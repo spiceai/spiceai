@@ -374,7 +374,7 @@ mod tests {
             order_exprs: vec![],
             unbounded: false,
             options: HashMap::new(),
-            constraints: Constraints::empty(),
+            constraints: Constraints::new_unverified(vec![]),
             column_defaults: HashMap::default(),
             temporary: false,
         };

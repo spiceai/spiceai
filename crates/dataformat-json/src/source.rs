@@ -32,7 +32,7 @@ use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_datasource::{RangeCalculation, calculate_range};
+use datafusion_datasource::{PartitionedFile, RangeCalculation, calculate_range};
 
 use arrow::datatypes::SchemaRef;
 use arrow::json::ReaderBuilder;
@@ -177,7 +177,7 @@ impl FileOpener for SpiceJsonOpener {
     /// 1. The first line of the partition is the line in which the index of the first character >= `start`.
     /// 2. The last line of the partition is the line in which the byte at position `end - 1` resides.
     #[allow(clippy::too_many_lines)]
-    fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture> {
+    fn open(&self, file_meta: FileMeta, _file: PartitionedFile) -> Result<FileOpenFuture> {
         let store = Arc::clone(&self.object_store);
         let base_flattened_schema = Arc::clone(&self.base_flattened_schema);
         let original_nested_schema = self

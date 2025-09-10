@@ -23,7 +23,7 @@ use std::{
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Column, DFSchema, JoinConstraint, JoinType},
+    common::{Column, DFSchema, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{Filter, Join, LogicalPlan, Projection, Sort, SortExpr, TableScan},
@@ -201,7 +201,7 @@ impl TextSearchIndexProvider {
             on,
             filter: pre_join_filters.into_iter().reduce(Expr::and),
             schema: join_schema.into(),
-            null_equals_null: false,
+            null_equality: NullEquality::NullEqualsNothing,
         });
 
         // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
@@ -288,7 +288,7 @@ impl TableProvider for TextSearchIndexProvider {
         // Only join on base table if required.
         let base_logical_plan: LogicalPlan = if self
             .text_index_table_is_sufficient(&index_table, projection, filters)
-            .map_err(|e| DataFusionError::ArrowError(e, None))?
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         {
             // Let DataFusion handle pushing filters.
             tracing::trace!("Index table is sufficient");
@@ -317,7 +317,7 @@ impl TableProvider for TextSearchIndexProvider {
             Some(idx) => self
                 .schema()
                 .project(idx)
-                .map_err(|e| DataFusionError::ArrowError(e, None))?
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
                 .into(),
         };
 

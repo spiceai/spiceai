@@ -44,9 +44,9 @@ impl From<Error> for DataFusionError {
         match e {
             Error::UnableToConvertRecordBatch {
                 source: arrow_error,
-            } => DataFusionError::ArrowError(arrow_error, None),
+            } => DataFusionError::ArrowError(Box::new(arrow_error), None),
             Error::FieldNotNullable { .. } => {
-                DataFusionError::ArrowError(ArrowError::SchemaError(e.to_string()), None)
+                DataFusionError::ArrowError(Box::new(ArrowError::SchemaError(e.to_string())), None)
             }
         }
     }

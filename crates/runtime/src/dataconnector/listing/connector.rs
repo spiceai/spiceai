@@ -572,7 +572,7 @@ pub trait ListingTableConnector: DataConnector {
             .await
             .map_err(|e| match e {
                 DataFusionError::ObjectStore(object_store_error) => {
-                    self.handle_object_store_error(dataset, object_store_error)
+                    self.handle_object_store_error(dataset, *object_store_error)
                 }
                 e => crate::dataconnector::DataConnectorError::UnableToConnectInternal {
                     dataconnector: format!("{self}"),

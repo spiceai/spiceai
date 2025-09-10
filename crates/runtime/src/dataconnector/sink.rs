@@ -49,7 +49,7 @@ impl SinkConnector {
     pub fn new(schema: SchemaRef) -> Self {
         Self {
             schema,
-            table_constraints: Constraints::empty(),
+            table_constraints: Constraints::new_unverified(vec![]),
         }
     }
 

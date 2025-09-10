@@ -443,7 +443,7 @@ impl AcceleratorExternalTableBuilder {
 
         let constraints = match self.constraints {
             Some(constraints) => constraints,
-            None => Constraints::empty(),
+            None => Constraints::new_unverified(vec![]),
         };
 
         let external_table = CreateExternalTable {

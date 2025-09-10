@@ -29,7 +29,7 @@ use data_components::s3_vectors::MetadataColumns;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType},
+    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
@@ -470,7 +470,7 @@ impl TableProvider for VectorQueryTableProvider {
                 on: join_conditions,
                 filter: pre_join_filters.into_iter().reduce(Expr::and),
                 schema: join_schema.into(),
-                null_equals_null: false,
+                null_equality: NullEquality::NullEqualsNothing,
             });
 
             // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join

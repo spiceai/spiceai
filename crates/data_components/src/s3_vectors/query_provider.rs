@@ -345,7 +345,7 @@ async fn query_vector_stream(
     let rows: Vec<_> = vectors.into_iter().map(to_flat_value).collect();
     decoder.serialize(rows.as_slice()).map_err(|e| {
         DataFusionError::ArrowError(
-            e,
+            Box::new(e),
             Some(
                 "could not convert QueryVectors JSON response into expected Arrow format"
                     .to_string(),
@@ -361,7 +361,7 @@ async fn query_vector_stream(
         Err(e) => {
             let _ = tx
                 .send(Err(DataFusionError::ArrowError(
-                    e,
+                    Box::new(e),
                     Some("Received only partial JSON payload from QueryVectors".to_string()),
                 )))
                 .await;

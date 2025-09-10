@@ -472,6 +472,7 @@ dependencies = [
  "arrow-schema",
  "flatbuffers",
  "lz4_flex",
+ "zstd",
 ]
 
 [[package]]
@@ -679,7 +680,7 @@ version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06575e6a9673580f52661c92107baabffbf41e2141373441cbcdc47cb733003c"
 dependencies = [
- "bzip2",
+ "bzip2 0.5.2",
  "flate2",
  "futures-core",
  "memchr",
@@ -782,7 +783,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strum 0.26.3",
- "syn 2.0.101",
+ "syn 2.0.106",
  "thiserror 1.0.69",
 ]
 
@@ -873,7 +874,7 @@ source = "git+https://github.com/spiceai/async-openai?rev=a87204bf60ecb06553095b
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -921,7 +922,7 @@ checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -938,7 +939,7 @@ checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -987,7 +988,7 @@ dependencies = [
  "derive_utils",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -1755,7 +1756,7 @@ checksum = "604fde5e028fea851ce1d8570bbdc034bec850d157f7569d10f347d06808c05c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -1816,7 +1817,7 @@ checksum = "06bce1a683e1a27013e64a1ff760700c7241275fe38787e578c3526f4ac569e0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "tracing",
  "typespec_client_core",
 ]
@@ -2058,7 +2059,7 @@ dependencies = [
  "regex",
  "rustc-hash 1.1.0",
  "shlex",
- "syn 2.0.101",
+ "syn 2.0.106",
  "which",
 ]
 
@@ -2300,7 +2301,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -2323,7 +2324,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -2452,7 +2453,7 @@ checksum = "7ecc273b49b3205b83d648f0690daa588925572cc5063745bfe547fe7ec8e1a1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -2493,6 +2494,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
 dependencies = [
  "bzip2-sys",
+]
+
+[[package]]
+name = "bzip2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bea8dcd42434048e4f7a304411d9273a411f647446c1234a65ce0554923f4cff"
+dependencies = [
+ "libbz2-rs-sys",
 ]
 
 [[package]]
@@ -2550,7 +2560,7 @@ dependencies = [
  "darling 0.20.11",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -2984,7 +2994,7 @@ dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -3454,7 +3464,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13b588ba4ac1a99f7f2964d24b3d896ddc6bf847ee3855dbd4366f058cfcd331"
 dependencies = [
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -3598,7 +3608,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim 0.11.1",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -3631,7 +3641,7 @@ checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
  "darling_core 0.20.11",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -3756,15 +3766,15 @@ dependencies = [
 
 [[package]]
 name = "datafusion"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "bytes",
- "bzip2",
+ "bzip2 0.6.0",
  "chrono",
  "datafusion-catalog",
  "datafusion-catalog-listing",
@@ -3791,6 +3801,7 @@ dependencies = [
  "datafusion-sql",
  "flate2",
  "futures",
+ "hex",
  "itertools 0.14.0",
  "log",
  "object_store",
@@ -3809,8 +3820,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-catalog"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3834,8 +3845,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-catalog-listing"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3856,15 +3867,17 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
  "arrow-ipc",
  "base64 0.22.1",
+ "chrono",
  "half",
  "hashbrown 0.14.5",
+ "hex",
  "indexmap 2.11.0",
  "libc",
  "log",
@@ -3879,8 +3892,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common-runtime"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "futures",
  "log",
@@ -3889,14 +3902,14 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-compression",
  "async-trait",
  "bytes",
- "bzip2",
+ "bzip2 0.6.0",
  "chrono",
  "datafusion-common",
  "datafusion-common-runtime",
@@ -3924,8 +3937,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-csv"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3948,8 +3961,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-json"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3972,8 +3985,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-parquet"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3989,8 +4002,10 @@ dependencies = [
  "datafusion-physical-expr-common",
  "datafusion-physical-optimizer",
  "datafusion-physical-plan",
+ "datafusion-pruning",
  "datafusion-session",
  "futures",
+ "hex",
  "itertools 0.14.0",
  "log",
  "object_store",
@@ -4002,13 +4017,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-doc"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 
 [[package]]
 name = "datafusion-execution"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "dashmap",
@@ -4025,10 +4040,11 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
+ "async-trait",
  "chrono",
  "datafusion-common",
  "datafusion-doc",
@@ -4045,8 +4061,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr-common"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -4058,7 +4074,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=c920a7501cdbfe906bf8c7d4959367fd47f00774#c920a7501cdbfe906bf8c7d4959367fd47f00774"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=33fd35ccb894d5bdf253ff4ba45aef0e9564e480#33fd35ccb894d5bdf253ff4ba45aef0e9564e480"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -4069,8 +4085,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -4097,8 +4113,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4117,8 +4133,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate-common"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4129,9 +4145,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-json"
-version = "0.48.0"
+version = "0.49.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca456922daef2a4aff142cd5a37b6a5076f6c727f640ab881c8673ccc8429484"
+checksum = "f6ade29eaefe2563ec3f953841fade87742693c54252eeeeaa911dcedf38fca0"
 dependencies = [
  "datafusion",
  "jiter",
@@ -4141,8 +4157,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-nested"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -4152,6 +4168,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions",
  "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
  "datafusion-macros",
  "datafusion-physical-expr-common",
  "itertools 0.14.0",
@@ -4161,8 +4178,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-table"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4176,8 +4193,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-window"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -4193,8 +4210,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-window-common"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -4202,23 +4219,24 @@ dependencies = [
 
 [[package]]
 name = "datafusion-macros"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "datafusion-expr",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
 name = "datafusion-optimizer"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "chrono",
  "datafusion-common",
  "datafusion-expr",
+ "datafusion-expr-common",
  "datafusion-physical-expr",
  "indexmap 2.11.0",
  "itertools 0.14.0",
@@ -4230,8 +4248,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4251,8 +4269,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr-common"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4264,8 +4282,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-optimizer"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -4275,6 +4293,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "datafusion-physical-plan",
+ "datafusion-pruning",
  "itertools 0.14.0",
  "log",
  "recursive",
@@ -4282,8 +4301,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-plan"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4310,9 +4329,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-pruning"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-expr-common",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "itertools 0.14.0",
+ "log",
+]
+
+[[package]]
 name = "datafusion-session"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4334,8 +4370,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-sql"
-version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+version = "49.0.2"
+source = "git+https://github.com/spiceai/datafusion.git?rev=02b99cf6b0084f0ccf965487a4430a3af9de9b68#02b99cf6b0084f0ccf965487a4430a3af9de9b68"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -4351,7 +4387,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=3c139e8c4cd7b22d2b3ee72c95d3478932e49cac#3c139e8c4cd7b22d2b3ee72c95d3478932e49cac"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=477cb9baf424477b437956590efa0ae1eff63b53#477cb9baf424477b437956590efa0ae1eff63b53"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4477,7 +4513,7 @@ checksum = "064456b054cf26b607f4cbcef6d2ca102f64ed8e4fa702d2e307ce67b5b93569"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4544,7 +4580,7 @@ checksum = "2cdc8d50f426189eef89dac62fabfa0abb27d5cc008f25bf4156a0203325becc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4555,7 +4591,7 @@ checksum = "d65d7ce8132b7c0e54497a4d9a55a1c2a0912a0d786cf894472ba818fba45762"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4566,7 +4602,7 @@ checksum = "510c292c8cf384b1a340b816a9a6cf2599eb8f566a44949024af88418000c50b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4577,7 +4613,7 @@ checksum = "30542c1ad912e0e3d22a1935c290e12e8a29d704a420177a31faad4a601a0800"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4598,7 +4634,7 @@ dependencies = [
  "darling 0.20.11",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4608,7 +4644,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
 dependencies = [
  "derive_builder_core",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4621,7 +4657,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc_version",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4641,7 +4677,7 @@ checksum = "bda628edc44c4bb645fbe0f758797143e4e07926f7ebf4e9bdfbd3d2ce621df3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4652,7 +4688,7 @@ checksum = "ccfae181bab5ab6c5478b2ccb69e4c68a02f8c3ec72f6616bfec9dbc599d2ee0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -4735,7 +4771,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.0",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
@@ -4752,7 +4788,7 @@ checksum = "97369cbbc041bc366949bc74d34658d6cda5621039731c6310521892a3a20ae0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -5005,7 +5041,7 @@ dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -5025,7 +5061,7 @@ checksum = "fc4caf64a58d7a6d65ab00639b046ff54399a39f5f2554728895ace4b297cd79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -5064,7 +5100,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cea14ef9355e3beab063703aa9dab15afd25f0667c341310c1e5274bb1d0da18"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5255,7 +5291,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix 1.0.7",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5313,9 +5349,9 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.1.1"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ced92e76e966ca2fd84c8f7aa01a4aea65b0eb6648d72f7c8f3e2764a67fece"
+checksum = "4a3d7db9596fecd151c5f638c0ee5d5bd487b6e0ea232e5dc96d5250f6f94b1d"
 dependencies = [
  "crc32fast",
  "libz-rs-sys",
@@ -5441,7 +5477,7 @@ checksum = "1a5c6c585bc94aaf2c7b51dd4c2ba22680844aba4c687be581871a6f518c5742"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -5605,7 +5641,7 @@ checksum = "162ee34ebcb7c64a8abebc059ce0fee27c2262618d7b60ed8faf72fef13c3650"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -6797,7 +6833,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.5.2"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ea81659ac8909fe2c4cc1c57be7208a7a2101aec#ea81659ac8909fe2c4cc1c57be7208a7a2101aec"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=15cdfb16069c45cf6ac604d2aae79d236e9d4761#15cdfb16069c45cf6ac604d2aae79d236e9d4761"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6849,7 +6885,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.5.2"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ea81659ac8909fe2c4cc1c57be7208a7a2101aec#ea81659ac8909fe2c4cc1c57be7208a7a2101aec"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=15cdfb16069c45cf6ac604d2aae79d236e9d4761#15cdfb16069c45cf6ac604d2aae79d236e9d4761"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6866,7 +6902,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.5.2"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ea81659ac8909fe2c4cc1c57be7208a7a2101aec#ea81659ac8909fe2c4cc1c57be7208a7a2101aec"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=15cdfb16069c45cf6ac604d2aae79d236e9d4761#15cdfb16069c45cf6ac604d2aae79d236e9d4761"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6892,7 +6928,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.5.2"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ea81659ac8909fe2c4cc1c57be7208a7a2101aec#ea81659ac8909fe2c4cc1c57be7208a7a2101aec"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=15cdfb16069c45cf6ac604d2aae79d236e9d4761#15cdfb16069c45cf6ac604d2aae79d236e9d4761"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6905,7 +6941,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.5.2"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ea81659ac8909fe2c4cc1c57be7208a7a2101aec#ea81659ac8909fe2c4cc1c57be7208a7a2101aec"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=15cdfb16069c45cf6ac604d2aae79d236e9d4761#15cdfb16069c45cf6ac604d2aae79d236e9d4761"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -7190,7 +7226,7 @@ checksum = "6c38228f24186d9cc68c729accb4d413be9eaed6ad07ff79e0270d9e56f3de13"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -7377,7 +7413,7 @@ checksum = "6c6e1db7ed32c6c71b759497fae34bf7933636f75a251b9e736555da426f6442"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -7553,7 +7589,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -7648,10 +7684,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "libc"
-version = "0.2.172"
+name = "libbz2-rs-sys"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
+checksum = "2c4a545a15244c7d945065b5d392b2d2d7f21526fba56ce51467b06ed445e8f7"
+
+[[package]]
+name = "libc"
+version = "0.2.175"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a82ae493e598baaea5209805c49bbf2ea7de956d50d7da0da1164f9c6d28543"
 
 [[package]]
 name = "libduckdb-sys"
@@ -7754,9 +7796,9 @@ dependencies = [
 
 [[package]]
 name = "libz-rs-sys"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6489ca9bd760fe9642d7644e827b0c9add07df89857b0416ee15c1cc1a3b8c5a"
+checksum = "840db8cf39d9ec4dd794376f38acc40d0fc65eec2a8f484f7fd375b84602becd"
 dependencies = [
  "zlib-rs",
 ]
@@ -7840,7 +7882,7 @@ checksum = "3b51f1d220e3fa869e24cfd75915efe3164bd09bb11b3165db3f37f57bf673e3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -7976,7 +8018,7 @@ dependencies = [
  "quote",
  "regex-syntax",
  "rustc_version",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8120,7 +8162,7 @@ dependencies = [
  "macro_magic_core",
  "macro_magic_macros",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8134,7 +8176,7 @@ dependencies = [
  "macro_magic_core_macros",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8145,7 +8187,7 @@ checksum = "b02abfe41815b5bd98dbd4260173db2c116dda171dc0fe7838cb206333b83308"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8156,7 +8198,7 @@ checksum = "73ea28ee64b88876bf45277ed9a5817c1817df061a74f2b988971a12570e5869"
 dependencies = [
  "macro_magic_core",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8240,7 +8282,7 @@ checksum = "88a9689d8d44bf9964484516275f5cd4c9b59457a6940c1d5d0ecbb94510a36b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8792,7 +8834,7 @@ dependencies = [
  "macro_magic",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8813,7 +8855,7 @@ checksum = "c402a4092d5e204f32c9e155431046831fa712637043c58cb73bc6bc6c9663b5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -8864,7 +8906,7 @@ dependencies = [
  "proc-macro-error2",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "termcolor",
  "thiserror 2.0.12",
 ]
@@ -9274,7 +9316,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -9750,7 +9792,7 @@ checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10039,7 +10081,7 @@ dependencies = [
  "proc-macro2",
  "proc-macro2-diagnostics",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10173,6 +10215,7 @@ dependencies = [
  "num-bigint",
  "object_store",
  "paste",
+ "ring",
  "seq-macro",
  "simdutf8",
  "snap",
@@ -10315,7 +10358,7 @@ dependencies = [
  "pest_meta",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10391,7 +10434,7 @@ dependencies = [
  "phf_shared",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10420,7 +10463,7 @@ checksum = "6e918e4ff8c4549eb882f14b3a4bc8c8bc93de829416eacf579f1207a8fbf861"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10658,7 +10701,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "664ec5419c51e34154eec046ebcba56312d5a2fc3b09a06da188e1ad21afadf6"
 dependencies = [
  "proc-macro2",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10698,7 +10741,7 @@ dependencies = [
  "proc-macro-error-attr2",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10718,7 +10761,7 @@ checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "version_check",
  "yansi",
 ]
@@ -10811,7 +10854,7 @@ dependencies = [
  "prost 0.12.6",
  "prost-types 0.12.6",
  "regex",
- "syn 2.0.101",
+ "syn 2.0.106",
  "tempfile",
 ]
 
@@ -10838,7 +10881,7 @@ dependencies = [
  "itertools 0.12.1",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10851,7 +10894,7 @@ dependencies = [
  "itertools 0.14.0",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -10996,7 +11039,7 @@ dependencies = [
  "proc-macro2",
  "pyo3-macros-backend",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -11009,7 +11052,7 @@ dependencies = [
  "proc-macro2",
  "pyo3-build-config",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -11136,7 +11179,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11447,7 +11490,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b"
 dependencies = [
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -11522,7 +11565,7 @@ checksum = "1165225c21bff1f3bbce98f5a1f889949bc902d3575308cc7b0de30b4f6d27c7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -11574,7 +11617,7 @@ checksum = "d7ef12e84481ab4006cb942f8682bba28ece7270743e649442027c5db87df126"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -11850,7 +11893,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_json",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -11920,7 +11963,7 @@ dependencies = [
  "regex",
  "relative-path",
  "rustc_version",
- "syn 2.0.101",
+ "syn 2.0.106",
  "unicode-ident",
 ]
 
@@ -11938,7 +11981,7 @@ dependencies = [
  "regex",
  "relative-path",
  "rustc_version",
- "syn 2.0.101",
+ "syn 2.0.106",
  "unicode-ident",
 ]
 
@@ -12256,7 +12299,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rust-embed-utils",
- "syn 2.0.101",
+ "syn 2.0.106",
  "walkdir",
 ]
 
@@ -12388,7 +12431,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12401,7 +12444,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12543,7 +12586,7 @@ checksum = "5d66de233f908aebf9cc30ac75ef9103185b4b715c6f2fb7a626aa5e5ede53ab"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -12717,7 +12760,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -12729,7 +12772,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -12801,7 +12844,7 @@ dependencies = [
  "heck 0.4.1",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "thiserror 1.0.69",
 ]
 
@@ -12979,7 +13022,7 @@ checksum = "5b0276cf7f2c73365f7157c8123c21cd9a50fbbd844757af28ca1f5925fc2a00"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -12990,7 +13033,7 @@ checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -13056,7 +13099,7 @@ checksum = "175ee3e80ae9982737ca543e96133087cbd9a485eecc3bc4de9c1a37b47ea59c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -13107,7 +13150,7 @@ dependencies = [
  "darling 0.20.11",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -13329,7 +13372,7 @@ dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -13674,7 +13717,7 @@ checksum = "da5fc6819faabb412da764b99d3b713bb55083c11e7e0c00144d386cd6a1939c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -13718,7 +13761,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13856,7 +13899,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -13869,7 +13912,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -13882,7 +13925,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -14065,9 +14108,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.101"
+version = "2.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ce2b7fc941b3a24138a0a7cf8e858bfc6a992e7978a068a5c760deb0ed43caf"
+checksum = "ede7c438028d4436d71104916910f5bb611972c5cfd7f89b8300a8186e6fada6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14103,7 +14146,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -14379,7 +14422,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.7",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -14605,7 +14648,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -14616,7 +14659,7 @@ checksum = "7f7cf42b4507d8ea322120659672cf1b9dbb93f8f2d4ecfd6e51350ff5b17a1d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -14871,7 +14914,7 @@ checksum = "6e06d43f1345a3bcd39f6a56dbb7dcab2ba47e68e8ac134855e7e2bdbaf8cab8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -15122,7 +15165,7 @@ dependencies = [
  "proc-macro2",
  "prost-build",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -15259,7 +15302,7 @@ checksum = "395ae124c09f9e6918a2310af6038fba074bcf474ac352496d5910dd59a2226d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -15716,7 +15759,7 @@ checksum = "1f718dfaf347dcb5b983bfc87608144b0bad87970aebcbea5ce44d2a30c08e63"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -15727,7 +15770,7 @@ checksum = "f9534daa9fd3ed0bd911d462a37f172228077e7abf18c18a5f67199d959205f8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -15738,7 +15781,7 @@ checksum = "3c36781cc0e46a83726d9879608e4cf6c2505237e263a8eb8c24502989cfdb28"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -15794,7 +15837,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc_version",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -16099,7 +16142,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -16270,7 +16313,7 @@ dependencies = [
  "log",
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "wasm-bindgen-shared",
 ]
 
@@ -16305,7 +16348,7 @@ checksum = "8ae87ea40c9f689fc23f209965b6fb8a99ad69aeeb0231408be24920604395de"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "wasm-bindgen-backend",
  "wasm-bindgen-shared",
 ]
@@ -16465,7 +16508,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -16556,7 +16599,7 @@ checksum = "a47fddd13af08290e67f4acabf4b459f647552718f683a7b415d290ac744a836"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -16567,7 +16610,7 @@ checksum = "bd9211b69f8dcdfa817bfd14bf1c97c9188afa36f4750130fcdf3f400eca9fa8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -17161,7 +17204,7 @@ checksum = "2380878cad4ac9aac1e2435f3eb4020e8374b5f13c296cb75b4620ff8e229154"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "synstructure 0.13.2",
 ]
 
@@ -17173,7 +17216,7 @@ checksum = "38da3c9736e16c5d3c8c597a9aaa5d1fa565d0532ae05e27c24aa62fb32c0ab6"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "synstructure 0.13.2",
 ]
 
@@ -17200,7 +17243,7 @@ checksum = "28a6e20d751156648aa063f3800b706ee209a32c0b4d9f24be3d980b01be55ef"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -17220,7 +17263,7 @@ checksum = "d71e5d6e06ab090c67b5e44993ec16b72dcbaabc526db883a360057678b48502"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
  "synstructure 0.13.2",
 ]
 
@@ -17241,7 +17284,7 @@ checksum = "ce36e65b0d2999d2aafac989fb249189a141aee1f53c612c1f37d72631959f69"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -17274,7 +17317,7 @@ checksum = "5b96237efa0c878c64bd89c436f661be4e46b2f3eff1ebb976f7ef2321d2f58f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -17312,7 +17355,7 @@ checksum = "12598812502ed0105f607f941c386f43d441e00148fce9dec3ca5ffb0bde9308"
 dependencies = [
  "aes",
  "arbitrary",
- "bzip2",
+ "bzip2 0.5.2",
  "constant_time_eq",
  "crc32fast",
  "deflate64",
@@ -17333,9 +17376,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "868b928d7949e09af2f6086dfc1e01936064cc7a819253bce650d4e2a2d63ba8"
+checksum = "2f06ae92f42f5e5c42443fd094f245eb656abf56dd7cce9b8b263236565e00f2"
 
 [[package]]
 name = "zopfli"

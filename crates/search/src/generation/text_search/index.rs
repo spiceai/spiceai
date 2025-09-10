@@ -179,7 +179,7 @@ impl FullTextDatabaseIndex {
             .map(|arr| array_to_terms(pk_field, arr))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| super::Error::FailedToRetrieveDataFromSource {
-                source: DataFusionError::ArrowError(e, None),
+                source: DataFusionError::ArrowError(Box::new(e), None),
             })?
             .into_iter()
             .flatten()
