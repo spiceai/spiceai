@@ -48,6 +48,7 @@ use s3_vectors::{
 use s3_vectors_metadata_filter::{convert_datafusion_filters_to_s3_vectors, document_to_json_map};
 use snafu::ResultExt;
 use tokio::sync::mpsc::Sender;
+use tracing::{Instrument, info_span};
 
 /// The JSON key within a `QueryVector` response that contains the distance to the query vector.
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
@@ -309,6 +310,14 @@ async fn query_vector_stream(
                 .boxed()
                 .map_err(DataFusionError::External)?,
         )
+        .instrument(info_span!(
+            target: "task_history",
+            "s3_query_vectors",
+            bucket_name = bucket_name,
+            index_name = index_name,
+            arn = arn,
+            top_k = limit
+        ))
         .await
         .map_err(|e| {
             if let SdkError::ServiceError(service_error) = &e {
