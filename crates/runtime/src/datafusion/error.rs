@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Spice specific errors that are returned as part of `DataFusionError::External`.
 
-use std::{error::Error, fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 
 use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
