@@ -45,10 +45,17 @@ pub enum ChangeBatchError {
 
 #[derive(Debug)]
 pub enum StreamError {
-    Kafka(String),
+    #[cfg(any(feature = "debezium", feature = "kafka"))]
+    /// Error from the Kafka client, such as failure to consume messages.
+    Kafka(crate::kafka::Error),
+    /// Error from Serde JSON, such as failure to serialize or deserialize data.
     SerdeJsonError(String),
+    /// Error from Arrow Flight, such as failure during streaming or subscription.
     Flight(String),
+    /// Error from the Arrow library, such as failure during batch processing or manipulation.
     Arrow(String),
+    /// External error not originating from `ChangesStream` core logic, such as index processing failure.
+    External(String),
 }
 
 impl std::error::Error for StreamError {}
@@ -56,10 +63,12 @@ impl std::error::Error for StreamError {}
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(any(feature = "debezium", feature = "kafka"))]
             StreamError::Kafka(e) => write!(f, "Kafka error: {e}"),
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
+            StreamError::External(e) => write!(f, "External error: {e}"),
         }
     }
 }

@@ -22,16 +22,6 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 2 are in 14?"
-      },
-      "primary_key": {
-        "id": 462
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
         "question": "How many groups of 3 are in 18?"
       },
       "primary_key": {
@@ -46,6 +36,16 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 464
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "How many groups of 2 are in 14?"
+      },
+      "primary_key": {
+        "id": 462
       },
       "score": 0.01
     }

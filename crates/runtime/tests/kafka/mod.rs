@@ -21,7 +21,7 @@ use app::AppBuilder;
 use futures::TryStreamExt;
 use runtime::Runtime;
 
-mod bootstrap;
+pub mod bootstrap;
 
 use bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_docker_container};
 use tokio::time::sleep;

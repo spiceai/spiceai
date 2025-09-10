@@ -173,7 +173,7 @@ mod tests {
     /// In the Python notebook that gets started at http://localhost:8888, load the `Iceberg - Getting Started.ipynb` notebook.
     /// Run the first 5 cells to create the `nyc.taxis` table.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires local minio and spark cluster"]
     async fn test_rest_catalog() {
         let catalog = RestCatalog::new(
             RestCatalogConfig::builder()

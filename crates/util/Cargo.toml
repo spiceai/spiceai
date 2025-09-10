@@ -10,8 +10,9 @@ version.workspace = true
 
 [dependencies]
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
+ctrlc = "3.4"
 humantime = "2.1.0"
 rand.workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }
-ctrlc = "3.4"
+tracing-subscriber.workspace = true

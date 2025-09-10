@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         id: setup-matrix
         with:
           script: |
