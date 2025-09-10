@@ -428,7 +428,8 @@ mod test {
             .build()
             .expect("Failed to build dataset");
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let table_provider = MemTable::try_new(schema, vec![]).expect("to create table provider");
+        let table_provider =
+            MemTable::try_new(schema, vec![vec![]]).expect("to create table provider");
         df.ctx
             .register_table(dataset.name.clone(), Arc::new(table_provider))
             .expect("to register table provider");
