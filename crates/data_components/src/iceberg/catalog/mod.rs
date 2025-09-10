@@ -46,10 +46,12 @@ pub enum Error {
     ))]
     FailedToConnect { url: String, source: iceberg::Error },
 
-    #[snafu(display(
-        "TLS/SSL certificate error connecting to {}: {}", url, detail
-    ))]
-    CertificateError { url: String, detail: String, source: iceberg::Error },
+    #[snafu(display("TLS/SSL certificate error connecting to {}: {}", url, detail))]
+    CertificateError {
+        url: String,
+        detail: String,
+        source: iceberg::Error,
+    },
 
     #[snafu(display(
         "Internal error: could not acquire a semaphore permit for concurrency control: {source}"
