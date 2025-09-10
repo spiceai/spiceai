@@ -13,6 +13,7 @@ description: "Query: tpch_simple_q1"
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]    |
 |               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
 |               |         BytesProcessedExec                                                  |
-|               |           SqlServerExec sql=SELECT l_orderkey FROM lineitem                 |
+|               |           CooperativeExec                                                   |
+|               |             SqlServerExec sql=SELECT l_orderkey FROM lineitem               |
 |               |                                                                             |
 +---------------+-----------------------------------------------------------------------------+
