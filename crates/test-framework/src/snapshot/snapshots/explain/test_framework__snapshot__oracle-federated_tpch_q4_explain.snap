@@ -33,11 +33,13 @@ description: "Query: tpch_q4"
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                 |
 |               |                             FilterExec: O_ORDERDATE@1 >= 1993-07-01 AND O_ORDERDATE@1 < 1993-10-01                                    |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
-|               |                                 OracleExec sql=SELECT "O_ORDERKEY", "O_ORDERDATE", "O_ORDERPRIORITY" FROM "TPCH_SF1"."ORDERS"         |
+|               |                                 CooperativeExec                                                                                       |
+|               |                                   OracleExec sql=SELECT "O_ORDERKEY", "O_ORDERDATE", "O_ORDERPRIORITY" FROM "TPCH_SF1"."ORDERS"       |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |                     RepartitionExec: partitioning=Hash([L_ORDERKEY@0], 16), input_partitions=16                                       |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                           |
 |               |                         BytesProcessedExec                                                                                            |
-|               |                           OracleExec sql=SELECT "L_ORDERKEY" FROM "TPCH_SF1"."LINEITEM" WHERE ("L_RECEIPTDATE" > "L_COMMITDATE")      |
+|               |                           CooperativeExec                                                                                             |
+|               |                             OracleExec sql=SELECT "L_ORDERKEY" FROM "TPCH_SF1"."LINEITEM" WHERE ("L_RECEIPTDATE" > "L_COMMITDATE")    |
 |               |                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+

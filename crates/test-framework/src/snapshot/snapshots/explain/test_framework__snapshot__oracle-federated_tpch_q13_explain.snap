@@ -34,7 +34,8 @@ description: "Query: tpch_q13"
 |               |                         RepartitionExec: partitioning=Hash([C_CUSTKEY@0], 16), input_partitions=16                                          |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                             |
 |               |                             BytesProcessedExec                                                                                              |
-|               |                               OracleExec sql=SELECT "C_CUSTKEY" FROM "TPCH_SF1"."CUSTOMER"                                                  |
+|               |                               CooperativeExec                                                                                               |
+|               |                                 OracleExec sql=SELECT "C_CUSTKEY" FROM "TPCH_SF1"."CUSTOMER"                                                |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([O_CUSTKEY@1], 16), input_partitions=16                                          |
 |               |                           ProjectionExec: expr=[O_ORDERKEY@0 as O_ORDERKEY, O_CUSTKEY@1 as O_CUSTKEY]                                       |
@@ -42,6 +43,7 @@ description: "Query: tpch_q13"
 |               |                               CoalesceBatchesExec: target_batch_size=8192                                                                   |
 |               |                                 FilterExec: O_COMMENT@2 NOT LIKE %special%requests%                                                         |
 |               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                     |
-|               |                                     OracleExec sql=SELECT "O_ORDERKEY", "O_CUSTKEY", "O_COMMENT" FROM "TPCH_SF1"."ORDERS"                   |
+|               |                                     CooperativeExec                                                                                         |
+|               |                                       OracleExec sql=SELECT "O_ORDERKEY", "O_CUSTKEY", "O_COMMENT" FROM "TPCH_SF1"."ORDERS"                 |
 |               |                                                                                                                                             |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
