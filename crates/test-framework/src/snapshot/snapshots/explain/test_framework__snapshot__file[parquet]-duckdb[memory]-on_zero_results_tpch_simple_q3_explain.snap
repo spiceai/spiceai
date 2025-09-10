@@ -20,6 +20,7 @@ description: "Query: tpch_simple_q3"
 |               |               FallbackOnZeroResultsScanExec                                                                     |
 |               |                 CoalescePartitionsExec                                                                          |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                         |
-|               |                     DuckSqlExec sql= SELECT "l_partkey", "l_linenumber", "l_comment" FROM lineitem              |
+|               |                     CooperativeExec                                                                             |
+|               |                       DuckSqlExec sql= SELECT "l_partkey", "l_linenumber", "l_comment" FROM lineitem            |
 |               |                                                                                                                 |
 +---------------+-----------------------------------------------------------------------------------------------------------------+
