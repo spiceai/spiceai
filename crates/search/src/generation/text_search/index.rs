@@ -17,10 +17,10 @@ limitations under the License.
 use std::cmp::min;
 use std::{any::Any, collections::HashSet, sync::Arc};
 
+use crate::metadata::MetadataColumns;
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use crate::metadata::MetadataColumns;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use runtime_datafusion_index::Index;

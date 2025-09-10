@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::collections::HashSet;
 
-use arrow_schema::{ArrowError, FieldRef, Fields};
+use arrow_schema::{ArrowError, FieldRef};
 
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr};
 

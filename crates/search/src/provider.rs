@@ -186,7 +186,7 @@ impl SearchQueryProvider {
             .search_index
             .query_table_provider(&self.query)
             .await
-            .map_err(|e| DataFusionError::External(e))?;
+            .map_err(DataFusionError::External)?;
 
         // Create table scan with filters that can be handled by the search index
         let search_index_columns: std::collections::HashSet<String> = query_table
