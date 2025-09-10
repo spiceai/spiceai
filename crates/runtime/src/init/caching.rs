@@ -16,14 +16,8 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use cache::{
-    CacheProvider, Caching, HashBuilder, QueryResultsCacheProvider, SimpleCache, get_hash_builder,
-    lru_cache,
-};
-use datafusion::logical_expr::LogicalPlan;
-use spicepod::component::caching::{
-    CacheConfig, Caching as CachingConfig, HashingAlgorithm, SQLResultsCacheConfig,
-};
+use cache::{Caching, QueryResultsCacheProvider, SimpleCache, get_hash_builder, lru_cache};
+use spicepod::component::caching::{CacheConfig, Caching as CachingConfig, SQLResultsCacheConfig};
 use util::in_tracing_context;
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};

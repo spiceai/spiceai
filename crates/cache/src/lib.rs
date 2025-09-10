@@ -145,6 +145,10 @@ impl std::hash::BuildHasher for HashBuilder {
     }
 }
 
+/// Returns a hash builder for the specified algorithm.
+///
+/// # Errors
+/// Return an error if the hashing algorithm is not supported.
 pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuilder, Error> {
     match hashing_algorithm {
         HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
