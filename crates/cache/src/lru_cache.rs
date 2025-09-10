@@ -15,20 +15,19 @@ limitations under the License.
 */
 
 use crate::AsTableRefs;
-use crate::CacheProvider;
 use crate::FailedToInvalidateCacheSnafu;
 use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::current_time_secs;
 use crate::metrics::CacheMetrics;
+use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
 use spicepod::component::caching::CacheConfig;
-use spicepod::component::caching::HashingAlgorithm;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -89,18 +88,8 @@ pub fn build_from_config<
         None => std::time::Duration::from_secs(1),
     };
 
-    Ok(match cache_config.hashing_algorithm {
-        HashingAlgorithm::Siphash => Arc::new(LruCache::new(
-            cache_max_size,
-            ttl,
-            std::hash::RandomState::default(),
-        )),
-        HashingAlgorithm::Ahash => Arc::new(LruCache::new(
-            cache_max_size,
-            ttl,
-            ahash::RandomState::default(),
-        )),
-    })
+    let hash_builder = get_hash_builder(cache_config.hashing_algorithm)?;
+    Ok(Arc::new(LruCache::new(cache_max_size, ttl, hash_builder)))
 }
 
 impl<

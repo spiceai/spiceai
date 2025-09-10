@@ -165,6 +165,7 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
 tract-core = "0.21.10"
+twox-hash = { workspace = true, optional = true }
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
@@ -264,6 +265,7 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
+xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
+use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -278,6 +279,8 @@ impl RuntimeBuilder {
             }
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
+
+        register_udfs(&rt);
 
         rt
     }
