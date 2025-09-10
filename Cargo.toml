@@ -242,11 +242,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }              # spiceai-0.5.2
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }   # spiceai-0.5.2
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }   # spiceai-0.5.2
+iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "c04b7ac941c4a9a6c506d36199f5fc2eb41168b2" }              # apache/iceberg-rust:main
+iceberg-catalog-glue = { git = "https://github.com/apache/iceberg-rust.git", rev = "c04b7ac941c4a9a6c506d36199f5fc2eb41168b2" } # apache/iceberg-rust:main
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust.git", rev = "c04b7ac941c4a9a6c506d36199f5fc2eb41168b2" } # apache/iceberg-rust:main
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust.git", rev = "c04b7ac941c4a9a6c506d36199f5fc2eb41168b2" }   # apache/iceberg-rust:main
+iceberg_test_utils = { git = "https://github.com/apache/iceberg-rust.git", rev = "c04b7ac941c4a9a6c506d36199f5fc2eb41168b2" }   # apache/iceberg-rust:main
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
