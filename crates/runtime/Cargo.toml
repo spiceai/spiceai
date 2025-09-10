@@ -265,7 +265,7 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
-xx-hash = ["dep:twox-hash", "cache/xx-hash"]
+xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

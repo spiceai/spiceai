@@ -116,13 +116,13 @@ pub trait CacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
 pub enum HashBuilder {
     Ahash(ahash::RandomState),
     Siphash(std::hash::RandomState),
-    #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xxhash")]
     XxHash3(twox_hash::xxh3::RandomHashBuilder64),
-    #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xxhash")]
     XxHash32(twox_hash::RandomXxHashBuilder32),
-    #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xxhash")]
     XxHash64(twox_hash::RandomXxHashBuilder64),
-    #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xxhash")]
     XxHash128(twox_hash::xxh3::RandomHashBuilder128),
 }
 
@@ -133,13 +133,13 @@ impl std::hash::BuildHasher for HashBuilder {
         match self {
             HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
             HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xx-hash")]
+            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xx-hash")]
+            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xx-hash")]
+            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xx-hash")]
+            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash128(builder) => Box::new(builder.build_hasher()),
         }
     }
@@ -153,19 +153,19 @@ pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuild
     match hashing_algorithm {
         HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
         HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
-        #[cfg(feature = "xx-hash")]
+        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(
             twox_hash::xxh3::RandomHashBuilder64::default(),
         )),
-        #[cfg(feature = "xx-hash")]
+        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(
             twox_hash::RandomXxHashBuilder32::default(),
         )),
-        #[cfg(feature = "xx-hash")]
+        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(
             twox_hash::RandomXxHashBuilder64::default(),
         )),
-        #[cfg(feature = "xx-hash")]
+        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128(
             twox_hash::xxh3::RandomHashBuilder128::default(),
         )),

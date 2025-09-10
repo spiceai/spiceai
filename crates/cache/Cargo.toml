@@ -30,4 +30,4 @@ rstest = "0.25.0"
 
 [features]
 default = []
-xx-hash = ["dep:twox-hash"]
+xxhash = ["dep:twox-hash"]
