@@ -265,11 +265,9 @@ impl VectorQueryTableProvider {
         indexed.get_underlying().schema()
     }
 
-    /// Returns all metadata columns including the embedding column itself
+    /// Returns all metadata columns (including the embedding column which is now part of metadata_columns)
     fn all_metadata_columns(&self) -> Vec<String> {
-        let mut all_columns = self.vector_index.metadata_columns().all_names();
-        all_columns.push(embedding_col!(self.vector_index.embedded_column()));
-        all_columns
+        self.vector_index.metadata_columns().all_names()
     }
 
     async fn vector_index_table(

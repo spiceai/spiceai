@@ -18,12 +18,15 @@ use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{
-    MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorsTable,
+    MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
-use search::generation::util::get_primary_keys;
+use search::{
+    generation::util::get_primary_keys,
+    metadata::{MetadataColumn, MetadataColumns},
+};
 use snafu::ResultExt;
 use spicepod::{
     param::Params,
@@ -200,7 +203,14 @@ async fn try_vector_table(
         id,
         s3_vector_client,
         dimension as i64,
-        columns,
+        columns
+            .into_iter()
+            .map(|c| match c {
+                MetadataColumn::Filterable(f) => S3MetadataColumn::Filterable(f),
+                MetadataColumn::NonFilterable(f) => S3MetadataColumn::NonFilterable(f),
+            })
+            .collect::<Vec<_>>()
+            .into(),
         string_from_params(&params, "distance_metric"),
     )
     .await?

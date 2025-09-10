@@ -24,13 +24,13 @@ use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
+use search::index::SearchIndex;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 
 use crate::{
-    convert_string_arrow_to_iterator, embedding_col,
-    embeddings::index::{VectorIndex, s3::S3Vector},
+    convert_string_arrow_to_iterator, embedding_col, embeddings::index::s3::S3Vector,
     model::EmbeddingModelStore,
 };
 
@@ -134,7 +134,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     .await?;
 
     let metadata =
-        extract_and_format_metadata(index.name(), &index.metadata_columns.all_names(), &record)
+        extract_and_format_metadata(index.name(), &index.metadata_columns().all_names(), &record)
             .map_err(|e| *e)?;
     let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
         .map_err(|e| *e)?;

@@ -199,6 +199,7 @@ impl EmbeddingConnector {
                 let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
                 for (column, config) in embedding_columns {
                     use runtime_datafusion_index::Index;
+                    use search::index::SearchIndex;
 
                     use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
 
@@ -225,7 +226,7 @@ impl EmbeddingConnector {
                     // this will result in recursive augmentation of the underlying table for N embedding columns
                     provider.underlying = Arc::new(VectorScanTableProvider::new(
                         provider.underlying,
-                        Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>,
+                        Arc::new(vector_index.clone()) as Arc<dyn SearchIndex>,
                     )) as Arc<dyn TableProvider>;
                     provider = provider.add_index(Arc::new(vector_index.clone()) as Arc<dyn Index>);
                 }

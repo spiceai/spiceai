@@ -21,9 +21,10 @@ use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
+use search::metadata::{MetadataColumn, MetadataColumns};
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
@@ -32,7 +33,7 @@ use snafu::ResultExt;
 
 use crate::{
     embedding_col,
-    embeddings::index::{VectorIndex, query_table::metadata_columns_to_exprs, s3::write},
+    embeddings::index::{SearchIndex, query_table::metadata_columns_to_exprs, s3::write},
     model::EmbeddingModelStore,
 };
 use datafusion::{
@@ -62,7 +63,11 @@ pub struct S3Vector {
     pub primary_key: Vec<Field>,
 
     /// Additional columns to add as metadata to the S3 vector index from the original dataset columns.
-    pub metadata_columns: MetadataColumns,
+    /// Note: This does not include the embedding column itself.
+    pub base_metadata_columns: MetadataColumns,
+
+    /// All metadata columns including the embedding column as non-filterable metadata.
+    pub complete_metadata_columns: MetadataColumns,
 
     pub model_name: String,
 
@@ -79,11 +84,28 @@ impl S3Vector {
         model_name: String,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
+        // Build complete metadata columns including the embedding column as non-filterable
+        let mut complete_columns: Vec<MetadataColumn> = metadata_columns.clone().into_iter().collect();
+        
+        // Add the embedding column as non-filterable metadata
+        let embedding_field = Arc::new(Field::new(
+            embedding_col!(embedded_column),
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                1536, // Default embedding dimension, could be made configurable
+            ),
+            false,
+        ));
+        complete_columns.push(MetadataColumn::NonFilterable(embedding_field));
+        
+        let complete_metadata_columns = MetadataColumns::from(complete_columns);
+
         Self {
             table,
             embedded_column,
             primary_key,
-            metadata_columns,
+            base_metadata_columns: metadata_columns,
+            complete_metadata_columns,
             model_name,
             embedding_models,
         }
@@ -122,8 +144,8 @@ impl S3Vector {
 }
 
 #[async_trait]
-impl VectorIndex for S3Vector {
-    fn embedded_column(&self) -> String {
+impl SearchIndex for S3Vector {
+    fn search_column(&self) -> String {
         self.embedded_column.clone()
     }
 
@@ -136,8 +158,8 @@ impl VectorIndex for S3Vector {
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
     fn list_table_provider(
         &self,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut projection = metadata_columns_to_exprs(self.metadata_columns());
+    ) -> Result<Option<Arc<dyn TableProvider>>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut projection = metadata_columns_to_exprs(&self.base_metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
         projection.push(Expr::Alias(Alias::new(
             Expr::Column(datafusion::common::Column::new_unqualified(
@@ -147,15 +169,15 @@ impl VectorIndex for S3Vector {
             embedding_col!(self.embedded_column()),
         )));
 
-        table_with_projection(
+        Ok(Some(table_with_projection(
             Arc::new(S3VectorsListTable::from(self.table.clone())),
             projection,
-        )
-        .boxed()
+        )?))
+        .map_err(|e| e.into())
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
-        &self.metadata_columns
+        &self.complete_metadata_columns
     }
 
     async fn write(
@@ -186,7 +208,7 @@ impl VectorIndex for S3Vector {
                 SEARCH_SCORE_COLUMN_NAME,
             )),
         ]);
-        projection.extend(metadata_columns_to_exprs(self.metadata_columns()));
+        projection.extend(metadata_columns_to_exprs(&self.base_metadata_columns));
 
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
@@ -215,7 +237,7 @@ impl Index for S3Vector {
             .cloned()
             .collect();
         pks.push(self.embedded_column.clone());
-        pks.extend(self.metadata_columns.iter().map(|c| c.name().to_string()));
+        pks.extend(self.base_metadata_columns.iter().map(|c| c.name().to_string()));
 
         pks
     }

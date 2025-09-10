@@ -16,15 +16,14 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::array::RecordBatch;
-use arrow_schema::{ArrowError, Field, Fields, SchemaRef};
-use async_trait::async_trait;
-
-use data_components::s3_vectors::MetadataColumns;
+use arrow_schema::{ArrowError, Fields, SchemaRef};
 
 use datafusion::{
     catalog::TableProvider, error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr,
 };
+
+// Re-export SearchIndex from search crate
+pub use search::index::{SearchIndex, SearchIndexExt, VectorIndex};
 
 pub(crate) mod query_table;
 mod retry_client;
@@ -32,68 +31,6 @@ pub mod s3;
 pub(crate) mod scan_table;
 pub use query_table::VectorQueryTableProvider;
 pub use scan_table::VectorScanTableProvider;
-
-/// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
-/// This trait supports both vector similarity search and full-text search implementations.
-///
-/// A [`SearchIndex`] can have additional metadata columns to improve the filter capabilities of
-/// [`SearchIndex::query_table_provider`], or to reduce the need for joining the [`TableProvider`]s
-///  of the search index and underlying table.
-#[async_trait]
-pub trait SearchIndex: std::fmt::Debug + Send + Sync {
-    /// The name of the column, in the underlying table, of the column for which search is performed against.
-    /// For vector indexes, this is the column that gets embedded. For FTS indexes, this is the text column being searched.
-    fn search_column(&self) -> String;
-
-    /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
-    ///
-    fn primary_fields(&self) -> Vec<Field>;
-
-    /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
-    /// columns and the associated vectors/indexed content of the [`SearchIndex::search_column`].
-    ///
-    /// For vector indexes: The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
-    /// For FTS indexes: Contains the indexed text content and primary keys.
-    fn list_table_provider(
-        &self,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// The additional columns available in the [`SearchIndex`].
-    /// For FTS indexes, this may return empty metadata columns.
-    fn metadata_columns(&self) -> &MetadataColumns;
-
-    /// Update the index based on a [`RecordBatch`] from the underlying table.
-    async fn write(
-        &self,
-        record: RecordBatch,
-    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
-    /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
-    ///  search score between `query` and the [`SearchIndex::search_column`].
-    ///
-    /// For vector indexes: Returns similarity scores and embedding vectors as metadata.
-    /// For FTS indexes: Returns relevance scores without embedding vectors.
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-/// Type alias for backward compatibility. Use [`SearchIndex`] for new code.
-pub type VectorIndex = dyn SearchIndex;
-
-/// Extension trait to provide backward compatibility methods for [`SearchIndex`]
-pub trait SearchIndexExt {
-    /// Backward compatibility alias for [`SearchIndex::search_column`]
-    fn embedded_column(&self) -> String;
-}
-
-impl<T: SearchIndex + ?Sized> SearchIndexExt for T {
-    fn embedded_column(&self) -> String {
-        self.search_column()
-    }
-}
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(
@@ -199,7 +136,6 @@ pub mod tests {
         util::pretty,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use data_components::s3_vectors::{MetadataColumn, MetadataColumns};
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
         datasource::TableType,
@@ -210,6 +146,7 @@ pub mod tests {
         sql::TableReference,
     };
     use search::generation::util::append_fields;
+    use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
 
     use crate::{embedding_col, embeddings::index::SearchIndex};
@@ -378,7 +315,8 @@ pub mod tests {
 
         fn list_table_provider(
             &self,
-        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Option<Arc<dyn TableProvider>>, Box<dyn std::error::Error + Send + Sync>>
+        {
             let mem_table = MemTable::try_new(
                 Arc::new(self.schema.clone()),
                 vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
@@ -386,7 +324,7 @@ pub mod tests {
                 ))]],
             )
             .boxed()?;
-            Ok(Arc::new(ExplainMemTable(mem_table)))
+            Ok(Some(Arc::new(ExplainMemTable(mem_table))))
         }
 
         fn metadata_columns(&self) -> &MetadataColumns {

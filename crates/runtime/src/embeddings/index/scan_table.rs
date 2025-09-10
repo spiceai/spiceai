@@ -33,21 +33,18 @@ use datafusion::{
     sql::TableReference,
 };
 
-use crate::{
-    embedding_col,
-    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
-};
-use search::generation::util::append_fields;
+use crate::{embedding_col, embeddings::index::search_index_table_is_sufficient};
+use search::{generation::util::append_fields, index::SearchIndex};
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
 pub struct VectorScanTableProvider {
     pub table_provider: Arc<dyn TableProvider>,
-    pub index: Arc<dyn VectorIndex>,
+    pub index: Arc<dyn SearchIndex>,
 }
 
 impl VectorScanTableProvider {
-    pub fn new(table_provider: Arc<dyn TableProvider>, index: Arc<dyn VectorIndex>) -> Self {
+    pub fn new(table_provider: Arc<dyn TableProvider>, index: Arc<dyn SearchIndex>) -> Self {
         Self {
             table_provider,
             index,
@@ -220,7 +217,7 @@ impl TableProvider for VectorScanTableProvider {
             return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
         }
 
-        let output_plan = if vector_index_table_is_sufficient(
+        let output_plan = if search_index_table_is_sufficient(
             self.schema(),
             &vector_table_scan,
             projection,
@@ -338,7 +335,7 @@ mod tests {
 
     use crate::embeddings::index::VectorScanTableProvider;
     use crate::embeddings::index::tests::{
-        PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
+        PretendSearchIndex, one_row_default_record_batch_for_schema, test_explain,
     };
 
     #[tokio::test]
@@ -357,7 +354,7 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            index: Arc::new(PretendVectorIndex::new(
+            index: Arc::new(PretendSearchIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -418,7 +415,7 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            index: Arc::new(PretendVectorIndex::new(
+            index: Arc::new(PretendSearchIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -517,7 +514,7 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            index: Arc::new(PretendVectorIndex::new(
+            index: Arc::new(PretendSearchIndex::new(
                 "body".to_string(),
                 vec![
                     Field::new("pk1", DataType::Int64, false),
