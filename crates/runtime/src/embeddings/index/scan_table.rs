@@ -348,7 +348,7 @@ mod tests {
 
     use crate::embeddings::index::VectorScanTableProvider;
     use crate::embeddings::index::tests::{
-        PretendSearchIndex, one_row_default_record_batch_for_schema, test_explain,
+        PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
     };
 
     #[tokio::test]
@@ -367,7 +367,7 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            index: Arc::new(PretendSearchIndex::new(
+            index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -428,7 +428,7 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            index: Arc::new(PretendSearchIndex::new(
+            index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -527,7 +527,7 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            index: Arc::new(PretendSearchIndex::new(
+            index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![
                     Field::new("pk1", DataType::Int64, false),
