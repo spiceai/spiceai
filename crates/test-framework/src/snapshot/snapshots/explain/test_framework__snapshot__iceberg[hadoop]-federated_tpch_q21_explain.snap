@@ -69,7 +69,8 @@ description: "Query: tpch_q21"
 |               |                                                 RepartitionExec: partitioning=Hash([s_suppkey@0], 16), input_partitions=16                                                                    |
 |               |                                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                       |
 |               |                                                     BytesProcessedExec                                                                                                                        |
-|               |                                                       IcebergTableScan projection:[s_suppkey,s_name,s_nationkey] predicate:[]                                                                 |
+|               |                                                       CooperativeExec                                                                                                                         |
+|               |                                                         IcebergTableScan projection:[s_suppkey,s_name,s_nationkey] predicate:[]                                                               |
 |               |                                               CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
 |               |                                                 RepartitionExec: partitioning=Hash([l_suppkey@1], 16), input_partitions=16                                                                    |
 |               |                                                   ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]                                                                 |
@@ -77,7 +78,8 @@ description: "Query: tpch_q21"
 |               |                                                       CoalesceBatchesExec: target_batch_size=8192                                                                                             |
 |               |                                                         FilterExec: l_receiptdate@3 > l_commitdate@2                                                                                          |
 |               |                                                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                               |
-|               |                                                             IcebergTableScan projection:[l_orderkey,l_suppkey,l_commitdate,l_receiptdate] predicate:[]                                        |
+|               |                                                             CooperativeExec                                                                                                                   |
+|               |                                                               IcebergTableScan projection:[l_orderkey,l_suppkey,l_commitdate,l_receiptdate] predicate:[]                                      |
 |               |                                       CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |                                         RepartitionExec: partitioning=Hash([o_orderkey@0], 16), input_partitions=16                                                                           |
 |               |                                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey]                                                                                                   |
@@ -85,7 +87,8 @@ description: "Query: tpch_q21"
 |               |                                               CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
 |               |                                                 FilterExec: o_orderstatus@1 = F                                                                                                               |
 |               |                                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                       |
-|               |                                                     IcebergTableScan projection:[o_orderkey,o_orderstatus] predicate:[o_orderstatus = "F"]                                                    |
+|               |                                                     CooperativeExec                                                                                                                           |
+|               |                                                       IcebergTableScan projection:[o_orderkey,o_orderstatus] predicate:[o_orderstatus = "F"]                                                  |
 |               |                               CoalesceBatchesExec: target_batch_size=8192                                                                                                                     |
 |               |                                 RepartitionExec: partitioning=Hash([n_nationkey@0], 16), input_partitions=16                                                                                  |
 |               |                                   ProjectionExec: expr=[n_nationkey@0 as n_nationkey]                                                                                                         |
@@ -93,12 +96,14 @@ description: "Query: tpch_q21"
 |               |                                       CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |                                         FilterExec: n_name@1 = SAUDI ARABIA                                                                                                                   |
 |               |                                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                               |
-|               |                                             IcebergTableScan projection:[n_nationkey,n_name] predicate:[n_name = "SAUDI ARABIA"]                                                              |
+|               |                                             CooperativeExec                                                                                                                                   |
+|               |                                               IcebergTableScan projection:[n_nationkey,n_name] predicate:[n_name = "SAUDI ARABIA"]                                                            |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
 |               |                         RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                                                                           |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                               |
 |               |                             BytesProcessedExec                                                                                                                                                |
-|               |                               IcebergTableScan projection:[l_orderkey,l_suppkey] predicate:[]                                                                                                 |
+|               |                               CooperativeExec                                                                                                                                                 |
+|               |                                 IcebergTableScan projection:[l_orderkey,l_suppkey] predicate:[]                                                                                               |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                 |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                                                                               |
 |               |                       ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]                                                                                             |
@@ -106,6 +111,7 @@ description: "Query: tpch_q21"
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                                         |
 |               |                             FilterExec: l_receiptdate@3 > l_commitdate@2                                                                                                                      |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                           |
-|               |                                 IcebergTableScan projection:[l_orderkey,l_suppkey,l_commitdate,l_receiptdate] predicate:[]                                                                    |
+|               |                                 CooperativeExec                                                                                                                                               |
+|               |                                   IcebergTableScan projection:[l_orderkey,l_suppkey,l_commitdate,l_receiptdate] predicate:[]                                                                  |
 |               |                                                                                                                                                                                               |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

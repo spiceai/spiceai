@@ -34,7 +34,8 @@ description: "Query: tpch_q13"
 |               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 16), input_partitions=16                                                            |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                               |
 |               |                             BytesProcessedExec                                                                                                                |
-|               |                               IcebergTableScan projection:[c_custkey] predicate:[]                                                                            |
+|               |                               CooperativeExec                                                                                                                 |
+|               |                                 IcebergTableScan projection:[c_custkey] predicate:[]                                                                          |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                             |
 |               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 16), input_partitions=16                                                            |
 |               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                                         |
@@ -42,6 +43,7 @@ description: "Query: tpch_q13"
 |               |                               CoalesceBatchesExec: target_batch_size=8192                                                                                     |
 |               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                                           |
 |               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                       |
-|               |                                     IcebergTableScan projection:[o_orderkey,o_custkey,o_comment] predicate:[]                                                 |
+|               |                                     CooperativeExec                                                                                                           |
+|               |                                       IcebergTableScan projection:[o_orderkey,o_custkey,o_comment] predicate:[]                                               |
 |               |                                                                                                                                                               |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+

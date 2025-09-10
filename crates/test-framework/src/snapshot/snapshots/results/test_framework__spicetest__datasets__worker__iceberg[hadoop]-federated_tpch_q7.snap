@@ -6,7 +6,7 @@ description: "Query: tpch_q7"
 | supp_nation | cust_nation | l_year | revenue            |
 +-------------+-------------+--------+--------------------+
 | FRANCE      | GERMANY     | 1995   | 54639732.73360001  |
-| FRANCE      | GERMANY     | 1996   | 54633083.307599984 |
-| GERMANY     | FRANCE      | 1995   | 52531746.669700004 |
-| GERMANY     | FRANCE      | 1996   | 52520549.0223999   |
+| FRANCE      | GERMANY     | 1996   | 54633083.30760003  |
+| GERMANY     | FRANCE      | 1995   | 52531746.669700064 |
+| GERMANY     | FRANCE      | 1996   | 52520549.02239992  |
 +-------------+-------------+--------+--------------------+
