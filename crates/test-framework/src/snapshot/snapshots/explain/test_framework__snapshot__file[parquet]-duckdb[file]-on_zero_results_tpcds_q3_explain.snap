@@ -47,7 +47,8 @@ description: "Query: tpcds_q3"
 |               |                                           FallbackOnZeroResultsScanExec                                                                                              |
 |               |                                             CoalescePartitionsExec                                                                                                   |
 |               |                                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                  |
-|               |                                                 DuckSqlExec sql= SELECT "d_date_sk", "d_year", "d_moy" FROM date_dim WHERE (d_moy = 12)                              |
+|               |                                                 CooperativeExec                                                                                                      |
+|               |                                                   DuckSqlExec sql= SELECT "d_date_sk", "d_year", "d_moy" FROM date_dim WHERE (d_moy = 12)                            |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                |
 |               |                             RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 16), input_partitions=16                                                         |
 |               |                               BytesProcessedExec                                                                                                                     |
@@ -56,7 +57,8 @@ description: "Query: tpcds_q3"
 |               |                                     FallbackOnZeroResultsScanExec                                                                                                    |
 |               |                                       CoalescePartitionsExec                                                                                                         |
 |               |                                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
-|               |                                           DuckSqlExec sql= SELECT "ss_sold_date_sk", "ss_item_sk", "ss_net_profit" FROM store_sales                                  |
+|               |                                           CooperativeExec                                                                                                            |
+|               |                                             DuckSqlExec sql= SELECT "ss_sold_date_sk", "ss_item_sk", "ss_net_profit" FROM store_sales                                |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
 |               |                     RepartitionExec: partitioning=Hash([i_item_sk@0], 16), input_partitions=16                                                                       |
 |               |                       ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_brand_id@1 as i_brand_id, i_brand@2 as i_brand]                                              |
@@ -68,6 +70,7 @@ description: "Query: tpcds_q3"
 |               |                                   FallbackOnZeroResultsScanExec                                                                                                      |
 |               |                                     CoalescePartitionsExec                                                                                                           |
 |               |                                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                          |
-|               |                                         DuckSqlExec sql= SELECT "i_item_sk", "i_brand_id", "i_brand", "i_manufact_id" FROM item WHERE (i_manufact_id = 445)          |
+|               |                                         CooperativeExec                                                                                                              |
+|               |                                           DuckSqlExec sql= SELECT "i_item_sk", "i_brand_id", "i_brand", "i_manufact_id" FROM item WHERE (i_manufact_id = 445)        |
 |               |                                                                                                                                                                      |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
