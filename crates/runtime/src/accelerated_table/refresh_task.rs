@@ -958,7 +958,6 @@ impl DataLoadTracing {
     }
 }
 
-// This function is moved from RefreshTask for the testing.
 #[allow(clippy::needless_pass_by_value)]
 pub fn max_timestamp_df(
     accelerator: &Arc<dyn TableProvider>,
