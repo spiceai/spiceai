@@ -45,7 +45,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
         .scope(async {
             let app = AppBuilder::new("test_refresh_max_timestamp_df").build();
 
-            let mut rt = Runtime::builder()
+            let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
@@ -137,7 +137,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
         .scope(async {
             let app = AppBuilder::new("test_accelerator_table_provider").build();
 
-            let mut rt = Runtime::builder()
+            let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
@@ -198,7 +198,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 .downcast_ref::<FederatedTableProviderAdaptor>()
                 .expect("Expected FederatedTableProviderAdaptor");
 
-            let ensure_schema_adaptor = federated_table_adaptor
+            federated_table_adaptor
                 .table_provider
                 .as_ref()
                 .expect("Expected table provider")
