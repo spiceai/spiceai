@@ -26,9 +26,9 @@ use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
-    GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
-    MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector, PutVectorsInput, S3Vectors,
-    SdkError, VectorData,
+    GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput, ListIndexesInput,
+    ListIndexesOutput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
+    PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -47,6 +47,11 @@ pub struct S3VectorsTable {
     pub(super) schema: SchemaRef,
 
     pub(super) constraints: Constraints,
+
+    // Index capacity is limited in AWS. When an index is full, we spill to
+    // another index. This represents the number of physical indexes this
+    // logical index has.
+    num_physical_indexes: usize,
 }
 
 impl std::fmt::Debug for S3VectorsTable {
@@ -100,6 +105,9 @@ impl S3VectorsTable {
             None => return Ok(S3VectorTableResult::IndexDoesNotExist),
             Some(_) => {}
         }
+
+        let num_physical_indexes = 1;
+
         let schema = Self::compute_schema(columns);
         let constraints = Self::primary_key(&schema);
         Ok(S3VectorTableResult::Table(Self {
@@ -107,6 +115,7 @@ impl S3VectorsTable {
             client,
             schema,
             constraints,
+            num_physical_indexes,
         }))
     }
 
@@ -164,21 +173,6 @@ impl S3VectorsTable {
                     .await
                     .map(S3VectorTableResult::table)
             }
-        }
-    }
-
-    #[must_use]
-    pub fn new(
-        index: S3VectorIdentifier,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        schema: SchemaRef,
-    ) -> Self {
-        let constraints = Self::primary_key(&schema);
-        Self {
-            idx: index,
-            client,
-            schema,
-            constraints,
         }
     }
 
@@ -448,5 +442,44 @@ impl S3VectorsTable {
         );
 
         Ok(())
+    }
+}
+
+async fn infer_num_physical_indexes(
+    index: &S3VectorIdentifier,
+    client: &(dyn S3Vectors + Send + Sync),
+) -> Result<usize> {
+    match index {
+        S3VectorIdentifier::IndexArn(_) => Ok(1),
+        S3VectorIdentifier::Index {
+            bucket_name,
+            index_name,
+        } => {
+            // List the indexes in the bucket and count the number of indexes
+            // that have a name that start with `index_name`
+            let mut index_names = Vec::new();
+            loop {
+                let ListIndexesOutput {
+                    next_token,
+                    indexes,
+                    ..
+                } = client
+                    .list_indexes(
+                        ListIndexesInput::builder()
+                            .vector_bucket_name(bucket_name)
+                            .build()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                for summary in indexes {
+                    if summary.index_name.starts_with(index_name) {
+                        index_names.push(summary.index_name);
+                    }
+                }
+            }
+            todo!()
+        }
     }
 }
