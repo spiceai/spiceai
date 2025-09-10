@@ -33,29 +33,33 @@ pub(crate) mod scan_table;
 pub use query_table::VectorQueryTableProvider;
 pub use scan_table::VectorScanTableProvider;
 
-/// A [`VectorIndex`] is a table index that can provide vector similarity results for arbitrary queries (see [`VectorIndex::query_table_provider`]).
+/// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
+/// This trait supports both vector similarity search and full-text search implementations.
 ///
-/// A [`VectorIndex`] can have additional metadata columns to improve the filter capabilities of
-/// [`VectorIndex::query_table_provider`], or to reduce the need for joining the [`TableProvider`]s
-///  of the vector index and underlying table.
+/// A [`SearchIndex`] can have additional metadata columns to improve the filter capabilities of
+/// [`SearchIndex::query_table_provider`], or to reduce the need for joining the [`TableProvider`]s
+///  of the search index and underlying table.
 #[async_trait]
-pub trait VectorIndex: std::fmt::Debug + Send + Sync {
-    /// The name of the column, in the underlying table, of the column for which vector similarity is performed against.
-    fn embedded_column(&self) -> String;
+pub trait SearchIndex: std::fmt::Debug + Send + Sync {
+    /// The name of the column, in the underlying table, of the column for which search is performed against.
+    /// For vector indexes, this is the column that gets embedded. For FTS indexes, this is the text column being searched.
+    fn search_column(&self) -> String;
 
-    /// All [`Field`]s that define a primary key between the underlying table and the [`VectorIndex`].
+    /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
     ///
     fn primary_fields(&self) -> Vec<Field>;
 
-    /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
-    /// columns and the associated embedding vectors of the [`VectorIndex::embedded_column`].
+    /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
+    /// columns and the associated vectors/indexed content of the [`SearchIndex::search_column`].
     ///
-    /// The associated embedding vector column will be [`VectorIndex::embedded_column`] with `_embedding` appended (e.g. `body_embedding`).
+    /// For vector indexes: The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
+    /// For FTS indexes: Contains the indexed text content and primary keys.
     fn list_table_provider(
         &self,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// The additional columns available in the [`VectorIndex`].
+    /// The additional columns available in the [`SearchIndex`].
+    /// For FTS indexes, this may return empty metadata columns.
     fn metadata_columns(&self) -> &MetadataColumns;
 
     /// Update the index based on a [`RecordBatch`] from the underlying table.
@@ -64,23 +68,41 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
-    /// columns, the associated embedding vectors of the [`VectorIndex::embedded_column`] and the
-    ///  similarity score between `query` and the [`VectorIndex::embedded_column`].
+    /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
+    /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
+    ///  search score between `query` and the [`SearchIndex::search_column`].
+    ///
+    /// For vector indexes: Returns similarity scores and embedding vectors as metadata.
+    /// For FTS indexes: Returns relevance scores without embedding vectors.
     async fn query_table_provider(
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-// Returns true if the vector index table has all requested columns and can handle all filters (i.e. filters pertain to vector index column, even if they must be post-applied in DataFusion).
-pub(super) fn vector_index_table_is_sufficient(
+/// Type alias for backward compatibility. Use [`SearchIndex`] for new code.
+pub type VectorIndex = dyn SearchIndex;
+
+/// Extension trait to provide backward compatibility methods for [`SearchIndex`]
+pub trait SearchIndexExt {
+    /// Backward compatibility alias for [`SearchIndex::search_column`]
+    fn embedded_column(&self) -> String;
+}
+
+impl<T: SearchIndex + ?Sized> SearchIndexExt for T {
+    fn embedded_column(&self) -> String {
+        self.search_column()
+    }
+}
+
+// Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
+pub(super) fn search_index_table_is_sufficient(
     source_table_schema: SchemaRef,
-    vector_index_table: &LogicalPlan,
+    search_index_table: &LogicalPlan,
     projection: Option<&Vec<usize>>,
     filters: &[Expr],
 ) -> Result<bool, DataFusionError> {
-    let vector_index_columns: HashSet<String> = vector_index_table
+    let search_index_columns: HashSet<String> = search_index_table
         .schema()
         .fields()
         .iter()
@@ -88,16 +110,16 @@ pub(super) fn vector_index_table_is_sufficient(
         .collect();
 
     let full_projection =
-        vector_index_has_full_projection(source_table_schema, &vector_index_columns, projection)?;
-    let vector_index_filters = vector_index_filters(&vector_index_columns, filters);
+        search_index_has_full_projection(source_table_schema, &search_index_columns, projection)?;
+    let search_index_filters = search_index_filters(&search_index_columns, filters);
 
-    Ok(full_projection && vector_index_filters.len() == filters.len())
+    Ok(full_projection && search_index_filters.len() == filters.len())
 }
 
-/// Returns true if the projection (relative to [`VectorQueryTableProvider`]) can be handled by the given vector index schema.
-pub(super) fn vector_index_has_full_projection(
+/// Returns true if the projection (relative to search query table provider) can be handled by the given search index schema.
+pub(super) fn search_index_has_full_projection(
     source_table_schema: SchemaRef,
-    vector_index_columns: &HashSet<String>,
+    search_index_columns: &HashSet<String>,
     projection: Option<&Vec<usize>>,
 ) -> Result<bool, ArrowError> {
     let source_table_schema = match projection {
@@ -110,16 +132,16 @@ pub(super) fn vector_index_has_full_projection(
         .map(|f| f.name().clone())
         .collect();
 
-    Ok(vector_index_columns.is_superset(&columns_requested))
+    Ok(search_index_columns.is_superset(&columns_requested))
 }
 
-/// Returns all filters that can be handled by the given vector index columns.
+/// Returns all filters that can be handled by the given search index columns.
 ///
 /// This does not require that associated [`TableProvider::supports_filters_pushdown`] is
 /// [`TableProviderFilterPushDown::Unsupported`] for all filters, only that the columns
-/// referenced in the filters, are those available in the `vector_index_table`.
-pub(super) fn vector_index_filters(
-    vector_index_columns: &HashSet<String>,
+/// referenced in the filters, are those available in the `search_index_table`.
+pub(super) fn search_index_filters(
+    search_index_columns: &HashSet<String>,
     filters: &[Expr],
 ) -> Vec<Expr> {
     filters
@@ -130,7 +152,7 @@ pub(super) fn vector_index_filters(
                 .iter()
                 .map(|c| c.name().to_string())
                 .collect::<HashSet<_>>();
-            vector_index_columns.is_superset(&filter_columns)
+            search_index_columns.is_superset(&filter_columns)
         })
         .cloned()
         .collect()
@@ -190,7 +212,7 @@ pub mod tests {
     use search::generation::util::append_fields;
     use snafu::ResultExt;
 
-    use crate::{embedding_col, embeddings::index::VectorIndex};
+    use crate::{embedding_col, embeddings::index::SearchIndex};
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -305,7 +327,7 @@ pub mod tests {
         }
     }
 
-    /// An implementation of [`VectorIndex`] that has one row. Useful for testing explain plans.
+    /// An implementation of [`SearchIndex`] that has one row. Useful for testing explain plans.
     #[derive(Debug)]
     pub struct PretendVectorIndex {
         embedded_column: String,
@@ -345,8 +367,8 @@ pub mod tests {
     }
 
     #[async_trait::async_trait]
-    impl VectorIndex for PretendVectorIndex {
-        fn embedded_column(&self) -> String {
+    impl SearchIndex for PretendVectorIndex {
+        fn search_column(&self) -> String {
             self.embedded_column.clone()
         }
 

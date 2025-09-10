@@ -51,22 +51,22 @@ use tokio_stream::StreamExt;
 use crate::{
     embedding_col,
     embeddings::index::{
-        VectorIndex, projection_without_columns, vector_index_table_is_sufficient,
+        SearchIndex, SearchIndexExt, projection_without_columns, search_index_table_is_sufficient,
     },
 };
-use crate::{embeddings::index::vector_index_filters, search::util::find_concrete_table_provider};
+use crate::{embeddings::index::search_index_filters, search::util::find_concrete_table_provider};
 use search::generation::util::append_fields;
 
-/// An [`IndexedTableProvider`] embued with a [`VectorIndex`] that can order results in the underlying [`IndexedTableProvider::get_underlying`] by vector similarity to a query (similarity with respect to associated embedded column in [`VectorIndex`]).
+/// An [`IndexedTableProvider`] embued with a [`SearchIndex`] that can order results in the underlying [`IndexedTableProvider::get_underlying`] by search relevance to a query.
 #[derive(Debug, Clone)]
 pub struct VectorQueryTableProvider {
-    /// Base [`TableProvider`] associated with the vector index query.
-    /// Note: [`TableProvider::schema`] will contain vector embedding columns that may need to be
+    /// Base [`TableProvider`] associated with the search index query.
+    /// Note: [`TableProvider::schema`] will contain search-related columns (embeddings, etc.) that may need to be
     /// recomputed at query time. As such full projections on this [`TableProvider`] are not advised.
     ///
     /// To get the underlying schema (i.e. without any calculated columns), downcast to, and use [`runtime_datafusion_index::IndexedTableProvider::get_underlying`].
     pub table_provider: Arc<dyn TableProvider>,
-    pub vector_index: Arc<dyn VectorIndex>,
+    pub vector_index: Arc<dyn SearchIndex>,
 
     pub query: String,
 
@@ -210,14 +210,12 @@ impl VectorQueryTableProvider {
     fn underlying_table_scan(
         &self,
         filters: &[Expr],
-        embedded_column: &str,
-        metadata_columns: &[String],
+        all_metadata_columns: &[String],
     ) -> DataFusionResult<LogicalPlan> {
-        // Remove embedding column and metadata columns of vector index.
+        // Remove all metadata columns (including embedding column) from vector index.
         let base_proj = (0..self.get_underlying_schema().fields().len()).collect::<Vec<_>>();
         let base_proj =
-            projection_without_columns(&self.schema().fields, metadata_columns, Some(&base_proj));
-        let base_proj = self.remove_embedding_column(base_proj, embedded_column);
+            projection_without_columns(&self.schema().fields, all_metadata_columns, Some(&base_proj));
 
         let filter_refs: Vec<_> = filters.iter().collect();
         let supported_filters = self
@@ -253,12 +251,6 @@ impl VectorQueryTableProvider {
         Ok(plan)
     }
 
-    fn remove_embedding_column(&self, projection: Vec<usize>, col: &str) -> Vec<usize> {
-        match self.schema().column_with_name(col) {
-            Some((idx, _)) => projection.into_iter().filter(|p| *p != idx).collect(),
-            None => projection,
-        }
-    }
 
     fn get_underlying_schema(&self) -> Arc<Schema> {
         let Some(indexed) =
@@ -271,6 +263,13 @@ impl VectorQueryTableProvider {
             return self.table_provider.schema();
         };
         indexed.get_underlying().schema()
+    }
+
+    /// Returns all metadata columns including the embedding column itself
+    fn all_metadata_columns(&self) -> Vec<String> {
+        let mut all_columns = self.vector_index.metadata_columns().all_names();
+        all_columns.push(embedding_col!(self.vector_index.embedded_column()));
+        all_columns
     }
 
     async fn vector_index_table(
@@ -287,7 +286,7 @@ impl VectorQueryTableProvider {
             TableReference::parse_str("vector_index"),
             Arc::new(DefaultTableSource::new(query_table)),
             None,
-            vector_index_filters(
+            search_index_filters(
                 &self
                     .vector_index
                     .metadata_columns()
@@ -401,7 +400,7 @@ impl TableProvider for VectorQueryTableProvider {
         let vector_index_table = self.vector_index_table(filters, limit).await?;
 
         // Only join on base table if required.
-        let base_logical_plan: LogicalPlan = if vector_index_table_is_sufficient(
+        let base_logical_plan: LogicalPlan = if search_index_table_is_sufficient(
             self.schema(),
             &vector_index_table,
             projection,
@@ -432,8 +431,7 @@ impl TableProvider for VectorQueryTableProvider {
 
             let underlying_table_scan = self.underlying_table_scan(
                 underlying_filters.as_slice(),
-                embedding_col!(self.vector_index.embedded_column()).as_str(),
-                self.vector_index.metadata_columns().all_names().as_slice(),
+                &self.all_metadata_columns(),
             )?;
 
             let join_schema = vector_index_table
