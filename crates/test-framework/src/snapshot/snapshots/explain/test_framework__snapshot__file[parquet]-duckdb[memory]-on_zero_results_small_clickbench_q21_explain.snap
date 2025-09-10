@@ -24,6 +24,7 @@ description: "Query: clickbench_q21"
 |               |                     FallbackOnZeroResultsScanExec                                                                    |
 |               |                       CoalescePartitionsExec                                                                         |
 |               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                        |
-|               |                           DuckSqlExec sql= SELECT "URL" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%'          |
+|               |                           CooperativeExec                                                                            |
+|               |                             DuckSqlExec sql= SELECT "URL" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%'        |
 |               |                                                                                                                      |
 +---------------+----------------------------------------------------------------------------------------------------------------------+
