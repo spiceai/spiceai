@@ -97,7 +97,7 @@ impl VectorScanTableProvider {
 
         let Some(idx) = index_of_column(
             &self.schema(),
-            embedding_col!(self.index.embedded_column()).as_str(),
+            embedding_col!(self.index.search_column()).as_str(),
         ) else {
             return false; // Technically unreachable, but by definition not needed.
         };
@@ -115,7 +115,7 @@ impl VectorScanTableProvider {
         qualified_fields.push((
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(
-                embedding_col!(self.index.embedded_column()),
+                embedding_col!(self.index.search_column()),
                 DataType::new_list(DataType::Float32, true),
                 true,
             )),
@@ -154,7 +154,7 @@ impl TableProvider for VectorScanTableProvider {
         append_fields(
             &self.table_provider.schema(),
             vec![Arc::new(Field::new(
-                embedding_col!(self.index.embedded_column()),
+                embedding_col!(self.index.search_column()),
                 DataType::new_list(DataType::Float32, true),
                 true,
             ))],
@@ -185,6 +185,15 @@ impl TableProvider for VectorScanTableProvider {
                 .await;
         }
 
+        // If [`SearchIndex::list_table_provider`]  is None, the index does not provide any additional columns.
+        // Can resolved entirely with base table.
+        let Some(index_plan) = self.index.list_table_provider()? else {
+            return self
+                .table_provider
+                .scan(state, projection, filters, limit)
+                .await;
+        };
+
         let mut proj = self
             .index
             .primary_fields()
@@ -198,14 +207,14 @@ impl TableProvider for VectorScanTableProvider {
             .collect::<Vec<_>>();
         proj.push(Expr::Column(Column::new(
             Some(TableReference::parse_str("vector_index")),
-            embedding_col!(self.index.embedded_column()),
+            embedding_col!(self.index.search_column()),
         )));
 
         let vector_table_scan = LogicalPlan::Projection(Projection::try_new(
             proj,
             Arc::new(LogicalPlan::TableScan(TableScan::try_new(
                 TableReference::parse_str("vector_index"),
-                Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
+                Arc::new(DefaultTableSource::new(index_plan)),
                 None,
                 vec![],
                 None,
@@ -217,10 +226,14 @@ impl TableProvider for VectorScanTableProvider {
             return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
         }
 
+        let projection_schema: SchemaRef = match projection {
+            None => self.schema(),
+            Some(indices) => self.schema().project(indices)?.into(),
+        };
+
         let output_plan = if search_index_table_is_sufficient(
-            self.schema(),
+            projection_schema.fields().iter().collect(),
             &vector_table_scan,
-            projection,
             filters,
         )? {
             // Let DataFusion handle pushing filters.

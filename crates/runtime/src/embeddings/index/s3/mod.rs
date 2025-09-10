@@ -111,7 +111,7 @@ pub async fn try_from_dataset(
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
-    let table = try_vector_table(
+    let (table, dimension) = try_vector_table(
         metadata_columns.clone(),
         params,
         format!("{}-{}-{}", ds_name, column, config.model)
@@ -128,6 +128,7 @@ pub async fn try_from_dataset(
         primary_key,
         metadata_columns,
         config.model.clone(),
+        dimension,
         embedding_models,
     ))
 }
@@ -152,7 +153,7 @@ async fn try_vector_table(
     default_s3_index_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
-) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(S3VectorsTable, usize), Box<dyn std::error::Error + Send + Sync>> {
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
@@ -219,7 +220,7 @@ async fn try_vector_table(
             "S3 Vectors index does not exist. After it was created, it still does not exist. Unexpected.".to_string()
         ));
     };
-    Ok(vector_table)
+    Ok((vector_table, dimension))
 }
 
 // Attempt to get a certain string-value from the parameter.

@@ -14,40 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
-use arrow_schema::{ArrowError, Fields, SchemaRef};
+use arrow_schema::{ArrowError, FieldRef, Fields};
 
-use datafusion::{
-    catalog::TableProvider, error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr,
-};
+use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr};
 
 // Re-export SearchIndex from search crate
 pub use search::index::{SearchIndex, SearchIndexExt, VectorIndex};
 
-pub(crate) mod query_table;
 mod retry_client;
 pub mod s3;
 pub(crate) mod scan_table;
-pub use query_table::VectorQueryTableProvider;
 pub use scan_table::VectorScanTableProvider;
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(
-    source_table_schema: SchemaRef,
-    search_index_table: &LogicalPlan,
-    projection: Option<&Vec<usize>>,
+    projection: Vec<&FieldRef>,
+    search_index: &LogicalPlan,
     filters: &[Expr],
 ) -> Result<bool, DataFusionError> {
-    let search_index_columns: HashSet<String> = search_index_table
+    let search_index_columns: HashSet<String> = search_index
         .schema()
         .fields()
         .iter()
         .map(|f| f.name().to_string())
         .collect();
 
-    let full_projection =
-        search_index_has_full_projection(source_table_schema, &search_index_columns, projection)?;
+    let full_projection = search_index_has_full_projection(projection, &search_index_columns)?;
     let search_index_filters = search_index_filters(&search_index_columns, filters);
 
     Ok(full_projection && search_index_filters.len() == filters.len())
@@ -55,19 +49,10 @@ pub(super) fn search_index_table_is_sufficient(
 
 /// Returns true if the projection (relative to search query table provider) can be handled by the given search index schema.
 pub(super) fn search_index_has_full_projection(
-    source_table_schema: SchemaRef,
+    projection: Vec<&FieldRef>,
     search_index_columns: &HashSet<String>,
-    projection: Option<&Vec<usize>>,
 ) -> Result<bool, ArrowError> {
-    let source_table_schema = match projection {
-        None => source_table_schema,
-        Some(indices) => Arc::new(source_table_schema.project(indices)?),
-    };
-    let columns_requested: HashSet<String> = source_table_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
+    let columns_requested: HashSet<String> = projection.iter().map(|f| f.name().clone()).collect();
 
     Ok(search_index_columns.is_superset(&columns_requested))
 }
@@ -92,33 +77,6 @@ pub(super) fn search_index_filters(
             search_index_columns.is_superset(&filter_columns)
         })
         .cloned()
-        .collect()
-}
-
-// Returns a new projection without `columns` in the projection.
-//
-// The order of `table_fields` must be consistent with projection.
-fn projection_without_columns(
-    table_fields: &Fields,
-    columns: &[String],
-    projection: Option<&Vec<usize>>,
-) -> Vec<usize> {
-    table_fields
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| {
-            if columns.contains(f.name()) {
-                return None;
-            }
-
-            // Don't include if not in projection input.
-            if let Some(p) = projection.as_ref() {
-                if !p.contains(&i) {
-                    return None;
-                }
-            }
-            Some(i)
-        })
         .collect()
 }
 

@@ -53,9 +53,6 @@ use std::{
     sync::{Arc, Weak},
 };
 
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
-
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
@@ -277,15 +274,19 @@ impl VectorSearchTableFunc {
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         // TODO: we might actually not want to recurse over accelerated table here.
 
+        use search::{index::SearchIndex, provider::SearchQueryProvider};
+
         use crate::embeddings::index::s3::S3Vector;
         let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(tbl) else {
             return Ok(None);
         };
         let mut vector_indexes = indexed.get_indexes::<S3Vector>();
         let vector_index_opt = if let Some(col) = &args.column {
+            use search::index::SearchIndex;
+
             vector_indexes
                 .into_iter()
-                .find(|idx| *idx.embedded_column() == *col)
+                .find(|idx| *idx.search_column() == *col)
         } else {
             if vector_indexes.len() > 1 {
                 return Err(DataFusionError::Internal(format!(
@@ -299,10 +300,12 @@ impl VectorSearchTableFunc {
         let Some(vector_index) = vector_index_opt else {
             return Ok(None);
         };
-        Ok(Some(Arc::new(VectorQueryTableProvider {
+
+        let search_index = Arc::new(vector_index.clone()) as Arc<dyn SearchIndex>;
+        Ok(Some(Arc::new(SearchQueryProvider {
             query: args.query.clone(),
-            table_provider: Arc::clone(tbl),
-            vector_index: Arc::new(vector_index.clone()),
+            table_provider: indexed,
+            search_index,
             pre_limit: args.limit,
         })))
     }

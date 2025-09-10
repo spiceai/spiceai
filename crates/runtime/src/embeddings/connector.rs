@@ -201,7 +201,7 @@ impl EmbeddingConnector {
                     use runtime_datafusion_index::Index;
                     use search::index::SearchIndex;
 
-                    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
+                    use crate::embeddings::index::VectorScanTableProvider;
 
                     let vector_index = super::index::s3::try_from_dataset(
                         &dataset.name,

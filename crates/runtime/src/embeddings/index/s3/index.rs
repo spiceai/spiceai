@@ -24,16 +24,16 @@ use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
-use search::metadata::{MetadataColumn, MetadataColumns};
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use search::SEARCH_SCORE_COLUMN_NAME;
+use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
 use crate::{
     embedding_col,
-    embeddings::index::{SearchIndex, query_table::metadata_columns_to_exprs, s3::write},
+    embeddings::index::{SearchIndex, s3::write},
     model::EmbeddingModelStore,
 };
 use datafusion::{
@@ -82,22 +82,24 @@ impl S3Vector {
         primary_key: Vec<Field>,
         metadata_columns: MetadataColumns,
         model_name: String,
+        dimension: usize,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
         // Build complete metadata columns including the embedding column as non-filterable
-        let mut complete_columns: Vec<MetadataColumn> = metadata_columns.clone().into_iter().collect();
-        
+        let mut complete_columns: Vec<MetadataColumn> =
+            metadata_columns.clone().into_iter().collect();
+
         // Add the embedding column as non-filterable metadata
         let embedding_field = Arc::new(Field::new(
             embedding_col!(embedded_column),
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, false)),
-                1536, // Default embedding dimension, could be made configurable
+                dimension as i32,
             ),
             false,
         ));
         complete_columns.push(MetadataColumn::NonFilterable(embedding_field));
-        
+
         let complete_metadata_columns = MetadataColumns::from(complete_columns);
 
         Self {
@@ -159,21 +161,23 @@ impl SearchIndex for S3Vector {
     fn list_table_provider(
         &self,
     ) -> Result<Option<Arc<dyn TableProvider>>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut projection = metadata_columns_to_exprs(&self.base_metadata_columns);
+        let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
         projection.push(Expr::Alias(Alias::new(
             Expr::Column(datafusion::common::Column::new_unqualified(
                 S3_VECTOR_EMBEDDING_NAME,
             )),
             None::<TableReference>,
-            embedding_col!(self.embedded_column()),
+            embedding_col!(self.search_column()),
         )));
 
-        Ok(Some(table_with_projection(
-            Arc::new(S3VectorsListTable::from(self.table.clone())),
-            projection,
-        )?))
-        .map_err(|e| e.into())
+        Ok(Some(
+            table_with_projection(
+                Arc::new(S3VectorsListTable::from(self.table.clone())),
+                projection,
+            )
+            .boxed()?,
+        ))
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
@@ -196,7 +200,7 @@ impl SearchIndex for S3Vector {
             Expr::Alias(Alias::new(
                 Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
                 None::<TableReference>,
-                embedding_col!(self.embedded_column()),
+                embedding_col!(self.search_column()),
             )),
             Expr::Alias(Alias::new(
                 Expr::BinaryExpr(BinaryExpr::new(
@@ -219,6 +223,15 @@ impl SearchIndex for S3Vector {
     }
 }
 
+/// Convert a [`MetadataColumns`] into a set of [`Expr`]s suitable for a projection.
+#[must_use]
+pub(super) fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
+    metadata_columns
+        .iter()
+        .map(|c| Expr::Column(Column::new_unqualified(c.name())))
+        .collect()
+}
+
 #[async_trait]
 impl Index for S3Vector {
     fn name(&self) -> &'static str {
@@ -237,7 +250,11 @@ impl Index for S3Vector {
             .cloned()
             .collect();
         pks.push(self.embedded_column.clone());
-        pks.extend(self.base_metadata_columns.iter().map(|c| c.name().to_string()));
+        pks.extend(
+            self.base_metadata_columns
+                .iter()
+                .map(|c| c.name().to_string()),
+        );
 
         pks
     }

@@ -16,10 +16,10 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::metadata::MetadataColumns;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use crate::metadata::MetadataColumns;
 use datafusion::catalog::TableProvider;
 
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
@@ -29,7 +29,7 @@ use datafusion::catalog::TableProvider;
 /// [`SearchIndex::query_table_provider`], or to reduce the need for joining the [`TableProvider`]s
 ///  of the search index and underlying table.
 #[async_trait]
-pub trait SearchIndex: std::fmt::Debug + Send + Sync {
+pub trait SearchIndex: std::fmt::Debug + Send + Sync + 'static {
     /// The name of the column, in the underlying table, of the column for which search is performed against.
     /// For vector indexes, this is the column that gets embedded. For FTS indexes, this is the text column being searched.
     fn search_column(&self) -> String;
@@ -43,7 +43,7 @@ pub trait SearchIndex: std::fmt::Debug + Send + Sync {
     ///
     /// For vector indexes: Returns a table with embedding vectors and metadata columns.
     /// For FTS indexes: Returns `None` since no additional columns are needed (avoids unnecessary joins).
-    /// 
+    ///
     /// If `None`, query providers should avoid joins with the underlying table for list operations.
     fn list_table_provider(
         &self,
