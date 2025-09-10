@@ -277,8 +277,6 @@ jobs:
       - name: Verify artifacts
         run: |
           ls -l /tmp
-          ls -l /tmp/images-amd64
-          ls -l /tmp/images-arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -318,10 +316,10 @@ jobs:
 
             # Load both architecture images
             echo "Loading AMD64 image"
-            docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
+            docker load -i /tmp/image-amd64-${variant}.tar
 
             echo "Loading ARM64 image"
-            docker load -i /tmp/images-arm64/image-arm64-${variant}.tar
+            docker load -i /tmp/image-arm64-${variant}.tar
 
             # Push images to local registry
             echo "Pushing images to local registry"
@@ -375,7 +373,7 @@ jobs:
 
       - name: Verify artifacts
         run: |
-          ls -l /tmp/images-amd64-cuda
+          ls -l /tmp
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -406,7 +404,7 @@ jobs:
         run: |
           echo "Handling CUDA models..."
 
-          docker load -i /tmp/images-amd64-cuda/images-amd64-cuda.tar
+          docker load -i /tmp/images-amd64-cuda.tar
           docker push localhost:5000/spiceai:models-cuda-amd64
 
           if [[ "${PUBLISH}" == "true" ]]; then
