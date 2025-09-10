@@ -258,6 +258,10 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![false]
     }
 
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true; self.children().len()]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -388,8 +392,6 @@ mod tests {
            │          rows: 1          │
            └───────────────────────────┘
         */
-
-        // println!("{}", displayable(&final_plan).tree_render());
 
         // Optimizer is a bag of rules
         let optimizer = PhysicalOptimizer::new();
