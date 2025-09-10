@@ -309,3 +309,106 @@ impl ExecutionPlan for BytesProcessedExec {
         Ok(Box::pin(stream_adapter))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::datafusion::extension::bytes_processed::BytesProcessedExec;
+    use crate::{Runtime, RuntimeBuilder};
+    use arrow::array::Int64Array;
+    use arrow::record_batch::RecordBatch;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::MemTable;
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::Result;
+    use datafusion::physical_expr::expressions::col as physical_col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::physical_plan::{ExecutionPlan, displayable};
+    use rand::rng;
+    use rand::seq::SliceRandom;
+    use std::sync::Arc;
+
+    fn make_test_table() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let mut ids = (0i64..10000).into_iter().collect::<Vec<_>>();
+        ids.shuffle(&mut rng());
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(ids.into_iter()))],
+        )
+        .expect("Must make fixture batch");
+
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("Must make memtable"))
+    }
+
+    #[tokio::test]
+    async fn test_preserve_order_pushdown() -> Result<()> {
+        let runtime: Runtime = RuntimeBuilder::new().build().await;
+        let test_table = make_test_table();
+
+        let data_source_exec = test_table
+            .scan(&runtime.df.ctx.state(), None, &[], None)
+            .await?;
+
+        let sort_exec = SortExec::new(
+            LexOrdering::new(vec![
+                PhysicalSortExpr::new_default(physical_col(
+                    "id",
+                    data_source_exec.schema().as_ref(),
+                )?)
+                .desc()
+                .nulls_last(),
+            ]),
+            data_source_exec,
+        );
+
+        let final_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(BytesProcessedExec::new(Arc::new(sort_exec)));
+
+        /*
+           At this point `final_plan` is:
+           ┌───────────────────────────┐
+           │     BytesProcessedExec    │
+           │    --------------------   │
+           │     BytesProcessedExec    │
+           └─────────────┬─────────────┘
+           ┌─────────────┴─────────────┐
+           │          SortExec         │
+           │    --------------------   │
+           │    id@0 DESC NULLS LAST   │
+           └─────────────┬─────────────┘
+           ┌─────────────┴─────────────┐
+           │       DataSourceExec      │
+           │    --------------------   │
+           │        bytes: 80096       │
+           │       format: memory      │
+           │          rows: 1          │
+           └───────────────────────────┘
+        */
+
+        // println!("{}", displayable(&final_plan).tree_render());
+
+        // Optimizer is a bag of rules
+        let optimizer = PhysicalOptimizer::new();
+        let config = runtime.df.ctx.state().config_options().clone();
+
+        // Fold over the default rules to apply the same optimizations DF would at runtime
+        let optimized = optimizer
+            .rules
+            .iter()
+            .fold(Arc::clone(&final_plan), |plan, rule| {
+                rule.optimize(plan, &config).unwrap()
+            });
+
+        // No semantic eq implemented, so this is the easiest way to compare plans
+        assert_eq!(
+            displayable(final_plan.as_ref()).tree_render().to_string(),
+            displayable(optimized.as_ref()).tree_render().to_string()
+        );
+
+        Ok(())
+    }
+}
