@@ -167,6 +167,7 @@ impl Catalog for RestCatalog {
 #[cfg(test)]
 mod tests {
     use datafusion::prelude::SessionContext;
+    use iceberg::CatalogBuilder;
     use iceberg_catalog_rest::RestCatalogBuilder;
     use iceberg_datafusion::IcebergTableProvider;
     use std::sync::Arc;
