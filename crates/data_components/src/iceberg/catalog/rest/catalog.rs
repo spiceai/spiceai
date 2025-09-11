@@ -23,7 +23,7 @@ use iceberg::{
     Catalog, Error as IcebergError, ErrorKind, Namespace, NamespaceIdent, Result as IcebergResult,
     TableCommit, TableCreation, TableIdent, io::CustomAwsCredentialLoader, table::Table,
 };
-use iceberg_catalog_rest::{RestCatalog as IcebergRestCatalog, RestCatalogConfig};
+use iceberg_catalog_rest::RestCatalog as IcebergRestCatalog;
 
 #[derive(Debug)]
 pub struct RestCatalog {
@@ -32,11 +32,8 @@ pub struct RestCatalog {
 
 impl RestCatalog {
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
-    pub fn new(catalog_config: RestCatalogConfig) -> Self {
-        Self {
-            inner: IcebergRestCatalog::new(catalog_config),
-        }
+    pub fn new(inner: IcebergRestCatalog) -> Self {
+        Self { inner }
     }
 
     #[must_use]
@@ -52,6 +49,15 @@ impl RestCatalog {
 
 #[async_trait]
 impl Catalog for RestCatalog {
+    /// Register an existing table to the catalog.
+    async fn register_table(
+        &self,
+        table: &TableIdent,
+        metadata_location: String,
+    ) -> IcebergResult<Table> {
+        self.inner.register_table(table, metadata_location).await
+    }
+
     /// List namespaces inside the catalog.
     async fn list_namespaces(
         &self,
@@ -161,6 +167,7 @@ impl Catalog for RestCatalog {
 #[cfg(test)]
 mod tests {
     use datafusion::prelude::SessionContext;
+    use iceberg_catalog_rest::RestCatalogBuilder;
     use iceberg_datafusion::IcebergTableProvider;
     use std::sync::Arc;
 
@@ -176,18 +183,22 @@ mod tests {
     #[ignore = "requires local minio and spark cluster"]
     async fn test_rest_catalog() {
         let catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri("http://localhost:8181".to_string())
-                .props(HashMap::from([
-                    (
-                        "s3.endpoint".to_string(),
-                        "http://localhost:9000".to_string(),
-                    ),
-                    ("s3.access-key-id".to_string(), "admin".to_string()),
-                    ("s3.secret-access-key".to_string(), "password".to_string()),
-                    ("s3.region".to_string(), "us-east-1".to_string()),
-                ]))
-                .build(),
+            RestCatalogBuilder::default()
+                .load(
+                    "rest",
+                    HashMap::from([
+                        ("uri".to_string(), "http://localhost:8181".to_string()),
+                        (
+                            "s3.endpoint".to_string(),
+                            "http://localhost:9000".to_string(),
+                        ),
+                        ("s3.access-key-id".to_string(), "admin".to_string()),
+                        ("s3.secret-access-key".to_string(), "password".to_string()),
+                        ("s3.region".to_string(), "us-east-1".to_string()),
+                    ]),
+                )
+                .await
+                .expect("valid catalog"),
         );
 
         let namespaces = catalog.list_namespaces(None).await;
