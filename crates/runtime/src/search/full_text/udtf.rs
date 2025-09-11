@@ -45,8 +45,7 @@ use datafusion::{
 };
 use runtime_datafusion_index::IndexedTableProvider;
 use search::{
-    generation::text_search::{index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider},
-    index::SearchIndex,
+    generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
     provider::SearchQueryProvider,
 };
 

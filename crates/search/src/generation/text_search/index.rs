@@ -17,7 +17,7 @@ limitations under the License.
 use std::cmp::min;
 use std::{any::Any, collections::HashSet, sync::Arc};
 
-use crate::metadata::MetadataColumns;
+use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
 use async_trait::async_trait;
@@ -122,14 +122,41 @@ impl FullTextDatabaseIndex {
         }
 
         let index = Self::create_index(&inner, search_fields.as_slice(), pks.as_slice())?;
-
+        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks).await;
         Ok(Self {
             base_table: inner,
             search_fields,
             index,
             primary_key: pks,
-            metadata_columns: MetadataColumns::none(), // FTS doesn't have additional metadata columns
+            metadata_columns,
         })
+    }
+
+    /// Get all [`Field`]s in Tantivy [`tantivy::Index`] that are in base table, and not primary keys.
+    /// These are non-filterable [`MetadataColumn`]s, since we can retrieve the data
+    /// from the [`tantivy::Index`] without access to the base [`TableProvider`].
+    async fn derive_metadata_columns(
+        base_table: &Arc<dyn TableProvider>,
+        index: &Arc<RwLock<tantivy::Index>>,
+        primary_key: &[String],
+    ) -> MetadataColumns {
+        let index = &*index.read().await;
+        let base_schema = base_table.schema();
+
+        index
+            .schema()
+            .fields()
+            .filter_map(|(_, fe)| {
+                let name = fe.name();
+                if primary_key.contains(&name.to_string()) {
+                    return None;
+                };
+
+                let (_, f) = base_schema.column_with_name(name)?;
+                Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
 
     pub async fn full_text_search_field_index(

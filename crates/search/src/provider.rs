@@ -307,6 +307,11 @@ impl TableProvider for SearchQueryProvider {
             ));
         }
 
+        let primary_key_projection: Vec<usize> = primary_key_fields
+            .iter()
+            .filter_map(|f| self.schema().index_of(f.name()).ok())
+            .collect();
+
         let search_index_table = self.search_index_table(filters).await?;
 
         // Check if search index alone is sufficient
@@ -319,9 +324,21 @@ impl TableProvider for SearchQueryProvider {
                     search_index_table
                 }
             } else {
+                // Ensure primary keys are retrieved from underlying table.
+                let table_proj: Option<Vec<_>> = projection.map(|proj| {
+                    let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
+                    for pp in primary_key_projection {
+                        p.insert(pp);
+                    }
+                    p.into_iter().collect()
+                });
+
                 // Need to join with base table
-                let underlying_table_scan =
-                    self.underlying_table_scan(projection, filters, &self.all_metadata_columns())?;
+                let underlying_table_scan = self.underlying_table_scan(
+                    table_proj.as_ref(),
+                    filters,
+                    &self.all_metadata_columns(),
+                )?;
 
                 // Build join conditions based on primary keys
                 let join_conditions: Vec<(Column, Column)> = self
