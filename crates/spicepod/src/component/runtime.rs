@@ -82,7 +82,7 @@ pub struct Runtime {
     /// Configures log level for the runtime. Can be overriden if flags or environment variables
     /// are set to higher verbosity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_level: Option<LogLevel>,
+    pub output_level: Option<OutputLevel>,
 }
 
 impl Runtime {
@@ -386,7 +386,7 @@ impl AsRef<str> for ApiKey {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum LogLevel {
+pub enum OutputLevel {
     #[default]
     Info,
     Verbose,

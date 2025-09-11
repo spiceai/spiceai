@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{borrow::Cow, sync::Arc};
 
-use app::spicepod::component::runtime::LogLevel;
+use app::spicepod::component::runtime::OutputLevel;
 use app::{App, spicepod::component::runtime::TracingConfig};
 use futures::future::BoxFuture;
 use opentelemetry::InstrumentationScope;
@@ -43,13 +43,13 @@ impl LogVerbosity {
         verbose: bool,
         very_verbose: bool,
         env_var: &str,
-        config_log_level: Option<LogLevel>,
+        config_output_level: Option<OutputLevel>,
     ) -> Self {
-        if very_verbose || config_log_level == Some(LogLevel::VeryVerbose) {
+        if very_verbose || config_output_level == Some(OutputLevel::VeryVerbose) {
             return LogVerbosity::VeryVerbose;
         }
 
-        if verbose || config_log_level == Some(LogLevel::Verbose) {
+        if verbose || config_output_level == Some(OutputLevel::Verbose) {
             return LogVerbosity::Verbose;
         }
 
