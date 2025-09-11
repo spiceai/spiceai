@@ -20,7 +20,6 @@ on:
           - 'arm64'
           - 'cuda'
         default: 'all'
-
 jobs:
   setup:
     runs-on: ubuntu-latest

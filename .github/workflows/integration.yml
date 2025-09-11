@@ -166,7 +166,7 @@ jobs:
       - name: Set up Spice.ai API Key
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
-      
+
       - name: Set up Github Token
         uses: actions/create-github-app-token@v2
         id: github-app-token
