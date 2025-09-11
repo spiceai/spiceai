@@ -1,0 +1,27 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "dataformat-iceberg"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+datafusion.workspace = true
+datafusion-datasource.workspace = true
+data_components = { path = "../data_components" }
+object_store.workspace = true
+url.workspace = true
+snafu.workspace = true
+tracing.workspace = true
+iceberg.workspace = true
+iceberg-catalog-glue.workspace = true
+iceberg-catalog-rest.workspace = true
+iceberg-datafusion.workspace = true

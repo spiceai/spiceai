@@ -45,6 +45,8 @@ pub struct IcebergCatalogProvider {
     /// and values are dynamic references to objects implementing the
     /// [`SchemaProvider`] trait.
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+
+    pub client: Arc<dyn Catalog>,
 }
 
 impl IcebergCatalogProvider {
@@ -114,7 +116,7 @@ impl IcebergCatalogProvider {
             })
             .collect();
 
-        Ok(IcebergCatalogProvider { schemas })
+        Ok(IcebergCatalogProvider { schemas, client })
     }
 }
 

@@ -177,18 +177,18 @@ impl Query {
                 }
             };
 
-            if let Err(e) =
-                RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
-            {
-                let e = find_datafusion_root(e);
-                handle_error!(
-                    tracker,
-                    &request_context,
-                    ErrorCode::QueryPlanningError,
-                    e,
-                    UnableToExecuteQuery
-                )
-            }
+            // if let Err(e) =
+            //     RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
+            // {
+            //     let e = find_datafusion_root(e);
+            //     handle_error!(
+            //         tracker,
+            //         &request_context,
+            //         ErrorCode::QueryPlanningError,
+            //         e,
+            //         UnableToExecuteQuery
+            //     )
+            // }
 
             let input_tables = get_logical_plan_input_tables(&plan);
             if input_tables

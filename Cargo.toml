@@ -8,6 +8,7 @@ members = [
     "crates/aws-sdk-credential-bridge",
     "crates/data_components",
     "crates/dataformat-json",
+    "crates/dataformat-iceberg",
     "crates/document_parse",
     "crates/event_stream",
     "crates/flight_client",
@@ -242,11 +243,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "27146af615b65bd838051503fb27646638bd5f5f" }              # phillip/250911-poc-writing
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "27146af615b65bd838051503fb27646638bd5f5f" } # phillip/250911-poc-writing
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "27146af615b65bd838051503fb27646638bd5f5f" } # phillip/250911-poc-writing
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "27146af615b65bd838051503fb27646638bd5f5f" }   # phillip/250911-poc-writing
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "27146af615b65bd838051503fb27646638bd5f5f" }   # phillip/250911-poc-writing
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" }              # phillip/250911-poc-writing
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" } # phillip/250911-poc-writing
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" } # phillip/250911-poc-writing
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" }   # phillip/250911-poc-writing
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" }   # phillip/250911-poc-writing
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 

@@ -164,6 +164,8 @@ impl DataFusionBuilder {
             .with_analyzer_rules(get_analyzer_rules())
             .build();
 
+        state.register_file_format()
+
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
         }
