@@ -78,6 +78,11 @@ pub struct Runtime {
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout: Option<String>,
+
+    /// Configures log level for the runtime. Can be overriden if flags or environment variables
+    /// are set to higher verbosity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<LogLevel>,
 }
 
 impl Runtime {
@@ -376,6 +381,16 @@ impl AsRef<str> for ApiKey {
             ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.as_str(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    #[default]
+    Info,
+    Verbose,
+    VeryVerbose,
 }
 
 #[cfg(test)]

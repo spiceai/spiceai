@@ -238,10 +238,11 @@ pub async fn run(args: Args) -> Result<()> {
         app.as_ref(),
         tracing_config.as_ref(),
         rt.datafusion(),
-        LogVerbosity::from_flags_and_env(
+        LogVerbosity::from_flags_and_env_and_config(
             args.verbose == 1,                      // -v or --verbose
             args.verbose >= 2 || args.very_verbose, // -vv or --very-verbose
             "SPICED_LOG",
+            app.and_then(|a| a.runtime.log_level),
         ),
     )
     .await
