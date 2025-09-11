@@ -84,6 +84,7 @@ impl IndexedTableProvider {
         Arc::clone(&self.underlying)
     }
 
+    #[must_use]
     pub fn get_underlying_ref(&self) -> &Arc<dyn TableProvider> {
         &self.underlying
     }
