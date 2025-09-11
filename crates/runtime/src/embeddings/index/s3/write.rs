@@ -27,6 +27,7 @@ use runtime_datafusion_index::Index;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
+use util::distribute_nulls;
 
 use crate::{
     convert_string_arrow_to_iterator, embedding_col,

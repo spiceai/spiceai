@@ -160,19 +160,17 @@ pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
 
 /// Create a new array which is `None` at each `null_idxs`. Each element in `data` is in the new
 /// array in its provided order.
-fn distribute_nulls<T: Clone>(data: Vec<T>, null_idxs: Vec<usize>) -> Vec<Option<T>> {
-    let mut result: Vec<Option<T>> = vec![];
-    let mut value_ptr = 0;
-    let mut null_ptr = 0;
+pub fn distribute_nulls<T>(data: Vec<T>, null_idxs: Vec<usize>) -> Vec<Option<T>> {
+    let total_len = data.len() + null_idxs.len();
+    let mut result = Vec::with_capacity(total_len);
+    let null_set: std::collections::HashSet<usize> = null_idxs.into_iter().collect();
+    let mut data_iter = data.into_iter();
 
-    while value_ptr < data.len() || null_ptr < null_idxs.len() {
-        while null_ptr < null_idxs.len() && null_idxs[null_ptr] == result.len() {
+    for i in 0..total_len {
+        if null_set.contains(&i) {
             result.push(None);
-            null_ptr += 1;
-        }
-        if value_ptr < data.len() {
-            result.push(Some(data[value_ptr].clone()));
-            value_ptr += 1;
+        } else if let Some(value) = data_iter.next() {
+            result.push(Some(value));
         }
     }
 
