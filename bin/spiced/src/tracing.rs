@@ -45,11 +45,11 @@ impl LogVerbosity {
         env_var: &str,
         config_output_level: Option<OutputLevel>,
     ) -> Self {
-        if very_verbose || config_output_level == Some(OutputLevel::VeryVerbose) {
+
+        if very_verbose {
             return LogVerbosity::VeryVerbose;
         }
-
-        if verbose || config_output_level == Some(OutputLevel::Verbose) {
+        if verbose {
             return LogVerbosity::Verbose;
         }
 
@@ -57,7 +57,11 @@ impl LogVerbosity {
             return LogVerbosity::Specific(filter);
         }
 
-        LogVerbosity::Default
+        match config_output_level {
+            Some(OutputLevel::VeryVerbose) => LogVerbosity::VeryVerbose,
+            Some(OutputLevel::Verbose) => LogVerbosity::Verbose,
+            None | Some(OutputLevel::Info) => LogVerbosity::Default,
+        }
     }
 }
 
