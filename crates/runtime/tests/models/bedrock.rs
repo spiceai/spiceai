@@ -333,7 +333,7 @@ pub(crate) mod embeddings {
     // Bedrock edge case tests should pass: HTTP status server error (500 Internal Server Error) for url (http://127.0.0.1:50488/v1/embeddings)
     // note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
     // https://github.com/spiceai/spiceai/issues/6479
-    #[ignore]
+    #[ignore = "bug issue"]
     async fn bedrock_test_bedrock_edge_cases() {
         let model: Embeddings = create_titan_v1_embedding();
         let tests = vec![

@@ -49,7 +49,6 @@ use super::{
     SPICE_RUNTIME_SCHEMA,
     extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
     schema::SpiceSchemaProvider,
-    udf::register_udfs,
 };
 
 pub struct DataFusionBuilder {
@@ -171,7 +170,7 @@ impl DataFusionBuilder {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
-        register_udfs(&ctx);
+
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();

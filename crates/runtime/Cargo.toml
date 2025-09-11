@@ -165,6 +165,7 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
 tract-core = "0.21.10"
+twox-hash = { workspace = true, optional = true }
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
@@ -187,7 +188,7 @@ bollard = "0.18.1"
 dirs = "5.0.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
-insta = { workspace = true, features = ["json"] }
+insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
@@ -264,6 +265,7 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
+xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

@@ -16,11 +16,8 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider, SimpleCache, lru_cache};
-use datafusion::logical_expr::LogicalPlan;
-use spicepod::component::caching::{
-    CacheConfig, Caching as CachingConfig, HashingAlgorithm, SQLResultsCacheConfig,
-};
+use cache::{Caching, QueryResultsCacheProvider, SimpleCache, get_hash_builder, lru_cache};
+use spicepod::component::caching::{CacheConfig, Caching as CachingConfig, SQLResultsCacheConfig};
 use util::in_tracing_context;
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
@@ -64,22 +61,21 @@ impl Runtime {
             }
         }
 
-        // TODO: logical plan cache needs its own configuration?
-        let plan_cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync> =
-            match sql_results_config.hashing_algorithm {
-                HashingAlgorithm::Siphash => Arc::new(SimpleCache::new(
+        match get_hash_builder(sql_results_config.hashing_algorithm) {
+            Ok(hash_builder) => {
+                let plans_cache_provider = Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
-                    std::hash::RandomState::default(),
-                )),
-                HashingAlgorithm::Ahash => Arc::new(SimpleCache::new(
-                    DEFAULT_CACHED_PLANS_MAX_CAPACITY,
-                    Duration::from_secs(3600),
-                    ahash::RandomState::default(),
-                )),
-            };
-
-        caching = caching.with_plans_cache(plan_cache_provider);
+                    hash_builder,
+                ));
+                caching = caching.with_plans_cache(plans_cache_provider);
+            }
+            Err(e) => {
+                in_tracing_context(|| {
+                    tracing::error!("Failed to initialize plans cache: {e}");
+                });
+            }
+        }
 
         if search_results_config.enabled {
             match lru_cache::build_from_config(&search_results_config) {
