@@ -242,7 +242,7 @@ pub async fn run(args: Args) -> Result<()> {
             args.verbose == 1,                      // -v or --verbose
             args.verbose >= 2 || args.very_verbose, // -vv or --very-verbose
             "SPICED_LOG",
-            app.as_ref().and_then(|a| a.runtime.log_level),
+            app.as_ref().and_then(|a| a.runtime.output_level),
         ),
     )
     .await
