@@ -295,6 +295,15 @@ async fn query_vector_stream(
     let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
     let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
 
+    let combined_span = info_span!(
+        target: "task_history",
+        "s3_vector_query_and_get",
+        bucket_name = bucket_name,
+        index_name = index_name,
+        arn = arn,
+        top_k = limit
+    );
+
     let QueryVectorsOutput {
         vectors: mut query_vectors,
         ..
@@ -321,6 +330,7 @@ async fn query_vector_stream(
             arn = arn,
             top_k = limit
         ))
+        .instrument(combined_span.clone())
         .await
         .map_err(|e| {
             if let SdkError::ServiceError(service_error) = &e {
@@ -378,6 +388,7 @@ async fn query_vector_stream(
             index_name = index_name,
             arn = arn,
         ))
+        .instrument(combined_span)
         .await
         .map_err(|e| {
             DataFusionError::External(
