@@ -273,6 +273,7 @@ jobs:
         with:
           path: /tmp
           pattern: images-*
+          merge-multiple: true
 
       - name: Verify artifacts
         run: |
