@@ -158,9 +158,32 @@ pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
         .map(|s| format!("{s}"))
 }
 
+/// Create a new array which is `None` at each `null_idxs`. Each element in `data` is in the new
+/// array in its provided order.
+fn distribute_nulls<T: Clone>(data: Vec<T>, null_idxs: Vec<usize>) -> Vec<Option<T>> {
+    let mut result: Vec<Option<T>> = vec![];
+    let mut value_ptr = 0;
+    let mut null_ptr = 0;
+
+    while value_ptr < data.len() || null_ptr < null_idxs.len() {
+        while null_ptr < null_idxs.len() && null_idxs[null_ptr] == result.len() {
+            result.push(None);
+            null_ptr += 1;
+        }
+        if value_ptr < data.len() {
+            result.push(Some(data[value_ptr].clone()));
+            value_ptr += 1;
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     // generate test for human_readable_bytes
+
+    use crate::distribute_nulls;
 
     #[test]
     fn test_human_readable_bytes() {
@@ -178,5 +201,114 @@ mod tests {
         assert_eq!(super::pretty_print_number(123), "123");
         assert_eq!(super::pretty_print_number(1023), "1,023");
         assert_eq!(super::pretty_print_number(10_231_024), "10,231,024");
+    }
+
+    #[test]
+    fn test_distribute_nulls_empty_data_empty_nulls() {
+        assert_eq!(distribute_nulls(vec![], vec![]), Vec::<Option<i32>>::new());
+    }
+
+    #[test]
+    fn test_distribute_nulls_empty_data_with_nulls() {
+        assert_eq!(
+            distribute_nulls(Vec::<i32>::new(), vec![0, 1, 2]),
+            vec![None, None, None]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_data_no_nulls() {
+        assert_eq!(
+            distribute_nulls(vec![1, 2, 3], vec![]),
+            vec![Some(1), Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_nulls_at_beginning() {
+        assert_eq!(
+            distribute_nulls(vec![1, 2, 3], vec![0, 1]),
+            vec![None, None, Some(1), Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_nulls_at_end() {
+        assert_eq!(
+            distribute_nulls(vec![1, 2, 3], vec![3, 4]),
+            vec![Some(1), Some(2), Some(3), None, None]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_nulls_interspersed() {
+        assert_eq!(
+            distribute_nulls(vec![1, 2, 3], vec![0, 2, 4]),
+            vec![None, Some(1), None, Some(2), None, Some(3)]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_consecutive_nulls() {
+        assert_eq!(
+            distribute_nulls(vec![1, 2], vec![1, 2, 3]),
+            vec![Some(1), None, None, None, Some(2)]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_all_nulls() {
+        assert_eq!(
+            distribute_nulls(Vec::<i32>::new(), vec![0, 1, 2, 3, 4]),
+            vec![None, None, None, None, None]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_single_value_single_null() {
+        assert_eq!(distribute_nulls(vec![42], vec![0]), vec![None, Some(42)]);
+    }
+
+    #[test]
+    fn test_distribute_nulls_single_value_no_null() {
+        assert_eq!(distribute_nulls(vec![42], vec![]), vec![Some(42)]);
+    }
+
+    #[test]
+    fn test_distribute_nulls_with_strings() {
+        assert_eq!(
+            distribute_nulls(vec!["hello".to_string(), "world".to_string()], vec![1, 3]),
+            vec![
+                Some("hello".to_string()),
+                None,
+                Some("world".to_string()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_with_vectors() {
+        assert_eq!(
+            distribute_nulls(
+                vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]],
+                vec![0, 2]
+            ),
+            vec![
+                None,
+                Some(vec![1.0, 2.0]),
+                None,
+                Some(vec![3.0, 4.0]),
+                Some(vec![5.0, 6.0])
+            ]
+        );
+    }
+
+    #[test]
+    fn test_distribute_nulls_null_indices_unordered() {
+        assert_eq!(
+            distribute_nulls(vec![1, 2], vec![3, 0, 1]),
+            vec![None, None, Some(1), None, Some(2)]
+        );
     }
 }

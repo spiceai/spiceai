@@ -710,7 +710,6 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     .await
 }
 
-// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_text_search() -> Result<(), anyhow::Error> {
@@ -771,6 +770,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
             ),
+            // This one is failing :(
             SearchTestCase::new(
                 "text_search_sql_text_search_projection",
                 SearchTestType::Sql(
