@@ -582,12 +582,7 @@ mod search {
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
         configure_test_datafusion();
-        let rt = Arc::new(
-            Runtime::builder()
-                .with_app(app)
-                .build()
-                .await,
-        );
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

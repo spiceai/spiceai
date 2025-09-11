@@ -40,20 +40,11 @@ pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
 fn configure_test_datafusion() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => {
-            config
-                .options_mut()
-                .execution
-                .target_partitions = 3;
+            config.options_mut().execution.target_partitions = 3;
 
-            config
-                .options_mut()
-                .execution
-                .coalesce_batches = false;
+            config.options_mut().execution.coalesce_batches = false;
 
-            config
-                .options_mut()
-                .optimizer
-                .repartition_joins = false;
+            config.options_mut().optimizer.repartition_joins = false;
         }
         _ => panic!("Must obtain write lock to defaults"),
     }
