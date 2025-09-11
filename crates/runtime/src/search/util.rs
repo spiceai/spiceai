@@ -89,7 +89,8 @@ pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
         if !indexes.is_empty() {
             return Some(indexes);
         }
-        indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(&z.underlying);
+        indexed_table_opt =
+            find_concrete_table_provider::<IndexedTableProvider>(&indexed_table_opt.underlying);
     }
     None
 }

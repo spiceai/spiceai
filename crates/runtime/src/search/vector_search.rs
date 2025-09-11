@@ -89,9 +89,10 @@ impl VectorSearch {
     ) -> Option<Arc<dyn Embed>> {
         #[cfg(feature = "s3_vectors")]
         {
-            use crate::embeddings::index::s3::S3Vector;
-            let index = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
-            for s3v in index.get_indexes::<S3Vector>() {
+            use crate::{
+                embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider,
+            };
+            for s3v in find_index_in_table_provider::<S3Vector>(tbl)? {
                 if s3v.embedded_column == embedding_column {
                     return s3v.embedding_model().await;
                 }
