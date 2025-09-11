@@ -346,7 +346,6 @@ impl FullTextDatabaseIndex {
 impl SearchIndex for FullTextDatabaseIndex {
     fn search_column(&self) -> String {
         // For FTS, return the first search field as the primary search column
-        // In the future, this could be made more sophisticated to support multiple fields
         self.search_fields.first().cloned().unwrap_or_default()
     }
 
@@ -396,7 +395,7 @@ impl SearchIndex for FullTextDatabaseIndex {
         Ok(Arc::new(FullTextSearchQuery {
             index: field_index,
             query: query.to_string(),
-            pre_limit: None, // No pre-limit by default
+            pre_limit: None,
         }))
     }
 }
