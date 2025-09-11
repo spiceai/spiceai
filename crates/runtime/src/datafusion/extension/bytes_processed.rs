@@ -79,7 +79,6 @@ impl Stream for BytesProcessedStream {
                 self.bytes_processed += batch.get_array_memory_size() as u64;
                 Poll::Ready(Some(Ok(batch)))
             }
-            error @ Poll::Ready(Some(Err(_))) => error,
             Poll::Ready(None) => {
                 self.emit_bytes_processed();
                 Poll::Ready(None)
@@ -369,7 +368,6 @@ mod tests {
     }
 
     #[allow(clippy::similar_names)]
-    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
         let runtime: Runtime = RuntimeBuilder::new().build().await;
@@ -424,7 +422,7 @@ mod tests {
             .rules
             .iter()
             .fold(Arc::clone(&final_plan), |plan, rule| {
-                rule.optimize(plan, &config).unwrap()
+                rule.optimize(plan, &config).expect("Must optimize plan")
             });
 
         // No semantic eq implemented, so this is the easiest way to compare plans
