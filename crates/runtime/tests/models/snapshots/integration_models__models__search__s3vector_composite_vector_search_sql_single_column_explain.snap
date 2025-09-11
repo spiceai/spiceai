@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
-snapshot_kind: text
 ---
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                              |
@@ -17,23 +16,16 @@ snapshot_kind: text
 |               |       ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as trunc(vector_search(qs, Utf8("second")).score,Int64(3)), score@2 as score]                                       |
 |               |         BytesProcessedExec                                                                                                                                                                        |
 |               |           ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                                                                                                 |
-|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                                                           |
-|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                                         |
-|               |                 HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0), (question@1, question@1)], projection=[id@0, score@2, answer@5]                                                 |
-|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                     |
-|               |                     RepartitionExec: partitioning=Hash([id@0, question@1], 10), input_partitions=10                                                                                               |
-|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                                 |
-|               |                         BytesProcessedExec                                                                                                                                                        |
-|               |                           ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, union_extract(json_get(key@0, question), str) as question, 1 - distance@1 as score]                |
-|               |                             RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                                                                                 |
-|               |                               BytesProcessedExec                                                                                                                                                  |
-|               |                                 S3VectorsQueryExec: limit=30                                                                                                                                      |
-|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                     |
-|               |                     RepartitionExec: partitioning=Hash([id@0, question@1], 10), input_partitions=10                                                                                               |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                                                                                       |
-|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                                               |
-|               |                           BytesProcessedExec                                                                                                                                                      |
-|               |                             SchemaCastScanExec                                                                                                                                                    |
-|               |                               DataSourceExec: partitions=1, partition_sizes=[10]                                                                                                                  |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0), (question@1, question@1)], projection=[id@0, score@2, answer@5]                                                     |
+|               |               CoalescePartitionsExec                                                                                                                                                              |
+|               |                 BytesProcessedExec                                                                                                                                                                |
+|               |                   ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, union_extract(json_get(key@0, question), str) as question, 1 - distance@1 as score]                        |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                          |
+|               |                       BytesProcessedExec                                                                                                                                                          |
+|               |                         S3VectorsQueryExec: limit=30                                                                                                                                              |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                |
+|               |                 BytesProcessedExec                                                                                                                                                                |
+|               |                   SchemaCastScanExec                                                                                                                                                              |
+|               |                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                             |
 |               |                                                                                                                                                                                                   |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

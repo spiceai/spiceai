@@ -16,8 +16,10 @@ limitations under the License.
 
 #![allow(clippy::large_futures)]
 
+use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+
 mod docker;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -42,6 +44,29 @@ fn configure_test_datafusion(df: &mut runtime::datafusion::DataFusion) {
         .options_mut()
         .execution
         .target_partitions = 3;
+
+    state_lock
+        .config_mut()
+        .options_mut()
+        .execution
+        .coalesce_batches = false;
+
+    state_lock
+        .config_mut()
+        .options_mut()
+        .optimizer
+        .repartition_joins = false;
+
+    let final_config = state_lock.config().clone();
+
+    match DEFAULT_DATAFUSION_CONFIG.write() {
+        Ok(mut config) => {
+            *config = final_config
+                .clone()
+                .with_create_default_catalog_and_schema(true);
+        }
+        _ => panic!("Must obtain write lock to defaults"),
+    }
 }
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
