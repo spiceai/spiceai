@@ -169,7 +169,6 @@ impl SearchQueryProvider {
 
     /// Get filters that can be handled by the search index
     fn search_index_filters(
-        &self,
         search_index_columns: &std::collections::HashSet<String>,
         filters: &[Expr],
     ) -> Vec<Expr> {
@@ -204,7 +203,7 @@ impl SearchQueryProvider {
             .map(|f| f.name().to_string())
             .collect();
 
-        let search_filters = self.search_index_filters(&search_index_columns, filters);
+        let search_filters = Self::search_index_filters(&search_index_columns, filters);
 
         Ok(LogicalPlan::TableScan(TableScan::try_new(
             TableReference::parse_str("search_index"),
@@ -213,6 +212,101 @@ impl SearchQueryProvider {
             search_filters,
             self.pre_limit,
         )?))
+    }
+
+    async fn join_with_base(
+        &self,
+        projection: Option<&Vec<usize>>,
+        search_index_table: &LogicalPlan,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        // Ensure primary keys are retrieved from underlying table.
+        let table_proj: Option<Vec<_>> = projection.map(|proj| {
+            let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
+            for pp in primary_key_projection {
+                p.insert(pp);
+            }
+            p.into_iter().collect()
+        });
+
+        // Need to join with base table
+        let underlying_table_scan =
+            self.underlying_table_scan(table_proj.as_ref(), filters, &self.all_metadata_columns())?;
+
+        // Build join conditions based on primary keys
+        let join_conditions: Vec<(Column, Column)> = self
+            .search_index
+            .primary_fields()
+            .iter()
+            .map(|field| {
+                (
+                    Column::new(
+                        Some(TableReference::parse_str("search_index")),
+                        field.name(),
+                    ),
+                    Column::new(Some(TableReference::parse_str("base_table")), field.name()),
+                )
+            })
+            .collect();
+
+        let on: Vec<(Expr, Expr)> = join_conditions
+            .into_iter()
+            .map(|(left, right)| (Expr::Column(left), Expr::Column(right)))
+            .collect();
+
+        // Build join schema
+        let join_schema = search_index_table
+            .schema()
+            .join(underlying_table_scan.schema())?;
+
+        let primary_key_column_names: std::collections::HashSet<String> = self
+            .search_index
+            .primary_fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
+            filters.iter().cloned().partition(|f| {
+                f.column_refs()
+                    .iter()
+                    .any(|col| primary_key_column_names.contains(col.name()))
+            });
+
+        let join = LogicalPlan::Join(Join {
+            left: Arc::new(search_index_table),
+            right: Arc::new(underlying_table_scan),
+            join_type: JoinType::Left,
+            join_constraint: JoinConstraint::On,
+            on,
+            filter: pre_join_filters.into_iter().reduce(Expr::and),
+            schema: join_schema.into(),
+            null_equals_null: false,
+        });
+
+        let deduped_schema = DFSchema::new_with_metadata(
+            join.schema()
+                .iter()
+                .filter(|(tbl, f)| {
+                    !(primary_key_column_names.contains(f.name())
+                        && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
+                })
+                .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
+                .collect(),
+            HashMap::default(),
+        )?;
+
+        let proj = LogicalPlan::Projection(Projection::new_from_schema(
+            join.into(),
+            deduped_schema.into(),
+        ));
+
+        if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
+            LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
+        } else {
+            proj
+        }
     }
 }
 
@@ -324,100 +418,8 @@ impl TableProvider for SearchQueryProvider {
                     search_index_table
                 }
             } else {
-                // Ensure primary keys are retrieved from underlying table.
-                let table_proj: Option<Vec<_>> = projection.map(|proj| {
-                    let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
-                    for pp in primary_key_projection {
-                        p.insert(pp);
-                    }
-                    p.into_iter().collect()
-                });
-
-                // Need to join with base table
-                let underlying_table_scan = self.underlying_table_scan(
-                    table_proj.as_ref(),
-                    filters,
-                    &self.all_metadata_columns(),
-                )?;
-
-                // Build join conditions based on primary keys
-                let join_conditions: Vec<(Column, Column)> = self
-                    .search_index
-                    .primary_fields()
-                    .iter()
-                    .map(|field| {
-                        (
-                            Column::new(
-                                Some(TableReference::parse_str("search_index")),
-                                field.name(),
-                            ),
-                            Column::new(
-                                Some(TableReference::parse_str("base_table")),
-                                field.name(),
-                            ),
-                        )
-                    })
-                    .collect();
-
-                let on: Vec<(Expr, Expr)> = join_conditions
-                    .into_iter()
-                    .map(|(left, right)| (Expr::Column(left), Expr::Column(right)))
-                    .collect();
-
-                // Build join schema
-                let join_schema = search_index_table
-                    .schema()
-                    .join(underlying_table_scan.schema())?;
-
-                let primary_key_column_names: std::collections::HashSet<String> =
-                    primary_key_fields
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect();
-
-                let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
-                    filters.iter().cloned().partition(|f| {
-                        f.column_refs()
-                            .iter()
-                            .any(|col| primary_key_column_names.contains(col.name()))
-                    });
-
-                let join = LogicalPlan::Join(Join {
-                    left: Arc::new(search_index_table),
-                    right: Arc::new(underlying_table_scan),
-                    join_type: JoinType::Left,
-                    join_constraint: JoinConstraint::On,
-                    on,
-                    filter: pre_join_filters.into_iter().reduce(Expr::and),
-                    schema: join_schema.into(),
-                    null_equals_null: false,
-                });
-
-                // For now, use the join schema directly
-                // TODO: Implement proper deduplication of primary key columns
-                let deduped_schema = DFSchema::new_with_metadata(
-                    join.schema()
-                        .iter()
-                        .filter(|(tbl, f)| {
-                            !(primary_key_column_names.contains(f.name())
-                                && tbl
-                                    .is_some_and(|t| *t == TableReference::parse_str("base_table")))
-                        })
-                        .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
-                        .collect(),
-                    HashMap::default(),
-                )?;
-
-                let proj = LogicalPlan::Projection(Projection::new_from_schema(
-                    join.into(),
-                    deduped_schema.into(),
-                ));
-
-                if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
-                    LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
-                } else {
-                    proj
-                }
+                self.join_with_base(projection, search_index_table, filters, limit)
+                    .await?
             };
 
         // Add sorting by search score (descending)

@@ -150,7 +150,7 @@ impl FullTextDatabaseIndex {
                 let name = fe.name();
                 if primary_key.contains(&name.to_string()) {
                     return None;
-                };
+                }
 
                 let (_, f) = base_schema.column_with_name(name)?;
                 Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
