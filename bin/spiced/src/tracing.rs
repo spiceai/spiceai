@@ -43,7 +43,7 @@ impl LogVerbosity {
         verbose: bool,
         very_verbose: bool,
         env_var: &str,
-        config_log_level: Some<LogLevel>,
+        config_log_level: Option<LogLevel>,
     ) -> Self {
         if very_verbose || config_log_level == Some(LogLevel::VeryVerbose) {
             return LogVerbosity::VeryVerbose;
