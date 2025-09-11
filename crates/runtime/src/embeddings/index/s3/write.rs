@@ -464,6 +464,7 @@ fn create_embedding_array(
 }
 
 /// Filter out zero vectors (all values in the vector are 0.0)
+#[allow(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
     mut primary_keys: Vec<Option<String>>,
