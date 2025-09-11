@@ -207,6 +207,7 @@ tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+twox-hash = "1.6"
 url = "2.5"
 uuid = "1"
 x509-certificate = "0.23.1"

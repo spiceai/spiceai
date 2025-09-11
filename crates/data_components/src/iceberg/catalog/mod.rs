@@ -42,9 +42,16 @@ pub enum Error {
     NamespaceDoesNotExist { namespace: String },
 
     #[snafu(display(
-        "Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again."
+        "Failed to connect to the Iceberg catalog or object store at {url}: {source}. Verify the Iceberg catalog is accessible and try again."
     ))]
     FailedToConnect { url: String, source: iceberg::Error },
+
+    #[snafu(display("TLS/SSL certificate error connecting to {}: {}", url, detail))]
+    CertificateError {
+        url: String,
+        detail: String,
+        source: iceberg::Error,
+    },
 
     #[snafu(display(
         "Internal error: could not acquire a semaphore permit for concurrency control: {source}"

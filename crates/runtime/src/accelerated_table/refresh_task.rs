@@ -21,7 +21,7 @@ use arrow::{
 };
 use arrow_schema::SchemaRef;
 use async_stream::stream;
-use datafusion::datasource::TableType;
+use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion_table_providers::util::retriable_error::{
@@ -63,6 +63,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::sync::{RwLock, Semaphore, oneshot};
 
+use super::refresh::Refresh;
+use data_components::poly::PolyTableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::{
     dataframe::DataFrame,
@@ -72,8 +74,8 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
-
-use super::refresh::Refresh;
+use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
+use datafusion_federation::FederatedTableProviderAdaptor;
 
 mod changes;
 mod streaming_append;
@@ -647,29 +649,6 @@ impl RefreshTask {
         ctx
     }
 
-    #[allow(clippy::needless_pass_by_value)]
-    fn max_timestamp_df(
-        &self,
-        ctx: SessionContext,
-        column: &str,
-    ) -> Result<DataFrame, DataFusionError> {
-        let expr = cast(
-            col(format!(r#""{column}""#)),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        )
-        .alias("a");
-
-        self.accelerator_df(&ctx)?
-            .select(vec![expr])?
-            .sort(vec![col("a").sort(false, false)])?
-            .limit(0, Some(1))
-    }
-
-    fn accelerator_df(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
-        // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
-        ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
-    }
-
     #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records_from(
         &self,
@@ -685,17 +664,19 @@ impl RefreshTask {
 
         let federated_provider = self.federated.table_provider().await;
 
-        let existing_records = self
-            .accelerator_df(&self.refresh_df_context(Arc::clone(&federated_provider)))
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?
-            .filter(filter_converter.convert(value, Operator::Gt))
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?
-            .collect()
-            .await
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?;
+        let existing_records = accelerator_df(
+            &Arc::clone(&self.accelerator),
+            &self.refresh_df_context(Arc::clone(&federated_provider)),
+        )
+        .map_err(find_datafusion_root)
+        .context(super::UnableToScanTableProviderSnafu)?
+        .filter(filter_converter.convert(value, Operator::Gt))
+        .map_err(find_datafusion_root)
+        .context(super::UnableToScanTableProviderSnafu)?
+        .collect()
+        .await
+        .map_err(find_datafusion_root)
+        .context(super::UnableToScanTableProviderSnafu)?;
 
         let filter_schema = BaseSchema::get_schema(&federated_provider);
         let update_type = update.update_type.clone();
@@ -735,8 +716,7 @@ impl RefreshTask {
                 "Failed to get the latest timestamp. The `time_column` parameter must be specified.",
         })?;
 
-        let df = self
-            .max_timestamp_df(ctx, &column)
+        let df = max_timestamp_df(&Arc::clone(&self.accelerator), ctx, &column)
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
@@ -975,6 +955,74 @@ impl DataLoadTracing {
             self.num_records_received = 0;
             self.last_updated_time = Instant::now();
         }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn max_timestamp_df(
+    accelerator: &Arc<dyn TableProvider>,
+    ctx: SessionContext,
+    column: &str,
+) -> Result<DataFrame, DataFusionError> {
+    let expr = cast(
+        col(format!(r#""{column}""#)),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+    )
+    .alias("a");
+
+    accelerator_df(accelerator, &ctx)?
+        .select(vec![expr])?
+        .sort(vec![col("a").sort(false, false)])?
+        .limit(0, Some(1))
+}
+
+fn accelerator_df(
+    accelerator: &Arc<dyn TableProvider>,
+    ctx: &SessionContext,
+) -> Result<DataFrame, DataFusionError> {
+    // The purpose behind this logic is:
+    // 1. If possible, extract FederatedTableProviderAdaptor from PolyTableProvider and make it the top-level table provider (needed by datafusion-federation)
+    // 2. Make sure EnsureSchema is present (either on top-level or under FederatedTableProviderAdaptor)
+    let accelerator: Arc<dyn TableProvider> = accelerator_table_provider(accelerator);
+
+    let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&accelerator)));
+
+    // Get the columns so we can add projection to the plan. This
+    // converts the plan to federated where the correct dialect is applied
+    let schema = accelerator.schema();
+    let columns: Vec<Expr> = schema.fields().iter().map(|f| ident(f.name())).collect();
+
+    // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
+    let logical_plan = LogicalPlanBuilder::scan(UNNAMED_TABLE, table_source, None)
+        .map_err(find_datafusion_root)?
+        .project(columns)?
+        .build()
+        .map_err(find_datafusion_root)?;
+
+    Ok(DataFrame::new(ctx.state(), logical_plan))
+}
+
+pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+    match accelerator.as_any().downcast_ref::<PolyTableProvider>() {
+        Some(poly) => match poly
+            .get_federated_table_provider()
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            Some(FederatedTableProviderAdaptor {
+                source,
+                table_provider: Some(table_provider),
+            }) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                Arc::clone(source),
+                Arc::new(EnsureSchema::new(Arc::clone(table_provider))),
+            )) as Arc<dyn TableProvider>,
+            None
+            | Some(FederatedTableProviderAdaptor {
+                source: _,
+                table_provider: None,
+            }) => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+        },
+        None => Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
     }
 }
 
