@@ -224,14 +224,14 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "02b99cf6b0084f0ccf965487a4430a3af9de9b68" }            # jeadie/25-09-09/df-49
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "02b99cf6b0084f0ccf965487a4430a3af9de9b68" }     # jeadie/25-09-09/df-49
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "02b99cf6b0084f0ccf965487a4430a3af9de9b68" } # jeadie/25-09-09/df-49
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "02b99cf6b0084f0ccf965487a4430a3af9de9b68" }  # jeadie/25-09-09/df-49
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "02b99cf6b0084f0ccf965487a4430a3af9de9b68" }       # jeadie/25-09-09/df-49
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }            # jeadie/25-09-09/df-49
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }     # jeadie/25-09-09/df-49
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" } # jeadie/25-09-09/df-49
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }  # jeadie/25-09-09/df-49
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }       # jeadie/25-09-09/df-49
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "33fd35ccb894d5bdf253ff4ba45aef0e9564e480" }                     # jeadie/25-09-09/df-49
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "477cb9baf424477b437956590efa0ae1eff63b53" } # Jeadie:jeadie/25-09-09/df-49
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "26cdc8384ec0e285cfd8a7f08f0dec167a7a7a81" }                     # jeadie/25-09-09/df-49
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1cec3bbf5c19f6e5719a2511c611ea90910765ef" } # Jeadie:jeadie/25-09-09/df-49
 
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a4b83432acfe1dfdd140e35d4603701ae76f6607" } # spiceai-1.3.2
