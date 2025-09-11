@@ -24,7 +24,6 @@ use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
 use iceberg::{TableIdent, io::CustomAwsCredentialLoader};
-use iceberg_catalog_rest::RestCatalog as IcebergRestCatalog;
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
 
