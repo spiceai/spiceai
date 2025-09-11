@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/s3_vectors.rs
 expression: formatted
-snapshot_kind: text
 ---
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                    |
@@ -17,13 +16,12 @@ snapshot_kind: text
 |               |     SortExec: TopK(fetch=10), expr=[event.id@0 DESC, score@2 DESC], preserve_partitioning=[true]                                                                                                        |
 |               |       ProjectionExec: expr=[event.id@0 as event.id, round(score@2, 1) as round(vector_search(delivery, Utf8("wrong location")).score,Int64(1)), score@2 as score]                                       |
 |               |         BytesProcessedExec                                                                                                                                                                              |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                   |
-|               |             FilterExec: account.tier@1 = BUSINESS                                                                                                                                                       |
-|               |               ProjectionExec: expr=[event.id@0 as event.id, account.tier@2 as account.tier, score@1 as score]                                                                                           |
-|               |                 BytesProcessedExec                                                                                                                                                                      |
-|               |                   ProjectionExec: expr=[key@1 as event.id, 1 - distance@2 as score, account.tier@0 as account.tier]                                                                                     |
-|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                |
-|               |                       BytesProcessedExec                                                                                                                                                                |
-|               |                         S3VectorsQueryExec: limit=30                                                                                                                                                    |
+|               |           FilterExec: account.tier@1 = BUSINESS                                                                                                                                                         |
+|               |             ProjectionExec: expr=[event.id@0 as event.id, account.tier@2 as account.tier, score@1 as score]                                                                                             |
+|               |               BytesProcessedExec                                                                                                                                                                        |
+|               |                 ProjectionExec: expr=[key@1 as event.id, 1 - distance@2 as score, account.tier@0 as account.tier]                                                                                       |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                  |
+|               |                     BytesProcessedExec                                                                                                                                                                  |
+|               |                       S3VectorsQueryExec: limit=30                                                                                                                                                      |
 |               |                                                                                                                                                                                                         |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

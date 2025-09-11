@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4"
-snapshot_kind: text
 ---
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                                                   |
@@ -17,7 +16,7 @@ snapshot_kind: text
 |               |         ProjectionExec: expr=[id@0 as id, question@3 as question, answer@2 as answer, subject@4 as subject, score@1 as score]                                                                                                                          |
 |               |           BytesProcessedExec                                                                                                                                                                                                                           |
 |               |             ProjectionExec: expr=[CAST(key@3 AS Int64) as id, 1 - distance@4 as score, answer@0 as answer, question@1 as question, subject@2 as subject]                                                                                               |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                                                                                                                                                    |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                                                     |
 |               |                 BytesProcessedExec                                                                                                                                                                                                                     |
 |               |                   S3VectorsQueryExec: limit=30                                                                                                                                                                                                         |
 |               |                                                                                                                                                                                                                                                        |
