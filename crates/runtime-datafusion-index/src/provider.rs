@@ -83,6 +83,10 @@ impl IndexedTableProvider {
     pub fn get_underlying(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.underlying)
     }
+
+    pub fn get_underlying_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.underlying
+    }
 }
 
 #[async_trait]

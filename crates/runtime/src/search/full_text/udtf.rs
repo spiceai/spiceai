@@ -43,7 +43,6 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::{
     index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
 };
@@ -246,13 +245,22 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let fts_index = find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "Table '{}' does not have a full text search index.",
-                    args.tbl.clone()
-                ))
-            })?;
+        let mut fts_indexes = find_index_in_table_provider::<FullTextDatabaseIndex>(
+            &table_provider,
+        )
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Table '{}' does not have a full text search index.",
+                args.tbl.clone()
+            ))
+        })?;
+
+        let Some(fts_index) = fts_indexes.pop() else {
+            return Err(DataFusionError::Plan(format!(
+                "Table '{}' does not have a full text search index.",
+                args.tbl.clone()
+            )));
+        };
 
         let column = args.column(&fts_index.search_fields)?;
         Ok(Arc::new(TextSearchIndexProviderWrapper {
