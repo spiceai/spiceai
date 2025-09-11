@@ -13,7 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, error::Error as StdError, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error as StdError,
+    sync::Arc,
+};
 
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -106,7 +110,7 @@ impl S3VectorsTable {
             Some(_) => {}
         }
 
-        let num_physical_indexes = 1;
+        let num_physical_indexes = infer_num_physical_indexes(&id, client.as_ref()).await?;
 
         let schema = Self::compute_schema(columns);
         let constraints = Self::primary_key(&schema);
@@ -457,29 +461,37 @@ async fn infer_num_physical_indexes(
         } => {
             // List the indexes in the bucket and count the number of indexes
             // that have a name that start with `index_name`
-            let mut index_names = Vec::new();
+            let mut index_names = HashSet::new();
+            let mut the_next_token = None;
             loop {
+                let mut builder = ListIndexesInput::builder().vector_bucket_name(bucket_name);
+
+                if let Some(next_token) = the_next_token {
+                    builder = builder.next_token(next_token);
+                }
+
+                let input = builder.build().unwrap();
+
                 let ListIndexesOutput {
                     next_token,
                     indexes,
                     ..
-                } = client
-                    .list_indexes(
-                        ListIndexesInput::builder()
-                            .vector_bucket_name(bucket_name)
-                            .build()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
+                } = client.list_indexes(input).await.unwrap();
 
                 for summary in indexes {
                     if summary.index_name.starts_with(index_name) {
-                        index_names.push(summary.index_name);
+                        index_names.insert(summary.index_name);
                     }
                 }
+
+                if next_token.is_none() {
+                    break;
+                } else {
+                    the_next_token = next_token;
+                }
             }
-            todo!()
+
+            Ok(index_names.len())
         }
     }
 }
