@@ -54,7 +54,7 @@ use snafu::ResultExt;
 use tokio::sync::mpsc::Sender;
 
 /// An S3 Vector index that implements a [`TableProvider`] as a list records operation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct S3VectorsListTable(S3VectorsTable);
 
 impl From<S3VectorsTable> for S3VectorsListTable {

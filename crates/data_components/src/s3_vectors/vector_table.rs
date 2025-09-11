@@ -16,7 +16,10 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     error::Error as StdError,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crate::s3_vectors::{
@@ -32,14 +35,13 @@ use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
     GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput, ListIndexesInput,
     ListIndexesOutput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
-    PutVectorsInput, S3Vectors, SdkError, VectorData,
+    PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
 use snafu::ResultExt;
 
 /// An S3 Vector index.
-#[derive(Clone)]
 pub struct S3VectorsTable {
     pub(super) idx: S3VectorIdentifier,
     pub(super) client: Arc<dyn S3Vectors + Send + Sync>,
@@ -55,7 +57,7 @@ pub struct S3VectorsTable {
     // Index capacity is limited in AWS. When an index is full, we spill to
     // another index. This represents the number of physical indexes this
     // logical index has.
-    num_physical_indexes: usize,
+    num_physical_indexes: AtomicUsize,
 }
 
 impl std::fmt::Debug for S3VectorsTable {
@@ -420,10 +422,11 @@ impl S3VectorsTable {
             })
             .collect();
 
-        let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
+        let (index_arn, vector_bucket_name, mut index_name) = self.index_identifier_variables();
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-            self.client
+            let put_vector_response = self
+                .client
                 .put_vectors(
                     PutVectorsInput::builder()
                         .set_index_arn(index_arn.clone())
@@ -434,9 +437,30 @@ impl S3VectorsTable {
                         .context(S3VectorBuildSnafu)?,
                 )
                 .await
-                .map_err(|e| Error::S3VectorPutVectorError {
-                    source: e.into_service_error(),
-                })?;
+                .map_err(|e| e.into_service_error());
+
+            if let Err(PutVectorsError::ServiceQuotaExceededException(e)) = put_vector_response {
+                tracing::debug!("S3 vector index full: {e}");
+                // Index is full. Increase physical count, change index name and retry
+                self.num_physical_indexes.fetch_add(1, Ordering::Release);
+                index_name = self.index_identifier_variables().2;
+                self.client
+                    .put_vectors(
+                        PutVectorsInput::builder()
+                            .set_index_arn(index_arn.clone())
+                            .set_index_name(index_name.clone())
+                            .set_vector_bucket_name(vector_bucket_name.clone())
+                            .set_vectors(Some(chunk.to_vec()))
+                            .build()
+                            .context(S3VectorBuildSnafu)?,
+                    )
+                    .await
+                    .map_err(|e| Error::S3VectorPutVectorError {
+                        source: e.into_service_error(),
+                    })?;
+            } else {
+                put_vector_response.map_err(|source| Error::S3VectorPutVectorError { source })?;
+            }
         }
 
         tracing::info!(
@@ -447,14 +471,26 @@ impl S3VectorsTable {
 
         Ok(())
     }
+
+    fn index_identifier_variables(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let (index_arn, vector_bucket_name, mut index_name) = self.idx.index_identifier_variables();
+
+        // If this isn't an index specified by an ARN, then we will name the index with the partition number
+        if let (None, Some(index)) = (&index_arn, &index_name) {
+            let partition_number = self.num_physical_indexes.load(Ordering::Acquire);
+            index_name = Some(format!("{index}_{partition_number}"));
+        }
+
+        (index_arn, vector_bucket_name, index_name)
+    }
 }
 
 async fn infer_num_physical_indexes(
     index: &S3VectorIdentifier,
     client: &(dyn S3Vectors + Send + Sync),
-) -> Result<usize> {
-    match index {
-        S3VectorIdentifier::IndexArn(_) => Ok(1),
+) -> Result<AtomicUsize> {
+    let v = match index {
+        S3VectorIdentifier::IndexArn(_) => 1,
         S3VectorIdentifier::Index {
             bucket_name,
             index_name,
@@ -491,7 +527,14 @@ async fn infer_num_physical_indexes(
                 }
             }
 
-            Ok(index_names.len())
+            index_names.len()
         }
-    }
+    };
+
+    Ok(AtomicUsize::new(v))
+}
+
+#[cfg(test)]
+mod tests {
+    // TODO: Need to mock a client service to test the index spilling
 }
