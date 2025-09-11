@@ -31,6 +31,7 @@ use std::time::Duration;
 use tracing::Subscriber;
 use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, registry::LookupSpan};
 
+#[derive(PartialEq, Debug)]
 pub enum LogVerbosity {
     Default,
     Verbose,
@@ -45,10 +46,10 @@ impl LogVerbosity {
         env_var: &str,
         config_output_level: Option<OutputLevel>,
     ) -> Self {
-
         if very_verbose {
             return LogVerbosity::VeryVerbose;
         }
+
         if verbose {
             return LogVerbosity::Verbose;
         }
@@ -296,5 +297,64 @@ impl SpanExporter for OtelExportMultiplexer {
         for exporter in &mut self.exporters {
             exporter.set_resource(resource);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_very_verbose_if_flag_set() {
+        unsafe {
+            std::env::set_var("TEST_LOG_ENV", "custom");
+        }
+        let result = LogVerbosity::from_flags_and_env_and_config(
+            false,
+            true,
+            "TEST_LOG_ENV",
+            Some(OutputLevel::Verbose),
+        );
+        unsafe {
+            std::env::remove_var("TEST_LOG_ENV");
+        }
+
+        assert_eq!(result, LogVerbosity::VeryVerbose);
+    }
+
+    #[test]
+    fn returns_specific_if_env_set() {
+        unsafe {
+            std::env::set_var("TEST_LOG_ENV", "custom");
+        }
+        let result = LogVerbosity::from_flags_and_env_and_config(
+            false,
+            false,
+            "TEST_LOG_ENV",
+            Some(OutputLevel::VeryVerbose),
+        );
+        unsafe {
+            std::env::remove_var("TEST_LOG_ENV");
+        }
+
+        assert_eq!(result, LogVerbosity::Specific("custom".to_string()));
+    }
+
+    #[test]
+    fn returns_very_verbose_from_config() {
+        let result = LogVerbosity::from_flags_and_env_and_config(
+            false,
+            false,
+            "NON_EXISTENT_ENV",
+            Some(OutputLevel::VeryVerbose),
+        );
+        assert_eq!(result, LogVerbosity::VeryVerbose);
+    }
+
+    #[test]
+    fn returns_default_when_none() {
+        let result =
+            LogVerbosity::from_flags_and_env_and_config(false, false, "NON_EXISTENT_ENV", None);
+        assert_eq!(result, LogVerbosity::Default);
     }
 }
