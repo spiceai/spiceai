@@ -35,6 +35,14 @@ pub enum HashingAlgorithm {
     #[default]
     Siphash,
     Ahash,
+    #[serde(rename = "xxh3")]
+    XXH3,
+    #[serde(rename = "xxh32")]
+    XXH32,
+    #[serde(rename = "xxh64")]
+    XXH64,
+    #[serde(rename = "xxh128")]
+    XXH128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
