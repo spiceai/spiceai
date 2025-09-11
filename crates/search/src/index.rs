@@ -38,17 +38,6 @@ pub trait SearchIndex: std::fmt::Debug + Send + Sync + 'static {
     ///
     fn primary_fields(&self) -> Vec<Field>;
 
-    /// Optional [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
-    /// columns and the associated vectors/indexed content of the [`SearchIndex::search_column`].
-    ///
-    /// For vector indexes: Returns a table with embedding vectors and metadata columns.
-    /// For FTS indexes: Returns `None` since no additional columns are needed (avoids unnecessary joins).
-    ///
-    /// If `None`, query providers should avoid joins with the underlying table for list operations.
-    fn list_table_provider(
-        &self,
-    ) -> Result<Option<Arc<dyn TableProvider>>, Box<dyn std::error::Error + Send + Sync>>;
-
     /// The additional columns available in the [`SearchIndex`].
     /// For FTS indexes, this may return empty metadata columns.
     fn metadata_columns(&self) -> &MetadataColumns;

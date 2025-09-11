@@ -371,6 +371,9 @@ impl FullTextDatabaseIndex {
 
 #[async_trait]
 impl SearchIndex for FullTextDatabaseIndex {
+    /// Currently multi-column uses of [`FullTextDatabaseIndex`] do either:
+    ///   1. `TextSearchTableFunc` chooses a column from its UDTF params and overrides `self.search_fields` at query time.
+    ///   2. `as_candidate_generations` in `crates/runtime/src/search/full_text/mod.rs` creates [`FullTextSearchFieldIndex`].
     fn search_column(&self) -> String {
         // For FTS, return the first search field as the primary search column
         self.search_fields.first().cloned().unwrap_or_default()
@@ -387,14 +390,6 @@ impl SearchIndex for FullTextDatabaseIndex {
                     .map(|(_, field)| (*field).clone())
             })
             .collect()
-    }
-
-    fn list_table_provider(
-        &self,
-    ) -> Result<Option<Arc<dyn TableProvider>>, Box<dyn std::error::Error + Send + Sync>> {
-        // For FTS, return None since there are no additional columns (no embeddings, etc.)
-        // This avoids unnecessary joins in query providers
-        Ok(None)
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {

@@ -214,13 +214,18 @@ impl SearchQueryProvider {
         )?))
     }
 
-    async fn join_with_base(
+    fn join_with_base(
         &self,
         projection: Option<&Vec<usize>>,
-        search_index_table: &LogicalPlan,
+        search_index_table: LogicalPlan,
         filters: &[Expr],
-        limit: Option<usize>,
     ) -> Result<LogicalPlan, DataFusionError> {
+        let primary_key_fields = self.search_index.primary_fields();
+        let primary_key_projection: Vec<usize> = primary_key_fields
+            .iter()
+            .filter_map(|f| self.schema().index_of(f.name()).ok())
+            .collect();
+
         // Ensure primary keys are retrieved from underlying table.
         let table_proj: Option<Vec<_>> = projection.map(|proj| {
             let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
@@ -260,9 +265,7 @@ impl SearchQueryProvider {
             .schema()
             .join(underlying_table_scan.schema())?;
 
-        let primary_key_column_names: std::collections::HashSet<String> = self
-            .search_index
-            .primary_fields()
+        let primary_key_column_names: std::collections::HashSet<String> = primary_key_fields
             .iter()
             .map(|f| f.name().clone())
             .collect();
@@ -303,9 +306,9 @@ impl SearchQueryProvider {
         ));
 
         if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
-            LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
+            Ok(LogicalPlan::Filter(Filter::try_new(filter, proj.into())?))
         } else {
-            proj
+            Ok(proj)
         }
     }
 }
@@ -401,11 +404,6 @@ impl TableProvider for SearchQueryProvider {
             ));
         }
 
-        let primary_key_projection: Vec<usize> = primary_key_fields
-            .iter()
-            .filter_map(|f| self.schema().index_of(f.name()).ok())
-            .collect();
-
         let search_index_table = self.search_index_table(filters).await?;
 
         // Check if search index alone is sufficient
@@ -418,8 +416,7 @@ impl TableProvider for SearchQueryProvider {
                     search_index_table
                 }
             } else {
-                self.join_with_base(projection, search_index_table, filters, limit)
-                    .await?
+                self.join_with_base(projection, search_index_table, filters)?
             };
 
         // Add sorting by search score (descending)

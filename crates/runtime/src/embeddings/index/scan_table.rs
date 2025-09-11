@@ -33,18 +33,24 @@ use datafusion::{
     sql::TableReference,
 };
 
-use crate::{embedding_col, embeddings::index::search_index_table_is_sufficient};
-use search::{generation::util::append_fields, index::SearchIndex};
+use crate::{
+    embedding_col,
+    embeddings::index::{s3::S3Vector, search_index_table_is_sufficient},
+};
+use search::{
+    generation::util::append_fields,
+    index::{SearchIndex, SearchIndexExt},
+};
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
 pub struct VectorScanTableProvider {
     pub table_provider: Arc<dyn TableProvider>,
-    pub index: Arc<dyn SearchIndex>,
+    pub index: Arc<S3Vector>,
 }
 
 impl VectorScanTableProvider {
-    pub fn new(table_provider: Arc<dyn TableProvider>, index: Arc<dyn SearchIndex>) -> Self {
+    pub fn new(table_provider: Arc<dyn TableProvider>, index: Arc<S3Vector>) -> Self {
         Self {
             table_provider,
             index,
@@ -97,7 +103,7 @@ impl VectorScanTableProvider {
 
         let Some(idx) = index_of_column(
             &self.schema(),
-            embedding_col!(self.index.search_column()).as_str(),
+            embedding_col!(self.index.embedded_column()).as_str(),
         ) else {
             return false; // Technically unreachable, but by definition not needed.
         };
@@ -115,7 +121,7 @@ impl VectorScanTableProvider {
         qualified_fields.push((
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(
-                embedding_col!(self.index.search_column()),
+                embedding_col!(self.index.embedded_column()),
                 DataType::new_list(DataType::Float32, true),
                 true,
             )),
@@ -154,7 +160,7 @@ impl TableProvider for VectorScanTableProvider {
         append_fields(
             &self.table_provider.schema(),
             vec![Arc::new(Field::new(
-                embedding_col!(self.index.search_column()),
+                embedding_col!(self.index.embedded_column),
                 DataType::new_list(DataType::Float32, true),
                 true,
             ))],
@@ -207,7 +213,7 @@ impl TableProvider for VectorScanTableProvider {
             .collect::<Vec<_>>();
         proj.push(Expr::Column(Column::new(
             Some(TableReference::parse_str("vector_index")),
-            embedding_col!(self.index.search_column()),
+            embedding_col!(self.index.embedded_column()),
         )));
 
         let vector_table_scan = LogicalPlan::Projection(Projection::try_new(

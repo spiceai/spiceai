@@ -41,7 +41,7 @@ pub(super) fn search_index_table_is_sufficient(
         .map(|f| f.name().to_string())
         .collect();
 
-    let full_projection = search_index_has_full_projection(projection, &search_index_columns)?;
+    let full_projection = search_index_has_full_projection(projection, &search_index_columns);
     let search_index_filters = search_index_filters(&search_index_columns, filters);
 
     Ok(full_projection && search_index_filters.len() == filters.len())
@@ -49,12 +49,12 @@ pub(super) fn search_index_table_is_sufficient(
 
 /// Returns true if the projection (relative to search query table provider) can be handled by the given search index schema.
 pub(super) fn search_index_has_full_projection(
-    projection: Vec<&FieldRef>,
+    projection: &[&FieldRef],
     search_index_columns: &HashSet<String>,
-) -> Result<bool, ArrowError> {
+) -> bool, ArrowError {
     let columns_requested: HashSet<String> = projection.iter().map(|f| f.name().clone()).collect();
 
-    Ok(search_index_columns.is_superset(&columns_requested))
+    search_index_columns.is_superset(&columns_requested)
 }
 
 /// Returns all filters that can be handled by the given search index columns.
@@ -269,20 +269,6 @@ pub mod tests {
 
         fn primary_fields(&self) -> Vec<Field> {
             self.primary_columns.clone()
-        }
-
-        fn list_table_provider(
-            &self,
-        ) -> Result<Option<Arc<dyn TableProvider>>, Box<dyn std::error::Error + Send + Sync>>
-        {
-            let mem_table = MemTable::try_new(
-                Arc::new(self.schema.clone()),
-                vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
-                    self.schema.clone(),
-                ))]],
-            )
-            .boxed()?;
-            Ok(Some(Arc::new(ExplainMemTable(mem_table))))
         }
 
         fn metadata_columns(&self) -> &MetadataColumns {
