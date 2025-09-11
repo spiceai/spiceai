@@ -178,7 +178,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     Ok(updated_record)
 }
 
-/// Given a [`RecordBatch`] of data from a [`VectorIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
+/// Given a [`RecordBatch`] of data from a [`SearchIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
 ///
 /// Formatting is:
 ///  - When there is a single [`Field`] in `primary_key`, the relevant [`ArrayRef`] is cast to a [`StringArray`] via [`arrow::compute::cast`].

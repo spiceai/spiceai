@@ -21,7 +21,7 @@ use arrow_schema::{ArrowError, FieldRef};
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr};
 
 // Re-export SearchIndex from search crate
-pub use search::index::{SearchIndex, SearchIndexExt, VectorIndex};
+pub use search::index::SearchIndex;
 
 mod retry_client;
 pub mod s3;

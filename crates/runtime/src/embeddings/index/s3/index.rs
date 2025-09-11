@@ -150,7 +150,7 @@ impl S3Vector {
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
     pub fn list_table_provider(
         &self,
-    ) -> Result<Option<Arc<dyn TableProvider>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
         projection.push(Expr::Alias(Alias::new(
@@ -161,13 +161,11 @@ impl S3Vector {
             embedding_col!(self.search_column()),
         )));
 
-        Ok(Some(
-            table_with_projection(
-                Arc::new(S3VectorsListTable::from(self.table.clone())),
-                projection,
-            )
-            .boxed()?,
-        ))
+        table_with_projection(
+            Arc::new(S3VectorsListTable::from(self.table.clone())),
+            projection,
+        )
+        .boxed()
     }
 }
 

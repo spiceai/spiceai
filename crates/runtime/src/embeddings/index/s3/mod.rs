@@ -79,7 +79,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
 ];
 
-/// Attempt to construct a  S3 `VectorIndex` for the provided dataset on the given column.
+/// Attempt to construct an [`S3Vector`] for the provided dataset on the given column.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_from_dataset(
     ds_name: &TableReference,

@@ -59,18 +59,3 @@ pub trait SearchIndex: std::fmt::Debug + Send + Sync + 'static {
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 }
-
-/// Extension trait to provide backward compatibility methods for [`SearchIndex`]
-pub trait SearchIndexExt {
-    /// Backward compatibility alias for [`SearchIndex::search_column`]
-    fn embedded_column(&self) -> String;
-}
-
-impl<T: SearchIndex + ?Sized> SearchIndexExt for T {
-    fn embedded_column(&self) -> String {
-        self.search_column()
-    }
-}
-
-/// Type alias for backward compatibility. Use [`SearchIndex`] for new code.
-pub type VectorIndex = dyn SearchIndex;

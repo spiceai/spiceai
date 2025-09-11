@@ -191,15 +191,6 @@ impl TableProvider for VectorScanTableProvider {
                 .await;
         }
 
-        // If [`SearchIndex::list_table_provider`]  is None, the index does not provide any additional columns.
-        // Can resolved entirely with base table.
-        let Some(index_plan) = self.index.list_table_provider()? else {
-            return self
-                .table_provider
-                .scan(state, projection, filters, limit)
-                .await;
-        };
-
         let mut proj = self
             .index
             .primary_fields()
@@ -220,7 +211,7 @@ impl TableProvider for VectorScanTableProvider {
             proj,
             Arc::new(LogicalPlan::TableScan(TableScan::try_new(
                 TableReference::parse_str("vector_index"),
-                Arc::new(DefaultTableSource::new(index_plan)),
+                Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
                 None,
                 vec![],
                 None,

@@ -400,19 +400,16 @@ impl SearchIndex for FullTextDatabaseIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        // Update the FTS index with new data and return the record batch unchanged
-        self.update_index(&[record.clone()]).await?;
-        Ok(record)
+        self.update_index(&[record.clone()]).await
     }
 
     async fn query_table_provider(
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        // Create a FullTextSearchQuery for the given query string
-        // Use the first search field as the primary field to search
-        let search_field = self.search_column();
-        let field_index = self.full_text_search_field_index(&search_field).await?;
+        let field_index = self
+            .full_text_search_field_index(&self.search_column())
+            .await?;
 
         Ok(Arc::new(FullTextSearchQuery {
             index: field_index,
