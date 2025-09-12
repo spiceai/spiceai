@@ -49,7 +49,7 @@ pub(super) fn search_index_table_is_sufficient(
         .map(|f| f.name().to_string())
         .collect();
 
-    let full_projection = search_index_has_full_projection(&projection, &search_index_columns);
+    let full_projection = search_index_has_full_projection(projection, &search_index_columns);
     let search_index_filters = search_index_filters(&search_index_columns, filters);
 
     full_projection && search_index_filters.len() == filters.len()
