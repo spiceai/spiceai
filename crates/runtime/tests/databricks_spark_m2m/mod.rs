@@ -89,10 +89,10 @@ async fn databricks_spark_m2m_integration_test() -> Result<(), anyhow::Error> {
                 )
                 .build();
 
+            configure_test_datafusion();
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await;
 

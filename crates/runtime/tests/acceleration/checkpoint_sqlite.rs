@@ -58,13 +58,8 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 .with_dataset(dataset)
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             let app_ref = rt.app();
             let app_lock = app_ref.read().await;
