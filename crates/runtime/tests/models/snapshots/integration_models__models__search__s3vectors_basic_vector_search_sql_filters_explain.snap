@@ -16,15 +16,15 @@ snapshot_kind: text
 |               |     ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@3, 3) as score]                                                                                    |
 |               |       BytesProcessedExec                                                                                                                                                 |
 |               |         FilterExec: subject@2 != math                                                                                                                                    |
-|               |           ProjectionExec: expr=[id@0 as id, answer@3 as answer, subject@2 as subject, score@1 as score]                                                                  |
+|               |           ProjectionExec: expr=[id@0 as id, answer@2 as answer, subject@3 as subject, score@1 as score]                                                                  |
 |               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
-|               |               HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, subject@3, answer@4]                                         |
+|               |               HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@2)], projection=[id@0, score@1, answer@2, subject@3]                                         |
 |               |                 RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                        |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                            |
 |               |                     ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                                                           |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                               |
 |               |                         S3VectorsQueryExec: limit=30                                                                                                                     |
-|               |                 RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                        |
+|               |                 RepartitionExec: partitioning=Hash([id@2], 3), input_partitions=3                                                                                        |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                   |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
 |               |                       SchemaCastScanExec                                                                                                                                 |
