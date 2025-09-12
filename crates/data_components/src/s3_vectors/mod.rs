@@ -21,10 +21,10 @@ use s3_vectors::{
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
 
+mod index;
 pub mod list_provider;
 pub mod query_provider;
-mod vector_table;
-pub use vector_table::{S3VectorTableResult, S3VectorsTable};
+pub use index::{Index, S3VectorTableResult};
 mod metadata_column;
 pub use metadata_column::{MetadataColumn, MetadataColumns};
 
@@ -104,24 +104,48 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// [`S3VectorIdentifier`] uniquely identifies a S3 vector index.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum S3VectorIdentifier {
-    IndexArn(String),
-    Index {
+pub enum IndexIdentifier {
+    Arn(String),
+    Name {
         bucket_name: String,
         index_name: String,
     },
 }
 
-impl S3VectorIdentifier {
+impl IndexIdentifier {
+    fn arn(&self) -> Option<String> {
+        if let Self::Arn(arn) = self {
+            Some(arn.clone())
+        } else {
+            None
+        }
+    }
+
+    fn bucket_name(&self) -> Option<String> {
+        if let Self::Name { bucket_name, .. } = self {
+            Some(bucket_name.clone())
+        } else {
+            None
+        }
+    }
+
+    fn index_name(&self) -> Option<String> {
+        if let Self::Name { index_name, .. } = self {
+            Some(index_name.clone())
+        } else {
+            None
+        }
+    }
+
     /// Return (index arn, bucket name and index name) based on how the vector index is identified.
     #[must_use]
     pub fn index_identifier_variables(&self) -> (Option<String>, Option<String>, Option<String>) {
         match self {
-            Self::Index {
+            Self::Name {
                 bucket_name,
                 index_name,
             } => (None, Some(bucket_name.clone()), Some(index_name.clone())),
-            Self::IndexArn(arn) => (Some(arn.clone()), None, None),
+            Self::Arn(arn) => (Some(arn.clone()), None, None),
         }
     }
 }

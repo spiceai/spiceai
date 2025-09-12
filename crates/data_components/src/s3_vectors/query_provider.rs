@@ -15,11 +15,9 @@ limitations under the License.
 */
 use std::{any::Any, sync::Arc};
 
-use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, vector_table::S3VectorsTable,
-};
+use crate::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, index::Index};
 
-use super::{Error, S3VectorIdentifier};
+use super::{Error, IndexIdentifier};
 use arrow::{
     array::RecordBatch,
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -58,12 +56,12 @@ pub static S3_VECTOR_MAX_TOPK: i64 = 30;
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
 pub struct S3VectorsQueryTable {
-    table: S3VectorsTable,
+    table: Index,
     query: Vec<f32>,
 }
 impl S3VectorsQueryTable {
     #[must_use]
-    pub fn new(table: S3VectorsTable, query: Vec<f32>) -> Self {
+    pub fn new(table: Index, query: Vec<f32>) -> Self {
         Self { table, query }
     }
 }
@@ -161,7 +159,7 @@ impl std::fmt::Debug for S3VectorsQueryExec {
 }
 
 struct S3VectorsQueryExec {
-    idx: S3VectorIdentifier,
+    idx: IndexIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
     query: Vec<f32>,
@@ -278,7 +276,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
 
 async fn query_vector_stream(
     client: Arc<dyn S3Vectors + Send + Sync>,
-    idx: S3VectorIdentifier,
+    idx: IndexIdentifier,
     query: Vec<f32>,
     schema: SchemaRef,
     limit: i32,

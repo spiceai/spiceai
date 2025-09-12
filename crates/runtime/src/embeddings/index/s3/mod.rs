@@ -17,9 +17,7 @@ limitations under the License.
 use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
-use data_components::s3_vectors::{
-    MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorsTable,
-};
+use data_components::s3_vectors::{Index, IndexIdentifier, MetadataColumn, MetadataColumns};
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
@@ -149,19 +147,19 @@ async fn try_vector_table(
     default_s3_index_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
-) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Index, Box<dyn std::error::Error + Send + Sync>> {
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
 
     let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
-        (Some(arn), None, None) => Ok(S3VectorIdentifier::IndexArn(arn.to_string())),
-        (None, Some(bucket), Some(index)) => Ok(S3VectorIdentifier::Index {
+        (Some(arn), None, None) => Ok(IndexIdentifier::Arn(arn.to_string())),
+        (None, Some(bucket), Some(index)) => Ok(IndexIdentifier::Name {
             bucket_name: bucket.to_string(),
             index_name: index.to_string(),
         }),
-        (None, Some(bucket), None) => Ok(S3VectorIdentifier::Index {
+        (None, Some(bucket), None) => Ok(IndexIdentifier::Name {
             bucket_name: bucket.to_string(),
             index_name: default_s3_index_name.to_string(),
         }),
@@ -196,7 +194,7 @@ async fn try_vector_table(
         ));
     };
 
-    let Some(vector_table) = S3VectorsTable::try_create_new_table(
+    let Some(vector_table) = Index::try_create_new_table(
         id,
         s3_vector_client,
         dimension as i64,

@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
+    Index as S3VectorsIndex, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
 use futures::future::try_join_all;
@@ -53,7 +53,7 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct S3Vector {
-    pub table: S3VectorsTable,
+    pub table: S3VectorsIndex,
 
     /// The name of the column in the associated [`TableProvider`] that produces the `data` column in [`S3VectorsTable`].
     pub embedded_column: String,
@@ -72,7 +72,7 @@ pub struct S3Vector {
 impl S3Vector {
     #[must_use]
     pub fn new(
-        table: S3VectorsTable,
+        table: S3VectorsIndex,
         embedded_column: String,
         primary_key: Vec<Field>,
         metadata_columns: MetadataColumns,

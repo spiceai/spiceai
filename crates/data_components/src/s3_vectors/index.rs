@@ -24,7 +24,7 @@ use crate::s3_vectors::{
     S3VectorBuildSnafu,
 };
 
-use super::{Error, Result, S3VectorIdentifier};
+use super::{Error, IndexIdentifier, Result};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
@@ -41,8 +41,8 @@ use tokio::sync::Mutex;
 
 /// An S3 Vector index.
 #[derive(Clone)]
-pub struct S3VectorsTable {
-    pub(super) idx: S3VectorIdentifier,
+pub struct Index {
+    pub(super) idx: IndexIdentifier,
     pub(super) client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
@@ -59,7 +59,7 @@ pub struct S3VectorsTable {
     num_physical_indexes: Arc<Mutex<usize>>, // Cannot clone AtomicUsize
 }
 
-impl std::fmt::Debug for S3VectorsTable {
+impl std::fmt::Debug for Index {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3VectorsListTable")
             .field("schema", &self.schema)
@@ -72,12 +72,12 @@ impl std::fmt::Debug for S3VectorsTable {
 pub enum S3VectorTableResult {
     IndexDoesNotExist,
     BucketDoesNotExist,
-    Table(S3VectorsTable),
+    Table(Index),
 }
 
 impl S3VectorTableResult {
     #[must_use]
-    pub fn table(self) -> Option<S3VectorsTable> {
+    pub fn table(self) -> Option<Index> {
         match self {
             S3VectorTableResult::Table(table) => Some(table),
             _ => None,
@@ -85,10 +85,10 @@ impl S3VectorTableResult {
     }
 }
 
-impl S3VectorsTable {
+impl Index {
     // Returns an [`S3VectorTableResult`] if the [`S3VectorIdentifier`] does not exist. Use [`Self::try_create_new_identifier`].
     pub async fn try_new_table(
-        id: S3VectorIdentifier,
+        id: IndexIdentifier,
         client: Arc<dyn S3Vectors + Send + Sync>,
         columns: MetadataColumns,
         distance_metric: &DistanceMetric,
@@ -126,7 +126,7 @@ impl S3VectorsTable {
     }
 
     pub async fn try_create_new_table(
-        id: S3VectorIdentifier,
+        id: IndexIdentifier,
         client: Arc<dyn S3Vectors + Send + Sync>,
         dimension: i64,
         columns: MetadataColumns,
@@ -185,11 +185,11 @@ impl S3VectorsTable {
     async fn create_index(
         client: &Arc<dyn S3Vectors + Send + Sync>,
         dimension: i64,
-        vector_id: &S3VectorIdentifier,
+        vector_id: &IndexIdentifier,
         non_filterable_metadata_columns: Vec<String>,
         distance_metric: &DistanceMetric,
     ) -> Result<()> {
-        let S3VectorIdentifier::Index {
+        let IndexIdentifier::Name {
             bucket_name,
             index_name,
         } = vector_id
@@ -229,9 +229,9 @@ impl S3VectorsTable {
 
     async fn create_bucket(
         client: &Arc<dyn S3Vectors + Send + Sync>,
-        id: &S3VectorIdentifier,
+        id: &IndexIdentifier,
     ) -> Result<()> {
-        let S3VectorIdentifier::Index { bucket_name, .. } = id else {
+        let IndexIdentifier::Name { bucket_name, .. } = id else {
             return Err(Error::CreateIndexUsingArn);
         };
         client
@@ -250,11 +250,11 @@ impl S3VectorsTable {
 
     async fn check_if_bucket_exists(
         client: &Arc<dyn S3Vectors + Send + Sync>,
-        id: &S3VectorIdentifier,
+        id: &IndexIdentifier,
     ) -> Result<bool> {
         let bucket_name_opt = match id {
-            S3VectorIdentifier::Index { bucket_name, .. } => Some(bucket_name.clone()),
-            S3VectorIdentifier::IndexArn(_) => None,
+            IndexIdentifier::Name { bucket_name, .. } => Some(bucket_name.clone()),
+            IndexIdentifier::Arn(_) => None,
         };
         match client
             .get_vector_bucket(
@@ -296,7 +296,7 @@ impl S3VectorsTable {
 
     /// Returns whether the index exists.
     async fn get_index_if_exists(
-        index: &S3VectorIdentifier,
+        index: &IndexIdentifier,
         client: &Arc<dyn S3Vectors + Send + Sync>,
     ) -> Result<Option<GetIndexOutput>> {
         let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
@@ -487,12 +487,12 @@ impl S3VectorsTable {
 }
 
 async fn infer_num_physical_indexes(
-    index: &S3VectorIdentifier,
+    index: &IndexIdentifier,
     client: &(dyn S3Vectors + Send + Sync),
 ) -> Result<usize> {
     match index {
-        S3VectorIdentifier::IndexArn(_) => Ok(1),
-        S3VectorIdentifier::Index {
+        IndexIdentifier::Arn(_) => Ok(1),
+        IndexIdentifier::Name {
             bucket_name,
             index_name,
         } => {

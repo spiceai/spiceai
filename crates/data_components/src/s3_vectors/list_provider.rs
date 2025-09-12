@@ -15,14 +15,12 @@ limitations under the License.
 */
 use std::{any::Any, sync::Arc};
 
-use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, vector_table::S3VectorsTable,
-};
+use crate::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, index::Index};
 
 /// Num of segments to use for parallel `ListVectors` API calls.
 const LIST_S3_VECTORS_NUM_READ_SEGMENTS: usize = 10;
 
-use super::S3VectorIdentifier;
+use super::IndexIdentifier;
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -55,10 +53,10 @@ use tokio::sync::mpsc::Sender;
 
 /// An S3 Vector index that implements a [`TableProvider`] as a list records operation.
 #[derive(Debug)]
-pub struct S3VectorsListTable(S3VectorsTable);
+pub struct S3VectorsListTable(Index);
 
-impl From<S3VectorsTable> for S3VectorsListTable {
-    fn from(tbl: S3VectorsTable) -> Self {
+impl From<Index> for S3VectorsListTable {
+    fn from(tbl: Index) -> Self {
         Self(tbl)
     }
 }
@@ -109,14 +107,14 @@ impl std::fmt::Debug for S3VectorsListExec {
     }
 }
 
-impl AsRef<S3VectorsTable> for S3VectorsListTable {
-    fn as_ref(&self) -> &S3VectorsTable {
+impl AsRef<Index> for S3VectorsListTable {
+    fn as_ref(&self) -> &Index {
         &self.0
     }
 }
 
 struct S3VectorsListExec {
-    idx: S3VectorIdentifier,
+    idx: IndexIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
     limit: Option<usize>,
@@ -220,7 +218,7 @@ impl ExecutionPlan for S3VectorsListExec {
 #[allow(clippy::cast_possible_wrap)]
 async fn list_vector_stream(
     client: Arc<dyn S3Vectors + Send + Sync>,
-    idx: S3VectorIdentifier,
+    idx: IndexIdentifier,
     schema: SchemaRef,
     limit: usize,
     tx: Sender<DataFusionResult<RecordBatch, DataFusionError>>,
@@ -278,7 +276,7 @@ async fn list_vector_stream(
 
 async fn list_vector_segment(
     client: Arc<dyn S3Vectors + Send + Sync>,
-    idx: S3VectorIdentifier,
+    idx: IndexIdentifier,
     schema: SchemaRef,
     limit: usize,
     segment_index: usize,
