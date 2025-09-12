@@ -35,7 +35,6 @@ pub trait SearchIndex: std::fmt::Debug + Send + Sync + 'static {
     fn search_column(&self) -> String;
 
     /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
-    ///
     fn primary_fields(&self) -> Vec<Field>;
 
     /// The additional columns available in the [`SearchIndex`].
@@ -51,9 +50,6 @@ pub trait SearchIndex: std::fmt::Debug + Send + Sync + 'static {
     /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
     /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
     ///  search score between `query` and the [`SearchIndex::search_column`].
-    ///
-    /// For vector indexes: Returns similarity scores and embedding vectors as metadata.
-    /// For FTS indexes: Returns relevance scores without embedding vectors.
     async fn query_table_provider(
         &self,
         query: &str,

@@ -160,11 +160,6 @@ impl SearchQueryProvider {
         )?))
     }
 
-    /// Get all metadata columns that should be excluded from base table projections
-    fn all_metadata_columns(&self) -> Vec<String> {
-        self.search_index.metadata_columns().all_names()
-    }
-
     /// Get filters that can be handled by the search index
     fn search_index_filters(
         search_index_columns: &std::collections::HashSet<String>,
@@ -234,8 +229,11 @@ impl SearchQueryProvider {
         });
 
         // Need to join with base table
-        let underlying_table_scan =
-            self.underlying_table_scan(table_proj.as_ref(), filters, &self.all_metadata_columns())?;
+        let underlying_table_scan = self.underlying_table_scan(
+            table_proj.as_ref(),
+            filters,
+            &self.search_index.metadata_columns().all_names(),
+        )?;
 
         // Build join conditions based on primary keys
         let join_conditions: Vec<(Column, Column)> = self
