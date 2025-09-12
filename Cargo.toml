@@ -6,6 +6,7 @@ members = [
     "crates/arrow_sql_gen",
     "crates/arrow_tools",
     "crates/aws-sdk-credential-bridge",
+    "crates/chunking",
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",

@@ -15,13 +15,15 @@ limitations under the License.
 use std::sync::Arc;
 
 use snafu::ResultExt;
-use text_splitter::{Characters, ChunkCapacity, ChunkConfig, ChunkConfigError, ChunkSizer};
+use text_splitter::{Characters, ChunkCapacity, ChunkConfig, ChunkConfigError};
 use tokenizers::Tokenizer;
 
 use tiktoken_rs::{
     CoreBPE, get_bpe_from_tokenizer,
     tokenizer::{Tokenizer as OpenAITokenizer, get_tokenizer},
 };
+
+pub use text_splitter::ChunkSizer;
 
 #[derive(Debug, Clone)]
 pub struct ChunkingConfig<'a> {
@@ -90,7 +92,7 @@ impl RecursiveSplittingChunker<Characters> {
     }
 }
 
-pub(crate) struct ArcSizer(Arc<dyn ChunkSizer + Send + Sync>);
+pub struct ArcSizer(Arc<dyn ChunkSizer + Send + Sync>);
 impl ChunkSizer for ArcSizer {
     fn size(&self, chunk: &str) -> usize {
         self.0.size(chunk)
@@ -151,16 +153,8 @@ impl<Sizer: ChunkSizer + Send + Sync> Chunker for RecursiveSplittingChunker<Size
 
 #[cfg(test)]
 mod tests {
-    use std::vec;
-
     use super::*;
-    use crate::{
-        embeddings::Embed,
-        openai::{
-            embed::{DEFAULT_EMBEDDING_MODEL, OpenaiEmbed},
-            new_openai_client,
-        },
-    };
+    use std::vec;
 
     #[test]
     fn test_openai_chunker() {
@@ -171,19 +165,11 @@ mod tests {
             file_format: None,
         };
 
-        let chunker = OpenaiEmbed::new(
-            new_openai_client(
-                DEFAULT_EMBEDDING_MODEL.to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            None,
-        )
-        .chunker(&cfg)
-        .expect("Failed to create OpenAI chunker");
+        let chunker = Arc::new(
+            RecursiveSplittingChunker::for_openai_model("text-embedding-3-small", &cfg)
+                .expect("failed to make chunker"),
+        );
+
         let chunks: Vec<_> = chunker
             .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")
             .collect();

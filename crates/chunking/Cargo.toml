@@ -3,24 +3,25 @@ edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
-name = "parsley"
+name = "chunking"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[dependencies]
-bytes.workspace = true
-clap = { version = "4.5", features = ["derive"] }
-document_parse = { path = "../../crates/document_parse" }
-chunking = { path = "../../crates/chunking" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 
-spicepod = { path = "../../crates/spicepod" }
+[dependencies]
 text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "58f9c21006e01e5e968c5de80a0398b3f5ec439a", features = [
     "markdown",
     "tokenizers",
     "tiktoken-rs",
 ] }
+
+tracing.workspace = true
+tracing-futures.workspace = true
+tokenizers = "0.21.2"
+
+pulldown-cmark = "0.13.0"
 tiktoken-rs = "0.6.0"
-tokenizers = { version = "0.21.2", features = ["http"] }
+
+snafu.workspace = true
+async-trait.workspace = true
