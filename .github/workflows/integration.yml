@@ -34,6 +34,14 @@ on:
 
   workflow_dispatch:
     inputs:
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
       run_all_tests:
         description: 'Run all tests'
         type: boolean
@@ -179,6 +187,7 @@ jobs:
 
       - name: Run integration test
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
