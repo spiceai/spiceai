@@ -57,6 +57,9 @@ pub struct Index {
     // another index. This represents the number of physical indexes this
     // logical index has.
     num_physical_indexes: Arc<Mutex<usize>>, // Cannot clone AtomicUsize
+    dimension: i32,
+    distance_metric: DistanceMetric,
+    metadata_configuration: Option<MetadataConfiguration>,
 }
 
 impl std::fmt::Debug for Index {
@@ -85,13 +88,23 @@ impl Index {
         };
 
         let non_filterable_metadata_columns = columns.non_filterable_names();
+        let metadata_configuration = if non_filterable_metadata_columns.is_empty() {
+            None
+        } else {
+            Some(
+                MetadataConfiguration::builder()
+                    .set_non_filterable_metadata_keys(Some(non_filterable_metadata_columns))
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
+        };
 
         check_or_init_bucket(client.as_ref(), &ident).await?;
         get_or_init_index(
             &ident,
             client.as_ref(),
             dimension,
-            non_filterable_metadata_columns,
+            metadata_configuration.clone(),
             &distance_metric,
         )
         .await?;
@@ -107,6 +120,9 @@ impl Index {
             schema,
             constraints,
             num_physical_indexes,
+            dimension,
+            distance_metric,
+            metadata_configuration,
         })
     }
 
@@ -167,45 +183,47 @@ impl Index {
             })
             .collect();
 
-        let (index_arn, vector_bucket_name, mut index_name) =
-            self.index_identifier_variables().await;
+        let mut partition = { *self.num_physical_indexes.lock().await };
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
+            let (is_arn, input) = self.create_put_inputs(chunk.to_vec(), partition).await?;
             let put_vector_response = self
                 .client
-                .put_vectors(
-                    PutVectorsInput::builder()
-                        .set_index_arn(index_arn.clone())
-                        .set_index_name(index_name.clone())
-                        .set_vector_bucket_name(vector_bucket_name.clone())
-                        .set_vectors(Some(chunk.to_vec()))
-                        .build()
-                        .context(S3VectorBuildSnafu)?,
-                )
+                .put_vectors(input)
                 .await
                 .map_err(|e| e.into_service_error());
 
-            if let Err(PutVectorsError::ServiceQuotaExceededException(e)) = put_vector_response {
-                tracing::debug!("S3 vector index full: {e}");
-                // Index is full. Increase physical count, change index name and retry
-                *self.num_physical_indexes.lock().await += 1;
-                index_name = self.index_identifier_variables().await.2;
-                self.client
-                    .put_vectors(
-                        PutVectorsInput::builder()
-                            .set_index_arn(index_arn.clone())
-                            .set_index_name(index_name.clone())
-                            .set_vector_bucket_name(vector_bucket_name.clone())
-                            .set_vectors(Some(chunk.to_vec()))
-                            .build()
-                            .context(S3VectorBuildSnafu)?,
-                    )
-                    .await
-                    .map_err(|e| Error::S3VectorPutVectorError {
-                        source: e.into_service_error(),
+            match put_vector_response {
+                Ok(_) => {}
+                Err(PutVectorsError::ServiceQuotaExceededException(e)) if !is_arn => {
+                    tracing::debug!("S3 vector index full: {e}");
+                    // spill to new index:
+                    // 1. create new index
+                    // 2. increment physical partitions
+                    // 3. retry PutVectors
+                    {
+                        let mut num_physical_partitions = self.num_physical_indexes.lock().await;
+                        partition = *num_physical_partitions;
+                        create_index(
+                            &self.idx,
+                            partition,
+                            self.client.as_ref(),
+                            self.dimension,
+                            self.distance_metric.clone(),
+                            self.metadata_configuration.clone(),
+                        )
+                        .await?;
+                        *num_physical_partitions += 1;
+                    }
+
+                    let (_, input) = self.create_put_inputs(chunk.to_vec(), partition).await?;
+                    self.client.put_vectors(input).await.map_err(|e| {
+                        Error::S3VectorPutVectorError {
+                            source: e.into_service_error(),
+                        }
                     })?;
-            } else {
-                put_vector_response.map_err(|source| Error::S3VectorPutVectorError { source })?;
+                }
+                Err(source) => return Err(Error::S3VectorPutVectorError { source }),
             }
         }
 
@@ -218,16 +236,32 @@ impl Index {
         Ok(())
     }
 
-    async fn index_identifier_variables(&self) -> (Option<String>, Option<String>, Option<String>) {
-        let (index_arn, vector_bucket_name, mut index_name) = self.idx.index_identifier_variables();
+    async fn create_put_inputs(
+        &self,
+        vectors: Vec<PutInputVector>,
+        partition: usize,
+    ) -> Result<(bool, PutVectorsInput)> {
+        let builder = PutVectorsInput::builder();
+        let (is_arn, builder) = match &self.idx {
+            IndexIdentifier::Arn(arn) => (true, builder.set_index_arn(Some(arn.clone()))),
+            IndexIdentifier::Name {
+                bucket_name,
+                index_name,
+            } => (
+                false,
+                builder
+                    .set_vector_bucket_name(Some(bucket_name.clone()))
+                    .set_index_name(Some(partitioned_index_name(index_name, partition))),
+            ),
+        };
 
-        // If this isn't an index specified by an ARN, then we will name the index with the partition number
-        if let (None, Some(index)) = (&index_arn, &index_name) {
-            let partition_number = *self.num_physical_indexes.lock().await;
-            index_name = Some(format!("{index}_{partition_number}"));
-        }
-
-        (index_arn, vector_bucket_name, index_name)
+        Ok((
+            is_arn,
+            builder
+                .set_vectors(Some(vectors))
+                .build()
+                .context(S3VectorBuildSnafu)?,
+        ))
     }
 }
 
@@ -282,7 +316,7 @@ async fn get_or_init_index(
     ident: &IndexIdentifier,
     client: &(dyn S3Vectors + Send + Sync),
     dimension: i32,
-    non_filterable_metadata_columns: Vec<String>,
+    metadata_configuration: Option<MetadataConfiguration>,
     distance_metric: &DistanceMetric,
 ) -> Result<()> {
     let builder = GetIndexInput::builder();
@@ -321,19 +355,9 @@ async fn get_or_init_index(
         }
     };
 
-    let metadata_configuration = if non_filterable_metadata_columns.is_empty() {
-        None
-    } else {
-        Some(
-            MetadataConfiguration::builder()
-                .set_non_filterable_metadata_keys(Some(non_filterable_metadata_columns))
-                .build()
-                .context(S3VectorBuildSnafu)?,
-        )
-    };
-
     create_index(
-        ident,
+        &ident,
+        0,
         client,
         dimension,
         distance_metric.clone(),
@@ -409,6 +433,7 @@ async fn check_or_init_bucket(
 
 async fn create_index(
     ident: &IndexIdentifier,
+    partition: usize,
     client: &(dyn S3Vectors + Send + Sync),
     dimension: i32,
     distance_metric: DistanceMetric,
@@ -417,11 +442,12 @@ async fn create_index(
     let IndexIdentifier::Name {
         bucket_name,
         index_name,
-    } = ident
+    } = &ident
     else {
         return Err(Error::CreateIndexUsingArn);
     };
 
+    let index_name = partitioned_index_name(index_name, partition);
     let input = CreateIndexInput::builder()
         .data_type(s3_vectors::DataType::Float32)
         .dimension(dimension)
@@ -480,6 +506,10 @@ fn primary_key(schema: &SchemaRef) -> Constraints {
         .column_with_name(S3_VECTOR_PRIMARY_KEY_NAME)
         .map(|(i, _)| Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![i])]))
         .unwrap_or_default()
+}
+
+fn partitioned_index_name(index_name: &str, partition: usize) -> String {
+    format!("{index_name}_{partition}")
 }
 
 #[cfg(test)]

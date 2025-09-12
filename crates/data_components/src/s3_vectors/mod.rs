@@ -113,14 +113,6 @@ pub enum IndexIdentifier {
 }
 
 impl IndexIdentifier {
-    fn arn(&self) -> Option<String> {
-        if let Self::Arn(arn) = self {
-            Some(arn.clone())
-        } else {
-            None
-        }
-    }
-
     fn bucket_name(&self) -> Option<String> {
         if let Self::Name { bucket_name, .. } = self {
             Some(bucket_name.clone())
@@ -129,17 +121,11 @@ impl IndexIdentifier {
         }
     }
 
-    fn index_name(&self) -> Option<String> {
-        if let Self::Name { index_name, .. } = self {
-            Some(index_name.clone())
-        } else {
-            None
-        }
-    }
-
     /// Return (index arn, bucket name and index name) based on how the vector index is identified.
     #[must_use]
-    pub fn index_identifier_variables(&self) -> (Option<String>, Option<String>, Option<String>) {
+    pub(crate) fn index_identifier_variables(
+        &self,
+    ) -> (Option<String>, Option<String>, Option<String>) {
         match self {
             Self::Name {
                 bucket_name,
