@@ -23,5 +23,6 @@ snafu.workspace = true
 tracing.workspace = true
 iceberg.workspace = true
 iceberg-catalog-glue.workspace = true
+parking_lot.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true

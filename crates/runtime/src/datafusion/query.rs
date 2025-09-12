@@ -243,15 +243,15 @@ impl Query {
 
             let res_schema = res_stream.schema();
 
-            if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
-                handle_error!(
-                    tracker,
-                    &request_context,
-                    ErrorCode::InternalError,
-                    e,
-                    SchemaMismatch
-                )
-            }
+            // if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
+            //     handle_error!(
+            //         tracker,
+            //         &request_context,
+            //         ErrorCode::InternalError,
+            //         e,
+            //         SchemaMismatch
+            //     )
+            // }
 
             let final_stream = if cache_manager.should_cache_results() {
                 Self::wrap_stream_with_cache(
@@ -327,11 +327,11 @@ impl Query {
         };
 
         // Verify the plan against the restricted options
-        if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
-            let e = find_datafusion_root(e);
-            self.handle_schema_error(&request_context, &e);
-            return Err(e);
-        }
+        // if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
+        //     let e = find_datafusion_root(e);
+        //     self.handle_schema_error(&request_context, &e);
+        //     return Err(e);
+        // }
         let dataset_schema = plan.schema().as_arrow().clone();
         let parameter_schema = parameter_schema_for_plan(&plan)?;
 

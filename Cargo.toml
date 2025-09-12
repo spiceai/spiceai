@@ -160,6 +160,7 @@ opentelemetry_sdk = { version = "0.27", default-features = false, features = [
     "trace",
 ] }
 parquet = "55.2"
+parking_lot = "0.12.4"
 paste = "1.0.15"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
@@ -225,11 +226,11 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "0c7ce0f94a4d3888ab280d81f06106ed736aba24" }            # spiceai/spiceai-48
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "0c7ce0f94a4d3888ab280d81f06106ed736aba24" }     # spiceai/spiceai-48
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "0c7ce0f94a4d3888ab280d81f06106ed736aba24" } # spiceai/spiceai-48
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "0c7ce0f94a4d3888ab280d81f06106ed736aba24" }  # spiceai/spiceai-48
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "0c7ce0f94a4d3888ab280d81f06106ed736aba24" }       # spiceai/spiceai-48
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "9c42b574cc3b2ef4043b18cfa241bba3657bd641" }            # phillip/spiceai-48-add-register-file-format
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "9c42b574cc3b2ef4043b18cfa241bba3657bd641" }     # phillip/spiceai-48-add-register-file-format
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "9c42b574cc3b2ef4043b18cfa241bba3657bd641" } # phillip/spiceai-48-add-register-file-format
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "9c42b574cc3b2ef4043b18cfa241bba3657bd641" }  # phillip/spiceai-48-add-register-file-format
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "9c42b574cc3b2ef4043b18cfa241bba3657bd641" }       # phillip/spiceai-48-add-register-file-format
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "c920a7501cdbfe906bf8c7d4959367fd47f00774" }                      # spiceai-48
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "3c139e8c4cd7b22d2b3ee72c95d3478932e49cac" } # spiceai
@@ -243,11 +244,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" }              # phillip/250911-poc-writing
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" } # phillip/250911-poc-writing
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" } # phillip/250911-poc-writing
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" }   # phillip/250911-poc-writing
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "77cf45fa86a4462527ef3a34777736a90e4e7991" }   # phillip/250911-poc-writing
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "486bfc717f9e807c3cdcb2016b6d1a95b8a70931" }              # phillip/250911-poc-writing
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "486bfc717f9e807c3cdcb2016b6d1a95b8a70931" } # phillip/250911-poc-writing
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "486bfc717f9e807c3cdcb2016b6d1a95b8a70931" } # phillip/250911-poc-writing
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "486bfc717f9e807c3cdcb2016b6d1a95b8a70931" }   # phillip/250911-poc-writing
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "486bfc717f9e807c3cdcb2016b6d1a95b8a70931" }   # phillip/250911-poc-writing
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 

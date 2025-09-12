@@ -22,6 +22,7 @@ use std::{
 
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
+use dataformat_iceberg::IcebergFileFormat;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -164,14 +165,15 @@ impl DataFusionBuilder {
             .with_analyzer_rules(get_analyzer_rules())
             .build();
 
-        state.register_file_format()
-
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
         }
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
+
+        let iceberg_file_format = IcebergFileFormat::new(ctx.state_weak_ref());
+        let _ = ctx.register_file_format(Arc::new(iceberg_file_format), true);
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();

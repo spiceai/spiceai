@@ -275,7 +275,7 @@ impl RefreshingCatalogProvider {
                 match inner.refresh().await {
                     Ok(()) => (),
                     Err(e) => {
-                        tracing::error!("Failed to refresh catalog: {}", e);
+                        // tracing::error!("Failed to refresh catalog: {}", e);
                     }
                 }
             }

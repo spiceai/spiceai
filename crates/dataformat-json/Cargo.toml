@@ -19,3 +19,4 @@ datafusion-datasource.workspace = true
 object_store.workspace = true
 snafu.workspace = true
 tracing.workspace = true
+parking_lot.workspace = true
