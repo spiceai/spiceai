@@ -22,7 +22,8 @@ use std::{
 };
 
 use crate::{
-    http::traceparent::override_task_history_with_traceparent, model::LLMChatCompletionsModelStore,
+    model::LLMChatCompletionsModelStore,
+    request::{AsyncMarker, RequestContext},
 };
 #[cfg(feature = "openapi")]
 use async_openai::types::CreateChatCompletionResponse;
@@ -124,6 +125,8 @@ pub(crate) async fn post(
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+
     let span = tracing::span!(
         target: "task_history",
         tracing::Level::INFO,
@@ -132,7 +135,9 @@ pub(crate) async fn post(
     );
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
 
-    override_task_history_with_traceparent(&span.clone(), &headers);
+    if let Some(traceparent) = context.trace_parent() {
+        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+    }
 
     let span_clone = span.clone();
     async move {
