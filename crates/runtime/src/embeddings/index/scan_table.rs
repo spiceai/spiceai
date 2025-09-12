@@ -226,7 +226,7 @@ impl TableProvider for VectorScanTableProvider {
         };
 
         let output_plan = if search_index_table_is_sufficient(
-            projection_schema.fields().iter().collect(),
+            projection_schema.fields().iter().as_slice(),
             &vector_table_scan,
             filters,
         ) {

@@ -38,7 +38,7 @@ pub trait VectorIndex: SearchIndex {
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(
-    projection: Vec<&FieldRef>,
+    projection: &[FieldRef],
     search_index: &LogicalPlan,
     filters: &[Expr],
 ) -> bool {
@@ -57,7 +57,7 @@ pub(super) fn search_index_table_is_sufficient(
 
 /// Returns true if the projection (relative to search query table provider) can be handled by the given search index schema.
 pub(super) fn search_index_has_full_projection(
-    projection: &[&FieldRef],
+    projection: &[FieldRef],
     search_index_columns: &HashSet<String>,
 ) -> bool {
     let columns_requested: HashSet<String> = projection.iter().map(|f| f.name().clone()).collect();
