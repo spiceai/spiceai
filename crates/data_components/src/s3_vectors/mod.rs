@@ -24,7 +24,7 @@ use snafu::Snafu;
 mod index;
 pub mod list_provider;
 pub mod query_provider;
-pub use index::{Index, S3VectorTableResult};
+pub use index::Index;
 mod metadata_column;
 pub use metadata_column::{MetadataColumn, MetadataColumns};
 

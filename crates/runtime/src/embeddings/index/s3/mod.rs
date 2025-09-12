@@ -20,7 +20,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{Index, IndexIdentifier, MetadataColumn, MetadataColumns};
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
-use s3_vectors::{Client, S3Vectors};
+use s3_vectors::{Client, DistanceMetric, S3Vectors};
 use search::generation::util::get_primary_keys;
 use snafu::ResultExt;
 use spicepod::{
@@ -194,20 +194,17 @@ async fn try_vector_table(
         ));
     };
 
-    let Some(vector_table) = Index::try_create_new_table(
+    let distance_metric = string_from_params(&params, "distance_metric")
+        .and_then(|s| DistanceMetric::from_str(s).ok());
+
+    Ok(Index::new(
         id,
         s3_vector_client,
-        dimension as i64,
+        dimension.try_into().unwrap_or(i32::MAX),
         columns,
-        string_from_params(&params, "distance_metric"),
+        distance_metric,
     )
-    .await?
-    else {
-        return Err(Box::from(
-            "S3 Vectors index does not exist. After it was created, it still does not exist. Unexpected.".to_string()
-        ));
-    };
-    Ok(vector_table)
+    .await?)
 }
 
 // Attempt to get a certain string-value from the parameter.

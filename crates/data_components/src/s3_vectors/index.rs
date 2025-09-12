@@ -29,10 +29,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
-    CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
-    GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput, ListIndexesInput,
-    ListIndexesOutput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
-    PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
+    CreateIndexInput, CreateIndexOutput, CreateVectorBucketInput, DistanceMetric, Document,
+    GetIndexError, GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
+    ListIndexesInput, ListIndexesOutput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS,
+    PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -69,258 +69,45 @@ impl std::fmt::Debug for Index {
     }
 }
 
-pub enum S3VectorTableResult {
-    IndexDoesNotExist,
-    BucketDoesNotExist,
-    Table(Index),
-}
-
-impl S3VectorTableResult {
-    #[must_use]
-    pub fn table(self) -> Option<Index> {
-        match self {
-            S3VectorTableResult::Table(table) => Some(table),
-            _ => None,
-        }
-    }
-}
-
 impl Index {
-    // Returns an [`S3VectorTableResult`] if the [`S3VectorIdentifier`] does not exist. Use [`Self::try_create_new_identifier`].
-    pub async fn try_new_table(
-        id: IndexIdentifier,
+    pub async fn new(
+        ident: IndexIdentifier,
         client: Arc<dyn S3Vectors + Send + Sync>,
+        dimension: i32,
         columns: MetadataColumns,
-        distance_metric: &DistanceMetric,
-    ) -> Result<S3VectorTableResult> {
-        if !Self::check_if_bucket_exists(&client, &id).await? {
-            return Ok(S3VectorTableResult::BucketDoesNotExist);
-        }
-        match Self::get_index_if_exists(&id, &client).await? {
-            Some(GetIndexOutput {
-                index: Some(index), ..
-            }) => {
-                if index.distance_metric() != distance_metric {
-                    return Err(Error::IncompatibleDistanceMetric {
-                        exists: index.distance_metric,
-                        specified: distance_metric.clone(),
-                    });
-                }
+        distance_metric: Option<DistanceMetric>,
+    ) -> Result<Self, Error> {
+        let distance_metric = match distance_metric.unwrap_or(DistanceMetric::Cosine) {
+            distance_metric @ (DistanceMetric::Cosine | DistanceMetric::Euclidean) => {
+                distance_metric
             }
-            None => return Ok(S3VectorTableResult::IndexDoesNotExist),
-            Some(_) => {}
-        }
+            distance_metric => return Err(Error::InvalidDistanceMetric { distance_metric }),
+        };
 
-        let num_physical_indexes = infer_num_physical_indexes(&id, client.as_ref()).await?;
+        let non_filterable_metadata_columns = columns.non_filterable_names();
+
+        check_or_init_bucket(client.as_ref(), &ident).await?;
+        get_or_init_index(
+            &ident,
+            client.as_ref(),
+            dimension,
+            non_filterable_metadata_columns,
+            &distance_metric,
+        )
+        .await?;
+
+        let num_physical_indexes = infer_num_physical_indexes(&ident, client.as_ref()).await?;
         let num_physical_indexes = Arc::new(Mutex::new(num_physical_indexes));
 
-        let schema = Self::compute_schema(columns);
-        let constraints = Self::primary_key(&schema);
-        Ok(S3VectorTableResult::Table(Self {
-            idx: id,
+        let schema = compute_schema(columns);
+        let constraints = primary_key(&schema);
+        Ok(Self {
+            idx: ident,
             client,
             schema,
             constraints,
             num_physical_indexes,
-        }))
-    }
-
-    pub async fn try_create_new_table(
-        id: IndexIdentifier,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        dimension: i64,
-        columns: MetadataColumns,
-        distance_metric: Option<impl Into<DistanceMetric>>,
-    ) -> Result<Option<Self>> {
-        let non_filterable_metadata_columns = columns.non_filterable_names();
-
-        let distance_metric = match distance_metric.map(Into::into) {
-            // Default to `DistanceMetric::Cosine` for backwards compatibility.
-            Some(DistanceMetric::Cosine) | None => DistanceMetric::Cosine,
-            Some(DistanceMetric::Euclidean) => DistanceMetric::Euclidean,
-            Some(distance_metric) => {
-                return Err(Error::InvalidDistanceMetric { distance_metric });
-            }
-        };
-
-        match Self::try_new_table(
-            id.clone(),
-            Arc::clone(&client),
-            columns.clone(),
-            &distance_metric,
-        )
-        .await?
-        {
-            S3VectorTableResult::Table(slf) => Ok(Some(slf)),
-            S3VectorTableResult::BucketDoesNotExist => {
-                Self::create_bucket(&client, &id).await?;
-                Self::create_index(
-                    &client,
-                    dimension,
-                    &id,
-                    non_filterable_metadata_columns,
-                    &distance_metric,
-                )
-                .await?;
-                Self::try_new_table(id, client, columns, &distance_metric)
-                    .await
-                    .map(S3VectorTableResult::table)
-            }
-            S3VectorTableResult::IndexDoesNotExist => {
-                Self::create_index(
-                    &client,
-                    dimension,
-                    &id,
-                    non_filterable_metadata_columns,
-                    &distance_metric,
-                )
-                .await?;
-                Self::try_new_table(id, client, columns, &distance_metric)
-                    .await
-                    .map(S3VectorTableResult::table)
-            }
-        }
-    }
-
-    async fn create_index(
-        client: &Arc<dyn S3Vectors + Send + Sync>,
-        dimension: i64,
-        vector_id: &IndexIdentifier,
-        non_filterable_metadata_columns: Vec<String>,
-        distance_metric: &DistanceMetric,
-    ) -> Result<()> {
-        let IndexIdentifier::Name {
-            bucket_name,
-            index_name,
-        } = vector_id
-        else {
-            return Err(Error::CreateIndexUsingArn);
-        };
-
-        let metadata_configuration = if non_filterable_metadata_columns.is_empty() {
-            None
-        } else {
-            Some(
-                MetadataConfiguration::builder()
-                    .set_non_filterable_metadata_keys(Some(non_filterable_metadata_columns))
-                    .build()
-                    .context(S3VectorBuildSnafu)?,
-            )
-        };
-
-        client
-            .create_index(
-                CreateIndexInput::builder()
-                    .data_type(s3_vectors::DataType::Float32)
-                    .dimension(dimension.try_into().unwrap_or(i32::MAX))
-                    .distance_metric(distance_metric.clone())
-                    .index_name(index_name)
-                    .set_metadata_configuration(metadata_configuration)
-                    .vector_bucket_name(bucket_name)
-                    .build()
-                    .context(S3VectorBuildSnafu)?,
-            )
-            .await
-            .map_err(|e| Error::S3VectorCreateIndexError {
-                source: e.into_service_error(),
-            })?;
-        Ok(())
-    }
-
-    async fn create_bucket(
-        client: &Arc<dyn S3Vectors + Send + Sync>,
-        id: &IndexIdentifier,
-    ) -> Result<()> {
-        let IndexIdentifier::Name { bucket_name, .. } = id else {
-            return Err(Error::CreateIndexUsingArn);
-        };
-        client
-            .create_vector_bucket(
-                CreateVectorBucketInput::builder()
-                    .vector_bucket_name(bucket_name.clone())
-                    .build()
-                    .context(S3VectorBuildSnafu)?,
-            )
-            .await
-            .map_err(|e| Error::S3VectorCreateBucketError {
-                source: e.into_service_error(),
-            })?;
-        Ok(())
-    }
-
-    async fn check_if_bucket_exists(
-        client: &Arc<dyn S3Vectors + Send + Sync>,
-        id: &IndexIdentifier,
-    ) -> Result<bool> {
-        let bucket_name_opt = match id {
-            IndexIdentifier::Name { bucket_name, .. } => Some(bucket_name.clone()),
-            IndexIdentifier::Arn(_) => None,
-        };
-        match client
-            .get_vector_bucket(
-                GetVectorBucketInput::builder()
-                    .set_vector_bucket_name(bucket_name_opt)
-                    .build()
-                    .context(S3VectorBuildSnafu)?,
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(SdkError::ServiceError(e))
-                if matches!(&e.err(), GetVectorBucketError::NotFoundException(_)) =>
-            {
-                Ok(false)
-            }
-            Err(e) => match &e {
-                SdkError::DispatchFailure(d) => {
-                    if let Some(credentials_error) = d
-                        .as_connector_error()
-                        .and_then(|e| e.source())
-                        .and_then(|s| s.downcast_ref::<CredentialsError>())
-                        .map(ToString::to_string)
-                    {
-                        return Err(Error::UnableToLoadCredentials {
-                            message: credentials_error,
-                        });
-                    }
-                    Err(Error::S3VectorGetBucketError {
-                        source: e.into_service_error(),
-                    })
-                }
-                _ => Err(Error::S3VectorGetBucketError {
-                    source: e.into_service_error(),
-                }),
-            },
-        }
-    }
-
-    /// Returns whether the index exists.
-    async fn get_index_if_exists(
-        index: &IndexIdentifier,
-        client: &Arc<dyn S3Vectors + Send + Sync>,
-    ) -> Result<Option<GetIndexOutput>> {
-        let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
-        match client
-            .get_index(
-                GetIndexInput::builder()
-                    .set_index_arn(index_arn)
-                    .set_vector_bucket_name(vector_bucket_name)
-                    .set_index_name(index_name)
-                    .build()
-                    .context(S3VectorBuildSnafu)?,
-            )
-            .await
-        {
-            Err(SdkError::ServiceError(e))
-                if matches!(&e.err(), GetIndexError::NotFoundException(_msg)) =>
-            {
-                Ok(None)
-            }
-            Ok(output) => Ok(Some(output)),
-            Err(e) => Err(Error::S3VectorGetIndexError {
-                source: e.into_service_error(),
-            }),
-        }
+        })
     }
 
     pub(crate) fn is_filterable_column(&self, column: &str) -> bool {
@@ -328,48 +115,6 @@ impl Index {
             return false;
         };
         f.metadata().get("filterable").eq(&Some(&true.to_string()))
-    }
-
-    fn compute_schema(columns: MetadataColumns) -> SchemaRef {
-        Arc::new(Schema::new(
-            [
-                columns
-                    .into_iter()
-                    .map(|c| {
-                        let f = c.field();
-                        Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable())
-                            .with_metadata(
-                                [(
-                                    "filterable".to_string(),
-                                    (matches!(c, MetadataColumn::Filterable(_))).to_string(),
-                                )]
-                                .into(),
-                            )
-                            .into()
-                    })
-                    .collect(),
-                vec![
-                    Arc::new(Field::new_list(
-                        S3_VECTOR_EMBEDDING_NAME,
-                        Field::new("item", DataType::Float32, false),
-                        true,
-                    )),
-                    Arc::new(Field::new(
-                        S3_VECTOR_PRIMARY_KEY_NAME,
-                        DataType::Utf8,
-                        false,
-                    )),
-                ],
-            ]
-            .concat(),
-        ))
-    }
-
-    fn primary_key(schema: &SchemaRef) -> Constraints {
-        schema
-            .column_with_name(S3_VECTOR_PRIMARY_KEY_NAME)
-            .map(|(i, _)| Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![i])]))
-            .unwrap_or_default()
     }
 
     /// Writes new data to the s3 vector index.
@@ -531,6 +276,210 @@ async fn infer_num_physical_indexes(
             Ok(index_names.len())
         }
     }
+}
+
+async fn get_or_init_index(
+    ident: &IndexIdentifier,
+    client: &(dyn S3Vectors + Send + Sync),
+    dimension: i32,
+    non_filterable_metadata_columns: Vec<String>,
+    distance_metric: &DistanceMetric,
+) -> Result<()> {
+    let builder = GetIndexInput::builder();
+    let builder = match ident {
+        IndexIdentifier::Arn(arn) => builder.set_index_arn(Some(arn.clone())),
+        IndexIdentifier::Name {
+            bucket_name,
+            index_name,
+        } => builder
+            .set_vector_bucket_name(Some(bucket_name.clone()))
+            .set_index_name(Some(index_name.clone())),
+    };
+
+    let input = builder.build().context(S3VectorBuildSnafu)?;
+
+    match client.get_index(input).await {
+        Err(SdkError::ServiceError(e))
+            if matches!(&e.err(), GetIndexError::NotFoundException(_msg)) =>
+        {
+            // create index below
+        }
+        Ok(GetIndexOutput { index, .. }) => {
+            return match index {
+                Some(index) if index.distance_metric() != distance_metric => {
+                    Err(Error::InvalidDistanceMetric {
+                        distance_metric: index.distance_metric().clone(),
+                    })
+                }
+                _ => Ok(()),
+            };
+        }
+        Err(e) => {
+            return Err(Error::S3VectorGetIndexError {
+                source: e.into_service_error(),
+            });
+        }
+    };
+
+    let metadata_configuration = if non_filterable_metadata_columns.is_empty() {
+        None
+    } else {
+        Some(
+            MetadataConfiguration::builder()
+                .set_non_filterable_metadata_keys(Some(non_filterable_metadata_columns))
+                .build()
+                .context(S3VectorBuildSnafu)?,
+        )
+    };
+
+    create_index(
+        ident,
+        client,
+        dimension,
+        distance_metric.clone(),
+        metadata_configuration,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn check_or_init_bucket(
+    client: &(dyn S3Vectors + Send + Sync),
+    ident: &IndexIdentifier,
+) -> Result<()> {
+    let input = GetVectorBucketInput::builder()
+        .set_vector_bucket_name(ident.bucket_name())
+        .build()
+        .context(S3VectorBuildSnafu)?;
+
+    match client.get_vector_bucket(input).await {
+        Ok(_) => return Ok(()),
+        Err(SdkError::ServiceError(e))
+            if matches!(&e.err(), GetVectorBucketError::NotFoundException(_)) =>
+        {
+            // Create a new bucket below
+        }
+        Err(e) => {
+            let e = match &e {
+                SdkError::DispatchFailure(d) => {
+                    if let Some(credentials_error) = d
+                        .as_connector_error()
+                        .and_then(|e| e.source())
+                        .and_then(|s| s.downcast_ref::<CredentialsError>())
+                        .map(ToString::to_string)
+                    {
+                        Err(Error::UnableToLoadCredentials {
+                            message: credentials_error,
+                        })
+                    } else {
+                        Err(Error::S3VectorGetBucketError {
+                            source: e.into_service_error(),
+                        })
+                    }
+                }
+                _ => Err(Error::S3VectorGetBucketError {
+                    source: e.into_service_error(),
+                }),
+            };
+
+            return e;
+        }
+    }
+
+    let Some(bucket_name) = ident.bucket_name() else {
+        return Err(Error::CreateIndexUsingArn);
+    };
+
+    // Create the bucket
+    client
+        .create_vector_bucket(
+            CreateVectorBucketInput::builder()
+                .vector_bucket_name(bucket_name)
+                .build()
+                .context(S3VectorBuildSnafu)?,
+        )
+        .await
+        .map_err(|e| Error::S3VectorCreateBucketError {
+            source: e.into_service_error(),
+        })?;
+
+    Ok(())
+}
+
+async fn create_index(
+    ident: &IndexIdentifier,
+    client: &(dyn S3Vectors + Send + Sync),
+    dimension: i32,
+    distance_metric: DistanceMetric,
+    metadata_configuration: Option<MetadataConfiguration>,
+) -> Result<CreateIndexOutput> {
+    let IndexIdentifier::Name {
+        bucket_name,
+        index_name,
+    } = ident
+    else {
+        return Err(Error::CreateIndexUsingArn);
+    };
+
+    let input = CreateIndexInput::builder()
+        .data_type(s3_vectors::DataType::Float32)
+        .dimension(dimension)
+        .distance_metric(distance_metric)
+        .index_name(index_name)
+        .set_metadata_configuration(metadata_configuration)
+        .vector_bucket_name(bucket_name)
+        .build()
+        .context(S3VectorBuildSnafu)?;
+
+    client
+        .create_index(input)
+        .await
+        .map_err(|e| Error::S3VectorCreateIndexError {
+            source: e.into_service_error(),
+        })
+}
+
+fn compute_schema(columns: MetadataColumns) -> SchemaRef {
+    Arc::new(Schema::new(
+        [
+            columns
+                .into_iter()
+                .map(|c| {
+                    let f = c.field();
+                    Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable())
+                        .with_metadata(
+                            [(
+                                "filterable".to_string(),
+                                (matches!(c, MetadataColumn::Filterable(_))).to_string(),
+                            )]
+                            .into(),
+                        )
+                        .into()
+                })
+                .collect(),
+            vec![
+                Arc::new(Field::new_list(
+                    S3_VECTOR_EMBEDDING_NAME,
+                    Field::new("item", DataType::Float32, false),
+                    true,
+                )),
+                Arc::new(Field::new(
+                    S3_VECTOR_PRIMARY_KEY_NAME,
+                    DataType::Utf8,
+                    false,
+                )),
+            ],
+        ]
+        .concat(),
+    ))
+}
+
+fn primary_key(schema: &SchemaRef) -> Constraints {
+    schema
+        .column_with_name(S3_VECTOR_PRIMARY_KEY_NAME)
+        .map(|(i, _)| Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![i])]))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
