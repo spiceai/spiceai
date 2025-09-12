@@ -14,12 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroUsize,
-    sync::{Arc, RwLock},
-};
-
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 use datafusion::{
@@ -40,6 +34,12 @@ use datafusion::{
 };
 use datafusion_federation::sql::federation_analyzer_rule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use std::sync::LazyLock;
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+    sync::{Arc, RwLock},
+};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use crate::status;
@@ -51,18 +51,7 @@ use super::{
     schema::SpiceSchemaProvider,
 };
 
-pub struct DataFusionBuilder {
-    config: SessionConfig,
-    status: Arc<status::RuntimeStatus>,
-    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
-    memory_limit: Option<u64>,
-    temp_directory: Option<String>,
-    accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
-    task_history_enabled: bool,
-    caching: Option<Arc<Caching>>,
-}
-
-pub(crate) fn get_df_default_config() -> SessionConfig {
+pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
 
     // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.
@@ -87,7 +76,25 @@ pub(crate) fn get_df_default_config() -> SessionConfig {
         .execution
         .skip_physical_aggregate_schema_check = true;
 
-    df_config
+    RwLock::new(df_config)
+});
+
+pub struct DataFusionBuilder {
+    config: SessionConfig,
+    status: Arc<status::RuntimeStatus>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    memory_limit: Option<u64>,
+    temp_directory: Option<String>,
+    accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
+    task_history_enabled: bool,
+    caching: Option<Arc<Caching>>,
+}
+
+pub(crate) fn get_df_default_config() -> SessionConfig {
+    match DEFAULT_DATAFUSION_CONFIG.read() {
+        Ok(config) => config.clone(),
+        _ => panic!("Failed to read default DataFusion config. This is a bug."),
+    }
 }
 
 impl DataFusionBuilder {

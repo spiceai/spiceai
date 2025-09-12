@@ -51,13 +51,8 @@ async fn test_clickbench_query(query: &str) -> Result<(), anyhow::Error> {
                 .with_dataset(get_hits_small_accelerated_dataset())
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

@@ -22,7 +22,7 @@ use app::App;
 use datafusion::common::Column;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::generation::CandidateGeneration;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::generation::util::get_primary_keys;
@@ -39,22 +39,22 @@ use crate::search::full_text::as_candidate_generations;
 use super::{Error, Result};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
-pub(crate) fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
+pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
-) -> Option<Arc<T>> {
-    let mut current_tbl = Arc::clone(tbl);
+) -> Option<&T> {
+    let mut current_tbl = tbl;
 
     // For the many possible wrapping [`TableProvider`], attempt to find the concrete `impl TableProvider`.
     // Also avoids having to [`Box::pin`] for recursive `async fn`.
     loop {
         // Attempt to downcast the current table to the desired type.
         if let Some(found_table) = current_tbl.as_any().downcast_ref::<T>() {
-            return Some(Arc::new(found_table.clone()));
+            return Some(found_table);
         }
 
         // Handle specific table wrapping logic.
         if let Some(index_table) = current_tbl.as_any().downcast_ref::<IndexedTableProvider>() {
-            current_tbl = index_table.get_underlying();
+            current_tbl = index_table.get_underlying_ref();
             continue;
         }
 
@@ -62,22 +62,42 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
         {
-            if let Some(adapted_tbl) = adaptor.table_provider.clone() {
+            if let Some(adapted_tbl) = adaptor.table_provider.as_ref() {
                 current_tbl = adapted_tbl;
                 continue;
             }
         }
 
+        if let Some(embedding_table) = current_tbl.as_any().downcast_ref::<EmbeddingTable>() {
+            current_tbl = embedding_table.get_underlying_ref();
+            continue;
+        }
+
         if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
             current_tbl = accelerated_table
-                .get_federated_table()
-                .try_table_provider_sync()?;
+                .get_federated_table_ref()
+                .try_table_provider_sync_ref()?;
             continue;
         }
 
         // Exit if no further wrapping is found.
         return None;
     }
+}
+
+pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
+    tbl: &Arc<dyn TableProvider>,
+) -> Option<Vec<&T>> {
+    let mut indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(tbl);
+    while let Some(indexed_table) = indexed_table_opt {
+        let indexes = indexed_table.get_indexes::<T>();
+        if !indexes.is_empty() {
+            return Some(indexes);
+        }
+        indexed_table_opt =
+            find_concrete_table_provider::<IndexedTableProvider>(&indexed_table.underlying);
+    }
+    None
 }
 
 /// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
@@ -211,10 +231,12 @@ pub async fn full_text_search_candidates(
     df: &Arc<DataFusion>,
     tbl: &TableReference,
 ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
-    let table_provider = df.get_table(tbl).await?;
+    let base_table_provider = df.get_table(tbl).await?;
+    let index_table_provider = Arc::clone(&base_table_provider);
 
     // If the table exists, but does not have full text search support, return no candidates.
-    let Some(indexed_table) = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)
+    let Some(indexed_table) =
+        find_concrete_table_provider::<IndexedTableProvider>(&index_table_provider)
     else {
         return Some(Ok(vec![]));
     };
@@ -225,7 +247,7 @@ pub async fn full_text_search_candidates(
 
     Some(
         as_candidate_generations(
-            &fts.with_new_base(table_provider),
+            &fts.with_new_base(base_table_provider),
             Arc::clone(df),
             tbl.clone(),
         )
