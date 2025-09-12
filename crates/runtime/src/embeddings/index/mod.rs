@@ -117,7 +117,7 @@ pub mod tests {
 
     use crate::{
         embedding_col,
-        embeddings::index::{SearchIndex, vector::VectorIndex},
+        embeddings::index::{SearchIndex, VectorIndex},
     };
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.

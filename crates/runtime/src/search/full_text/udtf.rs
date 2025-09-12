@@ -44,7 +44,6 @@ use datafusion::{
     sql::TableReference,
 };
 
-use runtime_datafusion_index::IndexedTableProvider;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
     provider::SearchQueryProvider,

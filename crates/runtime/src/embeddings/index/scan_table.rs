@@ -37,7 +37,7 @@ use crate::{
     embedding_col,
     embeddings::index::{VectorIndex, search_index_table_is_sufficient},
 };
-use search::{generation::util::append_fields, index::SearchIndex};
+use search::generation::util::append_fields;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
