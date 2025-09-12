@@ -192,15 +192,18 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Path to the SSL/TLS CA certificate file for server verification."),
     ParameterSpec::component("enable_ssl_certificate_verification")
         .default("true")
-        .description("Enable SSL/TLS certificate verification. Default: 'true'."),
+        .description("Enable SSL/TLS certificate verification. Default: 'true'.")
+        .is_boolean(),
     ParameterSpec::component("ssl_endpoint_identification_algorithm")
         .default("https")
-        .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
+        .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.")
+        .one_of(&["none", "https"]),
     ParameterSpec::runtime("schema_infer_max_records")
         .default("1")
         .description("Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure."),
     ParameterSpec::runtime("flatten_json")
-        .description("Set true to flatten nested structs in JSON as separate columns."),
+        .description("Set true to flatten nested structs in JSON as separate columns.")
+        .is_boolean(),
 ];
 
 impl DataConnectorFactory for KafkaFactory {

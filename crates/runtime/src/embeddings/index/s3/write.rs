@@ -167,9 +167,13 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
         update_embedding_column_in_batch(&record, &index.embedded_column, &embedding_vectors)
             .map_err(|e| *e)?;
 
+    // Filter out zero vectors to prevent cosine similarity calculation errors
+    let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
+        filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
+
     index
         .table
-        .write_data(embedding_vectors, primary_key, metadata)
+        .write_data(filtered_embeddings, filtered_primary_key, filtered_metadata)
         .await
         .context(CannotWriteIndexSnafu {
             index: index.name().to_string(),
@@ -459,6 +463,42 @@ fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
+/// Filter out zero vectors (all values in the vector are 0.0)
+#[allow(clippy::type_complexity)]
+fn filter_zero_vectors(
+    mut embeddings: Vec<Option<Vec<f32>>>,
+    mut primary_keys: Vec<Option<String>>,
+    mut metadata: HashMap<String, Vec<Option<Value>>>,
+    index_name: &str,
+) -> (
+    Vec<Option<Vec<f32>>>,
+    Vec<Option<String>>,
+    HashMap<String, Vec<Option<Value>>>,
+) {
+    // Filter in reverse order to avoid index shifting when removing elements
+    for i in (0..embeddings.len()).rev() {
+        if let Some(embedding) = &embeddings[i] {
+            if embedding.iter().all(|&x| x == 0.0) {
+                let key_str = primary_keys
+                    .get(i)
+                    .and_then(|k| k.as_ref().map(String::as_str))
+                    .unwrap_or("unknown");
+                tracing::warn!(
+                    "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
+                );
+
+                embeddings.remove(i);
+                primary_keys.remove(i);
+                for values in metadata.values_mut() {
+                    values.remove(i);
+                }
+            }
+        }
+    }
+
+    (embeddings, primary_keys, metadata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +667,46 @@ mod tests {
         assert_eq!(first_floats.value(0), 0.1);
         assert_eq!(first_floats.value(1), 0.2);
         assert_eq!(first_floats.value(2), 0.3);
+    }
+
+    #[test]
+    fn test_filter_zero_vectors() {
+        use serde_json::Value;
+        use std::collections::HashMap;
+
+        let embeddings = vec![
+            Some(vec![1.0, 2.0]), // Keep
+            Some(vec![0.0, 0.0]), // Filter out (zero vector)
+            None,                 // Keep
+            Some(vec![3.0, 4.0]), // Keep
+        ];
+        let keys = vec![
+            Some("key1".to_string()),
+            Some("key2".to_string()),
+            Some("key3".to_string()),
+            Some("key4".to_string()),
+        ];
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "test".to_string(),
+            vec![
+                Some(Value::String("a".to_string())),
+                Some(Value::String("b".to_string())),
+                Some(Value::String("c".to_string())),
+                Some(Value::String("d".to_string())),
+            ],
+        );
+
+        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+            filter_zero_vectors(embeddings, keys, metadata, "test_index");
+
+        assert_eq!(filtered_embeddings.len(), 3);
+        assert_eq!(filtered_keys.len(), 3);
+        assert_eq!(filtered_metadata["test"].len(), 3);
+
+        // Check that zero vector was filtered out
+        assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
+        assert_eq!(filtered_embeddings[1], None);
+        assert_eq!(filtered_embeddings[2], Some(vec![3.0, 4.0]));
     }
 }

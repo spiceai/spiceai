@@ -73,9 +73,9 @@ async fn start_spice_test_app(
 
     let registry = prometheus::Registry::new();
 
-    let mut rt_builder = Runtime::builder()
-        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
-        .with_datafusion_configuration_fn(configure_test_datafusion);
+    configure_test_datafusion();
+    let mut rt_builder =
+        Runtime::builder().with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry);
 
     if let Some(rate_limits) = rate_limits {
         rt_builder = rt_builder.with_rate_limits(rate_limits);

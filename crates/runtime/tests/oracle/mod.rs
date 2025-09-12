@@ -200,9 +200,9 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
                 .with_dataset(accelerated_ds)
                 .build();
 
+            configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -301,11 +301,8 @@ async fn oracle_test_cloud_mtls() -> Result<(), anyhow::Error> {
                 .with_dataset(ds)
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

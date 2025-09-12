@@ -123,10 +123,10 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .with_dataset(non_federated_acc)
                 .build();
 
+            configure_test_datafusion();
             let rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await
             ;

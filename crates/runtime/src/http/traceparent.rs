@@ -21,24 +21,20 @@ use tracing::Span;
 const MAX_VERSION: u8 = 254;
 const TRACEPARENT_HEADER: &str = "traceparent";
 
-/// Use the span context from the traceparent header to override the `trace_id` & `parent_span_id` columns in the task history table.
-///
-/// Errors are not returned, invalid traceparent headers must be ignored.
-///
-/// This should not be used for any span within a HTTP API that has [HTTP Spans](https://opentelemetry.io/docs/specs/semconv/http/http-spans/) created, as they are incompatible (both the `span` input and the span created for the HTTP handler will have the same `parent_span_id`, even though the `input` span would become a child of the HTTP span).
-pub(super) fn override_task_history_with_traceparent(span: &Span, headers: &HeaderMap) {
-    match extract_traceparent(headers) {
-        Ok(Some((trace_id, span_id))) => {
-            tracing::info!(target: "task_history", parent: span, trace_id = %trace_id, parent_id = %span_id);
-        }
-        Err(e) => {
-            tracing::warn!("Recieved invalid `traceparent` HTTP header: {e}");
-        }
-        _ => {}
-    }
+/// Represents W3C `traceparent` header values.
+pub struct TraceParent {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
 }
 
-fn extract_traceparent(headers: &HeaderMap) -> Result<Option<(TraceId, SpanId)>, String> {
+/// Use the span context from the traceparent header to override the `trace_id` & `parent_span_id` columns in the task history table.
+///
+/// This should not be used for any span within a HTTP API that has [HTTP Spans](https://opentelemetry.io/docs/specs/semconv/http/http-spans/) created, as they are incompatible (both the `span` input and the span created for the HTTP handler will have the same `parent_span_id`, even though the `input` span would become a child of the HTTP span)
+pub fn override_task_history_with_trace_parent(span: &Span, value: &TraceParent) {
+    tracing::info!(target: "task_history", parent: span, trace_id = %value.trace_id, parent_id = %value.span_id);
+}
+
+pub fn extract_trace_parent(headers: &HeaderMap) -> Result<Option<TraceParent>, String> {
     let Some(header_value) = headers.get(TRACEPARENT_HEADER).map(|v| v.to_str()) else {
         return Ok(None);
     };
@@ -95,5 +91,5 @@ fn extract_traceparent(headers: &HeaderMap) -> Result<Option<(TraceId, SpanId)>,
         format!("In traceparent header, invalid trace flags. Expected hex value, got {e}")
     })?;
 
-    Ok(Some((trace_id, span_id)))
+    Ok(Some(TraceParent { trace_id, span_id }))
 }

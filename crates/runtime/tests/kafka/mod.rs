@@ -21,7 +21,7 @@ use app::AppBuilder;
 use futures::TryStreamExt;
 use runtime::Runtime;
 
-mod bootstrap;
+pub mod bootstrap;
 
 use bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_docker_container};
 use tokio::time::sleep;
@@ -85,11 +85,8 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 .with_dataset(ds_flatten_json)
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

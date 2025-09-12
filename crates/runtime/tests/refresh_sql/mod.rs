@@ -32,6 +32,8 @@ use crate::{
     utils::{runtime_ready_check, test_request_context, wait_until_true},
 };
 
+mod refresh_max_timestamp_df;
+
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
     let mut ds = Dataset::new(format!("spice.ai/{path}"), name.to_string());
     ds.acceleration = Some(Acceleration {
@@ -59,11 +61,8 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
                 ))
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

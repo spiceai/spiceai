@@ -27,7 +27,7 @@ jobs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -60,7 +60,7 @@ jobs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set Nightly REL_VERSION from current timestamp
         run: python3 ./.github/scripts/get_release_version.py
@@ -85,7 +85,7 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -173,7 +173,7 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -241,7 +241,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: /tmp
           pattern: images-*
@@ -249,8 +249,6 @@ jobs:
       - name: Verify artifacts
         run: |
           ls -l /tmp
-          ls -l /tmp/images-amd64
-          ls -l /tmp/images-arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -283,9 +281,9 @@ jobs:
 
             # Load both architecture images
             echo "Loading AMD64 image"
-            docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
+            docker load -i /tmp/image-amd64-${variant}.tar
             echo "Loading ARM64 image"
-            docker load -i /tmp/images-arm64/image-arm64-${variant}.tar
+            docker load -i /tmp/image-arm64-${variant}.tar
 
             # Push images to local registry
             echo "Pushing images to local registry"
@@ -315,7 +313,7 @@ jobs:
             fi
           done
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: github.event_name == 'schedule' || inputs.publish
         with:
           fetch-depth: 0

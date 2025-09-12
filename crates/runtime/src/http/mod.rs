@@ -39,7 +39,7 @@ use crate::{
 pub use routes::get_api_doc;
 mod metrics;
 mod routes;
-mod traceparent;
+pub mod traceparent;
 
 pub mod v1;
 

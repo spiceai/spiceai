@@ -57,7 +57,7 @@ use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
     request::{AsyncMarker, RequestContext},
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
+    search::util::{find_index_in_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
@@ -257,7 +257,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let index_table_provider = find_concrete_table_provider::<IndexedTableProvider>(
+        let mut fts_indexes = find_index_in_table_provider::<FullTextDatabaseIndex>(
             &table_provider,
         )
         .ok_or_else(|| {
@@ -267,7 +267,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
             ))
         })?;
 
-        let Some(fts_index) = index_table_provider.get_index::<FullTextDatabaseIndex>() else {
+        let Some(fts_index) = fts_indexes.pop() else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have a full text search index.",
                 args.tbl.clone()

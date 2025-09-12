@@ -247,11 +247,8 @@ async fn mysql_integration_test() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT1, false))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -342,11 +339,8 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -437,11 +431,8 @@ async fn mysql_timezone_test() -> Result<(), String> {
                 .with_dataset(ds_custom)
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

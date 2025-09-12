@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::DEFAULT_TRACING_MODELS;
 use crate::models::hf::get_model_to_vec_embeddings;
 use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
+use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
@@ -263,6 +263,7 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
 }
 
 async fn start_app(app: App) -> Result<Config, anyhow::Error> {
+    configure_test_datafusion();
     let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
@@ -368,7 +369,7 @@ pub(crate) async fn run_search_w_explain(
 }
 
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/6815
+#[ignore = "bug issue"] // https://github.com/spiceai/spiceai/issues/6815
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpcds_dataset_w_embeddings(
         "multi_column_search",
@@ -1006,7 +1007,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/6816
+#[ignore = "bug issue"] // https://github.com/spiceai/spiceai/issues/6816
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     use spicepod::{acceleration::Acceleration, param::Params};
 

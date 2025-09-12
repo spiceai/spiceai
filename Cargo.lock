@@ -568,7 +568,7 @@ dependencies = [
  "memchr",
  "num",
  "regex",
- "regex-syntax 0.8.5",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -620,7 +620,7 @@ dependencies = [
  "asn1-rs-derive",
  "asn1-rs-impl",
  "displaydoc",
- "nom",
+ "nom 7.1.3",
  "num-traits",
  "rusticata-macros",
  "thiserror 1.0.69",
@@ -2377,7 +2377,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234113d19d0d7d613b40e86fb654acf958910802bcceab913a4f9e7cda03b1a4"
 dependencies = [
  "memchr",
- "regex-automata 0.4.9",
+ "regex-automata",
  "serde",
 ]
 
@@ -2524,6 +2524,7 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
+ "twox-hash 1.6.3",
 ]
 
 [[package]]
@@ -2812,7 +2813,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
 dependencies = [
- "nom",
+ "nom 7.1.3",
 ]
 
 [[package]]
@@ -2863,7 +2864,7 @@ dependencies = [
  "num-traits",
  "serde",
  "wasm-bindgen",
- "windows-link",
+ "windows-link 0.1.1",
 ]
 
 [[package]]
@@ -3131,6 +3132,19 @@ dependencies = [
  "once_cell",
  "unicode-width 0.2.0",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "console"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b430743a6eb14e9764d4260d4c0d8123087d504eeb9c48f2b2a5e810dd369df4"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "once_cell",
+ "unicode-width 0.2.0",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
@@ -3744,7 +3758,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3797,7 +3811,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3822,7 +3836,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3844,7 +3858,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3867,7 +3881,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "futures",
  "log",
@@ -3877,7 +3891,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-compression",
@@ -3912,7 +3926,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3936,7 +3950,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3960,7 +3974,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3990,12 +4004,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 
 [[package]]
 name = "datafusion-execution"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "dashmap",
@@ -4013,7 +4027,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "chrono",
@@ -4033,7 +4047,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -4057,7 +4071,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -4085,7 +4099,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4105,7 +4119,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4129,7 +4143,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -4149,7 +4163,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4164,7 +4178,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -4181,7 +4195,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -4190,7 +4204,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "datafusion-expr",
  "quote",
@@ -4200,7 +4214,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "chrono",
@@ -4212,13 +4226,13 @@ dependencies = [
  "log",
  "recursive",
  "regex",
- "regex-syntax 0.8.5",
+ "regex-syntax",
 ]
 
 [[package]]
 name = "datafusion-physical-expr"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4239,7 +4253,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4252,7 +4266,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -4270,7 +4284,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4299,7 +4313,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4322,7 +4336,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "48.0.1"
-source = "git+https://github.com/spiceai/datafusion.git?rev=0c7ce0f94a4d3888ab280d81f06106ed736aba24#0c7ce0f94a4d3888ab280d81f06106ed736aba24"
+source = "git+https://github.com/spiceai/datafusion.git?rev=82985c16dd902aaa124eceded168088c4ec38cef#82985c16dd902aaa124eceded168088c4ec38cef"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -4496,7 +4510,7 @@ checksum = "dbd676fbbab537128ef0278adb5576cf363cff6aa22a7b24effe97347cfab61e"
 dependencies = [
  "asn1-rs",
  "displaydoc",
- "nom",
+ "nom 7.1.3",
  "num-bigint",
  "num-traits",
  "rusticata-macros",
@@ -4652,7 +4666,7 @@ dependencies = [
  "bytemuck",
  "bytemuck_derive",
  "hashbrown 0.15.3",
- "regex-syntax 0.8.5",
+ "regex-syntax",
  "strum 0.27.1",
 ]
 
@@ -5051,7 +5065,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cea14ef9355e3beab063703aa9dab15afd25f0667c341310c1e5274bb1d0da18"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5139,7 +5153,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
 dependencies = [
  "futures-core",
- "nom",
+ "nom 7.1.3",
  "pin-project-lite",
 ]
 
@@ -5189,8 +5203,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "531e46835a22af56d1e3b66f04844bed63158bc094a628bec1d321d9b4c44bf2"
 dependencies = [
  "bit-set 0.5.3",
- "regex-automata 0.4.9",
- "regex-syntax 0.8.5",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -5200,8 +5214,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
 dependencies = [
  "bit-set 0.8.0",
- "regex-automata 0.4.9",
- "regex-syntax 0.8.5",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -5242,7 +5256,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix 1.0.7",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5881,8 +5895,8 @@ dependencies = [
  "aho-corasick",
  "bstr",
  "log",
- "regex-automata 0.4.9",
- "regex-syntax 0.8.5",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -6228,7 +6242,7 @@ dependencies = [
  "byteorder",
  "crossbeam-channel",
  "flate2",
- "nom",
+ "nom 7.1.3",
  "num-traits",
 ]
 
@@ -6320,7 +6334,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "http 1.3.1",
- "indicatif",
+ "indicatif 0.17.11",
  "libc",
  "log",
  "native-tls",
@@ -6417,7 +6431,7 @@ checksum = "a56f203cd1c76362b69e3863fd987520ac36cf70a8c92627449b2f64a8cf7d65"
 dependencies = [
  "cfg-if",
  "libc",
- "windows-link",
+ "windows-link 0.1.1",
 ]
 
 [[package]]
@@ -7031,7 +7045,7 @@ dependencies = [
  "globset",
  "log",
  "memchr",
- "regex-automata 0.4.9",
+ "regex-automata",
  "same-file",
  "walkdir",
  "winapi-util",
@@ -7094,7 +7108,7 @@ dependencies = [
  "imap-proto",
  "lazy_static",
  "native-tls",
- "nom",
+ "nom 7.1.3",
  "ouroboros",
  "regex",
 ]
@@ -7105,7 +7119,7 @@ version = "0.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de555d9526462b6f9ece826a26fb7c67eca9a0245bd9ff84fa91972a5d5d8856"
 dependencies = [
- "nom",
+ "nom 7.1.3",
 ]
 
 [[package]]
@@ -7136,11 +7150,24 @@ version = "0.17.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
 dependencies = [
- "console",
+ "console 0.15.11",
  "number_prefix",
  "portable-atomic",
  "rayon",
  "unicode-width 0.2.0",
+ "web-time",
+]
+
+[[package]]
+name = "indicatif"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70a646d946d06bedbbc4cac4c218acf4bbf2d87757a784857025f4d447e4e1cd"
+dependencies = [
+ "console 0.16.1",
+ "portable-atomic",
+ "unicode-width 0.2.0",
+ "unit-prefix",
  "web-time",
 ]
 
@@ -7203,8 +7230,10 @@ version = "1.43.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "154934ea70c58054b556dd430b99a98c2a7ff5309ac9891597e339b5c28f4371"
 dependencies = [
- "console",
+ "console 0.15.11",
  "once_cell",
+ "pest",
+ "pest_derive",
  "regex",
  "serde",
  "similar",
@@ -7844,7 +7873,7 @@ dependencies = [
  "anyhow",
  "derivre",
  "indexmap 2.11.0",
- "regex-syntax 0.8.5",
+ "regex-syntax",
  "serde",
  "serde_json",
  "toktrie",
@@ -7946,7 +7975,7 @@ dependencies = [
  "lazy_static",
  "proc-macro2",
  "quote",
- "regex-syntax 0.8.5",
+ "regex-syntax",
  "rustc_version",
  "syn 2.0.101",
 ]
@@ -7985,7 +8014,7 @@ dependencies = [
  "itoa",
  "log",
  "md-5",
- "nom",
+ "nom 7.1.3",
  "rangemap",
  "time",
  "weezl",
@@ -8217,11 +8246,11 @@ dependencies = [
 
 [[package]]
 name = "matchers"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8263075bb86c5a1b1427b5ae862e8889656f126e9f77c484496e8b47cf5c5558"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
- "regex-automata 0.1.10",
+ "regex-automata",
 ]
 
 [[package]]
@@ -8492,7 +8521,7 @@ dependencies = [
  "http 1.3.1",
  "image 0.25.6",
  "indexmap 2.11.0",
- "indicatif",
+ "indicatif 0.17.11",
  "interprocess",
  "itertools 0.14.0",
  "libc",
@@ -8517,7 +8546,7 @@ dependencies = [
  "rand_isaac",
  "rayon",
  "regex",
- "regex-automata 0.4.9",
+ "regex-automata",
  "reqwest",
  "rubato",
  "rust-mcp-schema",
@@ -8628,9 +8657,8 @@ dependencies = [
 
 [[package]]
 name = "model2vec-rs"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "000ddd55d80e4217a14e32623eefd21a0a3f72064f1dc99997bc6f02401ca9f6"
+version = "0.1.3"
+source = "git+https://github.com/spiceai/model2vec-rs.git?rev=dd0beab3810aebacb716d4ab6d38455e74499d13#dd0beab3810aebacb716d4ab6d38455e74499d13"
 dependencies = [
  "anyhow",
  "clap",
@@ -8659,7 +8687,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tracing",
- "tract-core",
+ "tract-core 0.21.10",
  "tract-onnx",
 ]
 
@@ -8686,10 +8714,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "mongodb"
-version = "3.2.4"
+name = "mongocrypt"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0f8c69f13acf07eae386a2974f48ffd9187ea2aba8defbea9aa34e7e272c5f3"
+checksum = "22426d6318d19c5c0773f783f85375265d6a8f0fa76a733da8dc4355516ec63d"
+dependencies = [
+ "bson",
+ "mongocrypt-sys",
+ "once_cell",
+ "serde",
+]
+
+[[package]]
+name = "mongocrypt-sys"
+version = "0.1.4+1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dda42df21d035f88030aad8e877492fac814680e1d7336a57b2a091b989ae388"
+
+[[package]]
+name = "mongodb"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622f272c59e54a3c85f5902c6b8e7b1653a6b6681f45e4c42d6581301119a4b8"
 dependencies = [
  "async-trait",
  "base64 0.13.1",
@@ -8708,6 +8754,7 @@ dependencies = [
  "hmac",
  "macro_magic",
  "md-5",
+ "mongocrypt",
  "mongodb-internal-macros",
  "once_cell",
  "openssl",
@@ -8716,8 +8763,8 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.5",
  "rustc_version_runtime",
- "rustls 0.21.12",
- "rustls-pemfile 1.0.4",
+ "rustls 0.23.31",
+ "rustversion",
  "serde",
  "serde_bytes",
  "serde_with",
@@ -8730,18 +8777,18 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-openssl",
- "tokio-rustls 0.24.1",
+ "tokio-rustls 0.26.2",
  "tokio-util",
- "typed-builder 0.10.0",
+ "typed-builder 0.20.1",
  "uuid 1.18.0",
- "webpki-roots 0.25.4",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
 name = "mongodb-internal-macros"
-version = "3.2.4"
+version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9202de265a3a8bbb43f9fe56db27c93137d4f9fb04c093f47e9c7de0c61ac7d"
+checksum = "63981427a0f26b89632fd2574280e069d09fb2912a3138da15de0174d11dd077"
 dependencies = [
  "macro_magic",
  "proc-macro2",
@@ -9026,6 +9073,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "nom-language"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2de2bc5b451bfedaef92c90b8939a8fff5770bdcc1fafd6239d086aab8fa6b29"
+dependencies = [
+ "nom 8.0.0",
+]
+
+[[package]]
 name = "nonzero_ext"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9076,12 +9141,11 @@ dependencies = [
 
 [[package]]
 name = "nu-ansi-term"
-version = "0.46.0"
+version = "0.50.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a8165726e8236064dbb45459242600304b42a5ea24ee2948e18e023bf7ba84"
+checksum = "d4a28e057d01f97e61255210fcff094d74ed0466038633e95017f5beb68e4399"
 dependencies = [
- "overload",
- "winapi",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9986,12 +10050,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
-name = "overload"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
-
-[[package]]
 name = "ownedbytes"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10155,6 +10213,12 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pastey"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "path-clean"
@@ -11073,7 +11137,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11464,23 +11528,14 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.11.1"
+version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b544ef1b4eac5dc2db33ea63606ae9ffcfac26c1416a2806ae0bf5f56b201191"
+checksum = "23d7fd106d8c02486a8d64e778353d1cffe08ce79ac2e82f540c86d0facf6912"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-automata 0.4.9",
- "regex-syntax 0.8.5",
-]
-
-[[package]]
-name = "regex-automata"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c230d73fb8d8c1b9c0b3135c5142a8acee3a0558fb8db5cf1cb65f8d7862132"
-dependencies = [
- "regex-syntax 0.6.29",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -11491,7 +11546,7 @@ checksum = "809e8dc61f6de73b46c85f4c96486310fe304c434cfa43669d7b40f711150908"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax 0.8.5",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -11499,12 +11554,6 @@ name = "regex-lite"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53a49587ad06b26609c52e423de037e7f57f20d53535d66e08c695f347df952a"
-
-[[package]]
-name = "regex-syntax"
-version = "0.6.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f162c6dd7b008981e4d40210aca20b4bd0f9b60ca9271061b07f78537722f2e1"
 
 [[package]]
 name = "regex-syntax"
@@ -11627,7 +11676,7 @@ dependencies = [
  "futures-core",
  "futures-timer",
  "mime",
- "nom",
+ "nom 7.1.3",
  "pin-project-lite",
  "reqwest",
  "thiserror 1.0.69",
@@ -12061,7 +12110,8 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "tract-core",
+ "tract-core 0.21.10",
+ "twox-hash 1.6.3",
  "url",
  "util",
  "utoipa",
@@ -12106,11 +12156,15 @@ dependencies = [
  "ahash 0.8.12",
  "arrow",
  "arrow-schema",
+ "async-openai",
  "datafusion",
  "insta",
+ "llms",
+ "once_cell",
  "snafu",
+ "tokio",
  "tracing",
- "tract-core",
+ "tract-core 0.21.10",
 ]
 
 [[package]]
@@ -12323,7 +12377,7 @@ version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
 dependencies = [
- "nom",
+ "nom 7.1.3",
 ]
 
 [[package]]
@@ -12336,7 +12390,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12349,7 +12403,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12548,6 +12602,16 @@ name = "safetensors"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc0cdb7198d738a111f6df8fef42cb175412c311d0c4ac9126ff4e550ad1a0e8"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "safetensors"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "172dd94c5a87b5c79f945c863da53b2ebc7ccef4eca24ac63cca66a41aab2178"
 dependencies = [
  "serde",
  "serde_json",
@@ -13578,7 +13642,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5851699c4033c63636f7ea4cf7b7c1f1bf06d0cc03cfb42e711de5a5c46cf326"
 dependencies = [
  "base64 0.13.1",
- "nom",
+ "nom 7.1.3",
  "serde",
  "unicode-segmentation",
 ]
@@ -13656,7 +13720,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -14217,7 +14281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d60769b80ad7953d8a7b2c70cdfe722bbcdcac6bccc8ac934c40c034d866fc18"
 dependencies = [
  "byteorder",
- "regex-syntax 0.8.5",
+ "regex-syntax",
  "utf8-ranges",
 ]
 
@@ -14227,7 +14291,7 @@ version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e810cdeeebca57fc3f7bfec5f85fdbea9031b2ac9b990eb5ff49b371d52bbe6a"
 dependencies = [
- "nom",
+ "nom 7.1.3",
  "serde",
  "serde_json",
 ]
@@ -14309,15 +14373,15 @@ dependencies = [
 
 [[package]]
 name = "tempfile"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8a64e3985349f2441a1a9ef0b853f869006c3855f2cda6862a94d26ebb9d6a1"
+checksum = "15b61f8f20e3a6f7e0649d825294eaf317edce30f82cf6026e7e4cb9222a7d1e"
 dependencies = [
  "fastrand 2.3.0",
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.7",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -14385,10 +14449,11 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "dashmap",
  "duckdb",
  "flight_client",
  "futures",
- "indicatif",
+ "indicatif 0.18.0",
  "insta",
  "nix",
  "octocrab",
@@ -14758,7 +14823,7 @@ dependencies = [
  "fancy-regex 0.14.0",
  "getrandom 0.3.3",
  "hf-hub",
- "indicatif",
+ "indicatif 0.17.11",
  "itertools 0.14.0",
  "log",
  "macro_rules_attribute",
@@ -14769,7 +14834,7 @@ dependencies = [
  "rayon",
  "rayon-cond",
  "regex",
- "regex-syntax 0.8.5",
+ "regex-syntax",
  "serde",
  "serde_json",
  "spm_precompiled",
@@ -15252,14 +15317,14 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.19"
+version = "0.3.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8189decb5ac0fa7bc8b96b7cb9b2701d60d48805aca84a238004d665fcc4008"
+checksum = "2054a14f5307d601f88daf0553e1cbf472acc4f2c51afab632431cdcd72124d5"
 dependencies = [
  "matchers",
  "nu-ansi-term",
  "once_cell",
- "regex",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
@@ -15290,8 +15355,34 @@ dependencies = [
  "paste",
  "rustfft",
  "smallvec",
- "tract-data",
- "tract-linalg",
+ "tract-data 0.21.10",
+ "tract-linalg 0.21.10",
+]
+
+[[package]]
+name = "tract-core"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d72bdfb1d8809fc16b7e3496c8a3a31e8c55eeec8f648f2715d87bd25e9db1c"
+dependencies = [
+ "anyhow",
+ "anymap3",
+ "bit-set 0.5.3",
+ "derive-new 0.5.9",
+ "downcast-rs 1.2.1",
+ "dyn-clone",
+ "lazy_static",
+ "log",
+ "maplit",
+ "ndarray 0.16.1",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "pastey",
+ "rustfft",
+ "smallvec",
+ "tract-data 0.22.0",
+ "tract-linalg 0.22.0",
 ]
 
 [[package]]
@@ -15309,7 +15400,33 @@ dependencies = [
  "lazy_static",
  "maplit",
  "ndarray 0.16.1",
- "nom",
+ "nom 7.1.3",
+ "num-integer",
+ "num-traits",
+ "parking_lot 0.12.4",
+ "scan_fmt",
+ "smallvec",
+ "string-interner",
+]
+
+[[package]]
+name = "tract-data"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb9833e90b72a7a8e7abc517e79a90c1463d88550531deaabd4b5dbf706a091b"
+dependencies = [
+ "anyhow",
+ "downcast-rs 1.2.1",
+ "dyn-clone",
+ "dyn-hash",
+ "half",
+ "itertools 0.12.1",
+ "lazy_static",
+ "libm",
+ "maplit",
+ "ndarray 0.16.1",
+ "nom 8.0.0",
+ "nom-language",
  "num-integer",
  "num-traits",
  "parking_lot 0.12.4",
@@ -15320,13 +15437,13 @@ dependencies = [
 
 [[package]]
 name = "tract-hir"
-version = "0.21.10"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dca047ba1151fe3446fb0194d4b6ddb9ae8f361337c47a267870c53605fbafb"
+checksum = "0fe98f1a0fe9d7bcc39a64258729940da99a26e0ecac8d474d17cfd15f9e4ecf"
 dependencies = [
  "derive-new 0.5.9",
  "log",
- "tract-core",
+ "tract-core 0.22.0",
 ]
 
 [[package]]
@@ -15353,31 +15470,64 @@ dependencies = [
  "scan_fmt",
  "smallvec",
  "time",
- "tract-data",
+ "tract-data 0.21.10",
+ "unicode-normalization",
+ "walkdir",
+]
+
+[[package]]
+name = "tract-linalg"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d09562926176740991a4e74ada093ed4edc155a585c45e2dd6fa13994a89f04f"
+dependencies = [
+ "byteorder",
+ "cc",
+ "derive-new 0.5.9",
+ "downcast-rs 1.2.1",
+ "dyn-clone",
+ "dyn-hash",
+ "half",
+ "lazy_static",
+ "liquid",
+ "liquid-core",
+ "liquid-derive",
+ "log",
+ "num-traits",
+ "pastey",
+ "scan_fmt",
+ "smallvec",
+ "time",
+ "tract-data 0.22.0",
  "unicode-normalization",
  "walkdir",
 ]
 
 [[package]]
 name = "tract-nnef"
-version = "0.21.10"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72cb88a4367ec2c695610223cf886f01fc1deb5c9a82c7a74b1a5d32dc0b1466"
+checksum = "160625a1b79132698ac292ff555c575a567a2c27cd2371c53c13225cbda8d1de"
 dependencies = [
  "byteorder",
  "flate2",
+ "liquid",
+ "liquid-core",
  "log",
- "nom",
+ "nom 8.0.0",
+ "nom-language",
+ "safetensors 0.6.2",
+ "serde_json",
  "tar",
- "tract-core",
+ "tract-core 0.22.0",
  "walkdir",
 ]
 
 [[package]]
 name = "tract-onnx"
-version = "0.21.10"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5830aa672b2aa4dc98a97a36e5988eaf77b3ecee65e2601619588d2ca557008"
+checksum = "e96a3bf1d24b5ca9e4371dac498c6c3cb47d1e4eb7fede41a5750e611da45274"
 dependencies = [
  "bytes",
  "derive-new 0.5.9",
@@ -15393,9 +15543,9 @@ dependencies = [
 
 [[package]]
 name = "tract-onnx-opl"
-version = "0.21.10"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "121d3d224c806ba3d941f4bb50943ad33b59d1da5ae704d0e4e76d2808221f96"
+checksum = "6d1e8a95ae93fdc53143586ec00d816c2831c6958a8a59cc4122ca5b8dba6070"
 dependencies = [
  "getrandom 0.2.16",
  "log",
@@ -15515,6 +15665,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
+ "rand 0.7.3",
  "static_assertions",
 ]
 
@@ -15531,17 +15682,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3d6cc09e1a99c7e01f2afe4953789311a1c50baebbdac5b477ecf78e2e92a5b"
 dependencies = [
  "pom",
-]
-
-[[package]]
-name = "typed-builder"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89851716b67b937e393b3daa8423e67ddfc4bbbf1654bcf05488e95e0828db0c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -15841,6 +15981,12 @@ name = "unindent"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
+
+[[package]]
+name = "unit-prefix"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323402cff2dd658f39ca17c789b502021b3f18707c91cdf22e3838e1b4023817"
 
 [[package]]
 name = "unsafe-libyaml"
@@ -16239,12 +16385,6 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "0.25.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
-
-[[package]]
-name = "webpki-roots"
 version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
@@ -16328,7 +16468,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -16365,7 +16505,7 @@ dependencies = [
  "windows-collections",
  "windows-core 0.61.2",
  "windows-future",
- "windows-link",
+ "windows-link 0.1.1",
  "windows-numerics",
 ]
 
@@ -16395,7 +16535,7 @@ checksum = "c0fdd3ddb90610c7638aa2b3a3ab2904fb9e5cdbecc643ddb3647212781c4ae3"
 dependencies = [
  "windows-implement",
  "windows-interface",
- "windows-link",
+ "windows-link 0.1.1",
  "windows-result",
  "windows-strings",
 ]
@@ -16407,7 +16547,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc6a41e98427b19fe4b73c550f060b59fa592d7d686537eebf9385621bfbad8e"
 dependencies = [
  "windows-core 0.61.2",
- "windows-link",
+ "windows-link 0.1.1",
  "windows-threading",
 ]
 
@@ -16440,13 +16580,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76840935b766e1b0a05c0066835fb9ec80071d4c09a16f6bd5f7e655e3c14c38"
 
 [[package]]
+name = "windows-link"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45e46c0661abb7180e7b9c281db115305d49ca1709ab8242adf09666d2173c65"
+
+[[package]]
 name = "windows-numerics"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
 dependencies = [
  "windows-core 0.61.2",
- "windows-link",
+ "windows-link 0.1.1",
 ]
 
 [[package]]
@@ -16455,7 +16601,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3bab093bdd303a1240bb99b8aba8ea8a69ee19d34c9e2ef9594e708a4878820"
 dependencies = [
- "windows-link",
+ "windows-link 0.1.1",
  "windows-result",
  "windows-strings",
 ]
@@ -16466,7 +16612,7 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56f42bd332cc6c8eac5af113fc0c1fd6a8fd2aa08a0119358686e5160d0586c6"
 dependencies = [
- "windows-link",
+ "windows-link 0.1.1",
 ]
 
 [[package]]
@@ -16475,7 +16621,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
- "windows-link",
+ "windows-link 0.1.1",
 ]
 
 [[package]]
@@ -16521,6 +16667,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
 dependencies = [
  "windows-targets 0.53.2",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.61.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e201184e40b2ede64bc2ea34968b28e33622acdbbf37104f0e4a33f7abe657aa"
+dependencies = [
+ "windows-link 0.2.0",
 ]
 
 [[package]]
@@ -16591,7 +16746,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b66463ad2e0ea3bbf808b7f1d371311c80e115c0b71d60efc142cafbcfb057a6"
 dependencies = [
- "windows-link",
+ "windows-link 0.1.1",
 ]
 
 [[package]]
@@ -16914,7 +17069,7 @@ dependencies = [
  "data-encoding",
  "der-parser",
  "lazy_static",
- "nom",
+ "nom 7.1.3",
  "oid-registry",
  "rusticata-macros",
  "thiserror 1.0.69",

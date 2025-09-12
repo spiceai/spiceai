@@ -22,6 +22,8 @@ use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use datafusion::functions::math::random::RandomFunc;
 use runtime_datafusion_udfs::{alias, bucket, cosine_distance, truncate};
+use datafusion::functions::math::random::RandomFunc;
+use runtime_datafusion_udfs::{alias, bucket, cosine_distance, embed, truncate};
 
 pub fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
@@ -47,4 +49,5 @@ pub fn register_udfs(runtime: &crate::Runtime) {
         RRF_UDF_NAME,
         Arc::new(rrf::ReciprocalRankFusion::from_ctx(&ctx)),
     );
+    ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
 }

@@ -22,6 +22,7 @@ use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
+use crate::search::FormattingSnafu;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -44,7 +45,6 @@ use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::IndexedTableProvider;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -88,9 +88,10 @@ impl VectorSearch {
     ) -> Option<Arc<dyn Embed>> {
         #[cfg(feature = "s3_vectors")]
         {
-            use crate::embeddings::index::s3::S3Vector;
-            let index = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
-            for s3v in index.get_indexes::<S3Vector>() {
+            use crate::{
+                embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider,
+            };
+            for s3v in find_index_in_table_provider::<S3Vector>(tbl)? {
                 if s3v.embedded_column == embedding_column {
                     return s3v.embedding_model().await;
                 }
@@ -305,7 +306,7 @@ impl VectorSearch {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().collect();
+            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 
@@ -313,7 +314,14 @@ impl VectorSearch {
 
         match vector_search_result {
             Ok(result) => {
-                tracing::info!(target: "task_history", captured_output = ?result);
+                let displayable: HashMap<String, serde_json::Value> = result
+                    .iter()
+                    .map(|(tbl, agg_result)| (tbl.to_string(), agg_result.display_json()))
+                    .collect();
+                let captured_output_json = serde_json::to_string(&displayable)
+                    .boxed()
+                    .context(FormattingSnafu)?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
                 Ok(result)
             }
             Err(e) => {
