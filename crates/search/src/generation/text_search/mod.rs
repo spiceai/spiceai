@@ -49,7 +49,6 @@ pub static DEFAULT_BATCH_SIZE: usize = 100;
 pub mod exec;
 pub mod index;
 pub mod query;
-pub mod udtf;
 mod util;
 
 #[derive(Debug, Snafu)]

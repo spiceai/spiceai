@@ -35,7 +35,7 @@ pub mod udtf;
 
 /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
 ///
-/// `https://github.com/spiceai/spiceai/issues/6471` will move, like [`udtf::TextSearchTableFunc`] in favour of using [`search::generation::text_search::udtf::TextSearchIndexProvider`].
+/// `https://github.com/spiceai/spiceai/issues/6471` will move, like [`udtf::TextSearchTableFunc`] in favour of using [`search::provider::SearchQueryProvider`].
 pub async fn as_candidate_generations(
     database_index: &FullTextDatabaseIndex,
     df: Arc<DataFusion>,
