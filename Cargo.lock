@@ -2937,6 +2937,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "chunking"
+version = "1.7.0-unstable"
+dependencies = [
+ "async-trait",
+ "pulldown-cmark 0.13.0",
+ "snafu",
+ "text-splitter",
+ "tiktoken-rs",
+ "tokenizers",
+ "tracing",
+ "tracing-futures",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7929,6 +7943,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "cache",
+ "chunking",
  "cudarc 0.12.2",
  "dotenvy",
  "either",
@@ -7943,7 +7958,6 @@ dependencies = [
  "mistralrs-core",
  "model2vec-rs",
  "paste",
- "pulldown-cmark 0.13.0",
  "rand 0.9.2",
  "regex",
  "reqwest",
@@ -7960,8 +7974,6 @@ dependencies = [
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
  "text-embeddings-core",
- "text-splitter",
- "tiktoken-rs",
  "token_provider",
  "tokenizers",
  "tokio",
@@ -10235,9 +10247,9 @@ name = "parsley"
 version = "1.7.0-unstable"
 dependencies = [
  "bytes",
+ "chunking",
  "clap",
  "document_parse",
- "llms",
  "serde",
  "serde_json",
  "spicepod",
