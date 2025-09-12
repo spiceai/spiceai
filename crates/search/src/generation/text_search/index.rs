@@ -400,7 +400,8 @@ impl SearchIndex for FullTextDatabaseIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        self.update_index(&[record.clone()]).await
+        self.update_index(&[record.clone()]).await.boxed()?;
+        Ok(record)
     }
 
     async fn query_table_provider(

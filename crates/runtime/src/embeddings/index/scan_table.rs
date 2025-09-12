@@ -37,10 +37,7 @@ use crate::{
     embedding_col,
     embeddings::index::{s3::S3Vector, search_index_table_is_sufficient},
 };
-use search::{
-    generation::util::append_fields,
-    index::{SearchIndex, SearchIndexExt},
-};
+use search::{generation::util::append_fields, index::SearchIndex};
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
@@ -103,7 +100,7 @@ impl VectorScanTableProvider {
 
         let Some(idx) = index_of_column(
             &self.schema(),
-            embedding_col!(self.index.embedded_column()).as_str(),
+            embedding_col!(self.index.embedded_column).as_str(),
         ) else {
             return false; // Technically unreachable, but by definition not needed.
         };
@@ -121,7 +118,7 @@ impl VectorScanTableProvider {
         qualified_fields.push((
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(
-                embedding_col!(self.index.embedded_column()),
+                embedding_col!(self.index.embedded_column),
                 DataType::new_list(DataType::Float32, true),
                 true,
             )),
@@ -204,7 +201,7 @@ impl TableProvider for VectorScanTableProvider {
             .collect::<Vec<_>>();
         proj.push(Expr::Column(Column::new(
             Some(TableReference::parse_str("vector_index")),
-            embedding_col!(self.index.embedded_column()),
+            embedding_col!(self.index.embedded_column),
         )));
 
         let vector_table_scan = LogicalPlan::Projection(Projection::try_new(
