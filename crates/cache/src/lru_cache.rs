@@ -410,8 +410,6 @@ mod tests {
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key().as_u64()).await;
         assert!(retrieved.is_none());
-
-        // assert!(false);
     }
 
     #[cfg(feature = "xxhash")]
