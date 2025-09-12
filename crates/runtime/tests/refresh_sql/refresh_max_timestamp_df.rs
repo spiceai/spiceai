@@ -171,7 +171,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 order_exprs: vec![],
                 unbounded: false,
                 options: HashMap::new(),
-                constraints: Constraints::new_unverified(vec![])
+                constraints: Constraints::new_unverified(vec![]),
                 column_defaults: HashMap::default(),
                 temporary: false,
             };
