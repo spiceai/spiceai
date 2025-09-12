@@ -51,7 +51,7 @@ pub(super) fn search_index_table_is_sufficient(
 pub(super) fn search_index_has_full_projection(
     projection: &[&FieldRef],
     search_index_columns: &HashSet<String>,
-) -> bool, ArrowError> {
+) -> bool {
     let columns_requested: HashSet<String> = projection.iter().map(|f| f.name().clone()).collect();
 
     search_index_columns.is_superset(&columns_requested)
