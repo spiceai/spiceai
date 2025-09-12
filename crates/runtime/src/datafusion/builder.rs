@@ -173,7 +173,10 @@ impl DataFusionBuilder {
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
 
         let iceberg_file_format = IcebergFileFormat::new(ctx.state_weak_ref());
-        let _ = ctx.register_file_format(Arc::new(iceberg_file_format), true);
+        let state_ref = ctx.state_ref();
+        let mut state_ref_lock = state_ref.write();
+        let _ = state_ref_lock.register_file_format(Arc::new(iceberg_file_format), true);
+        drop(state_ref_lock);
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
