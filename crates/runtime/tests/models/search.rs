@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{configure_test_datafusion, DEFAULT_TRACING_MODELS};
 use crate::models::hf::get_model_to_vec_embeddings;
 use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
+use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
