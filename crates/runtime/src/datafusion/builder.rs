@@ -42,11 +42,6 @@ use datafusion::{
 use datafusion_federation::sql::federation_analyzer_rule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroUsize,
-    sync::{Arc, RwLock},
-};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use super::{

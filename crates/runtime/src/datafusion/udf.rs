@@ -21,8 +21,6 @@ use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc}
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use datafusion::functions::math::random::RandomFunc;
-use runtime_datafusion_udfs::{alias, bucket, cosine_distance, truncate};
-use datafusion::functions::math::random::RandomFunc;
 use runtime_datafusion_udfs::{alias, bucket, cosine_distance, embed, truncate};
 
 pub fn register_udfs(runtime: &crate::Runtime) {
@@ -44,10 +42,10 @@ pub fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
-    ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(&ctx).into());
+    ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(ctx).into());
     ctx.register_udtf(
         RRF_UDF_NAME,
-        Arc::new(rrf::ReciprocalRankFusion::from_ctx(&ctx)),
+        Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
     );
     ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
 }

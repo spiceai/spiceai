@@ -372,7 +372,7 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
     }
 
     fn signature(&self) -> &Signature {
-        &*VECTOR_SEARCH_SIGNATURE
+        &VECTOR_SEARCH_SIGNATURE
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {

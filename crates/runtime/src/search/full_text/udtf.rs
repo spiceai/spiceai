@@ -42,7 +42,6 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::{
     index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
 };
@@ -297,7 +296,7 @@ impl ScalarUDFImpl for TextSearchTableFunc {
     }
 
     fn signature(&self) -> &Signature {
-        &*TEXT_SEARCH_SIGNATURE
+        &TEXT_SEARCH_SIGNATURE
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
