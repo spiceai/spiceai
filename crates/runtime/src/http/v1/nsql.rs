@@ -256,6 +256,10 @@ pub(crate) async fn post(
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %payload.model, "labels");
 
+    if let Some(traceparent) = context.trace_parent() {
+        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+    }
+
     // Default to all available tables if specific table(s) are not provided.
     let tables = payload
         .datasets

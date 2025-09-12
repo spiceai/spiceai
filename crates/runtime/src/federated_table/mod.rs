@@ -27,7 +27,7 @@ limitations under the License.
 //! Unlike the `AcceleratedTable` struct, this struct does not implement the `TableProvider` trait itself.
 //! It only provides a way to get the underlying table provider and schema.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
@@ -57,12 +57,13 @@ pub enum FederatedTable {
 enum DeferredState {
     Waiting(oneshot::Receiver<Arc<dyn TableProvider>>),
     InProgress,
-    Done(Arc<dyn TableProvider>),
+    Done,
 }
 
 #[derive(Debug)]
 pub struct DeferredTableProvider {
     state: RwLock<DeferredState>,
+    table: OnceLock<Arc<dyn TableProvider>>,
     schema: SchemaRef,
 }
 
@@ -130,14 +131,21 @@ impl FederatedTable {
     ///   1. Active write on the [`DeferredTableProvider`]'s state.
     ///   2. The [`DeferredTableProvider`] is not Ready.
     pub fn try_table_provider_sync(&self) -> Option<Arc<dyn TableProvider>> {
+        Some(Arc::clone(self.try_table_provider_sync_ref()?))
+    }
+
+    /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that is not done (i.e. not in `DeferredState::Done`).
+    ///
+    /// Returns None if
+    ///   1. Active write on the [`DeferredTableProvider`]'s state.
+    ///   2. The [`DeferredTableProvider`] is not Ready.
+    pub fn try_table_provider_sync_ref(&self) -> Option<&Arc<dyn TableProvider>> {
         let deferred_table_provider = match self {
-            Self::Immediate(table_provider) => return Some(Arc::clone(table_provider)),
+            Self::Immediate(table_provider) => return Some(table_provider),
             Self::Deferred(deferred_table_provider) => deferred_table_provider,
         };
-        match &*deferred_table_provider.state.try_read().ok()? {
-            DeferredState::Done(tbl) => Some(Arc::clone(tbl)),
-            _ => None,
-        }
+
+        deferred_table_provider.table.get()
     }
 
     pub async fn table_provider(&self) -> Arc<dyn TableProvider> {
@@ -147,12 +155,14 @@ impl FederatedTable {
         };
 
         // If the table provider is not available immediately, see if we already have it from the deferred task.
-        let mut deferred_state_guard = deferred_table_provider.state.write().await;
 
         // If the table provider is available now, return it.
-        if let DeferredState::Done(table_provider) = &*deferred_state_guard {
+        if let Some(table_provider) = deferred_table_provider.table.get() {
             return Arc::clone(table_provider);
         }
+
+        // If the table provider is not available immediately, see if we already have it from the deferred task.
+        let mut deferred_state_guard = deferred_table_provider.state.write().await;
 
         // We need to own the deferred state to be able to wait on the receiver. Temporarily replace it with InProgress.
         let deferred_state_owned =
@@ -167,10 +177,13 @@ impl FederatedTable {
                         "deferred task should not be dropped before sending the table provider"
                     );
                 };
-                *deferred_state_guard = DeferredState::Done(Arc::clone(&table_provider));
+                let _ = deferred_table_provider
+                    .table
+                    .set(Arc::clone(&table_provider));
+                *deferred_state_guard = DeferredState::Done;
                 table_provider
             }
-            DeferredState::InProgress | DeferredState::Done(_) => {
+            DeferredState::InProgress | DeferredState::Done => {
                 unreachable!("deferred state should only be Waiting at this point");
             }
         }
@@ -242,6 +255,7 @@ impl FederatedTable {
         DeferredTableProvider {
             state: RwLock::new(DeferredState::Waiting(rx)),
             schema,
+            table: OnceLock::new(),
         }
     }
 

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::http::{
-    traceparent::override_task_history_with_traceparent,
-    v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response},
+use crate::{
+    http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response},
+    request::{AsyncMarker, RequestContext},
 };
 use async_openai::types::responses::{
     Content, CreateResponse, OutputContent, OutputMessage, Response as OpenAIResponse,
@@ -10,7 +10,7 @@ use async_openai::types::responses::{
 };
 use axum::{
     Extension, Json,
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -124,9 +124,10 @@ fn extract_text(resp: &OpenAIResponse) -> String {
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
-    headers: HeaderMap,
     Json(req): Json<CreateResponse>,
 ) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+
     let span = tracing::span!(
         target: "task_history",
         tracing::Level::INFO,
@@ -137,7 +138,9 @@ pub(crate) async fn post(
         || tracing::info!(target: "task_history", model = %req.model, api = "responses", "labels"),
     );
 
-    override_task_history_with_traceparent(&span.clone(), &headers);
+    if let Some(traceparent) = context.trace_parent() {
+        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+    }
 
     let span_clone = span.clone();
     async move {
