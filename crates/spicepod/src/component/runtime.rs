@@ -80,7 +80,7 @@ pub struct Runtime {
     pub shutdown_timeout: Option<String>,
 
     /// Configures log level for the runtime. Can be overriden if flags or environment variables
-    /// are set to higher verbosity.
+    /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_level: Option<OutputLevel>,
 }
