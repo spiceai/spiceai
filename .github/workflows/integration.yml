@@ -226,7 +226,6 @@ jobs:
       - name: Upload benchmark snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         run: |
-
           git config --global user.name 'Spice Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
           git add '*.snap'
@@ -235,5 +234,7 @@ jobs:
           else
             git commit -m "fix: Update the integration test snapshots"
             git push origin
+            if git diff --cached --quiet; then
+          fi
         env:
           GH_TOKEN: ${{ steps.github-app-token.outputs.token }}
