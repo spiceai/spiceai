@@ -28,14 +28,12 @@ use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use search::SEARCH_SCORE_COLUMN_NAME;
+use search::index::SearchIndex;
 use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
-use crate::{
-    embedding_col,
-    embeddings::index::{SearchIndex, s3::write},
-    model::EmbeddingModelStore,
-};
+use crate::embeddings::index::VectorIndex;
+use crate::{embedding_col, embeddings::index::s3::write, model::EmbeddingModelStore};
 use datafusion::{
     catalog::TableProvider,
     common::Column,
@@ -144,29 +142,6 @@ impl S3Vector {
 
         Ok(query_vector)
     }
-
-    /// Use a [`S3VectorsListTable`] and then:
-    ///   1. Convert the primary key to its appropriate name and data type
-    ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
-    pub fn list_table_provider(
-        &self,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
-        projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
-        projection.push(Expr::Alias(Alias::new(
-            Expr::Column(datafusion::common::Column::new_unqualified(
-                S3_VECTOR_EMBEDDING_NAME,
-            )),
-            None::<TableReference>,
-            embedding_col!(self.search_column()),
-        )));
-
-        table_with_projection(
-            Arc::new(S3VectorsListTable::from(self.table.clone())),
-            projection,
-        )
-        .boxed()
-    }
 }
 
 #[async_trait]
@@ -219,6 +194,31 @@ impl SearchIndex for S3Vector {
         let tp = Arc::new(S3VectorsQueryTable::new(self.table.clone(), vector));
 
         table_with_projection(tp, projection).boxed()
+    }
+}
+
+impl VectorIndex for S3Vector {
+    /// Use a [`S3VectorsListTable`] and then:
+    ///   1. Convert the primary key to its appropriate name and data type
+    ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
+    fn list_table_provider(
+        &self,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
+        projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
+        projection.push(Expr::Alias(Alias::new(
+            Expr::Column(datafusion::common::Column::new_unqualified(
+                S3_VECTOR_EMBEDDING_NAME,
+            )),
+            None::<TableReference>,
+            embedding_col!(self.search_column()),
+        )));
+
+        table_with_projection(
+            Arc::new(S3VectorsListTable::from(self.table.clone())),
+            projection,
+        )
+        .boxed()
     }
 }
 

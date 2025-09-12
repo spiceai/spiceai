@@ -70,8 +70,6 @@ impl SearchQueryProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
     ) -> Result<bool, DataFusionError> {
-        use std::collections::HashSet;
-
         let search_index_columns: HashSet<String> = search_index_table
             .schema()
             .fields()

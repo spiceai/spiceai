@@ -14,26 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow_schema::FieldRef;
 
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr};
-
-// Re-export SearchIndex from search crate
-pub use search::index::SearchIndex;
+use datafusion::{catalog::TableProvider, logical_expr::LogicalPlan, prelude::Expr};
 
 mod retry_client;
 pub mod s3;
 pub(crate) mod scan_table;
 pub use scan_table::VectorScanTableProvider;
+use search::index::SearchIndex;
+
+pub trait VectorIndex: SearchIndex {
+    /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
+    /// columns and the associated embedding vectors of the [`SearchIndex::search_column`].
+    ///
+    /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
+    fn list_table_provider(
+        &self,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+}
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(
     projection: Vec<&FieldRef>,
     search_index: &LogicalPlan,
     filters: &[Expr],
-) -> Result<bool, DataFusionError> {
+) -> bool {
     let search_index_columns: HashSet<String> = search_index
         .schema()
         .fields()
@@ -44,7 +52,7 @@ pub(super) fn search_index_table_is_sufficient(
     let full_projection = search_index_has_full_projection(&projection, &search_index_columns);
     let search_index_filters = search_index_filters(&search_index_columns, filters);
 
-    Ok(full_projection && search_index_filters.len() == filters.len())
+    full_projection && search_index_filters.len() == filters.len()
 }
 
 /// Returns true if the projection (relative to search query table provider) can be handled by the given search index schema.
@@ -107,7 +115,10 @@ pub mod tests {
     use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
 
-    use crate::{embedding_col, embeddings::index::SearchIndex};
+    use crate::{
+        embedding_col,
+        embeddings::index::{SearchIndex, vector::VectorIndex},
+    };
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -258,6 +269,22 @@ pub mod tests {
                 schema,
                 metadata: MetadataColumns::from(cols),
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VectorIndex for PretendVectorIndex {
+        fn list_table_provider(
+            &self,
+        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+            let mem_table = MemTable::try_new(
+                Arc::new(self.schema.clone()),
+                vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
+                    self.schema.clone(),
+                ))]],
+            )
+            .boxed()?;
+            Ok(Arc::new(ExplainMemTable(mem_table)))
         }
     }
 
