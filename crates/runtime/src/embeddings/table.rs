@@ -21,6 +21,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
 use arrow_tools::schema;
 use async_trait::async_trait;
+use chunking::{Chunker, ChunkingConfig};
 use datafusion::catalog::Session;
 use datafusion::common::{Constraints, Statistics, project_schema};
 use datafusion::error::Result as DataFusionResult;
@@ -32,10 +33,7 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
-use llms::{
-    chunking::{Chunker, ChunkingConfig},
-    embeddings::Error as EmbedError,
-};
+use llms::embeddings::Error as EmbedError;
 use snafu::prelude::*;
 
 use crate::embeddings::common::base_col;

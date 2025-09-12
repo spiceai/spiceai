@@ -36,7 +36,9 @@ use datafusion::{
     sql::TableReference,
 };
 
-use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
+use crate::{
+    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, chunking::is_chunked, index::SearchIndex,
+};
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]
 /// if required by filters or additional columns in the projection.
@@ -332,6 +334,14 @@ impl TableProvider for SearchQueryProvider {
             false,
         )));
 
+        if is_chunked(&self.search_index) {
+            fields.push(Arc::new(Field::new(
+                SEARCH_MATCH_COLUMN_NAME.to_string(),
+                arrow_schema::DataType::Utf8,
+                false,
+            )));
+        }
+
         Arc::new(Schema::new(fields))
     }
 
@@ -390,9 +400,8 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let primary_key_fields = self.search_index.primary_fields();
         // Check primary key constraints
-        if primary_key_fields.is_empty() {
+        if self.search_index.primary_fields().is_empty() {
             return Err(DataFusionError::Execution(
                 "The search index was created successfully without a primary key.\n\
                 Ensure a primary key is available in the dataset source, or specified in the column configuration."

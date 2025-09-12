@@ -24,26 +24,6 @@ pub mod table;
 pub mod task;
 pub mod udtf;
 
-/// Converts string-like Arrow types into an iterator [`Option<Box<dyn Iterator<Item = Option<&str>>>>`]. If the downcast conversion
-/// fails, returns `None`.
-#[macro_export]
-macro_rules! convert_string_arrow_to_iterator {
-    ($data:expr) => {{
-        None.or($data
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + Send>))
-            .or($data
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + Send>))
-            .or($data
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + Send>))
-    }};
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use datafusion::common::utils::quote_identifier;

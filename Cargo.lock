@@ -12005,6 +12005,7 @@ dependencies = [
  "bytes",
  "cache",
  "chrono",
+ "chunking",
  "clap",
  "clickhouse-rs",
  "csv",
@@ -12838,12 +12839,14 @@ dependencies = [
  "datafusion",
  "futures",
  "insta",
+ "itertools 0.14.0",
  "runtime-datafusion-index",
  "serde_json",
  "snafu",
  "tantivy",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]

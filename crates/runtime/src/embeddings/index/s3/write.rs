@@ -29,10 +29,8 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 
-use crate::{
-    convert_string_arrow_to_iterator, embedding_col, embeddings::index::s3::S3Vector,
-    model::EmbeddingModelStore,
-};
+use crate::{embedding_col, embeddings::index::s3::S3Vector, model::EmbeddingModelStore};
+use util::convert_string_arrow_to_iterator;
 
 #[derive(Snafu, Debug)]
 pub enum Error {

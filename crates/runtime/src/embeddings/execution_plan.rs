@@ -21,9 +21,13 @@ use arrow::array::{
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
 
+use super::table::EmbeddingColumnConfig;
+use crate::model::EmbeddingModelStore;
+use crate::{embedding_col, offset_col};
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use async_stream::stream;
+use chunking::Chunker;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -34,20 +38,16 @@ use datafusion::physical_plan::{
 };
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
-use llms::chunking::Chunker;
 use llms::embeddings::Embed;
+use rayon::ThreadPool;
 use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc, thread};
-
-use super::table::EmbeddingColumnConfig;
-use crate::model::EmbeddingModelStore;
-use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
-use rayon::ThreadPool;
 use std::fmt;
+use std::{any::Any, sync::Arc, thread};
 use tokio::sync::RwLock;
 use tokio::task;
+use util::convert_string_arrow_to_iterator;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
