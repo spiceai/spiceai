@@ -16,7 +16,7 @@ limitations under the License.
 use arrow::error::ArrowError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, PutVectorsError, QueryVectorsError,
+    GetVectorBucketError, ListIndexesError, PutVectorsError, QueryVectorsError,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
@@ -45,6 +45,9 @@ pub enum Error {
 
     #[snafu(display("Failed to write vectors to S3 Vectors. {source}"))]
     S3VectorPutVectorError { source: PutVectorsError },
+
+    #[snafu(display("Failed to list indexes in S3 Vectors. {source}"))]
+    S3VectorListIndexesError { source: ListIndexesError },
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
     S3VectorQueryVectorsError { source: QueryVectorsError },

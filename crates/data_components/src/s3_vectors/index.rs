@@ -21,10 +21,13 @@ use std::{
 
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    S3VectorBuildSnafu,
+    S3VectorBuildSnafu, S3VectorPutVectorSnafu,
 };
 
-use super::{Error, IndexIdentifier, Result};
+use super::{
+    Error, IndexIdentifier, Result, S3VectorCreateBucketSnafu, S3VectorCreateIndexSnafu,
+    S3VectorListIndexesSnafu,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
@@ -186,12 +189,12 @@ impl Index {
         let mut partition = { *self.num_physical_indexes.lock().await };
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-            let (is_arn, input) = self.create_put_inputs(chunk.to_vec(), partition).await?;
+            let (is_arn, input) = self.create_put_inputs(chunk.to_vec(), partition)?;
             let put_vector_response = self
                 .client
                 .put_vectors(input)
                 .await
-                .map_err(|e| e.into_service_error());
+                .map_err(SdkError::into_service_error);
 
             match put_vector_response {
                 Ok(_) => {}
@@ -216,12 +219,12 @@ impl Index {
                         *num_physical_partitions += 1;
                     }
 
-                    let (_, input) = self.create_put_inputs(chunk.to_vec(), partition).await?;
-                    self.client.put_vectors(input).await.map_err(|e| {
-                        Error::S3VectorPutVectorError {
-                            source: e.into_service_error(),
-                        }
-                    })?;
+                    let (_, input) = self.create_put_inputs(chunk.to_vec(), partition)?;
+                    self.client
+                        .put_vectors(input)
+                        .await
+                        .map_err(SdkError::into_service_error)
+                        .context(S3VectorPutVectorSnafu)?;
                 }
                 Err(source) => return Err(Error::S3VectorPutVectorError { source }),
             }
@@ -236,7 +239,8 @@ impl Index {
         Ok(())
     }
 
-    async fn create_put_inputs(
+    #[allow(clippy::result_large_err)]
+    fn create_put_inputs(
         &self,
         vectors: Vec<PutInputVector>,
         partition: usize,
@@ -286,13 +290,17 @@ async fn infer_num_physical_indexes(
                     builder = builder.next_token(next_token);
                 }
 
-                let input = builder.build().unwrap();
+                let input = builder.build().context(S3VectorBuildSnafu)?;
 
                 let ListIndexesOutput {
                     next_token,
                     indexes,
                     ..
-                } = client.list_indexes(input).await.unwrap();
+                } = client
+                    .list_indexes(input)
+                    .await
+                    .map_err(SdkError::into_service_error)
+                    .context(S3VectorListIndexesSnafu)?;
 
                 for summary in indexes {
                     if summary.index_name.starts_with(index_name) {
@@ -302,9 +310,8 @@ async fn infer_num_physical_indexes(
 
                 if next_token.is_none() {
                     break;
-                } else {
-                    the_next_token = next_token;
                 }
+                the_next_token = next_token;
             }
 
             Ok(index_names.len())
@@ -353,10 +360,10 @@ async fn get_or_init_index(
                 source: e.into_service_error(),
             });
         }
-    };
+    }
 
     create_index(
-        &ident,
+        ident,
         0,
         client,
         dimension,
@@ -424,9 +431,8 @@ async fn check_or_init_bucket(
                 .context(S3VectorBuildSnafu)?,
         )
         .await
-        .map_err(|e| Error::S3VectorCreateBucketError {
-            source: e.into_service_error(),
-        })?;
+        .map_err(SdkError::into_service_error)
+        .context(S3VectorCreateBucketSnafu)?;
 
     Ok(())
 }
@@ -461,9 +467,8 @@ async fn create_index(
     client
         .create_index(input)
         .await
-        .map_err(|e| Error::S3VectorCreateIndexError {
-            source: e.into_service_error(),
-        })
+        .map_err(SdkError::into_service_error)
+        .context(S3VectorCreateIndexSnafu)
 }
 
 fn compute_schema(columns: MetadataColumns) -> SchemaRef {
