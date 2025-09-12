@@ -37,9 +37,9 @@ async fn iceberg_integration_test_audit_log_query() -> Result<(), anyhow::Error>
                 "audit_log.yaml"
             )).await?;
 
+            configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());

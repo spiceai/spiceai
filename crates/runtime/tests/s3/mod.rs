@@ -74,11 +74,8 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -137,11 +134,8 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
                 .with_dataset(get_s3_hive_partitioned_dataset("hive_data_no_infer", false))
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -203,11 +197,8 @@ async fn s3_schema_evolution() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -256,11 +247,8 @@ async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -352,12 +340,12 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
                 .with_dataset(ds3)
                 .build();
 
+             configure_test_datafusion();
             let rt =
-            Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+                Runtime::builder()
+                    .with_app(app)
+                    .build()
+                    .await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -439,12 +427,12 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
                 .with_dataset(parts_ds)
                 .build();
 
+             configure_test_datafusion();
             let rt =
-            Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+                Runtime::builder()
+                    .with_app(app)
+                    .build()
+                    .await;
 
             let cloned_rt = Arc::new(rt.clone());
 
