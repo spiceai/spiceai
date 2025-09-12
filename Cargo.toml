@@ -225,14 +225,14 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }            # jeadie/25-09-09/df-49
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }     # jeadie/25-09-09/df-49
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" } # jeadie/25-09-09/df-49
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }  # jeadie/25-09-09/df-49
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "d38396af258b621ef86f88f655cb5a5de17240b6" }       # jeadie/25-09-09/df-49
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" }            # spiceai-49
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" }     # spiceai-49
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" } # spiceai-49
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" }  # spiceai-49
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6efddc62d85660b430e4f4ace3e5e92fce9ff8c6" }       # spiceai-49
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "26cdc8384ec0e285cfd8a7f08f0dec167a7a7a81" }                     # jeadie/25-09-09/df-49
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1cec3bbf5c19f6e5719a2511c611ea90910765ef" } # Jeadie:jeadie/25-09-09/df-49
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5ad2f52b9bafc6eaa50851f2e1fcf0585fb5184d" }                     # spiceai-49
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "3437d0103e3577e6615498802d55e67581a2bad2" } # spiceai
 
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a4b83432acfe1dfdd140e35d4603701ae76f6607" } # spiceai-1.3.2
@@ -243,11 +243,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "15cdfb16069c45cf6ac604d2aae79d236e9d4761" }              # jeadie/25-09-09/df-49
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "15cdfb16069c45cf6ac604d2aae79d236e9d4761" } # jeadie/25-09-09/df-49
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "15cdfb16069c45cf6ac604d2aae79d236e9d4761" } # jeadie/25-09-09/df-49
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "15cdfb16069c45cf6ac604d2aae79d236e9d4761" }   # jeadie/25-09-09/df-49
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "15cdfb16069c45cf6ac604d2aae79d236e9d4761" }   # jeadie/25-09-09/df-49
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc4f03fc7a91a7c9395d4807c4cbf102a1bda8cc" }              # spiceai-0.5.2
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc4f03fc7a91a7c9395d4807c4cbf102a1bda8cc" } # spiceai-0.5.2
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc4f03fc7a91a7c9395d4807c4cbf102a1bda8cc" } # spiceai-0.5.2
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc4f03fc7a91a7c9395d4807c4cbf102a1bda8cc" }   # spiceai-0.5.2
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "cc4f03fc7a91a7c9395d4807c4cbf102a1bda8cc" }   # spiceai-0.5.2
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
