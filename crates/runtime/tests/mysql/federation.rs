@@ -95,11 +95,8 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT1, false))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -197,10 +194,10 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .with_dataset(make_mysql_dataset("lineitem", "acc_line", MYSQL_PORT2, true))
             .build();
 
+        configure_test_datafusion();
         let mut rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 

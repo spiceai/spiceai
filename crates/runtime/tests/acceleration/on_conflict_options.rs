@@ -129,9 +129,9 @@ async fn test_acceleration_on_conflict_same_batch_upsert() -> Result<(), anyhow:
                 .with_dataset(dataset)
                 .build();
 
+            configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -183,11 +183,8 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup() -> Result<
                 .with_dataset(dataset)
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -238,9 +235,9 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_not_exact_du
                 .with_dataset(dataset)
                 .build();
 
+            configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -294,9 +291,9 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_by_row_id_no
                 .with_dataset(dataset)
                 .build();
 
+            configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 

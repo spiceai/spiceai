@@ -34,7 +34,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
-use datafusion::execution::{config::SessionConfig, context::SessionContext};
+use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
@@ -50,9 +50,9 @@ use crate::dataconnector::{
 use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
-use runtime_object_store::registry::default_runtime_env;
-
 use super::DelimitedFormat;
+use crate::datafusion::builder::get_df_default_config;
+use runtime_object_store::registry::default_runtime_env;
 
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
@@ -86,7 +86,7 @@ pub trait ListingTableConnector: DataConnector {
     #[must_use]
     fn get_session_context() -> SessionContext {
         SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
+            get_df_default_config().set_bool(
                 "datafusion.execution.listing_table_ignore_subdirectory",
                 false,
             ),

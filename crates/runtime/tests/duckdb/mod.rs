@@ -108,11 +108,8 @@ async fn duckdb_from_functions() -> Result<(), String> {
         ))
         .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
@@ -188,11 +185,8 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
                 ))
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
@@ -273,9 +267,9 @@ async fn duckdb_regexp() -> Result<(), String> {
                 .with_dataset(other_dataset)
                 .build();
 
+            configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
