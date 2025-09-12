@@ -213,6 +213,7 @@ jobs:
           AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          NEXTEST_FLAG: --features=xxhash
 
       - if: needs.check_changes.outputs.relevant_changes == 'true'
         run: cargo build -p testoperator --all-features
