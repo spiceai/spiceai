@@ -514,7 +514,7 @@ fn primary_key(schema: &SchemaRef) -> Constraints {
 }
 
 fn partitioned_index_name(index_name: &str, partition: usize) -> String {
-    format!("{index_name}_{partition}")
+    format!("{index_name}-{partition}")
 }
 
 #[cfg(test)]
