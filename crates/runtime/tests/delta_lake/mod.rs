@@ -79,11 +79,8 @@ async fn run_delta_lake_test(
         .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
         .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion_configuration_fn(configure_test_datafusion)
-        .build()
-        .await;
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
 
     let cloned_rt = Arc::new(rt.clone());
 

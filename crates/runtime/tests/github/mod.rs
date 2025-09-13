@@ -112,11 +112,8 @@ async fn test_github_issues() -> Result<(), String> {
                     None,
                 ))
                 .build();
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
@@ -226,11 +223,8 @@ async fn test_github_commits() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -290,11 +284,8 @@ async fn test_github_stargazers() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -354,11 +345,8 @@ async fn test_github_org_members() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -414,11 +402,8 @@ async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), Str
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -489,11 +474,8 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -553,11 +535,8 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -615,11 +594,8 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -680,11 +656,8 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -742,11 +715,8 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

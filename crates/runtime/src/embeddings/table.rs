@@ -327,6 +327,11 @@ impl EmbeddingTable {
         self.base_table.schema()
     }
 
+    #[must_use]
+    pub fn get_underlying_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.base_table
+    }
+
     /// Makes a [`Chunker`] from [`ChunkingConfig`] and a column's embedding model in [`EmbeddingModelStore`].
     async fn construct_chunker(
         model_name: &str,

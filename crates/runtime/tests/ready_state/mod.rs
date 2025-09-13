@@ -530,10 +530,10 @@ async fn run_ready_state_test(
                 .build()
         };
 
+        configure_test_datafusion();
         let rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -800,12 +800,12 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 ))
                 .build();
 
+             configure_test_datafusion();
             let rt =
-            Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+                Runtime::builder()
+                    .with_app(app)
+                    .build()
+                    .await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -915,12 +915,12 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
                 ))
                 .build();
 
+             configure_test_datafusion();
             let rt =
-            Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+                Runtime::builder()
+                    .with_app(app)
+                    .build()
+                    .await;
 
             let cloned_rt = Arc::new(rt.clone());
 

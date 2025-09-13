@@ -45,11 +45,8 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
         .scope(async {
             let app = AppBuilder::new("test_refresh_max_timestamp_df").build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -137,11 +134,8 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
         .scope(async {
             let app = AppBuilder::new("test_accelerator_table_provider").build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

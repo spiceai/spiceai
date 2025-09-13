@@ -87,13 +87,8 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -182,13 +177,8 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
 
             let app = app.build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             // align schedule start to be at least a few seconds before the next 10th second
             tokio::time::sleep(time_till_second(10, Some(2))).await;
@@ -461,13 +451,8 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
             .await
             .expect("Should load app from spicepod string");
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -565,13 +550,8 @@ async fn test_cron_view() -> Result<(), anyhow::Error> {
             .await
             .expect("Should load app from spicepod string");
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

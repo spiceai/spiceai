@@ -15,13 +15,12 @@ assignees: ''
 
 ## Milestone Release Timeline
 
-| Date            | Description  |
-| --------------- | ------------ |
-| Planning        |              |
-| Branch Creation |              |
-| Release         |              |
-| Announcement    |              |
-
+| Date            | Description |
+| --------------- | ----------- |
+| Planning        |             |
+| Branch Creation |             |
+| Release         |             |
+| Announcement    |             |
 
 ## Associated Changes
 - OSS Endgame (if applicable): `https://github.com/spiceai/spiceai/issues/<issue-number>`
@@ -35,16 +34,16 @@ assignees: ''
 - [ ] Lock the branch to critical fixes only and notify the team.
 
 ## Pre-Release Testing & Validation
+
 1. **OSS Endgame validation**
-  - [ ] Ensure all pre-release and post-release testing and verification is complete without non-acceptable failures.
+
+- [ ] Ensure all pre-release and post-release testing and verification is complete without non-acceptable failures.
 
 1. **Build Validations**
-
    - [ ] Ensure [builds pass](https://github.com/spicehq/spiceai/actions/workflows/build_and_release.yml) on **Linux and Windows**.
    - [ ] Verify all CI workflows complete without warnings or errors.
 
 1. **Unit/Integration Tests**
-
    - [ ] Confirm local and CI tests pass without major failures.
      - [ ] Verify [integration](https://github.com/spicehq/spiceai/actions/workflows/integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
 
@@ -71,7 +70,6 @@ assignees: ''
 ## Final Updates
 
 - [ ] Prepare and finalize enterprise release notes:
-
   - [ ] Duplicate OSS release notes as the base version for enterprise notes
   - [ ] Acknowledge external and new contributors.
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
@@ -92,11 +90,14 @@ assignees: ''
 - [ ] **QA DRI sign-off** and **Docs DRI sign-off** confirming readiness and completeness.
 
 ## Release Publication Steps
+
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spicehq/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1-enterprise`). Leave the body empty so automation can populate it from the checked-in notes.
 
 ### Post-Docker builds
+
 Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) run associated with the above create Github release:
+
 - [ ] Deploy the new docker image to several apps in dev [SCP](https://dev.spice.ai/). Confirm upgrade and functionality.
 - [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality.
   - spicehq:
@@ -122,25 +123,31 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
     - https://spice.ai/spiceai/quickstart
     - https://spice.ai/spiceai/tailwindcss
 - [ ] Run [Publish to AWS Marketplace](https://github.com/spicehq/spiceai/actions/workflows/aws_marketplace_publish.yml) with both configurations (these will require manual approval by either @lukekim or @phillipleblanc):
- - Standard
-   - Docker image: `X.Y.Z-models`
-   - Target ECR repository: `spice-ai/spiceai-enterprise`
-   - Platforms to publish: `linux/amd64,linux/arm64`
- - BYOL
-   - Docker image: `X.Y.Z-models`
-   - Target ECR repository: `spice-ai/spiceai-enterprise-byol`
-   - Platforms to publish: `linux/amd64,linux/arm64`
+- Standard
+  - Docker image: `X.Y.Z-models`
+  - Target ECR repository: `spice-ai/spiceai-enterprise`
+  - Platforms to publish: `linux/amd64,linux/arm64`
+- BYOL
+  - Docker image: `X.Y.Z-models`
+  - Target ECR repository: `spice-ai/spiceai-enterprise-byol`
+  - Platforms to publish: `linux/amd64,linux/arm64`
 
 - [ ] Mark the [release](https://github.com/spicehq/spiceai/releases) as official once all binaries and Docker images finish building.
 
 - [ ] Perform a final test pass on the released binaries and Docker images.
 
 ## Post-Release Validation and Housekeeping
+
 - [ ] Notify the team to verify [customer fixes](https://github.com/orgs/spicehq/projects/53)(if any):
+
   ```md
   :rocket: **Enterprise release complete!** Please confirm enterprise customer fixes have been merged and resolved.
+
   1. [Constraint violation check is improved to control behavior when violations occur within a batch](https://github.com/spicehq/customer-twilio/issues/77). DRI: @phillipleblanc
   2. ..
+  ```
+
 ```
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
+```

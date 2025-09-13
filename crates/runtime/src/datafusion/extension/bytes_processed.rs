@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
-use async_stream::stream;
+use crate::request::RequestContext;
+use arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::{
     common::{
         DFSchemaRef,
@@ -31,7 +33,9 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_federation::FederatedPlanNode;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::{
     any::Any,
     collections::HashSet,
@@ -40,10 +44,49 @@ use std::{
     sync::Arc,
 };
 
-use crate::request::RequestContext;
-
 #[derive(Debug, Default)]
 pub struct BytesProcessedOptimizerRule {}
+
+struct BytesProcessedStream {
+    inner: SendableRecordBatchStream,
+    bytes_processed: u64,
+    request_context: Arc<RequestContext>,
+}
+
+impl BytesProcessedStream {
+    pub fn new(inner: SendableRecordBatchStream, request_context: Arc<RequestContext>) -> Self {
+        Self {
+            inner,
+            bytes_processed: 0,
+            request_context,
+        }
+    }
+
+    fn emit_bytes_processed(&self) {
+        crate::metrics::telemetry::track_bytes_processed(
+            self.bytes_processed,
+            &self.request_context.to_dimensions(),
+        );
+    }
+}
+
+impl Stream for BytesProcessedStream {
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                self.bytes_processed += batch.get_array_memory_size() as u64;
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(None) => {
+                self.emit_bytes_processed();
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
 
 /// Walk over the plan and insert a `BytesProcessedNode` as the parent of any `TableScans` and `FederationNodes`.
 ///
@@ -258,6 +301,10 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![false]
     }
 
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true; self.children().len()]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -274,7 +321,7 @@ impl ExecutionPlan for BytesProcessedExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let mut stream = self.input_exec.execute(partition, Arc::clone(&context))?;
+        let stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
         let Some(request_context) = context.session_config().get_extension::<RequestContext>()
@@ -285,27 +332,105 @@ impl ExecutionPlan for BytesProcessedExec {
             )
         };
 
-        let bytes_processed_stream = stream! {
-            let mut bytes_processed = 0u64;
-            while let Some(batch) = stream.next().await {
-                match batch {
-                    Ok(batch) => {
-                        bytes_processed += batch.get_array_memory_size() as u64;
-                        yield Ok(batch)
-                    }
-                    Err(e) => {
-                        yield Err(e);
-                    }
-                }
-            }
-            crate::metrics::telemetry::track_bytes_processed(
-                bytes_processed,
-                &request_context.to_dimensions(),
-            );
-        };
+        let bytes_processed_stream = BytesProcessedStream::new(stream, request_context);
 
         let stream_adapter = RecordBatchStreamAdapter::new(schema, bytes_processed_stream);
 
         Ok(Box::pin(stream_adapter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::datafusion::extension::bytes_processed::BytesProcessedExec;
+    use crate::{Runtime, RuntimeBuilder};
+    use arrow::array::Int64Array;
+    use arrow::record_batch::RecordBatch;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::MemTable;
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::Result;
+    use datafusion::physical_expr::expressions::col as physical_col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::physical_plan::{ExecutionPlan, displayable};
+    use std::sync::Arc;
+
+    fn make_test_table() -> Result<Arc<dyn TableProvider>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0i64..10000))],
+        )?;
+
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn test_preserve_order_pushdown() -> Result<()> {
+        let runtime: Runtime = RuntimeBuilder::new().build().await;
+        let test_table = make_test_table()?;
+
+        let data_source_exec = test_table
+            .scan(&runtime.df.ctx.state(), None, &[], None)
+            .await?;
+
+        let sort_exec = SortExec::new(
+            LexOrdering::new(vec![
+                PhysicalSortExpr::new_default(physical_col(
+                    "id",
+                    data_source_exec.schema().as_ref(),
+                )?)
+                .desc()
+                .nulls_last(),
+            ]),
+            data_source_exec,
+        );
+
+        let final_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(BytesProcessedExec::new(Arc::new(sort_exec)));
+
+        /*
+           At this point `final_plan` is:
+           ┌───────────────────────────┐
+           │     BytesProcessedExec    │
+           │    --------------------   │
+           │     BytesProcessedExec    │
+           └─────────────┬─────────────┘
+           ┌─────────────┴─────────────┐
+           │          SortExec         │
+           │    --------------------   │
+           │    id@0 DESC NULLS LAST   │
+           └─────────────┬─────────────┘
+           ┌─────────────┴─────────────┐
+           │       DataSourceExec      │
+           │    --------------------   │
+           │        bytes: 80096       │
+           │       format: memory      │
+           │          rows: 1          │
+           └───────────────────────────┘
+        */
+
+        // Optimizer is a bag of rules
+        let optimizer = PhysicalOptimizer::new();
+        let config = runtime.df.ctx.state().config_options().clone();
+
+        // Fold over the default rules to apply the same optimizations DF would at runtime
+        let optimized = optimizer
+            .rules
+            .iter()
+            .fold(Arc::clone(&final_plan), |plan, rule| {
+                rule.optimize(plan, &config).expect("Must optimize plan")
+            });
+
+        // No semantic eq implemented, so this is the easiest way to compare plans
+        assert_eq!(
+            displayable(final_plan.as_ref()).tree_render().to_string(),
+            displayable(optimized.as_ref()).tree_render().to_string()
+        );
+
+        Ok(())
     }
 }
