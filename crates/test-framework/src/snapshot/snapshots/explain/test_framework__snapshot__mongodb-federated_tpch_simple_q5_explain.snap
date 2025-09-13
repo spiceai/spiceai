@@ -29,11 +29,13 @@ description: "Query: tpch_simple_q5"
 |               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 16), input_partitions=16                                                 |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
 |               |                         BytesProcessedExec                                                                                                      |
-|               |                           MongoDBExec projection=[o_orderkey, o_totalprice] filters=[{}]                                                        |
+|               |                           CooperativeExec                                                                                                       |
+|               |                             MongoDBExec projection=[o_orderkey, o_totalprice] filters=[{}]                                                      |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@1], 16), input_partitions=16                                                 |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
 |               |                         BytesProcessedExec                                                                                                      |
-|               |                           MongoDBExec projection=[l_linestatus, l_orderkey] filters=[{}]                                                        |
+|               |                           CooperativeExec                                                                                                       |
+|               |                             MongoDBExec projection=[l_linestatus, l_orderkey] filters=[{}]                                                      |
 |               |                                                                                                                                                 |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
