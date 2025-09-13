@@ -34,6 +34,14 @@ on:
 
   workflow_dispatch:
     inputs:
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
       run_all_tests:
         description: 'Run all tests'
         type: boolean
@@ -179,6 +187,7 @@ jobs:
 
       - name: Run integration test
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -214,3 +223,17 @@ jobs:
           else
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
           fi
+      - name: Upload benchmark snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        run: |
+          git config --global user.name 'Spice Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+          git add '*.snap'
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "fix: Update the integration test snapshots"
+            git push origin
+          fi
+        env:
+          GH_TOKEN: ${{ steps.github-app-token.outputs.token }}
