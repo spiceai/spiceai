@@ -29,11 +29,13 @@ description: "Query: tpch_simple_q5"
 |               |                     RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 16), input_partitions=16                                                 |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
 |               |                         BytesProcessedExec                                                                                                      |
-|               |                           OracleExec sql=SELECT "O_ORDERKEY", "O_TOTALPRICE" FROM "TPCH_SF1"."ORDERS"                                           |
+|               |                           CooperativeExec                                                                                                       |
+|               |                             OracleExec sql=SELECT "O_ORDERKEY", "O_TOTALPRICE" FROM "TPCH_SF1"."ORDERS"                                         |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([L_ORDERKEY@0], 16), input_partitions=16                                                 |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
 |               |                         BytesProcessedExec                                                                                                      |
-|               |                           OracleExec sql=SELECT "L_ORDERKEY", "L_LINESTATUS" FROM "TPCH_SF1"."LINEITEM"                                         |
+|               |                           CooperativeExec                                                                                                       |
+|               |                             OracleExec sql=SELECT "L_ORDERKEY", "L_LINESTATUS" FROM "TPCH_SF1"."LINEITEM"                                       |
 |               |                                                                                                                                                 |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
