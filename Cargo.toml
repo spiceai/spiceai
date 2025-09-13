@@ -99,7 +99,7 @@ bigdecimal = "0.4.7"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
 charset = "0.1.5"
-chrono = "0.4.38"
+chrono = "0.4.42"
 clap = { version = "4.5.45", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
