@@ -6,8 +6,8 @@ use crate::{
     metadata::{MetadataColumn, MetadataColumns},
 };
 
-use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{ArrayRef, LargeStringArray, RecordBatch, StringArray, StringViewArray};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
@@ -20,7 +20,10 @@ use datafusion::{
 };
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
-use util::convert_string_arrow_to_iterator;
+use util::{
+    arrow::{repeat, to_list_array},
+    convert_string_arrow_to_iterator,
+};
 
 /// A [`SearchIndex`] that chunks the [`SearchIndex::search_column`] before each [`SearchIndex::write`].
 ///
@@ -55,6 +58,16 @@ pub enum Error {
     WriteFailedSearchColumnNoString {
         search_column: String,
         data_type: DataType,
+    },
+
+    #[snafu(display("Cannot write search index. Could not contruct chunked Array data: {source}"))]
+    WriteFailedConstructRecordBatch { source: ArrowError },
+
+    #[snafu(display(
+        "Writing chunked data to search index failed due to underlying index error: {source}"
+    ))]
+    InnerIndexWriteError {
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -113,11 +126,40 @@ impl SearchIndex for ChunkedSearchIndex {
         &self.metadata
     }
 
+    ///
+    /// Consider a [`RecordBatch`] like this where `question` is the search column, and `id` is the primary key.
+    /// +-----+--------------------------------------------------------------------------------------------------------------------------------+--------------------+
+    /// | id  | question                                                                                                                       | source             |
+    /// +-----+--------------------------------------------------------------------------------------------------------------------------------+--------------------+
+    /// | 33  | Are there drug interactions with sipuleucel-T?                                                                                 | textbook_reasoning |
+    /// | 49  | Can a router in Area 0 running OSPF process ID 2 swap LSAs with a router in Area 0 running OSPF process ID 10?                 | textbook_reasoning |
+    /// | 87  | Convert the sentence "A series converges whenever it converges absolutely" into a sentence having the form "If $P$, then $Q$." | textbook_reasoning |
+    /// | 115 | Do low frequencies mask high ones easily?                                                                                      | textbook_reasoning |
+    /// | 116 | Do planning and scheduling mean the same thing? (Yes | No)                                                                     | textbook_reasoning |
+    /// +-----+--------------------------------------------------------------------------------------------------------------------------------+--------------------+
+    ///
+    /// Becomes
+    /// +-----+------------------------------------------------------+----------|-----------|--------------------+
+    /// | id  | question                                             | chunk_id | offsets   | source             |
+    /// +-----+------------------------------------------------------+----------|-----------|--------------------+
+    /// | 33  | Are there drug interactions                          | 0        | [0, 27]   | textbook_reasoning |
+    /// | 33  | with sipuleucel-T?                                   | 1        | [27, 45]  | textbook_reasoning |
+    /// | 49  | Can a router in Area 0 running OSPF process          | 0        | [0, 44]   | textbook_reasoning |
+    /// | 49  |  ID 2 swap LSAs with a router in Area 0 running      | 1        | [44, 90]  | textbook_reasoning |
+    /// | 49  |  OSPF process ID 10?                                 | 2        | [90, 110] | textbook_reasoning |
+    /// | 87  | Convert the sentence "A series converges whenever it | 0        | [0, 52]   | textbook_reasoning |
+    /// | 87  | converges absolutely" into a sentence having         | 0        | [52, 98]  | textbook_reasoning |
+    /// | 87  | the form "If $P$, then $Q$."                         | 0        | [98, 126] | textbook_reasoning |
+    /// | 115 | Do low frequencies mask high ones easily?            | 0        | [0, 41]   | textbook_reasoning |
+    /// | 116 | Do planning and scheduling mean the                  | 0        | [0, 35]   | textbook_reasoning |
+    /// | 116 | same thing? (Yes | No)                               | 0        | [35, 57]  | textbook_reasoning |
+    /// +-----+------------------------------------------------------+----------|-----------|--------------------+
     async fn write(
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(arr) = record.column_by_name(self.search_column().as_str()) else {
+        let schema = record.schema();
+        let Some((idx, _)) = schema.column_with_name(self.search_column().as_str()) else {
             return WriteFailedNoSearchColumnSnafu {
                 search_column: self.search_column(),
                 schema: record.schema(),
@@ -125,6 +167,7 @@ impl SearchIndex for ChunkedSearchIndex {
             .fail()
             .boxed();
         };
+        let arr = record.column(idx);
 
         let Some(arr_str) = convert_string_arrow_to_iterator!(arr) else {
             return WriteFailedSearchColumnNoStringSnafu {
@@ -152,9 +195,33 @@ impl SearchIndex for ChunkedSearchIndex {
             .into_iter()
             .unzip();
 
-        // Now I need to expand out all the other ArrayRefs in RecordBatch. Somehow.
+        let repeats = offsets.iter().map(Vec::len).collect::<Vec<_>>();
 
-        Ok(record)
+        let (fields, arrays): (Vec<Field>, Vec<ArrayRef>) = record
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, arr)| {
+                let field = schema.field(i).clone();
+                if i == idx {
+                    Ok((field, Arc::new(to_list_array(&chunks)) as ArrayRef))
+                } else {
+                    Ok((field, repeat(arr, &repeats)?))
+                }
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()?
+            .into_iter()
+            .unzip();
+
+        let rb = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .context(WriteFailedConstructRecordBatchSnafu)
+            .boxed()?;
+
+        self.inner
+            .write(rb)
+            .await
+            .context(InnerIndexWriteSnafu)
+            .boxed()
     }
 
     async fn query_table_provider(
