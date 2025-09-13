@@ -50,10 +50,6 @@ on:
 
 permissions:
   contents: write
-
-permissions:
-  contents: write
-
 jobs:
   setup-matrix:
     name: Setup strategy matrix

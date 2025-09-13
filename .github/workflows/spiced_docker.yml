@@ -39,7 +39,7 @@ jobs:
   build-amd64:
     if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'all' }}
     needs: setup
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@v5
 
@@ -295,13 +295,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to DockerHub
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Import images and create manifests
         env:
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -350,6 +343,7 @@ jobs:
               docker buildx imagetools inspect localhost:5000/spiceai-enterprise:latest${suffix}
             fi
           done
+
       - name: Get spicehq scoped GitHub access token
         uses: actions/create-github-app-token@v2
         id: github-app-token
@@ -359,6 +353,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: |
             ai-platform
+
       # triggers https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml workflow
       - name: Trigger platform images promotion
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
@@ -373,6 +368,7 @@ jobs:
             /repos/spicehq/ai-platform/dispatches \
             -f 'event_type=publish-spiceai-enterprise' \
             -F "client_payload[tag]=${{ env.REL_VERSION }}-models"
+
   publish-cuda:
     # Enterprise does not currently include CUDA Docker version, skip it
     if: ${{ false }}
@@ -404,13 +400,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to DockerHub
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Import images and create manifests
         env:
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -419,7 +408,7 @@ jobs:
           echo "Handling CUDA models..."
 
           docker load -i /tmp/images-amd64-cuda.tar
-          docker push localhost:5000/spiceai:models-cuda-amd64
+          docker push localhost:5000/spiceai-enterprise:models-cuda-amd64
 
           if [[ "${PUBLISH}" == "true" ]]; then
             echo "Pushing CUDA models to GHCR"

@@ -23,7 +23,6 @@ assignees: ''
 | Announcement    |             |
 
 ## Associated Changes
-
 - OSS Endgame (if applicable): `https://github.com/spiceai/spiceai/issues/<issue-number>`
   - If no associated open source endgame has been completed, an [`end-game.md`](https://github.com/spicehq/spiceai/blob/trunk/.github/ISSUE_TEMPLATE/end_game.md) should be opened, to track additional required steps (mentioned below)
 - PR upstreaming `trunk` from `spiceai/spiceai` into `spicehq/spiceai`: `#pr-num`
