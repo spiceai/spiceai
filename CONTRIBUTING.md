@@ -222,7 +222,7 @@ Next, create the same feature in crates that implement a `newdb` connector or da
 
 ```toml
 newdb = ["runtime/newdb", "spicepod/newdb", "app/newdb"]
-````
+```
 
 Include external dependencies optionally and with `dep:` prefix in `features`:
 
@@ -237,11 +237,10 @@ newdb = [
 Finally, tag code and module imports with `#[cfg(feature = "newdb")]`.
 To build `spiced` with only `newdb` and some other desired features:
 
-```
+```console
 SPICED_CUSTOM_FEATURES="newdb postgres" make build-runtime
 ```
 
 Ideally none or few unused code warnings should be emitted. If not, consider refactorings.
-
 
 **Thank You!** - Your contributions to open source, large or small, make projects like this possible. Thank you for taking the time to contribute.

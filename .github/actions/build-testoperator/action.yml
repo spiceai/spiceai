@@ -26,7 +26,7 @@ runs:
         else
           echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
         fi
-    
+
     - name: Setup Rust
       if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
       uses: spiceai/spiceai/.github/actions/setup-rust@trunk
@@ -44,7 +44,7 @@ runs:
         cargo build -p testoperator --release
         sudo cp target/release/testoperator /usr/local/bin/testoperator
         sudo chmod +x /usr/local/bin/testoperator
-      
+
     - name: Upload the testoperator binary
       shell: bash
       if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}

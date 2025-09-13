@@ -9,7 +9,7 @@ inputs:
     default: 'postgres'
 
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Install PostgreSQL (Linux)
       if: inputs.os == 'linux'
@@ -35,7 +35,7 @@ runs:
         createuser -s postgres
         psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
         createdb ${{ inputs.pg-db }}
-    
+
     - name: Wait for PostgreSQL to start
       shell: bash
       run: sleep 10

@@ -5,50 +5,50 @@ on:
     # Only <=10 inputs allowed. Some parameters for `testoperator run http-consistency` are optional and less important..
     inputs:
       spiced_commit:
-        description: "spiced build commit"
+        description: 'spiced build commit'
         required: false
         type: string
       spicepod_path:
-        description: "The spicepod file to test with"
+        description: 'The spicepod file to test with'
         required: true
         type: string
       concurrency:
-        description: "The number of concurrent clients"
+        description: 'The number of concurrent clients'
         required: true
         default: 1
         type: number
       duration:
-        description: "The test duration in seconds"
+        description: 'The test duration in seconds'
         required: true
-        default: "3600"
+        default: '3600'
         type: string
       payload_file:
-        description: "Payload file"
+        description: 'Payload file'
         required: false
         type: string
       model:
-        description: "Model name"
+        description: 'Model name'
         required: false
         type: string
       embedding:
-        description: "Embedding name"
+        description: 'Embedding name'
         required: false
         type: string
       warmup:
-        description: "The duration of the warmup period in seconds"
+        description: 'The duration of the warmup period in seconds'
         required: false
         default: 0
         type: number
       buckets:
-        description: "The number of buckets to divide the test duration into"
+        description: 'The number of buckets to divide the test duration into'
         required: true
         default: 10
         type: number
       ready_wait:
-         description: "How long (in seconds) to wait for spiced to start"
-         required: true
-         default: "30"
-         type: string
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '30'
+        type: string
 
 jobs:
   run-http-consistency:

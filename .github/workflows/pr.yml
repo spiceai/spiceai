@@ -13,14 +13,14 @@ on:
   workflow_dispatch:
     inputs:
       profile_option:
-        description: "Which Rust build profile to use? (Default is lint)"
+        description: 'Which Rust build profile to use? (Default is lint)'
         required: false
         type: choice
         options:
-          - "lint"
-          - "release"
-          - "release-lto"
-        default: "lint"
+          - 'lint'
+          - 'release'
+          - 'release-lto'
+        default: 'lint'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -94,7 +94,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           os: 'linux'
-      
+
       - name: Check if sccache can be set up
         run: |
           if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
@@ -168,7 +168,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-        
+
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
