@@ -35,7 +35,7 @@ base64.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
-chrono = { version = "0.4.38" }
+chrono = { version = "0.4.42" }
 clap.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 csv = "1.3.0"

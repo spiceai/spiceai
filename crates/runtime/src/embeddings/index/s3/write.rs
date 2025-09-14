@@ -27,6 +27,7 @@ use runtime_datafusion_index::Index;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
+use util::distribute_nulls;
 
 use crate::{
     convert_string_arrow_to_iterator, embedding_col,
@@ -369,22 +370,7 @@ async fn embed_column(
         .await
         .context(FailedToEmbedSnafu)?;
 
-    let mut result: Vec<Option<Vec<f32>>> = vec![];
-    let mut value_ptr = 0;
-    let mut null_ptr = 0;
-
-    while value_ptr < embedded_data.len() || null_ptr < nulls.len() {
-        while null_ptr < nulls.len() && nulls[null_ptr] == result.len() {
-            result.push(None);
-            null_ptr += 1;
-        }
-        if value_ptr < embedded_data.len() {
-            result.push(Some(embedded_data[value_ptr].clone()));
-            value_ptr += 1;
-        }
-    }
-
-    Ok(result)
+    Ok(distribute_nulls(embedded_data, nulls))
 }
 
 /// Update the embedding column in the `RecordBatch` with the computed embeddings.
