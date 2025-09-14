@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
@@ -6,19 +6,25 @@ use crate::{
     metadata::{MetadataColumn, MetadataColumns},
 };
 
-use arrow::array::{ArrayRef, LargeStringArray, RecordBatch, StringArray, StringViewArray};
+use arrow::{
+    array::{ArrayRef, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt64Array},
+    util::pretty::pretty_format_batches,
+};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
     catalog::TableProvider,
     datasource::{DefaultTableSource, ViewTable},
+    error::DataFusionError,
     functions_aggregate::expr_fn::first_value,
     logical_expr::{Aggregate, LogicalPlan, Projection, Sort, SortExpr, TableScan},
     prelude::col,
     sql::TableReference,
 };
+use futures::future::try_join_all;
 use itertools::Itertools;
+use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu};
 use util::{
     arrow::{repeat, to_list_array},
@@ -36,6 +42,34 @@ pub struct ChunkedSearchIndex {
 
     /// inner.metadata_columns() + chunk_offsets. Must store in struct for ref.
     metadata: MetadataColumns,
+}
+
+#[async_trait]
+impl Index for ChunkedSearchIndex {
+    fn name(&self) -> &'static str {
+        "ChunkedSearchIndex"
+    }
+
+    /// Columns that are required for the index to be computed.
+    fn required_columns(&self) -> Vec<String> {
+        let mut cols = self.inner.required_columns();
+        cols.retain(|s| s != "_spice.chunk_id");
+        cols
+    }
+
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let futs = batches
+            .into_iter()
+            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        try_join_all(futs).await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -86,6 +120,13 @@ impl std::fmt::Debug for ChunkedSearchIndex {
 }
 
 impl ChunkedSearchIndex {
+    pub fn augment_primary_key(pk: Vec<Field>) -> Vec<Field> {
+        vec![
+            pk,
+            vec![Field::new("_spice.chunk_id", DataType::UInt64, false)],
+        ]
+        .concat()
+    }
     pub fn new(inner: Arc<dyn SearchIndex>, chunker: Arc<dyn Chunker>) -> Self {
         let mut metadata: Vec<MetadataColumn> =
             inner.metadata_columns().clone().into_iter().collect();
@@ -197,14 +238,25 @@ impl SearchIndex for ChunkedSearchIndex {
 
         let repeats = offsets.iter().map(Vec::len).collect::<Vec<_>>();
 
-        let (fields, arrays): (Vec<Field>, Vec<ArrayRef>) = record
+        let chunk_index: Vec<_> = chunks
+            .iter()
+            .map(|v| (0..(v.len() as u64)).collect::<Vec<_>>())
+            .flatten()
+            .collect();
+        let flatten_chunks: Vec<_> = chunks.into_iter().flatten().collect();
+
+        let (mut fields, mut arrays): (Vec<Field>, Vec<ArrayRef>) = record
             .columns()
             .iter()
             .enumerate()
             .map(|(i, arr)| {
                 let field = schema.field(i).clone();
                 if i == idx {
-                    Ok((field, Arc::new(to_list_array(&chunks)) as ArrayRef))
+                    Ok((
+                        field,
+                        // This is lazy, avoid clone here.
+                        Arc::new(StringArray::from(flatten_chunks.clone())) as ArrayRef,
+                    ))
                 } else {
                     Ok((field, repeat(arr, &repeats)?))
                 }
@@ -213,9 +265,15 @@ impl SearchIndex for ChunkedSearchIndex {
             .into_iter()
             .unzip();
 
+        fields.push(Field::new("_spice.chunk_id", DataType::UInt64, false));
+        arrays.push(Arc::new(UInt64Array::from(chunk_index)) as ArrayRef);
+
+        // TODO: need to add offsets and chunk indexes
         let rb = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .context(WriteFailedConstructRecordBatchSnafu)
             .boxed()?;
+
+        let s = pretty_format_batches(&[rb.clone()]).boxed()?;
 
         self.inner
             .write(rb)

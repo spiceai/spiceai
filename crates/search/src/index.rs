@@ -21,6 +21,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
+use runtime_datafusion_index::Index;
 
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
 /// This trait supports both vector similarity search and full-text search implementations.
@@ -29,7 +30,7 @@ use datafusion::catalog::TableProvider;
 /// [`SearchIndex::query_table_provider`], or to reduce the need for joining the [`TableProvider`]s
 ///  of the search index and underlying table.
 #[async_trait]
-pub trait SearchIndex: std::fmt::Debug + Send + Sync + 'static {
+pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     /// The name of the column, in the underlying table, of the column for which search is performed against.
     /// For vector indexes, this is the column that gets embedded. For FTS indexes, this is the text column being searched.
     fn search_column(&self) -> String;

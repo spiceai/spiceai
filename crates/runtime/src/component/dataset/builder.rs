@@ -94,19 +94,6 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
                     dataset.name
                 );
             }
-
-            // Chunking with vector engines is not supported (yet).
-            for column in &dataset.columns {
-                for embedding in &column.embeddings {
-                    if embedding.chunking.is_some() {
-                        return Err(crate::Error::InvalidSpicepodDataset {
-                            source: Error::ChunkingNotSupportedForVectorEngine {
-                                column: column.name.clone(),
-                            },
-                        });
-                    }
-                }
-            }
         }
 
         Ok(DatasetBuilder {

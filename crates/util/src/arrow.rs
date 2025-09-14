@@ -80,15 +80,17 @@ pub fn repeat(arr: &ArrayRef, repeats: &[usize]) -> Result<ArrayRef, ArrowError>
 }
 
 pub fn to_list_array(chunks: &[Vec<&str>]) -> ListArray {
-    let mut builder = ListBuilder::with_capacity(StringBuilder::new(), chunks.len());
+    let mut builder = ListBuilder::new(StringBuilder::new());
 
     for chunk in chunks {
+        tracing::warn!("chunk");
         if chunk.is_empty() {
+            tracing::warn!("chunkNone");
             builder.append_null();
         } else {
-            let value_builder = builder.values();
+            tracing::warn!("chunk = {:?}", chunk);
             for item in chunk {
-                value_builder.append_value(item);
+                builder.values().append_value(item);
             }
             builder.append(true);
         }

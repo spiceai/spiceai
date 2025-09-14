@@ -88,17 +88,6 @@ impl S3Vector {
         let mut complete_columns: Vec<MetadataColumn> =
             metadata_columns.clone().into_iter().collect();
 
-        // Add the embedding column as non-filterable metadata
-        let embedding_field = Arc::new(Field::new(
-            embedding_col!(embedded_column),
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, false)),
-                dimension as i32,
-            ),
-            false,
-        ));
-        complete_columns.push(MetadataColumn::NonFilterable(embedding_field));
-
         let complete_metadata_columns = MetadataColumns::from(complete_columns);
 
         Self {

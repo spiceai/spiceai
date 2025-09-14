@@ -24,6 +24,30 @@ pub mod table;
 pub mod task;
 pub mod udtf;
 
+use std::sync::Arc;
+
+use chunking::{Chunker, ChunkingConfig};
+use llms::embeddings::Error as EmbedError;
+
+use crate::model::EmbeddingModelStore;
+use tokio::sync::RwLock;
+
+/// Makes a [`Chunker`] from [`ChunkingConfig`] and a column's embedding model in [`EmbeddingModelStore`].
+async fn construct_chunker(
+    model_name: &str,
+    chunk_config: &ChunkingConfig<'_>,
+    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+) -> Result<Arc<dyn Chunker>, EmbedError> {
+    let embedding_models_guard = embedding_models.read().await;
+    let Some(embed_model) = embedding_models_guard.get(model_name) else {
+        // Don't need warn, as we should have already checked/logged this.
+        return Err(EmbedError::ModelDoesNotExist {
+            model_name: model_name.to_string(),
+        });
+    };
+    embed_model.chunker(chunk_config)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use datafusion::common::utils::quote_identifier;

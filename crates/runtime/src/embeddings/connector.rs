@@ -20,6 +20,7 @@ use crate::component::metrics::MetricsProvider;
 use crate::dataconnector::DataConnector;
 use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
+use crate::embeddings::construct_chunker;
 use crate::embeddings::execution_plan::compute_additional_embedding_columns;
 use crate::embeddings::execution_plan::construct_record_batch;
 use crate::federated_table::FederatedTable;
@@ -199,13 +200,14 @@ impl EmbeddingConnector {
                 let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
                 for (column, config) in embedding_columns {
                     use runtime_datafusion_index::Index;
+                    use search::chunking::ChunkedSearchIndex;
 
                     use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
 
-                    let vector_index = super::index::s3::try_from_dataset(
+                    let mut vector_index = super::index::s3::try_from_dataset(
                         &dataset.name,
                         column,
-                        config,
+                        config.clone(),
                         vector_store,
                         Arc::clone(&inner_table_provider),
                         Arc::clone(&self.embedding_models),
@@ -221,14 +223,51 @@ impl EmbeddingConnector {
                         }
                     })?;
 
-                    let idx = Arc::new(vector_index);
-                    // augment the previous underlying table provider with the vector index
-                    // this will result in recursive augmentation of the underlying table for N embedding columns
-                    provider.underlying = Arc::new(VectorScanTableProvider::new(
-                        provider.underlying,
-                        Arc::clone(&idx) as Arc<dyn VectorIndex>,
-                    )) as Arc<dyn TableProvider>;
-                    provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
+                    // This is a hack, we need ChunkedSearchIndex to implement `VectorIndex`. But we haven't done that yet.
+                    if let Some(ref chunking) = config.chunking
+                        && chunking.enabled
+                    {
+                        use search::index::SearchIndex;
+                        use snafu::ResultExt;
+
+                        let chunker = construct_chunker(
+                            config.model.clone().as_str(),
+                            &ChunkingConfig {
+                                target_chunk_size: chunking.target_chunk_size,
+                                overlap_size: chunking.overlap_size,
+                                trim_whitespace: chunking.trim_whitespace,
+                                file_format: dataset.params.get("file_format").map(String::as_str),
+                            },
+                            &Arc::clone(&self.embedding_models),
+                        )
+                        .await
+                        .boxed()
+                        .map_err(|e| {
+                            DataConnectorError::UnableToConnectInternal {
+                                dataconnector: dataset.source().to_string(),
+                                connector_component: dataset.into(),
+                                source: e,
+                            }
+                        })?;
+                        vector_index.primary_key =
+                            ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
+                        let idx = Arc::new(vector_index);
+                        let chunked_idx =
+                            ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);
+
+                        provider = provider.add_index(Arc::new(chunked_idx) as Arc<dyn Index>);
+                    } else {
+                        let idx = Arc::new(vector_index);
+                        let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
+
+                        // augment the previous underlying table provider with the vector index
+                        // this will result in recursive augmentation of the underlying table for N embedding columns
+                        provider.underlying = Arc::new(VectorScanTableProvider::new(
+                            provider.underlying,
+                            vector_index,
+                        )) as Arc<dyn TableProvider>;
+                        provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
+                    }
                 }
                 tracing::info!(
                     "S3 Vectors for dataset {} initialized in {:?}",
