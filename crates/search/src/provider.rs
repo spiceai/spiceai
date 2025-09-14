@@ -121,7 +121,7 @@ impl SearchQueryProvider {
         filters: &[Expr],
         all_metadata_columns: &[String],
     ) -> Result<LogicalPlan, DataFusionError> {
-        let base_proj = projection_without_columns(
+        let mut base_proj = projection_without_columns(
             &self.schema().fields,
             &[
                 all_metadata_columns,
@@ -130,6 +130,7 @@ impl SearchQueryProvider {
             .concat(),
             projection,
         );
+        base_proj.sort(); // Deterministic LogicalPlans
 
         // Get filters that can be pushed down to the base table
         let filter_refs: Vec<_> = filters.iter().collect();
