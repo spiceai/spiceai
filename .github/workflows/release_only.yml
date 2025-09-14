@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Build and Release workflow run ID to get artifacts from"
+        description: 'Build and Release workflow run ID to get artifacts from'
         required: true
         type: string
       target_version:
-        description: "Target version to release"
+        description: 'Target version to release'
         required: true
         type: string
 
@@ -95,7 +95,7 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}
           github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
-      
+
       # Download macOS metal artifacts
       - name: Download spiced models metal artifact
         if: matrix.target_os == 'darwin'
@@ -115,10 +115,10 @@ jobs:
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
           export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-          
+
           # Get the list of files
           RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
-          
+
           # Delete existing release artifact
           python ./.github/scripts/github_release.py delete \
             --owner $OWNER_NAME --repo $REPO_NAME \
@@ -130,7 +130,7 @@ jobs:
           else
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
-          
+
           echo "Uploading Spice.ai Binaries to GitHub Release"
           python ./.github/scripts/github_release.py upload \
             --owner $OWNER_NAME --repo $REPO_NAME \

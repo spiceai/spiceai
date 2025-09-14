@@ -5,22 +5,22 @@ on:
   workflow_dispatch:
     inputs:
       model_option:
-        description: "Which model do you want to test? (Default is ALL)"
+        description: 'Which model do you want to test? (Default is ALL)'
         required: false
         type: choice
         options:
-          - "all"
-          - "gpt-4o"
-          - "gpt-4o-mini"
-          - "gpt-5"
-          - "o1"
-          - "o3_mini"
-          - "llama3-3B-Instruct"
-          - "claude-3-5-sonnet"
-          - "grok2"
-        default: "all"
+          - 'all'
+          - 'gpt-4o'
+          - 'gpt-4o-mini'
+          - 'gpt-5'
+          - 'o1'
+          - 'o3_mini'
+          - 'llama3-3B-Instruct'
+          - 'claude-3-5-sonnet'
+          - 'grok2'
+        default: 'all'
   schedule:
-    - cron: "0 5 * * 2,5" # Every Monday and Thursday at 10pm PST (5am UTC next day)
+    - cron: '0 5 * * 2,5' # Every Monday and Thursday at 10pm PST (5am UTC next day)
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -30,14 +30,14 @@ concurrency:
 jobs:
   build-testoperator:
     name: Build testoperator
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "darwin"
+          os: 'darwin'
 
       - name: Build the testoperator
         run: |
@@ -56,7 +56,7 @@ jobs:
 
   build-spiced:
     name: Build spiced
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
 
@@ -125,7 +125,7 @@ jobs:
       - build-testoperator
       - build-spiced
       - setup-matrix
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     strategy:
       max-parallel: 1
       fail-fast: false
