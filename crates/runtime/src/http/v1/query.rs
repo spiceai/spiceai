@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use axum::{
+    Extension,
     body::Bytes,
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -23,6 +24,7 @@ use axum_extra::TypedHeader;
 use headers_accept::Accept;
 use http::header::CONTENT_TYPE;
 use serde::Deserialize;
+use tokio::runtime::Handle;
 
 use crate::{
     datafusion::{param_utils, request_context_extension::get_current_datafusion},
@@ -178,6 +180,7 @@ use super::{ResponseMimeType, sql_to_http_response};
     )
 ))]
 pub(crate) async fn post(
+    Extension(tokio_handle): Extension<Handle>,
     headers: axum::http::HeaderMap,
     accept: Option<TypedHeader<Accept>>,
     body: Bytes,
@@ -227,9 +230,10 @@ pub(crate) async fn post(
 
     sql_to_http_response(
         df,
-        &sql,
+        sql,
         parameters,
         ResponseMimeType::from_accept_header(accept.as_ref()),
+        &tokio_handle,
     )
     .await
 }

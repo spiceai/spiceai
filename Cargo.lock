@@ -12066,6 +12066,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rmcp",
+ "runtime-async",
  "runtime-auth",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -12120,6 +12121,16 @@ dependencies = [
  "winver",
  "workers",
  "x509-certificate",
+]
+
+[[package]]
+name = "runtime-async"
+version = "1.7.0-unstable"
+dependencies = [
+ "futures",
+ "snafu",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

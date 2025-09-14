@@ -52,11 +52,13 @@ use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
 use http::{HeaderValue, header::CONTENT_TYPE};
+use runtime_async::spawn_task_and_collect_results;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
 use futures::TryStreamExt;
+use tokio::runtime::Handle;
 
 use crate::request::{AsyncMarker, RequestContext};
 #[cfg(feature = "openapi")]
@@ -179,25 +181,39 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 // Runs query and converts query results to HTTP response (as JSON).
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
-    sql: &str,
+    sql: String,
     parameters: Option<ParamValues>,
     format: ResponseMimeType,
+    tokio_handle: &Handle,
 ) -> Response {
-    let (data, results_cache_status) = match run_sql(df, sql, parameters).await {
-        Ok((data, results_cache_status)) => (data, results_cache_status),
-        Err(e) => {
-            tracing::debug!("Error executing query: {e}");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    };
+    match spawn_task_and_collect_results(
+        async move {
+            let (data, results_cache_status) = match run_sql(df, &sql, parameters).await {
+                Ok((data, results_cache_status)) => (data, results_cache_status),
+                Err(e) => {
+                    tracing::debug!("Error executing query: {e}");
+                    return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                }
+            };
 
-    to_http_response(
-        data,
-        results_cache_status,
-        format,
-        ResponseMetadata::empty(),
+            to_http_response(
+                data,
+                results_cache_status,
+                format,
+                ResponseMetadata::empty(),
+            )
+            .await
+        },
+        tokio_handle,
     )
     .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::debug!("Error executing query: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
 }
 
 // Runs query and returns the results as a vector of `RecordBatch`.

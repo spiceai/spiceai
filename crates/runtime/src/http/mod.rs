@@ -25,6 +25,7 @@ use snafu::prelude::*;
 use spicepod::component::runtime::CorsConfig;
 use tokio::net::TcpStream;
 use tokio::net::{TcpListener, ToSocketAddrs};
+use tokio::runtime::Handle;
 use tokio::sync::watch::{self, Receiver};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +62,7 @@ pub(crate) async fn start<A>(
     tls_config: Option<Arc<TlsConfig>>,
     auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
     shutdown_signal: Option<CancellationToken>,
+    work_runtime: Handle,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
@@ -81,6 +83,7 @@ where
         vsearch,
         auth_provider.map(AuthLayer::new),
         &cors_config,
+        work_runtime,
     );
     drop(app);
 

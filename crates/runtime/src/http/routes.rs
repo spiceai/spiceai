@@ -40,6 +40,7 @@ use rmcp::transport::SseServer;
 use rmcp::transport::sse_server::SseServerConfig;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
 #[cfg(feature = "openapi")]
@@ -188,6 +189,7 @@ pub(crate) fn routes(
     vector_search: Arc<vector_search::VectorSearch>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
+    work_runtime: Handle,
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post))
@@ -306,6 +308,7 @@ pub(crate) fn routes(
         ))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
+        .layer(Extension(work_runtime))
 }
 
 async fn track_metrics(

@@ -19,12 +19,14 @@ use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
 use init::scheduler::ScheduleRegistry;
+use runtime_async::ManagedTokioRuntime;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
+use tokio::runtime::Handle;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
@@ -119,6 +121,9 @@ mod worker;
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
+
+    #[snafu(display("Unable to start HTTP server: {source}"))]
+    UnableToCreateHttpRuntime { source: runtime_async::Error },
 
     #[snafu(display(
         "Task execution failed: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
@@ -554,19 +559,29 @@ impl Runtime {
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
+        let http_tokio_runtime =
+            ManagedTokioRuntime::try_new().context(UnableToCreateHttpRuntimeSnafu)?;
+        let http_tokio_handle = http_tokio_runtime.handle().clone();
+        let work_runtime = Handle::current();
         let http_future = self
-            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
-                http::start(
-                    cloned_config.http_bind_address,
-                    self_ref,
-                    cloned_config.into(),
-                    cloned_tls_config,
-                    http_auth,
-                    Some(http_shutdown),
-                )
-                .await
-                .context(UnableToStartHttpServerSnafu)
-            })
+            .start_runtime_task(
+                HTTP_SERVER,
+                Some(http_shutdown.clone()),
+                async move {
+                    http::start(
+                        cloned_config.http_bind_address,
+                        self_ref,
+                        cloned_config.into(),
+                        cloned_tls_config,
+                        http_auth,
+                        Some(http_shutdown),
+                        work_runtime,
+                    )
+                    .await
+                    .context(UnableToStartHttpServerSnafu)
+                },
+                http_tokio_handle,
+            )
             .await;
 
         // Start Metrics server
@@ -575,11 +590,16 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
 
         let metrics_future = self
-            .start_runtime_task(METRICS_SERVER, None, async move {
-                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
-                    .await
-                    .context(UnableToStartMetricsServerSnafu)
-            })
+            .start_runtime_task(
+                METRICS_SERVER,
+                None,
+                async move {
+                    metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
+                        .await
+                        .context(UnableToStartMetricsServerSnafu)
+                },
+                Handle::current(),
+            )
             .await;
 
         // Start Flight server
@@ -590,19 +610,24 @@ impl Runtime {
         let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
         let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                flight::start(
-                    config.flight_bind_address,
-                    cloned_app_ref,
-                    Arc::clone(&self_ref),
-                    cloned_tls_config,
-                    cloned_endpoint_auth,
-                    Arc::clone(&self_ref.rate_limits),
-                    Some(flight_shutdown),
-                )
-                .await
-                .context(UnableToStartFlightServerSnafu)
-            })
+            .start_runtime_task(
+                FLIGHT_SERVER,
+                Some(flight_shutdown.clone()),
+                async move {
+                    flight::start(
+                        config.flight_bind_address,
+                        cloned_app_ref,
+                        Arc::clone(&self_ref),
+                        cloned_tls_config,
+                        cloned_endpoint_auth,
+                        Arc::clone(&self_ref.rate_limits),
+                        Some(flight_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartFlightServerSnafu)
+                },
+                Handle::current(),
+            )
             .await;
 
         // Start OpenTelemetry server
@@ -626,6 +651,7 @@ impl Runtime {
                     .await
                     .context(UnableToStartOpenTelemetryServerSnafu)
                 },
+                Handle::current(),
             )
             .await;
 
@@ -643,12 +669,17 @@ impl Runtime {
         // Start Spicepod watcher
         let self_ref = Arc::clone(&self);
         let pods_watcher_future = self
-            .start_runtime_task(PODS_WATCHER, None, async move {
-                self_ref
-                    .start_pods_watcher()
-                    .await
-                    .context(UnableToInitializePodsWatcherSnafu)
-            })
+            .start_runtime_task(
+                PODS_WATCHER,
+                None,
+                async move {
+                    self_ref
+                        .start_pods_watcher()
+                        .await
+                        .context(UnableToInitializePodsWatcherSnafu)
+                },
+                Handle::current(),
+            )
             .await;
 
         // Shutdown signal
@@ -859,6 +890,7 @@ impl Runtime {
                         }
                     }
                 },
+                Handle::current(),
             )
             .await;
 
@@ -980,11 +1012,12 @@ impl Runtime {
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
         task_fn: F,
+        tokio_handle: Handle,
     ) -> impl Future<Output = Result<(), Error>>
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
+        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn, tokio_handle);
 
         self.tasks
             .write()

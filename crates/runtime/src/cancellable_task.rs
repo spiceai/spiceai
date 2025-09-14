@@ -18,8 +18,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use snafu::ResultExt;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::{runtime::Handle, sync::oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Error, FailedToExecuteTaskSnafu};
@@ -71,6 +71,7 @@ impl CancellableTaskHandle {
 pub(crate) fn spawn_cancellable_task<F>(
     task_cancellation: Option<CancellationToken>,
     task_fn: F,
+    tokio_handle: Handle,
 ) -> (
     impl Future<Output = Result<(), Error>>,
     CancellableTaskHandle,
@@ -87,7 +88,7 @@ where
         on_task_completed,
     };
 
-    let handle: JoinHandle<Result<(), Error>> = tokio::task::spawn(async move {
+    let handle: JoinHandle<Result<(), Error>> = tokio_handle.spawn(async move {
         let result = tokio::select! {
             res = task_fn => {
                 res
@@ -121,7 +122,7 @@ mod tests {
     #[tokio::test]
     async fn test_task_completes_successfully() {
         let task_fn = async { Ok::<(), Error>(()) };
-        let (task_future, _handle) = spawn_cancellable_task(None, task_fn);
+        let (task_future, _handle) = spawn_cancellable_task(None, task_fn, Handle::current());
         let result = task_future.await;
         assert!(result.is_ok());
     }
@@ -131,7 +132,7 @@ mod tests {
         // test that correct error is returned
         let task_fn =
             async { Err::<(), Error>(Error::AcceleratedReadWriteTableWithoutReplication {}) };
-        let (task_future, _handle) = spawn_cancellable_task(None, task_fn);
+        let (task_future, _handle) = spawn_cancellable_task(None, task_fn, Handle::current());
         let result = task_future.await;
         assert!(matches!(
             result,
@@ -142,12 +143,15 @@ mod tests {
     #[tokio::test]
     async fn test_task_is_cancelled_gracefully() {
         let cancellation_token = CancellationToken::new();
-        let (task_future, handle) =
-            spawn_cancellable_task(Some(cancellation_token.clone()), async move {
+        let (task_future, handle) = spawn_cancellable_task(
+            Some(cancellation_token.clone()),
+            async move {
                 // Simulate some work
                 cancellation_token.cancelled().await;
                 Ok::<(), Error>(())
-            });
+            },
+            Handle::current(),
+        );
 
         // cancel the task async after 100 ms
         let cancel_future = tokio::spawn(async move {
@@ -168,11 +172,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_is_aborted() {
-        let (task_future, handle) = spawn_cancellable_task(None, async move {
-            // Simulate some work
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            Ok::<(), Error>(())
-        });
+        let (task_future, handle) = spawn_cancellable_task(
+            None,
+            async move {
+                // Simulate some work
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok::<(), Error>(())
+            },
+            Handle::current(),
+        );
 
         // cancel the task async after 100 ms
         let cancel_future = tokio::spawn(async move {
@@ -194,12 +202,15 @@ mod tests {
     #[tokio::test]
     async fn test_task_can_be_force_aborted() {
         // test that the task can be aborted after timeout when cancellation token is provided
-        let (task_future, handle) =
-            spawn_cancellable_task(Some(CancellationToken::new()), async move {
+        let (task_future, handle) = spawn_cancellable_task(
+            Some(CancellationToken::new()),
+            async move {
                 // Simulate some work
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok::<(), Error>(())
-            });
+            },
+            Handle::current(),
+        );
 
         // cancel the task async after 100 ms
         let cancel_future = tokio::spawn(async move {
@@ -221,10 +232,14 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_already_completed_task() {
         let cancellation_token = CancellationToken::new();
-        let (task_future, handle) = spawn_cancellable_task(Some(cancellation_token), async move {
-            // complete the task immediatly
-            Ok::<(), Error>(())
-        });
+        let (task_future, handle) = spawn_cancellable_task(
+            Some(cancellation_token),
+            async move {
+                // complete the task immediatly
+                Ok::<(), Error>(())
+            },
+            Handle::current(),
+        );
 
         assert!(task_future.await.is_ok());
 
@@ -246,11 +261,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_completed() {
-        let (task_future, handle) = spawn_cancellable_task(None, async move {
-            // Finish task after 100 ms
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            Ok::<(), Error>(())
-        });
+        let (task_future, handle) = spawn_cancellable_task(
+            None,
+            async move {
+                // Finish task after 100 ms
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok::<(), Error>(())
+            },
+            Handle::current(),
+        );
 
         assert!(!handle.is_finished());
 

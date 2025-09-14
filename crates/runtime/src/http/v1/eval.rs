@@ -25,7 +25,7 @@ use datafusion::sql::TableReference;
 use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::{runtime::Handle, sync::RwLock};
 
 use crate::{
     Runtime,
@@ -95,6 +95,7 @@ pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(eval_scorer_registry): Extension<EvalScorerRegistry>,
+    Extension(tokio_handle): Extension<Handle>,
     accept: Option<TypedHeader<Accept>>,
     Path(eval_name): Path<String>,
     Json(req): Json<RunEval>,
@@ -137,9 +138,10 @@ pub(crate) async fn post(
         Ok(id) => {
             sql_to_http_response(
                 Arc::clone(&df),
-                sql_query_for(&id).as_str(),
+                sql_query_for(&id),
                 None,
                 ResponseMimeType::from_accept_header(accept.as_ref()),
+                &tokio_handle,
             )
             .await
         }

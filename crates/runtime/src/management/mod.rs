@@ -38,7 +38,7 @@ use datafusion::{
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::management::Management as SpicepodManagement;
-use tokio::sync::RwLock;
+use tokio::{runtime::Handle, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 use util::{
     RetryError,
@@ -182,6 +182,7 @@ impl Management {
 
                     Ok(())
                 },
+                Handle::current(),
             )
             .await;
 
