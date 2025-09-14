@@ -560,4 +560,3 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
-
