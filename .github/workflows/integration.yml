@@ -236,4 +236,4 @@ jobs:
             git push origin
           fi
         env:
-          GH_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
