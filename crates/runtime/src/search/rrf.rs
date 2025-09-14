@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
@@ -151,9 +151,7 @@ impl ReciprocalRankFusion {
     }
 
     fn empty_df(&self) -> DataFrame {
-        let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
-
-        let empty_batch = RecordBatch::new_empty(Arc::new(schema));
+        let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
 
         match self.session_context.read_batch(empty_batch) {
             Ok(batch) => batch,
@@ -183,7 +181,7 @@ impl ReciprocalRankFusion {
             match c.name.as_str() {
                 "__spice_rrf_row_id" | "rank" | "score" => None,
                 // TODO: do we want the embedding in the final projection?
-                other if other.contains("embedding") => None,
+                other if other.ends_with("_embedding") => None,
                 other => Some(
                     coalesce(
                         (0..subquery_dfs.len())
@@ -218,6 +216,8 @@ impl ReciprocalRankFusion {
         }
 
         if let Some(joined) = maybe_joined {
+            tracing::trace!("{RRF_UDF_NAME} made reranked & fused DF for: {args:?}");
+
             joined
                 .select(columns)?
                 .distinct()?
@@ -233,6 +233,8 @@ impl ReciprocalRankFusion {
         &self,
         args: &ReciprocalRankFusionArgs,
     ) -> Result<Vec<DataFrame>> {
+        tracing::trace!("{RRF_UDF_NAME} preparing subqueries for: {:?}", args);
+
         let search_dfs: Vec<DataFrame> = args
             .search_udtf_exprs
             .iter()
@@ -316,7 +318,7 @@ impl ReciprocalRankFusion {
             // Don't hash embeddings or scores
             .filter_map(|c| match c.name() {
                 "score" => None,
-                name if name.contains("embedding") => None,
+                name if name.ends_with("_embedding") => None,
                 name => Some(col(name).cast_to(&DataType::Utf8, df.schema())),
             })
             .collect::<Result<Vec<_>>>()?;
