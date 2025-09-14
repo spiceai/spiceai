@@ -96,21 +96,22 @@ impl SearchQueryProvider {
             .collect();
 
         let has_all_columns = search_index_columns.is_superset(&columns_requested);
+        if !has_all_columns {
+            // Early exit.
+            return Ok(false);
+        }
 
         // Check if all filters can be handled by search index
-        let handleable_filters = filters
-            .iter()
-            .filter(|f| {
-                let filter_columns = f
-                    .column_refs()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect::<HashSet<_>>();
-                search_index_columns.is_superset(&filter_columns)
-            })
-            .count();
+        let all_filters_can_be_done = filters.iter().all(|f| {
+            let filter_columns = f
+                .column_refs()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect::<HashSet<_>>();
+            search_index_columns.is_superset(&filter_columns)
+        });
 
-        Ok(has_all_columns && handleable_filters == filters.len())
+        Ok(all_filters_can_be_done)
     }
 
     /// Build the underlying table scan, removing search index metadata columns from projection
