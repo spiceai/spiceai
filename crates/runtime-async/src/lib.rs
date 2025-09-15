@@ -62,11 +62,11 @@ impl Drop for ManagedTokioRuntime {
         self.notify_shutdown.notify_one();
         if let Some(thread_join_handle) = self.thread_join_handle.take() {
             // If the thread is still running, wait for it to finish
-            tracing::debug!("Shutting down CPU runtime thread...");
+            tracing::debug!("Shutting down Tokio runtime thread...");
             if let Err(e) = thread_join_handle.join() {
-                tracing::debug!("Error joining CPU runtime thread: {e:?}");
+                tracing::debug!("Error joining Tokio runtime thread: {e:?}");
             } else {
-                tracing::debug!("CPU runtime thread shutdown successfully.");
+                tracing::debug!("Tokio runtime thread shutdown successfully.");
             }
         }
     }
@@ -143,5 +143,179 @@ async fn drain_join_set(mut join_set: JoinSet<Result<()>>) {
             Ok(Err(e)) => tracing::debug!("Task failed: {e}"), // task failed
             Err(e) => tracing::debug!("JoinSet error: {e}"),   // JoinSet error
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    #[test]
+    fn test_managed_tokio_runtime_creation() {
+        let runtime = ManagedTokioRuntime::try_new();
+        assert!(runtime.is_ok());
+
+        let runtime = runtime.expect("Failed to create ManagedTokioRuntime");
+        assert!(runtime.handle().try_current().is_ok());
+    }
+
+    #[test]
+    fn test_managed_tokio_runtime_handle() {
+        let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+        let handle = runtime.handle();
+
+        // Verify we can spawn a task on the handle
+        let future = async { 42 };
+        let join_handle = handle.spawn(future);
+
+        // We can't easily block on this in a sync test, but we can verify the handle works
+        assert!(!join_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_and_collect_results_success() {
+        let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+        let handle = runtime.handle();
+
+        let future = async { 42u32 };
+        let result = spawn_task_and_collect_results(future, handle).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.expect("Failed to get task result"), 42);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_and_collect_results_async_task() {
+        let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+        let handle = runtime.handle();
+
+        let future = async {
+            sleep(Duration::from_millis(10)).await;
+            "hello world"
+        };
+
+        let result = spawn_task_and_collect_results(future, handle).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            result.expect("Failed to get async task result"),
+            "hello world"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_task_and_collect_results_with_different_types() {
+        let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+        let handle = runtime.handle();
+
+        // Test with Vec<i32>
+        let future = async { vec![1, 2, 3, 4, 5] };
+        let result = spawn_task_and_collect_results(future, handle).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.expect("Failed to get Vec result"),
+            vec![1, 2, 3, 4, 5]
+        );
+
+        // Test with Option<String>
+        let future = async { Some("test".to_string()) };
+        let result = spawn_task_and_collect_results(future, handle).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.expect("Failed to get Option result"),
+            Some("test".to_string())
+        );
+
+        // Test with Result<i32, String>
+        let future = async { Ok::<i32, String>(100) };
+        let result = spawn_task_and_collect_results(future, handle).await;
+        assert!(result.is_ok());
+        assert_eq!(result.expect("Failed to get Result result"), Ok(100));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_concurrent_tasks() {
+        let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+        let handle = runtime.handle();
+
+        // Spawn multiple tasks concurrently
+        let futures = (0..5).map(|i| {
+            spawn_task_and_collect_results(
+                async move {
+                    sleep(Duration::from_millis(10)).await;
+                    i * 2
+                },
+                handle,
+            )
+        });
+
+        let results: Result<Vec<_>, _> = futures::future::try_join_all(futures).await;
+        assert!(results.is_ok());
+
+        let results = results.expect("Failed to collect concurrent task results");
+        assert_eq!(results, vec![0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn test_managed_tokio_runtime_drop_behavior() {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+
+        {
+            let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+            let handle = runtime.handle();
+
+            // Spawn a long-running task
+            handle.spawn(async move {
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                    if shutdown_flag_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                shutdown_flag_clone.store(true, Ordering::Relaxed);
+            });
+
+            // Runtime goes out of scope here and should be dropped
+        }
+
+        // Give some time for cleanup
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The task should have completed during shutdown
+        assert!(shutdown_flag.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_drain_join_set_with_successful_tasks() {
+        let mut join_set = JoinSet::new();
+
+        // Add some successful tasks
+        for i in 0..3 {
+            join_set.spawn(async move {
+                sleep(Duration::from_millis(i * 10)).await;
+                Ok(()) as Result<()>
+            });
+        }
+
+        // This should complete without panicking
+        drain_join_set(join_set).await;
+    }
+
+    #[tokio::test]
+    async fn test_drain_join_set_with_failed_tasks() {
+        let mut join_set = JoinSet::new();
+
+        // Add a mix of successful and failed tasks
+        join_set.spawn(async { Ok(()) as Result<()> });
+        join_set.spawn(async { Err(Error::TaskExecution) });
+        join_set.spawn(async { Ok(()) as Result<()> });
+
+        // This should complete without panicking, even with failed tasks
+        drain_join_set(join_set).await;
     }
 }
