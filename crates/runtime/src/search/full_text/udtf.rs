@@ -27,11 +27,9 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
-use std::{
-    borrow::Cow,
-    sync::{Arc, Weak},
-};
-
+use arrow_schema::DataType;
+use datafusion::common::exec_err;
+use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::{Column, Constraints, Statistics},
@@ -43,8 +41,15 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use search::generation::text_search::{
     index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
+};
+use std::any::Any;
+use std::sync::LazyLock;
+use std::{
+    borrow::Cow,
+    sync::{Arc, Weak},
 };
 
 use crate::{
@@ -55,6 +60,8 @@ use crate::{
 };
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
+pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> =
+    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
@@ -111,6 +118,10 @@ impl TextSearchTableFunc {
     #[must_use]
     pub fn new(df: Weak<DataFusion>) -> Self {
         Self { df }
+    }
+
+    fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
+        exec_err!("{TEXT_SEARCH_UDTF_NAME} does not support scalar invocation.")
     }
 }
 
@@ -272,6 +283,28 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 underlying: table_provider,
             }),
         }))
+    }
+}
+
+impl ScalarUDFImpl for TextSearchTableFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        TEXT_SEARCH_UDTF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &TEXT_SEARCH_SIGNATURE
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Self::scalar_invocation_error()
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Self::scalar_invocation_error()
     }
 }
 
