@@ -208,11 +208,19 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
         self.metrics
             .update_bytes_consumed(statistics.rxmsg_bytes as u64);
 
-        tracing::trace!(
-            "Kafka metrics updated - lag: {}, messages: {}, bytes: {}",
+        tracing::tarce!(
+            "Kafka metrics updated for consumer: {}, topics: {:?}, lag: {}, messages: {}, bytes: {}, brokers={:?}, consumer_group_state={:?}",
+            statistics.name,
+            statistics.topics.keys().collect::<Vec<_>>(),
             total_lag,
             statistics.rxmsgs,
-            statistics.rxmsg_bytes
+            statistics.rxmsg_bytes,
+            statistics
+                .brokers
+                .values()
+                .map(|b| format!("{}:{}", b.name, b.state))
+                .collect::<Vec<_>>(),
+            statistics.cgrp.as_ref().map(|cgrp| &cgrp.state),
         );
     }
 }
