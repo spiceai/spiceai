@@ -202,9 +202,7 @@ mod xxhash_compat {
             self.hasher.write(bytes);
         }
     }
-
 }
-
 
 #[derive(Default)]
 pub struct Caching {
