@@ -265,6 +265,11 @@ impl KafkaConsumer {
         config
             .set("group.id", group_id.clone())
             .set("bootstrap.servers", &kafka_config.brokers)
+            .set("retry.backoff.ms", "1000")
+            .set("retry.backoff.max.ms", "30000")
+            .set("reconnect.backoff.ms", "1000")
+            .set("reconnect.backoff.max.ms", "30000")
+            .set("debug", "broker,cgrp,fetch")
             // For new consumer groups, start reading at the beginning of the topic
             .set("auto.offset.reset", "smallest")
             // Commit offsets automatically

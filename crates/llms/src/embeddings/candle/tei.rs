@@ -178,6 +178,7 @@ impl TeiEmbed {
             None,
             DType::Float32,
             model_type,
+            None,          // Not Used
             String::new(), // Not used
             None,          // Not used
             String::new(), // Not used
@@ -226,6 +227,7 @@ impl TeiEmbed {
                         TruncationDirection::Right,
                         None,
                         true,
+                        None,
                         permit,
                     )
                     .await
