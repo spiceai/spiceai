@@ -45,6 +45,11 @@ use tokio::sync::RwLock;
 
 use super::table::EmbeddingTable;
 
+use crate::embeddings::index::{
+    VectorIndex, VectorScanTableProvider, s3::partition::S3VectorPartitionCreator,
+};
+use runtime_table_partition::provider::PartitionTableProvider;
+
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
@@ -200,9 +205,7 @@ impl EmbeddingConnector {
                 for (column, config) in embedding_columns {
                     use runtime_datafusion_index::Index;
 
-                    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
-
-                    let vector_index = super::index::s3::try_from_dataset(
+                    let s3_vector = super::index::s3::try_from_dataset(
                         &dataset.name,
                         column,
                         config,
@@ -222,13 +225,49 @@ impl EmbeddingConnector {
                         }
                     })?;
 
-                    // augment the previous underlying table provider with the vector index
-                    // this will result in recursive augmentation of the underlying table for N embedding columns
-                    provider.underlying = Arc::new(VectorScanTableProvider::new(
-                        provider.underlying,
-                        Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>,
-                    )) as Arc<dyn TableProvider>;
-                    provider = provider.add_index(Arc::new(vector_index.clone()) as Arc<dyn Index>);
+                    if let Some(partition_by) = s3_vector.partition_by.clone() {
+                        if partition_by.expressions.len() == 1 {
+                            let creator = Arc::new(S3VectorPartitionCreator {
+                                s3_vector: s3_vector.clone(),
+                                vector_store_config: vector_store.clone(),
+                                secrets: Arc::clone(&self.secrets),
+                            });
+
+                            let partitioned_provider = PartitionTableProvider::new(
+                                creator,
+                                partition_by.expressions,
+                                s3_vector.schema(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                DataConnectorError::InvalidConfigurationNoSource {
+                                    dataconnector: dataset.source().to_string(),
+                                    connector_component: dataset.into(),
+                                    message: format!("Failed to create partitioned provider: {e}"),
+                                }
+                            })?;
+
+                            provider.underlying =
+                                Arc::new(partitioned_provider) as Arc<dyn TableProvider>;
+                        } else {
+                            // Fallback for multiple partition expressions
+                            let vector_index = Arc::new(s3_vector.clone()) as Arc<dyn VectorIndex>;
+                            provider.underlying = Arc::new(VectorScanTableProvider::new(
+                                provider.underlying,
+                                vector_index,
+                            ))
+                                as Arc<dyn TableProvider>;
+                        }
+                    } else {
+                        // No partitioning
+                        let vector_index = Arc::new(s3_vector.clone()) as Arc<dyn VectorIndex>;
+                        provider.underlying = Arc::new(VectorScanTableProvider::new(
+                            provider.underlying,
+                            vector_index,
+                        )) as Arc<dyn TableProvider>;
+                    }
+
+                    provider = provider.add_index(Arc::new(s3_vector) as Arc<dyn Index>);
                 }
                 tracing::info!(
                     "S3 Vectors for dataset {} initialized in {:?}",

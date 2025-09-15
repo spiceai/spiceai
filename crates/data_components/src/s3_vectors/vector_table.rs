@@ -449,4 +449,15 @@ impl S3VectorsTable {
 
         Ok(())
     }
+
+    /// The name of the index
+    pub fn index_name(&self) -> String {
+        match &self.idx {
+            S3VectorIdentifier::IndexArn(_) => todo!(),
+            S3VectorIdentifier::Index {
+                bucket_name: _,
+                index_name,
+            } => index_name.clone(),
+        }
+    }
 }

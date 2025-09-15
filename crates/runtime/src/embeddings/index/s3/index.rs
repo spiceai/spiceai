@@ -17,6 +17,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
+use arrow_schema::SchemaRef;
 use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
@@ -92,6 +93,10 @@ impl S3Vector {
             embedding_models,
             partition_by,
         }
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.list_table_provider().unwrap().schema()
     }
 
     pub async fn embedding_model(&self) -> Option<Arc<dyn Embed>> {

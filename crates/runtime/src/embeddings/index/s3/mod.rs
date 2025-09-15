@@ -44,12 +44,14 @@ use crate::{
     secrets::Secrets,
 };
 
+pub mod partition;
 mod write;
-pub use write::write;
+
+pub(super) use write::write;
 mod index;
 pub use index::S3Vector;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub(super) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
         .description("The S3 bucket name to use for the S3 Vectors index.")
         .secret(),
@@ -155,7 +157,7 @@ async fn embedding_vector_size(
 //
 // If no index name provided (either explicitly, or in ARN), use `default_s3_index_name`.
 #[allow(clippy::cast_possible_wrap)]
-async fn try_vector_table(
+pub(super) async fn try_vector_table(
     columns: MetadataColumns,
     params: Parameters,
     default_s3_index_name: &str,
@@ -232,7 +234,7 @@ fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
 }
 
 /// Convert raw params configuration to parameters with secret support
-async fn get_store_params(
+pub(super) async fn get_store_params(
     vector_store_config: &VectorStore,
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
@@ -274,7 +276,10 @@ impl FromStr for S3VectorMetadataColumn {
 }
 
 /// Gets the columns that should be added as metadata to the S3 vector index.
-fn s3_vector_metadata_columns(columns: &[Column], schema: &SchemaRef) -> MetadataColumns {
+pub(super) fn s3_vector_metadata_columns(
+    columns: &[Column],
+    schema: &SchemaRef,
+) -> MetadataColumns {
     let metadata_columns: Vec<MetadataColumn> = columns
         .iter()
         .filter_map(|c| {
