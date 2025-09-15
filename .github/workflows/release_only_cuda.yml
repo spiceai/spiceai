@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Build and Release workflow run ID to get artifacts from"
+        description: 'Build and Release workflow run ID to get artifacts from'
         required: true
         type: string
       target_version:
-        description: "Target version to release"
+        description: 'Target version to release'
         required: true
         type: string
 
@@ -49,13 +49,13 @@ jobs:
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
           export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-          
+
           # First check if we have any files to upload
           if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then
             echo "No artifacts found in ${ARTIFACT_DIR}"
             exit 1
           fi
-          
+
           # Create an array of actual files (no globs)
           RELEASE_ARTIFACTS=()
           for file in ${ARTIFACT_DIR}/*; do
@@ -63,7 +63,7 @@ jobs:
               RELEASE_ARTIFACTS+=("$file")
             fi
           done
-          
+
           # Delete existing release artifact
           python ./.github/scripts/github_release.py delete \
             --owner $OWNER_NAME --repo $REPO_NAME \
@@ -75,7 +75,7 @@ jobs:
           else
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
-          
+
           echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
           python ./.github/scripts/github_release.py upload \
             --owner $OWNER_NAME --repo $REPO_NAME \

@@ -182,19 +182,20 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .expect("collect working");
 
             let expected_plan = [
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                          |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | BytesProcessedNode                                                                                                                            |",
-                "|               |   Federated                                                                                                                                   |",
-                "|               |  Projection: count(Int64(1))                                                                                                                  |",
-                "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                           |",
-                "|               |     TableScan: abc projection=[]                                                                                                              |",
-                "| physical_plan | BytesProcessedExec                                                                                                                            |",
-                "|               |   SchemaCastScanExec                                                                                                                          |",
-                "|               |     VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, initial_sql=SELECT count(1) FROM \"abc\" |",
-                "|               |                                                                                                                                               |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+",
+                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                            |",
+                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | BytesProcessedNode                                                                                                                              |",
+                "|               |   Federated                                                                                                                                     |",
+                "|               |  Projection: count(Int64(1))                                                                                                                    |",
+                "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                             |",
+                "|               |     TableScan: abc projection=[]                                                                                                                |",
+                "| physical_plan | BytesProcessedExec                                                                                                                              |",
+                "|               |   SchemaCastScanExec                                                                                                                            |",
+                "|               |     CooperativeExec                                                                                                                             |",
+                "|               |       VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, initial_sql=SELECT count(1) FROM \"abc\" |",
+                "|               |                                                                                                                                                 |",
+                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+",
             ];
             assert_batches_eq!(expected_plan, &plan_results);
 
@@ -235,7 +236,8 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 "|               |       BytesProcessedExec                                                       |",
                 "|               |         SchemaCastScanExec                                                     |",
                 "|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
-                "|               |             SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc       |",
+                "|               |             CooperativeExec                                                    |",
+                "|               |               SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc     |",
                 "|               |                                                                                |",
                 "+---------------+--------------------------------------------------------------------------------+",
             ];

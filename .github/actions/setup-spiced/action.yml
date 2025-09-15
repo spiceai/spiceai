@@ -32,7 +32,7 @@ runs:
         echo "Fetching latest 10 commits from ${{ inputs.ref }}"
 
         commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
-        
+
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
           features="odbc_models"
         else
@@ -50,13 +50,13 @@ runs:
 
         echo "Could not find any recently built spiced commit in MinIO"
         exit 1
-    
+
     - name: Set SPICED_COMMIT from workflow input
       shell: bash
       if: ${{ inputs.spiced_commit }}
       run: |
         echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $GITHUB_ENV
-    
+
     - name: Output SPICED_COMMIT
       id: output_spiced_commit
       shell: bash

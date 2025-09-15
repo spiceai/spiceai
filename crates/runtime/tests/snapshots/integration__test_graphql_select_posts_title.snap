@@ -12,6 +12,7 @@ description: "Query: SELECT posts[1]['title'] from test_graphql"
 |               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                    |
 |               |     BytesProcessedExec                                                                                    |
 |               |       ProjectionExec: expr=[posts@2 as posts]                                                             |
-|               |         GraphQLTableProviderExec                                                                          |
+|               |         CooperativeExec                                                                                   |
+|               |           GraphQLTableProviderExec                                                                        |
 |               |                                                                                                           |
 +---------------+-----------------------------------------------------------------------------------------------------------+

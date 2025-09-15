@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/s3_vectors.rs
 expression: formatted
+snapshot_kind: text
 ---
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                    |
@@ -20,8 +21,11 @@ expression: formatted
 |               |             ProjectionExec: expr=[event.id@0 as event.id, account.tier@2 as account.tier, score@1 as score]                                                                                             |
 |               |               BytesProcessedExec                                                                                                                                                                        |
 |               |                 ProjectionExec: expr=[key@1 as event.id, 1 - distance@2 as score, account.tier@0 as account.tier]                                                                                       |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                  |
-|               |                     BytesProcessedExec                                                                                                                                                                  |
-|               |                       S3VectorsQueryExec: limit=30                                                                                                                                                      |
+|               |                   BytesProcessedExec                                                                                                                                                                    |
+|               |                     CooperativeExec                                                                                                                                                                     |
+|               |                       CooperativeExec                                                                                                                                                                   |
+|               |                         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                            |
+|               |                           CooperativeExec                                                                                                                                                               |
+|               |                             S3VectorsQueryExec: limit=30                                                                                                                                                |
 |               |                                                                                                                                                                                                         |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

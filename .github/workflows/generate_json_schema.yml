@@ -2,7 +2,7 @@ name: Generate Spicepod JSON schema
 
 on:
   push:
-    branches: [ trunk ]
+    branches: [trunk]
     paths:
       - 'crates/spicepod/**'
 
@@ -13,49 +13,49 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-    - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install stable --profile minimal
 
-    - name: Set up make
-      uses: ./.github/actions/setup-make
+      - name: Set up make
+        uses: ./.github/actions/setup-make
 
-    - name: Build Cargo project
-      run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
+      - name: Build Cargo project
+        run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
 
-    - name: Run Cargo project
-      run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.schema.json
+      - name: Run Cargo project
+        run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.schema.json
 
-    - name: Verify JSON schema file
-      run: |
-        if [ -f ".schema/spicepod.schema.json" ]; then
-          echo ".schema/spicepod.schema.json file was successfully created."
-          cat .schema/spicepod.schema.json
-        else
-          echo ".schema/spicepod.schema.json file was not created."
-          exit 1
-        fi
+      - name: Verify JSON schema file
+        run: |
+          if [ -f ".schema/spicepod.schema.json" ]; then
+            echo ".schema/spicepod.schema.json file was successfully created."
+            cat .schema/spicepod.schema.json
+          else
+            echo ".schema/spicepod.schema.json file was not created."
+            exit 1
+          fi
 
-    - name: Upload JSON schema artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: spicepod.schema
-        path: .schema/spicepod.schema.json
+      - name: Upload JSON schema artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spicepod.schema
+          path: .schema/spicepod.schema.json
 
-    - name: Create PR
-      if: github.event_name == 'workflow_dispatch'
-      run: |
-        git config --global user.name 'Spice Schema Bot'
-        git config --global user.email 'schema-bot@spice.ai'
-        git checkout -b schema/${GITHUB_RUN_ID}
-        git diff .schema/spicepod.schema.json
-        if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
-          git add .schema/spicepod.schema.json
-          git commit -m "Update spicepod.schema.json"
-          git push origin schema/${GITHUB_RUN_ID}
-          gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
-        else
-          echo "No changes detected"
-        fi
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create PR
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config --global user.name 'Spice Schema Bot'
+          git config --global user.email 'schema-bot@spice.ai'
+          git checkout -b schema/${GITHUB_RUN_ID}
+          git diff .schema/spicepod.schema.json
+          if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
+            git add .schema/spicepod.schema.json
+            git commit -m "Update spicepod.schema.json"
+            git push origin schema/${GITHUB_RUN_ID}
+            gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
+          else
+            echo "No changes detected"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

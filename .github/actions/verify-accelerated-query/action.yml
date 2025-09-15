@@ -12,13 +12,13 @@ inputs:
     required: true
 outputs:
   query-result:
-    description: "Query result encoded as base64 string"
+    description: 'Query result encoded as base64 string'
     value: ${{ steps.query.outputs.query-result }}
   accelerated-query-result:
-    description: "Accelerated query result encoded as base64 string"
+    description: 'Accelerated query result encoded as base64 string'
     value: ${{ steps.query-accelerated.outputs.query-result }}
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Create spicepod
       shell: bash
@@ -37,7 +37,7 @@ runs:
         echo "datasets:" >> spicepod.yaml
         echo "${{ inputs.dataset-source }}" >> spicepod.yaml
         cat spicepod.yaml
-    
+
     - name: Run test query
       id: query
       env:
@@ -45,9 +45,9 @@ runs:
       uses: ./.github/actions/run-query
       with:
         working-directory: app_${{ inputs.table-name }}
-        query: "select * from ${{ inputs.table-name }} limit 10;"
+        query: 'select * from ${{ inputs.table-name }} limit 10;'
         start-runtime: true
-        
+
     - name: Create accelerated dataset
       shell: bash
       working-directory: app_${{ inputs.table-name }}
@@ -57,7 +57,7 @@ runs:
         echo "    enabled: true" >> spicepod.yaml
         echo "    engine: ${{ inputs.engine }} " >> spicepod.yaml
         cat spicepod.yaml
-  
+
     - name: Run test query (accelerated)
       id: query-accelerated
       env:
@@ -65,7 +65,7 @@ runs:
       uses: ./.github/actions/run-query
       with:
         working-directory: app_${{ inputs.table-name }}
-        query: "select * from ${{ inputs.table-name }} limit 10;"
+        query: 'select * from ${{ inputs.table-name }} limit 10;'
         start-runtime: true
 
     - name: Verify query results ${{ inputs.table-name }}
