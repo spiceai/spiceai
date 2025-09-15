@@ -130,7 +130,7 @@ impl SearchQueryProvider {
             .concat(),
             projection,
         );
-        base_proj.sort(); // Deterministic LogicalPlans
+        base_proj.sort_unstable(); // Deterministic LogicalPlans
 
         // Get filters that can be pushed down to the base table
         let filter_refs: Vec<_> = filters.iter().collect();
@@ -398,7 +398,7 @@ impl TableProvider for SearchQueryProvider {
         // Check primary key constraints
         if primary_key_fields.is_empty() {
             return Err(DataFusionError::Execution(
-                "The search index was created successfully without a primary key.\n\
+                "The search index was created without a primary key.\n\
                 Ensure a primary key is available in the dataset source, or specified in the column configuration."
                 .to_string(),
             ));

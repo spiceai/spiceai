@@ -204,16 +204,7 @@ impl TableProvider for VectorScanTableProvider {
             embedding_col!(self.index.search_column()),
         )));
 
-        let vector_table_scan = LogicalPlan::Projection(Projection::try_new(
-            proj,
-            Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-                TableReference::parse_str("vector_index"),
-                Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
-                None,
-                vec![],
-                None,
-            )?)),
-        )?);
+        let index_logical_plan = self.index.list_table_provider()?;
 
         let primary_key_fields = self.index.primary_fields();
         if primary_key_fields.is_empty() {
@@ -227,20 +218,20 @@ impl TableProvider for VectorScanTableProvider {
 
         let output_plan = if search_index_table_is_sufficient(
             projection_schema.fields().iter().as_slice(),
-            &vector_table_scan,
+            &index_logical_plan,
             filters,
         ) {
             // Let DataFusion handle pushing filters.
             if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                LogicalPlan::Filter(Filter::try_new(filter, vector_table_scan.into())?)
+                LogicalPlan::Filter(Filter::try_new(filter, index_logical_plan.into())?)
             } else {
-                vector_table_scan
+                index_logical_plan
             }
         } else {
             let underlying_table_scan =
                 LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
 
-            let join_schema = vector_table_scan
+            let join_schema = index_logical_plan
                 .schema()
                 .join(underlying_table_scan.schema())?;
 
@@ -269,7 +260,7 @@ impl TableProvider for VectorScanTableProvider {
             // Right Join so that all rows in the underlying table are returned.
             // Rows may not have associated vectors periodically due to indexing delays.
             let join = LogicalPlan::Join(Join {
-                left: Arc::new(vector_table_scan),
+                left: Arc::new(index_logical_plan),
                 right: Arc::new(underlying_table_scan),
                 join_type: JoinType::Right,
                 join_constraint: JoinConstraint::On,

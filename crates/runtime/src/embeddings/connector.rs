@@ -372,7 +372,6 @@ impl DataConnector for EmbeddingConnector {
 
     fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-
         if let Some(indexed_table) = table_provider
             .as_any()
             .downcast_ref::<IndexedTableProvider>()
@@ -381,7 +380,6 @@ impl DataConnector for EmbeddingConnector {
             let indexed_table = Arc::new(indexed_table);
             let underlying_federated_table =
                 underlying_federated_table_for_indexed_table(&table_provider)?;
-
             let stream = self
                 .inner_connector
                 .changes_stream(underlying_federated_table)?

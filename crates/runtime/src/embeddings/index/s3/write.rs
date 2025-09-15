@@ -134,9 +134,17 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     )
     .await?;
 
-    let metadata =
-        extract_and_format_metadata(index.name(), &index.metadata_columns().all_names(), &record)
-            .map_err(|e| *e)?;
+    let metadata = extract_and_format_metadata(
+        index.name(),
+        &index
+            .metadata_columns()
+            .all_names()
+            .into_iter()
+            .filter(|c| *c != embedding_col!(index.search_column()))
+            .collect::<Vec<_>>(),
+        &record,
+    )
+    .map_err(|e| *e)?;
     let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
         .map_err(|e| *e)?;
 

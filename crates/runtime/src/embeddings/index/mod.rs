@@ -27,13 +27,13 @@ pub use scan_table::VectorScanTableProvider;
 use search::index::SearchIndex;
 
 pub trait VectorIndex: SearchIndex {
-    /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
-    /// columns and the associated embedding vectors of the [`SearchIndex::search_column`].
+    /// A [`LogicalPlan`] representation of the data within the index. The [`LogicalPlan::schema`] must contain
+    ///  - The [`SearchIndex::primary_fields`]
+    ///  - All columns in [`SearchIndex::metadata_columns`]
+    ///  - The associated embedding vectors of the [`SearchIndex::search_column`].
     ///
     /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
-    fn list_table_provider(
-        &self,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
@@ -111,6 +111,7 @@ pub mod tests {
         prelude::{Expr, SessionConfig, SessionContext},
         sql::TableReference,
     };
+    use datafusion_expr::LogicalPlan;
     use search::generation::util::append_fields;
     use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
@@ -276,7 +277,7 @@ pub mod tests {
     impl VectorIndex for PretendVectorIndex {
         fn list_table_provider(
             &self,
-        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
             let mem_table = MemTable::try_new(
                 Arc::new(self.schema.clone()),
                 vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
