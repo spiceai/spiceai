@@ -84,6 +84,7 @@ pub mod error;
 pub mod extension;
 pub mod filter_converter;
 pub mod param_utils;
+pub mod physical_optimizer;
 pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
