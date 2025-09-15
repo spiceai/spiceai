@@ -88,22 +88,24 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
             // We have a vector engine configured with no explicit acceleration - no indexing will happen.
-            if vector_engine.enabled && acceleration.is_none() {
-                tracing::debug!(
-                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
-                    dataset.name
-                );
-            }
+            if vector_engine.enabled {
+                if acceleration.is_none() {
+                    tracing::debug!(
+                        "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
+                        dataset.name
+                    );
+                }
 
-            // Chunking with vector engines is not supported (yet).
-            for column in &dataset.columns {
-                for embedding in &column.embeddings {
-                    if embedding.chunking.is_some() {
-                        return Err(crate::Error::InvalidSpicepodDataset {
-                            source: Error::ChunkingNotSupportedForVectorEngine {
-                                column: column.name.clone(),
-                            },
-                        });
+                // Chunking with vector engines is not supported (yet).
+                for column in &dataset.columns {
+                    for embedding in &column.embeddings {
+                        if embedding.chunking.is_some() {
+                            return Err(crate::Error::InvalidSpicepodDataset {
+                                source: Error::ChunkingNotSupportedForVectorEngine {
+                                    column: column.name.clone(),
+                                },
+                            });
+                        }
                     }
                 }
             }
