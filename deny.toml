@@ -28,7 +28,8 @@ allow = [
   "CDLA-Permissive-2.0",
   "Zlib",
   "OpenSSL",
-  "0BSD"
+  "0BSD",
+  "bzip2-1.0.6" # https://spdx.org/licenses/bzip2-1.0.6.html
 ]
 private = { ignore = false }
 unused-allowed-license = "deny"
