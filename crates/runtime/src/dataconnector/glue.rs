@@ -212,7 +212,7 @@ impl DataConnector for GlueDataConnector {
 
         let mut glue_table_builder = client.get_table().database_name(database).name(table);
 
-        if let Some(catalog_id) = self.params.get("catalog_id").ok() {
+        if let Some(catalog_id) = self.params.get("glue_catalog_id").ok() {
             glue_table_builder = glue_table_builder.catalog_id(catalog_id.expose_secret());
         }
 
