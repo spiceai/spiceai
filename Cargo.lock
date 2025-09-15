@@ -14536,11 +14536,12 @@ dependencies = [
 
 [[package]]
 name = "text-embeddings-backend"
-version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
+version = "1.8.2"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8#9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8"
 dependencies = [
  "hf-hub",
  "rand 0.9.2",
+ "serde",
  "serde_json",
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
@@ -14550,8 +14551,8 @@ dependencies = [
 
 [[package]]
 name = "text-embeddings-backend-candle"
-version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
+version = "1.8.2"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8#9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8"
 dependencies = [
  "anyhow",
  "candle-core 0.8.4",
@@ -14573,8 +14574,8 @@ dependencies = [
 
 [[package]]
 name = "text-embeddings-backend-core"
-version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
+version = "1.8.2"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8#9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8"
 dependencies = [
  "nohash-hasher",
  "serde",
@@ -14583,8 +14584,8 @@ dependencies = [
 
 [[package]]
 name = "text-embeddings-core"
-version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
+version = "1.8.2"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8#9e47695e9dd9b7f0c29ad371d06a4acf7f5f92c8"
 dependencies = [
  "async-channel 2.3.1",
  "hf-hub",
