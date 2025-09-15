@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5.45", features = ["derive"] }
+clap = { version = "4.5.47", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 path-clean = "1.0"
