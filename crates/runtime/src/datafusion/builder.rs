@@ -31,6 +31,7 @@ use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -50,7 +51,6 @@ use datafusion::{
 use datafusion_federation::sql::federation_analyzer_rule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
-use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
