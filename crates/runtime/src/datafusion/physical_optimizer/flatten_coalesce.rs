@@ -25,8 +25,12 @@ use std::sync::Arc;
 pub struct FlattenCoalesce {}
 
 impl FlattenCoalesce {
-    fn coalesce_node(node: Arc<dyn ExecutionPlan>) -> Option<CoalesceBatchesExec> {
+    fn coalesce_batches_exec_node(node: Arc<dyn ExecutionPlan>) -> Option<CoalesceBatchesExec> {
         node.as_any().downcast_ref::<CoalesceBatchesExec>().cloned()
+    }
+
+    fn coalesce_batches_are_equivalent(a: &CoalesceBatchesExec, b: &CoalesceBatchesExec) -> bool {
+        a.target_batch_size() == b.target_batch_size() && a.fetch() == b.fetch()
     }
 }
 
@@ -37,19 +41,26 @@ impl PhysicalOptimizerRule for FlattenCoalesce {
         config: &ConfigOptions,
     ) -> Result<Arc<(dyn ExecutionPlan + 'static)>, DataFusionError> {
         let transformed = plan.transform_down(|plan| {
-            if let Some(outer_coalesce) = Self::coalesce_node(Arc::clone(&plan)) {
+            if let Some(outer_coalesce) = Self::coalesce_batches_exec_node(Arc::clone(&plan)) {
                 let mut current = outer_coalesce;
+                let mut transformed = false;
 
                 // Support arbitrarily nested CoalesceBatchesExec nodes, but only proceed if the
                 // parameters for both nodes are the same
-                while let Some(input_plan) = Self::coalesce_node(Arc::clone(current.input())) {
-                    if (current.target_batch_size() == input_plan.target_batch_size()) {
+                while let Some(input_plan) =
+                    Self::coalesce_batches_exec_node(Arc::clone(current.input()))
+                {
+                    if Self::coalesce_batches_are_equivalent(&current, &input_plan) {
+                        transformed = true;
                         current = input_plan;
                     } else {
                         break;
                     }
                 }
-                return Ok(Transformed::yes(Arc::new(current)));
+
+                if transformed {
+                    return Ok(Transformed::yes(Arc::new(current)));
+                }
             }
 
             Ok(Transformed::no(plan))
@@ -102,10 +113,10 @@ mod tests {
 
     #[test]
     fn test_do_not_flatten() {
-        // Make a plan with 3x CoalesceBatchesExec, where one in the chain has a different target_batch_size
+        // Make a plan with 3x CoalesceBatchesExec, where one in the chain has a different parameter
         let empty_exec = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
         let inner = Arc::new(CoalesceBatchesExec::new(empty_exec, 2));
-        let middle = Arc::new(CoalesceBatchesExec::new(inner, 100));
+        let middle = Arc::new(CoalesceBatchesExec::new(inner, 2).with_fetch(Some(2)));
         let outer: Arc<dyn ExecutionPlan> = Arc::new(CoalesceBatchesExec::new(middle, 2));
 
         let optimizer: Arc<dyn PhysicalOptimizerRule> = Arc::new(FlattenCoalesce {});

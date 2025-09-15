@@ -20,9 +20,17 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use super::{
+    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
+    SPICE_RUNTIME_SCHEMA,
+    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
+    schema::SpiceSchemaProvider,
+};
+use crate::datafusion::physical_optimizer::flatten_coalesce::FlattenCoalesce;
 use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -43,13 +51,6 @@ use datafusion_federation::sql::federation_analyzer_rule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
-
-use super::{
-    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
-    SPICE_RUNTIME_SCHEMA,
-    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
-    schema::SpiceSchemaProvider,
-};
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
@@ -169,6 +170,7 @@ impl DataFusionBuilder {
             .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
             .with_analyzer_rules(get_analyzer_rules())
+            .with_physical_optimizer_rules(get_physical_optimizer_rules())
             .build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -255,6 +257,12 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
     ]
+}
+
+/// Custom Spice physical optimizer rules
+#[must_use]
+pub fn get_physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    vec![Arc::new(FlattenCoalesce {})]
 }
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See

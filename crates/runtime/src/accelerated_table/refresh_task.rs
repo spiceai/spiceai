@@ -36,7 +36,9 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
-use crate::datafusion::builder::{get_analyzer_rules, get_df_default_config};
+use crate::datafusion::builder::{
+    get_analyzer_rules, get_df_default_config, get_physical_optimizer_rules,
+};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
 use crate::datafusion::extension::SpiceQueryPlanner;
 use crate::datafusion::is_spice_internal_dataset;
@@ -606,6 +608,7 @@ impl RefreshTask {
                 .with_default_features()
                 .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
                 .with_analyzer_rules(get_analyzer_rules())
+                .with_physical_optimizer_rules(get_physical_optimizer_rules())
                 .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
                 .build();
 

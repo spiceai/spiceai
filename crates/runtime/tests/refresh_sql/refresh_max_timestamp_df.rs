@@ -26,7 +26,7 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime::Runtime;
 use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
-use runtime::datafusion::builder::get_analyzer_rules;
+use runtime::datafusion::builder::{get_analyzer_rules, get_physical_optimizer_rules};
 use runtime::datafusion::extension::SpiceQueryPlanner;
 use runtime::execution_plan::schema_cast::EnsureSchema;
 use runtime_datafusion_index::analyzer::IndexTableScanOptimizerRule;
@@ -101,6 +101,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .with_default_features()
                 .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
                 .with_analyzer_rules(get_analyzer_rules())
+                .with_physical_optimizer_rules(get_physical_optimizer_rules())
                 .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
                 .build();
 

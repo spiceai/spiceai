@@ -178,6 +178,7 @@ pub mod tests {
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use data_components::s3_vectors::{MetadataColumn, MetadataColumns};
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
         datasource::TableType,
@@ -190,6 +191,7 @@ pub mod tests {
     use search::generation::util::append_fields;
     use snafu::ResultExt;
 
+    use crate::datafusion::builder::get_physical_optimizer_rules;
     use crate::{embedding_col, embeddings::index::VectorIndex};
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
@@ -403,8 +405,14 @@ pub mod tests {
         sql: &str,
         snapshot_name: &str,
     ) -> Result<(), String> {
-        let session =
-            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(3));
+        let config = SessionConfig::new().with_target_partitions(3);
+        let session_state = SessionContext::new_with_config(config)
+            .into_state_builder()
+            .with_physical_optimizer_rules(get_physical_optimizer_rules())
+            .build();
+
+        let session = SessionContext::new_with_state(session_state);
+
         session
             .register_table(tbl, provider)
             .map_err(|e| e.to_string())?;
