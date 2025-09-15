@@ -50,6 +50,7 @@ use datafusion::{
 use datafusion_federation::sql::federation_analyzer_rule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
@@ -262,7 +263,9 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
 /// Custom Spice physical optimizer rules
 #[must_use]
 pub fn get_physical_optimizer_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
-    vec![Arc::new(FlattenCoalesce {})]
+    let mut rules = PhysicalOptimizer::new().rules;
+    rules.push(Arc::new(FlattenCoalesce {}));
+    rules
 }
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
