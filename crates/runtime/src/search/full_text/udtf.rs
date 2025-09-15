@@ -45,7 +45,7 @@ use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
 use search::{
     generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
-    provider::SearchQueryProvider, udtf::TextSearchIndexProvider
+    provider::SearchQueryProvider, udtf::TextSearchIndexProvider,
 };
 use std::any::Any;
 use std::sync::LazyLock;
