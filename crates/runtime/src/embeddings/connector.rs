@@ -211,6 +211,7 @@ impl EmbeddingConnector {
                         Arc::clone(&self.embedding_models),
                         dataset.columns.clone(),
                         Arc::clone(&self.secrets),
+                        &dataset.runtime().df.ctx,
                     )
                     .await
                     .map_err(|e| {

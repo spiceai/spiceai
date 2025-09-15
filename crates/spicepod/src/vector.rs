@@ -33,6 +33,9 @@ pub struct VectorStore {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_by: Vec<String>,
 }
 
 const fn default_true() -> bool {

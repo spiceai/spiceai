@@ -20,8 +20,11 @@ use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{
     MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorsTable,
 };
-use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion::{
+    catalog::TableProvider, common::DFSchema, prelude::SessionContext, sql::TableReference,
+};
 use llms::embeddings::get_or_infer_size;
+use runtime_table_partition::expression::partition_by_expressions;
 use s3_vectors::{Client, S3Vectors};
 use search::generation::util::get_primary_keys;
 use snafu::ResultExt;
@@ -87,10 +90,18 @@ pub async fn try_from_dataset(
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
+    ctx: &SessionContext,
 ) -> Result<S3Vector, Box<dyn std::error::Error + Send + Sync>> {
     // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
     let pks_from_table = get_primary_keys(&underlying).await.boxed()?;
     let inner_schema = underlying.schema();
+    let df_schema = DFSchema::try_from(Arc::clone(&inner_schema)).boxed()?;
+
+    let partition_by = if vector_store_config.partition_by.is_empty() {
+        None
+    } else {
+        Some(partition_by_expressions(&vector_store_config.partition_by, ctx, &df_schema).boxed()?)
+    };
     let primary_key: Vec<_> = config
         .row_ids
         .clone()
@@ -126,6 +137,7 @@ pub async fn try_from_dataset(
         metadata_columns,
         config.model.clone(),
         embedding_models,
+        partition_by,
     ))
 }
 

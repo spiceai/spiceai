@@ -53,7 +53,7 @@ pub enum Error {
 
 pub type ValidationResult = Result<(), Error>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartitionBy {
     pub expressions_hash: u64,
     pub expressions: Vec<Expr>,

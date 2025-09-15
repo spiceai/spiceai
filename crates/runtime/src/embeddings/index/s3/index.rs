@@ -27,6 +27,7 @@ use data_components::s3_vectors::{
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
+use runtime_table_partition::expression::PartitionBy;
 use search::SEARCH_SCORE_COLUMN_NAME;
 use snafu::ResultExt;
 
@@ -67,6 +68,8 @@ pub struct S3Vector {
     pub model_name: String,
 
     pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+
+    pub partition_by: Option<PartitionBy>,
 }
 
 impl S3Vector {
@@ -78,6 +81,7 @@ impl S3Vector {
         metadata_columns: MetadataColumns,
         model_name: String,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+        partition_by: Option<PartitionBy>,
     ) -> Self {
         Self {
             table,
@@ -86,6 +90,7 @@ impl S3Vector {
             metadata_columns,
             model_name,
             embedding_models,
+            partition_by,
         }
     }
 
