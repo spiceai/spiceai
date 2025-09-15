@@ -2528,7 +2528,7 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
- "twox-hash 1.6.3",
+ "twox-hash 2.1.2",
 ]
 
 [[package]]
@@ -8934,7 +8934,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-util",
- "twox-hash 2.1.0",
+ "twox-hash 2.1.2",
  "url",
 ]
 
@@ -10216,7 +10216,7 @@ dependencies = [
  "snap",
  "thrift",
  "tokio",
- "twox-hash 2.1.0",
+ "twox-hash 2.1.2",
  "zstd",
 ]
 
@@ -12148,7 +12148,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tract-core 0.21.10",
- "twox-hash 1.6.3",
+ "twox-hash 2.1.2",
  "url",
  "util",
  "utoipa",
@@ -15702,15 +15702,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
- "rand 0.8.5",
  "static_assertions",
 ]
 
 [[package]]
 name = "twox-hash"
-version = "2.1.0"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7b17f197b3050ba473acf9181f7b1d3b66d1cf7356c6cc57886662276e65908"
+checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+dependencies = [
+ "rand 0.9.2",
+]
 
 [[package]]
 name = "type1-encoding-parser"
