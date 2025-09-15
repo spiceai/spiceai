@@ -173,7 +173,7 @@ impl GlueCatalogProvider {
             for table in some_tables {
                 let mut parameters = self.parameters.parameters.clone();
                 if let Some(catalog_id) = &self.catalog_id {
-                    parameters.insert("catalog_id".to_string(), catalog_id.to_string().into());
+                    parameters.insert("glue_catalog_id".to_string(), catalog_id.to_string().into());
                 }
 
                 let connector = GlueDataConnector::new(parameters);
