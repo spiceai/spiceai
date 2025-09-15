@@ -18,6 +18,7 @@ use async_openai::types::{
     EmbeddingVector, EncodingFormat,
 };
 use async_trait::async_trait;
+use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::{fmt::Debug, sync::Arc};
@@ -43,6 +44,11 @@ pub enum Error {
 
     #[snafu(display("Failed to create embedding. {source}."))]
     FailedToCreateEmbedding {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to create embedding due to throttling. {source}"))]
+    FailedToCreateEmbeddingThrottling {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
