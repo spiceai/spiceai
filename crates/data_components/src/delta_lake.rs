@@ -235,7 +235,7 @@ impl DeltaTable {
         });
         let parquet_source = ParquetSource::new(TableParquetOptions::default())
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
-            .with_predicate(Arc::clone(schema), Arc::clone(physical_expr));
+            .with_predicate(Arc::clone(physical_expr));
 
         let file_scan_config_builder = FileScanConfigBuilder::new(
             ObjectStoreUrl::local_filesystem(),
