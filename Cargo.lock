@@ -2043,7 +2043,7 @@ dependencies = [
  "bitflags 2.9.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -5095,7 +5095,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cea14ef9355e3beab063703aa9dab15afd25f0667c341310c1e5274bb1d0da18"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5286,7 +5286,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix 1.0.7",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8723,7 +8723,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tracing",
- "tract-core 0.21.10",
+ "tract-core",
  "tract-onnx",
 ]
 
@@ -10840,7 +10840,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
  "heck 0.5.0",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -10873,7 +10873,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.106",
@@ -11174,7 +11174,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12147,7 +12147,7 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "tract-core 0.21.10",
+ "tract-core",
  "twox-hash 2.1.2",
  "url",
  "util",
@@ -12201,7 +12201,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
- "tract-core 0.21.10",
+ "tract-core",
 ]
 
 [[package]]
@@ -12427,7 +12427,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -12440,7 +12440,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13757,7 +13757,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -15373,32 +15373,6 @@ dependencies = [
 
 [[package]]
 name = "tract-core"
-version = "0.21.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7b5347639690871b124593a8c8903f1f369531498b8abaebd18eb5c58163971"
-dependencies = [
- "anyhow",
- "anymap3",
- "bit-set 0.5.3",
- "derive-new 0.5.9",
- "downcast-rs 1.2.1",
- "dyn-clone",
- "lazy_static",
- "log",
- "maplit",
- "ndarray 0.16.1",
- "num-complex",
- "num-integer",
- "num-traits",
- "paste",
- "rustfft",
- "smallvec",
- "tract-data 0.21.10",
- "tract-linalg 0.21.10",
-]
-
-[[package]]
-name = "tract-core"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d72bdfb1d8809fc16b7e3496c8a3a31e8c55eeec8f648f2715d87bd25e9db1c"
@@ -15419,32 +15393,8 @@ dependencies = [
  "pastey",
  "rustfft",
  "smallvec",
- "tract-data 0.22.0",
- "tract-linalg 0.22.0",
-]
-
-[[package]]
-name = "tract-data"
-version = "0.21.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0a3f476a1804e05708e9bc5e2d29dcab82bad531e357d3d14d7da80fbba0b6d"
-dependencies = [
- "anyhow",
- "downcast-rs 1.2.1",
- "dyn-clone",
- "dyn-hash",
- "half",
- "itertools 0.12.1",
- "lazy_static",
- "maplit",
- "ndarray 0.16.1",
- "nom 7.1.3",
- "num-integer",
- "num-traits",
- "parking_lot 0.12.4",
- "scan_fmt",
- "smallvec",
- "string-interner",
+ "tract-data",
+ "tract-linalg",
 ]
 
 [[package]]
@@ -15481,36 +15431,7 @@ checksum = "0fe98f1a0fe9d7bcc39a64258729940da99a26e0ecac8d474d17cfd15f9e4ecf"
 dependencies = [
  "derive-new 0.5.9",
  "log",
- "tract-core 0.22.0",
-]
-
-[[package]]
-name = "tract-linalg"
-version = "0.21.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb8e0703eb53ef1bbf77050ff261675818dd5f0d6c27044c6e48ede9b845f9e0"
-dependencies = [
- "byteorder",
- "cc",
- "derive-new 0.5.9",
- "downcast-rs 1.2.1",
- "dyn-clone",
- "dyn-hash",
- "half",
- "lazy_static",
- "liquid",
- "liquid-core",
- "liquid-derive",
- "log",
- "num-traits",
- "paste",
- "rayon",
- "scan_fmt",
- "smallvec",
- "time",
- "tract-data 0.21.10",
- "unicode-normalization",
- "walkdir",
+ "tract-core",
 ]
 
 [[package]]
@@ -15536,7 +15457,7 @@ dependencies = [
  "scan_fmt",
  "smallvec",
  "time",
- "tract-data 0.22.0",
+ "tract-data",
  "unicode-normalization",
  "walkdir",
 ]
@@ -15557,7 +15478,7 @@ dependencies = [
  "safetensors 0.6.2",
  "serde_json",
  "tar",
- "tract-core 0.22.0",
+ "tract-core",
  "walkdir",
 ]
 
@@ -16508,7 +16429,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
