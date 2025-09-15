@@ -2,15 +2,16 @@
 source: crates/runtime/tests/ready_state/mod.rs
 expression: explain_str
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                             |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                               |
-|               |   Federated                                                                                                                                                      |
-|               |  Projection: federated_on_registration_duckdb.id                                                                                                                 |
-|               |   TableScan: federated_on_registration_duckdb projection=[id]                                                                                                    |
-| physical_plan | BytesProcessedExec                                                                                                                                               |
-|               |   SchemaCastScanExec                                                                                                                                             |
-|               |     VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "federated_on_registration_duckdb"."id" FROM "federated_on_registration_duckdb" |
-|               |                                                                                                                                                                  |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                               |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                 |
+|               |   Federated                                                                                                                                                        |
+|               |  Projection: federated_on_registration_duckdb.id                                                                                                                   |
+|               |   TableScan: federated_on_registration_duckdb projection=[id]                                                                                                      |
+| physical_plan | BytesProcessedExec                                                                                                                                                 |
+|               |   SchemaCastScanExec                                                                                                                                               |
+|               |     CooperativeExec                                                                                                                                                |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "federated_on_registration_duckdb"."id" FROM "federated_on_registration_duckdb" |
+|               |                                                                                                                                                                    |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+

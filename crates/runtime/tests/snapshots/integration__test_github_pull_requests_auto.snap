@@ -13,6 +13,7 @@ description: "Query: SELECT additions, review_comments, discussion FROM spiceai_
 |               |   GlobalLimitExec: skip=0, fetch=10                                                                                       |
 |               |     BytesProcessedExec                                                                                                    |
 |               |       ProjectionExec: expr=[additions@0 as additions, discussion@20 as discussion, review_comments@21 as review_comments] |
-|               |         GraphQLTableProviderExec limit=[10]                                                                               |
+|               |         CooperativeExec                                                                                                   |
+|               |           GraphQLTableProviderExec limit=[10]                                                                             |
 |               |                                                                                                                           |
 +---------------+---------------------------------------------------------------------------------------------------------------------------+

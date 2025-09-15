@@ -422,7 +422,11 @@ impl SpiceObjectStoreRegistry {
             builder = builder.with_disable_tagging(as_bool);
         }
 
-        let azure_store = Arc::new(builder.build().map_err(DataFusionError::ObjectStore)?);
+        let azure_store = Arc::new(
+            builder
+                .build()
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?,
+        );
 
         Ok(azure_store as Arc<dyn ObjectStore>)
     }

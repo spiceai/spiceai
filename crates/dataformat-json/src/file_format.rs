@@ -55,7 +55,7 @@ use datafusion::{
     },
     error::Result,
     physical_expr::LexRequirement,
-    physical_plan::{ExecutionPlan, PhysicalExpr},
+    physical_plan::ExecutionPlan,
 };
 use datafusion_datasource::decoder::Decoder;
 use datafusion_datasource::file_groups::FileGroup;
@@ -179,6 +179,11 @@ impl FileFormat for SpiceJsonFormat {
         Ok(format!("{}{}", ext, file_compression_type.get_ext()))
     }
 
+    /// Returns whether this instance uses compression if applicable
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        Some(self.options.compression.into())
+    }
+
     async fn infer_schema(
         &self,
         _state: &dyn Session,
@@ -267,7 +272,6 @@ impl FileFormat for SpiceJsonFormat {
         &self,
         _state: &dyn Session,
         mut conf: FileScanConfig,
-        _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let source = Arc::new(
             SpiceJsonSource::new()
