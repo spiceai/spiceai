@@ -25,7 +25,7 @@ use std::sync::Arc;
 pub struct FlattenCoalesce {}
 
 impl FlattenCoalesce {
-    fn coalesce_batches_exec_node(node: Arc<dyn ExecutionPlan>) -> Option<CoalesceBatchesExec> {
+    fn coalesce_batches_exec_node(node: &Arc<dyn ExecutionPlan>) -> Option<CoalesceBatchesExec> {
         node.as_any().downcast_ref::<CoalesceBatchesExec>().cloned()
     }
 
@@ -38,18 +38,16 @@ impl PhysicalOptimizerRule for FlattenCoalesce {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        config: &ConfigOptions,
+        _config: &ConfigOptions,
     ) -> Result<Arc<(dyn ExecutionPlan + 'static)>, DataFusionError> {
         let transformed = plan.transform_down(|plan| {
-            if let Some(outer_coalesce) = Self::coalesce_batches_exec_node(Arc::clone(&plan)) {
+            if let Some(outer_coalesce) = Self::coalesce_batches_exec_node(&plan) {
                 let mut current = outer_coalesce;
                 let mut transformed = false;
 
                 // Support arbitrarily nested CoalesceBatchesExec nodes, but only proceed if the
                 // parameters for both nodes are the same
-                while let Some(input_plan) =
-                    Self::coalesce_batches_exec_node(Arc::clone(current.input()))
-                {
+                while let Some(input_plan) = Self::coalesce_batches_exec_node(current.input()) {
                     if Self::coalesce_batches_are_equivalent(&current, &input_plan) {
                         transformed = true;
                         current = input_plan;
@@ -69,7 +67,7 @@ impl PhysicalOptimizerRule for FlattenCoalesce {
         Ok(transformed.data)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spice_flatten_coalesce"
     }
 

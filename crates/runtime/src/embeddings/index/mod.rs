@@ -178,7 +178,6 @@ pub mod tests {
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use data_components::s3_vectors::{MetadataColumn, MetadataColumns};
-    use datafusion::execution::SessionStateBuilder;
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
         datasource::TableType,
