@@ -2,15 +2,16 @@
 source: crates/runtime/tests/duckdb/mod.rs
 expression: pretty
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                         |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                           |
-|               |   Federated                                                                                                                                                  |
-|               |  Projection: regexp_replace(csv_test.region, Utf8("AMERICA"), Utf8("AUSTRALIA"))                                                                             |
-|               |   TableScan: csv_test projection=[region]                                                                                                                    |
-| physical_plan | BytesProcessedExec                                                                                                                                           |
-|               |   SchemaCastScanExec                                                                                                                                         |
-|               |     VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT regexp_replace("csv_test"."region", 'AMERICA', 'AUSTRALIA') FROM "csv_test" |
-|               |                                                                                                                                                              |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                           |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                             |
+|               |   Federated                                                                                                                                                    |
+|               |  Projection: regexp_replace(csv_test.region, Utf8("AMERICA"), Utf8("AUSTRALIA"))                                                                               |
+|               |   TableScan: csv_test projection=[region]                                                                                                                      |
+| physical_plan | BytesProcessedExec                                                                                                                                             |
+|               |   SchemaCastScanExec                                                                                                                                           |
+|               |     CooperativeExec                                                                                                                                            |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT regexp_replace("csv_test"."region", 'AMERICA', 'AUSTRALIA') FROM "csv_test" |
+|               |                                                                                                                                                                |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+

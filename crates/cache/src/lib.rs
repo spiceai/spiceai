@@ -117,13 +117,13 @@ pub enum HashBuilder {
     Ahash(ahash::RandomState),
     Siphash(std::hash::RandomState),
     #[cfg(feature = "xxhash")]
-    XxHash3(twox_hash::xxh3::RandomHashBuilder64),
+    XxHash3(std::hash::BuildHasherDefault<twox_hash::XxHash3_64>),
     #[cfg(feature = "xxhash")]
-    XxHash32(twox_hash::RandomXxHashBuilder32),
+    XxHash32(std::hash::BuildHasherDefault<twox_hash::XxHash32>),
     #[cfg(feature = "xxhash")]
-    XxHash64(twox_hash::RandomXxHashBuilder64),
+    XxHash64(std::hash::BuildHasherDefault<twox_hash::XxHash64>),
     #[cfg(feature = "xxhash")]
-    XxHash128(twox_hash::xxh3::RandomHashBuilder128),
+    XxHash128,
 }
 
 impl std::hash::BuildHasher for HashBuilder {
@@ -140,7 +140,7 @@ impl std::hash::BuildHasher for HashBuilder {
             #[cfg(feature = "xxhash")]
             HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
             #[cfg(feature = "xxhash")]
-            HashBuilder::XxHash128(builder) => Box::new(builder.build_hasher()),
+            HashBuilder::XxHash128 => Box::new(xxhash_compat::XxHash3_128Wrapper::new()),
         }
     }
 }
@@ -154,23 +154,53 @@ pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuild
         HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
         HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
         #[cfg(feature = "xxhash")]
-        HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(
-            twox_hash::xxh3::RandomHashBuilder64::default(),
-        )),
+        HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(std::hash::BuildHasherDefault::<
+            twox_hash::XxHash3_64,
+        >::default())),
         #[cfg(feature = "xxhash")]
-        HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(
-            twox_hash::RandomXxHashBuilder32::default(),
-        )),
+        HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(std::hash::BuildHasherDefault::<
+            twox_hash::XxHash32,
+        >::default())),
         #[cfg(feature = "xxhash")]
-        HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(
-            twox_hash::RandomXxHashBuilder64::default(),
-        )),
+        HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(std::hash::BuildHasherDefault::<
+            twox_hash::XxHash64,
+        >::default())),
         #[cfg(feature = "xxhash")]
-        HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128(
-            twox_hash::xxh3::RandomHashBuilder128::default(),
-        )),
+        HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128),
         #[allow(unreachable_patterns)]
         _ => Err(Error::InvalidHashingAlgorithm),
+    }
+}
+
+#[cfg(feature = "xxhash")]
+mod xxhash_compat {
+    use std::hash::Hasher;
+
+    pub struct XxHash3_128Wrapper {
+        hasher: twox_hash::XxHash3_128,
+    }
+
+    impl XxHash3_128Wrapper {
+        pub fn new() -> Self {
+            Self {
+                hasher: twox_hash::XxHash3_128::with_seed(0),
+            }
+        }
+    }
+
+    impl Hasher for XxHash3_128Wrapper {
+        fn finish(&self) -> u64 {
+            let mut hasher_copy = self.hasher.clone();
+            let hash128 = hasher_copy.finish_128();
+
+            let high = (hash128 >> 64) as u64;
+            let low = hash128 as u64;
+            high ^ low
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.hasher.write(bytes);
+        }
     }
 }
 

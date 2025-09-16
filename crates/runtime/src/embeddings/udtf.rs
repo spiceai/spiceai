@@ -27,9 +27,13 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
+#[cfg(feature = "s3_vectors")]
+use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
-use arrow_schema::{Field, SchemaRef};
+use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
+use datafusion::common::exec_err;
+use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
@@ -44,16 +48,15 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use itertools::Itertools;
 use std::cmp::min;
+use std::sync::LazyLock;
 use std::{
     any::Any,
     collections::HashMap,
     sync::{Arc, Weak},
 };
-
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
@@ -70,6 +73,9 @@ use crate::{
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
+
+pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> =
+    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct VectorSearchTableFuncArgs {
@@ -153,6 +159,10 @@ impl VectorSearchTableFunc {
     #[must_use]
     pub fn new(df: Weak<DataFusion>) -> Self {
         Self { df }
+    }
+
+    fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
+        exec_err!("{VECTOR_SEARCH_UDTF_NAME} does not support scalar invocation.")
     }
 }
 
@@ -348,6 +358,29 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             embedded_columns: embedding_table_provider.embedded_columns.clone(),
             embedding_models: Arc::clone(&embedding_table_provider.embedding_models),
         }))
+    }
+}
+
+/// This is a stub implementation, so that we can nest UDTF function invocations
+impl ScalarUDFImpl for VectorSearchTableFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        VECTOR_SEARCH_UDTF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &VECTOR_SEARCH_SIGNATURE
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Self::scalar_invocation_error()
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Self::scalar_invocation_error()
     }
 }
 

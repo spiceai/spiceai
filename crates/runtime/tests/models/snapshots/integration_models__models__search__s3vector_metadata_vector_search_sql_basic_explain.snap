@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+snapshot_kind: text
 ---
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                              |
@@ -18,8 +19,11 @@ description: "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second'
 |               |           ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                                                                                                 |
 |               |             BytesProcessedExec                                                                                                                                                                    |
 |               |               ProjectionExec: expr=[CAST(key@1 AS Int64) as id, 1 - distance@2 as score, answer@0 as answer]                                                                                      |
-|               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                              |
-|               |                   BytesProcessedExec                                                                                                                                                              |
-|               |                     S3VectorsQueryExec: limit=30                                                                                                                                                  |
+|               |                 BytesProcessedExec                                                                                                                                                                |
+|               |                   CooperativeExec                                                                                                                                                                 |
+|               |                     CooperativeExec                                                                                                                                                               |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                        |
+|               |                         CooperativeExec                                                                                                                                                           |
+|               |                           S3VectorsQueryExec: limit=30                                                                                                                                            |
 |               |                                                                                                                                                                                                   |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
