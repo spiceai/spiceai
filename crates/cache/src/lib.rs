@@ -189,8 +189,9 @@ mod xxhash_compat {
     }
 
     impl Hasher for XxHash3_128Wrapper {
+        #[allow(clippy::cast_possible_truncation)]
         fn finish(&self) -> u64 {
-            let mut hasher_copy = self.hasher.clone();
+            let hasher_copy = self.hasher.clone();
             let hash128 = hasher_copy.finish_128();
 
             let high = (hash128 >> 64) as u64;

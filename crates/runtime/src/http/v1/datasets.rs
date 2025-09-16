@@ -93,7 +93,6 @@ pub(crate) struct Property {
 ///
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
 /// and additional filters can be applied using query parameters.
-
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/datasets",
@@ -347,8 +346,6 @@ pub(crate) async fn refresh(
 ///
 /// This endpoint allows for updating the `refresh_sql` parameter for a dataset's acceleration at runtime.
 /// The change is **temporary** and will revert to the `spicepod.yml` definition at the next runtime restart.
-///
-
 #[cfg_attr(feature = "openapi", utoipa::path(
     patch,
     path = "/v1/datasets/{name}/acceleration",

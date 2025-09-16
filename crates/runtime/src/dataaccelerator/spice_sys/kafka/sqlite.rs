@@ -14,87 +14,96 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use std::sync::Arc;
+use datafusion_table_providers::sql::db_connection_pool::{
+    dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
+};
+
+use super::{KAFKA_TABLE_NAME, KafkaSys, Result};
+use crate::dataconnector::kafka::KafkaMetadata;
 
 impl KafkaSys {
-    pub(super) fn upsert_duckdb(
+    pub(super) async fn upsert_sqlite(
         &self,
-        pool: &Arc<DuckDbConnectionPool>,
+        pool: &SqliteConnectionPool,
         metadata: &KafkaMetadata,
     ) -> Result<()> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
-        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
-            .get_underlying_conn_mut();
-
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
-                dataset_name TEXT PRIMARY KEY,
-                consumer_group_id TEXT,
-                topic TEXT,
-                schema_json TEXT,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP
-            )"
-        );
-        duckdb_conn
-            .execute(&create_table, [])
-            .map_err(|e| e.to_string())?;
-
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err("Failed to downcast to SqliteConnection".into());
+        };
         let schema_json = Self::serialize_schema(&metadata.schema)?;
+        let dataset_name = self.dataset_name.clone();
+        let consumer_group_id = metadata.consumer_group_id.clone();
+        let topic = metadata.topic.clone();
 
-        let upsert = format!(
-            "INSERT INTO {KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, schema_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, now(), now())
-             ON CONFLICT (dataset_name) DO UPDATE SET
-                consumer_group_id = excluded.consumer_group_id,
-                topic = excluded.topic,
-                schema_json = excluded.schema_json,
-                updated_at = now()"
-        );
+        conn.conn
+            .call(move |conn| {
+                let create_table = format!(
+                    "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
+                        dataset_name TEXT PRIMARY KEY,
+                        consumer_group_id TEXT,
+                        topic TEXT,
+                        schema_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )"
+                );
+                conn.execute(&create_table, [])?;
 
-        duckdb_conn
-            .execute(
-                &upsert,
-                [
-                    &self.dataset_name,
-                    &metadata.consumer_group_id,
-                    &metadata.topic,
-                    &schema_json,
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+                let upsert = format!(
+                    "INSERT INTO {KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, schema_json, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                     ON CONFLICT (dataset_name) DO UPDATE SET
+                        consumer_group_id = ?2,
+                        topic = ?3,
+                        schema_json = ?4,
+                        updated_at = CURRENT_TIMESTAMP"
+                );
+                conn.execute(
+                    &upsert,
+                    [
+                        dataset_name,
+                        consumer_group_id,
+                        topic,
+                        schema_json,
+                    ],
+                )?;
 
-        Ok(())
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string().into())
     }
 
-    pub(super) fn get_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Option<KafkaMetadata> {
-        let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
-        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .ok()?
-            .get_underlying_conn_mut();
+    pub(super) async fn get_sqlite(&self, pool: &SqliteConnectionPool) -> Option<KafkaMetadata> {
+        let conn_sync = pool.connect_sync();
+        let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+        let dataset_name = self.dataset_name.clone();
 
-        let query = format!(
-            "SELECT consumer_group_id, topic, schema_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
-        );
-        let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([&self.dataset_name]).ok()?;
+        conn
+            .conn
+            .call(move |conn| {
+                let query = format!(
+                    "SELECT consumer_group_id, topic, schema_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
+                );
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([dataset_name])?;
 
-        if let Some(row) = rows.next().ok()? {
-            let consumer_group_id: String = row.get(0).ok()?;
-            let topic: String = row.get(1).ok()?;
-            let schema_json: String = row.get(2).ok()?;
+                if let Some(row) = rows.next()? {
+                    let consumer_group_id: String = row.get(0)?;
+                    let topic: String = row.get(1)?;
+                    let schema_json: String = row.get(2)?;
 
-            Some(KafkaMetadata {
-                consumer_group_id,
-                topic,
-                schema: KafkaSys::deserialize_schema(&schema_json).ok()?,
+                   Ok(KafkaMetadata {
+                        consumer_group_id,
+                        topic,
+                        schema: KafkaSys::deserialize_schema(&schema_json).map_err(tokio_rusqlite::Error::Other)?,
+                    })
+                } else {
+                    Err(tokio_rusqlite::Error::Other("No row found".into()))
+                }
             })
-        } else {
-            None
-        }
+            .await.ok()
     }
 }
 
@@ -124,11 +133,11 @@ mod tests {
             .expect("to create dataset");
 
         dataset.acceleration = Some(Acceleration {
-            engine: Engine::DuckDB,
+            engine: Engine::Sqlite,
             mode: Mode::File,
             params: [(
-                "duckdb_file".to_string(),
-                ".spice/data/kafka_duckdb_test.db".to_string(),
+                "sqlite_file".to_string(),
+                ".spice/data/kafka_sqlite_test.db".to_string(),
             )]
             .into_iter()
             .collect(),
@@ -152,8 +161,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_roundtrip() {
-        let ds = create_test_dataset("test_duckdb_roundtrip").await;
+    async fn test_sqlite_roundtrip() {
+        let ds = create_test_dataset("test_sqlite_roundtrip").await;
         let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
             .await
             .expect("to create KafkaSys");
@@ -172,8 +181,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_metadata_overwrite() {
-        let ds = create_test_dataset("test_duckdb_metadata_overwrite").await;
+    async fn test_sqlite_metadata_overwrite() {
+        let ds = create_test_dataset("test_sqlite_metadata_overwrite").await;
         let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
             .await
             .expect("to create KafkaSys");
@@ -198,8 +207,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_get_nonexistent() {
-        let ds = create_test_dataset("test_duckdb_get_nonexistent").await;
+    async fn test_sqlite_get_nonexistent() {
+        let ds = create_test_dataset("test_sqlite_get_nonexistent").await;
         let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
             .await
             .expect("to create KafkaSys");
