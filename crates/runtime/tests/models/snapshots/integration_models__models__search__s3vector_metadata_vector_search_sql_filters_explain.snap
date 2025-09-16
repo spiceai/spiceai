@@ -17,20 +17,6 @@ snapshot_kind: text
 |               |       BytesProcessedExec                                                                                                                                                 |
 |               |         FilterExec: source@2 = textbook_reasoning                                                                                                                        |
 |               |           ProjectionExec: expr=[id@0 as id, answer@2 as answer, source@3 as source, score@1 as score]                                                                    |
-<<<<<<< HEAD
-|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
-|               |               HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@2, source@4]                                          |
-|               |                 RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                        |
-|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                            |
-|               |                     ProjectionExec: expr=[CAST(key@1 AS Int64) as id, 1 - distance@2 as score, answer@0 as answer]                                                       |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                               |
-|               |                         S3VectorsQueryExec: limit=30                                                                                                                     |
-|               |                 RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                        |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                   |
-|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
-|               |                       SchemaCastScanExec                                                                                                                                 |
-|               |                         DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                |
-=======
 |               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@2, source@4]                                            |
 |               |               CoalescePartitionsExec                                                                                                                                     |
 |               |                 BytesProcessedExec                                                                                                                                       |
@@ -45,6 +31,5 @@ snapshot_kind: text
 |               |                 BytesProcessedExec                                                                                                                                       |
 |               |                   SchemaCastScanExec                                                                                                                                     |
 |               |                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                    |
->>>>>>> origin/trunk
 |               |                                                                                                                                                                          |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
