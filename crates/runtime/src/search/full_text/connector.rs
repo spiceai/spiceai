@@ -123,6 +123,39 @@ impl FullTextConnector {
 
         first
     }
+
+    fn with_indexed_stream<F>(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        f: F,
+    ) -> Option<ChangesStream>
+    where
+        F: Fn(&dyn DataConnector, Arc<FederatedTable>) -> Option<ChangesStream>,
+    {
+        let table_provider = federated_table.try_table_provider_sync()?;
+
+        let Some(indexed) = table_provider
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>()
+            .cloned()
+        else {
+            tracing::debug!(
+                "FullTextConnector didn't wrap underlying table with index - this is unexpected"
+            );
+            return None;
+        };
+
+        let indexed = Arc::new(indexed);
+        let underlying = indexed.get_underlying();
+        let ft = Arc::new(FederatedTable::Immediate(underlying));
+
+        let stream = f(&self.inner_connector, ft)?;
+        Some(
+            stream
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexed)))
+                .boxed(),
+        )
+    }
 }
 
 #[async_trait]
@@ -184,26 +217,7 @@ impl DataConnector for FullTextConnector {
     }
 
     fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        let table_provider = federated_table.try_table_provider_sync()?;
-
-        if let Some(indexed_table) = table_provider
-            .as_any()
-            .downcast_ref::<IndexedTableProvider>()
-            .cloned()
-        {
-            let indexed_table = Arc::new(indexed_table);
-            let underlying = indexed_table.get_underlying();
-            return Some(
-                self.inner_connector
-                    .changes_stream(Arc::new(FederatedTable::Immediate(underlying)))?
-                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                    .boxed(),
-            );
-        } else {
-            unreachable!(
-                "FullTextConnector didn't wrap underlying table with index - this is unexpected"
-            )
-        }
+        self.with_indexed_stream(federated_table, |inner, ft| inner.changes_stream(ft))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -211,25 +225,6 @@ impl DataConnector for FullTextConnector {
     }
 
     fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        let table_provider = federated_table.try_table_provider_sync()?;
-
-        if let Some(indexed_table) = table_provider
-            .as_any()
-            .downcast_ref::<IndexedTableProvider>()
-            .cloned()
-        {
-            let indexed_table = Arc::new(indexed_table);
-            let underlying = indexed_table.get_underlying();
-            return Some(
-                self.inner_connector
-                    .append_stream(Arc::new(FederatedTable::Immediate(underlying)))?
-                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                    .boxed(),
-            );
-        } else {
-            unreachable!(
-                "FullTextConnector didn't wrap underlying table with index - this is unexpected"
-            )
-        }
+        self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
     }
 }
