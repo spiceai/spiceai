@@ -46,7 +46,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Embedding rate limit exceeded. {source}. Try again later."))]
+    #[snafu(display("Embedding rate limit exceeded. {source}."))]
     RateLimited {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
