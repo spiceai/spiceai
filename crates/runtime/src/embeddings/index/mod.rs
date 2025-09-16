@@ -92,7 +92,6 @@ pub(super) fn search_index_filters(
 pub mod tests {
     use std::{any::Any, sync::Arc};
 
-    use anyhow::Ok;
     use arrow::{
         array::{
             ArrayData, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array,
