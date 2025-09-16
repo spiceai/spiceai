@@ -77,6 +77,14 @@ pub trait Sizeable {
     fn get_memory_size(&self) -> usize;
 }
 
+impl Sizeable for Vec<Vec<f32>> {
+    fn get_memory_size(&self) -> usize {
+        self.iter()
+            .map(|vec| vec.len() * std::mem::size_of::<f32>())
+            .sum()
+    }
+}
+
 pub trait HashProvider {
     fn hasher(&self) -> Box<dyn Hasher>;
 }
@@ -89,6 +97,13 @@ pub trait AsTableRefs {
 impl AsTableRefs for LogicalPlan {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
         Arc::new(get_logical_plan_input_tables(self))
+    }
+}
+
+// embeddings have no table reference
+impl AsTableRefs for Vec<Vec<f32>> {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::new(HashSet::new())
     }
 }
 
@@ -209,6 +224,7 @@ pub struct Caching {
     pub results: Option<Arc<QueryResultsCacheProvider>>,
     pub plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
     pub search: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+    pub embeddings: Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Caching {
@@ -217,6 +233,7 @@ impl std::fmt::Debug for Caching {
             .field("results", &self.results)
             .field("plans", &self.plans)
             .field("search", &self.search)
+            .field("embeddings", &self.embeddings)
             .finish_non_exhaustive()
     }
 }
@@ -248,6 +265,15 @@ impl Caching {
         search: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
     ) -> Self {
         self.search = Some(search);
+        self
+    }
+
+    #[must_use]
+    pub fn with_embeddings_cache(
+        mut self,
+        embeddings: Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>,
+    ) -> Self {
+        self.embeddings = Some(embeddings);
         self
     }
 

@@ -18,6 +18,8 @@ use async_openai::types::{
     EmbeddingVector, EncodingFormat,
 };
 use async_trait::async_trait;
+use cache::CacheProvider;
+use cache::key::CacheKey;
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::{fmt::Debug, sync::Arc};
@@ -135,6 +137,35 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 #[async_trait]
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>> {
+        None
+    }
+
+    async fn get_cached_embed(&self, input: &'_ EmbeddingInput) -> Option<Vec<Vec<f32>>> {
+        if let Some(embeddings_cache) = self.cache() {
+            let key: CacheKey<'_> = input.into();
+
+            if let Some(cached) = embeddings_cache
+                .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
+                .await
+            {
+                return Some(cached);
+            }
+        }
+
+        None
+    }
+
+    async fn put_cached_embed(&self, input: &'_ EmbeddingInput, value: Vec<Vec<f32>>) {
+        if let Some(embeddings_cache) = self.cache() {
+            let key: CacheKey<'_> = input.into();
+
+            embeddings_cache
+                .put_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64(), value)
+                .await;
+        }
+    }
 
     fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
         task::block_in_place(move || Handle::current().block_on(self.embed(input)))

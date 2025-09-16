@@ -18,6 +18,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
+use async_openai::types::EmbeddingInput;
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
@@ -63,7 +64,14 @@ pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
+    Embedding(&'a EmbeddingInput),
     ClientSupplied(&'a str),
+}
+
+impl<'a> From<&'a EmbeddingInput> for CacheKey<'a> {
+    fn from(embedding_input: &'a EmbeddingInput) -> Self {
+        Self::Embedding(embedding_input)
+    }
 }
 
 impl CacheKey<'_> {
@@ -72,6 +80,7 @@ impl CacheKey<'_> {
         match self {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
             Self::Search(search_key) => search_key.hash(&mut hasher),
+            Self::Embedding(embedding_input) => embedding_input.hash(&mut hasher),
             Self::Query(sql, param_values) => {
                 sql.hash(&mut hasher);
                 if let Some(params) = param_values {
@@ -100,6 +109,11 @@ impl CacheKey<'_> {
 pub struct RawCacheKey(u64);
 
 impl RawCacheKey {
+    #[must_use]
+    pub fn new(key: u64) -> Self {
+        Self(key)
+    }
+
     #[must_use]
     pub fn as_u64(&self) -> u64 {
         self.0

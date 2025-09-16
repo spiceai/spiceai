@@ -19,6 +19,7 @@ aws-config.workspace = true
 aws-sdk-bedrockruntime.workspace = true
 aws-smithy-types.workspace = true
 bytes.workspace = true
+cache = { path = "../cache" }
 futures = { workspace = true }
 governor.workspace = true
 hf-hub.workspace = true
