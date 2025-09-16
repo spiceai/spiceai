@@ -78,7 +78,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.2", features = [
+keyring = { version = "3.6.3", features = [
     "apple-native",
     "windows-native",
     "linux-native",
