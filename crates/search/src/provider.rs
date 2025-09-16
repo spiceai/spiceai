@@ -456,7 +456,6 @@ impl TableProvider for SearchQueryProvider {
             )?),
         ));
 
-
         state.create_physical_plan(&final_proj).await
     }
 }
