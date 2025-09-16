@@ -456,7 +456,7 @@ impl TableProvider for SearchQueryProvider {
             )?),
         ));
 
-        tracing::error!("final_proj={final_proj:?}");
+
         state.create_physical_plan(&final_proj).await
     }
 }

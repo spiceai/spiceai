@@ -210,11 +210,6 @@ impl TableProvider for VectorScanTableProvider {
             TableReference::parse_str("vector_index"),
         )?);
 
-        tracing::error!("index_logical_plan={index_logical_plan:#?}");
-        if let Err(e) = state.create_physical_plan(&index_logical_plan).await {
-            tracing::error!("Error in 'index_logical_plan'={e:?}");
-        }
-
         let primary_key_fields = self.index.primary_fields();
         if primary_key_fields.is_empty() {
             return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
