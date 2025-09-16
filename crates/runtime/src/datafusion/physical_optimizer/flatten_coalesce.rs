@@ -78,6 +78,9 @@ impl PhysicalOptimizerRule for FlattenCoalesce {
 
 #[cfg(test)]
 mod tests {
+    use arrow_schema::DataType;
+    use arrow::datatypes::Field;
+    use datafusion::physical_plan::expressions::col;
     use crate::datafusion::physical_optimizer::flatten_coalesce::FlattenCoalesce;
     use arrow_schema::Schema;
     use datafusion::config::ConfigOptions;
@@ -86,6 +89,14 @@ mod tests {
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
     use std::sync::Arc;
+    use datafusion::common::NullEquality;
+    use datafusion::execution::SessionState;
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion::physical_plan::joins::{HashJoinExec, JoinOn, PartitionMode};
+    use datafusion::physical_planner::DefaultPhysicalPlanner;
+    use datafusion::prelude::SessionContext;
+    use datafusion_expr::JoinType;
+    use tracing::field::display;
 
     #[test]
     fn test_flatten_coalesce() {
@@ -129,5 +140,38 @@ mod tests {
                 .to_string(),
             displayable(outer.as_ref()).indent(true).to_string()
         );
+    }
+
+    #[test]
+    fn test_repeat_optimize() {
+        // Make a plan with 3x CoalesceBatchesExec, where one in the chain has a different parameter
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("foo", DataType::Int32, false),
+        ]));
+
+        let empty_left = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let empty_right = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let hash_join_exec: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+            empty_left,
+            empty_right,
+            JoinOn::from(&[(
+                col("foo", schema.as_ref()).expect("must foo"),
+                col("foo", schema.as_ref()).expect("must foo")
+                )]),
+            None,
+            &JoinType::Full,
+            None,
+            PartitionMode::Auto,
+            NullEquality::NullEqualsNothing
+        ).expect("Should be able to create hash join exec"));
+
+        let planner = DefaultPhysicalPlanner::default();
+        let context = SessionContext::new();
+
+        (0..3).fold(hash_join_exec, |plan, i| {
+            let optimized = planner.optimize_physical_plan(plan, &context.state(), |_a, _b| {}).unwrap();
+            println!("Optimization pass {i}\n{}", displayable(optimized.as_ref()).indent(true));
+            optimized
+        });
     }
 }
