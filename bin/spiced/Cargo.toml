@@ -73,7 +73,6 @@ default = [
     "mssql",
     "dynamodb",
     "imap",
-    "alloc-snmalloc",
     "oracle",
     "runtime/s3_vectors",
     "mongodb",
