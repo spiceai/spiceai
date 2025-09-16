@@ -79,15 +79,29 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // bytes_processed Extension
         let bytes_processed_node = node.as_any().downcast_ref::<BytesProcessedNode>();
-        if bytes_processed_node.is_some() {
+
+        if let Some(bytes_processed_node) = bytes_processed_node {
             assert_eq!(logical_inputs.len(), 1, "should have 1 input");
             assert_eq!(physical_inputs.len(), 1, "should have 1 input");
             let physical_input = &physical_inputs[0];
 
-            let exec_plan = Arc::new(BytesProcessedExec::new(Arc::clone(physical_input)));
-            return Ok(Some(exec_plan));
-        }
+            let logical_schema = Arc::clone(bytes_processed_node.input.schema().inner());
+            let physical_schema = physical_input.schema();
 
-        Ok(None)
+            let maybe_fallback_schema = if logical_schema == physical_schema {
+                None
+            } else {
+                Some(logical_schema)
+            };
+
+            let exec_plan = Arc::new(BytesProcessedExec::new(
+                Arc::clone(physical_input),
+                maybe_fallback_schema,
+            ));
+
+            Ok(Some(exec_plan))
+        } else {
+            Ok(None)
+        }
     }
 }

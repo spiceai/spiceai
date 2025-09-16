@@ -17,6 +17,7 @@ limitations under the License.
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
 use crate::request::RequestContext;
 use arrow::record_batch::RecordBatch;
+use arrow_schema::SchemaRef;
 use datafusion::error::DataFusionError;
 use datafusion::{
     common::{
@@ -252,11 +253,18 @@ impl Hash for BytesProcessedNode {
 
 pub(crate) struct BytesProcessedExec {
     input_exec: Arc<dyn ExecutionPlan>,
+    logical_plan_schema_fallback: Option<SchemaRef>,
 }
 
 impl BytesProcessedExec {
-    pub(crate) fn new(input_exec: Arc<dyn ExecutionPlan>) -> Self {
-        Self { input_exec }
+    pub(crate) fn new(
+        input_exec: Arc<dyn ExecutionPlan>,
+        logical_plan_schema_fallback: Option<SchemaRef>,
+    ) -> Self {
+        Self {
+            input_exec,
+            logical_plan_schema_fallback,
+        }
     }
 }
 
@@ -287,6 +295,12 @@ impl ExecutionPlan for BytesProcessedExec {
         self
     }
 
+    fn schema(&self) -> SchemaRef {
+        self.logical_plan_schema_fallback
+            .clone()
+            .unwrap_or(self.input_exec.schema())
+    }
+
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         self.input_exec.properties()
     }
@@ -313,7 +327,10 @@ impl ExecutionPlan for BytesProcessedExec {
         let Some(input) = children.into_iter().next() else {
             panic!("should have one input");
         };
-        Ok(Arc::new(Self { input_exec: input }))
+        Ok(Arc::new(Self {
+            input_exec: input,
+            logical_plan_schema_fallback: self.logical_plan_schema_fallback.clone(),
+        }))
     }
 
     fn execute(
@@ -386,7 +403,7 @@ mod tests {
         let sort_exec = SortExec::new(lex_ordering, data_source_exec);
 
         let final_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(BytesProcessedExec::new(Arc::new(sort_exec)));
+            Arc::new(BytesProcessedExec::new(Arc::new(sort_exec), None));
 
         /*
            At this point `final_plan` is:
