@@ -106,7 +106,7 @@ func (tMs *TimeWithMilliSeconds) UnmarshalJSON(b []byte) error {
         }
     }
 
-	return fmt.Errorf("cannot parse time: %s", s)
+	return fmt.Errorf("cannot parse time: %w", err)
 }
 
 func (tMs TimeWithMilliSeconds) asTime() time.Time {
