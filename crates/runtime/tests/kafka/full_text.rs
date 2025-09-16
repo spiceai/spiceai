@@ -14,12 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
-use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::semantic::{Column, FullTextSearchConfig};
 
@@ -98,6 +96,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
         .await
 }
 
+#[allow(clippy::expect_used)]
 fn stack_qa_json() -> Vec<serde_json::Value> {
     include_str!("./test_data/stack_qa.json")
         .lines()
