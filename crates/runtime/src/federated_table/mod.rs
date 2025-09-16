@@ -144,6 +144,7 @@ impl FederatedTable {
             Self::Immediate(table_provider) => return Some(table_provider),
             Self::Deferred(deferred_table_provider) => deferred_table_provider,
         };
+
         deferred_table_provider.table.get()
     }
 
@@ -152,6 +153,8 @@ impl FederatedTable {
             Self::Immediate(table_provider) => return Arc::clone(table_provider),
             Self::Deferred(deferred_table_provider) => deferred_table_provider,
         };
+
+        // If the table provider is not available immediately, see if we already have it from the deferred task.
 
         // If the table provider is available now, return it.
         if let Some(table_provider) = deferred_table_provider.table.get() {
