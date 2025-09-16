@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::{
     cdc::ChangesStream,
-    kafka::{KafkaConfig, KafkaConsumer},
+    kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics},
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
@@ -30,7 +30,11 @@ use snafu::prelude::*;
 use tonic::async_trait;
 
 use crate::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
+    component::{
+        ComponentType,
+        dataset::{Dataset, acceleration::RefreshMode},
+        metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
+    },
     dataaccelerator::spice_sys::kafka::KafkaSys,
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
@@ -117,6 +121,8 @@ impl Kafka {
                     tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
                     data_components::kafka::SslIdentification::Https
                 }),
+            // Metrics instance that will be used by the Kafka consumer to update statistics
+            metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
         Ok(Self {
@@ -319,6 +325,14 @@ impl DataConnector for Kafka {
             }
         }))
     }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        if let Some(metrics) = self.kafka_config.metrics_store.as_ref() {
+            Some(Arc::new(KafkaMetricsProvider::new(Arc::clone(metrics))))
+        } else {
+            None
+        }
+    }
 }
 
 async fn init_kafka_consumer(
@@ -478,4 +492,93 @@ async fn bootstrap_new_kafka_consumer(
         })?;
 
     Ok((kafka_consumer, schema))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct KafkaMetricsProvider {
+    metrics: Arc<KafkaMetrics>,
+}
+
+impl KafkaMetricsProvider {
+    pub(crate) fn new(metrics: Arc<KafkaMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+const METRICS: &[MetricSpec] = &[
+    MetricSpec {
+        name: "records_consumed_total",
+        description: Some("Total number of records consumed"),
+        unit: Some("records"),
+        metric_type: MetricType::ObservableCounterU64,
+    },
+    MetricSpec {
+        name: "bytes_consumed_total",
+        description: Some("Total bytes consumed"),
+        unit: Some("bytes"),
+        metric_type: MetricType::ObservableCounterU64,
+    },
+    MetricSpec {
+        name: "records_lag",
+        description: Some("Total consumer lag across all partitions"),
+        unit: Some("records"),
+        metric_type: MetricType::ObservableGaugeU64,
+    },
+];
+
+impl MetricsProvider for KafkaMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "kafka"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<opentelemetry::KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        match metric.name {
+            "records_consumed_total" => {
+                let metrics = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(
+                        metrics
+                            .records_consumed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "bytes_consumed_total" => {
+                let metrics = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(
+                        metrics
+                            .bytes_consumed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "records_lag" => {
+                let metrics = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(
+                        metrics
+                            .records_lag
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            _ => None,
+        }
+    }
 }
