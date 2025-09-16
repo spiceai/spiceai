@@ -432,7 +432,6 @@ impl Display for QueryResultsCacheProvider {
 
 #[cfg(test)]
 mod tests {
-    
     use utils::tests::parse_sql_to_logical_plan;
 
     use super::*;
