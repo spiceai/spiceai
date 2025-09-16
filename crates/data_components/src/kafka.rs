@@ -111,6 +111,7 @@ pub struct KafkaConfig {
     pub ssl_ca_location: Option<String>,
     pub enable_ssl_certificate_verification: bool,
     pub ssl_endpoint_identification_algorithm: SslIdentification,
+    pub consumer_group_id: Option<String>,
     pub metrics_store: Option<Arc<KafkaMetrics>>,
 }
 
@@ -134,6 +135,7 @@ impl std::fmt::Debug for KafkaConfig {
                 "ssl_endpoint_identification_algorithm",
                 &self.ssl_endpoint_identification_algorithm,
             )
+            .field("consumer_group_id", &self.consumer_group_id)
             .field(
                 "metrics_store",
                 &self.metrics_store.as_ref().map(|_| "Some(KafkaMetrics)"),
@@ -190,8 +192,8 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
 
         for topic in statistics.topics.values() {
             for partition in topic.partitions.values() {
-                // Skip internal partitions (partition id -1)
-                if partition.partition >= 0 {
+                // Skip internal partitions (partition id -1), and only consider partitions with known lag (-1 means unknown)
+                if partition.partition >= 0 && partition.consumer_lag >= 0 {
                     total_lag += partition.consumer_lag as u64;
                     has_valid_partitions = true;
                 }
@@ -241,11 +243,15 @@ impl KafkaConsumer {
         Self::create(group_id.into(), kafka_config)
     }
 
-    pub fn create_with_generated_group_id(
+    pub fn create_for_dataset(
         dataset: &str,
+        group_id: Option<String>,
         kafka_config: &KafkaConfig,
     ) -> Result<Self> {
-        Self::create(Self::generate_group_id(dataset), kafka_config)
+        Self::create(
+            group_id.unwrap_or_else(|| Self::generate_group_id(dataset)),
+            kafka_config,
+        )
     }
 
     #[must_use]
