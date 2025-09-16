@@ -1,6 +1,5 @@
 ---
 source: crates/runtime/tests/kafka/mod.rs
-assertion_line: 154
 expression: formatted
 ---
 +-------------+--------------------------------------------+
