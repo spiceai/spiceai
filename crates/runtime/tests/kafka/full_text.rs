@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,7 +79,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
 
             run_and_snapshot_query(
                 &rt,
-                &format!("SELECT * FROM text_search({table}, 'gitignore untracked') ORDER BY score DESC LIMIT 10"),
+                &format!("SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY score DESC LIMIT 10"),
                 &data_snapshot,
             )
             .await?;
@@ -99,23 +99,9 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
 }
 
 fn stack_qa_json() -> Vec<serde_json::Value> {
-    // Open the file and create a buffered reader
-    let stack_qa_str = include_str!("./test_data/stack_qa.json");
-    let reader = BufReader::new(stack_qa_str);
-
-    // Collect deserialized JSON values into a vector
-    let mut values = Vec::new();
-
-    // Read each line and parse as JSON
-    for line in reader.lines() {
-        let line = line;
-        if !line.trim().is_empty() {
-            // Skip empty lines
-            let json_value: serde_json::Value =
-                serde_json::from_str(&line).expect("Failed to parse JSON");
-            values.push(json_value);
-        }
-    }
-
-    Ok(values)
+    include_str!("./test_data/stack_qa.json")
+        .lines()
+        .filter(|line| !line.trim().is_empty()) // skip blank lines
+        .map(|line| serde_json::from_str(line).expect("Failed to parse JSON"))
+        .collect()
 }

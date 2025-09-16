@@ -47,17 +47,19 @@ pub async fn index_change_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
-    use std::sync::Arc;
-    use async_trait::async_trait;
     use arrow::{
         array::{Int32Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, wrap_data_as_change_batch};
+    use async_trait::async_trait;
+    use data_components::cdc::{
+        ChangeBatch, ChangeEnvelope, CommitChange, CommitError, wrap_data_as_change_batch,
+    };
+    use datafusion::catalog::TableProvider;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use runtime_datafusion_index::{Index, IndexedTableProvider};
-    use datafusion::catalog::TableProvider;
+    use std::any::Any;
+    use std::sync::Arc;
 
     struct MockCommitChange;
 
@@ -104,7 +106,10 @@ mod tests {
             vec!["id".to_string()]
         }
 
-        async fn compute_index(&self, mut batches: Vec<RecordBatch>) -> DataFusionResult<Vec<RecordBatch>> {
+        async fn compute_index(
+            &self,
+            mut batches: Vec<RecordBatch>,
+        ) -> DataFusionResult<Vec<RecordBatch>> {
             if self.should_fail {
                 return Err(DataFusionError::Execution("Mock index error".to_string()));
             }
@@ -112,7 +117,9 @@ mod tests {
             if self.add_column {
                 for batch in &mut batches {
                     let embedding_array = Arc::new(StringArray::from(
-                        (0..batch.num_rows()).map(|i| format!("embedding_{}", i)).collect::<Vec<_>>()
+                        (0..batch.num_rows())
+                            .map(|i| format!("embedding_{}", i))
+                            .collect::<Vec<_>>(),
                     ));
 
                     let mut columns = batch.columns().to_vec();
@@ -174,7 +181,8 @@ mod tests {
         let id_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
         let name_array = Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"]));
 
-        RecordBatch::try_new(schema, vec![id_array, name_array]).expect("Failed to create test data batch")
+        RecordBatch::try_new(schema, vec![id_array, name_array])
+            .expect("Failed to create test data batch")
     }
 
     fn create_test_change_envelope() -> ChangeEnvelope {
@@ -204,7 +212,10 @@ mod tests {
         let envelope = create_test_change_envelope();
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(table_provider, vec![index]));
+        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+            table_provider,
+            vec![index],
+        ));
 
         let result = index_change_envelope(Ok(envelope), embedding_table).await;
 
@@ -225,7 +236,7 @@ mod tests {
         let index2 = Arc::new(MockIndex::new("index2"));
         let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
             table_provider,
-            vec![index1, index2]
+            vec![index1, index2],
         ));
 
         let result = index_change_envelope(Ok(envelope), embedding_table).await;
@@ -258,7 +269,7 @@ mod tests {
         let failing_index = Arc::new(MockIndex::new("failing_index").with_failure());
         let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
             table_provider,
-            vec![failing_index]
+            vec![failing_index],
         ));
 
         let result = index_change_envelope(Ok(envelope), embedding_table).await;
@@ -281,7 +292,10 @@ mod tests {
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index"));
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(table_provider, vec![index]));
+        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+            table_provider,
+            vec![index],
+        ));
 
         let result = index_change_envelope(Ok(envelope), embedding_table).await;
 
@@ -302,12 +316,18 @@ mod tests {
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index").with_added_column());
-        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(table_provider, vec![index]));
+        let embedding_table = Arc::new(IndexedTableProvider::with_indexes(
+            table_provider,
+            vec![index],
+        ));
 
         let result = index_change_envelope(Ok(envelope), embedding_table).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
-        assert_eq!(result_envelope.change_batch.record.num_rows(), original_row_count);
+        assert_eq!(
+            result_envelope.change_batch.record.num_rows(),
+            original_row_count
+        );
     }
 }
