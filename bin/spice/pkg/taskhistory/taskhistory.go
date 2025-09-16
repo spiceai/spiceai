@@ -90,7 +90,7 @@ func (tMs *TimeWithMilliSeconds) UnmarshalJSON(b []byte) error {
 	s := string(b)
 	s = s[1 : len(s)-1]
 
-	layout := "2006-01-02T15:04:05.999999"
+	layout := "2006-01-02T15:04:05.999999Z"
 
 	t, err := time.Parse(layout, s)
 	if err != nil {
