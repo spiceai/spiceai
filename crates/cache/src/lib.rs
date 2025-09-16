@@ -109,7 +109,7 @@ impl AsTableRefs for Vec<Vec<f32>> {
 
 #[async_trait]
 pub trait CacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
-    HashProvider + std::fmt::Debug
+    HashProvider + std::fmt::Debug + std::fmt::Display
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);

@@ -1112,6 +1112,12 @@ impl DataFusion {
         self.caching.plans.clone()
     }
 
+    pub fn embeddings_cache_provider(
+        &self,
+    ) -> Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>> {
+        self.caching.embeddings.clone()
+    }
+
     pub fn search_cache_provider(
         &self,
     ) -> Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>> {

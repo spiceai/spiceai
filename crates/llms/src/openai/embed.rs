@@ -98,8 +98,8 @@ impl<C: Config + Clone> OpenaiEmbed<C> {
     }
 
     #[must_use]
-    fn with_cache(mut self, cache: Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>) -> Self {
-        self.cache = Some(cache);
+    pub fn set_cache(mut self, cache: Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>>) -> Self {
+        self.cache = cache;
         self
     }
 

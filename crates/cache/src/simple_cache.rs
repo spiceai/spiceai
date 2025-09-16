@@ -16,9 +16,11 @@ limitations under the License.
 
 use crate::{AsTableRefs, CacheProvider, FailedToInvalidateCacheSnafu, HashProvider, Result};
 use async_trait::async_trait;
+use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
+use std::fmt::Display;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,20 @@ pub struct SimpleCache<
     cache: Cache<u64, V, T>,
     hasher: T,
     max_size: u64,
+    ttl: Duration,
+}
+
+impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+    Display for SimpleCache<V, T>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "max size: {:.2}, item ttl: {:?}",
+            Byte::from_u64(self.max_size).get_adjusted_unit(byte_unit::Unit::MiB),
+            self.ttl
+        )
+    }
 }
 
 impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
@@ -57,6 +73,7 @@ impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Se
         SimpleCache {
             cache,
             hasher,
+            ttl,
             max_size: cache_max_size,
         }
     }

@@ -28,6 +28,7 @@ use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
 use spicepod::component::caching::CacheConfig;
+use std::fmt::Display;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -44,6 +45,22 @@ pub struct LruCache<
     hasher: T,
     max_size: u64,
     metrics_last_reported_time: AtomicU64,
+    ttl: Duration,
+}
+
+impl<
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> Display for LruCache<V, T>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "max size: {:.2}, item ttl: {:?}",
+            Byte::from_u64(self.max_size).get_adjusted_unit(byte_unit::Unit::MiB),
+            self.ttl
+        )
+    }
 }
 
 impl<
@@ -126,6 +143,7 @@ impl<
             hasher,
             max_size: cache_max_size,
             metrics_last_reported_time: AtomicU64::new(0),
+            ttl,
         }
     }
 }

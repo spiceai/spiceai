@@ -81,7 +81,7 @@ impl Runtime {
             match lru_cache::build_from_config(&search_results_config) {
                 Ok(cache_provider) => {
                     in_tracing_context(|| {
-                        tracing::info!("Initialized search results cache;"); // TODO: update to include max size and ttl. https://github.com/spiceai/spiceai/issues/6019
+                        tracing::info!("Initialized search results cache; {cache_provider}");
                     });
                     caching = caching.with_search_cache(cache_provider);
                 }
@@ -90,6 +90,20 @@ impl Runtime {
                         tracing::error!("Failed to initialize search results cache: {e}");
                     });
                 }
+            }
+        }
+
+        match lru_cache::build_from_config(&CacheConfig::default()) {
+            Ok(cache_provider) => {
+                in_tracing_context(|| {
+                    tracing::info!("Initialized embeddings cache; {cache_provider}");
+                });
+                caching = caching.with_embeddings_cache(cache_provider);
+            }
+            Err(e) => {
+                in_tracing_context(|| {
+                    tracing::error!("Failed to initialize embeddings cache: {e}");
+                });
             }
         }
 
