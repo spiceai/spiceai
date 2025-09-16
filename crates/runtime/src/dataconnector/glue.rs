@@ -138,7 +138,7 @@ impl GlueDataConnectorFactory {
 
 pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
-    all_parameters.extend_from_slice(&[ParameterSpec::component("catalog_id").secret()]);
+    all_parameters.push(ParameterSpec::component("catalog_id").secret());
     all_parameters.extend_from_slice(crate::dataconnector::s3::PARAMETERS.as_ref());
     all_parameters
 });
