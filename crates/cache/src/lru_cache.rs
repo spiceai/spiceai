@@ -126,7 +126,9 @@ impl<
             hasher,
             max_size: cache_max_size,
             metrics_last_reported_time: Mutex::new(
-                Instant::now().checked_sub(Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)).unwrap(),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(METRICS_REPORT_INTERVAL_SECS))
+                    .unwrap(),
             ),
         }
     }
