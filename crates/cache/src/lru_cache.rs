@@ -19,7 +19,6 @@ use crate::FailedToInvalidateCacheSnafu;
 use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
-use crate::current_time_secs;
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
@@ -31,9 +30,10 @@ use spicepod::component::caching::CacheConfig;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+const METRICS_REPORT_INTERVAL_SECS: u64 = 5;
 
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
@@ -43,7 +43,7 @@ pub struct LruCache<
     cache: Cache<u64, V, T>,
     hasher: T,
     max_size: u64,
-    metrics_last_reported_time: AtomicU64,
+    metrics_last_reported_time: Mutex<Instant>,
 }
 
 impl<
@@ -125,7 +125,9 @@ impl<
             cache,
             hasher,
             max_size: cache_max_size,
-            metrics_last_reported_time: AtomicU64::new(0),
+            metrics_last_reported_time: Mutex::new(
+                Instant::now().checked_sub(Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)).unwrap(),
+            ),
         }
     }
 }
@@ -160,10 +162,10 @@ impl<
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.cache.insert(*key, value).await;
 
-        let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        let now = Instant::now();
+        let mut last_report = self.metrics_last_reported_time.lock().await;
+        if now.duration_since(*last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS) {
+            *last_report = now;
 
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
@@ -171,13 +173,13 @@ impl<
         }
     }
 
-    fn invalidate_all(&self) {
+    async fn invalidate_all(&self) {
         self.cache.invalidate_all();
 
-        let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        let now = Instant::now();
+        let mut last_report = self.metrics_last_reported_time.lock().await;
+        if now.duration_since(*last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS) {
+            *last_report = now;
 
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());

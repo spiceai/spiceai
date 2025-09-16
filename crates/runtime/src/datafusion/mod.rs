@@ -1668,10 +1668,10 @@ impl DataFusion {
         Ok(plan)
     }
 
-    pub(crate) fn clear_cached_plans(&self) {
+    pub(crate) async fn clear_cached_plans(&self) {
         tracing::trace!("clearing cached logical plans");
         if let Some(cache_provider) = self.plans_cache_provider() {
-            cache_provider.invalidate_all();
+            cache_provider.invalidate_all().await;
         }
     }
 

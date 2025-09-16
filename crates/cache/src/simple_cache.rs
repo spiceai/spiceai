@@ -82,7 +82,7 @@ impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Se
         self.cache.insert(*key, value).await;
     }
 
-    fn invalidate_all(&self) {
+    async fn invalidate_all(&self) {
         self.cache.invalidate_all();
     }
 
@@ -214,7 +214,7 @@ mod tests {
         assert!(retrieved.is_some());
 
         // Invalidate the cache for the table
-        cache.invalidate_all();
+        cache.invalidate_all().await;
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
