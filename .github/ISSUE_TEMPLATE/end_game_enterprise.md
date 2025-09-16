@@ -98,6 +98,7 @@ assignees: ''
 
 Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) run associated with the above create Github release:
 
+- [ ] Ensure [docker image build](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) completed and image [got promoted](https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml) to all stamps and environments
 - [ ] Deploy the new docker image to several apps in dev [SCP](https://dev.spice.ai/). Confirm upgrade and functionality.
 - [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality.
   - spicehq:
