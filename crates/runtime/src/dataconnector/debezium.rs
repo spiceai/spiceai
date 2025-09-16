@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
@@ -27,7 +28,7 @@ use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::{KafkaConfig, KafkaConsumer};
+use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,8 @@ impl Debezium {
                     tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
                     data_components::kafka::SslIdentification::Https
                 }),
+            // Metrics instance that will be used by the Kafka consumer to update statistics
+            metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
         Ok(Self { kafka_config })
@@ -359,6 +362,16 @@ impl DataConnector for Debezium {
                 yield item;
             }
         }))
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        if let Some(metrics) = self.kafka_config.metrics_store.as_ref() {
+            Some(Arc::new(super::kafka::KafkaMetricsProvider::new(
+                Arc::clone(metrics),
+            )))
+        } else {
+            None
+        }
     }
 }
 

@@ -78,7 +78,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.2", features = [
+keyring = { version = "3.6.3", features = [
     "apple-native",
     "windows-native",
     "linux-native",
@@ -164,7 +164,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
-tract-core = "0.21.10"
+tract-core = "0.22.0"
 twox-hash = { workspace = true, optional = true }
 url = "2.5.4"
 util = { path = "../util" }
@@ -218,7 +218,7 @@ clickhouse = [
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
-debezium = ["data_components/debezium"]
+debezium = ["kafka", "data_components/debezium"]
 kafka = ["data_components/kafka"]
 default = [
     "keyring-secret-store",

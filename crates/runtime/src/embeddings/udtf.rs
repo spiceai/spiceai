@@ -48,7 +48,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
+use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, SubqueryAlias};
 use itertools::Itertools;
 use std::cmp::min;
 use std::sync::LazyLock;
@@ -504,7 +504,12 @@ impl TableProvider for VectorSearchUDTFProvider {
             None,
         )?);
 
-        let mut base_expr: Vec<Expr> = self
+        let search_field_index = self
+            .schema()
+            .index_of(SEARCH_SCORE_COLUMN_NAME)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let mut final_expr: Vec<Expr> = self
             .schema()
             .fields()
             .iter()
@@ -522,6 +527,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
             })
             .collect();
+        let mut base_expr = final_expr.clone();
 
         base_expr.push(Expr::Alias(Alias {
             expr: Box::from(Expr::BinaryExpr(BinaryExpr::new(
@@ -540,6 +546,13 @@ impl TableProvider for VectorSearchUDTFProvider {
             metadata: None,
         }));
 
+        // only include score in the projection if it is requested.
+        // Otherwise, if the query is `SELECT a FROM vector_search(...)`, it will fail because we supplied too many columns in the response!
+        if projection.is_none() || projection.is_some_and(|proj| proj.contains(&search_field_index))
+        {
+            final_expr.push(Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)));
+        }
+
         let proj = LogicalPlan::Projection(Projection::try_new(base_expr, Arc::new(scan))?);
         let sort = LogicalPlan::Sort(Sort {
             expr: vec![SortExpr::new(
@@ -551,6 +564,13 @@ impl TableProvider for VectorSearchUDTFProvider {
             fetch: self.limit_to_use(limit),
         });
 
-        state.create_physical_plan(&sort).await
+        // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
+        let score_subquery =
+            LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(sort), "tbl")?);
+
+        let final_proj =
+            LogicalPlan::Projection(Projection::try_new(final_expr, Arc::new(score_subquery))?);
+
+        state.create_physical_plan(&final_proj).await
     }
 }
