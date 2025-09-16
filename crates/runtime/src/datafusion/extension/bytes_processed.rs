@@ -295,6 +295,9 @@ impl ExecutionPlan for BytesProcessedExec {
         self
     }
 
+    /// In some cases, projection pushdown may not have happened and the scan will only
+    /// reflect the raw schema of the physical table. In these cases, `SpiceExtensionPlanner`
+    /// will pass through the logical schema if it detects a mismatch.
     fn schema(&self) -> SchemaRef {
         self.logical_plan_schema_fallback
             .clone()
@@ -375,10 +378,16 @@ mod tests {
     use std::sync::Arc;
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("foo", DataType::Int64, false),
+        ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from_iter_values(0i64..10000))],
+            vec![
+                Arc::new(Int64Array::from_iter_values(0i64..10000)),
+                Arc::new(Int64Array::from_iter_values(10000..20000)),
+            ],
         )?;
 
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
@@ -443,6 +452,28 @@ mod tests {
             displayable(final_plan.as_ref()).tree_render().to_string(),
             displayable(optimized.as_ref()).tree_render().to_string()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_respect_logical_schema() -> Result<()> {
+        let runtime: Runtime = RuntimeBuilder::new().build().await;
+        let table = make_test_table()?;
+        let table_scan = table.scan(&runtime.df.ctx.state(), None, &[], None).await?;
+
+        let projected_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        // Without a logical schema fallback, the exec node should emit the same
+        // schema as its input scan
+        let bytes_exec = BytesProcessedExec::new(Arc::clone(&table_scan), None);
+        assert_eq!(bytes_exec.schema(), table_scan.schema());
+
+        // With a logical schema fallback, the exec node should emit the new schema
+        let bytes_exec_with_logical_schema =
+            BytesProcessedExec::new(Arc::clone(&table_scan), Some(Arc::clone(&projected_schema)));
+        assert_eq!(bytes_exec_with_logical_schema.schema(), projected_schema);
 
         Ok(())
     }
