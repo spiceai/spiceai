@@ -92,6 +92,7 @@ pub(super) fn search_index_filters(
 pub mod tests {
     use std::{any::Any, sync::Arc};
 
+    use anyhow::Ok;
     use arrow::{
         array::{
             ArrayData, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array,
@@ -102,16 +103,17 @@ pub mod tests {
         util::pretty,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use async_trait::async_trait;
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
-        datasource::TableType,
+        datasource::{DefaultTableSource, TableType},
         error::DataFusionError,
         logical_expr::TableProviderFilterPushDown,
         physical_plan::{DisplayAs, ExecutionPlan},
         prelude::{Expr, SessionConfig, SessionContext},
         sql::TableReference,
     };
-    use datafusion_expr::LogicalPlan;
+    use datafusion_expr::{LogicalPlan, TableScan};
     use search::generation::util::append_fields;
     use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
@@ -162,7 +164,7 @@ pub mod tests {
                 self.1.clone(),
                 self.2,
                 self.3.clone(),
-            )))
+            )) as Arc<dyn ExecutionPlan>)
         }
 
         fn execute(
@@ -197,7 +199,7 @@ pub mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl TableProvider for ExplainMemTable {
         fn as_any(&self) -> &dyn Any {
             self
@@ -273,7 +275,7 @@ pub mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl VectorIndex for PretendVectorIndex {
         fn list_table_provider(
             &self,
@@ -285,11 +287,23 @@ pub mod tests {
                 ))]],
             )
             .boxed()?;
-            Ok(Arc::new(ExplainMemTable(mem_table)))
+
+            Ok(LogicalPlan::TableScan(
+                TableScan::try_new(
+                    "tbl",
+                    Arc::new(DefaultTableSource::new(
+                        Arc::new(ExplainMemTable(mem_table)) as Arc<dyn TableProvider>,
+                    )),
+                    None,
+                    vec![],
+                    None,
+                )
+                .boxed()?,
+            ))
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl SearchIndex for PretendVectorIndex {
         fn search_column(&self) -> String {
             self.embedded_column.clone()
