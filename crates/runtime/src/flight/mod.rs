@@ -312,7 +312,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                 }
             } else if let Some(err) = e.downcast_ref::<llms::embeddings::Error>() {
                 match err {
-                    llms::embeddings::Error::FailedToCreateEmbeddingThrottling { .. } => {
+                    llms::embeddings::Error::RateLimited { .. } => {
                         Status::unavailable(format!("{err}"))
                     }
                     _ => to_tonic_err(e),

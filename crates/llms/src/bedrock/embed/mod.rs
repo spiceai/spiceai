@@ -138,7 +138,7 @@ where
             .do_invoke(self.config.model_id().clone(), body)
             .await
             .map_err(|err| match err.downcast::<BedrockThrottlingException>() {
-                Ok(e) => EmbedError::FailedToCreateEmbeddingThrottling { source: e },
+                Ok(e) => EmbedError::RateLimited { source: e },
                 Err(e) => EmbedError::FailedToCreateEmbedding { source: e },
             })?;
 

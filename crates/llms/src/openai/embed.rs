@@ -177,7 +177,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                     );
 
                                     if is_throttling_error(&err) {
-                                        return RetryError::transient(EmbedError::FailedToCreateEmbeddingThrottling { source: err.into() });
+                                        return RetryError::transient(EmbedError::RateLimited { source: err.into() });
                                     }
 
                                     return RetryError::transient(EmbedError::FailedToCreateEmbedding { source: err.into() });
