@@ -1014,7 +1014,6 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
-            tracing::error!("Hello headie");
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
             if let Some(changes_stream) = changes_stream {
