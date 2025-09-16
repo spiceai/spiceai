@@ -164,7 +164,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
-tract-core = "0.21.10"
+tract-core = "0.22.0"
 twox-hash = { workspace = true, optional = true }
 url = "2.5.4"
 util = { path = "../util" }

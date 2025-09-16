@@ -81,6 +81,8 @@ impl VectorSearch {
     }
 
     /// Checks if a  [`TableProvider`] has an associated vector index, and if so, returns the associated [`Embed`].
+    #[allow(clippy::unused_async)] // async is not used when the feature is disabled
+    #[allow(unused_variables)]
     async fn model_from_vector_index(
         &self,
         tbl: &Arc<dyn TableProvider>,
