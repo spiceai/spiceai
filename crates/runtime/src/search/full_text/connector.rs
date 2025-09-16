@@ -130,7 +130,7 @@ impl FullTextConnector {
         f: F,
     ) -> Option<ChangesStream>
     where
-        F: Fn(&dyn DataConnector, Arc<FederatedTable>) -> Option<ChangesStream>,
+        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
 
