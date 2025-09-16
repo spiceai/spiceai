@@ -371,7 +371,7 @@ pub(crate) struct KafkaMetadata {
 
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadata> {
     let kafka_sys = KafkaSys::try_new(dataset).await.ok()?;
-    kafka_sys.get()
+    kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
@@ -379,7 +379,7 @@ async fn set_metadata_to_accelerator(
     metadata: &KafkaMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let debezium_kafka_sys = KafkaSys::try_new_create_if_not_exists(dataset).await?;
-    debezium_kafka_sys.upsert(metadata)
+    debezium_kafka_sys.upsert(metadata).await
 }
 
 async fn bootstrap_new_kafka_consumer(
