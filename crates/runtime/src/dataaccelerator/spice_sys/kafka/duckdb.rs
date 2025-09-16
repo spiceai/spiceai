@@ -126,6 +126,12 @@ mod tests {
         dataset.acceleration = Some(Acceleration {
             engine: Engine::DuckDB,
             mode: Mode::File,
+            params: [(
+                "duckdb_file".to_string(),
+                ".spice/data/kafka_duckdb_test.db".to_string(),
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         });
 
