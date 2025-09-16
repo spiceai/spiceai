@@ -53,7 +53,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use data_components::cdc::{
-        ChangeBatch, ChangeEnvelope, CommitChange, CommitError, wrap_data_as_change_batch,
+        ChangeEnvelope, CommitChange, CommitError, wrap_data_as_change_batch,
     };
     use datafusion::catalog::TableProvider;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -118,7 +118,7 @@ mod tests {
                 for batch in &mut batches {
                     let embedding_array = Arc::new(StringArray::from(
                         (0..batch.num_rows())
-                            .map(|i| format!("embedding_{}", i))
+                            .map(|i| format!("embedding_{i}"))
                             .collect::<Vec<_>>(),
                     ));
 
