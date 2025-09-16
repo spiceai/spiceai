@@ -69,46 +69,6 @@ pub struct SearchRequestHTTPJson {
     pub keywords: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub struct SearchRequestAIJson {
-    #[serde(flatten)]
-    pub base: SearchRequestBaseJson,
-
-    /// At least one keyword should be supplied for a vector search. Keywords should be individual words.
-    /// Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition.
-    /// Keywords should not contain column names, special characters, or other operators.
-    pub keywords: Vec<String>,
-}
-
-impl From<SearchRequestHTTPJson> for SearchRequestAIJson {
-    fn from(req: SearchRequestHTTPJson) -> Self {
-        SearchRequestAIJson {
-            base: req.base,
-            keywords: req.keywords.unwrap_or_default(),
-        }
-    }
-}
-
-impl TryFrom<SearchRequestAIJson> for SearchRequest {
-    type Error = String;
-
-    fn try_from(req: SearchRequestAIJson) -> Result<Self, Self::Error> {
-        Ok(SearchRequest::new(
-            req.base.text,
-            req.base.datasets,
-            req.base.limit.unwrap_or(default_limit()),
-            req.base
-                .where_cond
-                .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
-                .transpose()?,
-            SearchRequest::parse_additional_columns(&req.base.additional_columns)
-                .map_err(|e| e.to_string())?,
-            valid_keywords(&req.keywords).map_err(|e| e.to_string())?,
-        ))
-    }
-}
-
 #[derive(Debug, Clone)]
 #[allow(clippy::doc_markdown)]
 pub struct SearchRequest {
@@ -129,6 +89,43 @@ pub struct SearchRequest {
 
     /// Keywords to perform a lexical search and pre-filter the embedding column.
     pub keywords: Vec<String>,
+}
+
+impl TryFrom<SearchRequestHTTPJson> for SearchRequest {
+    type Error = String;
+
+    fn try_from(req: SearchRequestHTTPJson) -> Result<Self, Self::Error> {
+        Ok(SearchRequest::new(
+            req.base.text,
+            req.base.datasets,
+            req.base.limit.unwrap_or(default_limit()),
+            req.base
+                .where_cond
+                .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
+                .transpose()?,
+            SearchRequest::parse_additional_columns(&req.base.additional_columns)
+                .map_err(|e| e.to_string())?,
+            valid_keywords(&req.keywords.unwrap_or_default()).map_err(|e| e.to_string())?,
+        ))
+    }
+}
+
+impl TryFrom<SearchRequestBaseJson> for SearchRequest {
+    type Error = String;
+
+    fn try_from(req: SearchRequestBaseJson) -> Result<Self, Self::Error> {
+        Ok(SearchRequest::new(
+            req.text,
+            req.datasets,
+            req.limit.unwrap_or(default_limit()),
+            req.where_cond
+                .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
+                .transpose()?,
+            SearchRequest::parse_additional_columns(&req.additional_columns)
+                .map_err(|e| e.to_string())?,
+            Vec::new(),
+        ))
+    }
 }
 
 impl From<SearchRequest> for SearchKey {
@@ -386,14 +383,6 @@ impl SearchRequest {
 pub(crate) mod tests {
     use super::*;
     use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr};
-    use schemars::schema_for;
-    use snafu::ResultExt;
-
-    #[tokio::test]
-    async fn test_search_request_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        serde_json::to_value(schema_for!(SearchRequestAIJson)).boxed()?;
-        Ok(())
-    }
 
     #[test]
     fn test_parse_additional_columns_basic() {

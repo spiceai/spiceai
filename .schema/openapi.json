@@ -259,7 +259,7 @@
           "Datasets"
         ],
         "summary": "Update Refresh SQL",
-        "description": "Update the refresh SQL for a dataset's acceleration.\n\nThis endpoint allows for updating the `refresh_sql` parameter for a dataset's acceleration at runtime.\nThe change is **temporary** and will revert to the `spicepod.yml` definition at the next runtime restart.\n\n",
+        "description": "Update the refresh SQL for a dataset's acceleration.\n\nThis endpoint allows for updating the `refresh_sql` parameter for a dataset's acceleration at runtime.\nThe change is **temporary** and will revert to the `spicepod.yml` definition at the next runtime restart.",
         "operationId": "patch_dataset_acceleration",
         "parameters": [
           {

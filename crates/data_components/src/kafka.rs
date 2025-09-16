@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{any::Any, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
@@ -110,6 +111,7 @@ pub struct KafkaConfig {
     pub ssl_ca_location: Option<String>,
     pub enable_ssl_certificate_verification: bool,
     pub ssl_endpoint_identification_algorithm: SslIdentification,
+    pub metrics_store: Option<Arc<KafkaMetrics>>,
 }
 
 impl std::fmt::Debug for KafkaConfig {
@@ -132,13 +134,103 @@ impl std::fmt::Debug for KafkaConfig {
                 "ssl_endpoint_identification_algorithm",
                 &self.ssl_endpoint_identification_algorithm,
             )
+            .field(
+                "metrics_store",
+                &self.metrics_store.as_ref().map(|_| "Some(KafkaMetrics)"),
+            )
             .finish()
     }
 }
 
+#[derive(Debug, Default)]
+pub struct KafkaMetrics {
+    /// Total consumer lag across all partitions
+    pub records_lag: AtomicU64,
+    /// Total number of messages consumed
+    pub records_consumed: AtomicU64,
+    /// Total bytes consumed
+    pub bytes_consumed: AtomicU64,
+}
+
+struct KafkaConsumerContext {
+    metrics: Arc<KafkaMetrics>,
+}
+
+impl KafkaConsumerContext {
+    fn new(metrics: Arc<KafkaMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl KafkaMetrics {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update_records_lag(&self, lag: u64) {
+        self.records_lag.store(lag, Ordering::Relaxed);
+    }
+
+    pub fn update_records_consumed(&self, count: u64) {
+        self.records_consumed.store(count, Ordering::Relaxed);
+    }
+
+    pub fn update_bytes_consumed(&self, bytes: u64) {
+        self.bytes_consumed.store(bytes, Ordering::Relaxed);
+    }
+}
+
+impl rdkafka::ClientContext for KafkaConsumerContext {
+    #[allow(clippy::cast_sign_loss)]
+    fn stats(&self, statistics: rdkafka::Statistics) {
+        // Calculate total consumer lag from all topic partitions
+        let mut total_lag = 0u64;
+        let mut has_valid_partitions = false;
+
+        for topic in statistics.topics.values() {
+            for partition in topic.partitions.values() {
+                // Skip internal partitions (partition id -1)
+                if partition.partition >= 0 {
+                    total_lag += partition.consumer_lag as u64;
+                    has_valid_partitions = true;
+                }
+            }
+        }
+
+        // Update total lag only if we have valid partitions to avoid misleading data
+        if has_valid_partitions {
+            self.metrics.update_records_lag(total_lag);
+        }
+
+        self.metrics
+            .update_records_consumed(statistics.rxmsgs as u64);
+        self.metrics
+            .update_bytes_consumed(statistics.rxmsg_bytes as u64);
+
+        tracing::trace!(
+            "Kafka metrics updated for consumer: {}, topics: {:?}, lag: {}, messages: {}, bytes: {}, brokers={:?}, consumer_group_state={:?}",
+            statistics.name,
+            statistics.topics.keys().collect::<Vec<_>>(),
+            total_lag,
+            statistics.rxmsgs,
+            statistics.rxmsg_bytes,
+            statistics
+                .brokers
+                .values()
+                .map(|b| format!("{}:{}", b.name, b.state))
+                .collect::<Vec<_>>(),
+            statistics.cgrp.as_ref().map(|cgrp| &cgrp.state),
+        );
+    }
+}
+
+impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {}
+
 pub struct KafkaConsumer {
     group_id: String,
-    consumer: StreamConsumer,
+    consumer: StreamConsumer<KafkaConsumerContext>,
+    metrics: Arc<KafkaMetrics>,
 }
 
 impl KafkaConsumer {
@@ -257,6 +349,11 @@ impl KafkaConsumer {
         Ok(())
     }
 
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<KafkaMetrics> {
+        &self.metrics
+    }
+
     fn create(group_id: String, kafka_config: &KafkaConfig) -> Result<Self> {
         let (_, version) = get_rdkafka_version();
         tracing::debug!("rd_kafka_version: {}", version);
@@ -265,6 +362,8 @@ impl KafkaConsumer {
         config
             .set("group.id", group_id.clone())
             .set("bootstrap.servers", &kafka_config.brokers)
+            // Explicit statistics emission interval configuration (1s is the default)
+            .set("statistics.interval.ms", "1000")
             .set("retry.backoff.ms", "1000")
             .set("retry.backoff.max.ms", "30000")
             .set("reconnect.backoff.ms", "1000")
@@ -303,12 +402,21 @@ impl KafkaConsumer {
                 .to_string(),
         );
 
-        let consumer: StreamConsumer = config
+        let metrics = kafka_config
+            .metrics_store
+            .clone()
+            .unwrap_or(Arc::new(KafkaMetrics::new()));
+
+        let consumer: StreamConsumer<KafkaConsumerContext> = config
             .set_log_level(RDKafkaLogLevel::Debug)
-            .create()
+            .create_with_context(KafkaConsumerContext::new(Arc::clone(&metrics)))
             .context(UnableToCreateConsumerSnafu)?;
 
-        Ok(Self { group_id, consumer })
+        Ok(Self {
+            group_id,
+            consumer,
+            metrics,
+        })
     }
 
     fn generate_group_id(dataset: &str) -> String {
@@ -317,7 +425,7 @@ impl KafkaConsumer {
 }
 
 pub struct KafkaMessage<'a, K, V> {
-    consumer: &'a StreamConsumer,
+    consumer: &'a StreamConsumer<KafkaConsumerContext>,
     msg: BorrowedMessage<'a>,
     key: Option<K>,
     value: V,
@@ -325,7 +433,7 @@ pub struct KafkaMessage<'a, K, V> {
 
 impl<'a, K, V> KafkaMessage<'a, K, V> {
     fn new(
-        consumer: &'a StreamConsumer,
+        consumer: &'a StreamConsumer<KafkaConsumerContext>,
         msg: BorrowedMessage<'a>,
         key: Option<K>,
         value: V,
