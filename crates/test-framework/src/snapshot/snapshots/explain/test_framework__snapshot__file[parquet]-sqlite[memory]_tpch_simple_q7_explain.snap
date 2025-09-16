@@ -2,20 +2,21 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q7"
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                         |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                                           |
-|               |   Federated                                                                                                                                                                  |
-|               |  Limit: skip=0, fetch=10                                                                                                                                                     |
-|               |   Projection: c.key                                                                                                                                                          |
-|               |     SubqueryAlias: c                                                                                                                                                         |
-|               |       Projection: orders.o_orderkey AS key                                                                                                                                   |
-|               |         Limit: skip=0, fetch=10                                                                                                                                              |
-|               |           Projection: orders.o_orderkey                                                                                                                                      |
-|               |             TableScan: orders projection=[o_orderkey]                                                                                                                        |
-| physical_plan | BytesProcessedExec                                                                                                                                                           |
-|               |   SchemaCastScanExec                                                                                                                                                         |
-|               |     VirtualExecutionPlan name=sqlite compute_context=memory initial_sql=SELECT `c`.`key` FROM (SELECT `orders`.`o_orderkey` AS `key` FROM `orders` LIMIT 10) AS `c` LIMIT 10 |
-|               |                                                                                                                                                                              |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                           |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                             |
+|               |   Federated                                                                                                                                                                    |
+|               |  Limit: skip=0, fetch=10                                                                                                                                                       |
+|               |   Projection: c.key                                                                                                                                                            |
+|               |     SubqueryAlias: c                                                                                                                                                           |
+|               |       Projection: orders.o_orderkey AS key                                                                                                                                     |
+|               |         Limit: skip=0, fetch=10                                                                                                                                                |
+|               |           Projection: orders.o_orderkey                                                                                                                                        |
+|               |             TableScan: orders projection=[o_orderkey]                                                                                                                          |
+| physical_plan | BytesProcessedExec                                                                                                                                                             |
+|               |   SchemaCastScanExec                                                                                                                                                           |
+|               |     CooperativeExec                                                                                                                                                            |
+|               |       VirtualExecutionPlan name=sqlite compute_context=memory initial_sql=SELECT `c`.`key` FROM (SELECT `orders`.`o_orderkey` AS `key` FROM `orders` LIMIT 10) AS `c` LIMIT 10 |
+|               |                                                                                                                                                                                |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
