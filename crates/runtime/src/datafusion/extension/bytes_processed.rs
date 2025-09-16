@@ -377,17 +377,13 @@ mod tests {
             .scan(&runtime.df.ctx.state(), None, &[], None)
             .await?;
 
-        let sort_exec = SortExec::new(
-            LexOrdering::new(vec![
-                PhysicalSortExpr::new_default(physical_col(
-                    "id",
-                    data_source_exec.schema().as_ref(),
-                )?)
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("id", data_source_exec.schema().as_ref())?)
                 .desc()
                 .nulls_last(),
-            ]),
-            data_source_exec,
-        );
+        ])
+        .expect("could not generate lex ordering");
+        let sort_exec = SortExec::new(lex_ordering, data_source_exec);
 
         let final_plan: Arc<dyn ExecutionPlan> =
             Arc::new(BytesProcessedExec::new(Arc::new(sort_exec)));

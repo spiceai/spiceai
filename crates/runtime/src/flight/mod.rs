@@ -281,7 +281,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
         }
-        DataFusionError::SQL(sql_err, _) => match sql_err {
+        DataFusionError::SQL(sql_err, _) => match *sql_err {
             ParserError::RecursionLimitExceeded => {
                 Status::invalid_argument("Recursion limit exceeded")
             }

@@ -25,7 +25,7 @@ serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
-tract-core = "0.21.10"
+tract-core = "0.22.0"
 tract-onnx = "0.22.0"
 
 [features]

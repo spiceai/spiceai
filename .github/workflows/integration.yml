@@ -126,12 +126,14 @@ jobs:
   test:
     name: Integration Tests
     needs: build
-    permissions: read-all
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -233,7 +235,7 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "fix: Update the integration test snapshots"
-            git push origin
+            git push origin HEAD
           fi
         env:
-          GH_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

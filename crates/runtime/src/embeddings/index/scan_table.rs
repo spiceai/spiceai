@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType},
+    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
@@ -32,6 +32,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion_expr::SubqueryAlias;
 
 use crate::{
     embedding_col,
@@ -204,7 +205,15 @@ impl TableProvider for VectorScanTableProvider {
             embedding_col!(self.index.search_column()),
         )));
 
-        let index_logical_plan = self.index.list_table_provider()?;
+        let index_logical_plan = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            self.index.list_table_provider()?.into(),
+            TableReference::parse_str("vector_index"),
+        )?);
+
+        tracing::error!("index_logical_plan={index_logical_plan:#?}");
+        if let Err(e) = state.create_physical_plan(&index_logical_plan).await {
+            tracing::error!("Error in 'index_logical_plan'={e:?}");
+        }
 
         let primary_key_fields = self.index.primary_fields();
         if primary_key_fields.is_empty() {
@@ -249,10 +258,16 @@ impl TableProvider for VectorScanTableProvider {
 
             let join_conditions: Vec<(Expr, Expr)> = primary_key_fields
                 .iter()
-                .map(|pk_field| {
+                .map(|field| {
                     (
-                        Expr::Column(Column::new_unqualified(pk_field.name())),
-                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                        Expr::Column(Column::new(
+                            Some(TableReference::parse_str("vector_index")),
+                            field.name(),
+                        )),
+                        Expr::Column(Column::new(
+                            Some(TableReference::parse_str("base_table")),
+                            field.name(),
+                        )),
                     )
                 })
                 .collect();
@@ -267,7 +282,7 @@ impl TableProvider for VectorScanTableProvider {
                 on: join_conditions,
                 filter: pre_join_filters.into_iter().reduce(Expr::and),
                 schema: join_schema.into(),
-                null_equals_null: false,
+                null_equality: NullEquality::NullEqualsNothing,
             });
 
             // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join

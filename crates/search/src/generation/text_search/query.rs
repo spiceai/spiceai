@@ -98,7 +98,7 @@ impl TableProvider for FullTextSearchQuery {
                 filters.to_vec(),
                 self.limit_to_use(limit).unwrap_or(DEFAULT_BATCH_SIZE),
             )
-            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
         ))
     }
 }

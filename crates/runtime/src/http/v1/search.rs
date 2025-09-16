@@ -17,7 +17,7 @@ use crate::{
     request::{AsyncMarker, RequestContext},
     search::{
         Error as VectorSearchError,
-        request::{SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson},
+        request::{SearchRequest, SearchRequestHTTPJson},
         types::{Match, to_matches_sorted},
         vector_search::VectorSearch,
     },
@@ -141,7 +141,7 @@ pub(crate) async fn post(
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.base.text);
 
-    let search_request = match SearchRequest::try_from(SearchRequestAIJson::from(payload)) {
+    let search_request = match SearchRequest::try_from(payload) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");

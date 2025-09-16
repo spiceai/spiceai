@@ -27,8 +27,6 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;

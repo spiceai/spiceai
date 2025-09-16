@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use arrow_schema::FieldRef;
 
-use datafusion::{catalog::TableProvider, logical_expr::LogicalPlan, prelude::Expr};
+use datafusion::{logical_expr::LogicalPlan, prelude::Expr};
 
 mod retry_client;
 pub mod s3;

@@ -64,13 +64,6 @@ snapshot_kind: text
                 "null"
               ]
             },
-            "keywords": {
-              "description": "At least one keyword should be supplied for a vector search. Keywords should be individual words.\n Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition.\n Keywords should not contain column names, special characters, or other operators.",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
             "limit": {
               "default": null,
               "description": "Number of documents to return for each dataset",
@@ -95,10 +88,9 @@ snapshot_kind: text
             }
           },
           "required": [
-            "text",
-            "keywords"
+            "text"
           ],
-          "title": "SearchRequestAIJson",
+          "title": "SearchRequestBaseJson",
           "type": "object"
         }
       },

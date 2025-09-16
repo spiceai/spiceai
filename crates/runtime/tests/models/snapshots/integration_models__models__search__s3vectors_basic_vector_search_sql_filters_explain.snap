@@ -17,17 +17,19 @@ snapshot_kind: text
 |               |       BytesProcessedExec                                                                                                                                                 |
 |               |         FilterExec: subject@2 != math                                                                                                                                    |
 |               |           ProjectionExec: expr=[id@0 as id, answer@2 as answer, subject@3 as subject, score@1 as score]                                                                  |
-|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
-|               |               HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3, subject@4]                                         |
-|               |                 RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                        |
-|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                            |
-|               |                     ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                                                           |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                               |
-|               |                         S3VectorsQueryExec: limit=30                                                                                                                     |
-|               |                 RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                        |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                   |
-|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
-|               |                       SchemaCastScanExec                                                                                                                                 |
-|               |                         DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3, subject@4]                                           |
+|               |               CoalescePartitionsExec                                                                                                                                     |
+|               |                 BytesProcessedExec                                                                                                                                       |
+|               |                   ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                                                             |
+|               |                     BytesProcessedExec                                                                                                                                   |
+|               |                       CooperativeExec                                                                                                                                    |
+|               |                         CooperativeExec                                                                                                                                  |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                           |
+|               |                             CooperativeExec                                                                                                                              |
+|               |                               S3VectorsQueryExec: limit=30                                                                                                               |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                       |
+|               |                 BytesProcessedExec                                                                                                                                       |
+|               |                   SchemaCastScanExec                                                                                                                                     |
+|               |                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                    |
 |               |                                                                                                                                                                          |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
