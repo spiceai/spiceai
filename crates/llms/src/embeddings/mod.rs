@@ -46,8 +46,8 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to create embedding due to throttling. {source}"))]
-    FailedToCreateEmbeddingThrottling {
+    #[snafu(display("Embedding rate limit exceeded. {source}. Try again later."))]
+    RateLimited {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
