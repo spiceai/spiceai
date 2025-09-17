@@ -285,7 +285,7 @@ impl VectorSearchTableFunc {
         args: &VectorSearchTableFuncArgs,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         use crate::{embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider};
-        let Some(mut vector_indexes) = find_index_in_table_provider::<S3Vector>(tbl) else {
+        let Some((mut vector_indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl) else {
             return Ok(None);
         };
 

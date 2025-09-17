@@ -93,7 +93,7 @@ impl VectorSearch {
             use crate::{
                 embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider,
             };
-            for s3v in find_index_in_table_provider::<S3Vector>(tbl)? {
+            for s3v in find_index_in_table_provider::<S3Vector>(tbl)?.0 {
                 if s3v.embedded_column == embedding_column {
                     return s3v.embedding_model().await;
                 }

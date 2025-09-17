@@ -21,12 +21,12 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::changes::index_change_envelope;
+use crate::changes::{Indexes, index_change_envelope};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
-use crate::search::util::find_concrete_table_provider;
+use crate::search::util::find_index_in_table_provider;
 use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
@@ -136,8 +136,8 @@ impl FullTextConnector {
     {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        let Some(indexed) =
-            find_concrete_table_provider::<IndexedTableProvider>(&table_provider).cloned()
+        let Some((indexed, underlying)) =
+            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
         else {
             tracing::debug!(
                 "FullTextConnector didn't wrap underlying table with index - this is unexpected"
@@ -145,8 +145,13 @@ impl FullTextConnector {
             return None;
         };
 
-        let indexed = Arc::new(indexed);
-        let underlying = indexed.get_underlying();
+        let indexed = indexed
+            .into_iter()
+            .cloned()
+            .map(|i| Arc::new(i) as Arc<dyn Index + Send + Sync>)
+            .collect();
+
+        let indexed = Indexes::new(indexed);
         let ft = Arc::new(FederatedTable::Immediate(underlying));
 
         let stream = f(&self.inner_connector, ft)?;
