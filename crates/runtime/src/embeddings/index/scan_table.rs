@@ -235,7 +235,10 @@ impl TableProvider for VectorScanTableProvider {
             let underlying_table_scan =
                 LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
 
-            let join_schema = index_logical_plan
+            // Don't get metadata columns from index. Only vectors and primary key.
+            let index_logical_projection =
+                LogicalPlan::Projection(Projection::try_new(proj, index_logical_plan.into())?);
+            let join_schema = index_logical_projection
                 .schema()
                 .join(underlying_table_scan.schema())?;
 
@@ -270,7 +273,7 @@ impl TableProvider for VectorScanTableProvider {
             // Right Join so that all rows in the underlying table are returned.
             // Rows may not have associated vectors periodically due to indexing delays.
             let join = LogicalPlan::Join(Join {
-                left: Arc::new(index_logical_plan),
+                left: Arc::new(index_logical_projection),
                 right: Arc::new(underlying_table_scan),
                 join_type: JoinType::Right,
                 join_constraint: JoinConstraint::On,
