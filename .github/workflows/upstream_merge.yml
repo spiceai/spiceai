@@ -1,0 +1,196 @@
+name: OSS Upstream Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_conflict_resolution:
+        description: "Attempt automated conflict resolution when needed"
+        required: false
+        default: "true"
+      custom_merge_branch_suffix:
+        description: "Optional suffix to append to the automation branch"
+        required: false
+  schedule:
+    - cron: '0 21 * * *' # Daily: 9PM UTC, 2PM PST, 6AM KST
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-merge-sync
+  cancel-in-progress: false
+
+jobs:
+  merge-upstream:
+    runs-on: ubuntu-latest
+    env:
+      DEFAULT_BRANCH: trunk
+      UPSTREAM_REPO: https://github.com/spiceai/spiceai.git
+      MERGE_LABEL: kind/upstream-merge
+      REPORT_FILE: merge_conflict_report.md
+    steps:
+      - name: Configure authentication token
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.MERGE_AUTOMATION_TOKEN }}" ]; then
+            echo "GH_TOKEN=${{ secrets.MERGE_AUTOMATION_TOKEN }}" >> $GITHUB_ENV
+          else
+            echo "GH_TOKEN=${{ github.token }}" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.DEFAULT_BRANCH }}
+
+      - name: Resolve workflow inputs
+        run: |
+          run_conflict="${{ github.event.inputs.run_conflict_resolution }}"
+          if [ -z "$run_conflict" ]; then
+            run_conflict="true"
+          fi
+          echo "RUN_CONFLICT_RESOLUTION=$run_conflict" >> $GITHUB_ENV
+
+          suffix="${{ github.event.inputs.custom_merge_branch_suffix }}"
+          if [ -z "$suffix" ]; then
+            suffix=""
+          fi
+          echo "CUSTOM_SUFFIX=$suffix" >> $GITHUB_ENV
+
+      - name: Configure git user
+        if: always()
+        run: |
+          git config user.name "Spice Enterprise Merge Bot"
+          git config user.email "enterprise-merge@spice.ai"
+
+      - name: Check for existing automation PR
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+        run: |
+          existing=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --search 'label:"kind/upstream-merge" is:open' \
+            --json number \
+            --limit 1 \
+            --template '{{range .}}{{.number}}{{end}}')
+          if [ -n "$existing" ]; then
+            echo "has_open=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_open=false" >> $GITHUB_OUTPUT
+          fi
+          echo "existing_pr=${existing}" >> $GITHUB_OUTPUT
+
+      - name: Exit early when PR already open
+        if: steps.check_pr.outputs.has_open == 'true'
+        run: |
+          echo "Automated upstream merge PR (#${{ steps.check_pr.outputs.existing_pr }}) already open. Skipping."
+
+      - name: Prepare upstream remotes
+        if: steps.check_pr.outputs.has_open == 'false'
+        run: |
+          git remote add upstream "${UPSTREAM_REPO}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_REPO}"
+          git fetch origin "${DEFAULT_BRANCH}"
+          git fetch upstream "${DEFAULT_BRANCH}"
+          echo "UPSTREAM_SHA=$(git rev-parse "upstream/${DEFAULT_BRANCH}")" >> $GITHUB_ENV
+          echo "BASE_SHA=$(git rev-parse "origin/${DEFAULT_BRANCH}")" >> $GITHUB_ENV
+
+      - name: Create merge branch
+        if: steps.check_pr.outputs.has_open == 'false'
+        run: |
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          if [ -n "$CUSTOM_SUFFIX" ]; then
+            branch="automation/upstream-merge-${timestamp}-${CUSTOM_SUFFIX}"
+          else
+            branch="automation/upstream-merge-${timestamp}"
+          fi
+          echo "MERGE_BRANCH=${branch}" >> $GITHUB_ENV
+          git checkout -B "$branch" "origin/${DEFAULT_BRANCH}"
+
+      - name: Merge upstream branch
+        if: steps.check_pr.outputs.has_open == 'false'
+        id: merge
+        run: |
+          set +e
+          git merge "upstream/${DEFAULT_BRANCH}" --no-edit
+          status=$?
+          set -e
+          echo "exit_code=$status" >> $GITHUB_OUTPUT
+          if [ $status -gt 1 ]; then
+            echo "Merge command failed with exit code $status"
+            exit $status
+          fi
+          if [ $status -eq 1 ]; then
+            echo "conflicts=true" >> $GITHUB_OUTPUT
+          else
+            echo "conflicts=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install uv
+        if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
+        uses: astral-sh/setup-uv@v6
+
+      - name: Attempt automated conflict resolution
+        if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
+        id: llm
+        env:
+          OPENAI_API_KEY: ${{ secrets.SPICE_OPENAI_API_KEY }}
+          LLM_MODEL: ${{ vars.UPSTREAM_MERGE_LLM_MODEL }}
+          LLM_REPORT_PATH: ${{ env.REPORT_FILE }}
+        run: |
+          uv run --with openai python scripts/automation/auto_resolve_conflicts.py
+
+      - name: Mark unresolved files for commit
+        if: steps.merge.outputs.conflicts == 'true' && (env.RUN_CONFLICT_RESOLUTION != 'true' || steps.llm.outputs.status != 'resolved')
+        run: |
+          git diff --name-only --diff-filter=U | xargs -r git add
+
+      - name: Finalise merge commit
+        if: steps.check_pr.outputs.has_open == 'false'
+        run: |
+          if git status --porcelain | grep -q .; then
+            git commit --no-edit
+          fi
+
+      - name: Build PR body
+        if: steps.check_pr.outputs.has_open == 'false'
+        run: |
+          pr_body=pr_body.md
+          echo "## Automated upstream merge" > "$pr_body"
+          echo "" >> "$pr_body"
+          echo "* Base branch: ${DEFAULT_BRANCH} (${BASE_SHA})" >> "$pr_body"
+          echo "* Upstream branch: ${UPSTREAM_REPO} @ ${UPSTREAM_SHA}" >> "$pr_body"
+          echo "* Generated at: $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$pr_body"
+          if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
+            echo "* Conflict handling: $([[ -n "${{ steps.llm.outputs.status }}" ]] && echo "${{ steps.llm.outputs.status }}" || echo "manual")" >> "$pr_body"
+          else
+            echo "* Conflict handling: not required" >> "$pr_body"
+          fi
+          echo "" >> "$pr_body"
+          if [ -f "${REPORT_FILE}" ]; then
+            echo "---" >> "$pr_body"
+            echo "" >> "$pr_body"
+            cat "${REPORT_FILE}" >> "$pr_body"
+          else
+            echo "No conflicts encountered during this merge." >> "$pr_body"
+          fi
+
+      - name: Push merge branch
+        if: steps.check_pr.outputs.has_open == 'false'
+        run: |
+          git push --set-upstream origin "$MERGE_BRANCH"
+
+      - name: Create pull request
+        if: steps.check_pr.outputs.has_open == 'false'
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+        run: |
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --base "${DEFAULT_BRANCH}" \
+            --head "$MERGE_BRANCH" \
+            --title "Merge OSS changes ($(date -u '+%Y-%m-%d'))" \
+            --body-file pr_body.md \
+            --label "${MERGE_LABEL}"
