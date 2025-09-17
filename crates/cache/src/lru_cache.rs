@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::AsTableRefs;
 use crate::FailedToInvalidateCacheSnafu;
 use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::metrics::CacheMetrics;
+use crate::{AsTableRefs, Error};
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
@@ -43,7 +43,7 @@ pub struct LruCache<
     cache: Cache<u64, V, T>,
     hasher: T,
     max_size: u64,
-    metrics_last_reported_time: Mutex<Instant>,
+    metrics_last_reported_time: Mutex<Option<Instant>>,
 }
 
 impl<
@@ -97,7 +97,7 @@ impl<
     T: BuildHasher + Clone + Send + Sync + 'static,
 > LruCache<V, T>
 {
-    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
+    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Result<Self> {
         let cache: Cache<u64, V, T> = Cache::builder()
             .time_to_live(ttl)
             .weigher(|_key, value: &V| -> u32 {
@@ -121,16 +121,12 @@ impl<
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
-        LruCache {
+        Ok(LruCache {
             cache,
             hasher,
             max_size: cache_max_size,
-            metrics_last_reported_time: Mutex::new(
-                Instant::now()
-                    .checked_sub(Duration::from_secs(METRICS_REPORT_INTERVAL_SECS))
-                    .unwrap(),
-            ),
-        }
+            metrics_last_reported_time: Mutex::new(None),
+        })
     }
 }
 
@@ -165,9 +161,15 @@ impl<
         self.cache.insert(*key, value).await;
 
         let now = Instant::now();
-        let mut last_report = self.metrics_last_reported_time.lock().await;
-        if now.duration_since(*last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS) {
-            *last_report = now;
+        let mut last_report_opt = self.metrics_last_reported_time.lock().await;
+        let should_report = match *last_report_opt {
+            Some(last_report) => {
+                now.duration_since(last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)
+            }
+            None => true,
+        };
+        if should_report {
+            *last_report_opt = Some(now);
 
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
@@ -179,9 +181,15 @@ impl<
         self.cache.invalidate_all();
 
         let now = Instant::now();
-        let mut last_report = self.metrics_last_reported_time.lock().await;
-        if now.duration_since(*last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS) {
-            *last_report = now;
+        let mut last_report_opt = self.metrics_last_reported_time.lock().await;
+        let should_report = match *last_report_opt {
+            Some(last_report) => {
+                now.duration_since(last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)
+            }
+            None => true,
+        };
+        if should_report {
+            *last_report_opt = Some(now);
 
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());

@@ -67,6 +67,9 @@ pub enum Error {
         "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
     ))]
     InvalidHashingAlgorithm,
+
+    #[snafu(display("Cache invalidation failed with error: {source}."))]
+    FailedToInitializeMetrics,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
