@@ -8,7 +8,7 @@ on:
     types: [checks_requested]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref }}
   cancel-in-progress: true
 
 jobs:

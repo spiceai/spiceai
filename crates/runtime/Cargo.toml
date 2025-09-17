@@ -218,7 +218,7 @@ clickhouse = [
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
-debezium = ["data_components/debezium"]
+debezium = ["kafka", "data_components/debezium"]
 kafka = ["data_components/kafka"]
 default = [
     "keyring-secret-store",

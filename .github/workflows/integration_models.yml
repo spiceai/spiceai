@@ -39,6 +39,14 @@ on:
         type: boolean
         required: false
         default: false
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -113,6 +121,7 @@ jobs:
 
       - name: Run integration test
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -123,6 +132,7 @@ jobs:
 
       - name: Run Beta functionality embeddings test
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -130,6 +140,12 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture openai_embeddings_beta_requirements
+      
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   test-hf:
     name: Test Huggingface Models
@@ -155,6 +171,7 @@ jobs:
 
       - name: Run integration test
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -165,6 +182,7 @@ jobs:
 
       - name: Run Beta functionality embedding tests
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -172,6 +190,12 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture hf_embeddings_beta_requirements
+      
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   test-local:
     name: Test Local Models
@@ -195,8 +219,16 @@ jobs:
           chmod +x ./integration_test/ai_integration_test
 
       - name: Run Beta functionality embedding tests
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture local_embeddings_beta_requirements
+      
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   test-bedrock:
     name: Test Bedrock Models
@@ -222,10 +254,17 @@ jobs:
 
       - name: Run Beta functionality embedding tests
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture bedrock_test
+      
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   test-workers:
     name: Test Workers
@@ -254,6 +293,7 @@ jobs:
 
       - name: Run integration test
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -261,6 +301,12 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture workers
+      
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   test-search:
     name: Test Search
@@ -289,6 +335,7 @@ jobs:
 
       - name: Run integration test
         env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
@@ -298,3 +345,9 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture search
+      
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
