@@ -3738,6 +3738,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "twox-hash 2.1.2",
  "url",
  "util",
  "uuid 1.18.0",
