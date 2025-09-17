@@ -26,10 +26,6 @@ impl Indexes {
     pub fn new(indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Arc<Self> {
         Arc::new(Self(indexes))
     }
-
-    pub fn single(index: Arc<dyn Index + Send + Sync>) -> Arc<Self> {
-        Arc::new(Self(vec![index]))
-    }
 }
 
 impl From<Arc<IndexedTableProvider>> for Indexes {
