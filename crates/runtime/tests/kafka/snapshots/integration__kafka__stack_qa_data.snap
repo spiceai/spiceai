@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/kafka/mod.rs
+expression: formatted
+---
++-------------+--------------------------------------------+
+| question_id | title                                      |
++-------------+--------------------------------------------+
+| 73839909    | .gitignore is not ignoring untracked files |
++-------------+--------------------------------------------+
