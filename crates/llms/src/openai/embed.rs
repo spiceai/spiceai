@@ -256,7 +256,7 @@ fn is_throttling_error(err: &OpenAIError) -> bool {
     match err {
         OpenAIError::ApiError(api_err) => {
             // Supported error codes: https://platform.openai.com/docs/guides/error-codes/api-errors
-            matches!(api_err.code.as_deref(), Some("429" | "503"))
+            matches!(api_err.code.as_deref(), Some("429"))
         }
         OpenAIError::Reqwest(request) => {
             matches!(request.status(), Some(StatusCode::TOO_MANY_REQUESTS))
