@@ -24,17 +24,6 @@ mod retry_client;
 pub mod s3;
 pub(crate) mod scan_table;
 pub use scan_table::VectorScanTableProvider;
-use search::index::SearchIndex;
-
-pub trait VectorIndex: SearchIndex {
-    /// A [`LogicalPlan`] representation of the data within the index. The [`LogicalPlan::schema`] must contain
-    ///  - The [`SearchIndex::primary_fields`]
-    ///  - All columns in [`SearchIndex::metadata_columns`]
-    ///  - The associated embedding vectors of the [`SearchIndex::search_column`].
-    ///
-    /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
-    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
-}
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(

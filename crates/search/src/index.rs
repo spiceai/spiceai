@@ -20,7 +20,7 @@ use crate::metadata::MetadataColumns;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::catalog::TableProvider;
+use datafusion::{catalog::TableProvider, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
@@ -55,4 +55,14 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+pub trait VectorIndex: SearchIndex {
+    /// A [`LogicalPlan`] representation of the data within the index. The [`LogicalPlan::schema`] must contain
+    ///  - The [`SearchIndex::primary_fields`]
+    ///  - All columns in [`SearchIndex::metadata_columns`]
+    ///  - The associated embedding vectors of the [`SearchIndex::search_column`].
+    ///
+    /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
+    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
 }

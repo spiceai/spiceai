@@ -18,26 +18,25 @@ use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorError;
-use crate::dataconnector::DataConnectorResult;
+use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::embeddings::construct_chunker;
-use crate::embeddings::execution_plan::compute_additional_embedding_columns;
-use crate::embeddings::execution_plan::construct_record_batch;
+use crate::embeddings::execution_plan::{
+    compute_additional_embedding_columns, construct_record_batch,
+};
+use crate::embeddings::index::VectorScanTableProvider;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
 use chunking::ChunkingConfig;
-use data_components::cdc::ChangeEnvelope;
-use data_components::cdc::ChangesStream;
-use data_components::cdc::StreamError;
-use data_components::cdc::replace_change_batch_data;
+use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
+use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
+use search::{chunking::ChunkedSearchIndex, index::VectorIndex};
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
@@ -200,11 +199,6 @@ impl EmbeddingConnector {
                     .collect();
                 let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
                 for (column, config) in embedding_columns {
-                    use runtime_datafusion_index::Index;
-                    use search::chunking::ChunkedSearchIndex;
-
-                    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
-
                     let mut vector_index = super::index::s3::try_from_dataset(
                         &dataset.name,
                         column,
@@ -252,6 +246,11 @@ impl EmbeddingConnector {
                         })?;
                         vector_index.primary_key =
                             ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
+                        vector_index.complete_metadata_columns =
+                            ChunkedSearchIndex::augment_metadata(
+                                vector_index.complete_metadata_columns,
+                            )
+                            .into();
                         let idx = Arc::new(vector_index);
                         let chunked_idx =
                             ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);

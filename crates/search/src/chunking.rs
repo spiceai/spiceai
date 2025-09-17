@@ -2,17 +2,15 @@ use std::{any::Any, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    index::SearchIndex,
+    index::{SearchIndex, VectorIndex},
     metadata::{MetadataColumn, MetadataColumns},
 };
 
-use arrow::{
-    array::{
-        ArrayRef, FixedSizeListBuilder, LargeStringArray, ListArray, ListBuilder, RecordBatch,
-        StringArray, StringViewArray, UInt64Array, UInt64Builder,
-    },
-    util::pretty::pretty_format_batches,
+use arrow::array::{
+    ArrayRef, FixedSizeListArray, FixedSizeListBuilder, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, UInt64Array, UInt64Builder,
 };
+
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
@@ -20,9 +18,9 @@ use datafusion::{
     catalog::TableProvider,
     datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
-    functions_aggregate::expr_fn::first_value,
+    functions_aggregate::expr_fn::{array_agg, first_value},
     logical_expr::{Aggregate, LogicalPlan, Projection, Sort, SortExpr, TableScan},
-    prelude::col,
+    prelude::{ExprFunctionExt, col},
     sql::TableReference,
 };
 use futures::future::try_join_all;
@@ -39,9 +37,6 @@ use util::{arrow::repeat, convert_string_arrow_to_iterator};
 pub struct ChunkedSearchIndex {
     inner: Arc<dyn SearchIndex>,
     chunker: Arc<dyn Chunker>,
-
-    /// inner.metadata_columns() + chunk_offsets. Must store in struct for ref.
-    metadata: MetadataColumns,
 }
 
 #[async_trait]
@@ -127,23 +122,80 @@ impl ChunkedSearchIndex {
         ]
         .concat()
     }
-    pub fn new(inner: Arc<dyn SearchIndex>, chunker: Arc<dyn Chunker>) -> Self {
-        let mut metadata: Vec<MetadataColumn> =
-            inner.metadata_columns().clone().into_iter().collect();
-        metadata.push(MetadataColumn::NonFilterable(
-            Field::new(
-                "_spice.chunk_offset",
-                DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
-                false,
-            )
-            .into(),
-        ));
 
-        Self {
-            inner,
-            chunker,
-            metadata: metadata.into(),
-        }
+    pub fn augment_metadata(metadata: MetadataColumns) -> Vec<MetadataColumn> {
+        vec![
+            metadata.into_iter().collect::<Vec<_>>(),
+            vec![MetadataColumn::NonFilterable(
+                Field::new(
+                    "_spice.chunk_offset",
+                    DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
+                    false,
+                )
+                .into(),
+            )],
+        ]
+        .concat()
+    }
+
+    pub fn new(inner: Arc<dyn SearchIndex>, chunker: Arc<dyn Chunker>) -> Self {
+        Self { inner, chunker }
+    }
+
+    /// If [`Self::inner`] search index is also a   is a [`VectorIndex`]
+    pub fn list_table_provider(
+        &self,
+        vector_index: Arc<dyn VectorIndex>,
+    ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
+        let base_index_table = vector_index.list_table_provider()?;
+
+        // I need to group by `_spice.chunk_id` and make an array of  `_spice.chunk_offset`. and `col_embedding`.
+        // select location, array_agg(content_offset order by idx), concat(array_agg(match order by idx)) content from flattened group by location limit 2;
+
+        let group_by_pks: Vec<_> = self
+            .inner
+            .primary_fields()
+            .iter()
+            .map(|f| col(f.name()))
+            .collect();
+
+        // Primary key, offsets and embeddings.
+        let mut aggr_expr = group_by_pks.clone();
+        //// Need to `order by _spice.chunk_id`.
+        aggr_expr.push(
+            array_agg(col("_spice.chunk_offset"))
+                .order_by(vec![SortExpr::new(col("_spice.chunk_id"), true, false)])
+                .build()?,
+        );
+        aggr_expr.push(
+            array_agg(col(format!("{}_embedding", self.search_column())))
+                .order_by(vec![SortExpr::new(col("_spice.chunk_id"), true, false)])
+                .build()?,
+        );
+        aggr_expr.extend(
+            self.inner
+                .metadata_columns()
+                .all_names()
+                .iter()
+                .filter_map(|c| {
+                    if [
+                        "_spice.chunk_offset".to_string(),
+                        format!("{}_embedding", self.search_column()),
+                    ]
+                    .contains(c)
+                    {
+                        return None;
+                    };
+                    Some(first_value(col(c), vec![]))
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let agg = LogicalPlan::Aggregate(
+            Aggregate::try_new(base_index_table.into(), group_by_pks, aggr_expr).boxed()?,
+        );
+
+        Ok(agg)
     }
 }
 
@@ -164,7 +216,7 @@ impl SearchIndex for ChunkedSearchIndex {
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
-        &self.metadata
+        self.inner.metadata_columns()
     }
 
     ///
@@ -270,20 +322,14 @@ impl SearchIndex for ChunkedSearchIndex {
 
         fields.push(Field::new(
             "_spice.chunk_offset",
-            DataType::new_list(
-                DataType::new_fixed_size_list(DataType::UInt64, 2, false),
-                false,
-            ),
+            DataType::new_fixed_size_list(DataType::UInt64, 2, false),
             false,
         ));
-        arrays.push(Arc::new(to_offset_array(&offsets)) as ArrayRef);
+        arrays.push(Arc::new(to_offset_array(&offsets, false)) as ArrayRef);
 
-        // TODO: need to add offsets and
         let rb = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .context(WriteFailedConstructRecordBatchSnafu)
             .boxed()?;
-
-        let s = pretty_format_batches(&[rb.clone()]).boxed()?;
 
         self.inner
             .write(rb)
@@ -346,15 +392,16 @@ impl SearchIndex for ChunkedSearchIndex {
     }
 }
 
-fn to_offset_array(x: &[Vec<(usize, usize)>]) -> ListArray {
-    let mut builder = ListBuilder::new(FixedSizeListBuilder::new(UInt64Builder::new(), 2));
+fn to_offset_array(x: &[Vec<(usize, usize)>], nullable: bool) -> FixedSizeListArray {
+    let mut builder = FixedSizeListBuilder::new(UInt64Builder::new(), 2)
+        .with_field(Field::new_list_field(DataType::UInt64, nullable));
+
     for row in x {
         for (start, end) in row {
-            builder.values().values().append_value(*start as u64);
-            builder.values().values().append_value(*end as u64);
-            builder.values().append(true);
+            builder.values().append_value(*start as u64);
+            builder.values().append_value(*end as u64);
+            builder.append(true);
         }
-        builder.append(true);
     }
     builder.finish()
 }

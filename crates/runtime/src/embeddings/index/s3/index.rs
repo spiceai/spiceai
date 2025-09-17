@@ -28,11 +28,10 @@ use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use search::SEARCH_SCORE_COLUMN_NAME;
-use search::index::SearchIndex;
+use search::index::{SearchIndex, VectorIndex};
 use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
-use crate::embeddings::index::VectorIndex;
 use crate::{embedding_col, embeddings::index::s3::write, model::EmbeddingModelStore};
 use datafusion::{
     catalog::TableProvider,
@@ -151,6 +150,8 @@ impl SearchIndex for S3Vector {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        // let s = pretty_format_batches(&[rb.clone()]).boxed()?;
+        // tracing::error!("In s3: []\n{s}\n");
         write::write(self, record).await.boxed()
     }
 
