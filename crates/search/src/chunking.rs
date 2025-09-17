@@ -27,7 +27,7 @@ use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu};
 use util::{
-    arrow::{repeat, to_list_array},
+    arrow::{repeat},
     convert_string_arrow_to_iterator,
 };
 
@@ -314,7 +314,7 @@ impl SearchIndex for ChunkedSearchIndex {
         let aggr_expr: Vec<_> = schema
             .fields()
             .iter()
-            .map(|f| first_value(col(f.name()), Some(order_by.clone())))
+            .map(|f| first_value(col(f.name()), order_by.clone()))
             .collect();
 
         let agg =
