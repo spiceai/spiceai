@@ -42,8 +42,10 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use search::generation::text_search::{
-    index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
+
+use search::{
+    generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
+    provider::SearchQueryProvider,
 };
 use std::any::Any;
 use std::sync::LazyLock;
@@ -273,15 +275,18 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
+        // Select single column if needed.
         let column = args.column(&fts_index.search_fields)?;
+        let mut fts_index = fts_index.clone();
+        fts_index.search_fields = vec![column];
+
         Ok(Arc::new(TextSearchIndexProviderWrapper {
-            inner: Arc::new(TextSearchIndexProvider {
-                query: args.query.clone(),
-                column,
-                pre_limit: args.limit,
-                index: fts_index.clone(),
-                underlying: table_provider,
-            }),
+            inner: Arc::new(SearchQueryProvider::new(
+                Arc::new(fts_index) as Arc<dyn SearchIndex>,
+                table_provider,
+                args.query.clone(),
+                args.limit,
+            )),
         }))
     }
 }
@@ -310,7 +315,7 @@ impl ScalarUDFImpl for TextSearchTableFunc {
 
 #[derive(Debug)]
 struct TextSearchIndexProviderWrapper {
-    inner: Arc<TextSearchIndexProvider>,
+    inner: Arc<SearchQueryProvider>,
 }
 
 #[async_trait::async_trait]
