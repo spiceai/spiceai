@@ -98,6 +98,7 @@ impl PartitionedIndexName {
     }
 
     /// Determines if the partitions come from the same dataset
+    #[must_use]
     pub fn belongs_with(&self, other: &Self) -> BelongsWith {
         if self.index_name != other.index_name || self.column_name != other.column_name {
             return BelongsWith::DifferentDataset;
