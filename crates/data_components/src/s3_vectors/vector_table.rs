@@ -339,7 +339,7 @@ impl S3VectorsTable {
                         S3_VECTOR_EMBEDDING_NAME,
                         Field::new("item", DataType::Float32, false),
                         embedding_dimension,
-                        true,
+                        false,
                     )),
                     Arc::new(Field::new(
                         S3_VECTOR_PRIMARY_KEY_NAME,
