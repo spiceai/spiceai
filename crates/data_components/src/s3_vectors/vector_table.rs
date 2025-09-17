@@ -96,18 +96,19 @@ impl S3VectorsTable {
                         specified: distance_metric.clone(),
                     });
                 }
+                let schema = Self::compute_schema(index.dimension(), columns);
+                let constraints = Self::primary_key(&schema);
+                Ok(S3VectorTableResult::Table(Self {
+                    idx: id,
+                    client,
+                    schema,
+                    constraints,
+                }))
             }
-            None => return Ok(S3VectorTableResult::IndexDoesNotExist),
-            Some(_) => {}
+            None | Some(GetIndexOutput { index: None, .. }) => {
+                return Ok(S3VectorTableResult::IndexDoesNotExist);
+            }
         }
-        let schema = Self::compute_schema(columns);
-        let constraints = Self::primary_key(&schema);
-        Ok(S3VectorTableResult::Table(Self {
-            idx: id,
-            client,
-            schema,
-            constraints,
-        }))
     }
 
     pub async fn try_create_new_table(
@@ -164,21 +165,6 @@ impl S3VectorsTable {
                     .await
                     .map(S3VectorTableResult::table)
             }
-        }
-    }
-
-    #[must_use]
-    pub fn new(
-        index: S3VectorIdentifier,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        schema: SchemaRef,
-    ) -> Self {
-        let constraints = Self::primary_key(&schema);
-        Self {
-            idx: index,
-            client,
-            schema,
-            constraints,
         }
     }
 
@@ -330,7 +316,7 @@ impl S3VectorsTable {
         f.metadata().get("filterable").eq(&Some(&true.to_string()))
     }
 
-    fn compute_schema(columns: MetadataColumns) -> SchemaRef {
+    fn compute_schema(embedding_dimension: i32, columns: MetadataColumns) -> SchemaRef {
         Arc::new(Schema::new(
             [
                 columns
@@ -349,9 +335,10 @@ impl S3VectorsTable {
                     })
                     .collect(),
                 vec![
-                    Arc::new(Field::new_list(
+                    Arc::new(Field::new_fixed_size_list(
                         S3_VECTOR_EMBEDDING_NAME,
                         Field::new("item", DataType::Float32, false),
+                        embedding_dimension,
                         true,
                     )),
                     Arc::new(Field::new(
