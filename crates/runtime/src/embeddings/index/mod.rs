@@ -113,7 +113,6 @@ pub mod tests {
         sql::TableReference,
     };
     use datafusion_expr::{LogicalPlan, TableScan};
-    use itertools::Itertools;
     use search::generation::util::append_fields;
     use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
@@ -128,6 +127,7 @@ pub mod tests {
     #[derive(Debug)]
     pub struct ExplainMemTable(pub MemTable, pub &'static str);
     impl ExplainMemTable {
+        #[must_use]
         pub fn new(table: MemTable, name: &'static str) -> Self {
             Self(table, name)
         }
