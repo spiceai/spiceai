@@ -19,7 +19,7 @@ use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::metrics::CacheMetrics;
-use crate::{AsTableRefs, Error};
+use crate::AsTableRefs;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
@@ -97,7 +97,7 @@ impl<
     T: BuildHasher + Clone + Send + Sync + 'static,
 > LruCache<V, T>
 {
-    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Result<Self> {
+    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
         let cache: Cache<u64, V, T> = Cache::builder()
             .time_to_live(ttl)
             .weigher(|_key, value: &V| -> u32 {
@@ -121,12 +121,12 @@ impl<
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
-        Ok(LruCache {
+        LruCache {
             cache,
             hasher,
             max_size: cache_max_size,
             metrics_last_reported_time: Mutex::new(None),
-        })
+        }
     }
 }
 
