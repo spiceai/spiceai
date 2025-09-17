@@ -23,7 +23,6 @@ use std::{
 use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
 use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::logical_expr::col;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Column, DFSchema, JoinConstraint, JoinType, NullEquality},

@@ -32,7 +32,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use datafusion_expr::{SubqueryAlias, col};
+use datafusion_expr::SubqueryAlias;
 
 use crate::{
     embedding_col,
