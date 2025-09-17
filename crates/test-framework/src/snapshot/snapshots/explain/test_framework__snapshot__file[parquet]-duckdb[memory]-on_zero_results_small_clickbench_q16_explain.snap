@@ -23,6 +23,7 @@ description: "Query: clickbench_q16"
 |               |                     FallbackOnZeroResultsScanExec                                             |
 |               |                       CoalescePartitionsExec                                                  |
 |               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |                           DuckSqlExec sql= SELECT "UserID" FROM hits                          |
+|               |                           CooperativeExec                                                     |
+|               |                             DuckSqlExec sql= SELECT "UserID" FROM hits                        |
 |               |                                                                                               |
 +---------------+-----------------------------------------------------------------------------------------------+

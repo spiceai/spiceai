@@ -19,6 +19,7 @@ description: "Query: tpch_simple_q6"
 |               |             FallbackOnZeroResultsScanExec                                             |
 |               |               CoalescePartitionsExec                                                  |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |                   DuckSqlExec sql= SELECT "o_orderkey" FROM orders  LIMIT 10          |
+|               |                   CooperativeExec                                                     |
+|               |                     DuckSqlExec sql= SELECT "o_orderkey" FROM orders  LIMIT 10        |
 |               |                                                                                       |
 +---------------+---------------------------------------------------------------------------------------+

@@ -175,6 +175,11 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                     tracing::debug!(
                                         "OpenAI embedding model encountered a retriable server error: {err}. Backing off and retrying..."
                                     );
+
+                                    if is_throttling_error(&err) {
+                                        return RetryError::transient(EmbedError::RateLimited { source: err.into() });
+                                    }
+
                                     return RetryError::transient(EmbedError::FailedToCreateEmbedding { source: err.into() });
                                 }
                                 tracing::debug!(
@@ -242,6 +247,19 @@ fn is_retriable_error(err: &OpenAIError) -> bool {
                             | StatusCode::GATEWAY_TIMEOUT
                     )
                 )
+        }
+        _ => false,
+    }
+}
+
+fn is_throttling_error(err: &OpenAIError) -> bool {
+    match err {
+        OpenAIError::ApiError(api_err) => {
+            // Supported error codes: https://platform.openai.com/docs/guides/error-codes/api-errors
+            matches!(api_err.code.as_deref(), Some("429"))
+        }
+        OpenAIError::Reqwest(request) => {
+            matches!(request.status(), Some(StatusCode::TOO_MANY_REQUESTS))
         }
         _ => false,
     }

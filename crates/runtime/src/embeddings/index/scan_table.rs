@@ -32,10 +32,11 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion_expr::SubqueryAlias;
 
 use crate::{
     embedding_col,
-    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
+    embeddings::index::{VectorIndex, search_index_table_is_sufficient},
 };
 use search::generation::util::append_fields;
 
@@ -100,7 +101,7 @@ impl VectorScanTableProvider {
 
         let Some(idx) = index_of_column(
             &self.schema(),
-            embedding_col!(self.index.embedded_column()).as_str(),
+            embedding_col!(self.index.search_column()).as_str(),
         ) else {
             return false; // Technically unreachable, but by definition not needed.
         };
@@ -118,7 +119,7 @@ impl VectorScanTableProvider {
         qualified_fields.push((
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(
-                embedding_col!(self.index.embedded_column()),
+                embedding_col!(self.index.search_column()),
                 DataType::new_list(DataType::Float32, true),
                 true,
             )),
@@ -157,7 +158,7 @@ impl TableProvider for VectorScanTableProvider {
         append_fields(
             &self.table_provider.schema(),
             vec![Arc::new(Field::new(
-                embedding_col!(self.index.embedded_column()),
+                embedding_col!(self.index.search_column()),
                 DataType::new_list(DataType::Float32, true),
                 true,
             ))],
@@ -201,18 +202,12 @@ impl TableProvider for VectorScanTableProvider {
             .collect::<Vec<_>>();
         proj.push(Expr::Column(Column::new(
             Some(TableReference::parse_str("vector_index")),
-            embedding_col!(self.index.embedded_column()),
+            embedding_col!(self.index.search_column()),
         )));
 
-        let vector_table_scan = LogicalPlan::Projection(Projection::try_new(
-            proj,
-            Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-                TableReference::parse_str("vector_index"),
-                Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
-                None,
-                vec![],
-                None,
-            )?)),
+        let index_logical_plan = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            self.index.list_table_provider()?.into(),
+            TableReference::parse_str("vector_index"),
         )?);
 
         let primary_key_fields = self.index.primary_fields();
@@ -220,23 +215,30 @@ impl TableProvider for VectorScanTableProvider {
             return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
         }
 
-        let output_plan = if vector_index_table_is_sufficient(
-            self.schema(),
-            &vector_table_scan,
-            projection,
+        let projection_schema: SchemaRef = match projection {
+            None => self.schema(),
+            Some(indices) => self.schema().project(indices)?.into(),
+        };
+
+        let output_plan = if search_index_table_is_sufficient(
+            projection_schema.fields().iter().as_slice(),
+            &index_logical_plan,
             filters,
-        )? {
+        ) {
             // Let DataFusion handle pushing filters.
             if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                LogicalPlan::Filter(Filter::try_new(filter, vector_table_scan.into())?)
+                LogicalPlan::Filter(Filter::try_new(filter, index_logical_plan.into())?)
             } else {
-                vector_table_scan
+                index_logical_plan
             }
         } else {
             let underlying_table_scan =
                 LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
 
-            let join_schema = vector_table_scan
+            // Don't get metadata columns from index. Only vectors and primary key.
+            let index_logical_projection =
+                LogicalPlan::Projection(Projection::try_new(proj, index_logical_plan.into())?);
+            let join_schema = index_logical_projection
                 .schema()
                 .join(underlying_table_scan.schema())?;
 
@@ -254,10 +256,16 @@ impl TableProvider for VectorScanTableProvider {
 
             let join_conditions: Vec<(Expr, Expr)> = primary_key_fields
                 .iter()
-                .map(|pk_field| {
+                .map(|field| {
                     (
-                        Expr::Column(Column::new_unqualified(pk_field.name())),
-                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                        Expr::Column(Column::new(
+                            Some(TableReference::parse_str("vector_index")),
+                            field.name(),
+                        )),
+                        Expr::Column(Column::new(
+                            Some(TableReference::parse_str("base_table")),
+                            field.name(),
+                        )),
                     )
                 })
                 .collect();
@@ -265,7 +273,7 @@ impl TableProvider for VectorScanTableProvider {
             // Right Join so that all rows in the underlying table are returned.
             // Rows may not have associated vectors periodically due to indexing delays.
             let join = LogicalPlan::Join(Join {
-                left: Arc::new(vector_table_scan),
+                left: Arc::new(index_logical_projection),
                 right: Arc::new(underlying_table_scan),
                 join_type: JoinType::Right,
                 join_constraint: JoinConstraint::On,
@@ -336,10 +344,10 @@ mod tests {
         sql::TableReference,
     };
 
-    use crate::embeddings::index::VectorScanTableProvider;
     use crate::embeddings::index::tests::{
         PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
     };
+    use crate::embeddings::index::{VectorScanTableProvider, tests::ExplainMemTable};
 
     #[tokio::test]
     pub async fn test_vector_scan_basic() -> Result<(), String> {
@@ -350,13 +358,14 @@ mod tests {
         ]));
 
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
@@ -411,13 +420,14 @@ mod tests {
             Field::new("not_where", DataType::Utf8, false),
         ]));
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
@@ -510,13 +520,14 @@ mod tests {
             Field::new("not_where", DataType::Utf8, false),
         ]));
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![

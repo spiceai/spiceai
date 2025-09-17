@@ -18,12 +18,15 @@ use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{
-    MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorsTable,
+    MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
-use search::generation::util::get_primary_keys;
+use search::{
+    generation::util::get_primary_keys,
+    metadata::{MetadataColumn, MetadataColumns},
+};
 use snafu::ResultExt;
 use spicepod::{
     param::Params,
@@ -76,7 +79,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
 ];
 
-/// Attempt to construct a  S3 `VectorIndex` for the provided dataset on the given column.
+/// Attempt to construct an [`S3Vector`] for the provided dataset on the given column.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_from_dataset(
     ds_name: &TableReference,
@@ -108,7 +111,7 @@ pub async fn try_from_dataset(
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
-    let table = try_vector_table(
+    let (table, dimension) = try_vector_table(
         metadata_columns.clone(),
         params,
         format!("{}-{}-{}", ds_name, column, config.model)
@@ -125,6 +128,7 @@ pub async fn try_from_dataset(
         primary_key,
         metadata_columns,
         config.model.clone(),
+        dimension,
         embedding_models,
     ))
 }
@@ -149,7 +153,7 @@ async fn try_vector_table(
     default_s3_index_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
-) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(S3VectorsTable, usize), Box<dyn std::error::Error + Send + Sync>> {
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
@@ -200,7 +204,14 @@ async fn try_vector_table(
         id,
         s3_vector_client,
         dimension as i64,
-        columns,
+        columns
+            .into_iter()
+            .map(|c| match c {
+                MetadataColumn::Filterable(f) => S3MetadataColumn::Filterable(f),
+                MetadataColumn::NonFilterable(f) => S3MetadataColumn::NonFilterable(f),
+            })
+            .collect::<Vec<_>>()
+            .into(),
         string_from_params(&params, "distance_metric"),
     )
     .await?
@@ -209,7 +220,7 @@ async fn try_vector_table(
             "S3 Vectors index does not exist. After it was created, it still does not exist. Unexpected.".to_string()
         ));
     };
-    Ok(vector_table)
+    Ok((vector_table, dimension))
 }
 
 // Attempt to get a certain string-value from the parameter.
