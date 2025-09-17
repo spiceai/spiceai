@@ -17,11 +17,26 @@ limitations under the License.
 use std::sync::Arc;
 
 use data_components::cdc::{ChangeEnvelope, StreamError, replace_change_batch_data};
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion_index::{Index, IndexedTableProvider};
+
+/// A newtype wrapper around a vector of indexes to prevent cloning the vector for each item in a stream.
+pub struct Indexes(Vec<Arc<dyn Index + Send + Sync>>);
+
+impl Indexes {
+    pub fn new(indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Arc<Self> {
+        Arc::new(Self(indexes))
+    }
+}
+
+impl From<Arc<IndexedTableProvider>> for Indexes {
+    fn from(indexed_table: Arc<IndexedTableProvider>) -> Self {
+        Self(indexed_table.get_all_indexes())
+    }
+}
 
 pub async fn index_change_envelope(
     maybe_envelope: Result<ChangeEnvelope, StreamError>,
-    embedding_table: Arc<IndexedTableProvider>,
+    indexes: Arc<Indexes>,
 ) -> Result<ChangeEnvelope, StreamError> {
     let envelope = maybe_envelope.map_err(|e| {
         tracing::debug!("Error in underlying base stream: {e:?}");
@@ -31,7 +46,7 @@ pub async fn index_change_envelope(
     let (change_committer, batch) = envelope.into_parts();
     let mut batches = vec![batch.data_batch()];
 
-    for index in &embedding_table.indexes {
+    for index in &indexes.0 {
         batches = index
             .compute_index(batches)
             .await
@@ -199,7 +214,7 @@ mod tests {
         let table_provider = Arc::new(MockTableProvider);
         let embedding_table = Arc::new(IndexedTableProvider::new(table_provider));
 
-        let result = index_change_envelope(Ok(envelope), embedding_table).await;
+        let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
@@ -217,7 +232,7 @@ mod tests {
             vec![index],
         ));
 
-        let result = index_change_envelope(Ok(envelope), embedding_table).await;
+        let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
@@ -239,7 +254,7 @@ mod tests {
             vec![index1, index2],
         ));
 
-        let result = index_change_envelope(Ok(envelope), embedding_table).await;
+        let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
@@ -252,7 +267,8 @@ mod tests {
         let embedding_table = Arc::new(IndexedTableProvider::new(table_provider));
         let input_error = StreamError::External("Input stream error".to_string());
 
-        let result = index_change_envelope(Err(input_error), embedding_table).await;
+        let result =
+            index_change_envelope(Err(input_error), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_err());
         if let Err(StreamError::External(msg)) = result {
@@ -272,7 +288,7 @@ mod tests {
             vec![failing_index],
         ));
 
-        let result = index_change_envelope(Ok(envelope), embedding_table).await;
+        let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_err());
         if let Err(StreamError::External(msg)) = result {
@@ -297,7 +313,7 @@ mod tests {
             vec![index],
         ));
 
-        let result = index_change_envelope(Ok(envelope), embedding_table).await;
+        let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");
@@ -321,7 +337,7 @@ mod tests {
             vec![index],
         ));
 
-        let result = index_change_envelope(Ok(envelope), embedding_table).await;
+        let result = index_change_envelope(Ok(envelope), Arc::new(embedding_table.into())).await;
 
         assert!(result.is_ok());
         let result_envelope = result.expect("Expected successful result");

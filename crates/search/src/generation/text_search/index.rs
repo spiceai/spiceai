@@ -15,26 +15,29 @@ limitations under the License.
 */
 
 use std::cmp::min;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
+use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
+use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
-use std::collections::HashSet;
 use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::RwLock;
 
 use crate::aggregation::write_to_json_string;
+use crate::generation::text_search::query::FullTextSearchQuery;
 use crate::generation::text_search::util::{array_to_terms, with_json_subset_column};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
     InvalidIndexingSnafu,
 };
 use crate::generation::util::get_primary_keys;
+use crate::index::SearchIndex;
 
 /// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
 pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
@@ -46,6 +49,8 @@ pub struct FullTextDatabaseIndex {
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
     pub index: Arc<RwLock<tantivy::Index>>,
+    /// FTS indexes don't have additional metadata columns beyond primary keys and search fields
+    pub metadata_columns: MetadataColumns,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -117,13 +122,41 @@ impl FullTextDatabaseIndex {
         }
 
         let index = Self::create_index(&inner, search_fields.as_slice(), pks.as_slice())?;
-
+        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks).await;
         Ok(Self {
             base_table: inner,
             search_fields,
             index,
             primary_key: pks,
+            metadata_columns,
         })
+    }
+
+    /// Get all [`Field`]s in Tantivy [`tantivy::Index`] that are in base table, and not primary keys.
+    /// These are non-filterable [`MetadataColumn`]s, since we can retrieve the data
+    /// from the [`tantivy::Index`] without access to the base [`TableProvider`].
+    async fn derive_metadata_columns(
+        base_table: &Arc<dyn TableProvider>,
+        index: &Arc<RwLock<tantivy::Index>>,
+        primary_key: &[String],
+    ) -> MetadataColumns {
+        let index = &*index.read().await;
+        let base_schema = base_table.schema();
+
+        index
+            .schema()
+            .fields()
+            .filter_map(|(_, fe)| {
+                let name = fe.name();
+                if primary_key.contains(&name.to_string()) {
+                    return None;
+                }
+
+                let (_, f) = base_schema.column_with_name(name)?;
+                Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
 
     pub async fn full_text_search_field_index(
@@ -250,6 +283,7 @@ impl FullTextDatabaseIndex {
             primary_key: self.primary_key.clone(),
             index: Arc::clone(&self.index),
             base_table,
+            metadata_columns: self.metadata_columns.clone(),
         }
     }
 
@@ -332,6 +366,57 @@ impl FullTextDatabaseIndex {
     #[must_use]
     pub fn column_is_part_of_pk(&self, column: &str) -> bool {
         self.primary_key.contains(&column.to_string())
+    }
+}
+
+#[async_trait]
+impl SearchIndex for FullTextDatabaseIndex {
+    /// Currently multi-column uses of [`FullTextDatabaseIndex`] do either:
+    ///   1. `TextSearchTableFunc` chooses a column from its UDTF params and overrides `self.search_fields` at query time.
+    ///   2. `as_candidate_generations` in `crates/runtime/src/search/full_text/mod.rs` creates [`FullTextSearchFieldIndex`].
+    fn search_column(&self) -> String {
+        // For FTS, return the first search field as the primary search column
+        self.search_fields.first().cloned().unwrap_or_default()
+    }
+
+    fn primary_fields(&self) -> Vec<Field> {
+        // Convert primary key names to Field objects by looking them up in the base table schema
+        let schema = self.base_table.schema();
+        self.primary_key
+            .iter()
+            .filter_map(|pk_name| {
+                schema
+                    .column_with_name(pk_name)
+                    .map(|(_, field)| (*field).clone())
+            })
+            .collect()
+    }
+
+    fn metadata_columns(&self) -> &MetadataColumns {
+        &self.metadata_columns
+    }
+
+    async fn write(
+        &self,
+        record: RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        self.update_index(&[record.clone()]).await.boxed()?;
+        Ok(record)
+    }
+
+    async fn query_table_provider(
+        &self,
+        query: &str,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let field_index = self
+            .full_text_search_field_index(&self.search_column())
+            .await?;
+
+        Ok(Arc::new(FullTextSearchQuery {
+            index: field_index,
+            query: query.to_string(),
+            pre_limit: None,
+        }))
     }
 }
 

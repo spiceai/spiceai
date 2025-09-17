@@ -20,9 +20,11 @@ description: "Query: tpch_simple_q2"
 |               |         AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]                                                      |
 |               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
 |               |             BytesProcessedExec                                                                                                      |
-|               |               IcebergTableScan projection:[l_linenumber] predicate:[]                                                               |
+|               |               CooperativeExec                                                                                                       |
+|               |                 IcebergTableScan projection:[l_linenumber] predicate:[]                                                             |
 |               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                           |
 |               |       BytesProcessedExec                                                                                                            |
-|               |         IcebergTableScan projection:[l_linenumber] predicate:[]                                                                     |
+|               |         CooperativeExec                                                                                                             |
+|               |           IcebergTableScan projection:[l_linenumber] predicate:[]                                                                   |
 |               |                                                                                                                                     |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------+

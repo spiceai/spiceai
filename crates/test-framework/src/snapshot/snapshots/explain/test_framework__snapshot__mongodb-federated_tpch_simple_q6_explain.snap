@@ -14,6 +14,7 @@ description: "Query: tpch_simple_q6"
 |               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
 |               |     GlobalLimitExec: skip=0, fetch=10                                   |
 |               |       BytesProcessedExec                                                |
-|               |         MongoDBExec projection=[o_orderkey] filters=[{}]                |
+|               |         CooperativeExec                                                 |
+|               |           MongoDBExec projection=[o_orderkey] filters=[{}]              |
 |               |                                                                         |
 +---------------+-------------------------------------------------------------------------+

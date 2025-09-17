@@ -33,6 +33,7 @@ use async_openai::types::{
     EmbeddingVector,
 };
 use async_trait::async_trait;
+use aws_sdk_bedrockruntime::types::error::ThrottlingException as BedrockThrottlingException;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use snafu::ResultExt;
@@ -136,7 +137,10 @@ where
             .client
             .do_invoke(self.config.model_id().clone(), body)
             .await
-            .context(FailedToCreateEmbeddingSnafu)?;
+            .map_err(|err| match err.downcast::<BedrockThrottlingException>() {
+                Ok(e) => EmbedError::RateLimited { source: e },
+                Err(e) => EmbedError::FailedToCreateEmbedding { source: e },
+            })?;
 
         let response_body = response.body().as_ref();
         let response_obj = serde_json::from_slice(response_body)
@@ -248,11 +252,12 @@ where
             return Ok(vec![]);
         }
 
-        let (vectors, _num_tokens) = self
-            .embed_texts(texts)
-            .await
-            .boxed()
-            .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e })?;
+        let (vectors, _num_tokens) = self.embed_texts(texts).await.boxed().map_err(|err| {
+            match err.downcast::<EmbedError>() {
+                Ok(embed_err) => *embed_err,
+                Err(err) => EmbedError::FailedToCreateEmbedding { source: err },
+            }
+        })?;
 
         let duration = start.elapsed();
         tracing::debug!(

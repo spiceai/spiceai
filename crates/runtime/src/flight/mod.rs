@@ -310,6 +310,13 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                     }
                     _ => to_tonic_err(e),
                 }
+            } else if let Some(err) = e.downcast_ref::<llms::embeddings::Error>() {
+                match err {
+                    llms::embeddings::Error::RateLimited { .. } => {
+                        Status::unavailable(format!("{err}"))
+                    }
+                    _ => to_tonic_err(e),
+                }
             } else {
                 to_tonic_err(e)
             }
