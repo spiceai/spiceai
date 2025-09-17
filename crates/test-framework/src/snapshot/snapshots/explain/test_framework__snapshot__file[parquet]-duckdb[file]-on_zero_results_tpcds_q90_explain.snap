@@ -80,7 +80,8 @@ description: "Query: tpcds_q90"
 |               |                                               FallbackOnZeroResultsScanExec                                                                                                          |
 |               |                                                 CoalescePartitionsExec                                                                                                               |
 |               |                                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                              |
-|               |                                                     DuckSqlExec sql= SELECT "ws_sold_time_sk", "ws_ship_hdemo_sk", "ws_web_page_sk" FROM web_sales                                   |
+|               |                                                     CooperativeExec                                                                                                                  |
+|               |                                                       DuckSqlExec sql= SELECT "ws_sold_time_sk", "ws_ship_hdemo_sk", "ws_web_page_sk" FROM web_sales                                 |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
 |               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 16), input_partitions=16                                                                    |
 |               |                                         ProjectionExec: expr=[hd_demo_sk@0 as hd_demo_sk]                                                                                            |
@@ -92,7 +93,8 @@ description: "Query: tpcds_q90"
 |               |                                                     FallbackOnZeroResultsScanExec                                                                                                    |
 |               |                                                       CoalescePartitionsExec                                                                                                         |
 |               |                                                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
-|               |                                                           DuckSqlExec sql= SELECT "hd_demo_sk", "hd_dep_count" FROM household_demographics WHERE (hd_dep_count = 2)                  |
+|               |                                                           CooperativeExec                                                                                                            |
+|               |                                                             DuckSqlExec sql= SELECT "hd_demo_sk", "hd_dep_count" FROM household_demographics WHERE (hd_dep_count = 2)                |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
 |               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 16), input_partitions=16                                                                             |
 |               |                                 ProjectionExec: expr=[t_time_sk@0 as t_time_sk]                                                                                                      |
@@ -104,7 +106,8 @@ description: "Query: tpcds_q90"
 |               |                                             FallbackOnZeroResultsScanExec                                                                                                            |
 |               |                                               CoalescePartitionsExec                                                                                                                 |
 |               |                                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                |
-|               |                                                   DuckSqlExec sql= SELECT "t_time_sk", "t_hour" FROM time_dim WHERE (t_hour >= 9) AND (t_hour <= 10)                                 |
+|               |                                                   CooperativeExec                                                                                                                    |
+|               |                                                     DuckSqlExec sql= SELECT "t_time_sk", "t_hour" FROM time_dim WHERE (t_hour >= 9) AND (t_hour <= 10)                               |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                      |
 |               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 16), input_partitions=16                                                                                |
 |               |                         ProjectionExec: expr=[wp_web_page_sk@0 as wp_web_page_sk]                                                                                                    |
@@ -116,7 +119,8 @@ description: "Query: tpcds_q90"
 |               |                                     FallbackOnZeroResultsScanExec                                                                                                                    |
 |               |                                       CoalescePartitionsExec                                                                                                                         |
 |               |                                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                        |
-|               |                                           DuckSqlExec sql= SELECT "wp_web_page_sk", "wp_char_count" FROM web_page WHERE (wp_char_count >= 2500) AND (wp_char_count <= 5200)          |
+|               |                                           CooperativeExec                                                                                                                            |
+|               |                                             DuckSqlExec sql= SELECT "wp_web_page_sk", "wp_char_count" FROM web_page WHERE (wp_char_count >= 2500) AND (wp_char_count <= 5200)        |
 |               |       ProjectionExec: expr=[count(Int64(1))@0 as pmc]                                                                                                                                |
 |               |         AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                                                                                    |
 |               |           CoalescePartitionsExec                                                                                                                                                     |
@@ -140,7 +144,8 @@ description: "Query: tpcds_q90"
 |               |                                               FallbackOnZeroResultsScanExec                                                                                                          |
 |               |                                                 CoalescePartitionsExec                                                                                                               |
 |               |                                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                              |
-|               |                                                     DuckSqlExec sql= SELECT "ws_sold_time_sk", "ws_ship_hdemo_sk", "ws_web_page_sk" FROM web_sales                                   |
+|               |                                                     CooperativeExec                                                                                                                  |
+|               |                                                       DuckSqlExec sql= SELECT "ws_sold_time_sk", "ws_ship_hdemo_sk", "ws_web_page_sk" FROM web_sales                                 |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
 |               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 16), input_partitions=16                                                                    |
 |               |                                         ProjectionExec: expr=[hd_demo_sk@0 as hd_demo_sk]                                                                                            |
@@ -152,7 +157,8 @@ description: "Query: tpcds_q90"
 |               |                                                     FallbackOnZeroResultsScanExec                                                                                                    |
 |               |                                                       CoalescePartitionsExec                                                                                                         |
 |               |                                                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
-|               |                                                           DuckSqlExec sql= SELECT "hd_demo_sk", "hd_dep_count" FROM household_demographics WHERE (hd_dep_count = 2)                  |
+|               |                                                           CooperativeExec                                                                                                            |
+|               |                                                             DuckSqlExec sql= SELECT "hd_demo_sk", "hd_dep_count" FROM household_demographics WHERE (hd_dep_count = 2)                |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
 |               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 16), input_partitions=16                                                                             |
 |               |                                 ProjectionExec: expr=[t_time_sk@0 as t_time_sk]                                                                                                      |
@@ -164,7 +170,8 @@ description: "Query: tpcds_q90"
 |               |                                             FallbackOnZeroResultsScanExec                                                                                                            |
 |               |                                               CoalescePartitionsExec                                                                                                                 |
 |               |                                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                |
-|               |                                                   DuckSqlExec sql= SELECT "t_time_sk", "t_hour" FROM time_dim WHERE (t_hour >= 15) AND (t_hour <= 16)                                |
+|               |                                                   CooperativeExec                                                                                                                    |
+|               |                                                     DuckSqlExec sql= SELECT "t_time_sk", "t_hour" FROM time_dim WHERE (t_hour >= 15) AND (t_hour <= 16)                              |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                      |
 |               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 16), input_partitions=16                                                                                |
 |               |                         ProjectionExec: expr=[wp_web_page_sk@0 as wp_web_page_sk]                                                                                                    |
@@ -176,6 +183,7 @@ description: "Query: tpcds_q90"
 |               |                                     FallbackOnZeroResultsScanExec                                                                                                                    |
 |               |                                       CoalescePartitionsExec                                                                                                                         |
 |               |                                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                        |
-|               |                                           DuckSqlExec sql= SELECT "wp_web_page_sk", "wp_char_count" FROM web_page WHERE (wp_char_count >= 2500) AND (wp_char_count <= 5200)          |
+|               |                                           CooperativeExec                                                                                                                            |
+|               |                                             DuckSqlExec sql= SELECT "wp_web_page_sk", "wp_char_count" FROM web_page WHERE (wp_char_count >= 2500) AND (wp_char_count <= 5200)        |
 |               |                                                                                                                                                                                      |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
