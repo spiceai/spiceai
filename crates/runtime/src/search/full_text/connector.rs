@@ -26,6 +26,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
+use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
@@ -135,10 +136,8 @@ impl FullTextConnector {
     {
         let table_provider = federated_table.try_table_provider_sync()?;
 
-        let Some(indexed) = table_provider
-            .as_any()
-            .downcast_ref::<IndexedTableProvider>()
-            .cloned()
+        let Some(indexed) =
+            find_concrete_table_provider::<IndexedTableProvider>(&table_provider).cloned()
         else {
             tracing::debug!(
                 "FullTextConnector didn't wrap underlying table with index - this is unexpected"
