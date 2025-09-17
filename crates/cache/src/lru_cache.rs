@@ -16,9 +16,11 @@ limitations under the License.
 
 use crate::AsTableRefs;
 use crate::FailedToInvalidateCacheSnafu;
+use crate::HashBuilder;
 use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
+use crate::TabledCacheProvider;
 use crate::current_time_secs;
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
@@ -38,7 +40,7 @@ use std::time::Duration;
 
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
@@ -49,7 +51,7 @@ pub struct LruCache<
 }
 
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > Display for LruCache<V, T>
 {
@@ -64,7 +66,7 @@ impl<
 }
 
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > std::fmt::Debug for LruCache<V, T>
 {
@@ -86,11 +88,9 @@ impl<
 ///
 /// - If the specified `max_size` cannot be parsed as a valid byte size.
 /// - If the specified `item_ttl` cannot be parsed as a valid duration.
-pub fn build_from_config<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
->(
+pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static>(
     cache_config: &CacheConfig,
-) -> Result<Arc<dyn CacheProvider<V> + Send + Sync>> {
+) -> Result<Arc<LruCache<V, HashBuilder>>> {
     let cache_max_size: u64 = match &cache_config.max_size {
         Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
             .context(super::FailedToParseCacheMaxSizeSnafu)?
@@ -110,7 +110,7 @@ pub fn build_from_config<
 }
 
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > LruCache<V, T>
 {
@@ -146,10 +146,24 @@ impl<
             ttl,
         }
     }
+
+    pub fn as_provider(self: Arc<Self>) -> Arc<dyn CacheProvider<V> + Send + Sync> {
+        self
+    }
 }
 
 impl<
     V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> LruCache<V, T>
+{
+    pub fn as_tabled_provider(self: Arc<Self>) -> Arc<dyn TabledCacheProvider<V> + Send + Sync> {
+        self
+    }
+}
+
+impl<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > HashProvider for LruCache<V, T>
 {
@@ -160,7 +174,7 @@ impl<
 
 #[async_trait]
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > CacheProvider<V> for LruCache<V, T>
 {
@@ -202,24 +216,6 @@ impl<
         }
     }
 
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        let table_name = match &table_ref {
-            TableReference::Bare { table }
-            | TableReference::Partial { table, .. }
-            | TableReference::Full { table, .. } => table,
-        };
-        let table_name = Arc::clone(table_name);
-        self.cache
-            .invalidate_entries_if(move |_key, value| {
-                value
-                    .as_table_refs()
-                    .is_some_and(|refs| refs.contains(&table_ref))
-            })
-            .context(FailedToInvalidateCacheSnafu { table_name })?;
-
-        Ok(())
-    }
-
     fn size_bytes(&self) -> u64 {
         self.cache.weighted_size()
     }
@@ -234,6 +230,27 @@ impl<
 
     async fn checkpoint(&self) {
         self.cache.run_pending_tasks().await;
+    }
+}
+
+#[async_trait]
+impl<
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> TabledCacheProvider<V> for LruCache<V, T>
+{
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let table_name = match &table_ref {
+            TableReference::Bare { table }
+            | TableReference::Partial { table, .. }
+            | TableReference::Full { table, .. } => table,
+        };
+        let table_name = Arc::clone(table_name);
+        self.cache
+            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
+            .context(FailedToInvalidateCacheSnafu { table_name })?;
+
+        Ok(())
     }
 }
 

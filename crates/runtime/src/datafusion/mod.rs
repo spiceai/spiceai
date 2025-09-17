@@ -48,6 +48,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
+use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
@@ -1109,7 +1110,7 @@ impl DataFusion {
 
     pub fn plans_cache_provider(
         &self,
-    ) -> Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>> {
+    ) -> Option<Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>> {
         self.caching.plans.clone()
     }
 
@@ -1121,7 +1122,7 @@ impl DataFusion {
 
     pub fn search_cache_provider(
         &self,
-    ) -> Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>> {
+    ) -> Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>> {
         self.caching.search.clone()
     }
 

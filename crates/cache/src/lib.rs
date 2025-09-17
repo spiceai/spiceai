@@ -93,35 +93,38 @@ pub trait HashProvider {
 
 /// Trait for types that can be converted to a set of table references.
 pub trait AsTableRefs {
-    fn as_table_refs(&self) -> Option<Arc<HashSet<TableReference>>> {
-        None
-    }
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>>;
 }
 
 impl AsTableRefs for LogicalPlan {
-    fn as_table_refs(&self) -> Option<Arc<HashSet<TableReference>>> {
-        Some(Arc::new(get_logical_plan_input_tables(self)))
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::new(get_logical_plan_input_tables(self))
     }
 }
 
 #[async_trait]
-pub trait CacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
+pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
     HashProvider + std::fmt::Debug + std::fmt::Display
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
     fn invalidate_all(&self);
+    fn size_bytes(&self) -> u64;
+    fn item_count(&self) -> u64;
+    fn max_size(&self) -> usize;
+    async fn checkpoint(&self);
+}
 
+/// A ``TabledCacheProvider`` represents a cache that can invalidate entries based on table references which their values reference.
+pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
+    CacheProvider<V>
+{
     /// Invalidates all cache entries for the specified table.
     ///
     /// # Errors
     ///
     /// If the cache invalidation fails.
     fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
-    fn size_bytes(&self) -> u64;
-    fn item_count(&self) -> u64;
-    fn max_size(&self) -> usize;
-    async fn checkpoint(&self);
 }
 
 #[derive(Clone)]
@@ -220,8 +223,8 @@ mod xxhash_compat {
 #[derive(Default)]
 pub struct Caching {
     pub results: Option<Arc<QueryResultsCacheProvider>>,
-    pub plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
-    pub search: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+    pub plans: Option<Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>>,
+    pub search: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
     pub embeddings: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
@@ -251,7 +254,7 @@ impl Caching {
     #[must_use]
     pub fn with_plans_cache(
         mut self,
-        plans: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
+        plans: Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>,
     ) -> Self {
         self.plans = Some(plans);
         self
@@ -260,7 +263,7 @@ impl Caching {
     #[must_use]
     pub fn with_search_cache(
         mut self,
-        search: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
+        search: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
     ) -> Self {
         self.search = Some(search);
         self
@@ -298,7 +301,7 @@ impl Caching {
 
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
 pub struct QueryResultsCacheProvider {
-    cache: Arc<dyn CacheProvider<CachedQueryResult> + Send + Sync>,
+    cache: Arc<dyn TabledCacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
 

@@ -71,7 +71,8 @@ impl Runtime {
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
                     hash_builder,
-                ));
+                ))
+                .as_tabled_provider();
                 caching = caching.with_plans_cache(plans_cache_provider);
             }
             Err(e) => {
@@ -87,7 +88,7 @@ impl Runtime {
                     in_tracing_context(|| {
                         tracing::info!("Initialized search results cache; {cache_provider}");
                     });
-                    caching = caching.with_search_cache(cache_provider);
+                    caching = caching.with_search_cache(cache_provider.as_tabled_provider());
                 }
                 Err(e) => {
                     in_tracing_context(|| {

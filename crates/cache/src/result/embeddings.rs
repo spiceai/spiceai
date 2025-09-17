@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_openai::types::CreateEmbeddingResponse;
 
-use crate::{AsTableRefs, Sizeable};
+use crate::Sizeable;
 
 #[derive(Debug, Clone)]
 pub enum CachedEmbeddingResult {
@@ -41,5 +41,3 @@ impl Sizeable for CachedEmbeddingResult {
         }
     }
 }
-
-impl AsTableRefs for CachedEmbeddingResult {}
