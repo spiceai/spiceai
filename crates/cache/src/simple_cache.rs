@@ -111,7 +111,11 @@ impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Se
         };
         let table_name = Arc::clone(table_name);
         self.cache
-            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
+            .invalidate_entries_if(move |_key, value| {
+                value
+                    .as_table_refs()
+                    .is_some_and(|refs| refs.contains(&table_ref))
+            })
             .context(FailedToInvalidateCacheSnafu { table_name })?;
 
         Ok(())

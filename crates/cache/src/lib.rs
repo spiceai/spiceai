@@ -93,19 +93,14 @@ pub trait HashProvider {
 
 /// Trait for types that can be converted to a set of table references.
 pub trait AsTableRefs {
-    fn as_table_refs(&self) -> Arc<HashSet<TableReference>>;
-}
-
-impl AsTableRefs for LogicalPlan {
-    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::new(get_logical_plan_input_tables(self))
+    fn as_table_refs(&self) -> Option<Arc<HashSet<TableReference>>> {
+        None
     }
 }
 
-// embeddings have no table reference
-impl AsTableRefs for Vec<Vec<f32>> {
-    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::new(HashSet::new())
+impl AsTableRefs for LogicalPlan {
+    fn as_table_refs(&self) -> Option<Arc<HashSet<TableReference>>> {
+        Some(Arc::new(get_logical_plan_input_tables(self)))
     }
 }
 

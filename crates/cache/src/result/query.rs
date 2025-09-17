@@ -50,8 +50,8 @@ impl Sizeable for CachedQueryResult {
 }
 
 impl AsTableRefs for CachedQueryResult {
-    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::clone(&self.input_tables)
+    fn as_table_refs(&self) -> Option<Arc<HashSet<TableReference>>> {
+        Some(Arc::clone(&self.input_tables))
     }
 }
 

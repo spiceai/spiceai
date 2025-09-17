@@ -58,8 +58,8 @@ pub struct CachedSearchResult {
 }
 
 impl AsTableRefs for CachedSearchResult {
-    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::clone(&self.input_tables)
+    fn as_table_refs(&self) -> Option<Arc<HashSet<TableReference>>> {
+        Some(Arc::clone(&self.input_tables))
     }
 }
 

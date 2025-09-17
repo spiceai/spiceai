@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc};
-
 use async_openai::types::CreateEmbeddingResponse;
 
 use crate::{AsTableRefs, Sizeable};
@@ -44,10 +42,4 @@ impl Sizeable for CachedEmbeddingResult {
     }
 }
 
-impl AsTableRefs for CachedEmbeddingResult {
-    fn as_table_refs(
-        &self,
-    ) -> std::sync::Arc<std::collections::HashSet<datafusion::sql::TableReference>> {
-        Arc::new(HashSet::new())
-    }
-}
+impl AsTableRefs for CachedEmbeddingResult {}
