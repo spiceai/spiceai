@@ -81,7 +81,7 @@ impl IndexedTableProvider {
 
     #[must_use]
     pub fn get_all_indexes(&self) -> Vec<Arc<dyn Index + Send + Sync>> {
-        self.indexes.iter().cloned().collect()
+        self.indexes.clone()
     }
 
     #[must_use]
