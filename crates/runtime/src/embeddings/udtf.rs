@@ -27,8 +27,6 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
@@ -48,19 +46,25 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, SubqueryAlias};
 use itertools::Itertools;
-use std::cmp::min;
-use std::sync::LazyLock;
 use std::{
     any::Any,
+    cmp::min,
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{Arc, LazyLock, Weak},
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
+use search::{
+    SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex,
+    provider::SearchQueryProvider,
+};
 use snafu::ResultExt;
+
+#[cfg(feature = "s3_vectors")]
+use crate::embeddings::index::s3::S3Vector;
 
 use crate::{
     datafusion::DataFusion,
@@ -68,7 +72,10 @@ use crate::{
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
     request::{AsyncMarker, RequestContext},
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
+    search::util::{
+        find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
+        to_column_expr,
+    },
 };
 use tokio::sync::RwLock;
 
@@ -284,15 +291,16 @@ impl VectorSearchTableFunc {
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        use crate::{embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider};
-        let Some(mut vector_indexes) = find_index_in_table_provider::<S3Vector>(tbl) else {
+        let Some((mut vector_indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl) else {
             return Ok(None);
         };
 
         let vector_index_opt = if let Some(col) = &args.column {
+            use search::index::SearchIndex;
+
             vector_indexes
                 .into_iter()
-                .find(|idx| *idx.embedded_column() == *col)
+                .find(|idx| *idx.search_column() == *col)
         } else {
             if vector_indexes.len() > 1 {
                 return Err(DataFusionError::Internal(format!(
@@ -306,12 +314,13 @@ impl VectorSearchTableFunc {
         let Some(vector_index) = vector_index_opt else {
             return Ok(None);
         };
-        Ok(Some(Arc::new(VectorQueryTableProvider {
-            query: args.query.clone(),
-            table_provider: Arc::clone(tbl),
-            vector_index: Arc::new(vector_index.clone()),
-            pre_limit: args.limit,
-        })))
+
+        Ok(Some(Arc::new(SearchQueryProvider::new(
+            Arc::new(vector_index.clone()) as Arc<dyn SearchIndex>,
+            Arc::clone(tbl),
+            args.query.clone(),
+            args.limit,
+        ))))
     }
 }
 

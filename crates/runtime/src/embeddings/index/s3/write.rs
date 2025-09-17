@@ -24,14 +24,14 @@ use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
+use search::index::SearchIndex;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 use util::distribute_nulls;
 
 use crate::{
-    convert_string_arrow_to_iterator, embedding_col,
-    embeddings::index::{VectorIndex, s3::S3Vector},
+    convert_string_arrow_to_iterator, embedding_col, embeddings::index::s3::S3Vector,
     model::EmbeddingModelStore,
 };
 
@@ -134,9 +134,17 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     )
     .await?;
 
-    let metadata =
-        extract_and_format_metadata(index.name(), &index.metadata_columns.all_names(), &record)
-            .map_err(|e| *e)?;
+    let metadata = extract_and_format_metadata(
+        index.name(),
+        &index
+            .metadata_columns()
+            .all_names()
+            .into_iter()
+            .filter(|c| *c != embedding_col!(index.search_column()))
+            .collect::<Vec<_>>(),
+        &record,
+    )
+    .map_err(|e| *e)?;
     let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
         .map_err(|e| *e)?;
 
@@ -183,7 +191,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     Ok(updated_record)
 }
 
-/// Given a [`RecordBatch`] of data from a [`VectorIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
+/// Given a [`RecordBatch`] of data from a [`SearchIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
 ///
 /// Formatting is:
 ///  - When there is a single [`Field`] in `primary_key`, the relevant [`ArrayRef`] is cast to a [`StringArray`] via [`arrow::compute::cast`].
