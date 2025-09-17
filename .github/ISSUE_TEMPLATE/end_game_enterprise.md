@@ -137,8 +137,8 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
 
 - [ ] Perform a final test pass on the released binaries and Docker images.
 
-- [ ] Trigger [Platform OpenAPI Spec generation workflow](https://github.com/spicehq/ai-platform/actions/workflows/generate-openapi.yml) to include Spice OSS spec updates, if applicable.
-  - [ ] Update HTTP API Reference in https://docs.spice.ai if needed
+- [ ] Trigger [Platform OpenAPI Spec generation workflow](https://github.com/spicehq/ai-platform/actions/workflows/generate-openapi.yml) to include Spice OSS OpenAPI spec updates, if there are any.
+  - [ ] Update HTTP API Reference in https://docs.spice.ai if needed.
 
 ## Post-Release Validation and Housekeeping
 
