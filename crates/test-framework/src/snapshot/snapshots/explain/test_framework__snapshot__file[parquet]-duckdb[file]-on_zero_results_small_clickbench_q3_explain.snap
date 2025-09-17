@@ -19,6 +19,7 @@ description: "Query: clickbench_q3"
 |               |               FallbackOnZeroResultsScanExec                                                                                                                      |
 |               |                 CoalescePartitionsExec                                                                                                                           |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                          |
-|               |                     DuckSqlExec sql= SELECT "ResolutionWidth", "AdvEngineID" FROM hits                                                                           |
+|               |                     CooperativeExec                                                                                                                              |
+|               |                       DuckSqlExec sql= SELECT "ResolutionWidth", "AdvEngineID" FROM hits                                                                         |
 |               |                                                                                                                                                                  |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -13,6 +13,7 @@ description: "Query: tpch_simple_q7"
 | physical_plan | ProjectionExec: expr=[o_orderkey@0 as key]                               |
 |               |   GlobalLimitExec: skip=0, fetch=10                                      |
 |               |     BytesProcessedExec                                                   |
-|               |       IcebergTableScan projection:[o_orderkey] predicate:[]              |
+|               |       CooperativeExec                                                    |
+|               |         IcebergTableScan projection:[o_orderkey] predicate:[]            |
 |               |                                                                          |
 +---------------+--------------------------------------------------------------------------+

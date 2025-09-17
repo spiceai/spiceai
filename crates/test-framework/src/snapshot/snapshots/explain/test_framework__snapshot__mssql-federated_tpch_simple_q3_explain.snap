@@ -14,6 +14,7 @@ description: "Query: tpch_simple_q3"
 |               |   SortExec: TopK(fetch=10), expr=[l_linenumber@2 DESC], preserve_partitioning=[false]                         |
 |               |     ProjectionExec: expr=[l_comment@2 as l_comment, l_partkey@0 as l_partkey, l_linenumber@1 as l_linenumber] |
 |               |       BytesProcessedExec                                                                                      |
-|               |         SqlServerExec sql=SELECT l_partkey, l_linenumber, l_comment FROM lineitem                             |
+|               |         CooperativeExec                                                                                       |
+|               |           SqlServerExec sql=SELECT l_partkey, l_linenumber, l_comment FROM lineitem                           |
 |               |                                                                                                               |
 +---------------+---------------------------------------------------------------------------------------------------------------+

@@ -49,7 +49,7 @@ description: "Query: tpcds_q71"
 |               |                   TableScan: time_dim projection=[t_time_sk, t_hour, t_minute, t_meal_time]                                                                                                      |
 | physical_plan | ProjectionExec: expr=[brand_id@0 as brand_id, brand@1 as brand, t_hour@2 as t_hour, t_minute@3 as t_minute, ext_price@4 as ext_price]                                                            |
 |               |   SortPreservingMergeExec: [ext_price@4 DESC, i_brand_id@5 ASC NULLS LAST]                                                                                                                       |
-|               |     SortExec: expr=[ext_price@4 DESC, i_brand_id@5 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                 |
+|               |     SortExec: expr=[ext_price@4 DESC, brand_id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                   |
 |               |       ProjectionExec: expr=[i_brand_id@1 as brand_id, i_brand@0 as brand, t_hour@2 as t_hour, t_minute@3 as t_minute, sum(tmp.ext_price)@4 as ext_price, i_brand_id@1 as i_brand_id]             |
 |               |         AggregateExec: mode=FinalPartitioned, gby=[i_brand@0 as i_brand, i_brand_id@1 as i_brand_id, t_hour@2 as t_hour, t_minute@3 as t_minute], aggr=[sum(tmp.ext_price)]                      |
 |               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                                                            |

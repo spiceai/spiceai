@@ -80,6 +80,11 @@ impl IndexedTableProvider {
     }
 
     #[must_use]
+    pub fn get_all_indexes(&self) -> Vec<Arc<dyn Index + Send + Sync>> {
+        self.indexes.clone()
+    }
+
+    #[must_use]
     pub fn get_underlying(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.underlying)
     }
