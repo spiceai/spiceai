@@ -63,13 +63,13 @@ use search::{
 };
 use snafu::ResultExt;
 
+#[cfg(feature = "s3_vectors")]
+use crate::embeddings::index::s3::S3Vector;
+
 use crate::{
     datafusion::DataFusion,
     embedding_col,
-    embeddings::{
-        index::s3::S3Vector,
-        table::{EmbeddingColumnConfig, EmbeddingTable},
-    },
+    embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
     request::{AsyncMarker, RequestContext},
     search::util::{
