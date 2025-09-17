@@ -35,7 +35,8 @@ description: "Query: tpch_q4"
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                 |
 |               |                             FilterExec: o_orderdate@0 >= 1993-07-01 AND o_orderdate@0 < 1993-10-01                                    |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
-|               |                                 MongoDBExec projection=[o_orderdate, o_orderkey, o_orderpriority] filters=[{}]                        |
+|               |                                 CooperativeExec                                                                                       |
+|               |                                   MongoDBExec projection=[o_orderdate, o_orderkey, o_orderpriority] filters=[{}]                      |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                       |
 |               |                       ProjectionExec: expr=[l_orderkey@1 as l_orderkey]                                                               |
@@ -43,6 +44,7 @@ description: "Query: tpch_q4"
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                 |
 |               |                             FilterExec: l_receiptdate@2 > l_commitdate@0                                                              |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
-|               |                                 MongoDBExec projection=[l_commitdate, l_orderkey, l_receiptdate] filters=[{}]                         |
+|               |                                 CooperativeExec                                                                                       |
+|               |                                   MongoDBExec projection=[l_commitdate, l_orderkey, l_receiptdate] filters=[{}]                       |
 |               |                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+
