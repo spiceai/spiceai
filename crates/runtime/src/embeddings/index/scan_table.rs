@@ -341,10 +341,10 @@ mod tests {
         sql::TableReference,
     };
 
-    use crate::embeddings::index::VectorScanTableProvider;
     use crate::embeddings::index::tests::{
         PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
     };
+    use crate::embeddings::index::{VectorScanTableProvider, tests::ExplainMemTable};
 
     #[tokio::test]
     pub async fn test_vector_scan_basic() -> Result<(), String> {
@@ -355,13 +355,14 @@ mod tests {
         ]));
 
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
@@ -416,13 +417,14 @@ mod tests {
             Field::new("not_where", DataType::Utf8, false),
         ]));
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
@@ -515,13 +517,14 @@ mod tests {
             Field::new("not_where", DataType::Utf8, false),
         ]));
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![

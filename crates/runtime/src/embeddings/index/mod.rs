@@ -113,6 +113,7 @@ pub mod tests {
         sql::TableReference,
     };
     use datafusion_expr::{LogicalPlan, TableScan};
+    use itertools::Itertools;
     use search::generation::util::append_fields;
     use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
@@ -125,8 +126,12 @@ pub mod tests {
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
     #[derive(Debug)]
-    pub struct ExplainMemTable(MemTable);
-
+    pub struct ExplainMemTable(pub MemTable, pub &'static str);
+    impl ExplainMemTable {
+        pub fn new(table: MemTable, name: &'static str) -> Self {
+            Self(table, name)
+        }
+    }
     /// Wraps a [`ExecutionPlan`] with a new [`DisplayAs`] to show what filters have been pushed down.
     /// This is useful for testing explain plans.
     #[derive(Debug)]
@@ -135,11 +140,12 @@ pub mod tests {
         Vec<Expr>,
         Option<usize>,
         Option<Vec<usize>>,
+        &'static str,
     );
 
     impl ExecutionPlan for ExplainExecutionPlan {
         fn name(&self) -> &'static str {
-            "ExplainExecutionPlan"
+            self.4
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -163,6 +169,7 @@ pub mod tests {
                 self.1.clone(),
                 self.2,
                 self.3.clone(),
+                self.4,
             )) as Arc<dyn ExecutionPlan>)
         }
 
@@ -191,8 +198,8 @@ pub mod tests {
 
             write!(
                 f,
-                "ExplainExecutionPlan: projection={columns:?} filter={:?} limit={:?}",
-                self.1, self.2,
+                "{}: projection={columns:?} filter={:?} limit={:?}",
+                self.4, self.1, self.2,
             )?;
             Ok(())
         }
@@ -224,6 +231,7 @@ pub mod tests {
                 filters.to_vec(),
                 limit,
                 projection.cloned(),
+                self.1,
             )) as Arc<dyn ExecutionPlan>)
         }
 
@@ -290,9 +298,11 @@ pub mod tests {
             Ok(LogicalPlan::TableScan(
                 TableScan::try_new(
                     "tbl",
-                    Arc::new(DefaultTableSource::new(
-                        Arc::new(ExplainMemTable(mem_table)) as Arc<dyn TableProvider>,
-                    )),
+                    Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                        mem_table,
+                        "PretendVectorIndex",
+                    ))
+                        as Arc<dyn TableProvider>)),
                     None,
                     vec![],
                     None,
@@ -332,12 +342,13 @@ pub mod tests {
                 vec![Arc::new(Field::new("score", DataType::Float64, false))],
             );
 
-            Ok(Arc::new(ExplainMemTable(
+            Ok(Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .boxed()?,
+                "PretendVectorIndex",
             )) as Arc<dyn TableProvider>)
         }
     }
