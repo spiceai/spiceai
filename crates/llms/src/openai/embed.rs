@@ -127,7 +127,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
         req: CreateEmbeddingRequest,
     ) -> EmbedResult<CreateEmbeddingResponse> {
         if let Some(CachedEmbeddingResult::Response(cached)) =
-            self.get_cached_embed(&req.input).await
+            self.get_cached_embed((&req).into()).await
         {
             return Ok(cached);
         }
@@ -153,7 +153,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
 
         resp.model = outer_model;
 
-        self.put_cached_embed(&req.input, CachedEmbeddingResult::Response(resp.clone()))
+        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
             .await;
 
         Ok(resp)
@@ -189,7 +189,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                 let rate_controller = Arc::clone(&self.rate_controller);
                 async move {
                     retry(retry_strategy, async || {
-                        if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed(&req.input).await {
+                        if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed((&req).into()).await {
                             return Ok(cached);
                         }
 
@@ -216,7 +216,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                 RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
                             })?;
 
-                        self.put_cached_embed(&req.input, CachedEmbeddingResult::Vector(embeddings.clone())).await;
+                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(embeddings.clone())).await;
 
                         Ok(embeddings)
                     })
