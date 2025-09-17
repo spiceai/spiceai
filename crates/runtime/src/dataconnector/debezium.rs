@@ -140,6 +140,11 @@ impl Debezium {
                     tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
                     data_components::kafka::SslIdentification::Https
                 }),
+            consumer_group_id: params
+                .get("kafka_consumer_group_id")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
             // Metrics instance that will be used by the Kafka consumer to update statistics
             metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
@@ -198,6 +203,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_ssl_endpoint_identification_algorithm")
         .default("https")
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
+    ParameterSpec::runtime("kafka_consumer_group_id")
+        .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -402,12 +409,16 @@ async fn get_metadata_from_kafka(
     kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
-    let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "debezium",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
+    let kafka_consumer = KafkaConsumer::create_for_dataset(
+        &dataset_name,
+        kafka_config.consumer_group_id.clone(),
+        kafka_config,
+    )
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "debezium",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
 
     kafka_consumer
         .subscribe(topic)

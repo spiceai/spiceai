@@ -54,16 +54,25 @@ impl Column {
             metadata: HashMap::new(),
         }
     }
+
     #[must_use]
     pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
         self.metadata = metadata;
         self
     }
+
     #[must_use]
     pub fn with_embeddings(mut self, embeddings: Vec<ColumnLevelEmbeddingConfig>) -> Self {
         self.embeddings = embeddings;
         self
     }
+
+    #[must_use]
+    pub fn with_full_text_search(mut self, full_text_search: FullTextSearchConfig) -> Self {
+        self.full_text_search = Some(full_text_search);
+        self
+    }
+
     /// Return the column-level metadata that should be added to a [`arrow::datatypes::Field`].
     #[must_use]
     pub fn metadata(&self) -> HashMap<String, String> {
@@ -152,6 +161,40 @@ pub struct FullTextSearchConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub row_ids: Option<Vec<String>>,
+}
+
+impl FullTextSearchConfig {
+    #[must_use]
+    pub fn disabled() -> Self {
+        FullTextSearchConfig {
+            enabled: false,
+            row_ids: None,
+        }
+    }
+
+    #[must_use]
+    pub fn enabled() -> Self {
+        FullTextSearchConfig {
+            enabled: true,
+            row_ids: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_row_id(self, row_id: &str) -> Self {
+        if let Some(mut row_ids) = self.row_ids {
+            row_ids.push(row_id.to_string());
+            FullTextSearchConfig {
+                row_ids: Some(row_ids),
+                ..self
+            }
+        } else {
+            FullTextSearchConfig {
+                row_ids: Some(vec![row_id.to_string()]),
+                ..self
+            }
+        }
+    }
 }
 
 #[cfg(test)]
