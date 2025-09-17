@@ -20,8 +20,10 @@ use std::{
     sync::Arc,
 };
 
+use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
 use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::logical_expr::col;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Column, DFSchema, JoinConstraint, JoinType, NullEquality},
@@ -35,8 +37,6 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
-
-use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]
 /// if required by filters or additional columns in the projection.
@@ -294,22 +294,21 @@ impl SearchQueryProvider {
             null_equality: NullEquality::NullEqualsNothing,
         });
 
-        let deduped_schema = DFSchema::new_with_metadata(
-            join.schema()
-                .iter()
-                .filter(|(tbl, f)| {
-                    !(primary_key_column_names.contains(f.name())
-                        && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
-                })
-                .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
-                .collect(),
-            HashMap::default(),
-        )?;
+        let deduped_join_proj_exprs: Vec<_> = join
+            .schema()
+            .iter()
+            .filter(|(tbl, f)| {
+                !(primary_key_column_names.contains(f.name())
+                    && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
+            })
+            .map(|(tbl, field_ref)| match tbl {
+                Some(table_ref) => col(format!("{}.{}", table_ref.table(), field_ref.name())),
+                None => col(field_ref.name()),
+            })
+            .collect();
 
-        let proj = LogicalPlan::Projection(Projection::new_from_schema(
-            join.into(),
-            deduped_schema.into(),
-        ));
+        let proj =
+            LogicalPlan::Projection(Projection::try_new(deduped_join_proj_exprs, join.into())?);
 
         if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
             Ok(LogicalPlan::Filter(Filter::try_new(filter, proj.into())?))

@@ -385,12 +385,28 @@ impl TableProvider for ReciprocalRankFusion {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(ref df) = self.df {
-            df.clone().create_physical_plan().await
+            let mut df = df.clone();
+
+            if let Some(filter) = filters.iter().cloned().reduce(|a, b| a.and(b)) {
+                df = df.filter(filter)?;
+            }
+
+            if let Some(projection) = projection {
+                df = df.select(
+                    self.schema()
+                        .project(projection)?
+                        .fields
+                        .iter()
+                        .map(|f| col(f.name())),
+                )?;
+            }
+
+            df.limit(0, limit)?.create_physical_plan().await
         } else {
             exec_err!("ReciprocalRankFusion could not create physical plan")
         }
