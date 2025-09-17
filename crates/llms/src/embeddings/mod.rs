@@ -20,6 +20,7 @@ use async_openai::types::{
 use async_trait::async_trait;
 use cache::CacheProvider;
 use cache::key::CacheKey;
+use cache::result::embeddings::CachedEmbeddingResult;
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::{fmt::Debug, sync::Arc};
@@ -138,11 +139,11 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
-    fn cache(&self) -> Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>> {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         None
     }
 
-    async fn get_cached_embed(&self, input: &'_ EmbeddingInput) -> Option<Vec<Vec<f32>>> {
+    async fn get_cached_embed(&self, input: &'_ EmbeddingInput) -> Option<CachedEmbeddingResult> {
         if let Some(embeddings_cache) = self.cache() {
             let key: CacheKey<'_> = input.into();
 
@@ -157,7 +158,7 @@ pub trait Embed: Debug + Sync + Send {
         None
     }
 
-    async fn put_cached_embed(&self, input: &'_ EmbeddingInput, value: Vec<Vec<f32>>) {
+    async fn put_cached_embed(&self, input: &'_ EmbeddingInput, value: CachedEmbeddingResult) {
         if let Some(embeddings_cache) = self.cache() {
             let key: CacheKey<'_> = input.into();
 

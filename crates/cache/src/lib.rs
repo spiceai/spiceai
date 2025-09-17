@@ -48,6 +48,8 @@ use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
+use crate::result::embeddings::CachedEmbeddingResult;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
@@ -224,7 +226,7 @@ pub struct Caching {
     pub results: Option<Arc<QueryResultsCacheProvider>>,
     pub plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
     pub search: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
-    pub embeddings: Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>>,
+    pub embeddings: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Caching {
@@ -271,7 +273,7 @@ impl Caching {
     #[must_use]
     pub fn with_embeddings_cache(
         mut self,
-        embeddings: Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>,
+        embeddings: Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>,
     ) -> Self {
         self.embeddings = Some(embeddings);
         self

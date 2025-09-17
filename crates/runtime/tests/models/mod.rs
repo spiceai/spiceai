@@ -357,7 +357,7 @@ fn sort_json_keys(value: &mut Value) {
     }
 }
 
-async fn send_embeddings_request(
+pub async fn send_embeddings_request(
     base_url: &str,
     model: &str,
     input: EmbeddingInput,

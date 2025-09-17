@@ -18,6 +18,7 @@ use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use bytes::Bytes;
 use cache::CacheProvider;
+use cache::result::embeddings::CachedEmbeddingResult;
 use reqwest::StatusCode;
 use runtime_rate_control::RateController;
 use std::fmt::Debug;
@@ -68,7 +69,7 @@ pub struct OpenaiEmbed<C: Config + Clone> {
     rate_controller: Arc<RateController>,
 
     // Shared embeddings cache
-    cache: Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>>,
+    cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 impl<C: Config + Debug + Clone> std::fmt::Debug for OpenaiEmbed<C> {
@@ -98,7 +99,10 @@ impl<C: Config + Clone> OpenaiEmbed<C> {
     }
 
     #[must_use]
-    pub fn set_cache(mut self, cache: Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>>) -> Self {
+    pub fn set_cache(
+        mut self,
+        cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> Self {
         self.cache = cache;
         self
     }
@@ -114,7 +118,7 @@ impl<C: Config + Clone> OpenaiEmbed<C> {
 
 #[async_trait]
 impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
-    fn cache(&self) -> Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>> {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         self.cache.as_ref().map(Arc::clone)
     }
 
@@ -122,6 +126,12 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
         &self,
         req: CreateEmbeddingRequest,
     ) -> EmbedResult<CreateEmbeddingResponse> {
+        if let Some(CachedEmbeddingResult::Response(cached)) =
+            self.get_cached_embed(&req.input).await
+        {
+            return Ok(cached);
+        }
+
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
 
@@ -142,6 +152,10 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
         drop(permit);
 
         resp.model = outer_model;
+
+        self.put_cached_embed(&req.input, CachedEmbeddingResult::Response(resp.clone()))
+            .await;
+
         Ok(resp)
     }
 
@@ -175,12 +189,12 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                 let rate_controller = Arc::clone(&self.rate_controller);
                 async move {
                     retry(retry_strategy, async || {
-                        let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
-
-                        let start = Instant::now();
-                        if let Some(cached) = self.get_cached_embed(&req.input).await {
+                        if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed(&req.input).await {
                             return Ok(cached);
                         }
+
+                        let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
+                        let start = Instant::now();
 
                         let embeddings: Vec<Vec<f32>> = client.embeddings().create_float(req.clone()).await
                             .map(|resp| {
@@ -202,8 +216,8 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                 RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
                             })?;
 
-                        self.put_cached_embed(&req.input, embeddings.clone()).await;
-                        
+                        self.put_cached_embed(&req.input, CachedEmbeddingResult::Vector(embeddings.clone())).await;
+
                         Ok(embeddings)
                     })
                     .await

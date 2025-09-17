@@ -295,11 +295,15 @@ mod search {
 
 #[allow(clippy::expect_used)]
 mod embeddings {
-    use std::time::Duration;
+    use spicepod::component::caching::CacheConfig;
+    use std::time::{Duration, Instant};
 
     use crate::models::embedding::{
         EmbeddingTestCase, run_beta_functionality_criteria_test, run_embedding_tests,
     };
+
+    use crate::models::search::start_app;
+    use crate::models::send_embeddings_request;
 
     use super::*;
 
@@ -376,6 +380,40 @@ mod embeddings {
                 Ok(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn openai_test_embeddings_cache() -> Result<(), anyhow::Error> {
+        let app = AppBuilder::new("cached_search")
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
+            .with_embeddings_cache(CacheConfig {
+                enabled: true,
+                max_size: Some("512mb".to_string()),
+                item_ttl: Some("30s".to_string()),
+                ..Default::default()
+            })
+            .build();
+
+        let _tracing = init_tracing(None);
+
+        test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let embedding_input = EmbeddingInput::StringArray((0..10).map(|i| format!("The food was delicious {i}")).collect());
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "openai_embeddings", embedding_input.clone(), Some("float"), None, None).await?;
+            let duration = start.elapsed();
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "openai_embeddings", embedding_input, Some("float"), None, None).await?;
+            let duration_cached = start.elapsed();
+            assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+            Ok(())
+        })
+        .await
     }
 }
 

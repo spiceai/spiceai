@@ -19,6 +19,7 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use cache::CacheProvider;
+use cache::result::embeddings::CachedEmbeddingResult;
 use itertools::Itertools;
 use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
@@ -59,7 +60,7 @@ pub async fn try_to_embedding(
     component: &spicepod::component::embeddings::Embeddings,
     secrets: Arc<RwLock<Secrets>>,
     token_provider_registry: Arc<TokenProviderRegistry>,
-    embeddings_cache: Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let string_params: HashMap<String, String> = component
         .params
@@ -448,7 +449,7 @@ async fn openai(
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
     secrets: Arc<RwLock<Secrets>>,
-    embeddings_cache: Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     // If parameter is from secret store, it will have `openai_` prefix
     let openai_usage_tier = params

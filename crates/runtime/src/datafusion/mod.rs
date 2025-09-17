@@ -48,6 +48,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
+use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
@@ -1114,7 +1115,7 @@ impl DataFusion {
 
     pub fn embeddings_cache_provider(
         &self,
-    ) -> Option<Arc<dyn CacheProvider<Vec<Vec<f32>>> + Send + Sync>> {
+    ) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         self.caching.embeddings.clone()
     }
 

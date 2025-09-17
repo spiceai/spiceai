@@ -21,7 +21,9 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Meter},
 };
 
-use crate::result::{query::CachedQueryResult, search::CachedSearchResult};
+use crate::result::{
+    embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+};
 
 macro_rules! generate_cache_metrics {
     ($prefix:literal, $name:ident) => {
@@ -137,7 +139,7 @@ impl CacheMetrics for CachedQueryResult {
     }
 }
 
-impl CacheMetrics for Vec<Vec<f32>> {
+impl CacheMetrics for CachedEmbeddingResult {
     fn record_hit() {
         embeddings::HITS.add(1, &[]);
     }

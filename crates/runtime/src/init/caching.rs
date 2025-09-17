@@ -41,6 +41,10 @@ impl Runtime {
             .search_results
             .clone()
             .unwrap_or(CacheConfig::default());
+        let embeddings_config = cache_config
+            .embeddings
+            .clone()
+            .unwrap_or(CacheConfig::default());
 
         if sql_results_config.enabled {
             match QueryResultsCacheProvider::try_new(
@@ -93,17 +97,19 @@ impl Runtime {
             }
         }
 
-        match lru_cache::build_from_config(&CacheConfig::default()) {
-            Ok(cache_provider) => {
-                in_tracing_context(|| {
-                    tracing::info!("Initialized embeddings cache; {cache_provider}");
-                });
-                caching = caching.with_embeddings_cache(cache_provider);
-            }
-            Err(e) => {
-                in_tracing_context(|| {
-                    tracing::error!("Failed to initialize embeddings cache: {e}");
-                });
+        if embeddings_config.enabled {
+            match lru_cache::build_from_config(&CacheConfig::default()) {
+                Ok(cache_provider) => {
+                    in_tracing_context(|| {
+                        tracing::info!("Initialized embeddings cache; {cache_provider}");
+                    });
+                    caching = caching.with_embeddings_cache(cache_provider);
+                }
+                Err(e) => {
+                    in_tracing_context(|| {
+                        tracing::error!("Failed to initialize embeddings cache: {e}");
+                    });
+                }
             }
         }
 
