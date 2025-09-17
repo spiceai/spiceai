@@ -181,7 +181,7 @@ mod tests {
         let chunker = Arc::new(
             RecursiveSplittingChunker::for_openai_model("text-embedding-3-small", &cfg)
                 .expect("failed to make chunker"),
-        );
+        ) as Arc<dyn Chunker>;
 
         let chunks: Vec<_> = chunker
             .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")

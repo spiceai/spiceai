@@ -7,7 +7,10 @@ use crate::{
 };
 
 use arrow::{
-    array::{ArrayRef, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt64Array},
+    array::{
+        ArrayRef, FixedSizeListBuilder, LargeStringArray, ListArray, ListBuilder, RecordBatch,
+        StringArray, StringViewArray, UInt64Array, UInt64Builder,
+    },
     util::pretty::pretty_format_batches,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
@@ -26,10 +29,7 @@ use futures::future::try_join_all;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu};
-use util::{
-    arrow::{repeat},
-    convert_string_arrow_to_iterator,
-};
+use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
 /// A [`SearchIndex`] that chunks the [`SearchIndex::search_column`] before each [`SearchIndex::write`].
 ///
@@ -268,7 +268,17 @@ impl SearchIndex for ChunkedSearchIndex {
         fields.push(Field::new("_spice.chunk_id", DataType::UInt64, false));
         arrays.push(Arc::new(UInt64Array::from(chunk_index)) as ArrayRef);
 
-        // TODO: need to add offsets and chunk indexes
+        fields.push(Field::new(
+            "_spice.chunk_offset",
+            DataType::new_list(
+                DataType::new_fixed_size_list(DataType::UInt64, 2, false),
+                false,
+            ),
+            false,
+        ));
+        arrays.push(Arc::new(to_offset_array(&offsets)) as ArrayRef);
+
+        // TODO: need to add offsets and
         let rb = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .context(WriteFailedConstructRecordBatchSnafu)
             .boxed()?;
@@ -334,4 +344,17 @@ impl SearchIndex for ChunkedSearchIndex {
 
         Ok(Arc::new(ViewTable::new(sort, None)))
     }
+}
+
+fn to_offset_array(x: &[Vec<(usize, usize)>]) -> ListArray {
+    let mut builder = ListBuilder::new(FixedSizeListBuilder::new(UInt64Builder::new(), 2));
+    for row in x {
+        for (start, end) in row {
+            builder.values().values().append_value(*start as u64);
+            builder.values().values().append_value(*end as u64);
+            builder.values().append(true);
+        }
+        builder.append(true);
+    }
+    builder.finish()
 }

@@ -113,6 +113,7 @@ pub mod tests {
         sql::TableReference,
     };
     use datafusion_expr::{LogicalPlan, TableScan};
+    use runtime_datafusion_index::Index;
     use search::generation::util::append_fields;
     use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
@@ -312,6 +313,25 @@ pub mod tests {
         }
     }
 
+    #[async_trait]
+    impl Index for PretendVectorIndex {
+        fn name(&self) -> &'static str {
+            "PretendVectorIndex"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            self.schema
+                .fields
+                .iter()
+                .filter(|c| *c.name() != embedding_col!(self.search_column()))
+                .map(|f| f.name().clone())
+                .collect()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
     #[async_trait]
     impl SearchIndex for PretendVectorIndex {
         fn search_column(&self) -> String {
