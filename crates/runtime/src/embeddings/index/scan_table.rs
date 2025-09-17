@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType},
+    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
@@ -32,6 +32,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion_expr::SubqueryAlias;
 
 use crate::{
     embedding_col,
@@ -204,15 +205,9 @@ impl TableProvider for VectorScanTableProvider {
             embedding_col!(self.index.search_column()),
         )));
 
-        let vector_table_scan = LogicalPlan::Projection(Projection::try_new(
-            proj,
-            Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-                TableReference::parse_str("vector_index"),
-                Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
-                None,
-                vec![],
-                None,
-            )?)),
+        let index_logical_plan = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            self.index.list_table_provider()?.into(),
+            TableReference::parse_str("vector_index"),
         )?);
 
         let primary_key_fields = self.index.primary_fields();
@@ -227,20 +222,23 @@ impl TableProvider for VectorScanTableProvider {
 
         let output_plan = if search_index_table_is_sufficient(
             projection_schema.fields().iter().as_slice(),
-            &vector_table_scan,
+            &index_logical_plan,
             filters,
         ) {
             // Let DataFusion handle pushing filters.
             if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                LogicalPlan::Filter(Filter::try_new(filter, vector_table_scan.into())?)
+                LogicalPlan::Filter(Filter::try_new(filter, index_logical_plan.into())?)
             } else {
-                vector_table_scan
+                index_logical_plan
             }
         } else {
             let underlying_table_scan =
                 LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
 
-            let join_schema = vector_table_scan
+            // Don't get metadata columns from index. Only vectors and primary key.
+            let index_logical_projection =
+                LogicalPlan::Projection(Projection::try_new(proj, index_logical_plan.into())?);
+            let join_schema = index_logical_projection
                 .schema()
                 .join(underlying_table_scan.schema())?;
 
@@ -258,10 +256,16 @@ impl TableProvider for VectorScanTableProvider {
 
             let join_conditions: Vec<(Expr, Expr)> = primary_key_fields
                 .iter()
-                .map(|pk_field| {
+                .map(|field| {
                     (
-                        Expr::Column(Column::new_unqualified(pk_field.name())),
-                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                        Expr::Column(Column::new(
+                            Some(TableReference::parse_str("vector_index")),
+                            field.name(),
+                        )),
+                        Expr::Column(Column::new(
+                            Some(TableReference::parse_str("base_table")),
+                            field.name(),
+                        )),
                     )
                 })
                 .collect();
@@ -269,14 +273,14 @@ impl TableProvider for VectorScanTableProvider {
             // Right Join so that all rows in the underlying table are returned.
             // Rows may not have associated vectors periodically due to indexing delays.
             let join = LogicalPlan::Join(Join {
-                left: Arc::new(vector_table_scan),
+                left: Arc::new(index_logical_projection),
                 right: Arc::new(underlying_table_scan),
                 join_type: JoinType::Right,
                 join_constraint: JoinConstraint::On,
                 on: join_conditions,
                 filter: pre_join_filters.into_iter().reduce(Expr::and),
                 schema: join_schema.into(),
-                null_equals_null: false,
+                null_equality: NullEquality::NullEqualsNothing,
             });
 
             // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
@@ -340,10 +344,10 @@ mod tests {
         sql::TableReference,
     };
 
-    use crate::embeddings::index::VectorScanTableProvider;
     use crate::embeddings::index::tests::{
         PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
     };
+    use crate::embeddings::index::{VectorScanTableProvider, tests::ExplainMemTable};
 
     #[tokio::test]
     pub async fn test_vector_scan_basic() -> Result<(), String> {
@@ -354,13 +358,14 @@ mod tests {
         ]));
 
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
@@ -415,13 +420,14 @@ mod tests {
             Field::new("not_where", DataType::Utf8, false),
         ]));
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
@@ -514,13 +520,14 @@ mod tests {
             Field::new("not_where", DataType::Utf8, false),
         ]));
         let p = VectorScanTableProvider {
-            table_provider: Arc::new(
+            table_provider: Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            ),
+                "BaseTable",
+            )),
             index: Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![

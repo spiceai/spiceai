@@ -8,32 +8,30 @@ expression: normalize_search_response(resp)
     {
       "dataset": "multi_column_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": "Years must understand. Well fat thousands take. Good police "
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 7
       },
-      "score": 0.03
+      "score": 0.01
     },
     {
       "dataset": "multi_column_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Earlier different differences get just to a methods; masses inclu"
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
         "cp_catalog_page_sk": 3
       },
-      "score": 0.03
+      "score": 0.01
     },
     {
       "dataset": "multi_column_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_description": "Good questions borrow only base children. Remarkably present "
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 19
       },
       "score": 0.01
     }

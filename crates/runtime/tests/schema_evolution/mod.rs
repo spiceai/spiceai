@@ -189,11 +189,8 @@ async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
         .with_dataset(ds)
         .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion_configuration_fn(configure_test_datafusion)
-        .build()
-        .await;
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
 
     let cloned_rt = Arc::new(rt.clone());
 

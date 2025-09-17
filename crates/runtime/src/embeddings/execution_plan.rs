@@ -185,7 +185,7 @@ fn to_sendable_stream(
                                 Ok(embedded_batch) => yield Ok(embedded_batch),
                                 Err(e) => {
                                     tracing::debug!("Failed to construct record batch");
-                                    yield Err(DataFusionError::ArrowError(e, None))
+                                    yield Err(DataFusionError::ArrowError(Box::new(e), None))
                                 },
                             }
                         }

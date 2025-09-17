@@ -53,11 +53,8 @@ async fn glue_federation() -> Result<(), anyhow::Error> {
                 .with_dataset(get_glue_dataset("glue:testdb.hive_table_001", "hive"))
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

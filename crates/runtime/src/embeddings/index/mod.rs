@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use arrow_schema::FieldRef;
 
-use datafusion::{catalog::TableProvider, logical_expr::LogicalPlan, prelude::Expr};
+use datafusion::{logical_expr::LogicalPlan, prelude::Expr};
 
 mod retry_client;
 pub mod s3;
@@ -27,13 +27,13 @@ pub use scan_table::VectorScanTableProvider;
 use search::index::SearchIndex;
 
 pub trait VectorIndex: SearchIndex {
-    /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
-    /// columns and the associated embedding vectors of the [`SearchIndex::search_column`].
+    /// A [`LogicalPlan`] representation of the data within the index. The [`LogicalPlan::schema`] must contain
+    ///  - The [`SearchIndex::primary_fields`]
+    ///  - All columns in [`SearchIndex::metadata_columns`]
+    ///  - The associated embedding vectors of the [`SearchIndex::search_column`].
     ///
     /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
-    fn list_table_provider(
-        &self,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
@@ -49,7 +49,7 @@ pub(super) fn search_index_table_is_sufficient(
         .map(|f| f.name().to_string())
         .collect();
 
-    let full_projection = search_index_has_full_projection(&projection, &search_index_columns);
+    let full_projection = search_index_has_full_projection(projection, &search_index_columns);
     let search_index_filters = search_index_filters(&search_index_columns, filters);
 
     full_projection && search_index_filters.len() == filters.len()
@@ -102,15 +102,17 @@ pub mod tests {
         util::pretty,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use async_trait::async_trait;
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
-        datasource::TableType,
+        datasource::{DefaultTableSource, TableType},
         error::DataFusionError,
         logical_expr::TableProviderFilterPushDown,
         physical_plan::{DisplayAs, ExecutionPlan},
         prelude::{Expr, SessionConfig, SessionContext},
         sql::TableReference,
     };
+    use datafusion_expr::{LogicalPlan, TableScan};
     use search::generation::util::append_fields;
     use search::metadata::{MetadataColumn, MetadataColumns};
     use snafu::ResultExt;
@@ -123,8 +125,13 @@ pub mod tests {
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
     #[derive(Debug)]
-    pub struct ExplainMemTable(MemTable);
-
+    pub struct ExplainMemTable(pub MemTable, pub &'static str);
+    impl ExplainMemTable {
+        #[must_use]
+        pub fn new(table: MemTable, name: &'static str) -> Self {
+            Self(table, name)
+        }
+    }
     /// Wraps a [`ExecutionPlan`] with a new [`DisplayAs`] to show what filters have been pushed down.
     /// This is useful for testing explain plans.
     #[derive(Debug)]
@@ -133,11 +140,12 @@ pub mod tests {
         Vec<Expr>,
         Option<usize>,
         Option<Vec<usize>>,
+        &'static str,
     );
 
     impl ExecutionPlan for ExplainExecutionPlan {
         fn name(&self) -> &'static str {
-            "ExplainExecutionPlan"
+            self.4
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -161,7 +169,8 @@ pub mod tests {
                 self.1.clone(),
                 self.2,
                 self.3.clone(),
-            )))
+                self.4,
+            )) as Arc<dyn ExecutionPlan>)
         }
 
         fn execute(
@@ -189,14 +198,14 @@ pub mod tests {
 
             write!(
                 f,
-                "ExplainExecutionPlan: projection={columns:?} filter={:?} limit={:?}",
-                self.1, self.2,
+                "{}: projection={columns:?} filter={:?} limit={:?}",
+                self.4, self.1, self.2,
             )?;
             Ok(())
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl TableProvider for ExplainMemTable {
         fn as_any(&self) -> &dyn Any {
             self
@@ -222,6 +231,7 @@ pub mod tests {
                 filters.to_vec(),
                 limit,
                 projection.cloned(),
+                self.1,
             )) as Arc<dyn ExecutionPlan>)
         }
 
@@ -272,11 +282,11 @@ pub mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl VectorIndex for PretendVectorIndex {
         fn list_table_provider(
             &self,
-        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
             let mem_table = MemTable::try_new(
                 Arc::new(self.schema.clone()),
                 vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
@@ -284,11 +294,25 @@ pub mod tests {
                 ))]],
             )
             .boxed()?;
-            Ok(Arc::new(ExplainMemTable(mem_table)))
+
+            Ok(LogicalPlan::TableScan(
+                TableScan::try_new(
+                    "tbl",
+                    Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                        mem_table,
+                        "PretendVectorIndex",
+                    ))
+                        as Arc<dyn TableProvider>)),
+                    None,
+                    vec![],
+                    None,
+                )
+                .boxed()?,
+            ))
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl SearchIndex for PretendVectorIndex {
         fn search_column(&self) -> String {
             self.embedded_column.clone()
@@ -318,12 +342,13 @@ pub mod tests {
                 vec![Arc::new(Field::new("score", DataType::Float64, false))],
             );
 
-            Ok(Arc::new(ExplainMemTable(
+            Ok(Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .boxed()?,
+                "PretendVectorIndex",
             )) as Arc<dyn TableProvider>)
         }
     }

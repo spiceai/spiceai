@@ -79,8 +79,8 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("5s")
                 .build();
 
+            configure_test_datafusion();
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);
@@ -169,8 +169,8 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("20s")
                 .build();
 
+            configure_test_datafusion();
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);

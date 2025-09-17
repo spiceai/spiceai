@@ -24,12 +24,12 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Column, DFSchema, JoinConstraint, JoinType},
+    common::{Column, DFSchema, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
-        Filter, Join, LogicalPlan, Projection, Sort, SortExpr, TableProviderFilterPushDown,
-        TableScan,
+        Filter, Join, LogicalPlan, Projection, Sort, SortExpr, SubqueryAlias,
+        TableProviderFilterPushDown, TableScan,
     },
     physical_plan::ExecutionPlan,
     prelude::Expr,
@@ -86,7 +86,7 @@ impl SearchQueryProvider {
                 let projected = self
                     .schema()
                     .project(indices)
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 Arc::new(projected)
             }
         };
@@ -98,21 +98,22 @@ impl SearchQueryProvider {
             .collect();
 
         let has_all_columns = search_index_columns.is_superset(&columns_requested);
+        if !has_all_columns {
+            // Early exit.
+            return Ok(false);
+        }
 
         // Check if all filters can be handled by search index
-        let handleable_filters = filters
-            .iter()
-            .filter(|f| {
-                let filter_columns = f
-                    .column_refs()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect::<HashSet<_>>();
-                search_index_columns.is_superset(&filter_columns)
-            })
-            .count();
+        let all_filters_can_be_done = filters.iter().all(|f| {
+            let filter_columns = f
+                .column_refs()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect::<HashSet<_>>();
+            search_index_columns.is_superset(&filter_columns)
+        });
 
-        Ok(has_all_columns && handleable_filters == filters.len())
+        Ok(all_filters_can_be_done)
     }
 
     /// Build the underlying table scan, removing search index metadata columns from projection
@@ -122,7 +123,7 @@ impl SearchQueryProvider {
         filters: &[Expr],
         all_metadata_columns: &[String],
     ) -> Result<LogicalPlan, DataFusionError> {
-        let base_proj = projection_without_columns(
+        let mut base_proj = projection_without_columns(
             &self.schema().fields,
             &[
                 all_metadata_columns,
@@ -131,6 +132,7 @@ impl SearchQueryProvider {
             .concat(),
             projection,
         );
+        base_proj.sort_unstable(); // Deterministic LogicalPlans
 
         // Get filters that can be pushed down to the base table
         let filter_refs: Vec<_> = filters.iter().collect();
@@ -215,6 +217,12 @@ impl SearchQueryProvider {
         search_index_table: LogicalPlan,
         filters: &[Expr],
     ) -> Result<LogicalPlan, DataFusionError> {
+        // Add subquery so that we can uniquely identify columns between search index and underlying table scan.
+        let search_index_proj = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            search_index_table.into(),
+            TableReference::parse_str("search_index"),
+        )?);
+
         let primary_key_fields = self.search_index.primary_fields();
         let primary_key_projection: Vec<usize> = primary_key_fields
             .iter()
@@ -259,7 +267,7 @@ impl SearchQueryProvider {
             .collect();
 
         // Build join schema
-        let join_schema = search_index_table
+        let join_schema = search_index_proj
             .schema()
             .join(underlying_table_scan.schema())?;
 
@@ -276,14 +284,14 @@ impl SearchQueryProvider {
             });
 
         let join = LogicalPlan::Join(Join {
-            left: Arc::new(search_index_table),
+            left: Arc::new(search_index_proj),
             right: Arc::new(underlying_table_scan),
             join_type: JoinType::Left,
             join_constraint: JoinConstraint::On,
             on,
             filter: pre_join_filters.into_iter().reduce(Expr::and),
             schema: join_schema.into(),
-            null_equals_null: false,
+            null_equality: NullEquality::NullEqualsNothing,
         });
 
         let deduped_schema = DFSchema::new_with_metadata(
@@ -395,7 +403,7 @@ impl TableProvider for SearchQueryProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -403,7 +411,7 @@ impl TableProvider for SearchQueryProvider {
         // Check primary key constraints
         if self.search_index.primary_fields().is_empty() {
             return Err(DataFusionError::Execution(
-                "The search index was created successfully without a primary key.\n\
+                "The search index was created without a primary key.\n\
                 Ensure a primary key is available in the dataset source, or specified in the column configuration."
                 .to_string(),
             ));
@@ -442,7 +450,7 @@ impl TableProvider for SearchQueryProvider {
                 let projected = self
                     .schema()
                     .project(idx)
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?;
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 Arc::new(projected)
             }
         };
@@ -455,11 +463,7 @@ impl TableProvider for SearchQueryProvider {
             )?),
         ));
 
-        // Convert logical plan to execution plan
-        let session_ctx = datafusion::prelude::SessionContext::new();
-        let exec_state = session_ctx.state();
-
-        exec_state.create_physical_plan(&final_proj).await
+        state.create_physical_plan(&final_proj).await
     }
 }
 

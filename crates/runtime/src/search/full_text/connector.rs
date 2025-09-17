@@ -14,14 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use std::any::Any;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::changes::index_change_envelope;
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::federated_table::FederatedTable;
+use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -118,6 +123,40 @@ impl FullTextConnector {
 
         first
     }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn with_indexed_stream<F>(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        f: F,
+    ) -> Option<ChangesStream>
+    where
+        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
+    {
+        let table_provider = federated_table.try_table_provider_sync()?;
+
+        let Some(indexed) = table_provider
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>()
+            .cloned()
+        else {
+            tracing::debug!(
+                "FullTextConnector didn't wrap underlying table with index - this is unexpected"
+            );
+            return None;
+        };
+
+        let indexed = Arc::new(indexed);
+        let underlying = indexed.get_underlying();
+        let ft = Arc::new(FederatedTable::Immediate(underlying));
+
+        let stream = f(&self.inner_connector, ft)?;
+        Some(
+            stream
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexed)))
+                .boxed(),
+        )
+    }
 }
 
 #[async_trait]
@@ -168,5 +207,25 @@ impl DataConnector for FullTextConnector {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
             .await
+    }
+
+    fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
+        self.inner_connector.resolve_refresh_mode(refresh_mode)
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        self.inner_connector.supports_changes_stream()
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        self.with_indexed_stream(federated_table, |inner, ft| inner.changes_stream(ft))
+    }
+
+    fn supports_append_stream(&self) -> bool {
+        self.inner_connector.supports_append_stream()
+    }
+
+    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
     }
 }

@@ -43,13 +43,8 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             let cloned_rt = Arc::clone(&rt);
 
@@ -95,10 +90,10 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
                 .with_catalog(catalog)
                 .build();
 
+            configure_test_datafusion();
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .with_autoload_extensions(HashMap::from([(
                         "spice_cloud".to_string(),
                         Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,

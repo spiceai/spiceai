@@ -126,6 +126,12 @@ mod tests {
         dataset.acceleration = Some(Acceleration {
             engine: Engine::DuckDB,
             mode: Mode::File,
+            params: [(
+                "duckdb_file".to_string(),
+                ".spice/data/kafka_duckdb_test.db".to_string(),
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         });
 
@@ -156,8 +162,9 @@ mod tests {
 
         kafka_sys
             .upsert(&test_metadata)
+            .await
             .expect("to upsert metadata");
-        let retrieved = kafka_sys.get().expect("to retrieve metadata");
+        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
 
         assert_eq!(retrieved.consumer_group_id, test_metadata.consumer_group_id);
         assert_eq!(retrieved.topic, test_metadata.topic);
@@ -174,15 +181,17 @@ mod tests {
 
         kafka_sys
             .upsert(&test_metadata)
+            .await
             .expect("to upsert metadata");
 
         test_metadata.consumer_group_id = "updated-group-456".to_string();
         test_metadata.topic = "updated-topic".to_string();
         kafka_sys
             .upsert(&test_metadata)
+            .await
             .expect("to overwrite metadata");
 
-        let retrieved = kafka_sys.get().expect("to retrieve metadata");
+        let retrieved = kafka_sys.get().await.expect("to retrieve metadata");
         assert_eq!(retrieved.consumer_group_id, "updated-group-456");
         assert_eq!(retrieved.topic, "updated-topic");
         assert_eq!(retrieved.schema, test_metadata.schema);
@@ -195,7 +204,7 @@ mod tests {
             .await
             .expect("to create KafkaSys");
 
-        let result = kafka_sys.get();
+        let result = kafka_sys.get().await;
         assert!(
             result.is_none(),
             "Should return None for nonexistent dataset"

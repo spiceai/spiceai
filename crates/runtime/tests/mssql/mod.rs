@@ -198,11 +198,8 @@ async fn mssql_integration_test() -> Result<(), String> {
                 .with_dataset(make_mssql_dataset("test", "test", MSSQL_PORT))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

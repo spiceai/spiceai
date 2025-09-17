@@ -128,15 +128,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Used to configure `DataFusion` in integration tests & test CI
-    pub fn with_datafusion_configuration_fn(
-        mut self,
-        callback: DatafusionConfigurationCallback,
-    ) -> Self {
-        self.datafusion_configuration_fn = Some(callback);
-        self
-    }
-
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self

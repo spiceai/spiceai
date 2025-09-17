@@ -16,8 +16,10 @@ limitations under the License.
 
 #![allow(clippy::large_futures)]
 
+use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+
 mod docker;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -34,14 +36,18 @@ pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
 /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
-fn configure_test_datafusion(df: &mut runtime::datafusion::DataFusion) {
-    let state = df.ctx.state_ref();
-    let mut state_lock = state.write();
-    state_lock
-        .config_mut()
-        .options_mut()
-        .execution
-        .target_partitions = 3;
+/// 2) Disables coalesce batches and repartition joins for terser plans.
+fn configure_test_datafusion() {
+    match DEFAULT_DATAFUSION_CONFIG.write() {
+        Ok(mut config) => {
+            config.options_mut().execution.target_partitions = 3;
+
+            config.options_mut().execution.coalesce_batches = false;
+
+            config.options_mut().optimizer.repartition_joins = false;
+        }
+        _ => panic!("Must obtain write lock to defaults"),
+    }
 }
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {

@@ -4,8 +4,8 @@ on:
   push:
     branches: [trunk]
     paths:
-      - "tools/spiceschema/**"
-      - "crates/**"
+      - 'tools/spiceschema/**'
+      - 'crates/**'
   workflow_dispatch:
 
 jobs:

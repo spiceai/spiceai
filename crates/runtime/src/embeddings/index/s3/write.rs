@@ -28,6 +28,7 @@ use search::index::SearchIndex;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
+use util::distribute_nulls;
 
 use crate::{embedding_col, embeddings::index::s3::S3Vector, model::EmbeddingModelStore};
 use util::convert_string_arrow_to_iterator;
@@ -131,9 +132,17 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     )
     .await?;
 
-    let metadata =
-        extract_and_format_metadata(index.name(), &index.metadata_columns().all_names(), &record)
-            .map_err(|e| *e)?;
+    let metadata = extract_and_format_metadata(
+        index.name(),
+        &index
+            .metadata_columns()
+            .all_names()
+            .into_iter()
+            .filter(|c| *c != embedding_col!(index.search_column()))
+            .collect::<Vec<_>>(),
+        &record,
+    )
+    .map_err(|e| *e)?;
     let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
         .map_err(|e| *e)?;
 
@@ -367,22 +376,7 @@ async fn embed_column(
         .await
         .context(FailedToEmbedSnafu)?;
 
-    let mut result: Vec<Option<Vec<f32>>> = vec![];
-    let mut value_ptr = 0;
-    let mut null_ptr = 0;
-
-    while value_ptr < embedded_data.len() || null_ptr < nulls.len() {
-        while null_ptr < nulls.len() && nulls[null_ptr] == result.len() {
-            result.push(None);
-            null_ptr += 1;
-        }
-        if value_ptr < embedded_data.len() {
-            result.push(Some(embedded_data[value_ptr].clone()));
-            value_ptr += 1;
-        }
-    }
-
-    Ok(result)
+    Ok(distribute_nulls(embedded_data, nulls))
 }
 
 /// Update the embedding column in the `RecordBatch` with the computed embeddings.

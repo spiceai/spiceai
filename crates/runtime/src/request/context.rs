@@ -29,7 +29,7 @@ use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use crate::datafusion::DataFusion;
+use crate::{datafusion::DataFusion, http::traceparent::TraceParent};
 
 use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
 
@@ -43,6 +43,7 @@ pub struct RequestContext {
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
+    trace_parent: Option<TraceParent>,
 }
 
 tokio::task_local! {
@@ -181,6 +182,11 @@ impl RequestContext {
         &self.client_supplied_cache_key
     }
 
+    #[must_use]
+    pub fn trace_parent(&self) -> &Option<TraceParent> {
+        &self.trace_parent
+    }
+
     pub fn extension<T>(&self) -> Option<Arc<T>>
     where
         T: 'static + Send + Sync + Clone,
@@ -229,6 +235,7 @@ pub struct RequestContextBuilder {
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
     extensions: Extensions,
+    trace_parent: Option<TraceParent>,
 }
 
 impl RequestContextBuilder {
@@ -243,6 +250,7 @@ impl RequestContextBuilder {
             user_agent: UserAgent::Absent,
             baggage: vec![],
             extensions: Extensions::default(),
+            trace_parent: None,
         }
     }
 
@@ -288,6 +296,15 @@ impl RequestContextBuilder {
                 .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
         }
 
+        match crate::http::traceparent::extract_trace_parent(headers) {
+            Ok(trace_parent) => {
+                self.trace_parent = trace_parent;
+            }
+            Err(e) => {
+                tracing::warn!("Received invalid `traceparent` HTTP header: {e}");
+            }
+        }
+
         self
     }
 
@@ -312,6 +329,12 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_baggage(mut self, baggage: Vec<KeyValue>) -> Self {
         self.baggage = baggage;
+        self
+    }
+
+    #[must_use]
+    pub fn with_trace_parent(mut self, trace_parent: Option<TraceParent>) -> Self {
+        self.trace_parent = trace_parent;
         self
     }
 
@@ -381,6 +404,7 @@ impl RequestContextBuilder {
             dimensions,
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
+            trace_parent: self.trace_parent,
         }
     }
 

@@ -42,7 +42,7 @@ runs:
       run: |
         cd /opt/spiced/data
         mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
-    
+
     - name: Download File Connector TPCDS Data
       shell: bash
       if: inputs.query_set == 'tpcds'
@@ -52,7 +52,7 @@ runs:
         mkdir ./sf0_01
         cd ./sf0_01
         mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/ ./
-    
+
     - name: Download File Connector ClickBench Data
       shell: bash
       if: inputs.query_set == 'clickbench'

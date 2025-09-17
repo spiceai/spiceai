@@ -225,6 +225,8 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use rstest::rstest;
+    #[cfg(feature = "xxhash")]
+    use spicepod::component::caching::HashingAlgorithm;
     use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
     use std::time::Duration;
@@ -390,6 +392,36 @@ mod tests {
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
+        let cache: LruCache<CachedQueryResult, _> =
+            LruCache::new(10, Duration::from_millis(100), hasher);
+        let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        cache.put_raw_key(&key().as_u64(), result).await;
+
+        // Verify the value is in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_some());
+
+        // Wait for the TTL to expire
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_none());
+    }
+
+    #[cfg(feature = "xxhash")]
+    #[rstest]
+    #[case::xxh3(HashingAlgorithm::XXH3)]
+    #[case::xxh32(HashingAlgorithm::XXH32)]
+    #[case::xxh64(HashingAlgorithm::XXH64)]
+    #[case::xxh128(HashingAlgorithm::XXH128)]
+    #[tokio::test]
+    async fn test_cache_ttl_xhash(#[case] hashing_algo: HashingAlgorithm) {
+        let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
+
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());

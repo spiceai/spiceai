@@ -330,7 +330,7 @@ async fn list_vector_segment(
         let rows: Vec<_> = vectors.into_iter().map(to_flat_value).collect();
         decoder.serialize(rows.as_slice()).map_err(|e| {
             DataFusionError::ArrowError(
-                e,
+                Box::new(e),
                 Some(
                     "could not convert ListVectors JSON response into expected Arrow format"
                         .to_string(),
@@ -346,7 +346,7 @@ async fn list_vector_segment(
             Err(e) => {
                 let _ = tx
                     .send(Err(DataFusionError::ArrowError(
-                        e,
+                        Box::new(e),
                         Some("Received only partial JSON payload from ListVectors".to_string()),
                     )))
                     .await;

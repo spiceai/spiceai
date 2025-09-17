@@ -182,7 +182,8 @@ impl SearchIndex for S3Vector {
         let vector = self.query_vector(query).await?;
         let tp = Arc::new(S3VectorsQueryTable::new(self.table.clone(), vector));
 
-        table_with_projection(tp, projection).boxed()
+        let lp = table_with_projection(tp, projection).boxed()?;
+        Ok(Arc::new(ViewTable::new(lp, None)) as Arc<dyn TableProvider>)
     }
 }
 
@@ -190,9 +191,7 @@ impl VectorIndex for S3Vector {
     /// Use a [`S3VectorsListTable`] and then:
     ///   1. Convert the primary key to its appropriate name and data type
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
-    fn list_table_provider(
-        &self,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
         let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
         projection.push(Expr::Alias(Alias::new(
@@ -241,6 +240,7 @@ impl Index for S3Vector {
         pks.extend(
             self.base_metadata_columns
                 .iter()
+                .filter(|c| *c.name() != embedding_col!(self.embedded_column))
                 .map(|c| c.name().to_string()),
         );
 
@@ -261,21 +261,17 @@ impl Index for S3Vector {
 fn table_with_projection(
     tbl: Arc<dyn TableProvider>,
     projection: Vec<Expr>,
-) -> Result<Arc<dyn TableProvider>, DataFusionError> {
-    let scan = TableScan::try_new(
-        "tbl",
-        Arc::new(DefaultTableSource::new(tbl)),
-        None,
-        vec![],
-        None,
-    )?;
-    Ok(Arc::new(ViewTable::new(
-        LogicalPlan::Projection(Projection::try_new(
-            projection,
-            Arc::new(LogicalPlan::TableScan(scan)),
-        )?),
-        None,
-    )) as Arc<dyn TableProvider>)
+) -> Result<LogicalPlan, DataFusionError> {
+    Ok(LogicalPlan::Projection(Projection::try_new(
+        projection,
+        Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+            "tbl",
+            Arc::new(DefaultTableSource::new(tbl)),
+            None,
+            vec![],
+            None,
+        )?)),
+    )?))
 }
 
 /// For a given data type, determine the variant within the JSON `Union(_, Sparse)` that would be populated from the associated [`datafusion_functions_json::udfs::json_get_udf`].
