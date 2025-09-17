@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::AsTableRefs;
 use crate::FailedToInvalidateCacheSnafu;
 use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::metrics::CacheMetrics;
-use crate::AsTableRefs;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
