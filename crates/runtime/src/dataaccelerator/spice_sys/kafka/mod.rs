@@ -32,6 +32,10 @@ const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "postgres")]
+mod postgres;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 pub struct KafkaSys {
     dataset_name: String,
@@ -53,47 +57,27 @@ impl KafkaSys {
         })
     }
 
-    pub(crate) fn get(&self) -> Option<KafkaMetadata> {
+    pub(crate) async fn get(&self) -> Option<KafkaMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
             #[cfg(feature = "postgres")]
-            AccelerationConnection::Postgres(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in Postgres for state retention across restarts is not currently supported"
-                );
-                None
-            }
+            AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in SQLite for state retention across restarts is not currently supported"
-                );
-                None
-            }
+            AccelerationConnection::SQLite(pool) => self.get_sqlite(pool).await,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
             _ => None,
         }
     }
 
-    pub(crate) fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
+    pub(crate) async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
             #[cfg(feature = "postgres")]
-            AccelerationConnection::Postgres(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in Postgres for state retention across restarts is not currently supported"
-                );
-                Ok(())
-            }
+            AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in SQLite for state retention across restarts is not currently supported"
-                );
-                Ok(())
-            }
+            AccelerationConnection::SQLite(pool) => self.upsert_sqlite(pool, metadata).await,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
             _ => Err("No acceleration connection available".into()),
         }

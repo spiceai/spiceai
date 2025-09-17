@@ -90,15 +90,23 @@ func (tMs *TimeWithMilliSeconds) UnmarshalJSON(b []byte) error {
 	s := string(b)
 	s = s[1 : len(s)-1]
 
-	layout := "2006-01-02T15:04:05.999999"
+	layouts := []string{
+        "2006-01-02T15:04:05.999999Z",
+        "2006-01-02T15:04:05.999999",
+    }
 
-	t, err := time.Parse(layout, s)
-	if err != nil {
-		return err
-	}
+	var t time.Time
+    var err error
 
-	*tMs = TimeWithMilliSeconds(t)
-	return nil
+    for _, layout := range layouts {
+        t, err = time.Parse(layout, s)
+        if err == nil {
+            *tMs = TimeWithMilliSeconds(t)
+            return nil
+        }
+    }
+
+	return fmt.Errorf("cannot parse time: %w", err)
 }
 
 func (tMs TimeWithMilliSeconds) asTime() time.Time {
