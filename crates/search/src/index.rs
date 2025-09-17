@@ -35,7 +35,6 @@ pub trait SearchIndex: std::fmt::Debug + Send + Sync + 'static {
     fn search_column(&self) -> String;
 
     /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
-    ///
     fn primary_fields(&self) -> Vec<Field>;
 
     /// The additional columns available in the [`SearchIndex`].
