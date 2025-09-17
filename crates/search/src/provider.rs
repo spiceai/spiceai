@@ -302,8 +302,10 @@ impl SearchQueryProvider {
                     && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
             })
             .map(|(tbl, field_ref)| match tbl {
-                Some(table_ref) => col(format!("{}.{}", table_ref.table(), field_ref.name())),
-                None => col(field_ref.name()),
+                Some(table_ref) => {
+                    Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
+                }
+                None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
             })
             .collect();
 
