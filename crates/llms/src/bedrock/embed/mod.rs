@@ -34,6 +34,8 @@ use async_openai::types::{
 };
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::types::error::ThrottlingException as BedrockThrottlingException;
+use cache::CacheProvider;
+use cache::result::embeddings::CachedEmbeddingResult;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use snafu::ResultExt;
@@ -52,6 +54,9 @@ where
 {
     client: BedrockClient,
     config: Arc<dyn BedrockEmbeddingConfig<Rq, Rsp> + 'static>,
+
+    // Shared embeddings cache
+    cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 #[must_use]
@@ -71,7 +76,11 @@ pub fn new_titan_v2(
         dimensions,
     }) as Arc<dyn BedrockEmbeddingConfig<TitanEmbedRequest, TitanEmbedResponse>>;
 
-    BedrockEmbed::<TitanEmbedRequest, TitanEmbedResponse> { client, config }
+    BedrockEmbed::<TitanEmbedRequest, TitanEmbedResponse> {
+        client,
+        config,
+        cache: None,
+    }
 }
 
 #[must_use]
@@ -94,7 +103,11 @@ pub fn new_cohere(
         embedding_type,
     }) as Arc<dyn BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse>>;
 
-    BedrockEmbed::<CohereEmbedRequest, CohereEmbedResponse> { client, config }
+    BedrockEmbed::<CohereEmbedRequest, CohereEmbedResponse> {
+        client,
+        config,
+        cache: None,
+    }
 }
 
 impl<Rq, Rsp> BedrockEmbed<Rq, Rsp>
@@ -185,6 +198,15 @@ where
             }
         }
     }
+
+    #[must_use]
+    pub fn set_cache(
+        mut self,
+        cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> Self {
+        self.cache = cache;
+        self
+    }
 }
 
 /// [`BedrockEmbeddingConfig`] handles the model-specific request and response payloads expected by AWS Bedrock.
@@ -209,10 +231,20 @@ where
     Rq: Serialize + Sized + Send + Sync + Debug,
     Rsp: DeserializeOwned + Send + Sync + Debug,
 {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        self.cache.as_ref().map(Arc::clone)
+    }
+
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
     ) -> EmbedResult<CreateEmbeddingResponse> {
+        if let Some(CachedEmbeddingResult::Response(cached)) =
+            self.get_cached_embed((&req).into()).await
+        {
+            return Ok(cached);
+        }
+
         let texts = Self::convert_input_to_texts(&req.input);
 
         let (vectors, num_tokens) = self
@@ -221,7 +253,7 @@ where
             .boxed()
             .context(FailedToCreateEmbeddingSnafu)?;
 
-        Ok(CreateEmbeddingResponse {
+        let resp = CreateEmbeddingResponse {
             object: "list".to_string(),
             model: req.model.clone(),
             data: vectors
@@ -238,10 +270,21 @@ where
                 prompt_tokens: num_tokens,
                 total_tokens: num_tokens,
             },
-        })
+        };
+
+        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
+            .await;
+
+        Ok(resp)
     }
 
     async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+        if let Some(CachedEmbeddingResult::Vector(cached)) =
+            self.get_cached_embed((&input).into()).await
+        {
+            return Ok(cached);
+        }
+
         let texts = Self::convert_input_to_texts(&input);
 
         let num_items = texts.len();
@@ -264,6 +307,12 @@ where
             "Embedding completed in {duration:?} for {num_items} records using model {}",
             self.config.model_id()
         );
+
+        self.put_cached_embed(
+            (&input).into(),
+            CachedEmbeddingResult::Vector(vectors.clone()),
+        )
+        .await;
 
         Ok(vectors)
     }

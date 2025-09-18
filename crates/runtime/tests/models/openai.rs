@@ -384,7 +384,7 @@ mod embeddings {
 
     #[tokio::test]
     async fn openai_test_embeddings_cache() -> Result<(), anyhow::Error> {
-        let app = AppBuilder::new("cached_search")
+        let app = AppBuilder::new("embeddings_cache")
             .with_embedding(get_openai_embeddings(
                 Some("text-embedding-3-small"),
                 "openai_embeddings",
