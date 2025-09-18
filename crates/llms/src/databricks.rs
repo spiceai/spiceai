@@ -27,6 +27,7 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
+use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -47,6 +48,9 @@ pub struct Databricks {
     pub model: String,
     client: Client<HostedModelConfig>,
     health_check: HealthCheck,
+
+    // Shared embeddings cache
+    cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 impl Databricks {
     /// Changes to `req` to accomodate Databricks not being `OpenAI` compatible.
@@ -92,6 +96,15 @@ impl Databricks {
         }
         req
     }
+
+    #[must_use]
+    pub fn set_cache(
+        mut self,
+        cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> Self {
+        self.cache = cache;
+        self
+    }
 }
 
 #[must_use]
@@ -114,6 +127,7 @@ pub fn from_access_token(
         model: model.to_string(),
         client: Client::with_config(cfg),
         health_check: HealthCheck::Required,
+        cache: None,
     }
 }
 
@@ -139,6 +153,7 @@ pub fn from_token_provider(
         model: model.to_string(),
         client: Client::with_config(cfg),
         health_check,
+        cache: None,
     }
 }
 
@@ -272,6 +287,10 @@ impl Chat for Databricks {
 
 #[async_trait]
 impl Embed for Databricks {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        self.cache.as_ref().map(Arc::clone)
+    }
+
     async fn health(&self) -> super::embeddings::Result<()> {
         if matches!(self.health_check, HealthCheck::Skip) {
             return Ok(());
@@ -286,12 +305,27 @@ impl Embed for Databricks {
     }
 
     async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
+        if let Some(CachedEmbeddingResult::Response(cached)) =
+            self.get_cached_embed((&req).into()).await
+        {
+            return Ok(cached);
+        }
+
         // Must use `post` instead of `embeddings().create(...` to avoid concatenation of `/embeddings`.
-        self.client
-            .post::<_, CreateEmbeddingResponse>("", req)
+        let response = self
+            .client
+            .post::<_, CreateEmbeddingResponse>("", req.clone())
             .await
             .boxed()
-            .context(FailedToCreateEmbeddingSnafu)
+            .context(FailedToCreateEmbeddingSnafu)?;
+
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(response.clone()),
+        )
+        .await;
+
+        Ok(response)
     }
 
     fn size(&self) -> i32 {
@@ -299,10 +333,16 @@ impl Embed for Databricks {
     }
 
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        if let Some(CachedEmbeddingResult::Vector(cached)) =
+            self.get_cached_embed((&input).into()).await
+        {
+            return Ok(cached);
+        }
+
         let resp = self
             .embed_request(CreateEmbeddingRequest {
                 model: self.model.clone(),
-                input,
+                input: input.clone(),
                 encoding_format: None,
                 user: None,
                 dimensions: None,
@@ -311,11 +351,19 @@ impl Embed for Databricks {
             .boxed()
             .context(FailedToCreateEmbeddingSnafu)?;
 
-        Ok(resp
+        let vectors: Vec<Vec<f32>> = resp
             .data
             .into_iter()
             .map(|emb| emb.embedding.into())
-            .collect())
+            .collect();
+
+        self.put_cached_embed(
+            (&input).into(),
+            CachedEmbeddingResult::Vector(vectors.clone()),
+        )
+        .await;
+
+        Ok(vectors)
     }
 }
 

@@ -99,7 +99,7 @@ impl Runtime {
         }
 
         if embeddings_config.enabled {
-            match lru_cache::build_from_config(&CacheConfig::default()) {
+            match lru_cache::build_from_config(&embeddings_config) {
                 Ok(cache_provider) => {
                     in_tracing_context(|| {
                         tracing::info!("Initialized embeddings cache; {cache_provider}");
