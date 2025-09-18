@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, num::TryFromIntError, sync::Arc};
 
 use arrow::array::{
-    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, ListBuilder, RecordBatch,
-    StringArray, StringViewArray,
+    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray,
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field};

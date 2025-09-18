@@ -17,13 +17,12 @@ use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    vector_table::{S3VectorsTable, loosen_vector_schema, replace_column_in_record},
+    vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
 use super::{Error, S3VectorIdentifier};
 use arrow::{
     array::RecordBatch,
-    compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
     json::ReaderBuilder,
 };
@@ -357,34 +356,7 @@ async fn query_vector_stream(
     })?;
 
     match decoder.flush() {
-        Ok(Some(rb)) => {
-            // if vectors are returned, cast back to FixedSizeList
-            match rb.column_by_name(S3_VECTOR_EMBEDDING_NAME).map(|v| cast(
-                    v,
-                    &DataType::new_fixed_size_list(DataType::Float32, vector_size, false),
-                )) {
-                Some(Ok(v)) => {
-                    let _ = tx
-                        .send(
-                            replace_column_in_record(rb, S3_VECTOR_EMBEDDING_NAME, v)
-                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
-                        )
-                        .await;
-                }
-                None => {
-                    // No 'S3_VECTOR_EMBEDDING_NAME', send original RecordBatch.
-                    let _ = tx.send(Ok(rb)).await;
-                }
-                Some(Err(e)) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::ArrowError(
-                            Box::new(e),
-                            Some(format!("Successfully decoded ListVectors JSON, but could not convert {S3_VECTOR_EMBEDDING_NAME} from 'ListArray' to `FixedSizeListArray`.")),
-                        )))
-                        .await;
-                }
-            }
-        }
+        Ok(Some(rb)) => send_vector_data(&tx, rb, vector_size).await,
         Ok(None) => {}
         Err(e) => {
             let _ = tx

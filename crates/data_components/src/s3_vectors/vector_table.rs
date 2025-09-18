@@ -23,11 +23,16 @@ use crate::s3_vectors::{
 use super::{Error, Result, S3VectorIdentifier};
 use arrow::{
     array::{ArrayRef, RecordBatch},
+    compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
 use aws_credential_types::provider::error::CredentialsError;
-use datafusion::common::{Constraint, Constraints};
+use datafusion::{
+    common::{Constraint, Constraints},
+    error::DataFusionError,
+};
+
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
     GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
@@ -37,6 +42,7 @@ use s3_vectors::{
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
 use snafu::ResultExt;
+use tokio::sync::mpsc::Sender;
 
 /// An S3 Vector index.
 #[derive(Clone)]
@@ -458,7 +464,7 @@ pub(super) fn loosen_vector_schema(s: &SchemaRef, col: &str) -> (SchemaRef, i32)
             match f.data_type() {
                 DataType::FixedSizeList(inner, n) => {
                     len = *n;
-                    Arc::unwrap_or_clone(f.clone())
+                    Arc::unwrap_or_clone(Arc::clone(f))
                         .with_data_type(DataType::List(Arc::clone(inner)))
                         .into()
                 }
@@ -473,7 +479,7 @@ pub(super) fn loosen_vector_schema(s: &SchemaRef, col: &str) -> (SchemaRef, i32)
 pub(super) fn replace_column_in_record(
     rb: RecordBatch,
     col: &str,
-    data: ArrayRef,
+    data: &ArrayRef,
 ) -> Result<RecordBatch, ArrowError> {
     let Some((idx, _)) = rb.schema().column_with_name(col) else {
         return Ok(rb);
@@ -484,11 +490,11 @@ pub(super) fn replace_column_in_record(
             .iter()
             .map(|f| {
                 if f.name() == col {
-                    Arc::unwrap_or_clone(f.clone())
+                    Arc::unwrap_or_clone(Arc::clone(f))
                         .with_data_type(data.data_type().clone())
                         .into()
                 } else {
-                    f.clone()
+                    Arc::clone(f)
                 }
             })
             .collect::<Vec<_>>(),
@@ -500,7 +506,7 @@ pub(super) fn replace_column_in_record(
         .enumerate()
         .map(|(i, arr)| {
             if i == idx {
-                Arc::clone(&data)
+                Arc::clone(data)
             } else {
                 Arc::clone(arr)
             }
@@ -508,4 +514,39 @@ pub(super) fn replace_column_in_record(
         .collect::<Vec<_>>();
 
     RecordBatch::try_new(schema.into(), columns)
+}
+
+pub(super) async fn send_vector_data(
+    tx: &Sender<Result<RecordBatch, DataFusionError>>,
+    rb: RecordBatch,
+    vector_size: i32,
+) -> () {
+    // if vectors are returned, cast back to FixedSizeList
+    match rb.column_by_name(S3_VECTOR_EMBEDDING_NAME).map(|v| {
+        cast(
+            v,
+            &DataType::new_fixed_size_list(DataType::Float32, vector_size, false),
+        )
+    }) {
+        Some(Ok(v)) => {
+            let _ = tx
+                .send(
+                    replace_column_in_record(rb, S3_VECTOR_EMBEDDING_NAME, &v)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+                )
+                .await;
+        }
+        None => {
+            // No 'S3_VECTOR_EMBEDDING_NAME', send original RecordBatch.
+            let _ = tx.send(Ok(rb)).await;
+        }
+        Some(Err(e)) => {
+            let _ = tx
+                .send(Err(DataFusionError::ArrowError(
+                    Box::new(e),
+                    Some(format!("Successfully decoded S3 vector JSON response, but could not convert {S3_VECTOR_EMBEDDING_NAME} from 'ListArray' to `FixedSizeListArray`.")),
+                )))
+                .await;
+        }
+    }
 }
