@@ -17,8 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, num::TryFromIntError, sync::Arc};
 
 use arrow::array::{
-    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray,
+    Array, Float32Builder, LargeStringArray, ListBuilder, RecordBatch, StringArray, StringViewArray,
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field};
@@ -420,7 +419,6 @@ fn update_embedding_column_in_batch(
 }
 
 /// Create an Arrow array from embedding vectors.
-#[allow(clippy::cast_sign_loss)]
 fn create_embedding_array(
     embedding_vectors: &[Option<Vec<f32>>],
 ) -> Result<Arc<dyn Array>, Box<Error>> {
@@ -440,19 +438,18 @@ fn create_embedding_array(
             .map_err(Box::from)?;
     }
 
-    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
+    let mut builder = ListBuilder::new(Float32Builder::new());
     let field = Field::new_list_field(DataType::Float32, false);
     builder = builder.with_field(field);
 
     for embedding_opt in embedding_vectors {
         if let Some(embedding) = embedding_opt {
-            builder.values().append_values(
-                embedding,
-                &(0..embedding.len()).map(|_| true).collect::<Vec<_>>(),
-            );
+            let float_builder = builder.values();
+            for &value in embedding {
+                float_builder.append_value(value);
+            }
             builder.append(true);
         } else {
-            builder.values().append_nulls(dimension as usize);
             builder.append(false);
         }
     }
@@ -499,30 +496,28 @@ fn filter_zero_vectors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, StringArray};
+    use arrow::array::{Float32Array, Float32Builder, ListArray, ListBuilder, StringArray};
     use arrow::datatypes::{DataType, Schema};
 
     // Helper function to create a test RecordBatch with text and embedding columns
-    #[allow(clippy::cast_sign_loss)]
     fn create_test_record_batch_with_embeddings(
         texts: Vec<Option<&str>>,
         embeddings: Vec<Option<Vec<f32>>>,
-        dim: i32,
     ) -> RecordBatch {
         let text_array = StringArray::from(texts);
 
         // Create embedding array
-        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+        let mut builder = ListBuilder::new(Float32Builder::new());
         let field = Field::new_list_field(DataType::Float32, false);
         builder = builder.with_field(field);
         for embedding_opt in embeddings {
             if let Some(embedding) = embedding_opt {
-                builder
-                    .values()
-                    .append_values(&embedding, &(0..dim).map(|_| true).collect::<Vec<_>>());
+                let float_builder = builder.values();
+                for &value in &embedding {
+                    float_builder.append_value(value);
+                }
                 builder.append(true);
             } else {
-                builder.values().append_nulls(dim as usize);
                 builder.append(false);
             }
         }
@@ -532,10 +527,7 @@ mod tests {
             Field::new("text", DataType::Utf8, true),
             Field::new(
                 "text_embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, false)),
-                    dim,
-                ),
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
                 true,
             ),
         ]);
@@ -565,8 +557,8 @@ mod tests {
 
         let list_array = result
             .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Result should be FixedSizeListArray");
+            .downcast_ref::<ListArray>()
+            .expect("Result should be ListArray");
 
         assert_eq!(list_array.len(), 3);
         assert!(!list_array.is_null(0));
@@ -604,7 +596,6 @@ mod tests {
         let record = create_test_record_batch_with_embeddings(
             vec![Some("hello"), Some("world")],
             vec![None, None], // Existing embeddings are null
-            3,
         );
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
@@ -616,8 +607,8 @@ mod tests {
         let embedding_column = result.column(1);
         let list_array = embedding_column
             .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Embedding column should be FixedSizeListArray");
+            .downcast_ref::<ListArray>()
+            .expect("Embedding column should be ListArray");
 
         assert!(!list_array.is_null(0));
         assert!(!list_array.is_null(1));
@@ -656,8 +647,8 @@ mod tests {
         let embedding_column = result.column(result.num_columns() - 1);
         let list_array = embedding_column
             .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Embedding column should be FixedSizeListArray");
+            .downcast_ref::<ListArray>()
+            .expect("Embedding column should be ListArray");
 
         assert!(!list_array.is_null(0));
         assert!(!list_array.is_null(1));
