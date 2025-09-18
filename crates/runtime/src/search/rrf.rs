@@ -392,7 +392,7 @@ impl TableProvider for ReciprocalRankFusion {
         if let Some(ref df) = self.df {
             let mut df = df.clone();
 
-            if let Some(filter) = filters.iter().cloned().reduce(|a, b| a.and(b)) {
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
                 df = df.filter(filter)?;
             }
 
