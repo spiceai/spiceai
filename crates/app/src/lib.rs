@@ -224,6 +224,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_embeddings_cache(mut self, embeddings_cache: CacheConfig) -> AppBuilder {
+        self.runtime.caching.embeddings = Some(embeddings_cache);
+        self
+    }
+
+    #[must_use]
     pub fn with_tls_config(mut self, tls_config: TlsConfig) -> AppBuilder {
         self.runtime.tls = Some(tls_config);
         self
