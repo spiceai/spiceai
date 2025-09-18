@@ -245,13 +245,12 @@ impl EmbeddingConnector {
                                 source: e,
                             }
                         })?;
+
+                        vector_index =
+                            vector_index.add_metadata(ChunkedSearchIndex::add_metadata());
                         vector_index.primary_key =
                             ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
-                        vector_index.complete_metadata_columns =
-                            ChunkedSearchIndex::augment_metadata(
-                                vector_index.complete_metadata_columns,
-                            )
-                            .into();
+
                         let idx = Arc::new(vector_index);
                         let chunked_idx =
                             ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);

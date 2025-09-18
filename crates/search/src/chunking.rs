@@ -16,11 +16,12 @@ use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
     catalog::TableProvider,
+    common::Column,
     datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
     functions_aggregate::expr_fn::{array_agg, first_value},
-    logical_expr::{Aggregate, LogicalPlan, Projection, Sort, SortExpr, TableScan},
-    prelude::{ExprFunctionExt, col},
+    logical_expr::{Aggregate, LogicalPlan, Projection, Sort, SortExpr, TableScan, expr::Alias},
+    prelude::{Expr, ExprFunctionExt, col},
     sql::TableReference,
 };
 use futures::future::try_join_all;
@@ -34,6 +35,7 @@ use util::{arrow::repeat, convert_string_arrow_to_iterator};
 /// Two new [`FieldRef`]s augment the table:
 ///   1. An index of the chunks position in the underlying search column. This is an additional element in [`SearchIndex::primary_fields`].
 ///   2. The start and end index of the chunk into the underlying search column. This is an additional [`MetadataColumn::NonFilterable`] in  [`SearchIndex::metadata_columns`].
+#[derive(Clone)]
 pub struct ChunkedSearchIndex {
     inner: Arc<dyn SearchIndex>,
     chunker: Arc<dyn Chunker>,
@@ -48,7 +50,7 @@ impl Index for ChunkedSearchIndex {
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String> {
         let mut cols = self.inner.required_columns();
-        cols.retain(|s| s != "_spice.chunk_id");
+        cols.retain(|s| s != "_spice.chunk_id" && s != "_spice.chunk_offset");
         cols
     }
 
@@ -101,9 +103,7 @@ pub enum Error {
 }
 
 pub fn is_chunked(idx: &Arc<dyn SearchIndex>) -> bool {
-    idx.primary_fields()
-        .iter()
-        .any(|f| *f == Field::new("_spice.chunk_id", DataType::UInt64, false))
+    idx.as_any().downcast_ref::<ChunkedSearchIndex>().is_some()
 }
 
 impl std::fmt::Debug for ChunkedSearchIndex {
@@ -123,19 +123,15 @@ impl ChunkedSearchIndex {
         .concat()
     }
 
-    pub fn augment_metadata(metadata: MetadataColumns) -> Vec<MetadataColumn> {
-        vec![
-            metadata.into_iter().collect::<Vec<_>>(),
-            vec![MetadataColumn::NonFilterable(
-                Field::new(
-                    "_spice.chunk_offset",
-                    DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
-                    false,
-                )
-                .into(),
-            )],
-        ]
-        .concat()
+    pub fn add_metadata() -> Vec<MetadataColumn> {
+        vec![MetadataColumn::NonFilterable(
+            Field::new(
+                "_spice.chunk_offset",
+                DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
+                false,
+            )
+            .into(),
+        )]
     }
 
     pub fn new(inner: Arc<dyn SearchIndex>, chunker: Arc<dyn Chunker>) -> Self {
@@ -156,21 +152,32 @@ impl ChunkedSearchIndex {
             .inner
             .primary_fields()
             .iter()
-            .map(|f| col(f.name()))
+            .map(|f| Expr::Column(Column::new_unqualified(f.name())))
             .collect();
 
         // Primary key, offsets and embeddings.
         let mut aggr_expr = group_by_pks.clone();
         //// Need to `order by _spice.chunk_id`.
         aggr_expr.push(
-            array_agg(col("_spice.chunk_offset"))
-                .order_by(vec![SortExpr::new(col("_spice.chunk_id"), true, false)])
+            array_agg(Expr::Column(Column::new_unqualified("_spice.chunk_offset")))
+                .order_by(vec![SortExpr::new(
+                    Expr::Column(Column::new_unqualified("_spice.chunk_id")),
+                    true,
+                    false,
+                )])
                 .build()?,
         );
         aggr_expr.push(
-            array_agg(col(format!("{}_embedding", self.search_column())))
-                .order_by(vec![SortExpr::new(col("_spice.chunk_id"), true, false)])
-                .build()?,
+            array_agg(Expr::Column(Column::new_unqualified(format!(
+                "{}_embedding",
+                self.search_column()
+            ))))
+            .order_by(vec![SortExpr::new(
+                Expr::Column(Column::new_unqualified("_spice.chunk_id")),
+                true,
+                false,
+            )])
+            .build()?,
         );
         aggr_expr.extend(
             self.inner
@@ -186,7 +193,10 @@ impl ChunkedSearchIndex {
                     {
                         return None;
                     };
-                    Some(first_value(col(c), vec![]))
+                    Some(first_value(
+                        Expr::Column(Column::new_unqualified(c)),
+                        vec![],
+                    ))
                 })
                 .collect::<Vec<_>>(),
         );
@@ -207,12 +217,11 @@ impl SearchIndex for ChunkedSearchIndex {
     }
 
     fn primary_fields(&self) -> Vec<Field> {
-        // we might not need '_spice.chunk_id'.
-        [
-            self.inner.primary_fields(),
-            vec![], // vec![Field::new("_spice.chunk_id", DataType::UInt64, false)],
-        ]
-        .concat()
+        self.inner
+            .primary_fields()
+            .into_iter()
+            .filter(|pk| pk.name() != "_spice.chunk_id")
+            .collect::<Vec<_>>()
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
@@ -307,6 +316,7 @@ impl SearchIndex for ChunkedSearchIndex {
                     Ok((
                         field,
                         // This is lazy, avoid clone here.
+                        // WRONG this should still be the full content.
                         Arc::new(StringArray::from(flatten_chunks.clone())) as ArrayRef,
                     ))
                 } else {
@@ -335,18 +345,24 @@ impl SearchIndex for ChunkedSearchIndex {
             .write(rb)
             .await
             .context(InnerIndexWriteSnafu)
-            .boxed()
+            .boxed()?;
+
+        return Ok(record);
     }
 
     async fn query_table_provider(
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let pk_expr: Vec<_> = self
+        let pk_names: Vec<_> = self
             .inner
             .primary_fields()
             .iter()
-            .map(|f| col(f.name().clone()))
+            .map(|f| f.name().clone())
+            .collect();
+        let pk_expr: Vec<_> = pk_names
+            .iter()
+            .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
             .collect();
 
         let tbl_prov = self.inner.query_table_provider(query).await?;
@@ -370,7 +386,14 @@ impl SearchIndex for ChunkedSearchIndex {
         let aggr_expr: Vec<_> = schema
             .fields()
             .iter()
-            .map(|f| first_value(col(f.name()), order_by.clone()))
+            .filter(|f| !pk_names.contains(f.name())) // group expressions are in output by default.
+            .map(|f| {
+                first_value(
+                    Expr::Column(Column::new_unqualified(f.name().clone())),
+                    order_by.clone(),
+                )
+                .alias(f.name().clone())
+            })
             .collect();
 
         let agg =
@@ -381,14 +404,13 @@ impl SearchIndex for ChunkedSearchIndex {
             fetch: Some(1), // Only return most relevant chunk from each ID
         });
 
-        let proj = LogicalPlan::Projection(Projection::try_new(aggr_expr, sort.into())?);
-        let sort = LogicalPlan::Sort(Sort {
+        let sort2 = LogicalPlan::Sort(Sort {
             expr: vec![SortExpr::new(col(SEARCH_SCORE_COLUMN_NAME), false, false)],
-            input: proj.into(),
+            input: sort.into(),
             fetch: None,
         });
 
-        Ok(Arc::new(ViewTable::new(sort, None)))
+        Ok(Arc::new(ViewTable::new(sort2, None)))
     }
 }
 

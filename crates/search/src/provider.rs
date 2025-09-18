@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -127,7 +127,11 @@ impl SearchQueryProvider {
             &self.schema().fields,
             &[
                 all_metadata_columns,
-                &[SEARCH_SCORE_COLUMN_NAME.to_string()],
+                &[
+                    SEARCH_SCORE_COLUMN_NAME.to_string(),
+                    SEARCH_MATCH_COLUMN_NAME.to_string(),
+                    "_spice.chunk_offset".to_string(),
+                ],
             ]
             .concat(),
             projection,
@@ -162,11 +166,6 @@ impl SearchQueryProvider {
             underlying_filters,
             None,
         )?))
-    }
-
-    /// Get all metadata columns that should be excluded from base table projections
-    fn all_metadata_columns(&self) -> Vec<String> {
-        self.search_index.metadata_columns().all_names()
     }
 
     /// Get filters that can be handled by the search index
@@ -244,8 +243,11 @@ impl SearchQueryProvider {
         });
 
         // Need to join with base table
-        let underlying_table_scan =
-            self.underlying_table_scan(table_proj.as_ref(), filters, &self.all_metadata_columns())?;
+        let underlying_table_scan = self.underlying_table_scan(
+            table_proj.as_ref(),
+            filters,
+            &self.search_index.metadata_columns().all_names(),
+        )?;
 
         // Build join conditions based on primary keys
         let join_conditions: Vec<(Column, Column)> = self
@@ -346,10 +348,16 @@ impl TableProvider for SearchQueryProvider {
 
         if is_chunked(&self.search_index) {
             fields.push(Arc::new(Field::new(
-                SEARCH_MATCH_COLUMN_NAME.to_string(),
-                arrow_schema::DataType::Utf8,
+                "_spice.chunk_offset".to_string(),
+                DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
                 false,
             )));
+            // TODO Reenable, but requires calculating based off self.search_field() and `_spice.chunk_offset`.
+            //     fields.push(Arc::new(Field::new(
+            //         SEARCH_MATCH_COLUMN_NAME.to_string(),
+            //         arrow_schema::DataType::Utf8,
+            //         false,
+            //     )));
         }
 
         Arc::new(Schema::new(fields))

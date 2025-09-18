@@ -44,7 +44,7 @@ pub struct S3VectorsTable {
     // - `data` Float32
     // - `key` Utf8
     // - `metadata` will be flattened. types will be inferred as per `arrow_json`.
-    pub(super) schema: SchemaRef,
+    pub schema: SchemaRef,
 
     pub(super) constraints: Constraints,
 }

@@ -412,7 +412,7 @@ impl ExecutionPlan for IndexerExec {
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
                                         "Index {} changed schema.\
-                                        Expected fields ({}): {}\
+                                        Expected fields ({}): {} \
                                         Got fields ({}): {}",
                                         idx.name(),
                                         expected_schema.fields().len(),
