@@ -196,6 +196,19 @@ impl SearchIndex for S3Vector {
 }
 
 impl VectorIndex for S3Vector {
+    fn dimension(&self) -> i32 {
+        self.table
+            .schema
+            .column_with_name(S3_VECTOR_EMBEDDING_NAME)
+            .map(|(_, f)| {
+                match f.data_type() {
+                    DataType::FixedSizeList(_, dim) => dim,
+                    _ => 0, // Should not be reachable
+                }
+            })
+            .unwrap_or_default()
+    }
+
     /// Use a [`S3VectorsListTable`] and then:
     ///   1. Convert the primary key to its appropriate name and data type
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately

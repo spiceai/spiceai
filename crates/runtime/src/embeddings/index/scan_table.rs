@@ -113,11 +113,12 @@ impl VectorScanTableProvider {
             .iter()
             .map(|f| (Some(TableReference::parse_str("base_table")), Arc::clone(f)))
             .collect();
+
         qualified_fields.push((
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(
                 embedding_col!(self.index.search_column()),
-                DataType::new_list(DataType::Float32, false),
+                DataType::new_fixed_size_list(DataType::Float32, self.index.dimension(), false),
                 true,
             )),
         ));
@@ -156,7 +157,7 @@ impl TableProvider for VectorScanTableProvider {
             &self.table_provider.schema(),
             vec![Arc::new(Field::new(
                 embedding_col!(self.index.search_column()),
-                DataType::new_list(DataType::Float32, false),
+                DataType::new_fixed_size_list(DataType::Float32, self.index.dimension(), false),
                 true,
             ))],
         )
