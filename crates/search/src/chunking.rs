@@ -355,7 +355,6 @@ impl SearchIndex for ChunkedSearchIndex {
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let pk_names: Vec<_> = self
-            .inner
             .primary_fields()
             .iter()
             .map(|f| f.name().clone())
@@ -376,12 +375,13 @@ impl SearchIndex for ChunkedSearchIndex {
             None,
         )?));
 
+        let mut sort_order_by = vec![SortExpr::new(col(SEARCH_SCORE_COLUMN_NAME), false, false)];
+
         let pk_order_by: Vec<SortExpr> = pk_expr
             .iter()
-            .map(|e| SortExpr::new(e.clone(), false, false))
+            .map(|e| SortExpr::new(e.clone(), true, false))
             .collect();
-        let mut order_by = pk_order_by.clone();
-        order_by.push(SortExpr::new(col(SEARCH_SCORE_COLUMN_NAME), false, false));
+        sort_order_by.extend(pk_order_by); // `sort_order_by` needs to be first.
 
         let aggr_expr: Vec<_> = schema
             .fields()
@@ -390,7 +390,7 @@ impl SearchIndex for ChunkedSearchIndex {
             .map(|f| {
                 first_value(
                     Expr::Column(Column::new_unqualified(f.name().clone())),
-                    order_by.clone(),
+                    sort_order_by.clone(),
                 )
                 .alias(f.name().clone())
             })
@@ -398,19 +398,14 @@ impl SearchIndex for ChunkedSearchIndex {
 
         let agg =
             LogicalPlan::Aggregate(Aggregate::try_new(tbl, pk_expr.clone(), aggr_expr.clone())?);
-        let sort = LogicalPlan::Sort(Sort {
-            expr: pk_order_by,
-            input: agg.into(),
-            fetch: Some(1), // Only return most relevant chunk from each ID
-        });
 
-        let sort2 = LogicalPlan::Sort(Sort {
+        let final_sort = LogicalPlan::Sort(Sort {
             expr: vec![SortExpr::new(col(SEARCH_SCORE_COLUMN_NAME), false, false)],
-            input: sort.into(),
+            input: agg.into(),
             fetch: None,
         });
 
-        Ok(Arc::new(ViewTable::new(sort2, None)))
+        Ok(Arc::new(ViewTable::new(final_sort, None)))
     }
 }
 
