@@ -1,0 +1,52 @@
+version: v1
+kind: Spicepod
+name: spiceai
+
+runtime:
+  caching:
+    sql_results:
+      enabled: true
+      item_ttl: 5s
+
+datasets:
+  # Fetch stargazers of the spiceai repository every 1 hour, materialize locally
+  - from: github:github.com/spiceai/spiceai/stargazers
+    name: stargazers
+    description: github.com/spiceai/spiceai GitHub Stargazers
+    time_column: starred_at
+    time_format: timestamp
+    params: &github_params
+      github_client_id: ${secrets:GITHUB_CLIENT_ID}
+      github_private_key: ${secrets:GITHUB_PRIVATE_KEY}
+      github_installation_id: ${secrets:GITHUB_INSTALLATION_ID}
+    acceleration: &github_acceleration
+      enabled: true
+      engine: duckdb
+      refresh_mode: append
+      refresh_append_overlap: 5m
+      refresh_check_interval: 1h
+      refresh_jitter_enabled: true
+      refresh_jitter_max: 5m
+
+  - from: https://raw.githubusercontent.com/spiceai/spiceai/refs/heads/trunk/docs/release_notes/qa_analytics.csv
+    name: qa_analytics
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_check_interval: 1d
+
+  - from: github:github.com/spiceai/spiceai/issues
+    name: issues
+    description: github.com/spiceai/spiceai GitHub Issues
+    params: *github_params
+    time_column: updated_at
+    time_format: timestamp
+    acceleration: *github_acceleration
+
+  # Fetch pull requests of the spiceai repository every 1 hour, materialize locally
+  - from: github:github.com/spiceai/spiceai/pulls
+    name: pulls
+    params: *github_params
+    time_column: updated_at
+    time_format: timestamp
+    acceleration: *github_acceleration
