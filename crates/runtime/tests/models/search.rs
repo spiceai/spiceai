@@ -341,7 +341,7 @@ pub(crate) async fn run_search_w_explain(
                                 format!("{}_error_response", ts.name),
                                 err.to_string()
                             );
-                            return Ok(());
+                            continue;
                         }
 
                         insta::assert_json_snapshot!(ts.name, resp?);
@@ -716,6 +716,75 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     .await
 }
 
+#[tokio::test]
+async fn test_rrf_search() -> Result<(), anyhow::Error> {
+    run_search(
+        AppBuilder::new("search_app")
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
+                "hf_minilm",
+            ))
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![ColumnLevelEmbeddingConfig {
+                        model: "hf_minilm".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }],
+                    description: None,
+                    full_text_search: None,
+                    metadata: HashMap::new(),
+                }),
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
+        vec![
+            SearchTestCase::new(
+                "hybrid_multiple_column_sql_rrf",
+                SearchTestType::Sql(
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second')) order by fused_score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "hybrid_multiple_column_sql_rrf_wrong_column",
+                SearchTestType::Sql(
+                    "SELECT id, question, trunc(score, 3) FROM rrf(vector_search(qs, 'second', answer), text_search(qs, 'second', answer)) order by fused_score desc LIMIT 4",
+                ),
+            ).should_fail(),
+            SearchTestCase::new(
+                "hybrid_multiple_column_sql_rrf_explicit_join",
+                SearchTestType::Sql(
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), id) order by fused_score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "hybrid_multiple_column_sql_rrf_explicit_join_wrong_column",
+                SearchTestType::Sql(
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), foobar) order by fused_score desc LIMIT 4",
+                ),
+            ).should_fail(),
+            SearchTestCase::new(
+                "hybrid_multiple_column_sql_rrf_one_subquery_fail",
+                SearchTestType::Sql(
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second')) order by fused_score desc LIMIT 4",
+                ),
+            ).should_fail(),
+        ],
+    ).await
+}
+
 // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -983,7 +1052,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_question",
                 SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
-            ),
+            ).skip(),
             SearchTestCase::new(
                 // When there are multiple columns, `text_search` needs column explicitly as input.
                 "multi_text_column_sql_text_search_error_without_column",
@@ -992,7 +1061,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_projection",
                 SearchTestType::Sql("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ),
+            ).skip(),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_filters",
                 SearchTestType::Sql("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),

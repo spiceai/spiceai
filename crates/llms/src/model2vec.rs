@@ -18,8 +18,11 @@ use crate::embeddings::Embed;
 use crate::embeddings::Error::{FailedToInstantiateEmbeddingModel, UnsupportedEmbeddingInput};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
+use cache::CacheProvider;
+use cache::result::embeddings::CachedEmbeddingResult;
 use model2vec_rs::model::StaticModel;
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
 /// A wrapper around the `model2vec` library for generating text embeddings.
 ///
@@ -38,6 +41,9 @@ pub struct Model2Vec {
 
     // Spice-specific concurrency limits
     parallelism: Option<usize>,
+
+    // Shared embeddings cache
+    cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 impl Model2Vec {
@@ -77,11 +83,21 @@ impl Model2Vec {
             parallelism,
             embed_max_token_length,
             embed_custom_batch_size,
+            cache: None,
         };
 
         tracing::trace!("Model2Vec::from_params: {model2vec:?}");
 
         Ok(model2vec)
+    }
+
+    #[must_use]
+    pub fn set_cache(
+        mut self,
+        cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> Self {
+        self.cache = cache;
+        self
     }
 }
 
@@ -104,11 +120,29 @@ impl Debug for Model2Vec {
 
 #[async_trait]
 impl Embed for Model2Vec {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        self.cache.as_ref().map(Arc::clone)
+    }
+
     async fn embed(
         &self,
         input: EmbeddingInput,
     ) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
-        self.embed_sync(input)
+        if let Some(CachedEmbeddingResult::Vector(cached)) =
+            self.get_cached_embed((&input).into()).await
+        {
+            return Ok(cached);
+        }
+
+        let vectors = self.embed_sync(input.clone())?;
+
+        self.put_cached_embed(
+            (&input).into(),
+            CachedEmbeddingResult::Vector(vectors.clone()),
+        )
+        .await;
+
+        Ok(vectors)
     }
 
     fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {

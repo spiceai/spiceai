@@ -85,28 +85,57 @@ pub async fn try_to_embedding(
         })?;
 
     match prefix {
-        EmbeddingPrefix::Azure => azure(model_id, component.name.as_str(), &params),
+        EmbeddingPrefix::Azure => azure(
+            model_id,
+            component.name.as_str(),
+            &params,
+            embeddings_cache.clone(),
+        ),
         EmbeddingPrefix::OpenAi => {
-            openai(model_id, component, &params, secrets, embeddings_cache).await
+            openai(
+                model_id,
+                component,
+                &params,
+                secrets,
+                embeddings_cache.clone(),
+            )
+            .await
         }
-        EmbeddingPrefix::File => file(model_id.as_deref(), component, &params).await,
-        EmbeddingPrefix::HuggingFace => huggingface(model_id, &params).await,
+        EmbeddingPrefix::File => {
+            file(
+                model_id.as_deref(),
+                component,
+                &params,
+                embeddings_cache.clone(),
+            )
+            .await
+        }
+        EmbeddingPrefix::HuggingFace => {
+            huggingface(model_id, &params, embeddings_cache.clone()).await
+        }
         EmbeddingPrefix::Databricks => {
-            databricks(model_id, &params, Arc::clone(&token_provider_registry)).await
+            databricks(
+                model_id,
+                &params,
+                Arc::clone(&token_provider_registry),
+                embeddings_cache.clone(),
+            )
+            .await
         }
         #[cfg(feature = "bedrock")]
-        EmbeddingPrefix::Bedrock => bedrock(model_id, &params).await,
+        EmbeddingPrefix::Bedrock => bedrock(model_id, &params, embeddings_cache.clone()).await,
         #[cfg(not(feature = "bedrock"))]
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
             from: "bedrock".to_string(),
         }),
-        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params),
+        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params, embeddings_cache.clone()),
     }
 }
 
 fn model2vec(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
@@ -147,7 +176,7 @@ fn model2vec(
         embed_max_token_length,
         embed_custom_batch_size,
     )
-    .map(|m| Arc::new(m) as Arc<dyn Embed>)
+    .map(|m| Arc::new(m.set_cache(embeddings_cache)) as Arc<dyn Embed>)
     .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
         source: Box::new(e),
     })
@@ -157,6 +186,7 @@ fn model2vec(
 async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
@@ -200,7 +230,9 @@ async fn bedrock(
             });
         }
 
-        Ok(Arc::new(bedrock::embed::new_titan_v2(client, normalize, dimensions)) as Arc<dyn Embed>)
+        Ok(Arc::new(
+            bedrock::embed::new_titan_v2(client, normalize, dimensions).set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
         let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
             CohereEmbeddingTruncate::from_str(truncate_str)
@@ -224,13 +256,16 @@ async fn bedrock(
         } else {
             CohereEmbeddingInputType::default()
         };
-        Ok(Arc::new(bedrock::embed::new_cohere(
-            client,
-            model_id,
-            truncate,
-            input_type,
-            CohereEmbeddingType::Float,
-        )) as Arc<dyn Embed>)
+        Ok(Arc::new(
+            bedrock::embed::new_cohere(
+                client,
+                model_id,
+                truncate,
+                input_type,
+                CohereEmbeddingType::Float,
+            )
+            .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>)
     } else {
         Err(EmbedError::ModelDoesNotExist {
             model_name: model_id,
@@ -241,13 +276,16 @@ async fn bedrock(
 async fn huggingface(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let hf_token = extract_secret!(params, "hf_token");
     let pooling = extract_secret!(params, "pooling");
     let max_seq_len = max_seq_length_from_params(params)?;
     if let Some(id) = model_id {
         Ok(Arc::new(
-            TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len).await?,
+            TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len)
+                .await?
+                .set_cache(embeddings_cache),
         ))
     } else {
         Err(EmbedError::ModelNotProvided {
@@ -260,6 +298,7 @@ async fn databricks(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
     token_provider_registry: Arc<TokenProviderRegistry>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
         return Err(EmbedError::MissingParamError {
@@ -302,7 +341,7 @@ async fn databricks(
             model_id.as_str(),
             token,
             user_agent,
-        )) as Arc<dyn Embed>),
+        ).set_cache(embeddings_cache)) as Arc<dyn Embed>),
 
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = token_provider_registry
@@ -327,7 +366,7 @@ async fn databricks(
                     token_provider,
                     user_agent,
                     HealthCheck::Required,
-                ),
+                ).set_cache(embeddings_cache),
             ) as Arc<dyn Embed>)
         }
         (None, Some(client_id), None) => {
@@ -351,7 +390,7 @@ async fn databricks(
                     token_provider,
                     user_agent,
                     HealthCheck::Skip,
-                ),
+                ).set_cache(embeddings_cache),
             ) as Arc<dyn Embed>)
         }
     }
@@ -361,6 +400,7 @@ async fn file(
     model_id: Option<&str>,
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let weights_path = model_id
         .map(ToString::to_string)
@@ -394,7 +434,8 @@ async fn file(
             pooling,
             max_seq_len,
         )
-        .await?,
+        .await?
+        .set_cache(embeddings_cache),
     ))
 }
 
@@ -402,6 +443,7 @@ fn azure(
     model_id: Option<String>,
     model_name: &str,
     params: &HashMap<String, SecretString>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_name) = model_id else {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
@@ -431,17 +473,20 @@ fn azure(
         });
     }
 
-    Ok(Arc::new(OpenaiEmbed::new(
-        llms::openai::new_azure_client(
-            model_name,
-            api_base,
-            api_version,
-            deployment_name,
-            entra_token,
-            api_key,
-        ),
-        None,
-    )))
+    Ok(Arc::new(
+        OpenaiEmbed::new(
+            llms::openai::new_azure_client(
+                model_name,
+                api_base,
+                api_version,
+                deployment_name,
+                entra_token,
+                api_key,
+            ),
+            None,
+        )
+        .set_cache(embeddings_cache),
+    ))
 }
 
 async fn openai(
