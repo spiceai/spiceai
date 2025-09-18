@@ -75,6 +75,13 @@ generate_cache_metrics!("results", sql_results); // TODO: update the prefix to `
 generate_cache_metrics!("search_results", search_results);
 
 pub trait CacheMetrics: Send + Sync {
+    fn init()
+    where
+        Self: Sized,
+    {
+        Self::record_item_count(0)
+    }
+
     fn record_hit()
     where
         Self: Sized;

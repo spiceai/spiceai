@@ -43,7 +43,7 @@ pub struct LruCache<
     cache: Cache<u64, V, T>,
     hasher: T,
     max_size: u64,
-    metrics_last_reported_time: Mutex<Option<Instant>>,
+    metrics_last_reported_time: Mutex<Instant>,
 }
 
 impl<
@@ -121,11 +121,13 @@ impl<
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
+        V::init();
+
         LruCache {
             cache,
             hasher,
             max_size: cache_max_size,
-            metrics_last_reported_time: Mutex::new(None),
+            metrics_last_reported_time: Mutex::new(Instant::now()),
         }
     }
 }
@@ -161,15 +163,9 @@ impl<
         self.cache.insert(*key, value).await;
 
         let now = Instant::now();
-        let mut last_report_opt = self.metrics_last_reported_time.lock().await;
-        let should_report = match *last_report_opt {
-            Some(last_report) => {
-                now.duration_since(last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)
-            }
-            None => true,
-        };
-        if should_report {
-            *last_report_opt = Some(now);
+        let mut last_report = self.metrics_last_reported_time.lock().await;
+        if now.duration_since(*last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS) {
+            *last_report = now;
 
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
@@ -181,15 +177,9 @@ impl<
         self.cache.invalidate_all();
 
         let now = Instant::now();
-        let mut last_report_opt = self.metrics_last_reported_time.lock().await;
-        let should_report = match *last_report_opt {
-            Some(last_report) => {
-                now.duration_since(last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS)
-            }
-            None => true,
-        };
-        if should_report {
-            *last_report_opt = Some(now);
+        let mut last_report = self.metrics_last_reported_time.lock().await;
+        if now.duration_since(*last_report) >= Duration::from_secs(METRICS_REPORT_INTERVAL_SECS) {
+            *last_report = now;
 
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
