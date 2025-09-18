@@ -274,7 +274,7 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
     }
 }
 
-/// For a given [`RecordBatch`], replace a given column, by name, with a new ['ArrayRef`] data.
+/// For a given [`RecordBatch`], replace a given column, by name, with a new [`ArrayRef`] data.
 ///
 /// If `col` is not in [`RecordBatch`], no change occurs.
 ///
