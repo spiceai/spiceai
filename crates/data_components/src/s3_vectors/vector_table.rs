@@ -25,6 +25,7 @@ use arrow::{
     array::RecordBatch,
     compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
+    error::ArrowError,
 };
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::{
@@ -447,65 +448,59 @@ impl S3VectorsTable {
     }
 }
 
-// For a [`SchemaRef`] with a single [`FixedSizeListArray`], convert it to a [`ListArray`] and return the associated size.
+// For a [`SchemaRef`] with [`FixedSizeListArray`]s, convert them to [`ListArray`] and return the associated size for each column name.
 //
 // This is useful when JSON decoding data with [`FixedSizeListArray`] since arrow_json has not implemented JSON reading of [`FixedSizeListArray`].
-pub(super) fn loosen_vector_schema(s: &SchemaRef, col: &str) -> (SchemaRef, i32) {
-    let mut len = 0;
+pub(super) fn loosen_vector_schema(s: &SchemaRef) -> (SchemaRef, HashMap<String, DataType>) {
+    let mut sizes: HashMap<String, DataType> = HashMap::default();
     let fields: Vec<_> = s
         .fields()
         .iter()
-        .map(|f| {
-            if f.name() != col {
-                return Arc::clone(f);
+        .map(|f| match f.data_type() {
+            DataType::FixedSizeList(inner, n) => {
+                sizes.insert(
+                    f.name().clone(),
+                    DataType::FixedSizeList(Arc::clone(&inner), *n),
+                );
+                Arc::unwrap_or_clone(Arc::clone(f))
+                    .with_data_type(DataType::List(Arc::clone(inner)))
+                    .into()
             }
-
-            match f.data_type() {
-                DataType::FixedSizeList(inner, n) => {
-                    len = *n;
-                    Arc::unwrap_or_clone(Arc::clone(f))
-                        .with_data_type(DataType::List(Arc::clone(inner)))
-                        .into()
-                }
-                _ => Arc::clone(f),
-            }
+            _ => Arc::clone(f),
         })
         .collect();
 
-    (Arc::new(Schema::new(fields)), len)
+    (Arc::new(Schema::new(fields)), sizes)
+}
+pub(super) fn make_fixed_sizes(
+    mut rb: RecordBatch,
+    vector_sizes: &HashMap<String, DataType>,
+) -> Result<RecordBatch, ArrowError> {
+    for (col, fixed_size_type) in vector_sizes {
+        if let Some(arr) = rb.column_by_name(col) {
+            rb = replace_column_in_record(rb.clone(), col, &cast(arr, &fixed_size_type)?)?;
+        }
+    }
+    Ok(rb)
 }
 
 pub(super) async fn send_vector_data(
     tx: &Sender<Result<RecordBatch, DataFusionError>>,
     rb: RecordBatch,
-    vector_size: i32,
+    vector_sizes: &HashMap<String, DataType>,
 ) {
     // if vectors are returned, cast back to FixedSizeList
-    match rb.column_by_name(S3_VECTOR_EMBEDDING_NAME).map(|v| {
-        cast(
-            v,
-            &DataType::new_fixed_size_list(DataType::Float32, vector_size, false),
-        )
-    }) {
-        Some(Ok(v)) => {
-            let _ = tx
-                .send(
-                    replace_column_in_record(rb, S3_VECTOR_EMBEDDING_NAME, &v)
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
-                )
-                .await;
+    let _ = match make_fixed_sizes(rb, vector_sizes) {
+        Ok(v) => {
+            tx.send(Ok(v)).await
         }
-        None => {
-            // No 'S3_VECTOR_EMBEDDING_NAME', send original RecordBatch.
-            let _ = tx.send(Ok(rb)).await;
-        }
-        Some(Err(e)) => {
-            let _ = tx
+        Err(e) => {
+            tx
                 .send(Err(DataFusionError::ArrowError(
                     Box::new(e),
                     Some(format!("Successfully decoded S3 vector JSON response, but could not convert {S3_VECTOR_EMBEDDING_NAME} from 'ListArray' to `FixedSizeListArray`.")),
                 )))
-                .await;
+                .await
         }
-    }
+    };
 }

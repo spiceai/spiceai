@@ -289,7 +289,7 @@ async fn list_vector_segment(
     let start_segment = std::time::Instant::now();
 
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let (json_schema, vector_size) = loosen_vector_schema(&schema, S3_VECTOR_EMBEDDING_NAME);
+    let (json_schema, vector_sizes) = loosen_vector_schema(&schema);
     let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
 
     let mut remaining_limit = limit;
@@ -341,7 +341,7 @@ async fn list_vector_segment(
         })?;
 
         match decoder.flush() {
-            Ok(Some(rb)) => send_vector_data(&tx, rb, vector_size).await,
+            Ok(Some(rb)) => send_vector_data(&tx, rb, &vector_sizes).await,
             Ok(None) => {}
             Err(e) => {
                 let _ = tx

@@ -20,7 +20,7 @@ use datafusion::{
     datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
     functions_aggregate::expr_fn::{array_agg, first_value},
-    logical_expr::{Aggregate, LogicalPlan, Projection, Sort, SortExpr, TableScan, expr::Alias},
+    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, TableScan},
     prelude::{Expr, ExprFunctionExt, col},
     sql::TableReference,
 };
