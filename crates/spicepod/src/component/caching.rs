@@ -53,6 +53,8 @@ pub struct Caching {
     pub sql_results: Option<SQLResultsCacheConfig>,
     #[serde(skip_serializing_if = "is_default_or_none")]
     pub search_results: Option<CacheConfig>,
+    #[serde(skip_serializing_if = "is_default_or_none")]
+    pub embeddings: Option<CacheConfig>,
 }
 
 impl Default for Caching {
@@ -60,6 +62,7 @@ impl Default for Caching {
         Self {
             sql_results: Some(SQLResultsCacheConfig::default()),
             search_results: Some(CacheConfig::default()),
+            embeddings: Some(CacheConfig::default()),
         }
     }
 }
@@ -193,5 +196,13 @@ mod tests {
         assert!(search_results.item_ttl.is_none());
         assert!(search_results.eviction_policy.is_none());
         assert_eq!(search_results, CacheConfig::default());
+
+        let embeddings = caching.embeddings.expect("Should have cache config");
+        assert!(embeddings.enabled);
+        assert_eq!(embeddings.hashing_algorithm, HashingAlgorithm::default());
+        assert!(embeddings.max_size.is_none());
+        assert!(embeddings.item_ttl.is_none());
+        assert!(embeddings.eviction_policy.is_none());
+        assert_eq!(embeddings, CacheConfig::default());
     }
 }

@@ -18,6 +18,8 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
+use async_openai::types::CreateEmbeddingRequest;
+use async_openai::types::EmbeddingInput;
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
@@ -64,6 +66,22 @@ pub enum CacheKey<'a> {
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
     ClientSupplied(&'a str),
+    // Embedding keys could either be the full request (for distinguising between dimension count, encoding format, etc)
+    // or just the individual input for less complex requests (e.g. via `.embed()` for some models instead of `.embed_request()`)
+    EmbeddingRequest(&'a CreateEmbeddingRequest),
+    EmbeddingInput(&'a EmbeddingInput),
+}
+
+impl<'a> From<&'a CreateEmbeddingRequest> for CacheKey<'a> {
+    fn from(embedding_request: &'a CreateEmbeddingRequest) -> Self {
+        Self::EmbeddingRequest(embedding_request)
+    }
+}
+
+impl<'a> From<&'a EmbeddingInput> for CacheKey<'a> {
+    fn from(embedding_input: &'a EmbeddingInput) -> Self {
+        Self::EmbeddingInput(embedding_input)
+    }
 }
 
 impl CacheKey<'_> {
@@ -72,6 +90,8 @@ impl CacheKey<'_> {
         match self {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
             Self::Search(search_key) => search_key.hash(&mut hasher),
+            Self::EmbeddingRequest(embedding_request) => embedding_request.hash(&mut hasher),
+            Self::EmbeddingInput(embedding_input) => embedding_input.hash(&mut hasher),
             Self::Query(sql, param_values) => {
                 sql.hash(&mut hasher);
                 if let Some(params) = param_values {
@@ -100,6 +120,11 @@ impl CacheKey<'_> {
 pub struct RawCacheKey(u64);
 
 impl RawCacheKey {
+    #[must_use]
+    pub fn new(key: u64) -> Self {
+        Self(key)
+    }
+
     #[must_use]
     pub fn as_u64(&self) -> u64 {
         self.0
