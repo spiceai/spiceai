@@ -17,7 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, num::TryFromIntError, sync::Arc};
 
 use arrow::array::{
-    Array, Float32Builder, LargeStringArray, ListBuilder, RecordBatch, StringArray, StringViewArray,
+    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, ListBuilder, RecordBatch,
+    StringArray, StringViewArray,
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field};
@@ -438,16 +439,17 @@ fn create_embedding_array(
             .map_err(Box::from)?;
     }
 
-    let mut builder = ListBuilder::new(Float32Builder::new());
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
     let field = Field::new_list_field(DataType::Float32, false);
     builder = builder.with_field(field);
 
     for embedding_opt in embedding_vectors {
         if let Some(embedding) = embedding_opt {
             let float_builder = builder.values();
-            for &value in embedding {
-                float_builder.append_value(value);
-            }
+            float_builder.append_values(
+                embedding,
+                &(0..embedding.len()).map(|_| true).collect::<Vec<_>>(),
+            );
             builder.append(true);
         } else {
             builder.append(false);

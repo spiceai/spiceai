@@ -21,7 +21,11 @@ use crate::s3_vectors::{
 };
 
 use super::{Error, Result, S3VectorIdentifier};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::{
+    array::{ArrayRef, RecordBatch},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    error::ArrowError,
+};
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
@@ -106,7 +110,7 @@ impl S3VectorsTable {
                 }))
             }
             None | Some(GetIndexOutput { index: None, .. }) => {
-                return Ok(S3VectorTableResult::IndexDoesNotExist);
+                Ok(S3VectorTableResult::IndexDoesNotExist)
             }
         }
     }
@@ -436,4 +440,72 @@ impl S3VectorsTable {
 
         Ok(())
     }
+}
+
+// For a [`SchemaRef`] with a single [`FixedSizeListArray`], convert it to a [`ListArray`] and return the associated size.
+//
+// This is useful when JSON decoding data with [`FixedSizeListArray`] since arrow_json has not implemented JSON reading of [`FixedSizeListArray`].
+pub(super) fn loosen_vector_schema(s: &SchemaRef, col: &str) -> (SchemaRef, i32) {
+    let mut len = 0;
+    let fields: Vec<_> = s
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() != col {
+                return Arc::clone(f);
+            }
+
+            match f.data_type() {
+                DataType::FixedSizeList(inner, n) => {
+                    len = *n;
+                    Arc::unwrap_or_clone(f.clone())
+                        .with_data_type(DataType::List(Arc::clone(inner)))
+                        .into()
+                }
+                _ => Arc::clone(f),
+            }
+        })
+        .collect();
+
+    (Arc::new(Schema::new(fields)), len)
+}
+
+pub(super) fn replace_column_in_record(
+    rb: RecordBatch,
+    col: &str,
+    data: ArrayRef,
+) -> Result<RecordBatch, ArrowError> {
+    let Some((idx, _)) = rb.schema().column_with_name(col) else {
+        return Ok(rb);
+    };
+    let schema = Schema::new(
+        rb.schema()
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == col {
+                    Arc::unwrap_or_clone(f.clone())
+                        .with_data_type(data.data_type().clone())
+                        .into()
+                } else {
+                    f.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let columns = rb
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, arr)| {
+            if i == idx {
+                Arc::clone(&data)
+            } else {
+                Arc::clone(arr)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new(schema.into(), columns)
 }

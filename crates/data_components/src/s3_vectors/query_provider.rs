@@ -16,12 +16,14 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, vector_table::S3VectorsTable,
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    vector_table::{S3VectorsTable, loosen_vector_schema, replace_column_in_record},
 };
 
 use super::{Error, S3VectorIdentifier};
 use arrow::{
     array::RecordBatch,
+    compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
     json::ReaderBuilder,
 };
@@ -288,7 +290,8 @@ async fn query_vector_stream(
     let start = std::time::Instant::now();
 
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let mut decoder = ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
+    let (json_schema, vector_size) = loosen_vector_schema(&schema, S3_VECTOR_EMBEDDING_NAME);
+    let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
 
     let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
     let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
@@ -355,7 +358,32 @@ async fn query_vector_stream(
 
     match decoder.flush() {
         Ok(Some(rb)) => {
-            let _ = tx.send(Ok(rb)).await;
+            // if vectors are returned, cast back to FixedSizeList
+            match rb.column_by_name(S3_VECTOR_EMBEDDING_NAME).map(|v| cast(
+                    v,
+                    &DataType::new_fixed_size_list(DataType::Float32, vector_size, false),
+                )) {
+                Some(Ok(v)) => {
+                    let _ = tx
+                        .send(
+                            replace_column_in_record(rb, S3_VECTOR_EMBEDDING_NAME, v)
+                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+                        )
+                        .await;
+                }
+                None => {
+                    // No 'S3_VECTOR_EMBEDDING_NAME', send original RecordBatch.
+                    let _ = tx.send(Ok(rb)).await;
+                }
+                Some(Err(e)) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::ArrowError(
+                            Box::new(e),
+                            Some(format!("Successfully decoded ListVectors JSON, but could not convert {S3_VECTOR_EMBEDDING_NAME} from 'ListArray' to `FixedSizeListArray`.")),
+                        )))
+                        .await;
+                }
+            }
         }
         Ok(None) => {}
         Err(e) => {
