@@ -253,6 +253,13 @@ impl ReciprocalRankFusion {
             .into_iter()
             .enumerate()
             .map(|(i, df)| {
+                // Ensure that all projections have a score column
+                if !df.schema().has_column_with_unqualified_name("score") {
+                    return exec_err!(
+                        "{RRF_UDF_NAME}: Query at position {i} does not have a `score` column."
+                    );
+                }
+
                 let df_with_id = match args.join_key {
                     Some(_) => Ok(df),
                     None => Self::with_rrf_rowid(df),
@@ -263,15 +270,6 @@ impl ReciprocalRankFusion {
                     .and_then(|df| df.alias(&format!("search_{i}")))
             })
             .collect::<Result<Vec<_>>>()?;
-
-        // Ensure that all projections have a score column
-        for (i, df) in prepared_dfs.iter().enumerate() {
-            if !df.schema().has_column_with_unqualified_name("score") {
-                return exec_err!(
-                    "{RRF_UDF_NAME}: Query at position {i} does not have a `score` column."
-                );
-            }
-        }
 
         Ok(prepared_dfs)
     }
