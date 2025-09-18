@@ -29,7 +29,7 @@ static PARTS_SEPARATOR: &str = "-";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Expected 4 parts in index name between hypens but got {num_parts}"))]
+    #[snafu(display("Expected exactly 4 parts in index name separated by hyphens, but found {num_parts}"))]
     IncorrectNumPartsInName { num_parts: usize },
 }
 
