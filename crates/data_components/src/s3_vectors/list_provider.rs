@@ -16,8 +16,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, vector_table::S3VectorsTable,
 };
 
 /// Num of segments to use for parallel `ListVectors` API calls.
@@ -289,8 +288,7 @@ async fn list_vector_segment(
     let start_segment = std::time::Instant::now();
 
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let (json_schema, vector_size) = loosen_vector_schema(&schema, S3_VECTOR_EMBEDDING_NAME);
-    let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
+    let mut decoder = ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
 
     let mut remaining_limit = limit;
     let mut next_token = None;
@@ -341,7 +339,9 @@ async fn list_vector_segment(
         })?;
 
         match decoder.flush() {
-            Ok(Some(rb)) => send_vector_data(&tx, rb, vector_size).await,
+            Ok(Some(rb)) => {
+                let _ = tx.send(Ok(rb)).await;
+            }
             Ok(None) => {}
             Err(e) => {
                 let _ = tx

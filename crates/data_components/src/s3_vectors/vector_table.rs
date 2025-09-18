@@ -13,25 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use std::{collections::HashMap, error::Error as StdError, sync::Arc};
+
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
     S3VectorBuildSnafu,
 };
-use arrow_tools::record_batch::replace_column_in_record;
-use std::{collections::HashMap, error::Error as StdError, sync::Arc};
 
 use super::{Error, Result, S3VectorIdentifier};
-use arrow::{
-    array::RecordBatch,
-    compute::cast,
-    datatypes::{DataType, Field, Schema, SchemaRef},
-};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use aws_credential_types::provider::error::CredentialsError;
-use datafusion::{
-    common::{Constraint, Constraints},
-    error::DataFusionError,
-};
-
+use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
     GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
@@ -41,7 +33,6 @@ use s3_vectors::{
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
 use snafu::ResultExt;
-use tokio::sync::mpsc::Sender;
 
 /// An S3 Vector index.
 #[derive(Clone)]
@@ -105,19 +96,18 @@ impl S3VectorsTable {
                         specified: distance_metric.clone(),
                     });
                 }
-                let schema = Self::compute_schema(index.dimension(), columns);
-                let constraints = Self::primary_key(&schema);
-                Ok(S3VectorTableResult::Table(Self {
-                    idx: id,
-                    client,
-                    schema,
-                    constraints,
-                }))
             }
-            None | Some(GetIndexOutput { index: None, .. }) => {
-                Ok(S3VectorTableResult::IndexDoesNotExist)
-            }
+            None => return Ok(S3VectorTableResult::IndexDoesNotExist),
+            Some(_) => {}
         }
+        let schema = Self::compute_schema(columns);
+        let constraints = Self::primary_key(&schema);
+        Ok(S3VectorTableResult::Table(Self {
+            idx: id,
+            client,
+            schema,
+            constraints,
+        }))
     }
 
     pub async fn try_create_new_table(
@@ -174,6 +164,21 @@ impl S3VectorsTable {
                     .await
                     .map(S3VectorTableResult::table)
             }
+        }
+    }
+
+    #[must_use]
+    pub fn new(
+        index: S3VectorIdentifier,
+        client: Arc<dyn S3Vectors + Send + Sync>,
+        schema: SchemaRef,
+    ) -> Self {
+        let constraints = Self::primary_key(&schema);
+        Self {
+            idx: index,
+            client,
+            schema,
+            constraints,
         }
     }
 
@@ -325,7 +330,7 @@ impl S3VectorsTable {
         f.metadata().get("filterable").eq(&Some(&true.to_string()))
     }
 
-    fn compute_schema(embedding_dimension: i32, columns: MetadataColumns) -> SchemaRef {
+    fn compute_schema(columns: MetadataColumns) -> SchemaRef {
         Arc::new(Schema::new(
             [
                 columns
@@ -344,11 +349,10 @@ impl S3VectorsTable {
                     })
                     .collect(),
                 vec![
-                    Arc::new(Field::new_fixed_size_list(
+                    Arc::new(Field::new_list(
                         S3_VECTOR_EMBEDDING_NAME,
                         Field::new("item", DataType::Float32, false),
-                        embedding_dimension,
-                        false,
+                        true,
                     )),
                     Arc::new(Field::new(
                         S3_VECTOR_PRIMARY_KEY_NAME,
@@ -444,68 +448,5 @@ impl S3VectorsTable {
         );
 
         Ok(())
-    }
-}
-
-// For a [`SchemaRef`] with a single [`FixedSizeListArray`], convert it to a [`ListArray`] and return the associated size.
-//
-// This is useful when JSON decoding data with [`FixedSizeListArray`] since arrow_json has not implemented JSON reading of [`FixedSizeListArray`].
-pub(super) fn loosen_vector_schema(s: &SchemaRef, col: &str) -> (SchemaRef, i32) {
-    let mut len = 0;
-    let fields: Vec<_> = s
-        .fields()
-        .iter()
-        .map(|f| {
-            if f.name() != col {
-                return Arc::clone(f);
-            }
-
-            match f.data_type() {
-                DataType::FixedSizeList(inner, n) => {
-                    len = *n;
-                    Arc::unwrap_or_clone(Arc::clone(f))
-                        .with_data_type(DataType::List(Arc::clone(inner)))
-                        .into()
-                }
-                _ => Arc::clone(f),
-            }
-        })
-        .collect();
-
-    (Arc::new(Schema::new(fields)), len)
-}
-
-pub(super) async fn send_vector_data(
-    tx: &Sender<Result<RecordBatch, DataFusionError>>,
-    rb: RecordBatch,
-    vector_size: i32,
-) {
-    // if vectors are returned, cast back to FixedSizeList
-    match rb.column_by_name(S3_VECTOR_EMBEDDING_NAME).map(|v| {
-        cast(
-            v,
-            &DataType::new_fixed_size_list(DataType::Float32, vector_size, false),
-        )
-    }) {
-        Some(Ok(v)) => {
-            let _ = tx
-                .send(
-                    replace_column_in_record(rb, S3_VECTOR_EMBEDDING_NAME, &v)
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
-                )
-                .await;
-        }
-        None => {
-            // No 'S3_VECTOR_EMBEDDING_NAME', send original RecordBatch.
-            let _ = tx.send(Ok(rb)).await;
-        }
-        Some(Err(e)) => {
-            let _ = tx
-                .send(Err(DataFusionError::ArrowError(
-                    Box::new(e),
-                    Some(format!("Successfully decoded S3 vector JSON response, but could not convert {S3_VECTOR_EMBEDDING_NAME} from 'ListArray' to `FixedSizeListArray`.")),
-                )))
-                .await;
-        }
     }
 }
