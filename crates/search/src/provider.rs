@@ -28,11 +28,12 @@ use datafusion::{
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
-        Filter, Join, LogicalPlan, Projection, Sort, SortExpr, SubqueryAlias,
-        TableProviderFilterPushDown, TableScan,
+        BinaryExpr, Cast, Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr,
+        SubqueryAlias, TableProviderFilterPushDown, TableScan, expr::Alias,
     },
     physical_plan::ExecutionPlan,
-    prelude::Expr,
+    prelude::{Expr, array_element, substring},
+    scalar::ScalarValue,
     sql::TableReference,
 };
 
@@ -233,12 +234,18 @@ impl SearchQueryProvider {
             .filter_map(|f| self.schema().index_of(f.name()).ok())
             .collect();
 
-        // Ensure primary keys are retrieved from underlying table.
         let table_proj: Option<Vec<_>> = projection.map(|proj| {
             let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
+            // Ensure primary keys are retrieved from underlying table.
             for pp in primary_key_projection {
                 p.insert(pp);
             }
+
+            // Remove 'match'
+            if let Some((idx, _)) = self.schema().column_with_name(SEARCH_MATCH_COLUMN_NAME) {
+                let _ = p.remove(&idx);
+            };
+
             p.into_iter().collect()
         });
 
@@ -321,6 +328,65 @@ impl SearchQueryProvider {
             Ok(proj)
         }
     }
+
+    fn match_column_index(&self) -> Option<usize> {
+        self.schema()
+            .column_with_name(SEARCH_MATCH_COLUMN_NAME)
+            .map(|(i, _)| i)
+    }
+
+    pub async fn add_match_column(
+        &self,
+        projection: Option<&Vec<usize>>,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        // If projection doesn't include/need the 'match' column, early exit.
+        if projection
+            .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)))
+        {
+            return Ok(input);
+        };
+        let mut initial: Vec<_> = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
+
+        let first = array_element(
+            Expr::Column(Column::new_unqualified("_spice.chunk_offset")),
+            Expr::Literal(ScalarValue::Int64(Some(1)), None),
+        );
+        let second = array_element(
+            Expr::Column(Column::new_unqualified("_spice.chunk_offset")),
+            Expr::Literal(ScalarValue::Int64(Some(2)), None),
+        );
+
+        // substring(search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]) as 'match'
+        let substr = Expr::Cast(Cast::new(
+            Box::new(substring(
+                Expr::Column(Column::new_unqualified(self.search_index.search_column())),
+                first.clone(),
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(second),
+                    Operator::Minus,
+                    Box::new(first),
+                )),
+            )),
+            DataType::Utf8,
+        ));
+
+        initial.push(Expr::Alias(Alias::new(
+            substr,
+            None::<TableReference>,
+            "match",
+        )));
+
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            initial,
+            input.into(),
+        )?))
+    }
 }
 
 #[async_trait]
@@ -352,12 +418,11 @@ impl TableProvider for SearchQueryProvider {
                 DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
                 false,
             )));
-            // TODO Reenable, but requires calculating based off self.search_field() and `_spice.chunk_offset`.
-            //     fields.push(Arc::new(Field::new(
-            //         SEARCH_MATCH_COLUMN_NAME.to_string(),
-            //         arrow_schema::DataType::Utf8,
-            //         false,
-            //     )));
+            fields.push(Arc::new(Field::new(
+                SEARCH_MATCH_COLUMN_NAME.to_string(),
+                arrow_schema::DataType::Utf8,
+                false,
+            )));
         }
 
         Arc::new(Schema::new(fields))
@@ -425,21 +490,43 @@ impl TableProvider for SearchQueryProvider {
                 .to_string(),
             ));
         }
-
         let search_index_table = self.search_index_table(filters).await?;
 
-        // Check if search index alone is sufficient
-        let base_logical_plan: LogicalPlan =
-            if self.search_index_table_is_sufficient(&search_index_table, projection, filters)? {
-                // Search index can handle everything - no join needed
-                if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                    LogicalPlan::Filter(Filter::try_new(filter, search_index_table.into())?)
-                } else {
-                    search_index_table
-                }
-            } else {
-                self.join_with_base(projection, search_index_table, filters)?
+        let inner_proj: Option<Vec<_>> = projection.cloned().and_then(|proj| {
+            let Some(match_idx) = self.match_column_index() else {
+                return Some(proj);
             };
+            if !proj.contains(&match_idx) {
+                return Some(proj);
+            }
+            let mut proj2 = proj.clone();
+            if let Some(search_idx) = self
+                .schema()
+                .column_with_name(self.search_index.search_column().as_str())
+                .map(|(i, _)| i)
+            {
+                if !proj2.contains(&search_idx) {
+                    proj2.push(search_idx);
+                };
+            };
+            Some(proj2)
+        });
+
+        // Check if search index alone is sufficient
+        let base_logical_plan: LogicalPlan = if self.search_index_table_is_sufficient(
+            &search_index_table,
+            inner_proj.as_ref(),
+            filters,
+        )? {
+            // Search index can handle everything - no join needed
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, search_index_table.into())?)
+            } else {
+                search_index_table
+            }
+        } else {
+            self.join_with_base(inner_proj.as_ref(), search_index_table, filters)?
+        };
 
         // Add sorting by search score (descending)
         let sort = LogicalPlan::Sort(Sort {
@@ -451,6 +538,10 @@ impl TableProvider for SearchQueryProvider {
             input: Arc::new(base_logical_plan),
             fetch: limit,
         });
+
+        let with_columns = self
+            .add_match_column(inner_proj.as_ref(), sort.into())
+            .await?;
 
         // Final projection to match requested schema
         let schema_proj: SchemaRef = match projection {
@@ -465,7 +556,7 @@ impl TableProvider for SearchQueryProvider {
         };
 
         let final_proj = LogicalPlan::Projection(Projection::new_from_schema(
-            Arc::new(sort),
+            Arc::new(with_columns),
             Arc::new(DFSchema::from_unqualified_fields(
                 schema_proj.fields().clone(),
                 HashMap::default(),
