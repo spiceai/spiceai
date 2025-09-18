@@ -193,7 +193,7 @@ impl<
         self.cache.insert(*key, value).await;
 
         let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
+        if now_seconds.saturating_sub(self.metrics_last_reported_time.load(Ordering::Relaxed)) >= 5 {
             self.metrics_last_reported_time
                 .store(now_seconds, Ordering::Relaxed);
 
@@ -207,7 +207,7 @@ impl<
         self.cache.invalidate_all();
 
         let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
+        if now_seconds.saturating_sub(self.metrics_last_reported_time.load(Ordering::Relaxed)) >= 5 {
             self.metrics_last_reported_time
                 .store(now_seconds, Ordering::Relaxed);
 
