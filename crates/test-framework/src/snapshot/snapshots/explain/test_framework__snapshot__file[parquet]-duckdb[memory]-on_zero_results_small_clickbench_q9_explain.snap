@@ -28,6 +28,7 @@ description: "Query: clickbench_q9"
 |               |                             FallbackOnZeroResultsScanExec                                                     |
 |               |                               CoalescePartitionsExec                                                          |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1         |
-|               |                                   DuckSqlExec sql= SELECT "RegionID", "UserID" FROM hits                      |
+|               |                                   CooperativeExec                                                             |
+|               |                                     DuckSqlExec sql= SELECT "RegionID", "UserID" FROM hits                    |
 |               |                                                                                                               |
 +---------------+---------------------------------------------------------------------------------------------------------------+

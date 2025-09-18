@@ -46,6 +46,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Embedding rate limit exceeded. {source}."))]
+    RateLimited {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "Invalid `pooling` parameter value: {value}. Use `cls`, `mean`, `splade`, or `last_token`."
     ))]

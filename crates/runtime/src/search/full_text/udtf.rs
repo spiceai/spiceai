@@ -258,15 +258,15 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let mut fts_indexes = find_index_in_table_provider::<FullTextDatabaseIndex>(
-            &table_provider,
-        )
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "Table '{}' does not have a full text search index.",
-                args.tbl.clone()
-            ))
-        })?;
+        let mut fts_indexes =
+            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Table '{}' does not have a full text search index.",
+                        args.tbl.clone()
+                    ))
+                })?
+                .0;
 
         let Some(fts_index) = fts_indexes.pop() else {
             return Err(DataFusionError::Plan(format!(

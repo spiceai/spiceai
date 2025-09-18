@@ -86,7 +86,6 @@ impl S3Vector {
         // Build complete metadata columns including the embedding column as non-filterable
         let mut complete_columns: Vec<MetadataColumn> =
             metadata_columns.clone().into_iter().collect();
-
         let complete_metadata_columns = MetadataColumns::from(complete_columns);
 
         Self {

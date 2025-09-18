@@ -24,6 +24,7 @@ mod retry_client;
 pub mod s3;
 pub(crate) mod scan_table;
 pub use scan_table::VectorScanTableProvider;
+use search::index::SearchIndex;
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(
@@ -321,6 +322,7 @@ pub mod tests {
             self
         }
     }
+
     #[async_trait]
     impl SearchIndex for PretendVectorIndex {
         fn search_column(&self) -> String {

@@ -30,7 +30,10 @@ use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 use util::distribute_nulls;
 
-use crate::{embedding_col, embeddings::index::s3::S3Vector, model::EmbeddingModelStore};
+use crate::{
+    convert_string_arrow_to_iterator, embedding_col, embeddings::index::s3::S3Vector,
+    model::EmbeddingModelStore,
+};
 use util::convert_string_arrow_to_iterator;
 
 #[derive(Snafu, Debug)]
