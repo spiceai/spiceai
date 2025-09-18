@@ -68,7 +68,11 @@ impl DuckDB {
                     params
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
-                ),
+                )
+                .with_connection_setup_queries(vec![
+                    Arc::<str>::from("INSTALL icu"),
+                    Arc::<str>::from("LOAD icu"),
+                ]),
         );
 
         Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
@@ -89,7 +93,11 @@ impl DuckDB {
                     params
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
-                ),
+                )
+                .with_connection_setup_queries(vec![
+                    Arc::<str>::from("INSTALL icu"),
+                    Arc::<str>::from("LOAD icu"),
+                ]),
         );
 
         Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
