@@ -234,6 +234,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6e
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5ad2f52b9bafc6eaa50851f2e1fcf0585fb5184d" }                      # spiceai-49
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "3437d0103e3577e6615498802d55e67581a2bad2" } # spiceai
 
+delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "0e5d8bca9b6f76087b88d7554c09a6cc43e87183" } # spiceai-0.14.0
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a4b83432acfe1dfdd140e35d4603701ae76f6607" } # spiceai-1.3.2
 
