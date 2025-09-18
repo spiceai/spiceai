@@ -13,19 +13,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, error::Error as StdError, sync::Arc};
-
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
     S3VectorBuildSnafu,
 };
+use arrow_tools::record_batch::replace_column_in_record;
+use std::{collections::HashMap, error::Error as StdError, sync::Arc};
 
 use super::{Error, Result, S3VectorIdentifier};
 use arrow::{
-    array::{ArrayRef, RecordBatch},
+    array::RecordBatch,
     compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
-    error::ArrowError,
 };
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::{
@@ -476,51 +475,11 @@ pub(super) fn loosen_vector_schema(s: &SchemaRef, col: &str) -> (SchemaRef, i32)
     (Arc::new(Schema::new(fields)), len)
 }
 
-pub(super) fn replace_column_in_record(
-    rb: RecordBatch,
-    col: &str,
-    data: &ArrayRef,
-) -> Result<RecordBatch, ArrowError> {
-    let Some((idx, _)) = rb.schema().column_with_name(col) else {
-        return Ok(rb);
-    };
-    let schema = Schema::new(
-        rb.schema()
-            .fields()
-            .iter()
-            .map(|f| {
-                if f.name() == col {
-                    Arc::unwrap_or_clone(Arc::clone(f))
-                        .with_data_type(data.data_type().clone())
-                        .into()
-                } else {
-                    Arc::clone(f)
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    let columns = rb
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, arr)| {
-            if i == idx {
-                Arc::clone(data)
-            } else {
-                Arc::clone(arr)
-            }
-        })
-        .collect::<Vec<_>>();
-
-    RecordBatch::try_new(schema.into(), columns)
-}
-
 pub(super) async fn send_vector_data(
     tx: &Sender<Result<RecordBatch, DataFusionError>>,
     rb: RecordBatch,
     vector_size: i32,
-) -> () {
+) {
     // if vectors are returned, cast back to FixedSizeList
     match rb.column_by_name(S3_VECTOR_EMBEDDING_NAME).map(|v| {
         cast(

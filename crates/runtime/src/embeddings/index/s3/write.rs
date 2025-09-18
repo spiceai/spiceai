@@ -420,6 +420,7 @@ fn update_embedding_column_in_batch(
 }
 
 /// Create an Arrow array from embedding vectors.
+#[allow(clippy::cast_sign_loss)]
 fn create_embedding_array(
     embedding_vectors: &[Option<Vec<f32>>],
 ) -> Result<Arc<dyn Array>, Box<Error>> {
@@ -498,12 +499,11 @@ fn filter_zero_vectors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        FixedSizeListArray, Float32Array, Float32Builder, ListArray, ListBuilder, StringArray,
-    };
+    use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, StringArray};
     use arrow::datatypes::{DataType, Schema};
 
     // Helper function to create a test RecordBatch with text and embedding columns
+    #[allow(clippy::cast_sign_loss)]
     fn create_test_record_batch_with_embeddings(
         texts: Vec<Option<&str>>,
         embeddings: Vec<Option<Vec<f32>>>,
@@ -517,7 +517,7 @@ mod tests {
         builder = builder.with_field(field);
         for embedding_opt in embeddings {
             if let Some(embedding) = embedding_opt {
-                let float_builder = builder
+                builder
                     .values()
                     .append_values(&embedding, &(0..dim).map(|_| true).collect::<Vec<_>>());
                 builder.append(true);
