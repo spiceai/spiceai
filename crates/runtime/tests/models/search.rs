@@ -262,7 +262,7 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
     ds_tpcds_cp
 }
 
-async fn start_app(app: App) -> Result<Config, anyhow::Error> {
+pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
     configure_test_datafusion();
     let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);

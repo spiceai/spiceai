@@ -21,7 +21,9 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Meter},
 };
 
-use crate::result::{query::CachedQueryResult, search::CachedSearchResult};
+use crate::result::{
+    embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+};
 
 macro_rules! generate_cache_metrics {
     ($prefix:literal, $name:ident) => {
@@ -73,6 +75,7 @@ macro_rules! generate_cache_metrics {
 
 generate_cache_metrics!("results", sql_results); // TODO: update the prefix to `sql_results` in v2.0 - https://github.com/spiceai/spiceai/issues/6128
 generate_cache_metrics!("search_results", search_results);
+generate_cache_metrics!("embeddings", embeddings);
 
 pub trait CacheMetrics: Send + Sync {
     fn record_hit()
@@ -133,5 +136,27 @@ impl CacheMetrics for CachedQueryResult {
 
     fn record_max_size(size: u64) {
         sql_results::MAX_SIZE_BYTES.record(size, &[]);
+    }
+}
+
+impl CacheMetrics for CachedEmbeddingResult {
+    fn record_hit() {
+        embeddings::HITS.add(1, &[]);
+    }
+
+    fn record_request() {
+        embeddings::REQUESTS.add(1, &[]);
+    }
+
+    fn record_item_count(count: u64) {
+        embeddings::ITEMS.record(count, &[]);
+    }
+
+    fn record_size(size: u64) {
+        embeddings::SIZE_BYTES.record(size, &[]);
+    }
+
+    fn record_max_size(size: u64) {
+        embeddings::MAX_SIZE_BYTES.record(size, &[]);
     }
 }

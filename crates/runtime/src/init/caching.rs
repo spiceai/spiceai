@@ -41,6 +41,10 @@ impl Runtime {
             .search_results
             .clone()
             .unwrap_or(CacheConfig::default());
+        let embeddings_config = cache_config
+            .embeddings
+            .clone()
+            .unwrap_or(CacheConfig::default());
 
         if sql_results_config.enabled {
             match QueryResultsCacheProvider::try_new(
@@ -67,7 +71,8 @@ impl Runtime {
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
                     hash_builder,
-                ));
+                ))
+                .as_tabled_provider();
                 caching = caching.with_plans_cache(plans_cache_provider);
             }
             Err(e) => {
@@ -81,13 +86,29 @@ impl Runtime {
             match lru_cache::build_from_config(&search_results_config) {
                 Ok(cache_provider) => {
                     in_tracing_context(|| {
-                        tracing::info!("Initialized search results cache;"); // TODO: update to include max size and ttl. https://github.com/spiceai/spiceai/issues/6019
+                        tracing::info!("Initialized search results cache; {cache_provider}");
                     });
-                    caching = caching.with_search_cache(cache_provider);
+                    caching = caching.with_search_cache(cache_provider.as_tabled_provider());
                 }
                 Err(e) => {
                     in_tracing_context(|| {
                         tracing::error!("Failed to initialize search results cache: {e}");
+                    });
+                }
+            }
+        }
+
+        if embeddings_config.enabled {
+            match lru_cache::build_from_config(&CacheConfig::default()) {
+                Ok(cache_provider) => {
+                    in_tracing_context(|| {
+                        tracing::info!("Initialized embeddings cache; {cache_provider}");
+                    });
+                    caching = caching.with_embeddings_cache(cache_provider);
+                }
+                Err(e) => {
+                    in_tracing_context(|| {
+                        tracing::error!("Failed to initialize embeddings cache: {e}");
                     });
                 }
             }
