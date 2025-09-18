@@ -89,6 +89,7 @@ impl Runtime {
             in_embed,
             Arc::clone(&self.secrets),
             self.token_provider_registry(),
+            self.datafusion().embeddings_cache_provider(),
         )
         .await
         .boxed()

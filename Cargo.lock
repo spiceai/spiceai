@@ -838,7 +838,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.29.1"
-source = "git+https://github.com/spiceai/async-openai?rev=a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5#a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5"
+source = "git+https://github.com/spiceai/async-openai?rev=ec48de2d31ecc021a1962c629199ca11cf645fab#ec48de2d31ecc021a1962c629199ca11cf645fab"
 dependencies = [
  "async-openai-macros",
  "backoff",
@@ -864,7 +864,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/async-openai?rev=a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5#a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5"
+source = "git+https://github.com/spiceai/async-openai?rev=ec48de2d31ecc021a1962c629199ca11cf645fab#ec48de2d31ecc021a1962c629199ca11cf645fab"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2515,6 +2515,7 @@ version = "1.7.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
+ "async-openai",
  "async-stream",
  "async-trait",
  "byte-unit",
@@ -3690,6 +3691,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-flight",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "aws-config",
@@ -7941,6 +7943,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
  "bytes",
+ "cache",
  "chunking",
  "cudarc 0.12.2",
  "dotenvy",
