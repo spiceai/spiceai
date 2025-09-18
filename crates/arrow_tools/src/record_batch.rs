@@ -274,53 +274,6 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
     }
 }
 
-/// For a given [`RecordBatch`], replace a given column, by name, with a new [`ArrayRef`] data.
-///
-/// If `col` is not in [`RecordBatch`], no change occurs.
-///
-/// # Errors
-///
-/// This function will return an error if it unexpectedly fails to create a new [`RecordBatch`].
-pub fn replace_column_in_record(
-    rb: RecordBatch,
-    col: &str,
-    data: &ArrayRef,
-) -> Result<RecordBatch, ArrowError> {
-    let Some((idx, _)) = rb.schema().column_with_name(col) else {
-        return Ok(rb);
-    };
-    let schema = Schema::new(
-        rb.schema()
-            .fields()
-            .iter()
-            .map(|f| {
-                if f.name() == col {
-                    Arc::unwrap_or_clone(Arc::clone(f))
-                        .with_data_type(data.data_type().clone())
-                        .into()
-                } else {
-                    Arc::clone(f)
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    let columns = rb
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, arr)| {
-            if i == idx {
-                Arc::clone(data)
-            } else {
-                Arc::clone(arr)
-            }
-        })
-        .collect::<Vec<_>>();
-
-    RecordBatch::try_new(schema.into(), columns)
-}
-
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
