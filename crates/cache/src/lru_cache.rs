@@ -21,7 +21,6 @@ use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
-use crate::current_time_secs;
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
@@ -36,7 +35,7 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
@@ -48,6 +47,7 @@ pub struct LruCache<
     max_size: u64,
     metrics_last_reported_time: AtomicU64,
     ttl: Duration,
+    initial_instant: Instant,
 }
 
 impl<
@@ -138,12 +138,15 @@ impl<
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
+        V::init();
+
         LruCache {
             cache,
             hasher,
             max_size: cache_max_size,
             metrics_last_reported_time: AtomicU64::new(0),
             ttl,
+            initial_instant: Instant::now(),
         }
     }
 
@@ -192,11 +195,20 @@ impl<
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.cache.insert(*key, value).await;
 
-        let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
             V::record_max_size(self.max_size() as u64);
@@ -206,11 +218,20 @@ impl<
     fn invalidate_all(&self) {
         self.cache.invalidate_all();
 
-        let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
         }
