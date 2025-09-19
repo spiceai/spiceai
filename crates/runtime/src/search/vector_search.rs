@@ -38,7 +38,7 @@ use cache::key::{CacheKey, RawCacheKey, SearchKey};
 use cache::result::CacheStatus;
 use cache::result::query::CachedStream;
 use cache::result::search::{CachedAggregationResult, CachedSearchResult};
-use cache::{CacheProvider, Sizeable};
+use cache::{Sizeable, TabledCacheProvider};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::{TableReference, sqlparser::ast::Expr};
@@ -93,7 +93,7 @@ impl VectorSearch {
             use crate::{
                 embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider,
             };
-            for s3v in find_index_in_table_provider::<S3Vector>(tbl)? {
+            for s3v in find_index_in_table_provider::<S3Vector>(tbl)?.0 {
                 if s3v.embedded_column == embedding_column {
                     return s3v.embedding_model().await;
                 }
@@ -172,7 +172,7 @@ impl VectorSearch {
     pub async fn search_with_cache(
         &self,
         req: &SearchRequest,
-        cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+        cache_provider: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
         request_context: Arc<RequestContext>,
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
@@ -337,7 +337,7 @@ impl VectorSearch {
 fn wrap_cache_to_result(
     key: RawCacheKey,
     aggregation_result: HashMap<TableReference, AggregationResult>,
-    cache_provider: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
+    cache_provider: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
 ) -> HashMap<TableReference, AggregationResult> {
     // each hashmap entry is an aggregation result which contains a sendable record batch stream
     // for each table reference, we need to wrap the batch stream in another stream to pull out the record batches

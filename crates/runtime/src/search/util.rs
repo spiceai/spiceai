@@ -87,12 +87,12 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
 
 pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
-) -> Option<Vec<&T>> {
+) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
     let mut indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(tbl);
     while let Some(indexed_table) = indexed_table_opt {
         let indexes = indexed_table.get_indexes::<T>();
         if !indexes.is_empty() {
-            return Some(indexes);
+            return Some((indexes, Arc::clone(&indexed_table.underlying)));
         }
         indexed_table_opt =
             find_concrete_table_provider::<IndexedTableProvider>(&indexed_table.underlying);

@@ -9,20 +9,21 @@ description: "Query: clickbench_q27"
 |               |   Sort: to_timestamp(hits.EventTime) ASC NULLS LAST, hits.SearchPhrase ASC NULLS LAST, fetch=10                                           |
 |               |     Projection: hits.SearchPhrase, hits.EventTime                                                                                         |
 |               |       BytesProcessedNode                                                                                                                  |
-|               |         Filter: CAST(hits.SearchPhrase AS Utf8) != Utf8("")                                                                               |
-|               |           TableScan: hits projection=[EventTime, SearchPhrase], partial_filters=[CAST(hits.SearchPhrase AS Utf8) != Utf8("")]             |
+|               |         Filter: CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")                                                                       |
+|               |           TableScan: hits projection=[EventTime, SearchPhrase], partial_filters=[CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")]     |
 | physical_plan | ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]                                                                                     |
 |               |   SortExec: TopK(fetch=10), expr=[to_timestamp(EventTime@1) ASC NULLS LAST, SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[false] |
 |               |     CoalescePartitionsExec                                                                                                                |
 |               |       ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]                                                     |
 |               |         BytesProcessedExec                                                                                                                |
 |               |           CoalesceBatchesExec: target_batch_size=8192                                                                                     |
-|               |             FilterExec: CAST(SearchPhrase@1 AS Utf8) !=                                                                                   |
+|               |             FilterExec: CAST(SearchPhrase@1 AS Utf8View) !=                                                                               |
 |               |               SchemaCastScanExec                                                                                                          |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
 |               |                   FallbackOnZeroResultsScanExec                                                                                           |
 |               |                     CoalescePartitionsExec                                                                                                |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                               |
-|               |                         DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM hits WHERE (CAST(SearchPhrase AS VARCHAR) <> '')         |
+|               |                         CooperativeExec                                                                                                   |
+|               |                           DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM hits WHERE (CAST(SearchPhrase AS VARCHAR) <> '')       |
 |               |                                                                                                                                           |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------+

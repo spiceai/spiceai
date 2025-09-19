@@ -1,0 +1,26 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+---
+[
+  {
+    "id": 361,
+    "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants.",
+    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.016
+  },
+  {
+    "id": 462,
+    "question": "How many groups of 2 are in 14?",
+    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.016
+  },
+  {
+    "id": 464,
+    "question": "How many groups of 5 are in 25?",
+    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.016
+  },
+  {
+    "id": 463,
+    "question": "How many groups of 3 are in 18?",
+    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.016
+  }
+]
