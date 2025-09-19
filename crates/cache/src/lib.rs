@@ -19,8 +19,6 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use byte_unit::Byte;
@@ -457,14 +455,6 @@ impl Display for QueryResultsCacheProvider {
         )
     }
 }
-
-pub(crate) fn current_time_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use utils::tests::parse_sql_to_logical_plan;

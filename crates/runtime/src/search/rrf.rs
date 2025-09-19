@@ -253,6 +253,13 @@ impl ReciprocalRankFusion {
             .into_iter()
             .enumerate()
             .map(|(i, df)| {
+                // Ensure that all projections have a score column
+                if !df.schema().has_column_with_unqualified_name("score") {
+                    return exec_err!(
+                        "{RRF_UDF_NAME}: Query at position {i} does not have a `score` column."
+                    );
+                }
+
                 let df_with_id = match args.join_key {
                     Some(_) => Ok(df),
                     None => Self::with_rrf_rowid(df),
@@ -263,15 +270,6 @@ impl ReciprocalRankFusion {
                     .and_then(|df| df.alias(&format!("search_{i}")))
             })
             .collect::<Result<Vec<_>>>()?;
-
-        // Ensure that all projections have a score column
-        for (i, df) in prepared_dfs.iter().enumerate() {
-            if !df.schema().has_column_with_unqualified_name("score") {
-                return exec_err!(
-                    "{RRF_UDF_NAME}: Query at position {i} does not have a `score` column."
-                );
-            }
-        }
 
         Ok(prepared_dfs)
     }
@@ -385,12 +383,28 @@ impl TableProvider for ReciprocalRankFusion {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(ref df) = self.df {
-            df.clone().create_physical_plan().await
+            let mut df = df.clone();
+
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+                df = df.filter(filter)?;
+            }
+
+            if let Some(projection) = projection {
+                df = df.select(
+                    self.schema()
+                        .project(projection)?
+                        .fields
+                        .iter()
+                        .map(|f| col(f.name())),
+                )?;
+            }
+
+            df.limit(0, limit)?.create_physical_plan().await
         } else {
             exec_err!("ReciprocalRankFusion could not create physical plan")
         }

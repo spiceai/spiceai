@@ -14,20 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 mod embeddings {
+    use spicepod::component::caching::CacheConfig;
     use std::{
         fs::{File, create_dir_all},
         io::Write,
         path::PathBuf,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use anyhow::Result;
+    use app::AppBuilder;
+    use async_openai::types::EmbeddingInput;
     use spicepod::component::{embeddings::Embeddings, model::ModelFile};
 
     use crate::{
         init_tracing, models::embedding::run_beta_functionality_criteria_test,
         utils::test_request_context,
     };
+
+    use crate::models::search::start_app;
+    use crate::models::send_embeddings_request;
 
     /// Create a local embedding model by downloading the `model_id` from `HuggingFace` if it doesn't exist.
     ///
@@ -101,5 +107,42 @@ mod embeddings {
             .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_test_embeddings_cache() -> Result<(), anyhow::Error> {
+        let app = AppBuilder::new("embeddings_cache")
+            .with_embedding(
+                create_local_embedding_from_hf(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "local_minilm",
+                )
+                .await?,
+            )
+            .with_embeddings_cache(CacheConfig {
+                enabled: true,
+                max_size: Some("512mb".to_string()),
+                item_ttl: Some("30s".to_string()),
+                ..Default::default()
+            })
+            .build();
+
+        let _tracing = init_tracing(None);
+
+        test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let embedding_input = EmbeddingInput::StringArray((0..10).map(|i| format!("The food was delicious {i}")).collect());
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "local_minilm", embedding_input.clone(), None, None, None).await?;
+            let duration = start.elapsed();
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "local_minilm", embedding_input, None, None, None).await?;
+            let duration_cached = start.elapsed();
+            assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+            Ok(())
+        })
+        .await
     }
 }

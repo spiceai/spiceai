@@ -16,7 +16,6 @@ arrow-buffer.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-arrow_tools = { path = "../arrow_tools" }
 aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }

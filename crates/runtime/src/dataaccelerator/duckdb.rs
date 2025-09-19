@@ -312,6 +312,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
+            // TODO: skip if we are bootstrapping
             self.get_shared_pool(source).await?;
         }
 

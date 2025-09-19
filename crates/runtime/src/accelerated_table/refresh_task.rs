@@ -887,7 +887,7 @@ impl RefreshTask {
     fn is_view_acceleration(&self) -> bool {
         match &*self.federated {
             FederatedTable::Immediate(provider) => provider.table_type() == TableType::View,
-            FederatedTable::Deferred(_) => false,
+            FederatedTable::Deferred(_) | FederatedTable::DeferredNoSchema { .. } => false,
         }
     }
 
