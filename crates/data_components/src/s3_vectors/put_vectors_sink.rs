@@ -21,16 +21,34 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::{
     datasource::sink::DataSink,
-    error::Result as DataFusionResult,
+    error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{DisplayAs, DisplayFormatType},
 };
 use futures::StreamExt as _;
-use s3_vectors::{PutInputVector, PutVectorsInput, S3Vectors, VectorData};
+use s3_vectors::{
+    BuildError, PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, VectorData,
+};
+use snafu::prelude::*;
 
 use super::S3VectorIdentifier;
 
 const PUT_VECTORS_MAX_ITEMS: usize = 500;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    // This means we didn't provide required fields when constructing.
+    #[snafu(display("Unable to build input message for S3 Vectors: {source}"))]
+    BuildInput { source: BuildError },
+    #[snafu(display("Failed to write vectors into S3 Vectors: {source}"))]
+    PutVectors { source: PutVectorsError },
+    #[snafu(display("Column '{name}' is expected but missing"))]
+    MissingColumn { name: String },
+    #[snafu(display("Column '{name}' type is not '{expected}' but expected to be"))]
+    ColumnTypeMismatch { name: String, expected: String },
+}
+
+type Result<T> = std::result::Result<T, Error>;
 
 pub struct PutVectorsSink {
     idx: S3VectorIdentifier,
@@ -97,10 +115,11 @@ impl DataSink for PutVectorsSink {
                             .set_vector_bucket_name(vector_bucket_name.clone())
                             .set_vectors(Some(chunk.to_vec()))
                             .build()
-                            .unwrap(),
+                            .context(BuildInputSnafu)?,
                     )
                     .await
-                    .unwrap();
+                    .map_err(|e| e.into_service_error())
+                    .context(PutVectorsSnafu)?;
 
                 count += chunk.len();
             }
@@ -110,27 +129,39 @@ impl DataSink for PutVectorsSink {
     }
 }
 
-fn create_put_input_vectors(record_batch: RecordBatch) -> Result<Vec<PutInputVector>, String> {
+fn create_put_input_vectors(record_batch: RecordBatch) -> Result<Vec<PutInputVector>> {
+    let name = "key".to_string();
     let keys = record_batch
-        .column_by_name("key")
-        .ok_or("Missing key column")?
+        .column_by_name(&name)
+        .ok_or_else(|| Error::MissingColumn { name: name.clone() })?
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
-        .ok_or("Key column must be String")?;
+        .ok_or_else(|| Error::ColumnTypeMismatch {
+            name,
+            expected: "StringArray".to_string(),
+        })?;
 
+    let name = "metadata".to_string();
+    let _metadata = record_batch
+        .column_by_name(&name)
+        .ok_or_else(|| Error::MissingColumn { name: name.clone() })?
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .ok_or_else(|| Error::ColumnTypeMismatch {
+            name,
+            expected: "StringArray".to_string(),
+        })?;
+
+    let name = "vector".to_string();
     let vectors = record_batch
-        .column_by_name("vector")
-        .ok_or("Missing vector column")?
+        .column_by_name(&name)
+        .ok_or_else(|| Error::MissingColumn { name: name.clone() })?
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()
-        .ok_or("Vector column must be List")?;
-
-    let _metadata = record_batch
-        .column_by_name("metadata")
-        .ok_or("Missing metadata column")?
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or("Metadata column must be String")?;
+        .ok_or_else(|| Error::ColumnTypeMismatch {
+            name,
+            expected: "ListArray".to_string(),
+        })?;
 
     let mut put_input_vectors = Vec::new();
     for i in 0..record_batch.num_rows() {
@@ -140,7 +171,10 @@ fn create_put_input_vectors(record_batch: RecordBatch) -> Result<Vec<PutInputVec
             .value(i)
             .as_any()
             .downcast_ref::<arrow::array::Float32Array>()
-            .ok_or("Invalid vector data")?
+            .ok_or_else(|| Error::ColumnTypeMismatch {
+                name: format!("vector[{i}]"),
+                expected: "Float32Array".to_string(),
+            })?
             .values()
             .to_vec();
 
@@ -157,10 +191,16 @@ fn create_put_input_vectors(record_batch: RecordBatch) -> Result<Vec<PutInputVec
             .key(key)
             .data(VectorData::Float32(vector))
             .build()
-            .unwrap();
+            .context(BuildInputSnafu)?;
 
         put_input_vectors.push(put_input_vector);
     }
 
     Ok(put_input_vectors)
+}
+
+impl From<Error> for DataFusionError {
+    fn from(value: Error) -> Self {
+        DataFusionError::Execution(value.to_string())
+    }
 }
