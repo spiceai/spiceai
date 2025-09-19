@@ -12043,6 +12043,7 @@ dependencies = [
  "bytes",
  "cache",
  "chrono",
+ "chunking",
  "clap",
  "clickhouse-rs",
  "csv",
