@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
-use arrow_array::RecordBatch;
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow_array::{Array, RecordBatch};
 use async_trait::async_trait;
 use datafusion::{
     datasource::sink::DataSink,
@@ -27,7 +27,8 @@ use datafusion::{
 };
 use futures::StreamExt as _;
 use s3_vectors::{
-    BuildError, PutInputVector, PutVectorsError, PutVectorsInput, SdkError, VectorData,
+    BuildError, Document, Number, PutInputVector, PutVectorsError, PutVectorsInput, SdkError,
+    VectorData,
 };
 use snafu::prelude::*;
 
@@ -55,6 +56,7 @@ pub struct PutVectorsSink {
 }
 
 impl PutVectorsSink {
+    #[must_use]
     pub fn new(table: S3VectorsTable) -> Self {
         Self { table }
     }
@@ -134,17 +136,6 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             expected: "StringArray".to_string(),
         })?;
 
-    let name = "metadata".to_string();
-    let _metadata = record_batch
-        .column_by_name(&name)
-        .ok_or_else(|| Error::MissingColumn { name: name.clone() })?
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| Error::ColumnTypeMismatch {
-            name,
-            expected: "StringArray".to_string(),
-        })?;
-
     let name = S3_VECTOR_EMBEDDING_NAME.to_string();
     let vectors = record_batch
         .column_by_name(&name)
@@ -156,16 +147,27 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             expected: "ListArray".to_string(),
         })?;
 
+    let schema = record_batch.schema();
+    let fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            f.name() != S3_VECTOR_EMBEDDING_NAME && f.name() != S3_VECTOR_PRIMARY_KEY_NAME
+        })
+        .map(|(i, f)| (i, f.name(), f.data_type()))
+        .collect::<Vec<_>>();
+
     let mut put_input_vectors = Vec::new();
-    for i in 0..record_batch.num_rows() {
-        let key = keys.value(i).to_string();
+    for row in 0..record_batch.num_rows() {
+        let key = keys.value(row).to_string();
 
         let vector = vectors
-            .value(i)
+            .value(row)
             .as_any()
             .downcast_ref::<arrow::array::Float32Array>()
             .ok_or_else(|| Error::ColumnTypeMismatch {
-                name: format!("data[{i}]"),
+                name: format!("data[{row}]"),
                 expected: "Float32Array".to_string(),
             })?
             .values()
@@ -179,10 +181,24 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             continue;
         }
 
-        // TODO: add metadata
+        let mut metadata = HashMap::new();
+
+        for (index, name, data_type) in &fields {
+            let col = record_batch.column(*index);
+            let value = metadata_from_row(row, data_type, col);
+            metadata.insert((*name).to_string(), value);
+        }
+
+        let metadata = if metadata.is_empty() {
+            None
+        } else {
+            Some(Document::Object(metadata))
+        };
+
         let put_input_vector = PutInputVector::builder()
             .key(key)
             .data(VectorData::Float32(vector))
+            .set_metadata(metadata)
             .build()
             .context(BuildInputSnafu)?;
 
@@ -190,6 +206,48 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
     }
 
     Ok(put_input_vectors)
+}
+
+#[allow(clippy::unwrap_used)]
+fn metadata_from_row(row: usize, data_type: &DataType, col: &Arc<dyn Array + 'static>) -> Document {
+    match data_type {
+        DataType::Utf8 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap(); // UNWRAP: we checked the datatype
+            Document::String(arr.value(row).to_string())
+        }
+        DataType::Int64 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap(); // UNWRAP: we checked the datatype
+            Document::Number(Number::NegInt(arr.value(row)))
+        }
+        DataType::UInt64 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap(); // UNWRAP: we checked the datatype
+            Document::Number(Number::PosInt(arr.value(row)))
+        }
+        DataType::Float64 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap(); // UNWRAP: we checked the datatype
+            Document::Number(Number::Float(arr.value(row)))
+        }
+        DataType::Boolean => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap(); // UNWRAP: we checked the datatype
+            Document::Bool(arr.value(row))
+        }
+        _ => unimplemented!(),
+    }
 }
 
 impl From<Error> for DataFusionError {
