@@ -289,7 +289,7 @@ async fn query_vector_stream(
     let start = std::time::Instant::now();
 
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let (json_schema, vector_size) = loosen_vector_schema(&schema, S3_VECTOR_EMBEDDING_NAME);
+    let (json_schema, vector_sizes) = loosen_vector_schema(&schema);
     let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
 
     let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
@@ -356,7 +356,7 @@ async fn query_vector_stream(
     })?;
 
     match decoder.flush() {
-        Ok(Some(rb)) => send_vector_data(&tx, rb, vector_size).await,
+        Ok(Some(rb)) => send_vector_data(&tx, rb, &vector_sizes).await,
         Ok(None) => {}
         Err(e) => {
             let _ = tx
