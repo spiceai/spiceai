@@ -16,7 +16,8 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, vector_table::S3VectorsTable,
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
 /// Num of segments to use for parallel `ListVectors` API calls.

@@ -27,8 +27,12 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
+use arrow_tools::record_batch::replace_column_in_record;
 use aws_credential_types::provider::error::CredentialsError;
-use datafusion::common::{Constraint, Constraints};
+use datafusion::{
+    common::{Constraint, Constraints},
+    error::DataFusionError,
+};
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
     GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
@@ -38,6 +42,7 @@ use s3_vectors::{
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
 use snafu::ResultExt;
+use tokio::sync::mpsc::Sender;
 
 /// An S3 Vector index.
 #[derive(Clone)]
