@@ -867,6 +867,7 @@ impl DataFusion {
             }
         };
 
+        // TODO: Need to download snapshot here
         let source_schema = source_table_provider.schema();
 
         let refresh_sql = dataset.refresh_sql();
@@ -891,7 +892,7 @@ impl DataFusion {
 
         let constraints = match &*source_table_provider {
             FederatedTable::Immediate(table_provider) => table_provider.constraints(),
-            FederatedTable::Deferred(_) => None,
+            FederatedTable::Deferred(_) | FederatedTable::DeferredNoSchema { .. } => None,
         };
 
         let accelerated_table_provider = self
