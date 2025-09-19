@@ -39,7 +39,7 @@ const _: () = {
             + PARTITION_BY_MAX_LENGTH
             + _NUM_SEPARATORS
             == _S3_VECTOR_INDEX_NAME_MAX_LENGTH
-    )
+    );
 };
 
 static PARTS_SEPARATOR: &str = ".";
@@ -151,7 +151,7 @@ fn validate_index(index: &str) -> Result<(), Error> {
             len
         }
     );
-    ensure!(!index.contains("-"), InvalidIndexNameHyphenSnafu);
+    ensure!(!index.contains('-'), InvalidIndexNameHyphenSnafu);
 
     Ok(())
 }
@@ -175,6 +175,7 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, DataFusionError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::sync::Arc;
 
