@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::{
@@ -27,11 +27,11 @@ use datafusion::{
 };
 use futures::StreamExt as _;
 use s3_vectors::{
-    BuildError, PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
+    BuildError, PutInputVector, PutVectorsError, PutVectorsInput, SdkError, VectorData,
 };
 use snafu::prelude::*;
 
-use super::S3VectorIdentifier;
+use super::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable};
 
 const PUT_VECTORS_MAX_ITEMS: usize = 500;
 
@@ -51,19 +51,12 @@ pub enum Error {
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct PutVectorsSink {
-    idx: S3VectorIdentifier,
-    client: Arc<dyn S3Vectors + Send + Sync>,
-    schema: SchemaRef,
+    table: S3VectorsTable,
 }
 
 impl PutVectorsSink {
-    pub fn new(idx: S3VectorIdentifier, client: Arc<dyn S3Vectors + Send + Sync>) -> Self {
-        let schema = schema_ref();
-        Self {
-            idx,
-            client,
-            schema,
-        }
+    pub fn new(table: S3VectorsTable) -> Self {
+        Self { table }
     }
 }
 
@@ -86,7 +79,7 @@ impl DataSink for PutVectorsSink {
     }
 
     fn schema(&self) -> &SchemaRef {
-        &self.schema
+        &self.table.schema
     }
 
     async fn write_all(
@@ -101,10 +94,12 @@ impl DataSink for PutVectorsSink {
 
             let vectors = create_put_input_vectors(&record_batch)?;
 
-            let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
+            let (index_arn, vector_bucket_name, index_name) =
+                self.table.idx.index_identifier_variables();
 
             for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-                self.client
+                self.table
+                    .client
                     .put_vectors(
                         PutVectorsInput::builder()
                             .set_index_arn(index_arn.clone())
@@ -126,21 +121,9 @@ impl DataSink for PutVectorsSink {
     }
 }
 
-fn schema_ref() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("key", DataType::Utf8, false),
-        Field::new("metadata", DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-            false,
-        ),
-    ]))
-}
-
 #[allow(clippy::result_large_err)]
 fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVector>> {
-    let name = "key".to_string();
+    let name = S3_VECTOR_PRIMARY_KEY_NAME.to_string();
     let keys = record_batch
         .column_by_name(&name)
         .ok_or_else(|| Error::MissingColumn { name: name.clone() })?
@@ -162,7 +145,7 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             expected: "StringArray".to_string(),
         })?;
 
-    let name = "vector".to_string();
+    let name = S3_VECTOR_EMBEDDING_NAME.to_string();
     let vectors = record_batch
         .column_by_name(&name)
         .ok_or_else(|| Error::MissingColumn { name: name.clone() })?
@@ -182,7 +165,7 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             .as_any()
             .downcast_ref::<arrow::array::Float32Array>()
             .ok_or_else(|| Error::ColumnTypeMismatch {
-                name: format!("vector[{i}]"),
+                name: format!("data[{i}]"),
                 expected: "Float32Array".to_string(),
             })?
             .values()
@@ -225,6 +208,18 @@ mod tests {
     use arrow_array::{Float32Array, GenericListArray, Int32Array, StringArray};
 
     use super::*;
+
+    fn schema_ref() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new("metadata", DataType::Utf8, false),
+            Field::new_list(
+                S3_VECTOR_EMBEDDING_NAME,
+                Field::new("item", DataType::Float32, true),
+                true,
+            ),
+        ]))
+    }
 
     fn build_vectors(input: &[&[f32]]) -> GenericListArray<i32> {
         let capacity = input.iter().map(|i| i.len()).sum();
@@ -275,9 +270,9 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("metadata", DataType::Utf8, false),
             Field::new(
-                "vector",
+                S3_VECTOR_EMBEDDING_NAME,
                 DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-                false,
+                true,
             ),
         ]));
 
@@ -306,12 +301,12 @@ mod tests {
         let vectors = list_builder.finish();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
             Field::new("metadata", DataType::Utf8, false),
             Field::new(
-                "vector",
+                S3_VECTOR_EMBEDDING_NAME,
                 DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                false,
+                true,
             ),
         ]));
 
