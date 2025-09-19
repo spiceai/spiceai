@@ -27,6 +27,21 @@ const COLUMN_NAME_MAX_LENGTH: usize = 25;
 const PARTITION_VALUE_MAX_LENGTH: usize = 5;
 const PARTITION_BY_MAX_LENGTH: usize = 5;
 
+const _NUM_SEPARATORS: usize = 3; // 3 periods '.' separate the 4 parts
+/// See [CreateIndex](https://docs.aws.amazon.com/AmazonS3/latest/API/API_S3VectorBuckets_CreateIndex.html#API_S3VectorBuckets_CreateIndex_RequestSyntax)
+const _S3_VECTOR_INDEX_NAME_MAX_LENGTH: usize = 63;
+
+const _: () = {
+    assert!(
+        INDEX_NAME_MAX_LENGTH
+            + COLUMN_NAME_MAX_LENGTH
+            + PARTITION_VALUE_MAX_LENGTH
+            + PARTITION_BY_MAX_LENGTH
+            + _NUM_SEPARATORS
+            == _S3_VECTOR_INDEX_NAME_MAX_LENGTH
+    )
+};
+
 static PARTS_SEPARATOR: &str = ".";
 
 #[derive(Debug, Snafu)]
@@ -37,6 +52,12 @@ pub enum Error {
     IncorrectNumPartsInName { num_parts: usize },
     #[snafu(display("Failed to unparse a partition_by expression: {source}"))]
     UnparsingExpression { source: DataFusionError },
+    #[snafu(display("Index names cannot contain hyphens"))]
+    InvalidIndexNameHyphen,
+    #[snafu(display(
+        "Index names are restricted to {INDEX_NAME_MAX_LENGTH} characters, but {index} is {len} characters"
+    ))]
+    InvalidIndexNameLength { index: String, len: usize },
 }
 
 #[derive(Debug)]
@@ -61,8 +82,9 @@ impl PartitionedIndexName {
         partition_value: &ScalarValue,
         partition_by: &[Expr],
     ) -> Result<Self, Error> {
-        let index_name = truncate(&sanitize(index_name), INDEX_NAME_MAX_LENGTH);
-        let column_name = truncate(&sanitize(column_name), COLUMN_NAME_MAX_LENGTH);
+        validate_index(index_name)?;
+        let index_name = truncate(&sanitize_column(index_name), INDEX_NAME_MAX_LENGTH);
+        let column_name = truncate(&sanitize_column(column_name), COLUMN_NAME_MAX_LENGTH);
         let partition_value_hash = truncate(
             &hash_to_hex(&partition_value.to_string()),
             PARTITION_VALUE_MAX_LENGTH,
@@ -116,8 +138,22 @@ impl PartitionedIndexName {
     }
 }
 
-fn sanitize(s: &str) -> String {
+fn sanitize_column(s: &str) -> String {
     s.replace('_', "-")
+}
+
+fn validate_index(index: &str) -> Result<(), Error> {
+    let len = index.len();
+    ensure!(
+        len < INDEX_NAME_MAX_LENGTH,
+        InvalidIndexNameLengthSnafu {
+            index: index.to_string(),
+            len
+        }
+    );
+    ensure!(!index.contains("-"), InvalidIndexNameHyphenSnafu);
+
+    Ok(())
 }
 
 fn truncate(s: &str, len: usize) -> String {
@@ -152,9 +188,6 @@ mod tests {
     use datafusion::prelude::{case, col, lit};
     use datafusion::scalar::ScalarValue;
 
-    /// See [CreateIndex](https://docs.aws.amazon.com/AmazonS3/latest/API/API_S3VectorBuckets_CreateIndex.html#API_S3VectorBuckets_CreateIndex_RequestSyntax)
-    const S3_VECTOR_INDEX_NAME_MAX_LENGTH: usize = 63;
-
     #[test]
     fn index_name_length_restricted() {
         let index_name = "a".repeat(INDEX_NAME_MAX_LENGTH + 1);
@@ -162,15 +195,9 @@ mod tests {
         let partition_value = ScalarValue::from("val");
         let partition_by = vec![col("col1")];
 
-        let result =
+        assert!(
             PartitionedIndexName::new(&index_name, column_name, &partition_value, &partition_by)
-                .expect("result");
-        let result = result.to_index_name();
-
-        assert!(result.len() <= S3_VECTOR_INDEX_NAME_MAX_LENGTH);
-        assert_eq!(
-            result.split(PARTS_SEPARATOR).next().expect("next").len(),
-            INDEX_NAME_MAX_LENGTH
+                .is_err()
         );
     }
 
@@ -216,7 +243,7 @@ mod tests {
     #[test]
     fn sanitize_replaces_underscores() {
         let input = "test_index_name";
-        let result = sanitize(input);
+        let result = sanitize_column(input);
         assert_eq!(result, "test-index-name");
     }
 
