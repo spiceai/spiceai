@@ -140,8 +140,16 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, DataFusionError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use datafusion::prelude::col;
+    use arrow::datatypes::DataType;
+    use datafusion::functions::regex::regexp_match;
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::logical_expr::{
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    };
+    use datafusion::prelude::{case, col, lit};
     use datafusion::scalar::ScalarValue;
 
     /// See [CreateIndex](https://docs.aws.amazon.com/AmazonS3/latest/API/API_S3VectorBuckets_CreateIndex.html#API_S3VectorBuckets_CreateIndex_RequestSyntax)
@@ -238,5 +246,69 @@ mod tests {
 
         let result = index.to_index_name();
         assert_eq!(result, "idx.col.12345.abcde");
+    }
+
+    #[derive(Debug)]
+    struct Bucket {
+        signature: Signature,
+    }
+
+    impl Bucket {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                signature: Signature::any(2, Volatility::Immutable),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for Bucket {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn name(&self) -> &'static str {
+            "bucket"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
+            Ok(DataType::Int32)
+        }
+
+        fn invoke_with_args(
+            &self,
+            _args: ScalarFunctionArgs,
+        ) -> Result<ColumnarValue, DataFusionError> {
+            unimplemented!()
+        }
+    }
+    #[test]
+    fn partition_by_stability() {
+        let partition_by = &[col("id").eq(lit(7))];
+        assert_eq!(to_stable_string(partition_by).unwrap(), "(id = 7)");
+        let partition_by = &[Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(Bucket::new())),
+            args: vec![lit(10i64), col("a")],
+        })];
+        assert_eq!(to_stable_string(partition_by).unwrap(), "bucket(10, a)");
+        let partition_by = &[col("a") % lit(10)];
+        assert_eq!(to_stable_string(partition_by).unwrap(), "(a % 10)");
+        let partition_by = &[col("region")];
+        assert_eq!(to_stable_string(partition_by).unwrap(), "region");
+        let partition_by = &[case(Expr::ScalarFunction(ScalarFunction {
+            func: regexp_match(),
+            args: vec![col("a"), lit("^DATAFUSION(-cli)*")],
+        }))
+        .when(lit(true), lit("datafusion"))
+        .otherwise(lit("other"))
+        .unwrap()];
+        assert_eq!(
+            to_stable_string(partition_by).unwrap(),
+            "CASE regexp_match(a, '^DATAFUSION(-cli)*') WHEN true THEN 'datafusion' ELSE 'other' END"
+        );
     }
 }
