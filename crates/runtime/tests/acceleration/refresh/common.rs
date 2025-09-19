@@ -67,21 +67,21 @@ pub(crate) fn get_dataset(port: usize) -> Dataset {
     ds
 }
 
-pub(crate) async fn run_ps_sql(db_conn: &PostgresConnection, sql: &str) -> u64 {
+pub(crate) async fn run_ps_sql(
+    db_conn: &PostgresConnection,
+    sql: &str,
+) -> Result<u64, anyhow::Error> {
     db_conn
         .conn
         .execute(sql, &[])
         .await
-        .expect("query executed")
+        .map_err(|e| anyhow::anyhow!("Error running sql: {}", e))
 }
 
 pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnection, anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
 
-    let db_conn = pool
-        .connect_direct()
-        .await
-        .expect("connection can be established");
+    let db_conn = pool.connect_direct().await?;
 
     run_ps_sql(
         &db_conn,
@@ -136,12 +136,7 @@ pub(crate) async fn read_sql(
     rt: Arc<Runtime>,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let mut result = rt
-        .datafusion()
-        .query_builder("SELECT * from test_table")
-        .build()
-        .run()
-        .await?;
+    let mut result = rt.datafusion().query_builder(sql).build().run().await?;
 
     let mut results: Vec<RecordBatch> = vec![];
     while let Some(batch) = result.data.next().await {
@@ -156,6 +151,9 @@ pub(crate) async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<
         .datafusion()
         .refresh_table(&TableReference::from(table_name), None)
         .await?;
-    notifier.expect("notifier").notified().await;
+    notifier
+        .ok_or_else(|| anyhow::anyhow!("Failed to refresh table"))?
+        .notified()
+        .await;
     Ok(())
 }
