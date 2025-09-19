@@ -20,6 +20,7 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
+    "crates/runtime-acceleration",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-table-partition",

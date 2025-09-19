@@ -1,0 +1,18 @@
+[package]
+description = "Acceleration support for the Spice runtime"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "runtime-acceleration"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+object_store.workspace = true
+tracing.workspace = true
+snafu.workspace = true
+url.workspace = true

@@ -12161,6 +12161,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-acceleration"
+version = "1.7.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "object_store",
+ "snafu",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "runtime-auth"
 version = "1.7.0-unstable"
 dependencies = [

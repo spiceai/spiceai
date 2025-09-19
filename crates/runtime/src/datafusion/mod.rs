@@ -867,6 +867,14 @@ impl DataFusion {
             }
         };
 
+        let acceleration_settings =
+            dataset
+                .acceleration
+                .clone()
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: dataset.name.to_string(),
+                })?;
+
         // TODO: Need to download snapshot here
         let source_schema = source_table_provider.schema();
 
@@ -881,14 +889,6 @@ impl DataFusion {
         } else {
             source_schema
         };
-
-        let acceleration_settings =
-            dataset
-                .acceleration
-                .clone()
-                .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: dataset.name.to_string(),
-                })?;
 
         let constraints = match &*source_table_provider {
             FederatedTable::Immediate(table_provider) => table_provider.constraints(),
