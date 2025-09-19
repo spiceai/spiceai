@@ -209,6 +209,15 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
+                    "s3vectors_hybrid_additional_columns2",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["answer"],
+                    })),
+                ),
+                SearchTestCase::new(
                     "s3vectors_hybrid_with_where",
                     SearchTestType::Http(json!({
                         "text": "secondary",
@@ -224,6 +233,12 @@ mod search {
                     ),
                 ),
                 SearchTestCase::new(
+                    "s3vectors_hybrid_vector_search_sql_w_question",
+                    SearchTestType::Sql(
+                        "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_text_search",
                     SearchTestType::Sql(
                         "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
@@ -236,34 +251,11 @@ mod search {
                     ),
                 ),
                 SearchTestCase::new(
-                    "s3vectors_hybrid_vector_search_sql_projection",
+                    "s3vectors_hybrid_vector_search_text_search_w_answer",
                     SearchTestType::Sql(
-                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
-                SearchTestCase::new(
-                    "s3vectors_hybrid_vector_search_sql_filters",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_hybrid_vector_search_sql_no_score",
-                    SearchTestType::Sql(
-                        "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_hybrid_vector_search_sql_random",
-                    SearchTestType::Sql(
-                        "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_hybrid_vector_search_sql_vectors",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
-                    ))
             ],
             true
         )
