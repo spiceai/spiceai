@@ -76,7 +76,6 @@ impl S3Vector {
         primary_key: Vec<Field>,
         metadata_columns: MetadataColumns,
         model_name: String,
-        dimension: usize,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
         Self {
@@ -202,7 +201,7 @@ impl VectorIndex for S3Vector {
             .column_with_name(S3_VECTOR_EMBEDDING_NAME)
             .map(|(_, f)| {
                 match f.data_type() {
-                    DataType::FixedSizeList(_, dim) => dim,
+                    DataType::FixedSizeList(_, dim) => *dim,
                     _ => 0, // Should not be reachable
                 }
             })

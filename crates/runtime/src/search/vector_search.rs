@@ -51,7 +51,7 @@ use itertools::Itertools;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::chunking::ChunkedSearchIndex;
-use search::index::{SearchIndex, VectorIndex};
+use search::index::SearchIndex;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -85,30 +85,6 @@ impl VectorSearch {
             embeddings,
             explicit_primary_keys,
         }
-    }
-
-    /// Checks if a  [`TableProvider`] has an associated vector index, and if so, returns the associated [`Embed`].
-    #[allow(clippy::unused_async)] // async is not used when the feature is disabled
-    #[allow(unused_variables)]
-    async fn model_from_vector_index(
-        &self,
-        tbl: &Arc<dyn TableProvider>,
-        embedding_column: &str,
-    ) -> Option<Arc<dyn Embed>> {
-        #[cfg(feature = "s3_vectors")]
-        {
-            use crate::{
-                embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider,
-            };
-            for s3v in find_index_in_table_provider::<S3Vector>(tbl)?.0 {
-                if s3v.embedded_column == embedding_column {
-                    return s3v.embedding_model().await;
-                }
-            }
-            None
-        }
-        #[cfg(not(feature = "s3_vectors"))]
-        None
     }
 
     fn get_vector_index(

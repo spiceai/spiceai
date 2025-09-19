@@ -14,7 +14,6 @@ version.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
-arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
 arrow_tools = { path = "../arrow_tools" }
