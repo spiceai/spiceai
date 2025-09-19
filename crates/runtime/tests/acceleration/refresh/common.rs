@@ -81,7 +81,10 @@ pub(crate) async fn run_ps_sql(
 pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnection, anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
 
-    let db_conn = pool.connect_direct().await?;
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("Error connecting: {}", e))?;
 
     run_ps_sql(
         &db_conn,
