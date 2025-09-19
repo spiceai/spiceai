@@ -306,8 +306,7 @@ impl ReciprocalRankFusion {
             .build()?
             .alias("rank");
 
-        df.window(vec![rank_expr])?
-            .sort(vec![col("rank").sort(false, false)])
+        df.window(vec![rank_expr])
     }
 
     // Create an internal row ID by hashing all pieces of the row
@@ -451,7 +450,7 @@ mod tests {
     pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-    fn make_test_table(test_data: Vec<&str>) -> Result<Arc<dyn TableProvider>> {
+    fn make_test_table(test_data: &[&str]) -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("content", DataType::Utf8, false),
@@ -528,7 +527,7 @@ mod tests {
             .config_mut()
             .set_extension(Arc::clone(&TEST_REQUEST_CONTEXT));
 
-        let test_table = make_test_table(vec![
+        let test_table = make_test_table(&[
             "banana yellow curved fruit",
             "orange citrus round juicy",
             "apple fruit sweet red crispy",
@@ -574,7 +573,7 @@ mod tests {
             .await
             .expect("Failed to create test runtime");
 
-        let empty_table = make_test_table(vec![]).expect("Failed to create empty table");
+        let empty_table = make_test_table(&[]).expect("Failed to create empty table");
         runtime
             .df
             .ctx
