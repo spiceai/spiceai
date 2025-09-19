@@ -247,7 +247,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_text_search_w_embedding",
                     SearchTestType::Sql(
-                        "SELECT id, answer, length(answer_embedding), trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
