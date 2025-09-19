@@ -94,15 +94,15 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
                     created_at TIMESTAMP WITH TIME ZONE
                 )",
     )
-    .await;
+    .await?;
 
     run_ps_sql(
         &db_conn,
         "INSERT INTO test_table (created_at) VALUES (now())",
     )
-    .await;
+    .await?;
 
-    run_ps_sql(&db_conn, "CREATE DATABASE acceleration").await;
+    run_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
 
     Ok(db_conn)
 }

@@ -41,6 +41,7 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
                 ("pg_db".to_string(), "acceleration".to_string()),
                 ("pg_sslmode".to_string(), "disable".to_string()),
                 ("pg_port".to_string(), port.to_string()),
+                ("pg_port".to_string(), port.to_string()),
             ]
             .iter()
             .cloned()
@@ -59,7 +60,7 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
                 &db_conn,
                 "INSERT INTO test_table (created_at) VALUES (now());",
             )
-            .await;
+            .await?;
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
@@ -107,7 +108,7 @@ async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
                 &db_conn,
                 "INSERT INTO test_table (created_at) VALUES (now());",
             )
-            .await;
+            .await?;
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
