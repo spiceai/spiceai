@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::{prelude::Expr, scalar::ScalarValue};
+use datafusion::{
+    error::DataFusionError, prelude::Expr, scalar::ScalarValue, sql::unparser::expr_to_sql,
+};
 use snafu::prelude::*;
 use twox_hash::XxHash64;
 
@@ -25,12 +27,16 @@ const COLUMN_NAME_MAX_LENGTH: usize = 25;
 const PARTITION_VALUE_MAX_LENGTH: usize = 5;
 const PARTITION_BY_MAX_LENGTH: usize = 5;
 
-static PARTS_SEPARATOR: &str = "-";
+static PARTS_SEPARATOR: &str = ".";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Expected exactly 4 parts in index name separated by hyphens, but found {num_parts}"))]
+    #[snafu(display(
+        "Expected exactly 4 parts in index name separated by hyphens, but found {num_parts}"
+    ))]
     IncorrectNumPartsInName { num_parts: usize },
+    #[snafu(display("Failed to unparse a partition_by expression: {source}"))]
+    UnparsingExpression { source: DataFusionError },
 }
 
 #[derive(Debug)]
@@ -62,7 +68,7 @@ impl PartitionedIndexName {
             PARTITION_VALUE_MAX_LENGTH,
         );
         let partition_by_hash = truncate(
-            &hash_to_hex(&format!("{partition_by:?}")),
+            &hash_to_hex(&to_stable_string(partition_by).context(UnparsingExpressionSnafu)?),
             PARTITION_BY_MAX_LENGTH,
         );
         Ok(Self {
@@ -86,7 +92,7 @@ impl PartitionedIndexName {
     }
 
     pub fn from_index_name(index_name: &str) -> Result<Self, Error> {
-        let parts: Vec<&str> = index_name.split('-').collect();
+        let parts: Vec<&str> = index_name.split(PARTS_SEPARATOR).collect();
         let num_parts = parts.len();
         ensure!(num_parts == 4, IncorrectNumPartsInNameSnafu { num_parts });
         Ok(Self {
@@ -123,6 +129,15 @@ fn hash_to_hex(input: &str) -> String {
     format!("{hash:x}")
 }
 
+// Provide a stable string representation of the expressions
+fn to_stable_string(exprs: &[Expr]) -> Result<String, DataFusionError> {
+    Ok(exprs
+        .iter()
+        .map(|expr| expr_to_sql(expr).map(|e| e.to_string()))
+        .collect::<Result<Vec<String>, DataFusionError>>()?
+        .join(PARTS_SEPARATOR))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,7 +161,7 @@ mod tests {
 
         assert!(result.len() <= S3_VECTOR_INDEX_NAME_MAX_LENGTH);
         assert_eq!(
-            result.split('-').next().expect("next").len(),
+            result.split(PARTS_SEPARATOR).next().expect("next").len(),
             INDEX_NAME_MAX_LENGTH
         );
     }
@@ -173,25 +188,21 @@ mod tests {
 
     #[test]
     fn from_index_name_valid() {
-        let name = "testindex-testcol-12345-abcde";
+        let name = "test-index.test-col.12345.abcde";
         let result = PartitionedIndexName::from_index_name(name).expect("from_index_name");
 
-        assert_eq!(result.index_name, "testindex");
-        assert_eq!(result.column_name, "testcol");
+        assert_eq!(result.index_name, "test-index");
+        assert_eq!(result.column_name, "test-col");
         assert_eq!(result.partition_value_hash, "12345");
         assert_eq!(result.partition_by_hash, "abcde");
     }
 
     #[test]
     fn from_index_name_invalid_parts() {
-        let name = "test-index-col";
+        let name = "test.index.col";
         let result = PartitionedIndexName::from_index_name(name);
 
         assert!(result.is_err());
-        assert_eq!(
-            result.expect_err("result").to_string(),
-            "Expected 4 parts in index name between hypens but got 3"
-        );
     }
 
     #[test]
@@ -226,6 +237,6 @@ mod tests {
         };
 
         let result = index.to_index_name();
-        assert_eq!(result, "idx-col-12345-abcde");
+        assert_eq!(result, "idx.col.12345.abcde");
     }
 }
