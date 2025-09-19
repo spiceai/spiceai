@@ -20,7 +20,6 @@ use std::{
     sync::Arc,
 };
 
-use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
