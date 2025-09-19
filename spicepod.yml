@@ -46,7 +46,11 @@ datasets:
   # Fetch pull requests of the spiceai repository every 1 hour, materialize locally
   - from: github:github.com/spiceai/spiceai/pulls
     name: pulls
-    params: *github_params
+    params:
+      github_client_id: ${secrets:GITHUB_CLIENT_ID}
+      github_private_key: ${secrets:GITHUB_PRIVATE_KEY}
+      github_installation_id: ${secrets:GITHUB_INSTALLATION_ID}
+      github_include_comments: all
     time_column: updated_at
     time_format: timestamp
     acceleration: *github_acceleration
