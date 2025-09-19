@@ -98,6 +98,7 @@ assignees: ''
 
 Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) run associated with the above create Github release:
 
+- [ ] Ensure the [docker image build](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) is completed and the image [was promoted](https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml) to all stamps and environments
 - [ ] Deploy the new docker image to several apps in dev [SCP](https://dev.spice.ai/). Confirm upgrade and functionality.
 - [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality.
   - spicehq:
@@ -135,6 +136,9 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
 - [ ] Mark the [release](https://github.com/spicehq/spiceai/releases) as official once all binaries and Docker images finish building.
 
 - [ ] Perform a final test pass on the released binaries and Docker images.
+
+- [ ] Trigger [Platform OpenAPI Spec generation workflow](https://github.com/spicehq/ai-platform/actions/workflows/generate-openapi.yml) to include Spice OSS OpenAPI spec updates, if any exist.
+  - [ ] Update HTTP API Reference in https://docs.spice.ai if needed.
 
 ## Post-Release Validation and Housekeeping
 
