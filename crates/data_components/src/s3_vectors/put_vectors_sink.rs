@@ -27,7 +27,7 @@ use datafusion::{
 };
 use futures::StreamExt as _;
 use s3_vectors::{
-    BuildError, PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, VectorData,
+    BuildError, PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use snafu::prelude::*;
 
@@ -102,7 +102,7 @@ impl DataSink for PutVectorsSink {
         while let Some(record_batch) = data.next().await {
             let record_batch = record_batch?;
 
-            let vectors = create_put_input_vectors(record_batch).unwrap();
+            let vectors = create_put_input_vectors(&record_batch)?;
 
             let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
 
@@ -118,7 +118,7 @@ impl DataSink for PutVectorsSink {
                             .context(BuildInputSnafu)?,
                     )
                     .await
-                    .map_err(|e| e.into_service_error())
+                    .map_err(SdkError::into_service_error)
                     .context(PutVectorsSnafu)?;
 
                 count += chunk.len();
@@ -129,7 +129,8 @@ impl DataSink for PutVectorsSink {
     }
 }
 
-fn create_put_input_vectors(record_batch: RecordBatch) -> Result<Vec<PutInputVector>> {
+#[allow(clippy::result_large_err)]
+fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVector>> {
     let name = "key".to_string();
     let keys = record_batch
         .column_by_name(&name)
@@ -202,5 +203,192 @@ fn create_put_input_vectors(record_batch: RecordBatch) -> Result<Vec<PutInputVec
 impl From<Error> for DataFusionError {
     fn from(value: Error) -> Self {
         DataFusionError::Execution(value.to_string())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use arrow::{
+        array::ListBuilder,
+        datatypes::{DataType, Field, Schema},
+    };
+    use arrow_array::{Float32Array, GenericListArray, Int32Array, StringArray};
+
+    use super::*;
+
+    fn build_vectors(input: &[&[f32]]) -> GenericListArray<i32> {
+        let capacity = input.iter().map(|i| i.len()).sum();
+        let mut list_builder = ListBuilder::new(Float32Array::builder(capacity));
+
+        for i in input {
+            for j in *i {
+                list_builder.values().append_value(*j);
+            }
+
+            list_builder.append(true);
+        }
+
+        list_builder.finish()
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_create_put_input_vectors_success() {
+        let keys = StringArray::from(vec!["key1", "key2"]);
+        let metadata = StringArray::from(vec!["meta1", "meta2"]);
+
+        let vectors = build_vectors(&[&[1f32, 2f32, 3f32], &[4f32, 5f32, 6f32]]);
+
+        let schema = Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("metadata", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
+        )
+        .unwrap();
+
+        let result = create_put_input_vectors(&batch).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].key(), "key1");
+        assert_eq!(
+            result[0].data().unwrap(),
+            &VectorData::Float32(vec![1f32, 2f32, 3f32])
+        );
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_missing_key_column() {
+        let metadata = StringArray::from(vec!["meta1", "meta2"]);
+
+        let vectors = build_vectors(&[&[1f32, 2f32, 3f32], &[4f32, 5f32, 6f32]]);
+
+        let schema = Schema::new(vec![
+            Field::new("metadata", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(metadata), Arc::new(vectors)],
+        )
+        .unwrap();
+
+        let result = create_put_input_vectors(&batch);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_wrong_vector_type() {
+        let keys = StringArray::from(vec!["key1", "key2"]);
+        let metadata = StringArray::from(vec!["meta1", "meta2"]);
+
+        let mut list_builder = ListBuilder::new(Int32Array::builder(6));
+        list_builder.values().append_value(1);
+        list_builder.values().append_value(2);
+        list_builder.values().append_value(3);
+        list_builder.append(true);
+        list_builder.values().append_value(4);
+        list_builder.values().append_value(5);
+        list_builder.values().append_value(6);
+        list_builder.append(true);
+
+        let vectors = list_builder.finish();
+
+        let schema = Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("metadata", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
+        )
+        .unwrap();
+
+        let result = create_put_input_vectors(&batch);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_nan_infinite_vectors_skipped() {
+        let keys = StringArray::from(vec!["key1", "key2", "key3"]);
+        let metadata = StringArray::from(vec!["meta1", "meta2", "meta3"]);
+
+        let vectors = build_vectors(&[
+            &[1.0, 2.0, 3.0],
+            &[f32::NAN, 2.0, 3.0],
+            &[1.0, f32::INFINITY, 3.0],
+        ]);
+
+        let schema = Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("metadata", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
+        )
+        .unwrap();
+
+        let result = create_put_input_vectors(&batch).unwrap();
+
+        // Only the first vector should be included (2 valid vectors)
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].key(), "key1");
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_empty_vectors_skipped() {
+        let keys = StringArray::from(vec!["key1", "key2"]);
+        let metadata = StringArray::from(vec!["meta1", "meta2"]);
+
+        let vectors = build_vectors(&[&[], &[1.0, 2.0, 3.0]]);
+
+        let schema = Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("metadata", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
+        )
+        .unwrap();
+
+        let result = create_put_input_vectors(&batch).unwrap();
+
+        // Only the second vector should be included (1 valid vector)
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].key(), "key2");
     }
 }
