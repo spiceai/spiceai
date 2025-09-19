@@ -198,8 +198,8 @@ impl<
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5 {
-            if self
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
                 .metrics_last_reported_time
                 .compare_exchange(
                     last_emitted,
@@ -208,11 +208,10 @@ impl<
                     Ordering::Relaxed,
                 )
                 .is_ok()
-            {
-                V::record_item_count(self.item_count());
-                V::record_size(self.size_bytes());
-                V::record_max_size(self.max_size() as u64);
-            }
+        {
+            V::record_item_count(self.item_count());
+            V::record_size(self.size_bytes());
+            V::record_max_size(self.max_size() as u64);
         }
     }
 
@@ -222,8 +221,8 @@ impl<
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5 {
-            if self
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
                 .metrics_last_reported_time
                 .compare_exchange(
                     last_emitted,
@@ -232,10 +231,9 @@ impl<
                     Ordering::Relaxed,
                 )
                 .is_ok()
-            {
-                V::record_item_count(self.item_count());
-                V::record_size(self.size_bytes());
-            }
+        {
+            V::record_item_count(self.item_count());
+            V::record_size(self.size_bytes());
         }
     }
 
