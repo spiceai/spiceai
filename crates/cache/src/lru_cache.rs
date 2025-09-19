@@ -21,7 +21,6 @@ use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
-use crate::current_time_secs;
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;

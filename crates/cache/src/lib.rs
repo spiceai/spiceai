@@ -19,8 +19,6 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
-use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use byte_unit::Byte;
