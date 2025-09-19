@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::{
@@ -57,11 +57,8 @@ pub struct PutVectorsSink {
 }
 
 impl PutVectorsSink {
-    pub fn new(
-        idx: S3VectorIdentifier,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        schema: SchemaRef,
-    ) -> Self {
+    pub fn new(idx: S3VectorIdentifier, client: Arc<dyn S3Vectors + Send + Sync>) -> Self {
+        let schema = schema_ref();
         Self {
             idx,
             client,
@@ -127,6 +124,18 @@ impl DataSink for PutVectorsSink {
 
         Ok(count as _)
     }
+}
+
+fn schema_ref() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("metadata", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            false,
+        ),
+    ]))
 }
 
 #[allow(clippy::result_large_err)]
@@ -240,18 +249,9 @@ mod tests {
 
         let vectors = build_vectors(&[&[1f32, 2f32, 3f32], &[4f32, 5f32, 6f32]]);
 
-        let schema = Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("metadata", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-                false,
-            ),
-        ]);
-
+        let schema = schema_ref();
         let batch = RecordBatch::try_new(
-            Arc::new(schema),
+            schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
         .unwrap();
@@ -272,20 +272,17 @@ mod tests {
 
         let vectors = build_vectors(&[&[1f32, 2f32, 3f32], &[4f32, 5f32, 6f32]]);
 
-        let schema = Schema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             Field::new("metadata", DataType::Utf8, false),
             Field::new(
                 "vector",
                 DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
                 false,
             ),
-        ]);
+        ]));
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(metadata), Arc::new(vectors)],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(metadata), Arc::new(vectors)]).unwrap();
 
         let result = create_put_input_vectors(&batch);
         assert!(result.is_err());
@@ -308,7 +305,7 @@ mod tests {
 
         let vectors = list_builder.finish();
 
-        let schema = Schema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),
             Field::new("metadata", DataType::Utf8, false),
             Field::new(
@@ -316,10 +313,10 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
                 false,
             ),
-        ]);
+        ]));
 
         let batch = RecordBatch::try_new(
-            Arc::new(schema),
+            schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
         .unwrap();
@@ -339,18 +336,10 @@ mod tests {
             &[1.0, f32::INFINITY, 3.0],
         ]);
 
-        let schema = Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("metadata", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-                false,
-            ),
-        ]);
+        let schema = schema_ref();
 
         let batch = RecordBatch::try_new(
-            Arc::new(schema),
+            schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
         .unwrap();
@@ -369,18 +358,10 @@ mod tests {
 
         let vectors = build_vectors(&[&[], &[1.0, 2.0, 3.0]]);
 
-        let schema = Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("metadata", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-                false,
-            ),
-        ]);
+        let schema = schema_ref();
 
         let batch = RecordBatch::try_new(
-            Arc::new(schema),
+            schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
         .unwrap();
