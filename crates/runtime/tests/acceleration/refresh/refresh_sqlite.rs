@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::acceleration::refresh::common::{
-    configure_spice_ai_runtime, get_acceleration_config, initialize_postgres, read_sql,
-    refresh_table, run_ps_sql,
+    configure_spice_ai_runtime, get_acceleration_config_append, get_acceleration_config_full,
+    initialize_postgres, read_sql, refresh_table, run_ps_sql,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
@@ -23,7 +23,7 @@ use crate::{init_tracing, utils::test_request_context};
 use std::sync::Arc;
 
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -32,7 +32,41 @@ async fn test_acceleration_refresh_duckdb() -> Result<(), anyhow::Error> {
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let db_conn = initialize_postgres(port).await?;
-            let acceleration_config = get_acceleration_config("sqlite", None);
+            let acceleration_config = get_acceleration_config_append("sqlite", None);
+            let rt = configure_spice_ai_runtime(port, acceleration_config).await?;
+
+            let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results.first().expect("batch").num_rows(), 1);
+
+            run_ps_sql(
+                &db_conn,
+                "INSERT INTO test_table (created_at) VALUES (now());",
+            )
+            .await;
+            refresh_table(Arc::clone(&rt), "test_table").await?;
+
+            let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results.first().expect("batch").num_rows(), 2);
+
+            running_container.remove().await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port: usize = get_random_port()?;
+            let running_container = common::start_postgres_docker_container(port).await?;
+
+            let db_conn = initialize_postgres(port).await?;
+            let acceleration_config = get_acceleration_config_full("sqlite", None);
             let rt = configure_spice_ai_runtime(port, acceleration_config).await?;
 
             let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;

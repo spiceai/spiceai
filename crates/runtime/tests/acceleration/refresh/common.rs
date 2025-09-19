@@ -15,7 +15,7 @@ use spicepod::param::Params;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) fn get_acceleration_config(
+pub(crate) fn get_acceleration_config_append(
     engine: &str,
     acceleration_params: Option<Params>,
 ) -> Acceleration {
@@ -37,6 +37,19 @@ pub(crate) fn get_acceleration_config(
             .iter()
             .cloned()
             .collect::<HashMap<String, IndexType>>(),
+        ..Acceleration::default()
+    }
+}
+
+pub(crate) fn get_acceleration_config_full(
+    engine: &str,
+    acceleration_params: Option<Params>,
+) -> Acceleration {
+    Acceleration {
+        enabled: true,
+        params: acceleration_params,
+        engine: Some(engine.to_string()),
+        refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
     }
 }
