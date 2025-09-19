@@ -838,7 +838,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.29.1"
-source = "git+https://github.com/spiceai/async-openai?rev=a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5#a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5"
+source = "git+https://github.com/spiceai/async-openai?rev=ec48de2d31ecc021a1962c629199ca11cf645fab#ec48de2d31ecc021a1962c629199ca11cf645fab"
 dependencies = [
  "async-openai-macros",
  "backoff",
@@ -864,7 +864,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/async-openai?rev=a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5#a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5"
+source = "git+https://github.com/spiceai/async-openai?rev=ec48de2d31ecc021a1962c629199ca11cf645fab#ec48de2d31ecc021a1962c629199ca11cf645fab"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2515,6 +2515,7 @@ version = "1.7.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
+ "async-openai",
  "async-stream",
  "async-trait",
  "byte-unit",
@@ -4474,8 +4475,7 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 [[package]]
 name = "delta_kernel"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cac0f0eae6345b0cfb67c4304da961e590370860aa51e88315e808c5d496629f"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=0e5d8bca9b6f76087b88d7554c09a6cc43e87183#0e5d8bca9b6f76087b88d7554c09a6cc43e87183"
 dependencies = [
  "arrow",
  "bytes",
@@ -4503,8 +4503,7 @@ dependencies = [
 [[package]]
 name = "delta_kernel_derive"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "064456b054cf26b607f4cbcef6d2ca102f64ed8e4fa702d2e307ce67b5b93569"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=0e5d8bca9b6f76087b88d7554c09a6cc43e87183#0e5d8bca9b6f76087b88d7554c09a6cc43e87183"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4903,7 +4902,7 @@ checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 [[package]]
 name = "duckdb"
 version = "1.3.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a4b83432acfe1dfdd140e35d4603701ae76f6607#a4b83432acfe1dfdd140e35d4603701ae76f6607"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=394325a8527df459f79e15f19ea5e97693339db2#394325a8527df459f79e15f19ea5e97693339db2"
 dependencies = [
  "arrow",
  "cast",
@@ -7694,7 +7693,7 @@ checksum = "6a82ae493e598baaea5209805c49bbf2ea7de956d50d7da0da1164f9c6d28543"
 [[package]]
 name = "libduckdb-sys"
 version = "1.3.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a4b83432acfe1dfdd140e35d4603701ae76f6607#a4b83432acfe1dfdd140e35d4603701ae76f6607"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=394325a8527df459f79e15f19ea5e97693339db2#394325a8527df459f79e15f19ea5e97693339db2"
 dependencies = [
  "cc",
  "flate2",
@@ -7929,6 +7928,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
  "bytes",
+ "cache",
  "cudarc 0.12.2",
  "dotenvy",
  "either",
