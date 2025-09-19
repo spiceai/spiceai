@@ -164,16 +164,19 @@ impl ReciprocalRankFusion {
     fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
         let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
 
-        let score_expr = coalesce(
-            (0..subquery_dfs.len())
-                .map(|i| {
-                    lit(1.0f64)
-                        / (lit(args.k)
-                            + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
-                })
-                .collect(),
-        )
-        .alias("fused_score");
+        let score_expr = (0..subquery_dfs.len())
+            .map(|i| {
+                lit(1.0f64)
+                    / (lit(args.k)
+                        + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
+            })
+            .reduce(|a, b| a + b);
+
+        let score_expr = if let Some(score_expr) = score_expr {
+            score_expr.alias("fused_score")
+        } else {
+            return exec_err!("{RRF_UDF_NAME} unable to compute fused_score");
+        };
 
         // Create column expressions for final projection
         let mut columns: Vec<Expr> = vec![score_expr];
