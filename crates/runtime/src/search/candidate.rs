@@ -16,3 +16,4 @@ limitations under the License.
 
 pub mod text;
 pub mod vector;
+pub mod vector_udtf;
