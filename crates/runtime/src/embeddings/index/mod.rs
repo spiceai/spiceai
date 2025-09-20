@@ -34,6 +34,8 @@ pub trait VectorIndex: SearchIndex {
     ///
     /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
     fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn dimension(&self) -> i32;
 }
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
@@ -284,6 +286,17 @@ pub mod tests {
 
     #[async_trait]
     impl VectorIndex for PretendVectorIndex {
+        fn dimension(&self) -> i32 {
+            self.schema
+                .column_with_name(self.search_column().as_str())
+                .map(|(_, f)| {
+                    match f.data_type() {
+                        DataType::FixedSizeList(_, dim) => *dim,
+                        _ => 0, // Should not be reachable
+                    }
+                })
+                .unwrap_or_default()
+        }
         fn list_table_provider(
             &self,
         ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
