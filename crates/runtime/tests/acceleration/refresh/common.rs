@@ -114,7 +114,7 @@ pub(crate) async fn start_test_runtime(
     let mut dataset = get_dataset(port);
 
     dataset.acceleration = Some(acceleration);
-    let app = AppBuilder::new("test_acceleration_refresh_duckdb")
+    let app = AppBuilder::new("test_acceleration_refresh")
         .with_dataset(dataset)
         .build();
 
