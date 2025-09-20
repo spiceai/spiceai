@@ -36,7 +36,13 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(
+                results
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
 
             execute_ps_sql(
                 &db_conn,
@@ -46,7 +52,13 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>(), 2);
+            assert_eq!(
+                results
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                2
+            );
 
             running_container.remove().await?;
             Ok(())
@@ -68,7 +80,13 @@ async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(
+                results
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
 
             execute_ps_sql(
                 &db_conn,
@@ -78,7 +96,13 @@ async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>(), 2);
+            assert_eq!(
+                results
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                2
+            );
 
             running_container.remove().await?;
             Ok(())
