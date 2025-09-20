@@ -83,7 +83,7 @@ lint-rust:
 		-Aclippy::module_name_repetitions
 
 lint-rust-fix:
-	cargo fmt --all -- --check
+	cargo fmt --all
 	## All except metal, cuda
 	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash --workspace -- \
 		-Dwarnings \
