@@ -16,7 +16,8 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, vector_table::S3VectorsTable,
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
 use super::{Error, S3VectorIdentifier};
@@ -288,7 +289,8 @@ async fn query_vector_stream(
     let start = std::time::Instant::now();
 
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let mut decoder = ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
+    let (json_schema, vector_sizes) = loosen_vector_schema(&schema);
+    let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
 
     let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
     let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
@@ -354,9 +356,7 @@ async fn query_vector_stream(
     })?;
 
     match decoder.flush() {
-        Ok(Some(rb)) => {
-            let _ = tx.send(Ok(rb)).await;
-        }
+        Ok(Some(rb)) => send_vector_data(&tx, rb, &vector_sizes).await,
         Ok(None) => {}
         Err(e) => {
             let _ = tx
