@@ -13,17 +13,26 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, error::Error as StdError, sync::Arc};
-
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
     S3VectorBuildSnafu,
 };
+use arrow_tools::record_batch::replace_column_in_record;
+use std::{collections::HashMap, error::Error as StdError, sync::Arc};
 
 use super::{Error, Result, S3VectorIdentifier};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::{
+    array::RecordBatch,
+    compute::cast,
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    error::ArrowError,
+};
 use aws_credential_types::provider::error::CredentialsError;
-use datafusion::common::{Constraint, Constraints};
+use datafusion::{
+    common::{Constraint, Constraints},
+    error::DataFusionError,
+};
+
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
     GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
@@ -33,6 +42,7 @@ use s3_vectors::{
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
 use snafu::ResultExt;
+use tokio::sync::mpsc::Sender;
 
 /// An S3 Vector index.
 #[derive(Clone)]
@@ -44,7 +54,7 @@ pub struct S3VectorsTable {
     // - `data` Float32
     // - `key` Utf8
     // - `metadata` will be flattened. types will be inferred as per `arrow_json`.
-    pub(super) schema: SchemaRef,
+    pub schema: SchemaRef,
 
     pub(super) constraints: Constraints,
 }
@@ -96,18 +106,19 @@ impl S3VectorsTable {
                         specified: distance_metric.clone(),
                     });
                 }
+                let schema = Self::compute_schema(index.dimension(), columns);
+                let constraints = Self::primary_key(&schema);
+                Ok(S3VectorTableResult::Table(Self {
+                    idx: id,
+                    client,
+                    schema,
+                    constraints,
+                }))
             }
-            None => return Ok(S3VectorTableResult::IndexDoesNotExist),
-            Some(_) => {}
+            None | Some(GetIndexOutput { index: None, .. }) => {
+                Ok(S3VectorTableResult::IndexDoesNotExist)
+            }
         }
-        let schema = Self::compute_schema(columns);
-        let constraints = Self::primary_key(&schema);
-        Ok(S3VectorTableResult::Table(Self {
-            idx: id,
-            client,
-            schema,
-            constraints,
-        }))
     }
 
     pub async fn try_create_new_table(
@@ -164,21 +175,6 @@ impl S3VectorsTable {
                     .await
                     .map(S3VectorTableResult::table)
             }
-        }
-    }
-
-    #[must_use]
-    pub fn new(
-        index: S3VectorIdentifier,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        schema: SchemaRef,
-    ) -> Self {
-        let constraints = Self::primary_key(&schema);
-        Self {
-            idx: index,
-            client,
-            schema,
-            constraints,
         }
     }
 
@@ -330,7 +326,7 @@ impl S3VectorsTable {
         f.metadata().get("filterable").eq(&Some(&true.to_string()))
     }
 
-    fn compute_schema(columns: MetadataColumns) -> SchemaRef {
+    fn compute_schema(embedding_dimension: i32, columns: MetadataColumns) -> SchemaRef {
         Arc::new(Schema::new(
             [
                 columns
@@ -349,10 +345,11 @@ impl S3VectorsTable {
                     })
                     .collect(),
                 vec![
-                    Arc::new(Field::new_list(
+                    Arc::new(Field::new_fixed_size_list(
                         S3_VECTOR_EMBEDDING_NAME,
                         Field::new("item", DataType::Float32, false),
-                        true,
+                        embedding_dimension,
+                        false,
                     )),
                     Arc::new(Field::new(
                         S3_VECTOR_PRIMARY_KEY_NAME,
@@ -449,4 +446,61 @@ impl S3VectorsTable {
 
         Ok(())
     }
+}
+
+// For a [`SchemaRef`] with [`FixedSizeListArray`]s, convert them to [`ListArray`] and return the associated size for each column name.
+//
+// This is useful when JSON decoding data with [`FixedSizeListArray`] since arrow_json has not implemented JSON reading of [`FixedSizeListArray`].
+pub(super) fn loosen_vector_schema(s: &SchemaRef) -> (SchemaRef, HashMap<String, DataType>) {
+    let mut sizes: HashMap<String, DataType> = HashMap::default();
+    let fields: Vec<_> = s
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::FixedSizeList(inner, n) => {
+                sizes.insert(
+                    f.name().clone(),
+                    DataType::FixedSizeList(Arc::clone(inner), *n),
+                );
+                Arc::unwrap_or_clone(Arc::clone(f))
+                    .with_data_type(DataType::List(Arc::clone(inner)))
+                    .into()
+            }
+            _ => Arc::clone(f),
+        })
+        .collect();
+
+    (Arc::new(Schema::new(fields)), sizes)
+}
+
+pub(super) fn make_fixed_sizes(
+    mut rb: RecordBatch,
+    vector_sizes: &HashMap<String, DataType>,
+) -> Result<RecordBatch, ArrowError> {
+    for (col, fixed_size_type) in vector_sizes {
+        if let Some(arr) = rb.column_by_name(col) {
+            rb = replace_column_in_record(rb.clone(), col, &cast(arr, fixed_size_type)?)?;
+        }
+    }
+    Ok(rb)
+}
+
+pub(super) async fn send_vector_data(
+    tx: &Sender<Result<RecordBatch, DataFusionError>>,
+    rb: RecordBatch,
+    vector_sizes: &HashMap<String, DataType>,
+) {
+    let _ = match make_fixed_sizes(rb, vector_sizes) {
+        Ok(v) => {
+            tx.send(Ok(v)).await
+        }
+        Err(e) => {
+            tx
+                .send(Err(DataFusionError::ArrowError(
+                    Box::new(e),
+                    Some("Successfully decoded S3 vector JSON response, but could not convert appropriate vectors or metadata to `FixedSizeListArray`.".to_string())
+                )))
+                .await
+        }
+    };
 }
