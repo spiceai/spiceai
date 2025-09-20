@@ -84,10 +84,19 @@ impl FullTextConnector {
             source: Box::new(e),
         })?;
 
-        let tbl = IndexedTableProvider::new(inner_table_provider)
-            .add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>);
+        let tbl: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>(
+        ) {
+            idx_tbl.clone()
+        } else {
+            IndexedTableProvider::new(inner_table_provider)
+        };
 
-        Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
+        Ok(
+            Arc::new(tbl.add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>))
+                as Arc<dyn TableProvider>,
+        )
     }
 
     // For all full text search columns, find the first with a non-null primary key override and

@@ -78,6 +78,15 @@ generate_cache_metrics!("search_results", search_results);
 generate_cache_metrics!("embeddings", embeddings);
 
 pub trait CacheMetrics: Send + Sync {
+    fn init()
+    where
+        Self: Sized,
+    {
+        Self::record_item_count(0);
+        Self::record_size(0);
+        Self::record_max_size(0);
+    }
+
     fn record_hit()
     where
         Self: Sized;
