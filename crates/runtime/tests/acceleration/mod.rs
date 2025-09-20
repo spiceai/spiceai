@@ -34,6 +34,7 @@ mod on_conflict;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
 mod query_push_down;
+mod refresh;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 
