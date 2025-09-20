@@ -67,7 +67,7 @@ pub(crate) fn get_dataset(port: usize) -> Dataset {
     ds
 }
 
-pub(crate) async fn run_ps_sql(
+pub(crate) async fn execute_ps_sql(
     db_conn: &PostgresConnection,
     sql: &str,
 ) -> Result<u64, anyhow::Error> {
@@ -86,7 +86,7 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
         .await
         .map_err(|e| anyhow::anyhow!("Error connecting: {}", e))?;
 
-    run_ps_sql(
+    execute_ps_sql(
         &db_conn,
         "
                 CREATE TABLE test_table (
@@ -96,18 +96,18 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
     )
     .await?;
 
-    run_ps_sql(
+    execute_ps_sql(
         &db_conn,
         "INSERT INTO test_table (created_at) VALUES (now())",
     )
     .await?;
 
-    run_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
+    execute_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
 
     Ok(db_conn)
 }
 
-pub(crate) async fn configure_spice_ai_runtime(
+pub(crate) async fn start_test_runtime(
     port: usize,
     acceleration: Acceleration,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
@@ -135,7 +135,7 @@ pub(crate) async fn configure_spice_ai_runtime(
     Ok(rt)
 }
 
-pub(crate) async fn read_sql(
+pub(crate) async fn execute_rt_sql(
     rt: Arc<Runtime>,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {

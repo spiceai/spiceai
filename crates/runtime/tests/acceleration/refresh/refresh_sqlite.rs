@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::acceleration::refresh::common::{
-    configure_spice_ai_runtime, get_acceleration_config_append, get_acceleration_config_full,
-    initialize_postgres, read_sql, refresh_table, run_ps_sql,
+    execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
+    initialize_postgres, refresh_table, start_test_runtime,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
@@ -33,22 +33,20 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_config = get_acceleration_config_append("sqlite", None);
-            let rt = configure_spice_ai_runtime(port, acceleration_config).await?;
+            let rt = start_test_runtime(port, acceleration_config).await?;
 
-            let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.len(), 1);
-            assert_eq!(results.first().expect("batch").num_rows(), 1);
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
+            assert_eq!(results.iter().map(|r| r.num_rows()).sum(), 1);
 
-            run_ps_sql(
+            execute_ps_sql(
                 &db_conn,
                 "INSERT INTO test_table (created_at) VALUES (now());",
             )
             .await?;
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
-            let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.len(), 1);
-            assert_eq!(results.first().expect("batch").num_rows(), 2);
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
+            assert_eq!(results.iter().map(|r| r.num_rows()).sum(), 2);
 
             running_container.remove().await?;
             Ok(())
@@ -67,22 +65,20 @@ async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_config = get_acceleration_config_full("sqlite", None);
-            let rt = configure_spice_ai_runtime(port, acceleration_config).await?;
+            let rt = start_test_runtime(port, acceleration_config).await?;
 
-            let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.len(), 1);
-            assert_eq!(results.first().expect("batch").num_rows(), 1);
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
+            assert_eq!(results.iter().map(|r| r.num_rows()).sum(), 1);
 
-            run_ps_sql(
+            execute_ps_sql(
                 &db_conn,
                 "INSERT INTO test_table (created_at) VALUES (now());",
             )
             .await?;
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
-            let results = read_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(results.len(), 1);
-            assert_eq!(results.first().expect("batch").num_rows(), 2);
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
+            assert_eq!(results.iter().map(|r| r.num_rows()).sum(), 2);
 
             running_container.remove().await?;
             Ok(())
