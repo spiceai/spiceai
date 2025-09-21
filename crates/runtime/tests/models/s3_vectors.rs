@@ -254,7 +254,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_text_search_w_answer",
                     SearchTestType::Sql(
-                        "SELECT id, answer, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
             ],
