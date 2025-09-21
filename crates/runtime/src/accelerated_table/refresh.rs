@@ -847,10 +847,11 @@ mod tests {
     use prometheus::proto::MetricType;
     use tokio::{sync::mpsc, time::timeout};
 
-    use crate::dataaccelerator::spice_sys::{Result, dataset_checkpoint::DatasetCheckpointer};
+    use crate::dataaccelerator::spice_sys::Result;
     use crate::status;
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
+    use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 
     use super::*;
 
