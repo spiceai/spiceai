@@ -51,15 +51,6 @@ pub enum FederatedTable {
     // If the table provider is not available immediately, we wait for it to become
     // available and store it here.
     Deferred(DeferredTableProvider),
-
-    // If the table provider is not available immediately, and we don't have the schema yet
-    // (e.g. we need to bootstrap the acceleration from a snapshot first), we wait for
-    // the schema to become available.
-    DeferredNoSchema {
-        dataset: Arc<Dataset>,
-        data_connector: Arc<dyn DataConnector>,
-        deferred: OnceLock<DeferredTableProvider>,
-    },
 }
 
 #[derive(Debug)]
@@ -124,19 +115,7 @@ impl FederatedTable {
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
     ) -> Option<Self> {
-        let Some(checkpoint) = Self::get_checkpoint(Arc::clone(&dataset)).await else {
-            // TODO: some helper functions for checking snapshots
-            if let Some(snapshots_enabled) = dataset.params.get("snapshots_enabled") {
-                if snapshots_enabled == "true" {
-                    return Some(Self::DeferredNoSchema {
-                        dataset,
-                        data_connector,
-                        deferred: OnceLock::new(),
-                    });
-                }
-            }
-            return None;
-        };
+        let checkpoint = Self::get_checkpoint(Arc::clone(&dataset)).await?;
         let accelerated_schema = checkpoint.get_schema().await.ok()??;
 
         Some(Self::Deferred(Self::new_deferred_with_schema(
@@ -144,23 +123,6 @@ impl FederatedTable {
             data_connector,
             accelerated_schema,
         )))
-    }
-
-    pub fn add_schema(&self, schema: SchemaRef) {
-        match self {
-            Self::DeferredNoSchema {
-                dataset,
-                data_connector,
-                deferred,
-            } => {
-                let _ = deferred.set(Self::new_deferred_with_schema(
-                    Arc::clone(dataset),
-                    Arc::clone(data_connector),
-                    schema,
-                ));
-            }
-            _ => {}
-        }
     }
 
     /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that is not done (i.e. not in `DeferredState::Done`).
@@ -181,7 +143,6 @@ impl FederatedTable {
         let deferred_table_provider = match self {
             Self::Immediate(table_provider) => return Some(table_provider),
             Self::Deferred(deferred_table_provider) => deferred_table_provider,
-            Self::DeferredNoSchema { deferred, .. } => deferred.get()?,
         };
 
         deferred_table_provider.table.get()
@@ -191,17 +152,6 @@ impl FederatedTable {
         let deferred_table_provider = match self {
             Self::Immediate(table_provider) => return Arc::clone(table_provider),
             Self::Deferred(deferred_table_provider) => deferred_table_provider,
-            Self::DeferredNoSchema {
-                dataset, deferred, ..
-            } => {
-                let Some(deferred_table_provider) = deferred.get() else {
-                    panic!(
-                        "Schema not available yet for {} - this is a bug in Spice. The federated table was not available and the acceleration snapshot was not bootstrapped before table_provider() was called.",
-                        dataset.name
-                    )
-                };
-                deferred_table_provider
-            }
         };
 
         // If the table provider is not available immediately, see if we already have it from the deferred task.
@@ -243,12 +193,6 @@ impl FederatedTable {
         match self {
             Self::Immediate(table_provider) => table_provider.schema(),
             Self::Deferred(deferred_table_provider) => Arc::clone(&deferred_table_provider.schema),
-            Self::DeferredNoSchema { dataset, .. } => {
-                panic!(
-                    "Schema not available yet for {} - this is a bug in Spice. The federated table was not available and the acceleration snapshot was not bootstrapped before schema() was called.",
-                    dataset.name
-                );
-            }
         }
     }
 
