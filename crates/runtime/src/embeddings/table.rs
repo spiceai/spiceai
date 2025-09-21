@@ -33,6 +33,7 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
+use llms::embeddings::Error as EmbedError;
 use snafu::prelude::*;
 
 use crate::embeddings::common::base_col;
