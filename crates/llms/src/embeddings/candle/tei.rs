@@ -20,10 +20,16 @@ use std::{
     sync::Arc,
 };
 
+use crate::embeddings::{
+    Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
+    candle::util::link_files_into_tmp_dir, encode_embedding,
+};
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
 };
 use async_trait::async_trait;
+use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use futures::future::join_all;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
@@ -35,14 +41,6 @@ use tei_core::{
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
-use crate::{
-    chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker},
-    embeddings::{
-        Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
-        candle::util::link_files_into_tmp_dir, encode_embedding,
-    },
-};
-
 use super::util::{
     download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer,
     max_seq_length_from_st_config, pool_from_str, position_offset,
@@ -53,6 +51,9 @@ pub struct TeiEmbed {
     pub infer: Infer,
     pub model_size: i32,     // Used for `size` method.
     pub tok: Arc<Tokenizer>, // Used for `chunker` method.
+
+    // Shared embeddings cache
+    cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 impl TeiEmbed {
@@ -178,6 +179,7 @@ impl TeiEmbed {
             None,
             DType::Float32,
             model_type,
+            None,          // Not Used
             String::new(), // Not used
             None,          // Not used
             String::new(), // Not used
@@ -204,7 +206,17 @@ impl TeiEmbed {
             infer,
             model_size: config.hidden_size,
             tok: Arc::new(tokenizer),
+            cache: None,
         })
+    }
+
+    #[must_use]
+    pub fn set_cache(
+        mut self,
+        cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> Self {
+        self.cache = cache;
+        self
     }
 
     pub(crate) async fn embed_futures(
@@ -226,6 +238,7 @@ impl TeiEmbed {
                         TruncationDirection::Right,
                         None,
                         true,
+                        None,
                         permit,
                     )
                     .await
@@ -240,7 +253,17 @@ impl TeiEmbed {
 
 #[async_trait]
 impl Embed for TeiEmbed {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        self.cache.as_ref().map(Arc::clone)
+    }
+
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        if let Some(CachedEmbeddingResult::Vector(cached)) =
+            self.get_cached_embed((&input).into()).await
+        {
+            return Ok(cached);
+        }
+
         let inputs = inputs_from_openai(&input);
         let resp =
             self.embed_futures(inputs)
@@ -249,14 +272,27 @@ impl Embed for TeiEmbed {
                     source: Box::new(e),
                 })?;
 
-        Ok(resp.into_iter().map(|r| r.results).collect())
+        let results: Vec<Vec<f32>> = resp.into_iter().map(|r| r.results).collect();
+        self.put_cached_embed(
+            (&input).into(),
+            CachedEmbeddingResult::Vector(results.clone()),
+        )
+        .await;
+
+        Ok(results)
     }
 
     #[allow(clippy::cast_possible_truncation)]
     async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
+        if let Some(CachedEmbeddingResult::Response(cached)) =
+            self.get_cached_embed((&req).into()).await
+        {
+            return Ok(cached);
+        }
+
         let model_name = req.model.clone();
         let inputs = inputs_from_openai(&req.input);
-        let format = req.encoding_format.unwrap_or_default();
+        let format = req.encoding_format.clone().unwrap_or_default();
 
         let batch_size = inputs.len();
         let results = self
@@ -276,7 +312,7 @@ impl Embed for TeiEmbed {
             prompt_tokens += r.metadata.prompt_tokens as u32;
         }
 
-        Ok(CreateEmbeddingResponse {
+        let resp = CreateEmbeddingResponse {
             object: "list".to_string(),
             model: model_name,
             data: embeddings,
@@ -284,7 +320,12 @@ impl Embed for TeiEmbed {
                 prompt_tokens,
                 total_tokens: prompt_tokens,
             },
-        })
+        };
+
+        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
+            .await;
+
+        Ok(resp)
     }
 
     fn size(&self) -> i32 {

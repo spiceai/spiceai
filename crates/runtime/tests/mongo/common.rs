@@ -68,10 +68,10 @@ pub async fn start_mongodb_docker_container(
                 "--eval".to_string(),
                 "db.runCommand('ping').ok".to_string(),
             ]),
-            interval: Some(500_000_000),
-            timeout: Some(500_000_000),
-            retries: Some(10),
-            start_period: Some(3_000_000_000),
+            interval: Some(2_000_000_000), // 2 seconds
+            timeout: Some(10_000_000_000), // 10 seconds
+            retries: Some(15),
+            start_period: Some(10_000_000_000), // 10 seconds
             start_interval: None,
         })
         .build()?

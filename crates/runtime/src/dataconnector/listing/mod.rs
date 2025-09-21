@@ -29,14 +29,16 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_infer_max_records")
         .description("Set a limit in terms of records to scan to infer the schema."),
     ParameterSpec::runtime("tsv_has_header")
-        .description("Set true to indicate that the first line is a header."),
+        .description("Set true to indicate that the first line is a header.")
+        .is_boolean(),
     ParameterSpec::runtime("tsv_quote").description("The quote character in a row."),
     ParameterSpec::runtime("tsv_escape").description("The escape character in a row."),
     ParameterSpec::runtime("tsv_schema_infer_max_records")
         .description("Set a limit in terms of records to scan to infer the schema.")
         .deprecated("use 'schema_infer_max_records' instead"),
     ParameterSpec::runtime("csv_has_header")
-        .description("Set true to indicate that the first line is a header."),
+        .description("Set true to indicate that the first line is a header.")
+        .is_boolean(),
     ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
     ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
     ParameterSpec::runtime("csv_schema_infer_max_records")
@@ -45,15 +47,19 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("csv_delimiter")
         .description("The character separating values within a row."),
     ParameterSpec::runtime("file_compression_type")
-        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED")
+        .one_of(&["GZIP", "BZIP2", "XZ", "ZSTD", "UNCOMPRESSED"]),
     ParameterSpec::runtime("hive_partitioning_enabled")
-        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
+        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.")
+        .is_boolean(),
     ParameterSpec::runtime("schema_source_path")
         .description("Specify a path to use for schema inference."),
     ParameterSpec::runtime("json_format")
-        .description("jsonl | array. Defaults to jsonl."),
+        .description("jsonl | array. Defaults to jsonl.")
+        .one_of(&["jsonl", "array"]),
     ParameterSpec::runtime("flatten_json")
-        .description("Set true to flatten nested structs in JSON as separate columns."),
+        .description("Set true to flatten nested structs in JSON as separate columns.")
+        .is_boolean(),
 ];
 
 pub enum DelimitedFormat {

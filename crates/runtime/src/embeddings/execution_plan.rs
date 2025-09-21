@@ -24,6 +24,7 @@ use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use async_stream::stream;
+use chunking::Chunker;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
@@ -34,7 +35,6 @@ use datafusion::physical_plan::{
 };
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
-use llms::chunking::Chunker;
 use llms::embeddings::Embed;
 use rayon::prelude::*;
 use snafu::ResultExt;
@@ -185,7 +185,7 @@ fn to_sendable_stream(
                                 Ok(embedded_batch) => yield Ok(embedded_batch),
                                 Err(e) => {
                                     tracing::debug!("Failed to construct record batch");
-                                    yield Err(DataFusionError::ArrowError(e, None))
+                                    yield Err(DataFusionError::ArrowError(Box::new(e), None))
                                 },
                             }
                         }

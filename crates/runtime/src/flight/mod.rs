@@ -281,7 +281,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
         }
-        DataFusionError::SQL(sql_err, _) => match sql_err {
+        DataFusionError::SQL(sql_err, _) => match *sql_err {
             ParserError::RecursionLimitExceeded => {
                 Status::invalid_argument("Recursion limit exceeded")
             }
@@ -307,6 +307,13 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                         let mut error = Status::invalid_argument(format!("{source}"));
                         error.metadata_mut().insert("spiceai-retryable", 1.into());
                         error
+                    }
+                    _ => to_tonic_err(e),
+                }
+            } else if let Some(err) = e.downcast_ref::<llms::embeddings::Error>() {
+                match err {
+                    llms::embeddings::Error::RateLimited { .. } => {
+                        Status::unavailable(format!("{err}"))
                     }
                     _ => to_tonic_err(e),
                 }

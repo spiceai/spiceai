@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
+use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -124,15 +125,6 @@ impl RuntimeBuilder {
     ) -> Self {
         self.metrics_endpoint = metrics_endpoint;
         self.prometheus_registry = prometheus_registry;
-        self
-    }
-
-    /// Used to configure `DataFusion` in integration tests & test CI
-    pub fn with_datafusion_configuration_fn(
-        mut self,
-        callback: DatafusionConfigurationCallback,
-    ) -> Self {
-        self.datafusion_configuration_fn = Some(callback);
         self
     }
 
@@ -278,6 +270,8 @@ impl RuntimeBuilder {
             }
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
+
+        register_udfs(&rt);
 
         rt
     }

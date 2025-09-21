@@ -275,6 +275,8 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
             // This is also returned when we cannot connect to the Iceberg catalog, so check for that.
             // i.e. Unexpected => Failed to execute http request, source: error sending request for url (http://localhoster:8181/v1/config)
             let err_msg = e.to_string();
+            let err_in_detail = format!("{e:?}");
+            let err_in_detail_lc = err_in_detail.to_lowercase();
             if err_msg.contains("error sending request for url") {
                 // Extract the URL from the error message
                 let url = err_msg
@@ -282,6 +284,20 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
                     .nth(1)
                     .unwrap_or_default()
                     .trim();
+
+                // Special case for detailed certificate errors
+                if err_in_detail_lc.contains("certificate")
+                    || err_in_detail_lc.contains("tls")
+                    || err_in_detail_lc.contains("ssl")
+                {
+                    return Error::CertificateError {
+                        url: url.to_string(),
+                        detail: err_in_detail,
+                        source: e,
+                    };
+                }
+
+                // Return a generic connection error for all other cases
                 return Error::FailedToConnect {
                     url: url.to_string(),
                     source: e,

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::DatasetTestArgs, wait_test_and_memory};
+use crate::{args::LoadTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -32,25 +32,29 @@ use test_framework::{
 };
 
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    if args.common.concurrency < 2 {
+pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
+    if args.test_args.common.concurrency < 2 {
         return Err(anyhow::anyhow!(
             "Concurrency should be greater than 1 for a load test"
         ));
     }
 
-    let query_set = QuerySet::from(args.query_set.clone());
-    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
+    let query_set = QuerySet::from(args.test_args.query_set.clone());
+    let query_overrides = args
+        .test_args
+        .query_overrides
+        .clone()
+        .map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
 
-    let (app, start_request) = get_app_and_start_request(&args.common).await?;
+    let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
+        .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
 
-    let test_duration = Duration::from_secs(args.common.duration);
+    let test_duration = Duration::from_secs(args.test_args.common.duration);
     let test_hours = (test_duration.as_secs() / 60 / 60).max(1);
 
     // baseline run
@@ -58,13 +62,14 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let baseline_test = SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
-            .with_parallel_count(args.common.concurrency)
+            .with_parallel_count(args.test_args.common.concurrency)
             .with_query_set(queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
-            .with_disable_caching(args.disable_caching),
+            .with_disable_caching(args.test_args.disable_caching)
+            .with_http_client(args.test_args.http_clients),
     )
     .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.common.disable_progress_bars)
+    .with_progress_bars(!args.test_args.common.disable_progress_bars)
     .start()
     .await?;
 
@@ -87,15 +92,16 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let throughput_test = SpiceTest::<NotStarted>::new(
         app.name.clone(),
         NotStarted::new()
-            .with_parallel_count(args.common.concurrency)
+            .with_parallel_count(args.test_args.common.concurrency)
             .with_query_set(queries.clone())
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
-                args.common.duration,
+                args.test_args.common.duration,
             )))
-            .with_disable_caching(args.disable_caching),
+            .with_disable_caching(args.test_args.disable_caching)
+            .with_http_client(args.test_args.http_clients),
     )
     .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.common.disable_progress_bars)
+    .with_progress_bars(!args.test_args.common.disable_progress_bars)
     .start()
     .await?;
 
@@ -160,11 +166,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         }
     }
 
-    if yellow_measurements >= 3 {
+    if !args.no_error && yellow_measurements >= 3 {
         return Err(anyhow::anyhow!(
             "Load test failed due to too many yellow measurements"
         ));
-    } else if !test_passed {
+    } else if !args.no_error && !test_passed {
         return Err(anyhow::anyhow!("Load test failed."));
     }
 

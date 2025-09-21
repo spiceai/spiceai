@@ -81,10 +81,10 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
+            configure_test_datafusion();
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await;
 

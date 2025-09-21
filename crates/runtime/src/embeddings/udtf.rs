@@ -28,8 +28,10 @@ limitations under the License.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
-use arrow_schema::{Field, SchemaRef};
+use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
+use datafusion::common::exec_err;
+use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
@@ -44,21 +46,25 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+
+use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, SubqueryAlias};
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
-use std::cmp::min;
 use std::{
     any::Any,
+    cmp::min,
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{Arc, LazyLock, Weak},
 };
 
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
-
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
+use search::{
+    SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex,
+    provider::SearchQueryProvider,
+};
 use snafu::ResultExt;
+
+#[cfg(feature = "s3_vectors")]
+use crate::embeddings::index::s3::S3Vector;
 
 use crate::{
     datafusion::DataFusion,
@@ -66,11 +72,17 @@ use crate::{
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
     request::{AsyncMarker, RequestContext},
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
+    search::util::{
+        find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
+        to_column_expr,
+    },
 };
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
+
+pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> =
+    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct VectorSearchTableFuncArgs {
@@ -106,7 +118,7 @@ impl VectorSearchTableFuncArgs {
             ))),
             (None, _) => {
                 if embedded_columns.len() > 1 {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
                         self.tbl,
                         embedded_columns.len()
@@ -115,7 +127,7 @@ impl VectorSearchTableFuncArgs {
                 if let Some((col, cfg)) = embedded_columns.iter().next() {
                     Ok((col.clone(), cfg.clone()))
                 } else {
-                    Err(DataFusionError::Internal(format!(
+                    Err(DataFusionError::Plan(format!(
                         "User function 'vector_search' is called on table '{}' that has no associated full text search index.",
                         self.tbl,
                     )))
@@ -154,6 +166,10 @@ impl VectorSearchTableFunc {
     #[must_use]
     pub fn new(df: Weak<DataFusion>) -> Self {
         Self { df }
+    }
+
+    fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
+        exec_err!("{VECTOR_SEARCH_UDTF_NAME} does not support scalar invocation.")
     }
 }
 
@@ -275,17 +291,16 @@ impl VectorSearchTableFunc {
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        // TODO: we might actually not want to recurse over accelerated table here.
-
-        use crate::embeddings::index::s3::S3Vector;
-        let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(tbl) else {
+        let Some((mut vector_indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl) else {
             return Ok(None);
         };
-        let mut vector_indexes = indexed.get_indexes::<S3Vector>();
+
         let vector_index_opt = if let Some(col) = &args.column {
+            use search::index::SearchIndex;
+
             vector_indexes
                 .into_iter()
-                .find(|idx| *idx.embedded_column() == *col)
+                .find(|idx| *idx.search_column() == *col)
         } else {
             if vector_indexes.len() > 1 {
                 return Err(DataFusionError::Internal(format!(
@@ -299,12 +314,13 @@ impl VectorSearchTableFunc {
         let Some(vector_index) = vector_index_opt else {
             return Ok(None);
         };
-        Ok(Some(Arc::new(VectorQueryTableProvider {
-            query: args.query.clone(),
-            table_provider: Arc::clone(tbl),
-            vector_index: Arc::new(vector_index.clone()),
-            pre_limit: args.limit,
-        })))
+
+        Ok(Some(Arc::new(SearchQueryProvider::new(
+            Arc::new(vector_index.clone()) as Arc<dyn SearchIndex>,
+            Arc::clone(tbl),
+            args.query.clone(),
+            args.limit,
+        ))))
     }
 }
 
@@ -351,6 +367,29 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             embedded_columns: embedding_table_provider.embedded_columns.clone(),
             embedding_models: Arc::clone(&embedding_table_provider.embedding_models),
         }))
+    }
+}
+
+/// This is a stub implementation, so that we can nest UDTF function invocations
+impl ScalarUDFImpl for VectorSearchTableFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        VECTOR_SEARCH_UDTF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &VECTOR_SEARCH_SIGNATURE
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Self::scalar_invocation_error()
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Self::scalar_invocation_error()
     }
 }
 
@@ -474,7 +513,12 @@ impl TableProvider for VectorSearchUDTFProvider {
             None,
         )?);
 
-        let mut base_expr: Vec<Expr> = self
+        let search_field_index = self
+            .schema()
+            .index_of(SEARCH_SCORE_COLUMN_NAME)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let mut final_expr: Vec<Expr> = self
             .schema()
             .fields()
             .iter()
@@ -492,6 +536,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
             })
             .collect();
+        let mut base_expr = final_expr.clone();
 
         base_expr.push(Expr::Alias(Alias {
             expr: Box::from(Expr::BinaryExpr(BinaryExpr::new(
@@ -510,6 +555,13 @@ impl TableProvider for VectorSearchUDTFProvider {
             metadata: None,
         }));
 
+        // only include score in the projection if it is requested.
+        // Otherwise, if the query is `SELECT a FROM vector_search(...)`, it will fail because we supplied too many columns in the response!
+        if projection.is_none() || projection.is_some_and(|proj| proj.contains(&search_field_index))
+        {
+            final_expr.push(Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)));
+        }
+
         let proj = LogicalPlan::Projection(Projection::try_new(base_expr, Arc::new(scan))?);
         let sort = LogicalPlan::Sort(Sort {
             expr: vec![SortExpr::new(
@@ -521,6 +573,13 @@ impl TableProvider for VectorSearchUDTFProvider {
             fetch: self.limit_to_use(limit),
         });
 
-        state.create_physical_plan(&sort).await
+        // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
+        let score_subquery =
+            LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(sort), "tbl")?);
+
+        let final_proj =
+            LogicalPlan::Projection(Projection::try_new(final_expr, Arc::new(score_subquery))?);
+
+        state.create_physical_plan(&final_proj).await
     }
 }

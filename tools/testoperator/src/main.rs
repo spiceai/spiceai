@@ -23,7 +23,7 @@ mod metrics;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,
-    HttpOverheadTestArgs, TestCommands,
+    HttpOverheadTestArgs, LoadTestArgs, TestCommands,
 };
 
 use crate::args::VectorSearchTestArgs;
@@ -46,7 +46,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Export(
             TestCommands::Throughput(DatasetTestArgs { common, .. })
             | TestCommands::Bench(DatasetTestArgs { common, .. })
-            | TestCommands::Load(DatasetTestArgs { common, .. })
+            | TestCommands::Load(LoadTestArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            })
             | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
             | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
             | TestCommands::Evals(EvalsTestArgs { common, .. })

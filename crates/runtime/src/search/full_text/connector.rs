@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
@@ -22,10 +23,17 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::component::dataset::FullTextSearchDatasetConfig;
-use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
+use crate::changes::{Indexes, index_change_envelope};
+use crate::component::{
+    ComponentInitialization,
+    dataset::{Dataset, FullTextSearchDatasetConfig, acceleration::RefreshMode},
+    metrics::MetricsProvider,
+};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::federated_table::FederatedTable;
 use crate::make_spice_data_sub_directory;
+use crate::search::util::find_index_in_table_provider;
+use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -95,10 +103,91 @@ impl FullTextConnector {
             source: Box::new(e),
         })?;
 
-        let tbl = IndexedTableProvider::new(inner_table_provider)
-            .add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>);
+        let tbl: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>(
+        ) {
+            idx_tbl.clone()
+        } else {
+            IndexedTableProvider::new(inner_table_provider)
+        };
 
-        Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
+        Ok(
+            Arc::new(tbl.add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>))
+                as Arc<dyn TableProvider>,
+        )
+    }
+
+    // For all full text search columns, find the first with a non-null primary key override and
+    // if there are multiple, warn if they are different.
+    fn warn_different_primary_keys(
+        ds_name: &str,
+        sets: Vec<Option<Vec<String>>>,
+        fields: &[String],
+    ) -> Option<Vec<String>> {
+        let mut first: Option<Vec<String>> = None;
+        let cmp_idx = 0;
+        for (i, s) in sets.into_iter().enumerate() {
+            let Some(mut pks) = s else {
+                continue;
+            };
+            pks.sort();
+
+            // If not first primary key defined, check it matches previous. Otherwise set to be used for next comparison.
+            if let Some(ref f) = first {
+                if *pks != *f {
+                    tracing::warn!(
+                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
+                        ds_name,
+                        fields[cmp_idx],
+                        f.join(", "),
+                        fields[i],
+                        pks.join(", "),
+                    );
+                }
+            } else {
+                first = Some(pks.clone());
+            }
+        }
+
+        first
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn with_indexed_stream<F>(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        f: F,
+    ) -> Option<ChangesStream>
+    where
+        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
+    {
+        let table_provider = federated_table.try_table_provider_sync()?;
+
+        let Some((indexed, underlying)) =
+            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
+        else {
+            tracing::debug!(
+                "FullTextConnector didn't wrap underlying table with index - this is unexpected"
+            );
+            return None;
+        };
+
+        let indexed = indexed
+            .into_iter()
+            .cloned()
+            .map(|i| Arc::new(i) as Arc<dyn Index + Send + Sync>)
+            .collect();
+
+        let indexed = Indexes::new(indexed);
+        let ft = Arc::new(FederatedTable::Immediate(underlying));
+
+        let stream = f(&self.inner_connector, ft)?;
+        Some(
+            stream
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexed)))
+                .boxed(),
+        )
     }
 }
 
@@ -150,5 +239,25 @@ impl DataConnector for FullTextConnector {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
             .await
+    }
+
+    fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
+        self.inner_connector.resolve_refresh_mode(refresh_mode)
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        self.inner_connector.supports_changes_stream()
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        self.with_indexed_stream(federated_table, |inner, ft| inner.changes_stream(ft))
+    }
+
+    fn supports_append_stream(&self) -> bool {
+        self.inner_connector.supports_append_stream()
+    }
+
+    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
     }
 }

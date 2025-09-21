@@ -37,6 +37,14 @@ use test_framework::{
 pub(crate) async fn prepare_dataset(spicepod_dir: &Path) -> anyhow::Result<()> {
     println!("Preparing MTEB QuoraRetrieval dataset...");
 
+    let corpus_dest = spicepod_dir.join("corpus.parquet");
+    let queries_dest = spicepod_dir.join("queries.parquet");
+    let data_dest = spicepod_dir.join("data.parquet");
+    let has_all_files = corpus_dest.exists() && queries_dest.exists() && data_dest.exists();
+    if has_all_files {
+        return Ok(());
+    }
+
     let hf_api = ApiBuilder::new()
         .with_progress(false)
         .build()
@@ -67,17 +75,14 @@ pub(crate) async fn prepare_dataset(spicepod_dir: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to download huggingface file: {e}"))?;
 
     // Copy files to spicepod directory with new names
-    let corpus_dest = spicepod_dir.join("corpus.parquet");
     std::fs::copy(&data_path, &corpus_dest)
         .map_err(|e| anyhow::anyhow!("Failed to copy corpus file: {e}"))?;
     println!("Corpus data saved to: {}", corpus_dest.display());
 
-    let queries_dest = spicepod_dir.join("queries.parquet");
     std::fs::copy(&test_queries_path, &queries_dest)
         .map_err(|e| anyhow::anyhow!("Failed to copy queries file: {e}"))?;
     println!("Queries data saved to: {}", queries_dest.display());
 
-    let data_dest = spicepod_dir.join("data.parquet");
     std::fs::copy(&scores_path, &data_dest)
         .map_err(|e| anyhow::anyhow!("Failed to copy data file: {e}"))?;
     println!("Data saved to: {}", data_dest.display());

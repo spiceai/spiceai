@@ -1,0 +1,26 @@
+name: 'Add benchmark snapshots to PR'
+description: 'Commits and pushes any updated benchmark snapshots to the current branch.'
+inputs:
+  token:
+    description: 'GitHub token with permissions to push to the repository'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Upload benchmark snapshots to branch
+      shell: bash
+      run: |
+        git config --global user.name 'Spice Snapshot Update Bot'
+        git config --global user.email 'spiceaibot@spice.ai'
+        git add '*.snap'
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "fix: Update the integration test snapshots"
+          if git ls-remote --exit-code --heads origin HEAD; then
+            git pull --rebase origin HEAD
+          fi
+          git push origin HEAD
+        fi
+      env:
+        GH_TOKEN: ${{ inputs.token }}

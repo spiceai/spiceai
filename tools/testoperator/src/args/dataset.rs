@@ -43,6 +43,10 @@ pub struct DatasetTestArgs {
     /// Whether to disable results caching, by supplying the cache control header through flight
     #[arg(long)]
     pub(crate) disable_caching: bool,
+
+    /// Whether to add HTTP clients for the test
+    #[arg(long)]
+    pub(crate) http_clients: bool,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -135,4 +139,13 @@ pub struct DataConsistencyArgs {
 
     #[arg(long)]
     pub(crate) compare_spicepod: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+pub struct LoadTestArgs {
+    #[command(flatten)]
+    pub(crate) test_args: DatasetTestArgs,
+
+    #[arg(long)]
+    pub(crate) no_error: bool,
 }

@@ -17,6 +17,8 @@ limitations under the License.
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use bytes::Bytes;
+use cache::CacheProvider;
+use cache::result::embeddings::CachedEmbeddingResult;
 use reqwest::StatusCode;
 use runtime_rate_control::RateController;
 use std::fmt::Debug;
@@ -25,8 +27,8 @@ use std::time::Instant;
 use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
 use util::{RetryError, retry};
 
-use crate::chunking::{
-    ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
+use chunking::{
+    ArcSizer, ChunkSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
 };
 
 use crate::embeddings::{
@@ -40,7 +42,6 @@ use async_openai::types::{
 use async_trait::async_trait;
 use futures::future::try_join_all;
 use snafu::ResultExt;
-use text_splitter::ChunkSizer;
 use tokenizers::Tokenizer;
 
 use super::{Openai, default_rate_controller};
@@ -65,6 +66,9 @@ pub struct OpenaiEmbed<C: Config + Clone> {
 
     // Rate limiter for requests
     rate_controller: Arc<RateController>,
+
+    // Shared embeddings cache
+    cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 impl<C: Config + Debug + Clone> std::fmt::Debug for OpenaiEmbed<C> {
@@ -83,12 +87,22 @@ impl<C: Config + Clone> OpenaiEmbed<C> {
             chunk_sizer: None,
             retry_strategy: default_retry_strategy(),
             rate_controller: rate_controller.unwrap_or_else(default_rate_controller),
+            cache: None,
         }
     }
 
     #[must_use]
     fn with_tokenizer(mut self, tokenizer: Arc<Tokenizer>) -> Self {
         self.chunk_sizer = Some(Arc::new(Into::<TokenizerWrapper>::into(tokenizer)));
+        self
+    }
+
+    #[must_use]
+    pub fn set_cache(
+        mut self,
+        cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> Self {
+        self.cache = cache;
         self
     }
 
@@ -103,10 +117,20 @@ impl<C: Config + Clone> OpenaiEmbed<C> {
 
 #[async_trait]
 impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        self.cache.as_ref().map(Arc::clone)
+    }
+
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
     ) -> EmbedResult<CreateEmbeddingResponse> {
+        if let Some(CachedEmbeddingResult::Response(cached)) =
+            self.get_cached_embed((&req).into()).await
+        {
+            return Ok(cached);
+        }
+
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
 
@@ -127,6 +151,10 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
         drop(permit);
 
         resp.model = outer_model;
+
+        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
+            .await;
+
         Ok(resp)
     }
 
@@ -160,10 +188,14 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                 let rate_controller = Arc::clone(&self.rate_controller);
                 async move {
                     retry(retry_strategy, async || {
-                        let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
+                        if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed((&req).into()).await {
+                            return Ok(cached);
+                        }
 
+                        let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
                         let start = Instant::now();
-                        client.embeddings().create_float(req.clone()).await
+
+                        let embeddings: Vec<Vec<f32>> = client.embeddings().create_float(req.clone()).await
                             .map(|resp| {
                                 let end = Instant::now();
                                 drop(permit);
@@ -175,13 +207,22 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                     tracing::debug!(
                                         "OpenAI embedding model encountered a retriable server error: {err}. Backing off and retrying..."
                                     );
+
+                                    if is_throttling_error(&err) {
+                                        return RetryError::transient(EmbedError::RateLimited { source: err.into() });
+                                    }
+
                                     return RetryError::transient(EmbedError::FailedToCreateEmbedding { source: err.into() });
                                 }
                                 tracing::debug!(
                                     "OpenAI embedding model encountered a non-retriable server error: {err}"
                                 );
                                 RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
-                            })
+                            })?;
+
+                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(embeddings.clone())).await;
+
+                        Ok(embeddings)
                     })
                     .await
                 }
@@ -242,6 +283,19 @@ fn is_retriable_error(err: &OpenAIError) -> bool {
                             | StatusCode::GATEWAY_TIMEOUT
                     )
                 )
+        }
+        _ => false,
+    }
+}
+
+fn is_throttling_error(err: &OpenAIError) -> bool {
+    match err {
+        OpenAIError::ApiError(api_err) => {
+            // Supported error codes: https://platform.openai.com/docs/guides/error-codes/api-errors
+            matches!(api_err.code.as_deref(), Some("429"))
+        }
+        OpenAIError::Reqwest(request) => {
+            matches!(request.status(), Some(StatusCode::TOO_MANY_REQUESTS))
         }
         _ => false,
     }

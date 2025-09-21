@@ -27,11 +27,9 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
-use std::{
-    borrow::Cow,
-    sync::{Arc, Weak},
-};
-
+use arrow_schema::DataType;
+use datafusion::common::exec_err;
+use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::{Column, Constraints, Statistics},
@@ -43,19 +41,29 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use runtime_datafusion_index::IndexedTableProvider;
-use search::generation::text_search::{
-    index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
+use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
+
+use search::{
+    generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
+    provider::SearchQueryProvider,
+};
+use std::any::Any;
+use std::sync::LazyLock;
+use std::{
+    borrow::Cow,
+    sync::{Arc, Weak},
 };
 
 use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
     request::{AsyncMarker, RequestContext},
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
+    search::util::{find_index_in_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
+pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> =
+    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
@@ -112,6 +120,10 @@ impl TextSearchTableFunc {
     #[must_use]
     pub fn new(df: Weak<DataFusion>) -> Self {
         Self { df }
+    }
+
+    fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
+        exec_err!("{TEXT_SEARCH_UDTF_NAME} does not support scalar invocation.")
     }
 }
 
@@ -246,39 +258,64 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let index_table_provider = find_concrete_table_provider::<IndexedTableProvider>(
-            &table_provider,
-        )
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "Table '{}' does not have a full text search index.",
-                args.tbl.clone()
-            ))
-        })?;
+        let mut fts_indexes =
+            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Table '{}' does not have a full text search index.",
+                        args.tbl.clone()
+                    ))
+                })?
+                .0;
 
-        let Some(fts_index) = index_table_provider.get_index::<FullTextDatabaseIndex>() else {
+        let Some(fts_index) = fts_indexes.pop() else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have a full text search index.",
                 args.tbl.clone()
             )));
         };
 
+        // Select single column if needed.
         let column = args.column(&fts_index.search_fields)?;
+        let mut fts_index = fts_index.clone();
+        fts_index.search_fields = vec![column];
+
         Ok(Arc::new(TextSearchIndexProviderWrapper {
-            inner: Arc::new(TextSearchIndexProvider {
-                query: args.query.clone(),
-                column,
-                pre_limit: args.limit,
-                index: fts_index.clone(),
-                underlying: table_provider,
-            }),
+            inner: Arc::new(SearchQueryProvider::new(
+                Arc::new(fts_index) as Arc<dyn SearchIndex>,
+                table_provider,
+                args.query.clone(),
+                args.limit,
+            )),
         }))
+    }
+}
+
+impl ScalarUDFImpl for TextSearchTableFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        TEXT_SEARCH_UDTF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &TEXT_SEARCH_SIGNATURE
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Self::scalar_invocation_error()
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Self::scalar_invocation_error()
     }
 }
 
 #[derive(Debug)]
 struct TextSearchIndexProviderWrapper {
-    inner: Arc<TextSearchIndexProvider>,
+    inner: Arc<SearchQueryProvider>,
 }
 
 #[async_trait::async_trait]

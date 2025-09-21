@@ -138,12 +138,12 @@ impl TaskSpan {
             Field::new("captured_output", DataType::Utf8, true),
             Field::new(
                 "start_time",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                 false,
             ), // Note: Used for time column of Retention
             Field::new(
                 "end_time",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                 false,
             ),
             Field::new("execution_duration_ms", DataType::Float64, false),

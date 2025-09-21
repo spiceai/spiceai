@@ -143,7 +143,7 @@ impl IcebergCatalog {
     }
 }
 
-pub(crate) const ICEBERG_PARAM_LEN: usize = 16;
+pub(crate) const ICEBERG_PARAM_LEN: usize = 17;
 pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
@@ -171,6 +171,10 @@ pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("signing_name")
         .description("The name to use when signing the request for SigV4.")
         .default("glue"),
+
+    // Glue like catalog options. Eg: Lakekeeper
+    ParameterSpec::component("warehouse")
+        .description("Name of the Iceberg warehouse."),
 
     // S3 storage options
     ParameterSpec::component("s3_endpoint")
@@ -229,6 +233,7 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<Str
             "client.assume-role.arn".to_string(),
             "rest.client.assume-role.arn".to_string(),
         ]),
+        "warehouse" => Some(vec!["warehouse".to_string()]),
         "sigv4_enabled" => Some(vec!["rest.sigv4-enabled".to_string()]),
         "signing_region" => Some(vec!["rest.signing-region".to_string()]),
         "signing_name" => Some(vec!["rest.signing-name".to_string()]),

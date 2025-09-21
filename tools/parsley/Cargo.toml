@@ -12,7 +12,7 @@ version.workspace = true
 bytes.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 document_parse = { path = "../../crates/document_parse" }
-llms = { path = "../../crates/llms", features = [] }
+chunking = { path = "../../crates/chunking" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

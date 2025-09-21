@@ -145,11 +145,8 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
                 .with_dataset(make_sqlite_decimal_dataset(Mode::Memory))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -205,11 +202,8 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
                 .with_dataset(make_sqlite_decimal_dataset(Mode::File))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

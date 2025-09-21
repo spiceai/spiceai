@@ -17,20 +17,22 @@ limitations under the License.
 use std::{collections::HashMap, num::TryFromIntError, sync::Arc};
 
 use arrow::array::{
-    Array, Float32Builder, LargeStringArray, ListBuilder, RecordBatch, StringArray, StringViewArray,
+    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray,
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
+use search::index::SearchIndex;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
+use util::distribute_nulls;
 
 use crate::{
-    convert_string_arrow_to_iterator, embedding_col,
-    embeddings::index::{VectorIndex, s3::S3Vector},
+    convert_string_arrow_to_iterator, embedding_col, embeddings::index::s3::S3Vector,
     model::EmbeddingModelStore,
 };
 
@@ -133,9 +135,17 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     )
     .await?;
 
-    let metadata =
-        extract_and_format_metadata(index.name(), &index.metadata_columns.all_names(), &record)
-            .map_err(|e| *e)?;
+    let metadata = extract_and_format_metadata(
+        index.name(),
+        &index
+            .metadata_columns()
+            .all_names()
+            .into_iter()
+            .filter(|c| *c != embedding_col!(index.search_column()))
+            .collect::<Vec<_>>(),
+        &record,
+    )
+    .map_err(|e| *e)?;
     let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
         .map_err(|e| *e)?;
 
@@ -167,9 +177,13 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
         update_embedding_column_in_batch(&record, &index.embedded_column, &embedding_vectors)
             .map_err(|e| *e)?;
 
+    // Filter out zero vectors to prevent cosine similarity calculation errors
+    let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
+        filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
+
     index
         .table
-        .write_data(embedding_vectors, primary_key, metadata)
+        .write_data(filtered_embeddings, filtered_primary_key, filtered_metadata)
         .await
         .context(CannotWriteIndexSnafu {
             index: index.name().to_string(),
@@ -178,7 +192,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     Ok(updated_record)
 }
 
-/// Given a [`RecordBatch`] of data from a [`VectorIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
+/// Given a [`RecordBatch`] of data from a [`SearchIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
 ///
 /// Formatting is:
 ///  - When there is a single [`Field`] in `primary_key`, the relevant [`ArrayRef`] is cast to a [`StringArray`] via [`arrow::compute::cast`].
@@ -365,22 +379,7 @@ async fn embed_column(
         .await
         .context(FailedToEmbedSnafu)?;
 
-    let mut result: Vec<Option<Vec<f32>>> = vec![];
-    let mut value_ptr = 0;
-    let mut null_ptr = 0;
-
-    while value_ptr < embedded_data.len() || null_ptr < nulls.len() {
-        while null_ptr < nulls.len() && nulls[null_ptr] == result.len() {
-            result.push(None);
-            null_ptr += 1;
-        }
-        if value_ptr < embedded_data.len() {
-            result.push(Some(embedded_data[value_ptr].clone()));
-            value_ptr += 1;
-        }
-    }
-
-    Ok(result)
+    Ok(distribute_nulls(embedded_data, nulls))
 }
 
 /// Update the embedding column in the `RecordBatch` with the computed embeddings.
@@ -421,6 +420,7 @@ fn update_embedding_column_in_batch(
 }
 
 /// Create an Arrow array from embedding vectors.
+#[allow(clippy::cast_sign_loss)]
 fn create_embedding_array(
     embedding_vectors: &[Option<Vec<f32>>],
 ) -> Result<Arc<dyn Array>, Box<Error>> {
@@ -440,18 +440,19 @@ fn create_embedding_array(
             .map_err(Box::from)?;
     }
 
-    let mut builder = ListBuilder::new(Float32Builder::new());
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
     let field = Field::new_list_field(DataType::Float32, false);
     builder = builder.with_field(field);
 
     for embedding_opt in embedding_vectors {
         if let Some(embedding) = embedding_opt {
-            let float_builder = builder.values();
-            for &value in embedding {
-                float_builder.append_value(value);
-            }
+            builder.values().append_values(
+                embedding,
+                &(0..embedding.len()).map(|_| true).collect::<Vec<_>>(),
+            );
             builder.append(true);
         } else {
+            builder.values().append_nulls(dimension as usize);
             builder.append(false);
         }
     }
@@ -459,31 +460,69 @@ fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
+/// Filter out zero vectors (all values in the vector are 0.0)
+#[allow(clippy::type_complexity)]
+fn filter_zero_vectors(
+    mut embeddings: Vec<Option<Vec<f32>>>,
+    mut primary_keys: Vec<Option<String>>,
+    mut metadata: HashMap<String, Vec<Option<Value>>>,
+    index_name: &str,
+) -> (
+    Vec<Option<Vec<f32>>>,
+    Vec<Option<String>>,
+    HashMap<String, Vec<Option<Value>>>,
+) {
+    // Filter in reverse order to avoid index shifting when removing elements
+    for i in (0..embeddings.len()).rev() {
+        if let Some(embedding) = &embeddings[i] {
+            if embedding.iter().all(|&x| x == 0.0) {
+                let key_str = primary_keys
+                    .get(i)
+                    .and_then(|k| k.as_ref().map(String::as_str))
+                    .unwrap_or("unknown");
+                tracing::warn!(
+                    "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
+                );
+
+                embeddings.remove(i);
+                primary_keys.remove(i);
+                for values in metadata.values_mut() {
+                    values.remove(i);
+                }
+            }
+        }
+    }
+
+    (embeddings, primary_keys, metadata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float32Array, Float32Builder, ListArray, ListBuilder, StringArray};
+    use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, StringArray};
     use arrow::datatypes::{DataType, Schema};
 
     // Helper function to create a test RecordBatch with text and embedding columns
+    #[allow(clippy::cast_sign_loss)]
     fn create_test_record_batch_with_embeddings(
         texts: Vec<Option<&str>>,
         embeddings: Vec<Option<Vec<f32>>>,
+        dim: i32,
     ) -> RecordBatch {
         let text_array = StringArray::from(texts);
 
         // Create embedding array
-        let mut builder = ListBuilder::new(Float32Builder::new());
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
         let field = Field::new_list_field(DataType::Float32, false);
         builder = builder.with_field(field);
         for embedding_opt in embeddings {
             if let Some(embedding) = embedding_opt {
-                let float_builder = builder.values();
-                for &value in &embedding {
-                    float_builder.append_value(value);
-                }
+                builder
+                    .values()
+                    .append_values(&embedding, &(0..dim).map(|_| true).collect::<Vec<_>>());
                 builder.append(true);
             } else {
+                builder.values().append_nulls(dim as usize);
                 builder.append(false);
             }
         }
@@ -493,7 +532,10 @@ mod tests {
             Field::new("text", DataType::Utf8, true),
             Field::new(
                 "text_embedding",
-                DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    dim,
+                ),
                 true,
             ),
         ]);
@@ -523,8 +565,8 @@ mod tests {
 
         let list_array = result
             .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("Result should be ListArray");
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("Result should be FixedSizeListArray");
 
         assert_eq!(list_array.len(), 3);
         assert!(!list_array.is_null(0));
@@ -562,6 +604,7 @@ mod tests {
         let record = create_test_record_batch_with_embeddings(
             vec![Some("hello"), Some("world")],
             vec![None, None], // Existing embeddings are null
+            3,
         );
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
@@ -573,8 +616,8 @@ mod tests {
         let embedding_column = result.column(1);
         let list_array = embedding_column
             .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("Embedding column should be ListArray");
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("Embedding column should be FixedSizeListArray");
 
         assert!(!list_array.is_null(0));
         assert!(!list_array.is_null(1));
@@ -613,8 +656,8 @@ mod tests {
         let embedding_column = result.column(result.num_columns() - 1);
         let list_array = embedding_column
             .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("Embedding column should be ListArray");
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("Embedding column should be FixedSizeListArray");
 
         assert!(!list_array.is_null(0));
         assert!(!list_array.is_null(1));
@@ -627,5 +670,46 @@ mod tests {
         assert_eq!(first_floats.value(0), 0.1);
         assert_eq!(first_floats.value(1), 0.2);
         assert_eq!(first_floats.value(2), 0.3);
+    }
+
+    #[test]
+    fn test_filter_zero_vectors() {
+        use serde_json::Value;
+        use std::collections::HashMap;
+
+        let embeddings = vec![
+            Some(vec![1.0, 2.0]), // Keep
+            Some(vec![0.0, 0.0]), // Filter out (zero vector)
+            None,                 // Keep
+            Some(vec![3.0, 4.0]), // Keep
+        ];
+        let keys = vec![
+            Some("key1".to_string()),
+            Some("key2".to_string()),
+            Some("key3".to_string()),
+            Some("key4".to_string()),
+        ];
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "test".to_string(),
+            vec![
+                Some(Value::String("a".to_string())),
+                Some(Value::String("b".to_string())),
+                Some(Value::String("c".to_string())),
+                Some(Value::String("d".to_string())),
+            ],
+        );
+
+        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+            filter_zero_vectors(embeddings, keys, metadata, "test_index");
+
+        assert_eq!(filtered_embeddings.len(), 3);
+        assert_eq!(filtered_keys.len(), 3);
+        assert_eq!(filtered_metadata["test"].len(), 3);
+
+        // Check that zero vector was filtered out
+        assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
+        assert_eq!(filtered_embeddings[1], None);
+        assert_eq!(filtered_embeddings[2], Some(vec![3.0, 4.0]));
     }
 }

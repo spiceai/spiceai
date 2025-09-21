@@ -44,8 +44,8 @@ pub(crate) fn calculate_ndcg<S: ::std::hash::BuildHasher>(
     for (query_id, relevance) in qrels {
         if let Some(ranked_results) = results.get(query_id) {
             let relevance_scores: Vec<f64> = ranked_results
-                .iter()
-                .map(|(doc_id, _score)| f64::from(*relevance.get(doc_id).unwrap_or(&0)))
+                .keys()
+                .map(|doc_id| f64::from(*relevance.get(doc_id).unwrap_or(&0)))
                 .collect();
             ndcg_at_k_values.push(ndcg_at_k(&relevance_scores, k));
         } else {

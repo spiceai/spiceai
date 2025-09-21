@@ -188,13 +188,8 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 .with_dataset(sqlite_file_on_conflict_drop)
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             // Set a timeout for the test
             tokio::select! {

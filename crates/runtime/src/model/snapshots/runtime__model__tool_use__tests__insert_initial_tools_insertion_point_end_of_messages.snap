@@ -1,0 +1,37 @@
+---
+source: crates/runtime/src/model/tool_use.rs
+expression: result
+snapshot_kind: text
+---
+[
+  {
+    "role": "system",
+    "content": "You are a helpful assistant"
+  },
+  {
+    "role": "user",
+    "content": "What datasets are available?"
+  },
+  {
+    "role": "user",
+    "content": "And what about tables?"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "test_id",
+        "type": "function",
+        "function": {
+          "name": "list_datasets",
+          "arguments": "{}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "dataset1, dataset2",
+    "tool_call_id": "test_id"
+  }
+]

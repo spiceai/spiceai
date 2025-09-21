@@ -27,7 +27,7 @@ jobs:
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -42,7 +42,7 @@ jobs:
     needs: setup
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -124,7 +124,7 @@ jobs:
       IMAGE_TAG: default
       CARGO_FEATURES: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install docker
         run: |
@@ -217,7 +217,7 @@ jobs:
     needs: setup
     runs-on: 'ubuntu-gpu-t4-4-core'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install docker
         run: |
@@ -269,16 +269,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: /tmp
           pattern: images-*
+          merge-multiple: true
 
       - name: Verify artifacts
         run: |
           ls -l /tmp
-          ls -l /tmp/images-amd64
-          ls -l /tmp/images-arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -318,10 +317,10 @@ jobs:
 
             # Load both architecture images
             echo "Loading AMD64 image"
-            docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
+            docker load -i /tmp/image-amd64-${variant}.tar
 
             echo "Loading ARM64 image"
-            docker load -i /tmp/images-arm64/image-arm64-${variant}.tar
+            docker load -i /tmp/image-arm64-${variant}.tar
 
             # Push images to local registry
             echo "Pushing images to local registry"
@@ -368,14 +367,14 @@ jobs:
     runs-on: 'ubuntu-gpu-t4-4-core'
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: /tmp
           pattern: images-amd64-cuda
 
       - name: Verify artifacts
         run: |
-          ls -l /tmp/images-amd64-cuda
+          ls -l /tmp
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -406,7 +405,7 @@ jobs:
         run: |
           echo "Handling CUDA models..."
 
-          docker load -i /tmp/images-amd64-cuda/images-amd64-cuda.tar
+          docker load -i /tmp/images-amd64-cuda.tar
           docker push localhost:5000/spiceai:models-cuda-amd64
 
           if [[ "${PUBLISH}" == "true" ]]; then

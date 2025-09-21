@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 use crate::DEFAULT_TRACING_MODELS;
-use crate::models::{sort_json_keys, sql_to_display, sql_to_json_values, sql_to_single_json_value};
+use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing,
     models::{
@@ -295,11 +295,15 @@ mod search {
 
 #[allow(clippy::expect_used)]
 mod embeddings {
-    use std::time::Duration;
+    use spicepod::component::caching::CacheConfig;
+    use std::time::{Duration, Instant};
 
     use crate::models::embedding::{
         EmbeddingTestCase, run_beta_functionality_criteria_test, run_embedding_tests,
     };
+
+    use crate::models::search::start_app;
+    use crate::models::send_embeddings_request;
 
     use super::*;
 
@@ -376,6 +380,40 @@ mod embeddings {
                 Ok(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn openai_test_embeddings_cache() -> Result<(), anyhow::Error> {
+        let app = AppBuilder::new("embeddings_cache")
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
+            .with_embeddings_cache(CacheConfig {
+                enabled: true,
+                max_size: Some("512mb".to_string()),
+                item_ttl: Some("30s".to_string()),
+                ..Default::default()
+            })
+            .build();
+
+        let _tracing = init_tracing(None);
+
+        test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let embedding_input = EmbeddingInput::StringArray((0..10).map(|i| format!("The food was delicious {i}")).collect());
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "openai_embeddings", embedding_input.clone(), Some("float"), None, None).await?;
+            let duration = start.elapsed();
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "openai_embeddings", embedding_input, Some("float"), None, None).await?;
+            let duration_cached = start.elapsed();
+            assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -483,7 +521,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             verify_sql_query_chat_completion(Arc::clone(&rt), &trace_provider).await?;
-            verify_similarity_search_chat_completion(Arc::clone(&rt), &trace_provider).await?;
+            verify_similarity_search_chat_completion(Arc::clone(&rt)).await?;
 
             Ok(())
         })
@@ -1008,10 +1046,7 @@ async fn verify_sql_query_chat_completion(
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
 #[allow(clippy::expect_used)]
-async fn verify_similarity_search_chat_completion(
-    rt: Arc<Runtime>,
-    trace_provider: &TracerProvider,
-) -> Result<(), anyhow::Error> {
+async fn verify_similarity_search_chat_completion(rt: Arc<Runtime>) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
 
@@ -1025,7 +1060,6 @@ async fn verify_similarity_search_chat_completion(
             .into()])
         .build()?;
 
-    let task_start_time = std::time::SystemTime::now();
     let response = model.chat_request(req).await?;
 
     // Verify Response
@@ -1041,72 +1075,6 @@ async fn verify_similarity_search_chat_completion(
         "chat_2_response",
         serde_json::to_string_pretty(&selector.find(&resp_value))
             .expect("Failed to serialize response.choices")
-    );
-
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
-    let task_input = sql_to_json_values(
-        &rt,
-        format!(
-            "SELECT input
-            FROM runtime.task_history
-            WHERE start_time >= '{}' and task='tool_use::document_similarity';",
-            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-        )
-        .as_str(),
-    )
-    .await;
-
-    let mut stable_inputs: Vec<serde_json::Value> = Vec::new();
-
-    for mut value in task_input {
-        if let serde_json::Value::Object(ref mut map) = value {
-            // Remove the unstable "text" and "datasets" field
-            map.remove("text");
-            map.remove("datasets");
-
-            // Sort the keys for consistent ordering
-            sort_json_keys(&mut value);
-
-            // Add the filtered value to our stable array
-            stable_inputs.push(value);
-        }
-    }
-
-    // Sort the array of objects for consistent ordering in snapshots
-    stable_inputs.sort_by(|a, b| {
-        let a_str = serde_json::to_string(a).unwrap_or_default();
-        let b_str = serde_json::to_string(b).unwrap_or_default();
-        a_str.cmp(&b_str)
-    });
-
-    // Instead of creating a snapshot, verify keywords contain expected values
-    let mut found_journalist = false;
-    let mut found_vehicle = false;
-    let mut actual_keywords = Vec::new();
-
-    for input in &stable_inputs {
-        if let Some(keywords) = input.get("keywords").and_then(|k| k.as_array()) {
-            actual_keywords.push(keywords.clone());
-            for keyword in keywords {
-                if let Some(keyword_str) = keyword.as_str() {
-                    if keyword_str.contains("journalist") {
-                        found_journalist = true;
-                    } else if keyword_str.contains("vehicle") {
-                        found_vehicle = true;
-                    }
-                }
-            }
-        }
-    }
-
-    assert!(
-        found_journalist,
-        "Expected to find 'journalist' in keywords, found {actual_keywords:?}",
-    );
-    assert!(
-        found_vehicle,
-        "Expected to find 'vehicle' in keywords, found {actual_keywords:?}",
     );
 
     Ok(())

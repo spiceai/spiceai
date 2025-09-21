@@ -109,12 +109,15 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .secret(),
         ParameterSpec::component("use_emulator")
             .description("Use the Azure Storage emulator.")
+            .is_boolean()
             .default("false"),
         ParameterSpec::component("use_fabric_endpoint")
             .description("Use the Azure Storage fabric endpoint.")
+            .is_boolean()
             .default("false"),
         ParameterSpec::runtime("allow_http")
             .description("Allow insecure HTTP connections.")
+            .is_boolean()
             .default("false"),
         ParameterSpec::component("authority_host")
             .description("Sets an alternative authority host."),
@@ -142,11 +145,14 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("federated_token_file")
             .description("Sets a file path for acquiring Azure federated identity token in Kubernetes"),
         ParameterSpec::component("use_cli")
+            .is_boolean()
             .description("Set if the Azure CLI should be used for acquiring access tokens."),
         ParameterSpec::component("skip_signature")
-            .description("Skip fetching credentials and skip signing requests. Used for interacting with public containers."),
+            .description("Skip fetching credentials and skip signing requests. Used for interacting with public containers.")
+            .is_boolean(),
         ParameterSpec::component("disable_tagging")
-            .description("Ignore any tags provided to put_opts"),
+            .description("Ignore any tags provided to put_opts")
+            .is_boolean(),
 
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);

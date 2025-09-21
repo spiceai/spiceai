@@ -143,7 +143,7 @@ jobs:
           os: 'linux'
 
       - name: Download test archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: integration_aws_sdk_credential_bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge_test

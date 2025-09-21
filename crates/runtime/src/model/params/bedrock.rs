@@ -30,7 +30,7 @@ pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 7] = [
     ParameterSpec::runtime("aws_region").description("The AWS region to use for Bedrock models."),
     ParameterSpec::component("guardrail_identifier").description("Identifier for the guardrail. Pattern: `(([a-z0-9]+) | (arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+))`. Length: 0-2048."),
     ParameterSpec::component("guardrail_version").description("Guardrail version. Pattern: `(([1-9][0-9]{0,7})|(DRAFT))`"),
-    ParameterSpec::component("trace").description("Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`"),
+    ParameterSpec::component("trace").description("Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`").one_of(&["enabled", "disabled", "enabled_full"]),
 ];
 pub(crate) const PARAMETERS: &[ParameterSpec] =
     &concat_arrays::<ParameterSpec, 7, PARAM_WITH_DEPRE_LEN, { 7 + PARAM_WITH_DEPRE_LEN }>(

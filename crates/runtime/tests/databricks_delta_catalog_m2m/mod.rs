@@ -47,10 +47,10 @@ async fn databricks_delta_lake_m2m_integration_test_catalog() -> Result<(), anyh
                 .with_catalog(db_catalog)
                 .build();
 
+            configure_test_datafusion();
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await;
             let cloned_rt = Arc::new(rt.clone());

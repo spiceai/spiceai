@@ -38,14 +38,13 @@ use cache::key::{CacheKey, RawCacheKey, SearchKey};
 use cache::result::CacheStatus;
 use cache::result::query::CachedStream;
 use cache::result::search::{CachedAggregationResult, CachedSearchResult};
-use cache::{CacheProvider, Sizeable};
+use cache::{Sizeable, TabledCacheProvider};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
 use llms::embeddings::Embed;
-use runtime_datafusion_index::IndexedTableProvider;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -82,6 +81,8 @@ impl VectorSearch {
     }
 
     /// Checks if a  [`TableProvider`] has an associated vector index, and if so, returns the associated [`Embed`].
+    #[allow(clippy::unused_async)] // async is not used when the feature is disabled
+    #[allow(unused_variables)]
     async fn model_from_vector_index(
         &self,
         tbl: &Arc<dyn TableProvider>,
@@ -89,9 +90,10 @@ impl VectorSearch {
     ) -> Option<Arc<dyn Embed>> {
         #[cfg(feature = "s3_vectors")]
         {
-            use crate::embeddings::index::s3::S3Vector;
-            let index = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
-            for s3v in index.get_indexes::<S3Vector>() {
+            use crate::{
+                embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider,
+            };
+            for s3v in find_index_in_table_provider::<S3Vector>(tbl)?.0 {
                 if s3v.embedded_column == embedding_column {
                     return s3v.embedding_model().await;
                 }
@@ -170,7 +172,7 @@ impl VectorSearch {
     pub async fn search_with_cache(
         &self,
         req: &SearchRequest,
-        cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+        cache_provider: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
         request_context: Arc<RequestContext>,
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
@@ -306,7 +308,7 @@ impl VectorSearch {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().collect();
+            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 
@@ -335,7 +337,7 @@ impl VectorSearch {
 fn wrap_cache_to_result(
     key: RawCacheKey,
     aggregation_result: HashMap<TableReference, AggregationResult>,
-    cache_provider: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
+    cache_provider: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
 ) -> HashMap<TableReference, AggregationResult> {
     // each hashmap entry is an aggregation result which contains a sendable record batch stream
     // for each table reference, we need to wrap the batch stream in another stream to pull out the record batches

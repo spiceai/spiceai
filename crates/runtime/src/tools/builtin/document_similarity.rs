@@ -23,7 +23,7 @@ use crate::request::{AsyncMarker, RequestContext};
 use crate::{
     Runtime,
     search::{
-        request::{SearchRequest, SearchRequestAIJson},
+        request::{SearchRequest, SearchRequestBaseJson},
         types::to_pretty,
         util::parse_explicit_primary_keys,
         vector_search::VectorSearch,
@@ -60,14 +60,14 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        parameters::<SearchRequestAIJson>()
+        parameters::<SearchRequestBaseJson>()
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name().to_string(), input = arg);
 
         let tool_use_result = async {
-            let req: SearchRequestAIJson = serde_json::from_str(arg)?;
+            let req: SearchRequestBaseJson = serde_json::from_str(arg)?;
             tracing::trace!("document_similarity tool use function call request: {req:?}");
 
             let vs = VectorSearch::new(

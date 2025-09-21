@@ -552,6 +552,11 @@ impl AcceleratedTable {
     }
 
     #[must_use]
+    pub fn get_federated_table_ref(&self) -> &Arc<FederatedTable> {
+        &self.federated
+    }
+
+    #[must_use]
     pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.accelerator)
     }

@@ -13,6 +13,7 @@ description: "Query: tpch_simple_q1"
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[max(ice.tpch_sf1.lineitem.l_orderkey)] |
 |               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1           |
 |               |         BytesProcessedExec                                                            |
-|               |           IcebergTableScan projection:[l_orderkey] predicate:[]                       |
+|               |           CooperativeExec                                                             |
+|               |             IcebergTableScan projection:[l_orderkey] predicate:[]                     |
 |               |                                                                                       |
 +---------------+---------------------------------------------------------------------------------------+

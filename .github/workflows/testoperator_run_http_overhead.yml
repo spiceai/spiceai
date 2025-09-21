@@ -4,50 +4,50 @@ on:
   workflow_dispatch:
     inputs:
       spiced_commit:
-        description: "spiced build commit"
+        description: 'spiced build commit'
         required: false
         type: string
       spicepod_path:
-        description: "The spicepod file to test with"
+        description: 'The spicepod file to test with'
         required: true
         type: string
       duration:
-        description: "The test duration in seconds"
+        description: 'The test duration in seconds'
         required: true
-        default: "3600"
+        default: '3600'
         type: string
       payload_file:
-        description: "Payload file"
+        description: 'Payload file'
         required: false
         type: string
       model:
-        description: "Model name"
+        description: 'Model name'
         required: false
         type: string
       embedding:
-        description: "Embedding name"
+        description: 'Embedding name'
         required: false
         type: string
       concurrency:
-        description: "The number of concurrent clients"
+        description: 'The number of concurrent clients'
         required: false
-        default: "1"
+        default: '1'
         type: string
       base:
         description: Underlying HTTP service to test against
         required: true
-        default: "openai"
+        default: 'openai'
         type: choice
         options:
-          - "openai"
-          - "anthropic"
-          - "xai"
+          - 'openai'
+          - 'anthropic'
+          - 'xai'
       base_component:
-        description: "Base component"
+        description: 'Base component'
         required: true
         type: string
       base_payload_file:
-        description: "The path to a file containing request body to use in testing the baseline component"
+        description: 'The path to a file containing request body to use in testing the baseline component'
         required: false
         type: string
 

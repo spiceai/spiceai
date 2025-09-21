@@ -17,11 +17,12 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 use async_openai::types::EmbeddingInput;
 use runtime::{Runtime, auth::EndpointAuth};
+use spicepod::component::caching::CacheConfig;
 use spicepod::component::{embeddings::Embeddings, model::Model};
 
 use crate::models::embedding::run_beta_functionality_criteria_test;
@@ -35,6 +36,9 @@ use crate::{
     utils::init_tracing_with_task_history,
     utils::{runtime_ready_check_with_timeout, test_request_context, verify_env_secret_exists},
 };
+
+use crate::models::search::start_app;
+use crate::models::send_embeddings_request;
 
 use tokio::sync::Mutex;
 
@@ -377,6 +381,40 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
         .await?;
 
     Ok(())
+}
+
+#[tokio::test]
+async fn huggingface_test_embeddings_cache() -> Result<(), anyhow::Error> {
+    let app = AppBuilder::new("embeddings_cache")
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .with_embeddings_cache(CacheConfig {
+            enabled: true,
+            max_size: Some("512mb".to_string()),
+            item_ttl: Some("30s".to_string()),
+            ..Default::default()
+        })
+        .build();
+
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+    .scope(async {
+        let api_config = start_app(app).await?;
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let embedding_input = EmbeddingInput::StringArray((0..10).map(|i| format!("The food was delicious {i}")).collect());
+        let start = Instant::now();
+        send_embeddings_request(http_base_url.as_str(), "hf_minilm", embedding_input.clone(), None, None, None).await?;
+        let duration = start.elapsed();
+        let start = Instant::now();
+        send_embeddings_request(http_base_url.as_str(), "hf_minilm", embedding_input, None, None, None).await?;
+        let duration_cached = start.elapsed();
+        assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]

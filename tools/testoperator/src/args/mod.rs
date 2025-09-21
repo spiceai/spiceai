@@ -22,7 +22,7 @@ mod http;
 pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 
 mod dataset;
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
+pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
 
 pub mod dispatch;
 use dispatch::DispatchArgs;
@@ -48,7 +48,7 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum TestCommands {
     Throughput(DatasetTestArgs),
-    Load(DatasetTestArgs),
+    Load(LoadTestArgs),
     Bench(DatasetTestArgs),
     DataConsistency(DataConsistencyArgs),
     HttpConsistency(HttpConsistencyTestArgs),

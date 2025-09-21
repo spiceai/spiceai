@@ -10,11 +10,21 @@
         "title_align": "left",
         "show_legend": false,
         "legend_layout": "horizontal",
-        "legend_columns": ["avg", "min", "max", "value", "sum"],
+        "legend_columns": [
+          "avg",
+          "min",
+          "max",
+          "value",
+          "sum"
+        ],
         "type": "timeseries",
         "requests": [
           {
-            "formulas": [{ "formula": "query1" }],
+            "formulas": [
+              {
+                "formula": "query1"
+              }
+            ],
             "queries": [
               {
                 "name": "query1",
@@ -33,7 +43,12 @@
           }
         ]
       },
-      "layout": { "x": 0, "y": 0, "width": 5, "height": 3 }
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "width": 5,
+        "height": 3
+      }
     },
     {
       "id": 75332997631124,
@@ -43,11 +58,21 @@
         "title_align": "left",
         "show_legend": true,
         "legend_layout": "auto",
-        "legend_columns": ["avg", "min", "max", "value", "sum"],
+        "legend_columns": [
+          "avg",
+          "min",
+          "max",
+          "value",
+          "sum"
+        ],
         "type": "timeseries",
         "requests": [
           {
-            "formulas": [{ "formula": "query1" }],
+            "formulas": [
+              {
+                "formula": "query1"
+              }
+            ],
             "queries": [
               {
                 "data_source": "metrics",
@@ -66,7 +91,12 @@
           }
         ]
       },
-      "layout": { "x": 5, "y": 0, "width": 5, "height": 3 }
+      "layout": {
+        "x": 5,
+        "y": 0,
+        "width": 5,
+        "height": 3
+      }
     },
     {
       "id": 5598759847287810,
@@ -76,14 +106,23 @@
         "title_align": "left",
         "show_legend": false,
         "legend_layout": "horizontal",
-        "legend_columns": ["avg", "min", "max", "value", "sum"],
+        "legend_columns": [
+          "avg",
+          "min",
+          "max",
+          "value",
+          "sum"
+        ],
         "type": "timeseries",
         "requests": [
           {
             "formulas": [
               {
                 "number_format": {
-                  "unit": { "type": "canonical_unit", "unit_name": "millisecond" }
+                  "unit": {
+                    "type": "canonical_unit",
+                    "unit_name": "millisecond"
+                  }
                 },
                 "formula": "query1"
               }
@@ -106,7 +145,12 @@
           }
         ]
       },
-      "layout": { "x": 0, "y": 3, "width": 5, "height": 3 }
+      "layout": {
+        "x": 0,
+        "y": 3,
+        "width": 5,
+        "height": 3
+      }
     },
     {
       "id": 4397818167950164,
@@ -116,11 +160,21 @@
         "title_align": "left",
         "show_legend": true,
         "legend_layout": "auto",
-        "legend_columns": ["avg", "min", "max", "value", "sum"],
+        "legend_columns": [
+          "avg",
+          "min",
+          "max",
+          "value",
+          "sum"
+        ],
         "type": "timeseries",
         "requests": [
           {
-            "formulas": [{ "formula": "query1" }],
+            "formulas": [
+              {
+                "formula": "query1"
+              }
+            ],
             "queries": [
               {
                 "data_source": "metrics",
@@ -138,13 +192,25 @@
             "display_type": "bars"
           }
         ],
-        "yaxis": { "scale": "linear" }
+        "yaxis": {
+          "scale": "linear"
+        }
       },
-      "layout": { "x": 5, "y": 3, "width": 5, "height": 3 }
+      "layout": {
+        "x": 5,
+        "y": 3,
+        "width": 5,
+        "height": 3
+      }
     }
   ],
   "template_variables": [
-    { "name": "host", "prefix": "host", "available_values": [], "default": "*" }
+    {
+      "name": "host",
+      "prefix": "host",
+      "available_values": [],
+      "default": "*"
+    }
   ],
   "layout_type": "ordered",
   "notify_list": [],

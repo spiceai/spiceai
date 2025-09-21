@@ -22,6 +22,7 @@ use std::{
 };
 
 use anyhow::Result;
+use dashmap::DashMap;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use spiceai::{Client as SpiceClient, SpiceClientError};
@@ -49,6 +50,7 @@ pub(crate) struct SpiceTestQueryWorker {
     validate: bool,
     scale_factor: f64,
     spice_client: Arc<SpiceClient>,
+    http_client: Option<reqwest::Client>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -66,12 +68,17 @@ struct QueryRunResult {
 
 impl SpiceTestQueryWorkerResult {
     pub fn new(
-        query_durations: BTreeMap<Arc<str>, Vec<Duration>>,
+        query_durations: &Arc<DashMap<Arc<str>, Vec<Duration>>>,
         query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)>,
         query_statuses: BTreeMap<Arc<str>, QueryStatus>,
         connection_failed: bool,
         row_counts: BTreeMap<Arc<str>, Vec<usize>>,
     ) -> Self {
+        let query_durations = query_durations
+            .iter()
+            .map(|mapref| (Arc::clone(mapref.key()), mapref.value().clone()))
+            .collect();
+
         Self {
             query_durations,
             query_iteration_durations,
@@ -101,7 +108,13 @@ impl SpiceTestQueryWorker {
             progress_bar: None,
             validate: false,
             scale_factor: 1.0,
+            http_client: None,
         }
+    }
+
+    pub fn with_http_client(mut self, http_client: reqwest::Client) -> Self {
+        self.http_client = Some(http_client);
+        self
     }
 
     pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
@@ -135,7 +148,7 @@ impl SpiceTestQueryWorker {
     #[allow(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
-            let mut query_durations: BTreeMap<Arc<str>, Vec<Duration>> = BTreeMap::new();
+            let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
 
             // Keeps track of the start and end time of each query iteration
             let mut query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)> =
@@ -161,14 +174,14 @@ impl SpiceTestQueryWorker {
 
                         if !self
                             .run_query_set(
-                                &mut query_durations,
+                                Arc::clone(&query_durations),
                                 &mut query_statuses,
                                 &mut row_counts,
                             )
                             .await?
                         {
                             return Ok(SpiceTestQueryWorkerResult::new(
-                                query_durations,
+                                &query_durations,
                                 query_iteration_durations,
                                 query_statuses,
                                 true,
@@ -203,7 +216,7 @@ impl SpiceTestQueryWorker {
                         } = self
                             .run_single_query(
                                 query,
-                                &mut BTreeMap::new(),
+                                Arc::new(DashMap::new()),
                                 &mut BTreeMap::new(),
                                 snapshot_results,
                                 false,
@@ -211,7 +224,7 @@ impl SpiceTestQueryWorker {
                             .await?;
                         if connection_failed {
                             return Ok(SpiceTestQueryWorkerResult::new(
-                                query_durations,
+                                &query_durations,
                                 query_iteration_durations,
                                 query_statuses,
                                 true,
@@ -261,7 +274,7 @@ impl SpiceTestQueryWorker {
                             } = self
                                 .run_single_query(
                                     query,
-                                    &mut query_durations,
+                                    Arc::clone(&query_durations),
                                     &mut row_counts,
                                     false, // don't attempt to snapshot results more than once
                                     self.validate,
@@ -270,7 +283,7 @@ impl SpiceTestQueryWorker {
 
                             if connection_failed {
                                 return Ok(SpiceTestQueryWorkerResult::new(
-                                    query_durations,
+                                    &query_durations,
                                     query_iteration_durations,
                                     query_statuses,
                                     true,
@@ -293,7 +306,7 @@ impl SpiceTestQueryWorker {
             }
 
             Ok(SpiceTestQueryWorkerResult::new(
-                query_durations,
+                &query_durations,
                 query_iteration_durations,
                 query_statuses,
                 false,
@@ -305,7 +318,7 @@ impl SpiceTestQueryWorker {
     // run queries as a duration-based test
     async fn run_query_set(
         &self,
-        query_durations: &mut BTreeMap<Arc<str>, Vec<Duration>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         query_statuses: &mut BTreeMap<Arc<str>, QueryStatus>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
     ) -> Result<bool> {
@@ -314,7 +327,13 @@ impl SpiceTestQueryWorker {
                 connection_failed,
                 query_failure,
             } = self
-                .run_single_query(query, query_durations, row_counts, false, false)
+                .run_single_query(
+                    query,
+                    Arc::clone(&query_durations),
+                    row_counts,
+                    false,
+                    false,
+                )
                 .await?;
             if connection_failed {
                 return Ok(false);
@@ -343,7 +362,7 @@ impl SpiceTestQueryWorker {
     async fn run_single_query(
         &self,
         query: &Query,
-        query_durations: &mut BTreeMap<Arc<str>, Vec<Duration>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         results_snapshot: bool,
         validate: bool,
@@ -351,7 +370,7 @@ impl SpiceTestQueryWorker {
         match self
             .execute_query(
                 query,
-                query_durations,
+                Arc::clone(&query_durations),
                 row_counts,
                 results_snapshot,
                 validate,
@@ -385,6 +404,7 @@ impl SpiceTestQueryWorker {
                         query.name,
                         e
                     );
+
                     query_durations.entry(Arc::clone(&query.name)).or_default();
                     Ok(QueryRunResult {
                         connection_failed: false,
@@ -396,15 +416,16 @@ impl SpiceTestQueryWorker {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn execute_query(
+    async fn execute_flight(
         &self,
         query: &Query,
-        query_durations: &mut BTreeMap<Arc<str>, Vec<Duration>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
         let query_start = Instant::now();
+
         let mut result_stream = self
             .spice_client
             .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
@@ -431,6 +452,7 @@ impl SpiceTestQueryWorker {
                             query.name,
                             e
                         );
+
                         query_durations.entry(Arc::clone(&query.name)).or_default();
                         return Err(e.into());
                     }
@@ -504,6 +526,7 @@ impl SpiceTestQueryWorker {
         }
 
         let duration = query_start.elapsed();
+
         query_durations
             .entry(Arc::clone(&query.name))
             .or_default()
@@ -517,6 +540,67 @@ impl SpiceTestQueryWorker {
         if let Some(pb) = self.progress_bar.as_ref() {
             pb.inc(1);
         }
+        Ok(())
+    }
+
+    async fn execute_http(
+        &self,
+        query: &Query,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
+    ) -> Result<()> {
+        if let Some(http_client) = self.http_client.as_ref() {
+            let query_start = Instant::now();
+            let http_response = http_client
+                .post("http://localhost:8090/v1/sql")
+                .body(query.sql.to_string())
+                .send()
+                .await?;
+
+            if !http_response.status().is_success() {
+                eprintln!(
+                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {}",
+                    chrono::Utc::now(),
+                    self.id,
+                    query.name,
+                    http_response.status()
+                );
+                return Err(anyhow::anyhow!(
+                    "Query HTTP request failed: {}",
+                    http_response.status()
+                ));
+            }
+
+            let duration = query_start.elapsed();
+
+            query_durations
+                .entry(Arc::clone(&query.name))
+                .or_default()
+                .push(duration);
+        }
+
+        Ok(())
+    }
+
+    async fn execute_query(
+        &self,
+        query: &Query,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
+        row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
+        results_snapshot: bool,
+        validate: bool,
+    ) -> Result<()> {
+        futures::future::try_join(
+            self.execute_flight(
+                query,
+                Arc::clone(&query_durations),
+                row_counts,
+                results_snapshot,
+                validate,
+            ),
+            self.execute_http(query, Arc::clone(&query_durations)),
+        )
+        .await?;
+
         Ok(())
     }
 }
