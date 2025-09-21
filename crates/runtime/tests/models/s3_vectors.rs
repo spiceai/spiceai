@@ -33,7 +33,10 @@ mod search {
         models::{
             get_mega_science_dataset,
             hf::get_huggingface_embeddings,
-            s3_vectors::{delete_index, vectors_filterable_col, vectors_nonfilterable_col},
+            s3_vectors::{
+                basic_vector_search_tests, delete_index, vectors_filterable_col,
+                vectors_nonfilterable_col,
+            },
             search::{SearchTestCase, SearchTestType, run_search_w_explain},
         },
         utils::verify_env_secret_exists,

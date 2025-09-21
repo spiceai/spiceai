@@ -241,7 +241,7 @@ impl SearchQueryProvider {
                 p.insert(pp);
             }
 
-            // Remove 'match'
+            // Remove 'match'. Not in base table, calculated from offsets and search column.
             if let Some((idx, _)) = self.schema().column_with_name(SEARCH_MATCH_COLUMN_NAME) {
                 let _ = p.remove(&idx);
             };
