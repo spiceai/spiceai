@@ -149,13 +149,12 @@ pub trait Embed: Debug + Sync + Send {
     }
 
     async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
-        if let Some(embeddings_cache) = self.cache() {
-            if let Some(cached) = embeddings_cache
+        if let Some(embeddings_cache) = self.cache()
+            && let Some(cached) = embeddings_cache
                 .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
                 .await
-            {
-                return Some(cached);
-            }
+        {
+            return Some(cached);
         }
 
         None
