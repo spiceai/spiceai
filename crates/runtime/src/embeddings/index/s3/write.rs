@@ -474,21 +474,21 @@ fn filter_zero_vectors(
 ) {
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
-        if let Some(embedding) = &embeddings[i] {
-            if embedding.iter().all(|&x| x == 0.0) {
-                let key_str = primary_keys
-                    .get(i)
-                    .and_then(|k| k.as_ref().map(String::as_str))
-                    .unwrap_or("unknown");
-                tracing::warn!(
-                    "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
-                );
+        if let Some(embedding) = &embeddings[i]
+            && embedding.iter().all(|&x| x == 0.0)
+        {
+            let key_str = primary_keys
+                .get(i)
+                .and_then(|k| k.as_ref().map(String::as_str))
+                .unwrap_or("unknown");
+            tracing::warn!(
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
+            );
 
-                embeddings.remove(i);
-                primary_keys.remove(i);
-                for values in metadata.values_mut() {
-                    values.remove(i);
-                }
+            embeddings.remove(i);
+            primary_keys.remove(i);
+            for values in metadata.values_mut() {
+                values.remove(i);
             }
         }
     }

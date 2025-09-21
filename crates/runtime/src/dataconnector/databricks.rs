@@ -221,7 +221,7 @@ impl Databricks {
         })
     }
 
-    pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials> {
+    pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
         let token = params.get("token").ok();
         let client_id = params.get("client_id").expose().ok();
         let client_secret = params.get("client_secret").ok();

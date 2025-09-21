@@ -144,7 +144,7 @@ impl ListingTableConnector for File {
     /// Set up a file watcher to refresh the accelerated table when the file is updated.
     ///
     /// Spawns an async top-level Tokio task to watch the file(s) and adds it to the join
-    /// handles of the AcceleratedTable. When the AcceleratedTable is dropped, the file
+    /// handles of the `AcceleratedTable`. When the `AcceleratedTable` is dropped, the file
     /// watcher is aborted.
     async fn on_accelerated_table_registration(
         &self,

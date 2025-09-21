@@ -32,7 +32,7 @@ use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 use tonic::transport::Channel;
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 #[tokio::test]
 async fn test_flight_auth() -> Result<(), anyhow::Error> {

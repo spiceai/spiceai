@@ -464,11 +464,11 @@ fn create_new_recursive_req(
     }
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
-    if let Some(max_completion_tokens) = new_req.max_completion_tokens {
-        if let Some(usage) = marginal_usage {
-            new_req.max_completion_tokens =
-                Some(max_completion_tokens.saturating_sub(usage.completion_tokens));
-        }
+    if let Some(max_completion_tokens) = new_req.max_completion_tokens
+        && let Some(usage) = marginal_usage
+    {
+        new_req.max_completion_tokens =
+            Some(max_completion_tokens.saturating_sub(usage.completion_tokens));
     }
 
     new_req
@@ -623,11 +623,10 @@ fn make_a_stream(
                     let response = match result {
                         Ok(response) => response,
                         Err(e) => {
-                            if let Err(e) = sender_clone.send(Err(e)).await {
-                                if !sender_clone.is_closed() {
+                            if let Err(e) = sender_clone.send(Err(e)).await
+                                && !sender_clone.is_closed() {
                                     tracing::error!("Error sending error: {}", e);
                                 }
-                            }
                             return;
                         }
                     };
@@ -722,11 +721,10 @@ fn make_a_stream(
                                         continue;
                                     }
                                     Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await {
-                                            if !sender_clone.is_closed() {
+                                        if let Err(e) = sender_clone.send(Err(e)).await
+                                            && !sender_clone.is_closed() {
                                                 tracing::error!("Error sending error: {}", e);
                                             }
-                                        }
                                         return;
                                     }
                                 };
@@ -751,11 +749,10 @@ fn make_a_stream(
                                         }
                                     }
                                     Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await {
-                                            if !sender_clone.is_closed() {
+                                        if let Err(e) = sender_clone.send(Err(e)).await
+                                            && !sender_clone.is_closed() {
                                                 tracing::error!("Error sending error: {}", e);
                                             }
-                                        }
                                         return;
                                     }
                                 }
@@ -775,21 +772,18 @@ fn make_a_stream(
 
                         let mut resp2 = response.clone();
                         resp2.choices = finished_choices;
-                        if let Err(e) = sender_clone.send(Ok(resp2)).await {
-                            if !sender_clone.is_closed() {
+                        if let Err(e) = sender_clone.send(Ok(resp2)).await
+                            && !sender_clone.is_closed() {
                                 tracing::error!("Error sending error: {}", e);
                             }
-                        }
                     }
 
                     // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with no choices).
-                    if response.choices.is_empty() && response.usage.is_some() {
-                        if let Err(e) = sender_clone.send(Ok(response)).await {
-                            if !sender_clone.is_closed() {
+                    if response.choices.is_empty() && response.usage.is_some()
+                        && let Err(e) = sender_clone.send(Ok(response)).await
+                            && !sender_clone.is_closed() {
                                 tracing::error!("Error sending error: {}", e);
                             }
-                        }
-                    }
                 }
 
                 tracing::info!(target: "task_history", captured_output = %chat_output);

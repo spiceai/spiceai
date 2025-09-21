@@ -222,20 +222,17 @@ fn configure_max_message_size(
     mut flight_client: FlightClient,
     params: &ConnectorParams,
 ) -> Result<FlightClient> {
-    if let Some(app) = params.app.as_ref() {
-        if let Some(flight) = app.runtime.flight.as_ref() {
-            if let Some(max_message_size) =
-                flight
-                    .max_message_size_bytes()
-                    .map_err(|err| Error::InvalidParameterValue {
-                        parameter: "max_message_size".to_string(),
-                        source: err,
-                    })?
-            {
-                flight_client =
-                    flight_client.with_max_message_size(max_message_size, max_message_size);
-            }
-        }
+    if let Some(app) = params.app.as_ref()
+        && let Some(flight) = app.runtime.flight.as_ref()
+        && let Some(max_message_size) =
+            flight
+                .max_message_size_bytes()
+                .map_err(|err| Error::InvalidParameterValue {
+                    parameter: "max_message_size".to_string(),
+                    source: err,
+                })?
+    {
+        flight_client = flight_client.with_max_message_size(max_message_size, max_message_size);
     }
     Ok(flight_client)
 }
