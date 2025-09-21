@@ -152,6 +152,7 @@ mod search {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
