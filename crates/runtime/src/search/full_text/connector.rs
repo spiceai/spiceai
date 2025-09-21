@@ -20,6 +20,8 @@ use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
 use spicepod::semantic::IndexStore;
 use std::any::Any;
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
@@ -55,6 +57,7 @@ impl FullTextConnector {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(FullTextSearchDatasetConfig {
             index_store,
+            index_path,
             search_fields,
             primary_key,
         }) = dataset.full_text_search_config()
@@ -70,21 +73,32 @@ impl FullTextConnector {
         };
 
         let directory = if index_store == IndexStore::File {
-            // Example `.spice/data/fts/catalog/schema/table/`.
-            Some(
-                make_spice_data_sub_directory(
-                    [vec!["fts".to_string()], dataset.name.to_vec()]
-                        .concat()
-                        .as_slice(),
+            if let Some(path) = index_path {
+                Some(PathBuf::from_str(path.as_str()).boxed().map_err(|e| {
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: dataset.source().to_string(),
+                        message: e.to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    }
+                })?)
+            } else {
+                // Default case. Example `.spice/data/fts/catalog/schema/table/`.
+                Some(
+                    make_spice_data_sub_directory(
+                        [vec!["fts".to_string()], dataset.name.to_vec()]
+                            .concat()
+                            .as_slice(),
+                    )
+                    .boxed()
+                    .map_err(|e| DataConnectorError::InvalidConfiguration {
+                        dataconnector: dataset.source().to_string(),
+                        message: e.to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    })?,
                 )
-                .boxed()
-                .map_err(|e| DataConnectorError::InvalidConfiguration {
-                    dataconnector: dataset.source().to_string(),
-                    message: e.to_string(),
-                    connector_component: dataset.into(),
-                    source: e,
-                })?,
-            )
+            }
         } else {
             None
         };

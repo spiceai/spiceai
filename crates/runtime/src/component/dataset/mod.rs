@@ -34,7 +34,13 @@ use spicepod::{
     semantic::{Column, FullTextSearchConfig, IndexStore},
     vector::VectorStore,
 };
-use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 pub mod acceleration;
 pub mod builder;
@@ -644,9 +650,9 @@ impl Dataset {
     #[allow(clippy::type_complexity)] // From a two-part `.unzip()`.
     #[must_use]
     pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
-        let (search_fields_and_primary_key_overrides, index_store): (
+        let (search_fields_and_primary_key_overrides, indexes): (
             Vec<(String, Option<Vec<String>>)>,
-            Vec<IndexStore>,
+            Vec<(IndexStore, Option<String>)>,
         ) = self
             .columns
             .iter()
@@ -655,11 +661,16 @@ impl Dataset {
                     enabled: true,
                     row_ids,
                     index_store,
+                    index_directory,
                 }) = &c.full_text_search
                 else {
                     return None;
                 };
-                Some(((c.name.clone(), row_ids.clone()), *index_store))
+
+                if *index_store == IndexStore::Memory && index_directory.is_some() {
+                    tracing::warn!("Dataset '{}' has in-memory full text search configured for column '{}', but has 'index_directory' set", self.name, c.name)
+                }
+                Some(((c.name.clone(), row_ids.clone()), (*index_store, index_directory.clone())))
             })
             .unzip();
         let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
@@ -699,7 +710,26 @@ impl Dataset {
             }
         }
 
-        let index_store = if index_store.contains(IndexStore::File) {
+        let index_paths: HashSet<String> = indexes
+            .iter()
+            .filter_map(|(_, directory)| *directory)
+            .collect();
+        let index_path_len = index_paths.len();
+        let index_path: Option<String> = index_paths.into_iter().next();
+
+        if let Some(ref path) = index_path
+            && index_path_len > 1
+        {
+            tracing::warn!(
+                "Dataset '{}' has several full text search index directories provided. Using '{path}'.",
+                self.name
+            )
+        };
+
+        let index_store = if indexes
+            .iter()
+            .any(|(store, directory)| *store == IndexStore::File)
+        {
             IndexStore::File
         } else {
             IndexStore::Memory
@@ -707,6 +737,7 @@ impl Dataset {
 
         Some(FullTextSearchDatasetConfig {
             index_store,
+            index_path,
             search_fields,
             primary_key: first_pks.unwrap_or_default(),
         })
@@ -751,6 +782,7 @@ impl Dataset {
 /// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
 pub struct FullTextSearchDatasetConfig {
     pub index_store: IndexStore,
+    pub index_path: Option<String>,
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
 }

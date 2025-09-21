@@ -163,6 +163,9 @@ pub struct FullTextSearchConfig {
     pub row_ids: Option<Vec<String>>,
 
     pub index_store: IndexStore,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -189,6 +192,7 @@ impl FullTextSearchConfig {
             enabled: false,
             row_ids: None,
             index_store: IndexStore::default(),
+            index_directory: None,
         }
     }
 
@@ -198,6 +202,7 @@ impl FullTextSearchConfig {
             enabled: true,
             row_ids: None,
             index_store: IndexStore::default(),
+            index_directory: None,
         }
     }
 
