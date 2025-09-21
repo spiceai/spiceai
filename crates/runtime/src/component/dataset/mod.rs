@@ -31,7 +31,7 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::{Column, FullTextSearchConfig, Mode as FtsMode},
+    semantic::{Column, FullTextSearchConfig, IndexStore},
     vector::VectorStore,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
@@ -644,9 +644,9 @@ impl Dataset {
     #[allow(clippy::type_complexity)] // From a two-part `.unzip()`.
     #[must_use]
     pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
-        let (search_fields_and_primary_key_overrides, modes): (
+        let (search_fields_and_primary_key_overrides, index_store): (
             Vec<(String, Option<Vec<String>>)>,
-            Vec<Option<FtsMode>>,
+            Vec<IndexStore>,
         ) = self
             .columns
             .iter()
@@ -654,12 +654,12 @@ impl Dataset {
                 let Some(FullTextSearchConfig {
                     enabled: true,
                     row_ids,
-                    mode,
+                    index_store,
                 }) = &c.full_text_search
                 else {
                     return None;
                 };
-                Some(((c.name.clone(), row_ids.clone()), *mode))
+                Some(((c.name.clone(), row_ids.clone()), *index_store))
             })
             .unzip();
         let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
@@ -699,30 +699,14 @@ impl Dataset {
             }
         }
 
-        let mode = match (
-            modes.contains(&Some(FtsMode::File)),
-            modes.contains(&Some(FtsMode::Memory)),
-        ) {
-            (true, false) => FtsMode::File,
-            (false, true) => FtsMode::Memory,
-            (true, true) => {
-                tracing::warn!(
-                    "For dataset '{}', full text search cannot currently be configured with both file and in-memory mode. Using file mode for all columns",
-                    self.name
-                );
-                FtsMode::File
-            }
-            (false, false) => {
-                tracing::warn!(
-                    "For dataset '{}', full text search will default to using file-based mode",
-                    self.name
-                );
-                FtsMode::File
-            }
+        let index_store = if index_store.contains(IndexStore::File) {
+            IndexStore::File
+        } else {
+            IndexStore::Memory
         };
 
         Some(FullTextSearchDatasetConfig {
-            mode,
+            index_store,
             search_fields,
             primary_key: first_pks.unwrap_or_default(),
         })
@@ -766,7 +750,7 @@ impl Dataset {
 
 /// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
 pub struct FullTextSearchDatasetConfig {
-    pub mode: FtsMode,
+    pub index_store: IndexStore,
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
 }

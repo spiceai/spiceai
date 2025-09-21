@@ -245,7 +245,6 @@ impl FullTextDatabaseIndex {
     ///
     /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
     async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
-        tracing::trace!("Writing to full text search index");
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
         let rb = if self.primary_key.len() > 1 {
             rb.iter()

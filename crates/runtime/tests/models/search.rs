@@ -649,7 +649,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search:  Some(FullTextSearchConfig::with_row_id("id").in_memory()),
+                    full_text_search:  Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -792,7 +792,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search:  Some(FullTextSearchConfig::with_row_id("id").in_memory()),
+                    full_text_search:  Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -877,7 +877,7 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig::with_row_id("answer").in_memory()),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -910,14 +910,14 @@ async fn test_text_search_where_rowid_is_search_column_multi_column() -> Result<
                     name: "question".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig::with_row_id("answer").in_memory()),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
                 Some(Column {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig::with_row_id("answer").in_memory()),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -983,14 +983,14 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                     name: "question".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig::with_row_id("id".to_string()).in_memory()),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
                 Some(Column {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig::with_row_id("id".to_string()).in_memory()),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))

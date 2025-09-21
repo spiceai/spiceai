@@ -18,7 +18,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
-use spicepod::semantic::Mode;
+use spicepod::semantic::IndexStore;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -54,7 +54,7 @@ impl FullTextConnector {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(FullTextSearchDatasetConfig {
-            mode,
+            index_store,
             search_fields,
             primary_key,
         }) = dataset.full_text_search_config()
@@ -69,7 +69,7 @@ impl FullTextConnector {
             });
         };
 
-        let directory = if mode == Mode::File {
+        let directory = if index_store == IndexStore::File {
             // Example `.spice/data/fts/catalog/schema/table/`.
             Some(
                 make_spice_data_sub_directory(

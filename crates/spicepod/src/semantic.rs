@@ -162,39 +162,22 @@ pub struct FullTextSearchConfig {
     )]
     pub row_ids: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Mode>,
-}
-
-impl FullTextSearchConfig {
-    #[must_use]
-    pub fn with_row_id(id: impl Into<String>) -> Self {
-        Self {
-            enabled: true,
-            row_ids: Some(vec![id.into()]),
-            mode: None,
-        }
-    }
-    #[must_use]
-    pub fn in_memory(mut self) -> Self {
-        self.mode = Some(Mode::Memory);
-        self
-    }
+    pub index_store: IndexStore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub enum Mode {
-    Memory,
+pub enum IndexStore {
     #[default]
+    Memory,
     File,
 }
 
-impl Display for Mode {
+impl Display for IndexStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Mode::Memory => write!(f, "memory"),
-            Mode::File => write!(f, "file"),
+            Self::Memory => write!(f, "memory"),
+            Self::File => write!(f, "file"),
         }
     }
 }
@@ -205,6 +188,7 @@ impl FullTextSearchConfig {
         FullTextSearchConfig {
             enabled: false,
             row_ids: None,
+            index_store: IndexStore::default(),
         }
     }
 
@@ -213,6 +197,7 @@ impl FullTextSearchConfig {
         FullTextSearchConfig {
             enabled: true,
             row_ids: None,
+            index_store: IndexStore::default(),
         }
     }
 
@@ -230,6 +215,12 @@ impl FullTextSearchConfig {
                 ..self
             }
         }
+    }
+
+    #[must_use]
+    pub fn in_memory(mut self) -> Self {
+        self.index_store = IndexStore::Memory;
+        self
     }
 }
 
