@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,10 +27,9 @@ use datafusion::{
 };
 use futures::StreamExt as _;
 use s3_vectors::{
-    BuildError, Document, Number, PutInputVector, PutVectorsError, PutVectorsInput, SdkError,
-    VectorData,
+    BuildError, Document, Number, PutInputVector, PutVectorsInput, SdkError, VectorData,
 };
-use snafu::prelude::*;
+use snafu::{ResultExt, prelude::*};
 
 use super::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable};
 
@@ -42,11 +41,15 @@ pub enum Error {
     #[snafu(display("Unable to build input message for S3 Vectors: {source}"))]
     BuildInput { source: BuildError },
     #[snafu(display("Failed to write vectors into S3 Vectors: {source}"))]
-    PutVectors { source: PutVectorsError },
+    PutVectors {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[snafu(display("Column '{name}' is expected but missing"))]
     MissingColumn { name: String },
     #[snafu(display("Column '{name}' type is not '{expected}' but expected to be"))]
     ColumnTypeMismatch { name: String, expected: String },
+    #[snafu(display("Expected {expected} datatype but got a different datatype"))]
+    DatatypeMismatch { expected: String },
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -113,6 +116,7 @@ impl DataSink for PutVectorsSink {
                     )
                     .await
                     .map_err(SdkError::into_service_error)
+                    .boxed()
                     .context(PutVectorsSnafu)?;
 
                 count += chunk.len();
@@ -123,7 +127,6 @@ impl DataSink for PutVectorsSink {
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVector>> {
     let name = S3_VECTOR_PRIMARY_KEY_NAME.to_string();
     let keys = record_batch
@@ -185,7 +188,7 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
 
         for (index, name, data_type) in &fields {
             let col = record_batch.column(*index);
-            let value = metadata_from_row(row, data_type, col);
+            let value = metadata_from_row(row, data_type, col)?;
             metadata.insert((*name).to_string(), value);
         }
 
@@ -208,46 +211,59 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
     Ok(put_input_vectors)
 }
 
-#[allow(clippy::unwrap_used)]
-fn metadata_from_row(row: usize, data_type: &DataType, col: &Arc<dyn Array + 'static>) -> Document {
-    match data_type {
+fn metadata_from_row(
+    row: usize,
+    data_type: &DataType,
+    col: &Arc<dyn Array + 'static>,
+) -> Result<Document> {
+    Ok(match data_type {
         DataType::Utf8 => {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
-                .unwrap(); // UNWRAP: we checked the datatype
+                .context(DatatypeMismatchSnafu {
+                    expected: "Utf8".to_string(),
+                })?;
             Document::String(arr.value(row).to_string())
         }
         DataType::Int64 => {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .unwrap(); // UNWRAP: we checked the datatype
+                .context(DatatypeMismatchSnafu {
+                    expected: "Int64".to_string(),
+                })?;
             Document::Number(Number::NegInt(arr.value(row)))
         }
         DataType::UInt64 => {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
-                .unwrap(); // UNWRAP: we checked the datatype
+                .context(DatatypeMismatchSnafu {
+                    expected: "UInt64".to_string(),
+                })?;
             Document::Number(Number::PosInt(arr.value(row)))
         }
         DataType::Float64 => {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .unwrap(); // UNWRAP: we checked the datatype
+                .context(DatatypeMismatchSnafu {
+                    expected: "Float64".to_string(),
+                })?;
             Document::Number(Number::Float(arr.value(row)))
         }
         DataType::Boolean => {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
-                .unwrap(); // UNWRAP: we checked the datatype
+                .context(DatatypeMismatchSnafu {
+                    expected: "Boolean".to_string(),
+                })?;
             Document::Bool(arr.value(row))
         }
         _ => unimplemented!(),
-    }
+    })
 }
 
 impl From<Error> for DataFusionError {
@@ -257,7 +273,6 @@ impl From<Error> for DataFusionError {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use arrow::{
         array::ListBuilder,
@@ -295,7 +310,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn test_create_put_input_vectors_success() {
         let keys = StringArray::from(vec!["key1", "key2"]);
         let metadata = StringArray::from(vec!["meta1", "meta2"]);
@@ -307,14 +321,14 @@ mod tests {
             schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
-        .unwrap();
+        .expect("try_new");
 
-        let result = create_put_input_vectors(&batch).unwrap();
+        let result = create_put_input_vectors(&batch).expect("create_put_input_vectors");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].key(), "key1");
         assert_eq!(
-            result[0].data().unwrap(),
+            result[0].data().expect("data"),
             &VectorData::Float32(vec![1f32, 2f32, 3f32])
         );
     }
@@ -334,8 +348,8 @@ mod tests {
             ),
         ]));
 
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(metadata), Arc::new(vectors)]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(metadata), Arc::new(vectors)])
+            .expect("try_new");
 
         let result = create_put_input_vectors(&batch);
         assert!(result.is_err());
@@ -372,7 +386,7 @@ mod tests {
             schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
-        .unwrap();
+        .expect("try_new");
 
         let result = create_put_input_vectors(&batch);
         assert!(result.is_err());
@@ -395,9 +409,9 @@ mod tests {
             schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
-        .unwrap();
+        .expect("try_new");
 
-        let result = create_put_input_vectors(&batch).unwrap();
+        let result = create_put_input_vectors(&batch).expect("create_put_input_vectors");
 
         // Only the first vector should be included (2 valid vectors)
         assert_eq!(result.len(), 1);
@@ -417,9 +431,9 @@ mod tests {
             schema,
             vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
         )
-        .unwrap();
+        .expect("try_new");
 
-        let result = create_put_input_vectors(&batch).unwrap();
+        let result = create_put_input_vectors(&batch).expect("create_put_input_vectors");
 
         // Only the second vector should be included (1 valid vector)
         assert_eq!(result.len(), 1);
