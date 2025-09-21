@@ -216,12 +216,6 @@ impl FullTextSearchConfig {
             }
         }
     }
-
-    #[must_use]
-    pub fn in_memory(mut self) -> Self {
-        self.index_store = IndexStore::Memory;
-        self
-    }
 }
 
 #[cfg(test)]
