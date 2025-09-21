@@ -48,7 +48,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
-use llms::embeddings::Embed;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::chunking::ChunkedSearchIndex;
 use search::index::SearchIndex;

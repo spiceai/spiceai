@@ -25,6 +25,8 @@ use spicepod::{
     semantic::{Column, ColumnLevelEmbeddingConfig},
 };
 
+use crate::models::search::{SearchTestCase, SearchTestType};
+
 mod search {
     use crate::{
         configure_test_datafusion,
@@ -40,6 +42,7 @@ mod search {
     use app::AppBuilder;
     use serde_json::json;
     use spicepod::{
+        component::embeddings::EmbeddingChunkConfig,
         semantic::{Column, ColumnLevelEmbeddingConfig},
         vector::VectorStore,
     };
@@ -83,70 +86,8 @@ mod search {
                 ))
                 .with_dataset(ds)
                 .build(),
-            vec![
-                SearchTestCase::new(
-                    "s3vectors_basic_basic",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
-                    })),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_additional_columns",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
-                        "additional_columns": ["question"],
-                    })),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_with_where",
-                    SearchTestType::Http(json!({
-                        "text": "secondary",
-                        "datasets": ["qs"],
-                        "where": "subject!='math'",
-                        "limit": 4,
-                    })),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_vector_search_sql_basic",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_vector_search_sql_projection",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_vector_search_sql_filters",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_vector_search_sql_no_score",
-                    SearchTestType::Sql(
-                        "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_vector_search_sql_random",
-                    SearchTestType::Sql(
-                        "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vectors_basic_vector_search_sql_vectors",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
-                    ))
-            ],
-            true
+            basic_vector_search_tests("basic"),
+            true,
         )
         .await
     }
@@ -181,40 +122,10 @@ mod search {
                 ))
                 .with_dataset(ds)
                 .build(),
-            vec![
-                SearchTestCase::new(
-                    "s3vector_composite_basic",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
-                    })),
-                ),
-                SearchTestCase::new(
-                    "s3vector_composite_additional_columns",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
-                        "additional_columns": ["subject"],
-                    })),
-                ),
-                SearchTestCase::new(
-                    "s3vector_composite_with_where",
-                    SearchTestType::Http(json!({
-                        "text": "secondary",
-                        "datasets": ["qs"],
-                        "where": "subject!='math'",
-                        "limit": 4,
-                    })),
-                ),
-                SearchTestCase::new(
-                    "s3vector_composite_vector_search_sql_single_column",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
 
+            vec![
+                basic_vector_search_tests("composite"),
+                vec![
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_composite_key",
                     SearchTestType::Sql(
@@ -226,8 +137,70 @@ mod search {
                     SearchTestType::Sql(
                         "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id> 10 order by score desc LIMIT 4",
                     ),
+                )]
+            ].concat(),
+            true
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn with_chunking() -> Result<(), anyhow::Error> {
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["id".to_string()]),
+                    chunking: Some(EmbeddingChunkConfig {
+                        enabled: true,
+                        target_chunk_size: 16,
+                        overlap_size: 4,
+                        trim_whitespace: true,
+                    }),
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: HashMap::new(),
+            }),
+        );
+        let bucket_name = "spice-ci-tests-s3-vectors-chunking";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                basic_vector_search_tests("chunking"),
+                vec![
+                SearchTestCase::new(
+                    "s3vector_chunking_vector_search_sql_match",
+                    SearchTestType::Sql(
+                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
                 ),
-            ],
+                SearchTestCase::new(
+                    "s3vector_chunking_vector_search_sql_offset",
+                    SearchTestType::Sql(
+                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_chunking_vector_search_sql_match_and_underlying",
+                    SearchTestType::Sql(
+                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                )]
+            ].concat(),
             true
         )
         .await
@@ -276,14 +249,8 @@ mod search {
                 .with_dataset(ds)
                 .build(),
             vec![
-                SearchTestCase::new(
-                    "s3vector_metadata_basic",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
-                    })),
-                ),
+                basic_vector_search_tests("metadata"),
+            vec![
                 SearchTestCase::new(
                     "s3vector_metadata_additional_columns_metadata",
                     SearchTestType::Http(json!({
@@ -293,15 +260,7 @@ mod search {
                         "additional_columns": ["reference_answer", "source"],
                     })),
                 ),
-                SearchTestCase::new(
-                    "s3vector_metadata_with_where",
-                    SearchTestType::Http(json!({
-                        "text": "secondary",
-                        "datasets": ["qs"],
-                        "where": "source='textbook_reasoning'",
-                        "limit": 4,
-                    })),
-                ),
+
                 SearchTestCase::new(
                     "s3vector_metadata_with_where_metadata",
                     SearchTestType::Http(json!({
@@ -311,18 +270,7 @@ mod search {
                         "limit": 4,
                     })),
                 ),
-                SearchTestCase::new(
-                    "s3vector_metadata_vector_search_sql_basic",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vector_metadata_vector_search_sql_projection",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, reference_answer, source, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
+
                 SearchTestCase::new(
                     "s3vector_metadata_vector_search_sql_projection_metadata",
                     SearchTestType::Sql(
@@ -335,13 +283,8 @@ mod search {
                         "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
                     ),
                 ),
-                SearchTestCase::new(
-                    "s3vector_metadata_vector_search_sql_filters",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where source='textbook_reasoning' order by score desc LIMIT 4",
-                    ),
-                ),
-            ],
+            ]
+            ].concat(),
             true
         )
         .await
@@ -722,4 +665,74 @@ fn vectors_nonfilterable_col(name: &str) -> Column {
         )]
         .into(),
     )
+}
+
+/// Returns common test cases for vector search on the [`get_mega_science_dataset`] dataset
+///
+/// Assumes datasets has name `qs` and embedding column is on `answer` column.
+fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
+    vec![
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_basic").as_str(),
+            SearchTestType::Http(json!({
+                "text": "second",
+                "limit": 4,
+                "datasets": ["qs"],
+            })),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_additional_columns").as_str(),
+            SearchTestType::Http(json!({
+                "text": "second",
+                "limit": 4,
+                "datasets": ["qs"],
+                "additional_columns": ["question"],
+            })),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_with_where").as_str(),
+            SearchTestType::Http(json!({
+                "text": "secondary",
+                "datasets": ["qs"],
+                "where": "subject!='math'",
+                "limit": 4,
+            })),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_vector_search_sql_basic").as_str(),
+            SearchTestType::Sql(
+                "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+            ),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_vector_search_sql_projection").as_str(),
+            SearchTestType::Sql(
+                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+            ),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_vector_search_sql_filters").as_str(),
+            SearchTestType::Sql(
+                "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+            ),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_vector_search_sql_no_score").as_str(),
+            SearchTestType::Sql(
+                "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+            ),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_vector_search_sql_random").as_str(),
+            SearchTestType::Sql(
+                "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+            ),
+        ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_vector_search_sql_vectors").as_str(),
+            SearchTestType::Sql(
+                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
+            ),
+        ),
+    ]
 }
