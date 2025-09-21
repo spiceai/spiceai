@@ -12,7 +12,13 @@ version.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+futures.workspace = true
 object_store.workspace = true
 tracing.workspace = true
 snafu.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+util = { path = "../util" }
 url.workspace = true
+
+[features]
+snapshots = []

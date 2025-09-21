@@ -12167,10 +12167,13 @@ dependencies = [
  "arrow",
  "async-trait",
  "aws-sdk-credential-bridge",
+ "futures",
  "object_store",
  "snafu",
+ "tokio",
  "tracing",
  "url",
+ "util",
 ]
 
 [[package]]
