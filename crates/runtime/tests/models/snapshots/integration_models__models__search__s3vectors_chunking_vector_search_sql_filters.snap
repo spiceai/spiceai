@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 890,
+    "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume.",
+    "score": 0.995
+  },
+  {
+    "id": 1279,
+    "answer": "$\\boxed{\\text{Pyruvate}}$ is not an intermediate of the TCA cycle. It is converted to acetyl-CoA, which then enters the cycle.",
+    "score": 0.364
+  },
+  {
+    "id": 618,
+    "answer": "$\\boxed{D}$ (Mg²⁺ ions are required as a cofactor for pyruvate kinase to achieve maximum activity in glycolysis.)",
+    "score": 0.342
+  },
+  {
+    "id": 449,
+    "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
+    "score": 0.322
+  }
+]

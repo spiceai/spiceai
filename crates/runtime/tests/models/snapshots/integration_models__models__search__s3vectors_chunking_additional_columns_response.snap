@@ -1,0 +1,62 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "data": {
+        "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": " and secon"
+      },
+      "primary_key": {
+        "id": 525
+      },
+      "score": 0.99
+    },
+    {
+      "data": {
+        "question": "Using the method of multiplying by 10 and then halving the answer, what is \\( 6 \\times 5 \\)?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 806
+      },
+      "score": 0.79
+    },
+    {
+      "data": {
+        "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 612
+      },
+      "score": 0.79
+    },
+    {
+      "data": {
+        "question": "What is the product of \\(5 \\times 5\\) in multiplication?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 1086
+      },
+      "score": 0.79
+    }
+  ]
+}

@@ -17,6 +17,7 @@ limitations under the License.
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use s3_vectors::Client;
+use serde_json::json;
 use snafu::ResultExt;
 use spicepod::{
     acceleration::Acceleration,
@@ -32,7 +33,7 @@ mod search {
         configure_test_datafusion,
         models::{
             get_mega_science_dataset,
-            hf::get_huggingface_embeddings,
+            hf::{get_huggingface_embeddings, get_model_to_vec_embeddings},
             s3_vectors::{
                 basic_vector_search_tests, delete_index, vectors_filterable_col,
                 vectors_nonfilterable_col,
@@ -676,7 +677,7 @@ fn vectors_nonfilterable_col(name: &str) -> Column {
 fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
     vec![
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_basic").as_str(),
+            format!("s3vectors_{prefix}_basic"),
             SearchTestType::Http(json!({
                 "text": "second",
                 "limit": 4,
@@ -684,7 +685,7 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
             })),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_additional_columns").as_str(),
+            format!("s3vectors_{prefix}_additional_columns"),
             SearchTestType::Http(json!({
                 "text": "second",
                 "limit": 4,
@@ -693,7 +694,7 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
             })),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_with_where").as_str(),
+            format!("s3vectors_{prefix}_with_where"),
             SearchTestType::Http(json!({
                 "text": "secondary",
                 "datasets": ["qs"],
@@ -702,37 +703,37 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
             })),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_basic").as_str(),
+            format!("s3vectors_{prefix}_vector_search_sql_basic"),
             SearchTestType::Sql(
                 "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_projection").as_str(),
+            format!("s3vectors_{prefix}_vector_search_sql_projection"),
             SearchTestType::Sql(
                 "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_filters").as_str(),
+            format!("s3vectors_{prefix}_vector_search_sql_filters"),
             SearchTestType::Sql(
                 "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_no_score").as_str(),
+            format!("s3vectors_{prefix}_vector_search_sql_no_score"),
             SearchTestType::Sql(
                 "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_random").as_str(),
+            format!("s3vectors_{prefix}_vector_search_sql_random"),
             SearchTestType::Sql(
                 "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_vectors").as_str(),
+            format!("s3vectors_{prefix}_vector_search_sql_vectors"),
             SearchTestType::Sql(
                 "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
             ),

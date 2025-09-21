@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " and secon"
+      },
+      "primary_key": {
+        "id": 525
+      },
+      "score": 0.99
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 806
+      },
+      "score": 0.79
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 612
+      },
+      "score": 0.79
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 1086
+      },
+      "score": 0.79
+    }
+  ]
+}
