@@ -538,6 +538,7 @@ impl Runtime {
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::large_futures)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,

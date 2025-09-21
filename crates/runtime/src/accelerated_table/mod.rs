@@ -18,7 +18,6 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
@@ -42,6 +41,7 @@ use datafusion::{
 };
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};

@@ -32,12 +32,13 @@ use std::sync::{Arc, OnceLock};
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
 use datafusion::catalog::TableProvider;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use tokio::sync::{RwLock, oneshot};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
     component::dataset::Dataset,
-    dataaccelerator::spice_sys::dataset_checkpoint::{DatasetCheckpoint, DatasetCheckpointer},
+    dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
     dataconnector::{DataConnector, DataConnectorError},
     tracers::OnceTracer,
     warn_once,
@@ -147,19 +148,17 @@ impl FederatedTable {
     }
 
     pub fn add_schema(&self, schema: SchemaRef) {
-        match self {
-            Self::DeferredNoSchema {
-                dataset,
-                data_connector,
-                deferred,
-            } => {
-                let _ = deferred.set(Self::new_deferred_with_schema(
-                    Arc::clone(dataset),
-                    Arc::clone(data_connector),
-                    schema,
-                ));
-            }
-            _ => {}
+        if let Self::DeferredNoSchema {
+            dataset,
+            data_connector,
+            deferred,
+        } = self
+        {
+            let _ = deferred.set(Self::new_deferred_with_schema(
+                Arc::clone(dataset),
+                Arc::clone(data_connector),
+                schema,
+            ));
         }
     }
 
@@ -187,6 +186,11 @@ impl FederatedTable {
         deferred_table_provider.table.get()
     }
 
+    /// Returns the [`TableProvider`], waiting for a deferred [`TableProvider`] if necessary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the federated table is unavailable at startup and the acceleration snapshot has not been bootstrapped yet.
     pub async fn table_provider(&self) -> Arc<dyn TableProvider> {
         let deferred_table_provider = match self {
             Self::Immediate(table_provider) => return Arc::clone(table_provider),
@@ -239,6 +243,11 @@ impl FederatedTable {
         }
     }
 
+    /// Returns the schema of the table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the federated table is unavailable at startup and the acceleration snapshot has not been bootstrapped yet.
     pub fn schema(&self) -> SchemaRef {
         match self {
             Self::Immediate(table_provider) => table_provider.schema(),

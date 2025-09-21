@@ -27,6 +27,7 @@ use super::{AccelerationConnection, Result, acceleration_connection};
 use crate::dataaccelerator::AccelerationSource;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use serde_json;
 
 const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
@@ -39,14 +40,6 @@ mod duckdb;
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
-
-#[async_trait]
-pub trait DatasetCheckpointer: Send + Sync {
-    async fn exists(&self) -> bool;
-    async fn checkpoint(&self, schema: &SchemaRef) -> Result<()>;
-    async fn get_schema(&self) -> Result<Option<SchemaRef>>;
-    async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>>;
-}
 
 #[async_trait]
 impl DatasetCheckpointer for DatasetCheckpoint {

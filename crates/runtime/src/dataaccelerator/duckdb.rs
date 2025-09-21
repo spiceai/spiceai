@@ -40,6 +40,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use runtime_acceleration::snapshot::SnapshotBootstrapManager;
 use runtime_table_partition::expression::PartitionBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
@@ -312,7 +313,10 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
-            // TODO: skip if we are bootstrapping
+            // Skip initializating the file if snapshot bootstrapping is enabled
+            if SnapshotBootstrapManager::enabled(&acceleration.params) {
+                return Ok(());
+            }
             self.get_shared_pool(source).await?;
         }
 

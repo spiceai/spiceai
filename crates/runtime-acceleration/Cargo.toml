@@ -22,3 +22,7 @@ url.workspace = true
 
 [features]
 snapshots = []
+
+[dev-dependencies]
+bytes.workspace = true
+chrono.workspace = true

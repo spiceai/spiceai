@@ -26,6 +26,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::dataaccelerator::spice_sys::acceleration_file_path;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self};
 use crate::dataconnector::deferred::DeferredConnector;
@@ -68,6 +69,8 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
+use runtime_acceleration::dataset_checkpoint::make_checkpointer_factory;
+use runtime_acceleration::snapshot::SnapshotBootstrapManager;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
@@ -875,7 +878,28 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
-        // TODO: Need to download snapshot here
+        if SnapshotBootstrapManager::enabled(&acceleration_settings.params)
+            && let Some(file_path) = acceleration_file_path(dataset).await
+        {
+            let dataset = dataset.clone();
+            let manager = SnapshotBootstrapManager::from_params(
+                dataset.name.to_string(),
+                &acceleration_settings.params,
+                make_checkpointer_factory(move || {
+                    let dataset = dataset.clone();
+                    async move { DatasetCheckpoint::try_new(&dataset).await }
+                }),
+                file_path,
+            )
+            .await;
+            if let Some(manager) = manager {
+                let schema = manager.download_latest_snapshot().await.ok().flatten();
+                if let Some(schema) = schema {
+                    source_table_provider.add_schema(schema);
+                }
+            }
+        }
+
         let source_schema = source_table_provider.schema();
 
         let refresh_sql = dataset.refresh_sql();

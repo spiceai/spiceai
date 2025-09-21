@@ -16,7 +16,10 @@ limitations under the License.
 
 //! Durable storage for Spice operational data related to acceleration.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use super::AccelerationSource;
 
@@ -56,6 +59,38 @@ enum AccelerationConnection {
 }
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+pub async fn acceleration_file_path(source: &dyn AccelerationSource) -> Option<PathBuf> {
+    let runtime = source.runtime();
+    let acceleration_settings = source.acceleration()?;
+
+    match acceleration_settings.engine {
+        #[cfg(feature = "duckdb")]
+        Engine::DuckDB => {
+            let accelerator = runtime
+                .accelerator_engine_registry()
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await?;
+
+            let duckdb_accelerator = accelerator.as_any().downcast_ref::<DuckDBAccelerator>()?;
+
+            let duckdb_file = duckdb_accelerator.duckdb_file_path(source).ok()?;
+            Some(PathBuf::from(duckdb_file))
+        }
+        #[cfg(feature = "sqlite")]
+        Engine::Sqlite => {
+            let accelerator = runtime
+                .accelerator_engine_registry()
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await?;
+            let sqlite_accelerator = accelerator.as_any().downcast_ref::<SqliteAccelerator>()?;
+
+            let sqlite_file = sqlite_accelerator.sqlite_file_path(source).ok()?;
+            Some(PathBuf::from(sqlite_file))
+        }
+        _ => None,
+    }
+}
 
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
