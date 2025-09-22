@@ -453,7 +453,7 @@ impl TableProvider for SearchQueryProvider {
                         false,
                     ),
                     true,
-                )))
+                )));
             }
         }
 
