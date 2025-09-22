@@ -563,7 +563,7 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
                     }],
-                    full_text_search: Some(FullTextSearchConfig::with_row_id("id")),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     description: None,
                     metadata: HashMap::new(),
                 }),
@@ -736,6 +736,8 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
                     full_text_search: Some(FullTextSearchConfig {
                         enabled: true,
                         row_ids: Some(vec!["id".to_string()]),
+                        index_store: None,
+                        index_directory: None,
                     }),
                     metadata: HashMap::new(),
                 }),
@@ -945,7 +947,7 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
                     full_text_search: Some(FullTextSearchConfig {
                         enabled: true,
                         row_ids: Some(vec!["answer".to_string(), "id".to_string()]),
-                        mode: Some(spicepod::semantic::Mode::Memory)
+                        index_store: Some(spicepod::semantic::IndexStore::Memory)
                     }),
                     metadata: HashMap::new(),
                 }),
