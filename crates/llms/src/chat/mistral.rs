@@ -84,28 +84,28 @@ impl MistralLlama {
             }
         }
 
-        if let Some(config) = config {
-            if !config.exists() {
-                return Err(ChatError::LocalModelConfigNotFound {
-                    expected_path: config.to_string_lossy().to_string(),
-                });
-            }
+        if let Some(config) = config
+            && !config.exists()
+        {
+            return Err(ChatError::LocalModelConfigNotFound {
+                expected_path: config.to_string_lossy().to_string(),
+            });
         }
 
-        if let Some(tokenizer) = tokenizer {
-            if !tokenizer.exists() {
-                return Err(ChatError::LocalTokenizerNotFound {
-                    expected_path: tokenizer.to_string_lossy().to_string(),
-                });
-            }
+        if let Some(tokenizer) = tokenizer
+            && !tokenizer.exists()
+        {
+            return Err(ChatError::LocalTokenizerNotFound {
+                expected_path: tokenizer.to_string_lossy().to_string(),
+            });
         }
 
-        if let Some(tokenizer_config) = tokenizer_config {
-            if !tokenizer_config.exists() {
-                return Err(ChatError::LocalTokenizerNotFound {
-                    expected_path: tokenizer_config.to_string_lossy().to_string(),
-                });
-            }
+        if let Some(tokenizer_config) = tokenizer_config
+            && !tokenizer_config.exists()
+        {
+            return Err(ChatError::LocalTokenizerNotFound {
+                expected_path: tokenizer_config.to_string_lossy().to_string(),
+            });
         }
 
         let paths = Self::create_paths(

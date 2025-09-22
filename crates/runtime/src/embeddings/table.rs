@@ -222,17 +222,16 @@ impl EmbeddingTable {
         if let DataType::List(inner)
         | DataType::LargeList(inner)
         | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
+            && let DataType::FixedSizeList(_, _) = inner.data_type()
         {
-            if let DataType::FixedSizeList(_, _) = inner.data_type() {
-                let Some((_, offsets_field)) =
-                    base_schema.column_with_name(offset_col!(column).as_str())
-                else {
-                    return false;
-                };
+            let Some((_, offsets_field)) =
+                base_schema.column_with_name(offset_col!(column).as_str())
+            else {
+                return false;
+            };
 
-                if !is_valid_offset_type(offsets_field.data_type()) {
-                    return false;
-                }
+            if !is_valid_offset_type(offsets_field.data_type()) {
+                return false;
             }
         }
         true

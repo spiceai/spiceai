@@ -29,7 +29,7 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 pub fn get_s3_dictionary_dataset(name: &str) -> Dataset {
     Dataset::new(

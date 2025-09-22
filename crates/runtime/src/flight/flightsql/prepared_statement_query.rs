@@ -251,7 +251,7 @@ pub enum Error {
 /// This function handles the conversion of JDBC parameter placeholders (e.g., `?`) to
 /// Postgres placeholders (e.g., `$1`, `$2`, etc.). If the query does not contain any JDBC
 /// parameter placeholders, the original query is returned unchanged.
-fn convert_jdbc_parameter_placeholders(query: &str) -> Result<Cow<str>, Error> {
+fn convert_jdbc_parameter_placeholders(query: &str) -> Result<Cow<'_, str>, Error> {
     // Simple check for the common case where the query does not contain any JDBC parameter placeholders
     if !query.contains('?') {
         return Ok(Cow::Borrowed(query));
@@ -292,13 +292,12 @@ impl VisitorMut for ConvertJdbcPlaceholdersVisitor {
     type Break = ();
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        if let Expr::Value(value_with_span) = expr {
-            if let Value::Placeholder(ref mut placeholder) = value_with_span.value {
-                let new_placeholder =
-                    placeholder.replace('?', &format!("${}", self.next_placeholder));
-                value_with_span.value = Value::Placeholder(new_placeholder);
-                self.next_placeholder += 1;
-            }
+        if let Expr::Value(value_with_span) = expr
+            && let Value::Placeholder(ref mut placeholder) = value_with_span.value
+        {
+            let new_placeholder = placeholder.replace('?', &format!("${}", self.next_placeholder));
+            value_with_span.value = Value::Placeholder(new_placeholder);
+            self.next_placeholder += 1;
         }
         ControlFlow::Continue(())
     }

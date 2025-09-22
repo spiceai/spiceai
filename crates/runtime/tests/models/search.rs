@@ -179,17 +179,14 @@ fn normalize_search_response(mut json: Value) -> String {
             format!("{b_pks:?}").cmp(&format!("{a_pks:?}"))
         });
         for m in matches {
-            if let Some(obj) = m.as_object_mut() {
-                if let Some(Value::Number(n)) = obj.get("score") {
-                    if let Some(score) = n.as_f64() {
-                        if let Some(truncated_score) =
-                            serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
-                        // Keep 4 decimals
-                        {
-                            obj.insert("score".to_string(), Value::Number(truncated_score));
-                        }
-                    }
-                }
+            if let Some(obj) = m.as_object_mut()
+                && let Some(Value::Number(n)) = obj.get("score")
+                && let Some(score) = n.as_f64()
+                && let Some(truncated_score) =
+                    serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
+            // Keep 4 decimals
+            {
+                obj.insert("score".to_string(), Value::Number(truncated_score));
             }
         }
     }

@@ -123,10 +123,10 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
 
-        if this.start.is_none() {
-            if let Some(start_timer) = this.start_timer.take() {
-                this.start.replace(start_timer());
-            }
+        if this.start.is_none()
+            && let Some(start_timer) = this.start_timer.take()
+        {
+            this.start.replace(start_timer());
         }
 
         let stream = &mut this.stream;

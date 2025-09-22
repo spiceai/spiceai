@@ -169,8 +169,8 @@ mod tests {
     /// Comment the `#[ignore]` and run this test with `cargo test -p data_components --lib -- iceberg::catalog --nocapture`.
     ///
     /// Pre-requisites:
-    /// Follow the guide at https://iceberg.apache.org/spark-quickstart/ to spin up a local Iceberg catalog/Minio & Spark cluster.
-    /// In the Python notebook that gets started at http://localhost:8888, load the `Iceberg - Getting Started.ipynb` notebook.
+    /// Follow the guide at <https://iceberg.apache.org/spark-quickstart/> to spin up a local Iceberg catalog/Minio & Spark cluster.
+    /// In the Python notebook that gets started at <http://localhost:8888>, load the `Iceberg - Getting Started.ipynb` notebook.
     /// Run the first 5 cells to create the `nyc.taxis` table.
     #[tokio::test]
     #[ignore = "requires local minio and spark cluster"]

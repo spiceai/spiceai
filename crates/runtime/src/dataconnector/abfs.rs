@@ -168,12 +168,12 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         &self,
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(sas_token) = params.parameters.get("sas_string").expose().ok() {
-            if let Some(sas_token) = sas_token.strip_prefix('?') {
-                params
-                    .parameters
-                    .insert("sas_string".to_string(), sas_token.to_string().into());
-            }
+        if let Some(sas_token) = params.parameters.get("sas_string").expose().ok()
+            && let Some(sas_token) = sas_token.strip_prefix('?')
+        {
+            params
+                .parameters
+                .insert("sas_string".to_string(), sas_token.to_string().into());
         }
 
         Box::pin(async move {

@@ -61,11 +61,10 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
         if let Some(adaptor) = current_tbl
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
+            && let Some(adapted_tbl) = adaptor.table_provider.as_ref()
         {
-            if let Some(adapted_tbl) = adaptor.table_provider.as_ref() {
-                current_tbl = adapted_tbl;
-                continue;
-            }
+            current_tbl = adapted_tbl;
+            continue;
         }
 
         if let Some(embedding_table) = current_tbl.as_any().downcast_ref::<EmbeddingTable>() {

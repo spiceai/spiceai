@@ -206,16 +206,15 @@ impl AcceleratorEngineRegistry {
 
         // If there are constraints from the federated table, then add them to the accelerated table
         // and automatically configure upsert behavior for them. This can be overridden by the user.
-        if let Some(constraints) = constraints {
-            if !constraints.is_empty() {
-                external_table_builder = external_table_builder.constraints(constraints.clone());
-                let primary_keys: Vec<String> =
-                    get_primary_keys_from_constraints(constraints, &schema);
-                external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
-                    ColumnReference::new(primary_keys),
-                    UpsertOptions::default(),
-                ));
-            }
+        if let Some(constraints) = constraints
+            && !constraints.is_empty()
+        {
+            external_table_builder = external_table_builder.constraints(constraints.clone());
+            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
+            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
+                ColumnReference::new(primary_keys),
+                UpsertOptions::default(),
+            ));
         }
 
         if let Some(on_conflict) =
