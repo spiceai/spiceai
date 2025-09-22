@@ -34,14 +34,14 @@ snapshot_kind: text
     },
     {
       "data": {
-        "question": "Subtract and then check by adding: \\(7 - 0\\)."
+        "question": "Subtract 820 from 892, then subtract 9 from the result. What is the final answer?"
       },
       "dataset": "qs",
       "matches": {
         "answer": "\n2"
       },
       "primary_key": {
-        "id": 778
+        "id": 776
       },
       "score": 0.79
     },

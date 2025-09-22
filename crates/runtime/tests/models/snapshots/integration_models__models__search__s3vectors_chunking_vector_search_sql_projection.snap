@@ -5,6 +5,13 @@ snapshot_kind: text
 ---
 [
   {
+    "id": 180,
+    "answer": "1. First, compute the exponentiation: $2^4 = 16$.\n2. Then, apply the negation: $-16$.\n3. Thus, $-2^4 = \\boxed{-16}$.",
+    "question": "Evaluate the expression $-2^4$, where the exponentiation is performed before the negation.",
+    "subject": "math",
+    "score": 0.793
+  },
+  {
     "id": 612,
     "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\).",
     "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words.",
@@ -19,16 +26,9 @@ snapshot_kind: text
     "score": 0.793
   },
   {
-    "id": 778,
-    "answer": "1. Subtract: \\(7 - 0 = 7\\).  \n2. Check by adding: \\(7 + 0 = 7\\).  \n\nThe result is \\(\\boxed{7}\\).",
-    "question": "Subtract and then check by adding: \\(7 - 0\\).",
-    "subject": "math",
-    "score": 0.793
-  },
-  {
-    "id": 180,
-    "answer": "1. First, compute the exponentiation: $2^4 = 16$.\n2. Then, apply the negation: $-16$.\n3. Thus, $-2^4 = \\boxed{-16}$.",
-    "question": "Evaluate the expression $-2^4$, where the exponentiation is performed before the negation.",
+    "id": 225,
+    "answer": "1. **Multiply first**: \\(8 \\times 2 = 16\\).  \n2. **Then add**: \\(16 + 3 = 19\\).  \n\nThe final answer is \\(\\boxed{19}\\).",
+    "question": "Evaluate the expression \\(8 \\times 2 + 3\\) by following the order of operations (multiplication before addition).",
     "subject": "math",
     "score": 0.793
   }

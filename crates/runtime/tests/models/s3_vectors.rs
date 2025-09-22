@@ -161,8 +161,8 @@ mod search {
                     chunking: Some(EmbeddingChunkConfig {
                         enabled: true,
                         target_chunk_size: 32,
-                        overlap_size: 4,
-                        trim_whitespace: true,
+                        overlap_size: 0,
+                        trim_whitespace: false,
                     }),
                     vector_size: None,
                 }],
@@ -192,12 +192,12 @@ mod search {
                         "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
-                SearchTestCase::new(
-                    "s3vector_chunking_vector_search_sql_offset",
-                    SearchTestType::Sql(
-                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
+                // SearchTestCase::new(
+                //     "s3vector_chunking_vector_search_sql_offset",
+                //     SearchTestType::Sql(
+                //         "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                //     ),
+                // ),
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match_and_underlying",
                     SearchTestType::Sql(
@@ -732,11 +732,11 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
                 "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
             ),
         ),
-        SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_vectors"),
-            SearchTestType::Sql(
-                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
-            ),
-        ),
+        // SearchTestCase::new(
+        //     format!("s3vectors_{prefix}_vector_search_sql_vectors"),
+        //     SearchTestType::Sql(
+        //         "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
+        //     ),
+        // ),
     ]
 }

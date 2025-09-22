@@ -5,6 +5,11 @@ snapshot_kind: text
 ---
 [
   {
+    "id": 180,
+    "answer": "1. First, compute the exponentiation: $2^4 = 16$.\n2. Then, apply the negation: $-16$.\n3. Thus, $-2^4 = \\boxed{-16}$.",
+    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.793
+  },
+  {
     "id": 612,
     "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\).",
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.793
@@ -15,13 +20,8 @@ snapshot_kind: text
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.793
   },
   {
-    "id": 778,
-    "answer": "1. Subtract: \\(7 - 0 = 7\\).  \n2. Check by adding: \\(7 + 0 = 7\\).  \n\nThe result is \\(\\boxed{7}\\).",
-    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.793
-  },
-  {
-    "id": 180,
-    "answer": "1. First, compute the exponentiation: $2^4 = 16$.\n2. Then, apply the negation: $-16$.\n3. Thus, $-2^4 = \\boxed{-16}$.",
+    "id": 225,
+    "answer": "1. **Multiply first**: \\(8 \\times 2 = 16\\).  \n2. **Then add**: \\(16 + 3 = 19\\).  \n\nThe final answer is \\(\\boxed{19}\\).",
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.793
   }
 ]
