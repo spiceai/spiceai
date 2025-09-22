@@ -37,17 +37,17 @@ use tokio::sync::RwLock;
 
 use crate::{
     dataconnector::parameters::aws::load_config,
-    embeddings::index::retry_client::S3VectorRetryClientBuilder,
     get_params_with_secrets,
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
     secrets::Secrets,
 };
-
+use retry_client::S3VectorRetryClientBuilder;
+mod retry_client;
 mod write;
-pub use write::write;
-mod index;
 pub use index::S3Vector;
+mod index;
+pub use write::write;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")

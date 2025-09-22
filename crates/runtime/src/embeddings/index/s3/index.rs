@@ -88,8 +88,8 @@ impl S3Vector {
         }
     }
 
-    /// Add extra metadata columns to the S3Vector table schema.
-    pub fn add_metadata(mut self, cols: Vec<MetadataColumn>) -> Self {
+    /// Add extra metadata columns to the `S3Vector` table schema.
+    #[must_use] pub fn add_metadata(mut self, cols: Vec<MetadataColumn>) -> Self {
         // Add to schema too.
         let mut fields: Vec<_> = self.table.schema.fields().into_iter().cloned().collect();
         fields.extend(

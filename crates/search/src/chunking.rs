@@ -51,7 +51,7 @@ impl Index for ChunkedSearchIndex {
     fn required_columns(&self) -> Vec<String> {
         let mut cols = self.inner.required_columns();
         cols.retain(|s| {
-            s != "_spice.chunk_id" && *s != Self::chunking_offset_col(self.search_column())
+            s != "_spice.chunk_id" && *s != Self::chunking_offset_col(self.search_column().as_str())
         });
         cols
     }
@@ -117,23 +117,27 @@ impl std::fmt::Debug for ChunkedSearchIndex {
 }
 
 impl ChunkedSearchIndex {
-    pub fn chunking_offset_col(search_column: String) -> String {
+    #[must_use]
+    pub fn chunking_offset_col(search_column: &str) -> String {
         format!("{search_column}_offset")
     }
 
-    pub fn embedding_col(search_column: String) -> String {
+    #[must_use]
+    pub fn embedding_col(search_column: &str) -> String {
         format!("{search_column}_embedding")
     }
 
+    #[must_use]
     pub fn augment_primary_key(pk: Vec<Field>) -> Vec<Field> {
-        vec![
+        [
             pk,
             vec![Field::new("_spice.chunk_id", DataType::UInt64, false)],
         ]
         .concat()
     }
 
-    pub fn additional_metadata(search_column: String) -> Vec<MetadataColumn> {
+    #[must_use]
+    pub fn additional_metadata(search_column: &str) -> Vec<MetadataColumn> {
         vec![MetadataColumn::NonFilterable(
             Field::new(
                 Self::chunking_offset_col(search_column),
@@ -148,7 +152,7 @@ impl ChunkedSearchIndex {
         Self { inner, chunker }
     }
 
-    /// If [`Self::inner`] search index is also a   is a [`VectorIndex`]
+    /// If [`Self::inner`] search index is also a is a [`VectorIndex`]
     pub fn list_table_provider(
         &self,
         vector_index: Arc<dyn VectorIndex>,
@@ -167,7 +171,7 @@ impl ChunkedSearchIndex {
         //// Need to `order by _spice.chunk_id`.
         aggr_expr.push(
             array_agg(Expr::Column(Column::new_unqualified(
-                Self::chunking_offset_col(self.search_column()),
+                Self::chunking_offset_col(self.search_column().as_str()),
             )))
             .order_by(vec![SortExpr::new(
                 Expr::Column(Column::new_unqualified("_spice.chunk_id")),
@@ -178,7 +182,7 @@ impl ChunkedSearchIndex {
         );
         aggr_expr.push(
             array_agg(Expr::Column(Column::new_unqualified(Self::embedding_col(
-                self.search_column(),
+                self.search_column().as_str(),
             ))))
             .order_by(vec![SortExpr::new(
                 Expr::Column(Column::new_unqualified("_spice.chunk_id")),
@@ -194,13 +198,13 @@ impl ChunkedSearchIndex {
                 .iter()
                 .filter_map(|c| {
                     if [
-                        Self::chunking_offset_col(self.search_column()),
-                        Self::embedding_col(self.search_column()),
+                        Self::chunking_offset_col(self.search_column().as_str()),
+                        Self::embedding_col(self.search_column().as_str()),
                     ]
                     .contains(c)
                     {
                         return None;
-                    };
+                    }
                     Some(first_value(
                         Expr::Column(Column::new_unqualified(c)),
                         vec![],
@@ -308,8 +312,7 @@ impl SearchIndex for ChunkedSearchIndex {
 
         let chunk_index: Vec<_> = chunks
             .iter()
-            .map(|v| (0..(v.len() as u64)).collect::<Vec<_>>())
-            .flatten()
+            .flat_map(|v| (0..(v.len() as u64)).collect::<Vec<_>>())
             .collect();
         let flatten_chunks: Vec<_> = chunks.into_iter().flatten().collect();
 
@@ -338,7 +341,7 @@ impl SearchIndex for ChunkedSearchIndex {
         arrays.push(Arc::new(UInt64Array::from(chunk_index)) as ArrayRef);
 
         fields.push(Field::new(
-            Self::chunking_offset_col(self.search_column()),
+            Self::chunking_offset_col(self.search_column().as_str()),
             DataType::new_fixed_size_list(DataType::UInt64, 2, false),
             false,
         ));

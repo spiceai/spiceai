@@ -297,7 +297,7 @@ impl VectorSearchTableFunc {
             find_index_in_table_provider::<S3Vector>(tbl),
             find_index_in_table_provider::<ChunkedSearchIndex>(tbl),
         ) {
-            (None, Some((chunked_index, _))) | (Some((_, _)), Some((chunked_index, _))) => {
+            (None | Some((_, _)), Some((chunked_index, _))) => {
                 chunked_index
                     .into_iter()
                     .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)

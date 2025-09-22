@@ -45,6 +45,11 @@ macro_rules! convert_string_arrow_to_iterator {
 
 /// Repeat each element in `arr` according to `repeats`.
 /// `repeats.len()` must equal `arr.len()`.
+///
+/// # Errors
+///
+/// This function will return an [`ArrowError`] if `arr` and `repeats` are unequal.
+#[allow(clippy::checked_conversions, clippy::cast_possible_truncation)]
 pub fn repeat(arr: &ArrayRef, repeats: &[usize]) -> Result<ArrayRef, ArrowError> {
     let len = arr.len();
     if repeats.len() != len {
@@ -79,16 +84,14 @@ pub fn repeat(arr: &ArrayRef, repeats: &[usize]) -> Result<ArrayRef, ArrowError>
     }
 }
 
+#[must_use]
 pub fn to_list_array(chunks: &[Vec<&str>]) -> ListArray {
     let mut builder = ListBuilder::new(StringBuilder::new());
 
     for chunk in chunks {
-        tracing::warn!("chunk");
         if chunk.is_empty() {
-            tracing::warn!("chunkNone");
             builder.append_null();
         } else {
-            tracing::warn!("chunk = {:?}", chunk);
             for item in chunk {
                 builder.values().append_value(item);
             }
@@ -111,8 +114,11 @@ mod tests {
         let repeats: Vec<usize> = vec![2, 3, 1];
         let result = repeat(&arr, &repeats).expect("failed to call 'repeat'");
 
-        let string_result = result.as_any().downcast_ref::<StringArray>().unwrap();
-        let expected = vec!["foo", "foo", "bar", "bar", "bar", "baz"];
+        let string_result = result
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("failed to downcast result to 'StringArray'");
+        let expected = ["foo", "foo", "bar", "bar", "bar", "baz"];
 
         assert_eq!(string_result.len(), 6);
         for (i, expected_val) in expected.iter().enumerate() {
@@ -126,8 +132,11 @@ mod tests {
         let repeats = vec![1, 0, 3, 2];
         let result = repeat(&arr, &repeats).expect("failed to call 'repeat'");
 
-        let int_result = result.as_any().downcast_ref::<Int32Array>().unwrap();
-        let expected = vec![1, 3, 3, 3, 4, 4];
+        let int_result = result
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("failed to downcast result to 'Int32Array'");
+        let expected = [1, 3, 3, 3, 4, 4];
 
         assert_eq!(int_result.len(), 6);
         for (i, expected_val) in expected.iter().enumerate() {

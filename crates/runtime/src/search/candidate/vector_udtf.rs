@@ -113,7 +113,7 @@ impl VectorUDTFGeneration {
             .iter()
             .cloned()
             .chain(addition_projection.iter().filter_map(|&e| match e {
-                Expr::Identifier(Ident { value, .. }) => Some(format!("{value}")),
+                Expr::Identifier(Ident { value, .. }) => Some(value.to_string()),
                 _ => None,
             }))
             .chain([

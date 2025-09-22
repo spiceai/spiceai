@@ -133,7 +133,9 @@ impl SearchQueryProvider {
                 &[
                     SEARCH_SCORE_COLUMN_NAME.to_string(),
                     SEARCH_MATCH_COLUMN_NAME.to_string(),
-                    ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
+                    ChunkedSearchIndex::chunking_offset_col(
+                        self.search_index.search_column().as_str(),
+                    ),
                 ],
             ]
             .concat(),
@@ -246,13 +248,13 @@ impl SearchQueryProvider {
             // Remove 'match'. Not in base table, calculated from offsets and search column.
             if let Some((idx, _)) = self.schema().column_with_name(SEARCH_MATCH_COLUMN_NAME) {
                 let _ = p.remove(&idx);
-            };
+            }
 
             if let Some((idx, _)) = self.schema().column_with_name(
                 format!("{}_embedding", self.search_index.search_column()).as_str(),
             ) {
                 let _ = p.remove(&idx);
-            };
+            }
 
             p.into_iter().collect()
         });
@@ -344,7 +346,7 @@ impl SearchQueryProvider {
             .map(|(i, _)| i)
     }
 
-    pub async fn add_match_column(
+    pub fn add_match_column(
         &self,
         projection: Option<&Vec<usize>>,
         input: LogicalPlan,
@@ -355,7 +357,7 @@ impl SearchQueryProvider {
                 .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)))
         {
             return Ok(input);
-        };
+        }
         let mut initial: Vec<_> = input
             .schema()
             .columns()
@@ -365,13 +367,13 @@ impl SearchQueryProvider {
 
         let first = array_element(
             Expr::Column(Column::new_unqualified(
-                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
+                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
             )),
             Expr::Literal(ScalarValue::Int64(Some(1)), None),
         );
         let second = array_element(
             Expr::Column(Column::new_unqualified(
-                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
+                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
             )),
             Expr::Literal(ScalarValue::Int64(Some(2)), None),
         );
@@ -429,7 +431,9 @@ impl TableProvider for SearchQueryProvider {
         if is_chunked(&self.search_index) {
             fields.extend([
                 Arc::new(Field::new(
-                    ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
+                    ChunkedSearchIndex::chunking_offset_col(
+                        self.search_index.search_column().as_str(),
+                    ),
                     DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
                     false,
                 )),
@@ -508,24 +512,23 @@ impl TableProvider for SearchQueryProvider {
         }
         let search_index_table = self.search_index_table(filters).await?;
 
-        let inner_proj: Option<Vec<_>> = projection.cloned().and_then(|proj| {
+        let inner_proj: Option<Vec<_>> = projection.cloned().map(|proj| {
             let Some(match_idx) = self.match_column_index() else {
-                return Some(proj);
+                return proj;
             };
             if !proj.contains(&match_idx) {
-                return Some(proj);
+                return proj;
             }
             let mut proj2 = proj.clone();
             if let Some(search_idx) = self
                 .schema()
                 .column_with_name(self.search_index.search_column().as_str())
                 .map(|(i, _)| i)
+                && !proj2.contains(&search_idx)
             {
-                if !proj2.contains(&search_idx) {
-                    proj2.push(search_idx);
-                };
-            };
-            Some(proj2)
+                proj2.push(search_idx);
+            }
+            proj2
         });
 
         // Check if search index alone is sufficient
@@ -555,9 +558,7 @@ impl TableProvider for SearchQueryProvider {
             fetch: limit,
         });
 
-        let with_columns = self
-            .add_match_column(inner_proj.as_ref(), sort.into())
-            .await?;
+        let with_columns = self.add_match_column(inner_proj.as_ref(), sort)?;
 
         // Final projection to match requested schema
         let schema_proj: SchemaRef = match projection {

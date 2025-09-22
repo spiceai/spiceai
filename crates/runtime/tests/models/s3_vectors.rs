@@ -127,8 +127,7 @@ mod search {
                 .with_dataset(ds)
                 .build(),
 
-            vec![
-                basic_vector_search_tests("composite"),
+            [basic_vector_search_tests("composite"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_composite_key",
@@ -141,8 +140,7 @@ mod search {
                     SearchTestType::Sql(
                         "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id > 10 order by score desc LIMIT 4",
                     ),
-                )]
-            ].concat(),
+                )]].concat(),
             true
         )
         .await
@@ -183,8 +181,7 @@ mod search {
                 ))
                 .with_dataset(ds)
                 .build(),
-            vec![
-                basic_vector_search_tests("chunking"),
+            [basic_vector_search_tests("chunking"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match",
@@ -203,8 +200,7 @@ mod search {
                     SearchTestType::Sql(
                         "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
-                )]
-            ].concat(),
+                )]].concat(),
             true
         )
         .await
@@ -252,8 +248,7 @@ mod search {
                 ))
                 .with_dataset(ds)
                 .build(),
-            vec![
-                basic_vector_search_tests("metadata"),
+            [basic_vector_search_tests("metadata"),
             vec![
                 SearchTestCase::new(
                     "s3vector_metadata_additional_columns_metadata",
@@ -287,8 +282,7 @@ mod search {
                         "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
                     ),
                 ),
-            ]
-            ].concat(),
+            ]].concat(),
             true
         )
         .await
