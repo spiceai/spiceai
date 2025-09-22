@@ -73,14 +73,13 @@ impl IcebergCatalogProvider {
                     // Unfortunately, there isn't a better way to handle this
                     let err_msg = e.to_string();
 
-                    if let Some(namespace) = root_namespace {
-                        if err_msg.contains("NoSuchNamespaceException")
-                            || err_msg.contains("Namespace does not exist")
-                        {
-                            return Err(Error::NamespaceDoesNotExist {
-                                namespace: namespace.join("."),
-                            });
-                        }
+                    if let Some(namespace) = root_namespace
+                        && (err_msg.contains("NoSuchNamespaceException")
+                            || err_msg.contains("Namespace does not exist"))
+                    {
+                        return Err(Error::NamespaceDoesNotExist {
+                            namespace: namespace.join("."),
+                        });
                     }
 
                     return Err(handle_iceberg_error(e));

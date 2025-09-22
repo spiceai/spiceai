@@ -552,13 +552,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                     }
                 }
             } else {
-                extended_metrics_builders
-                    .iter_mut()
-                    .for_each(|(_, builder)| match builder {
+                for builder in &mut extended_metrics_builders.values_mut() {
+                    match builder {
                         Builder::String(builder) => builder.append_null(),
                         Builder::UInt64(builder) => builder.append_null(),
                         Builder::Float64(builder) => builder.append_null(),
-                    });
+                    }
+                }
             }
         }
 

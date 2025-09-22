@@ -44,7 +44,7 @@ pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
     dataset
 }
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// Test that the `shutdown_timeout` parameter is correctly applied:
 /// 1. The runtime shutdown waits for 5 seconds for a long-running HTTP operation to complete.

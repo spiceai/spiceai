@@ -518,7 +518,7 @@ mod tests {
             .eq(lit(1))
             .or(col("account_id").eq(lit(2)));
         assert_prune_partition!(
-            &[filter.clone()],
+            std::slice::from_ref(&filter),
             &partition_by,
             schema,
             Int32,
@@ -536,7 +536,7 @@ mod tests {
             .or(col("account_id").eq(lit(2)))
             .or(col("account_id").eq(lit(3)));
         assert_prune_partition!(
-            &[filter.clone()],
+            std::slice::from_ref(&filter),
             &partition_by,
             schema,
             Int32,
@@ -560,7 +560,7 @@ mod tests {
             .not_eq(lit(1))
             .and(col("account_id").not_eq(lit(2)));
         assert_prune_partition!(
-            &[filter.clone()],
+            std::slice::from_ref(&filter),
             &partition_by,
             schema,
             Int32,
@@ -578,7 +578,7 @@ mod tests {
             .and(col("account_id").not_eq(lit(2)))
             .and(col("account_id").not_eq(lit(3)));
         assert_prune_partition!(
-            &[filter.clone()],
+            std::slice::from_ref(&filter),
             &partition_by,
             schema,
             Int32,
@@ -726,7 +726,12 @@ mod tests {
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i <= 3)) {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
-                prune_partition(&[filter.clone()], &partition_by, &partition_value, &schema)?,
+                prune_partition(
+                    std::slice::from_ref(&filter),
+                    &partition_by,
+                    &partition_value,
+                    &schema
+                )?,
                 should_prune,
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );

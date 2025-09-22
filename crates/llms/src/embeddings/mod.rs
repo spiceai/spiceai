@@ -12,7 +12,6 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
     EmbeddingVector, EncodingFormat,
@@ -21,6 +20,7 @@ use async_trait::async_trait;
 use cache::CacheProvider;
 use cache::key::CacheKey;
 use cache::result::embeddings::CachedEmbeddingResult;
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::{fmt::Debug, sync::Arc};
@@ -149,13 +149,12 @@ pub trait Embed: Debug + Sync + Send {
     }
 
     async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
-        if let Some(embeddings_cache) = self.cache() {
-            if let Some(cached) = embeddings_cache
+        if let Some(embeddings_cache) = self.cache()
+            && let Some(cached) = embeddings_cache
                 .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
                 .await
-            {
-                return Some(cached);
-            }
+        {
+            return Some(cached);
         }
 
         None

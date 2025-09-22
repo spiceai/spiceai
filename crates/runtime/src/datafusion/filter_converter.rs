@@ -154,10 +154,10 @@ fn data_type_to_time_format(
         | DataType::Float32
         | DataType::Float64 => {
             let mut scale = 1_000_000_000;
-            if let Some(time_format) = time_format {
-                if time_format == TimeFormat::UnixMillis {
-                    scale = 1_000_000;
-                }
+            if let Some(time_format) = time_format
+                && time_format == TimeFormat::UnixMillis
+            {
+                scale = 1_000_000;
             }
             Some(ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale }))
         }

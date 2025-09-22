@@ -20,6 +20,7 @@ aws-sdk-bedrockruntime.workspace = true
 aws-smithy-types.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
+chunking = {path="../chunking"}
 futures = { workspace = true }
 governor.workspace = true
 hf-hub.workspace = true
@@ -39,15 +40,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util" }
-## For Chunking
-text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "58f9c21006e01e5e968c5de80a0398b3f5ec439a", features = [
-    "markdown",
-    "tokenizers",
-    "tiktoken-rs",
-] }
-
-pulldown-cmark = "0.13.0"
-tiktoken-rs = "0.6.0"
 
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", optional = true }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", package = "mistralrs-core", optional = true }

@@ -22,22 +22,22 @@ pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<Ta
     let mut table_names = Vec::new();
     let mut cte_names = HashSet::new();
 
-    if let parser::Statement::Statement(statement) = statement.clone() {
-        if let ast::Statement::Query(statement) = *statement {
-            // Collect names of CTEs
-            if let Some(with) = statement.with {
-                for table in with.cte_tables {
-                    cte_names.insert(TableReference::bare(table.alias.name.to_string()));
-                    let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
-                        Box::new(ast::Statement::Query(table.query)),
-                    ));
-                    // Extend table_names with names found in CTEs if they reference actual tables
-                    table_names.extend(cte_table_names);
-                }
+    if let parser::Statement::Statement(statement) = statement.clone()
+        && let ast::Statement::Query(statement) = *statement
+    {
+        // Collect names of CTEs
+        if let Some(with) = statement.with {
+            for table in with.cte_tables {
+                cte_names.insert(TableReference::bare(table.alias.name.to_string()));
+                let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
+                    Box::new(ast::Statement::Query(table.query)),
+                ));
+                // Extend table_names with names found in CTEs if they reference actual tables
+                table_names.extend(cte_table_names);
             }
-            // Extract table names from the main query
-            table_names.extend(extract_tables_from_set_expr(&statement.body, &cte_names));
         }
+        // Extract table names from the main query
+        table_names.extend(extract_tables_from_set_expr(&statement.body, &cte_names));
     }
 
     // Filter out CTEs and temporary views (aliases of subqueries)

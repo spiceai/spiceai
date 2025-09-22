@@ -389,9 +389,9 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
         None
     } else {
         let mut builder = SchemaBuilder::new();
-        parameters
-            .into_iter()
-            .for_each(|(name, typ)| builder.push(Field::new(name, typ, false)));
+        for (name, typ) in parameters {
+            builder.push(Field::new(name, typ, false));
+        }
         Some(builder.finish())
     };
 

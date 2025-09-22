@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::cmp::min;
+use std::slice;
 use std::{any::Any, collections::HashSet, sync::Arc};
 
 use crate::metadata::{MetadataColumn, MetadataColumns};
@@ -400,7 +401,7 @@ impl SearchIndex for FullTextDatabaseIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        self.update_index(&[record.clone()]).await.boxed()?;
+        self.update_index(slice::from_ref(&record)).await.boxed()?;
         Ok(record)
     }
 
