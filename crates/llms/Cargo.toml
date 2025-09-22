@@ -64,7 +64,7 @@ token_provider = { path = "../token_provider" }
 model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "dd0beab3810aebacb716d4ab6d38455e74499d13", optional = true }
 
 [dev-dependencies]
-anyhow = "1.0.99"
+anyhow = "1.0.100"
 aws-credential-types.workspace = true
 dotenvy.workspace = true
 insta.workspace = true
