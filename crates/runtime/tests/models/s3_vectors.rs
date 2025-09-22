@@ -160,9 +160,9 @@ mod search {
                     row_ids: Some(vec!["id".to_string()]),
                     chunking: Some(EmbeddingChunkConfig {
                         enabled: true,
-                        target_chunk_size: 32,
+                        target_chunk_size: 64,
                         overlap_size: 0,
-                        trim_whitespace: false,
+                        trim_whitespace: true,
                     }),
                     vector_size: None,
                 }],
@@ -192,12 +192,12 @@ mod search {
                         "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
-                // SearchTestCase::new(
-                //     "s3vector_chunking_vector_search_sql_offset",
-                //     SearchTestType::Sql(
-                //         "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                //     ),
-                // ),
+                SearchTestCase::new(
+                    "s3vector_chunking_vector_search_sql_offset",
+                    SearchTestType::Sql(
+                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match_and_underlying",
                     SearchTestType::Sql(

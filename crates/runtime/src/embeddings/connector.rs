@@ -246,8 +246,9 @@ impl EmbeddingConnector {
                             }
                         })?;
 
-                        vector_index =
-                            vector_index.add_metadata(ChunkedSearchIndex::add_metadata());
+                        let additional_meta =
+                            ChunkedSearchIndex::additional_metadata(vector_index.search_column());
+                        vector_index = vector_index.add_metadata(additional_meta);
                         vector_index.primary_key =
                             ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
 

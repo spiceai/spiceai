@@ -50,7 +50,9 @@ impl Index for ChunkedSearchIndex {
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String> {
         let mut cols = self.inner.required_columns();
-        cols.retain(|s| s != "_spice.chunk_id" && s != "_spice.chunk_offset");
+        cols.retain(|s| {
+            s != "_spice.chunk_id" && *s != Self::chunking_offset_col(self.search_column())
+        });
         cols
     }
 
@@ -115,6 +117,9 @@ impl std::fmt::Debug for ChunkedSearchIndex {
 }
 
 impl ChunkedSearchIndex {
+    pub fn chunking_offset_col(search_column: String) -> String {
+        format!("{search_column}_offset")
+    }
     pub fn augment_primary_key(pk: Vec<Field>) -> Vec<Field> {
         vec![
             pk,
@@ -123,10 +128,10 @@ impl ChunkedSearchIndex {
         .concat()
     }
 
-    pub fn add_metadata() -> Vec<MetadataColumn> {
+    pub fn additional_metadata(search_column: String) -> Vec<MetadataColumn> {
         vec![MetadataColumn::NonFilterable(
             Field::new(
-                "_spice.chunk_offset",
+                Self::chunking_offset_col(search_column),
                 DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
                 false,
             )
@@ -145,9 +150,6 @@ impl ChunkedSearchIndex {
     ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
         let base_index_table = vector_index.list_table_provider()?;
 
-        // I need to group by `_spice.chunk_id` and make an array of  `_spice.chunk_offset`. and `col_embedding`.
-        // select location, array_agg(content_offset order by idx), concat(array_agg(match order by idx)) content from flattened group by location limit 2;
-
         let group_by_pks: Vec<_> = self
             .inner
             .primary_fields()
@@ -159,13 +161,15 @@ impl ChunkedSearchIndex {
         let mut aggr_expr = group_by_pks.clone();
         //// Need to `order by _spice.chunk_id`.
         aggr_expr.push(
-            array_agg(Expr::Column(Column::new_unqualified("_spice.chunk_offset")))
-                .order_by(vec![SortExpr::new(
-                    Expr::Column(Column::new_unqualified("_spice.chunk_id")),
-                    true,
-                    false,
-                )])
-                .build()?,
+            array_agg(Expr::Column(Column::new_unqualified(
+                Self::chunking_offset_col(self.search_column()),
+            )))
+            .order_by(vec![SortExpr::new(
+                Expr::Column(Column::new_unqualified("_spice.chunk_id")),
+                true,
+                false,
+            )])
+            .build()?,
         );
         aggr_expr.push(
             array_agg(Expr::Column(Column::new_unqualified(format!(
@@ -186,7 +190,7 @@ impl ChunkedSearchIndex {
                 .iter()
                 .filter_map(|c| {
                     if [
-                        "_spice.chunk_offset".to_string(),
+                        Self::chunking_offset_col(self.search_column()),
                         format!("{}_embedding", self.search_column()),
                     ]
                     .contains(c)
@@ -212,7 +216,6 @@ impl ChunkedSearchIndex {
 #[async_trait]
 impl SearchIndex for ChunkedSearchIndex {
     fn search_column(&self) -> String {
-        // TODO: this might need a separate name?
         self.inner.search_column()
     }
 
@@ -331,7 +334,7 @@ impl SearchIndex for ChunkedSearchIndex {
         arrays.push(Arc::new(UInt64Array::from(chunk_index)) as ArrayRef);
 
         fields.push(Field::new(
-            "_spice.chunk_offset",
+            Self::chunking_offset_col(self.search_column()),
             DataType::new_fixed_size_list(DataType::UInt64, 2, false),
             false,
         ));

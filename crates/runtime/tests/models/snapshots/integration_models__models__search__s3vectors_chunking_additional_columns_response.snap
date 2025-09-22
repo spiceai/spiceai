@@ -8,45 +8,6 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "question": "Using the method of multiplying by 10 and then halving the answer, what is \\( 6 \\times 5 \\)?"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "\n2"
-      },
-      "primary_key": {
-        "id": 806
-      },
-      "score": 0.79
-    },
-    {
-      "data": {
-        "question": "Using the divide-and-average method for square roots, calculate \\((71 + 60) \\div 2\\)."
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "\n2"
-      },
-      "primary_key": {
-        "id": 804
-      },
-      "score": 0.79
-    },
-    {
-      "data": {
-        "question": "Subtract 820 from 892, then subtract 9 from the result. What is the final answer?"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "\n2"
-      },
-      "primary_key": {
-        "id": 776
-      },
-      "score": 0.79
-    },
-    {
-      "data": {
         "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
       },
       "dataset": "qs",
@@ -57,6 +18,45 @@ snapshot_kind: text
         "id": 612
       },
       "score": 0.79
+    },
+    {
+      "data": {
+        "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\)."
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": " is 2."
+      },
+      "primary_key": {
+        "id": 349
+      },
+      "score": 0.78
+    },
+    {
+      "data": {
+        "question": "What is the fifth root of 32?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 948
+      },
+      "score": 0.55
+    },
+    {
+      "data": {
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 1277
+      },
+      "score": 0.55
     }
   ]
 }

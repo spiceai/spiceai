@@ -9,12 +9,42 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": " decrease systemic vascular r"
+        "answer": "The presence of fibrinolysin in the reagents can partially o"
+      },
+      "primary_key": {
+        "id": 938
+      },
+      "score": 0.34
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " properties, possibly due to their high tannin content"
+      },
+      "primary_key": {
+        "id": 1015
+      },
+      "score": 0.3
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " Late recurrences can occur beyond 10 years, so patients requir"
+      },
+      "primary_key": {
+        "id": 551
+      },
+      "score": 0.29
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "stemic vascular resistance (SVR) by causing vasodilation."
       },
       "primary_key": {
         "id": 1035
       },
-      "score": 0.35
+      "score": 0.29
     }
   ]
 }

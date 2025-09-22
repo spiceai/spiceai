@@ -12,39 +12,39 @@ snapshot_kind: text
         "answer": "\n2"
       },
       "primary_key": {
-        "id": 806
-      },
-      "score": 0.79
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "answer": "\n2"
-      },
-      "primary_key": {
-        "id": 778
-      },
-      "score": 0.79
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "answer": "\n2"
-      },
-      "primary_key": {
-        "id": 776
-      },
-      "score": 0.79
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "answer": "\n2"
-      },
-      "primary_key": {
         "id": 612
       },
       "score": 0.79
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " is 2."
+      },
+      "primary_key": {
+        "id": 349
+      },
+      "score": 0.78
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 948
+      },
+      "score": 0.55
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 1277
+      },
+      "score": 0.55
     }
   ]
 }

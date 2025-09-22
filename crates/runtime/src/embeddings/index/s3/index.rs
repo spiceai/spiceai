@@ -156,8 +156,6 @@ impl SearchIndex for S3Vector {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        // let s = pretty_format_batches(&[rb.clone()]).boxed()?;
-        // tracing::error!("In s3: []\n{s}\n");
         write::write(self, record).await.boxed()
     }
 

@@ -38,7 +38,9 @@ use datafusion::{
 };
 
 use crate::{
-    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, chunking::is_chunked, index::SearchIndex,
+    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
+    chunking::{ChunkedSearchIndex, is_chunked},
+    index::SearchIndex,
 };
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]
@@ -131,7 +133,7 @@ impl SearchQueryProvider {
                 &[
                     SEARCH_SCORE_COLUMN_NAME.to_string(),
                     SEARCH_MATCH_COLUMN_NAME.to_string(),
-                    "_spice.chunk_offset".to_string(),
+                    ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
                 ],
             ]
             .concat(),
@@ -361,11 +363,15 @@ impl SearchQueryProvider {
             .collect();
 
         let first = array_element(
-            Expr::Column(Column::new_unqualified("_spice.chunk_offset")),
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
+            )),
             Expr::Literal(ScalarValue::Int64(Some(1)), None),
         );
         let second = array_element(
-            Expr::Column(Column::new_unqualified("_spice.chunk_offset")),
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
+            )),
             Expr::Literal(ScalarValue::Int64(Some(2)), None),
         );
 
@@ -421,7 +427,7 @@ impl TableProvider for SearchQueryProvider {
 
         if is_chunked(&self.search_index) {
             fields.push(Arc::new(Field::new(
-                "_spice.chunk_offset".to_string(),
+                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
                 DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
                 false,
             )));
