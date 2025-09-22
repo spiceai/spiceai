@@ -162,7 +162,7 @@ pub struct FullTextSearchConfig {
     )]
     pub row_ids: Option<Vec<String>>,
 
-    pub index_store: IndexStore,
+    pub index_store: Option<IndexStore>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_directory: Option<String>,
@@ -170,6 +170,7 @@ pub struct FullTextSearchConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
 pub enum IndexStore {
     #[default]
     Memory,
@@ -191,7 +192,7 @@ impl FullTextSearchConfig {
         FullTextSearchConfig {
             enabled: false,
             row_ids: None,
-            index_store: IndexStore::default(),
+            index_store: Some(IndexStore::default()),
             index_directory: None,
         }
     }
@@ -201,7 +202,7 @@ impl FullTextSearchConfig {
         FullTextSearchConfig {
             enabled: true,
             row_ids: None,
-            index_store: IndexStore::default(),
+            index_store: Some(IndexStore::default()),
             index_directory: None,
         }
     }

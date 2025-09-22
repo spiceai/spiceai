@@ -117,7 +117,7 @@ impl FullTextDatabaseIndex {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
 
-        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks).await;
+        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks);
         Ok(Self {
             base_table: inner,
             search_fields,
@@ -158,7 +158,7 @@ impl FullTextDatabaseIndex {
     /// Get all [`Field`]s in Tantivy [`tantivy::Index`] that are in base table, and not primary keys.
     /// These are non-filterable [`MetadataColumn`]s, since we can retrieve the data
     /// from the [`tantivy::Index`] without access to the base [`TableProvider`].
-    async fn derive_metadata_columns(
+    fn derive_metadata_columns(
         base_table: &Arc<dyn TableProvider>,
         index: &tantivy::Index,
         primary_key: &[String],

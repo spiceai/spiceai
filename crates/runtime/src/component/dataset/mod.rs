@@ -667,10 +667,10 @@ impl Dataset {
                     return None;
                 };
 
-                if *index_store == IndexStore::Memory && index_directory.is_some() {
+                if index_store.is_some_and(|is| is == IndexStore::Memory) && index_directory.is_some() {
                     tracing::warn!("Dataset '{}' has in-memory full text search configured for column '{}', but has 'index_directory' set", self.name, c.name)
                 }
-                Some(((c.name.clone(), row_ids.clone()), (*index_store, index_directory.clone())))
+                Some(((c.name.clone(), row_ids.clone()), (index_store.unwrap_or_default(), index_directory.clone())))
             })
             .unzip();
         let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
