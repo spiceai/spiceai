@@ -20,10 +20,8 @@ use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
 };
 use async_trait::async_trait;
-use llms::{
-    chunking::{Chunker, ChunkingConfig},
-    embeddings::{Embed, Result as EmbedResult, get_or_infer_size},
-};
+use chunking::{Chunker, ChunkingConfig};
+use llms::embeddings::{Embed, Result as EmbedResult, get_or_infer_size};
 use tracing::{Instrument, Span};
 
 use crate::request::{AsyncMarker, RequestContext};

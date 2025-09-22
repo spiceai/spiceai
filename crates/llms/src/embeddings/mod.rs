@@ -12,7 +12,6 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
     EmbeddingVector, EncodingFormat,
@@ -21,6 +20,7 @@ use async_trait::async_trait;
 use cache::CacheProvider;
 use cache::key::CacheKey;
 use cache::result::embeddings::CachedEmbeddingResult;
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::{fmt::Debug, sync::Arc};
