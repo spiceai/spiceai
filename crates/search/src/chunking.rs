@@ -120,6 +120,11 @@ impl ChunkedSearchIndex {
     pub fn chunking_offset_col(search_column: String) -> String {
         format!("{search_column}_offset")
     }
+
+    pub fn embedding_col(search_column: String) -> String {
+        format!("{search_column}_embedding")
+    }
+
     pub fn augment_primary_key(pk: Vec<Field>) -> Vec<Field> {
         vec![
             pk,
@@ -172,9 +177,8 @@ impl ChunkedSearchIndex {
             .build()?,
         );
         aggr_expr.push(
-            array_agg(Expr::Column(Column::new_unqualified(format!(
-                "{}_embedding",
-                self.search_column()
+            array_agg(Expr::Column(Column::new_unqualified(Self::embedding_col(
+                self.search_column(),
             ))))
             .order_by(vec![SortExpr::new(
                 Expr::Column(Column::new_unqualified("_spice.chunk_id")),
@@ -191,7 +195,7 @@ impl ChunkedSearchIndex {
                 .filter_map(|c| {
                     if [
                         Self::chunking_offset_col(self.search_column()),
-                        format!("{}_embedding", self.search_column()),
+                        Self::embedding_col(self.search_column()),
                     ]
                     .contains(c)
                     {

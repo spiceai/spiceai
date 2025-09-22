@@ -426,16 +426,18 @@ impl TableProvider for SearchQueryProvider {
         )));
 
         if is_chunked(&self.search_index) {
-            fields.push(Arc::new(Field::new(
-                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
-                DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
-                false,
-            )));
-            fields.push(Arc::new(Field::new(
-                SEARCH_MATCH_COLUMN_NAME.to_string(),
-                arrow_schema::DataType::Utf8,
-                false,
-            )));
+            fields.extend([
+                Arc::new(Field::new(
+                    ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column()),
+                    DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
+                    false,
+                )),
+                Arc::new(Field::new(
+                    SEARCH_MATCH_COLUMN_NAME.to_string(),
+                    arrow_schema::DataType::Utf8,
+                    false,
+                )),
+            ]);
         }
 
         Arc::new(Schema::new(fields))
