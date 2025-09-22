@@ -55,6 +55,10 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
+        None
+    }
 }
 
 pub trait VectorIndex: SearchIndex {

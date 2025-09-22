@@ -160,6 +160,10 @@ impl SearchIndex for S3Vector {
         write::write(self, record).await.boxed()
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
+        Some(Arc::clone(&self) as Arc<dyn VectorIndex>)
+    }
+
     async fn query_table_provider(
         &self,
         query: &str,

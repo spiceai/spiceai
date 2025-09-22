@@ -726,11 +726,11 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
                 "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
             ),
         ),
-        // SearchTestCase::new(
-        //     format!("s3vectors_{prefix}_vector_search_sql_vectors"),
-        //     SearchTestType::Sql(
-        //         "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
-        //     ),
-        // ),
+        SearchTestCase::new(
+            format!("s3vectors_{prefix}_vector_search_sql_vectors"),
+            SearchTestType::Sql(
+                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
+            ),
+        ),
     ]
 }

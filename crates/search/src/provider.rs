@@ -443,6 +443,18 @@ impl TableProvider for SearchQueryProvider {
                     false,
                 )),
             ]);
+
+            if let Some(vector_index) = Arc::clone(&self.search_index).as_vector_index() {
+                fields.push(Arc::new(Field::new(
+                    ChunkedSearchIndex::embedding_col(self.search_index.search_column().as_str()),
+                    DataType::new_fixed_size_list(
+                        DataType::Float32,
+                        vector_index.dimension(),
+                        false,
+                    ),
+                    true,
+                )))
+            }
         }
 
         Arc::new(Schema::new(fields))
