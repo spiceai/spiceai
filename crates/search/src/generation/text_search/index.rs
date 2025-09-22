@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use std::cmp::min;
-use std::{any::Any, collections::HashSet, path::PathBuf, sync::Arc};
 use std::slice;
+use std::{any::Any, collections::HashSet, path::PathBuf, sync::Arc};
 
 use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
