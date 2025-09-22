@@ -21,6 +21,8 @@ use arrow_schema::FieldRef;
 use datafusion::{logical_expr::LogicalPlan, prelude::Expr};
 
 mod retry_client;
+
+#[cfg(feature = "s3_vectors")]
 pub mod s3;
 pub(crate) mod scan_table;
 pub use scan_table::VectorScanTableProvider;

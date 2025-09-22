@@ -37,8 +37,8 @@ static VSS_TEMP_GEN_ID_COLUMN: &str = "vss_temp_gen_id";
 // Temporary table name to provide surrogate unique id for vector search query when no primary keys are provided.
 static VSS_TEMP_TABLE_NAME: &str = "vss_temp_table";
 
-// TODO: Maybe we should call this like non-index chunked.
-pub struct VectorGeneration {
+/// A [`CandidateGeneration`] for datasets that have a chunked embedding column, but aren't using a vector index.
+pub struct ChunkedNonIndexVectorGeneration {
     df: Arc<DataFusion>,
     tbl: TableReference,
     embed: Arc<dyn Embed>,
@@ -46,7 +46,7 @@ pub struct VectorGeneration {
     embedding_column: String,
 }
 
-impl VectorGeneration {
+impl ChunkedNonIndexVectorGeneration {
     pub fn new(
         df: &Arc<DataFusion>,
         tbl: &TableReference,
@@ -265,7 +265,7 @@ impl VectorGeneration {
 }
 
 #[async_trait::async_trait]
-impl CandidateGeneration for VectorGeneration {
+impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
     async fn search(
         &self,
         query: String,
@@ -285,6 +285,9 @@ impl CandidateGeneration for VectorGeneration {
             opt_filters,
             limit,
         );
+
+        tracing::warn!("jeadie=query={query}");
+
         let data = self
             .df
             .query_builder(&query)

@@ -350,8 +350,9 @@ impl SearchQueryProvider {
         input: LogicalPlan,
     ) -> Result<LogicalPlan, DataFusionError> {
         // If projection doesn't include/need the 'match' column, early exit.
-        if projection
-            .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)))
+        if !is_chunked(&self.search_index)
+            || projection
+                .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)))
         {
             return Ok(input);
         };

@@ -37,7 +37,11 @@ use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
-use search::{chunking::ChunkedSearchIndex, index::VectorIndex};
+use search::{
+    chunking::ChunkedSearchIndex,
+    index::{SearchIndex, VectorIndex},
+};
+use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
@@ -219,13 +223,9 @@ impl EmbeddingConnector {
                         }
                     })?;
 
-                    // This is a hack, we need ChunkedSearchIndex to implement `VectorIndex`. But we haven't done that yet.
                     if let Some(ref chunking) = config.chunking
                         && chunking.enabled
                     {
-                        use search::index::SearchIndex;
-                        use snafu::ResultExt;
-
                         let chunker = construct_chunker(
                             config.model.clone().as_str(),
                             &ChunkingConfig {

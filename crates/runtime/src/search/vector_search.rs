@@ -29,7 +29,7 @@ use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 
 use crate::search::{
     SearchPipelineSnafu,
-    candidate::vector::VectorGeneration,
+    candidate::vector::ChunkedNonIndexVectorGeneration,
     util::{
         embedding_columns_from_table, find_concrete_table_provider, full_text_search_candidates,
         get_primary_keys_with_overrides,
@@ -144,6 +144,17 @@ impl VectorSearch {
                 });
             };
 
+            // Use UDTF for non-chunked `EmbeddingTable`.
+            if !embedding_table.is_chunked(embedding_column) {
+                return Ok(Arc::new(VectorUDTFGeneration::new(
+                    &self.df,
+                    tbl,
+                    primary_keys,
+                    embedding_column,
+                    false,
+                )));
+            }
+
             let Some(model_name) = embedding_table.get_embedding_model_used_by(embedding_column)
             else {
                 return Err(Error::CannotVectorSearchDataset {
@@ -167,7 +178,7 @@ impl VectorSearch {
                     data_source: tbl.clone(),
                 });
             };
-            Ok(Arc::new(VectorGeneration::new(
+            Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
                 &self.df,
                 tbl,
                 &embed,
