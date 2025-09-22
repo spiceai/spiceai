@@ -712,7 +712,7 @@ impl Dataset {
 
         let index_paths: HashSet<String> = indexes
             .iter()
-            .filter_map(|(_, directory)| *directory)
+            .filter_map(|(_, directory)| directory.clone())
             .collect();
         let index_path_len = index_paths.len();
         let index_path: Option<String> = index_paths.into_iter().next();
@@ -726,10 +726,7 @@ impl Dataset {
             )
         };
 
-        let index_store = if indexes
-            .iter()
-            .any(|(store, directory)| *store == IndexStore::File)
-        {
+        let index_store = if indexes.iter().any(|(store, _)| *store == IndexStore::File) {
             IndexStore::File
         } else {
             IndexStore::Memory
