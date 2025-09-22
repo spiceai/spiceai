@@ -202,9 +202,9 @@ impl DataAccelerator for SqliteAccelerator {
         self.has_existing_file(source)
     }
 
-    /// Initializes an SQLite database for the dataset
+    /// Initializes an `SQLite` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
-    /// This step is required for federation, as SQLite connections attach to all other configured SQLite databases.
+    /// This step is required for federation, as `SQLite` connections attach to all other configured `SQLite` databases.
     /// Federation then requires that all attached databases exist before dataset registration.
     async fn init(
         &self,
@@ -257,44 +257,44 @@ impl DataAccelerator for SqliteAccelerator {
             }
         );
 
-        if let Some(source) = source {
-            if source.is_file_accelerated() {
-                // If the user didn't specify a SQLite file and this is a file-mode SQLite,
-                // then use the shared SQLite file `accelerated_sqlite.db`
-                if !cmd.options.contains_key("file") {
-                    let sqlite_file = self.sqlite_file_path(source)?;
-                    cmd.options.insert("file".to_string(), sqlite_file);
-                }
+        if let Some(source) = source
+            && source.is_file_accelerated()
+        {
+            // If the user didn't specify a SQLite file and this is a file-mode SQLite,
+            // then use the shared SQLite file `accelerated_sqlite.db`
+            if !cmd.options.contains_key("file") {
+                let sqlite_file = self.sqlite_file_path(source)?;
+                cmd.options.insert("file".to_string(), sqlite_file);
+            }
 
-                let datasets = source
-                    .runtime()
-                    .get_initialized_datasets(&source.app(), crate::LogErrors(false))
-                    .await;
-                let self_path = self.file_path(source)?;
-                let attach_databases = datasets
-                    .iter()
-                    .filter_map(|other_dataset| {
-                        if other_dataset
-                            .acceleration
-                            .as_ref()
-                            .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
-                        {
-                            if other_dataset.name() == source.name() {
-                                None
-                            } else {
-                                let other_path = self.file_path(other_dataset.as_ref());
-                                other_path.ok().filter(|p| p != &self_path)
-                            }
-                        } else {
+            let datasets = source
+                .runtime()
+                .get_initialized_datasets(&source.app(), crate::LogErrors(false))
+                .await;
+            let self_path = self.file_path(source)?;
+            let attach_databases = datasets
+                .iter()
+                .filter_map(|other_dataset| {
+                    if other_dataset
+                        .acceleration
+                        .as_ref()
+                        .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
+                    {
+                        if other_dataset.name() == source.name() {
                             None
+                        } else {
+                            let other_path = self.file_path(other_dataset.as_ref());
+                            other_path.ok().filter(|p| p != &self_path)
                         }
-                    })
-                    .collect::<Vec<_>>();
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
 
-                if !attach_databases.is_empty() {
-                    cmd.options
-                        .insert("attach_databases".to_string(), attach_databases.join(";"));
-                }
+            if !attach_databases.is_empty() {
+                cmd.options
+                    .insert("attach_databases".to_string(), attach_databases.join(";"));
             }
         }
 

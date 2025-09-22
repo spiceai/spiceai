@@ -185,18 +185,17 @@ pub fn schema_difference(expected: &Schema, actual: &Schema) -> Option<String> {
             .fields()
             .iter()
             .find(|f| f.name() == expected_field.name())
-        {
-            if !DFSchema::datatype_is_semantically_equal(
+            && !DFSchema::datatype_is_semantically_equal(
                 expected_field.data_type(),
                 actual_field.data_type(),
-            ) {
-                differences.push(format!(
-                    "The type of `{column_name}` changed from `{expected_type}` to `{actual_type}`",
-                    column_name = expected_field.name(),
-                    expected_type = expected_field.data_type(),
-                    actual_type = actual_field.data_type()
-                ));
-            }
+            )
+        {
+            differences.push(format!(
+                "The type of `{column_name}` changed from `{expected_type}` to `{actual_type}`",
+                column_name = expected_field.name(),
+                expected_type = expected_field.data_type(),
+                actual_type = actual_field.data_type()
+            ));
         }
     }
 

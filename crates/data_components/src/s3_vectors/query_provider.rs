@@ -313,25 +313,21 @@ async fn query_vector_stream(
         )
         .await
         .map_err(|e| {
-            if let SdkError::ServiceError(service_error) = &e {
-                if let s3_vectors::QueryVectorsError::ValidationException(validation_exception) =
+            if let SdkError::ServiceError(service_error) = &e
+                && let s3_vectors::QueryVectorsError::ValidationException(validation_exception) =
                     service_error.err()
-                {
-                    if validation_exception
-                        .message()
-                        .contains("Invalid query filter")
-                    {
-                        if let (Some(s3_filter), Some(s3_filter_pre)) = (s3_filter, s3_filter_pre) {
-                            return DataFusionError::External(
-                                Error::S3VectorQueryVectorsInvalidFilterError {
-                                    filter_pre: s3_filter_pre,
-                                    filter: s3_filter,
-                                }
-                                .into(),
-                            );
-                        }
+                && validation_exception
+                    .message()
+                    .contains("Invalid query filter")
+                && let (Some(s3_filter), Some(s3_filter_pre)) = (s3_filter, s3_filter_pre)
+            {
+                return DataFusionError::External(
+                    Error::S3VectorQueryVectorsInvalidFilterError {
+                        filter_pre: s3_filter_pre,
+                        filter: s3_filter,
                     }
-                }
+                    .into(),
+                );
             }
 
             DataFusionError::External(
@@ -398,13 +394,13 @@ fn to_flat_value(output: QueryOutputVector) -> serde_json::Value {
         serde_json::Value::String(key),
     );
 
-    if let Some(distance) = distance {
-        if let Some(d) = serde_json::Number::from_f64(f64::from(distance)) {
-            result.insert(
-                S3_VECTOR_DISTANCE_NAME.to_string(),
-                serde_json::Value::Number(d),
-            );
-        }
+    if let Some(distance) = distance
+        && let Some(d) = serde_json::Number::from_f64(f64::from(distance))
+    {
+        result.insert(
+            S3_VECTOR_DISTANCE_NAME.to_string(),
+            serde_json::Value::Number(d),
+        );
     }
 
     serde_json::Value::Object(result)

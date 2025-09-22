@@ -819,10 +819,9 @@ impl Runtime {
             .await
             .as_ref()
             .and_then(|app| app.management.as_ref())
+            && let Err(err) = management::init_management(Arc::clone(&self), cfg).await
         {
-            if let Err(err) = management::init_management(Arc::clone(&self), cfg).await {
-                tracing::error!("Failed to initialize management of the Spice runtime: {err}");
-            }
+            tracing::error!("Failed to initialize management of the Spice runtime: {err}");
         }
 
         let ctx = &self.datafusion().ctx;

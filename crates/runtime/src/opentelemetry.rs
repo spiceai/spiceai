@@ -264,25 +264,25 @@ fn number_data_points_to_record_batch(
     let mut start_time_unix_nano_builder = UInt64Builder::new();
     let mut attributes = Vec::new();
 
-    if let Some(s) = existing_schema {
-        if let Ok(value_field) = s.field_with_name(VALUE_COLUMN_NAME) {
-            match value_field.data_type() {
-                DataType::Float64 => {
-                    values_builder = Some(Box::new(Float64Builder::new()));
-                    values_type = DataType::Float64;
+    if let Some(s) = existing_schema
+        && let Ok(value_field) = s.field_with_name(VALUE_COLUMN_NAME)
+    {
+        match value_field.data_type() {
+            DataType::Float64 => {
+                values_builder = Some(Box::new(Float64Builder::new()));
+                values_type = DataType::Float64;
+            }
+            DataType::Int64 => {
+                values_builder = Some(Box::new(Int64Builder::new()));
+                values_type = DataType::Int64;
+            }
+            _ => {
+                return UnsupportedExistingMetricValueColumnTypeSnafu {
+                    metric,
+                    data_type: value_field.data_type().clone(),
+                    data_point_type: "NumberDataPoint",
                 }
-                DataType::Int64 => {
-                    values_builder = Some(Box::new(Int64Builder::new()));
-                    values_type = DataType::Int64;
-                }
-                _ => {
-                    return UnsupportedExistingMetricValueColumnTypeSnafu {
-                        metric,
-                        data_type: value_field.data_type().clone(),
-                        data_point_type: "NumberDataPoint",
-                    }
-                    .fail();
-                }
+                .fail();
             }
         }
     }

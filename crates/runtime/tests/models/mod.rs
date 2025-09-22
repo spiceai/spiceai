@@ -143,7 +143,7 @@ fn create_api_bindings_config() -> Config {
     let otel_port: u16 = http_port + 2;
     let metrics_port: u16 = http_port + 3;
 
-    let localhost: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let localhost: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(localhost, http_port))
@@ -283,14 +283,14 @@ fn normalize_embeddings_response(mut json: Value) -> String {
 /// Normalizes chat completion response for consistent snapshot testing by replacing dynamic values
 fn normalize_chat_completion_response(mut json: Value, normalize_message_content: bool) -> String {
     // Replace `content`
-    if normalize_message_content {
-        if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-            for choice in choices {
-                if let Some(message) = choice.get_mut("message") {
-                    if let Some(content) = message.get_mut("content") {
-                        *content = json!("content_val");
-                    }
-                }
+    if normalize_message_content
+        && let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut())
+    {
+        for choice in choices {
+            if let Some(message) = choice.get_mut("message")
+                && let Some(content) = message.get_mut("content")
+            {
+                *content = json!("content_val");
             }
         }
     }

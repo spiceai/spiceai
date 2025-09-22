@@ -202,16 +202,15 @@ impl Runtime {
 
     async fn remove_view(self: Arc<Self>, name: &TableReference) {
         if self.df.table_exists(name.clone()) {
-            if self.df.is_accelerated(name).await {
-                if let Err(e) = Arc::clone(&self)
+            if self.df.is_accelerated(name).await
+                && let Err(e) = Arc::clone(&self)
                     .remove_dataset_or_view_schedule(name)
                     .await
-                {
-                    tracing::warn!(
-                        "Failed to remove refresh schedule for accelerated view {}: {e}",
-                        &name
-                    );
-                }
+            {
+                tracing::warn!(
+                    "Failed to remove refresh schedule for accelerated view {}: {e}",
+                    &name
+                );
             }
 
             if let Err(e) = self.df.remove_view(name).await {

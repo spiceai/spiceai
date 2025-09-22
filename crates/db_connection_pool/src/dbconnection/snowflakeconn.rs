@@ -227,21 +227,19 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
                 {
                     if let (Some(precision_str), Some(scale_str)) =
                         (field_metadata.get("precision"), field_metadata.get("scale"))
-                    {
-                        if let (Ok(precision), Ok(scale)) =
+                        && let (Ok(precision), Ok(scale)) =
                             (precision_str.parse::<u8>(), scale_str.parse::<i8>())
-                        {
-                            fields.push(Arc::new(Field::new(
-                                field.name(),
-                                DataType::Decimal128(precision, scale),
-                                field.is_nullable(),
-                            )));
+                    {
+                        fields.push(Arc::new(Field::new(
+                            field.name(),
+                            DataType::Decimal128(precision, scale),
+                            field.is_nullable(),
+                        )));
 
-                            columns.push(cast_sf_fixed_point_number_to_decimal(
-                                column, precision, scale,
-                            )?);
-                            continue;
-                        }
+                        columns.push(cast_sf_fixed_point_number_to_decimal(
+                            column, precision, scale,
+                        )?);
+                        continue;
                     }
                 }
                 _ => {}

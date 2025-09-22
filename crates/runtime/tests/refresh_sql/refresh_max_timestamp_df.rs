@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 /// This test verifies:
 ///   *  `DataAccelerator::create_external_table` returns `PolyTableProvider`
-///   *  `max_timestamp_df` returns DataFrame which can be properly federated
+///   *  `max_timestamp_df` returns `DataFrame` which can be properly federated
 #[tokio::test]
 async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
     let _tracing = init_tracing(None);

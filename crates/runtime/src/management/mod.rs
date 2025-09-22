@@ -141,11 +141,11 @@ impl Management {
     async fn start_task_history_export(&self) -> Result<(), Error> {
         let app_ref = self.runtime.app();
         let app_lock = app_ref.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            if !app.runtime.task_history.enabled {
-                tracing::debug!("Task history is disabled via configuration.");
-                return Ok(());
-            }
+        if let Some(app) = app_lock.as_ref()
+            && !app.runtime.task_history.enabled
+        {
+            tracing::debug!("Task history is disabled via configuration.");
+            return Ok(());
         }
         drop(app_lock);
 
@@ -380,11 +380,11 @@ async fn get_task_history_records(
 }
 
 fn is_table_not_ready_error(e: &DataFusionError) -> bool {
-    if let DataFusionError::External(e) = e {
-        if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
-            match e {
-                SpiceExternalError::AccelerationNotReady { .. } => return true,
-            }
+    if let DataFusionError::External(e) = e
+        && let Some(e) = e.downcast_ref::<SpiceExternalError>()
+    {
+        match e {
+            SpiceExternalError::AccelerationNotReady { .. } => return true,
         }
     }
     false

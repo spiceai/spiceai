@@ -94,12 +94,12 @@ impl EmbeddingConnector {
         }
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
-        if let Some(vector_engine) = &dataset.vectors {
-            if vector_engine.enabled {
-                return self
-                    .wrap_table_as_index(dataset, Arc::clone(&inner_table_provider), vector_engine)
-                    .await;
-            }
+        if let Some(vector_engine) = &dataset.vectors
+            && vector_engine.enabled
+        {
+            return self
+                .wrap_table_as_index(dataset, Arc::clone(&inner_table_provider), vector_engine)
+                .await;
         }
 
         // Add in embedding columns from `dataset.columns.embeddings`.

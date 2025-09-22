@@ -117,7 +117,7 @@ impl TableProvider for IndexedTableProvider {
         self.underlying.get_table_definition()
     }
 
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.underlying.get_logical_plan()
     }
 

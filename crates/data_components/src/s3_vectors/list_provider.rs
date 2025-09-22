@@ -82,7 +82,7 @@ impl TableProvider for S3VectorsListTable {
         Some(&self.as_ref().constraints)
     }
 
-    /// S3 vectors ListVectors API operation does not support filtering.
+    /// S3 vectors `ListVectors` API operation does not support filtering.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],

@@ -340,7 +340,7 @@ impl TableProvider for TextSearchIndexProviderWrapper {
         self.inner.get_table_definition()
     }
 
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.inner.get_logical_plan()
     }
 

@@ -62,15 +62,14 @@ impl RefreshTask {
 
                         if let Some(cache_provider_ref) = caching.as_ref() {
                             // No cache provider means runtime is shutting down and cache is already cleaned up
-                            if let Some(cache_provider) = cache_provider_ref.upgrade() {
-                                if let Err(e) =
+                            if let Some(cache_provider) = cache_provider_ref.upgrade()
+                                && let Err(e) =
                                     cache_provider.invalidate_for_table(dataset_name.clone())
-                                {
-                                    tracing::error!(
-                                        "Failed to invalidate cached results for dataset {}: {e}",
-                                        &dataset_name.to_string()
-                                    );
-                                }
+                            {
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name.to_string()
+                                );
                             }
                         }
                     }

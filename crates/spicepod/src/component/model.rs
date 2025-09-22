@@ -278,15 +278,14 @@ impl Model {
         if matches!(
             ModelSource::try_from(self.from.as_str()),
             Ok(ModelSource::File)
-        ) {
-            if let Some(id) = self.get_model_id() {
-                component_files.push(ModelFile {
-                    path: id,
-                    name: Some("from_id".to_string()),
-                    r#type: Some(ModelFileType::Weights),
-                    params: None,
-                });
-            }
+        ) && let Some(id) = self.get_model_id()
+        {
+            component_files.push(ModelFile {
+                path: id,
+                name: Some("from_id".to_string()),
+                r#type: Some(ModelFileType::Weights),
+                params: None,
+            });
         }
         component_files
             .iter()
