@@ -155,7 +155,7 @@ impl ChunkedSearchIndex {
     /// If [`Self::inner`] search index is also a is a [`VectorIndex`]
     pub fn list_table_provider(
         &self,
-        vector_index: Arc<dyn VectorIndex>,
+        vector_index: &Arc<dyn VectorIndex>,
     ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
         let base_index_table = vector_index.list_table_provider()?;
 

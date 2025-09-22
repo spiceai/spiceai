@@ -39,7 +39,6 @@ async fn construct_chunker(
 ) -> Result<Arc<dyn Chunker>, EmbedError> {
     let embedding_models_guard = embedding_models.read().await;
     let Some(embed_model) = embedding_models_guard.get(model_name) else {
-        // Don't need warn, as we should have already checked/logged this.
         return Err(EmbedError::ModelDoesNotExist {
             model_name: model_name.to_string(),
         });
