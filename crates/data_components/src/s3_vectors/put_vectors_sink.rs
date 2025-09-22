@@ -177,10 +177,12 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             .to_vec();
 
         if vector.iter().any(|&x| x.is_nan() || x.is_infinite()) {
+            tracing::debug!("Disregarding a vector that contains NaN or Inf");
             continue;
         }
 
         if vector.iter().all(|&x| x == 0.0) {
+            tracing::debug!("Disregarding a zero vector");
             continue;
         }
 
