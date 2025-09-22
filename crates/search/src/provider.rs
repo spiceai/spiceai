@@ -246,6 +246,12 @@ impl SearchQueryProvider {
                 let _ = p.remove(&idx);
             };
 
+            if let Some((idx, _)) = self.schema().column_with_name(
+                format!("{}_embedding", self.search_index.search_column()).as_str(),
+            ) {
+                let _ = p.remove(&idx);
+            };
+
             p.into_iter().collect()
         });
 

@@ -8,19 +8,6 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": " and secon"
-      },
-      "primary_key": {
-        "id": 525
-      },
-      "score": 0.99
-    },
-    {
-      "data": {
         "question": "Using the method of multiplying by 10 and then halving the answer, what is \\( 6 \\times 5 \\)?"
       },
       "dataset": "qs",
@@ -34,6 +21,32 @@ snapshot_kind: text
     },
     {
       "data": {
+        "question": "Using the divide-and-average method for square roots, calculate \\((71 + 60) \\div 2\\)."
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 804
+      },
+      "score": 0.79
+    },
+    {
+      "data": {
+        "question": "Subtract and then check by adding: \\(7 - 0\\)."
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 778
+      },
+      "score": 0.79
+    },
+    {
+      "data": {
         "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
       },
       "dataset": "qs",
@@ -42,19 +55,6 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 612
-      },
-      "score": 0.79
-    },
-    {
-      "data": {
-        "question": "What is the product of \\(5 \\times 5\\) in multiplication?"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "\n2"
-      },
-      "primary_key": {
-        "id": 1086
       },
       "score": 0.79
     }

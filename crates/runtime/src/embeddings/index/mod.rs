@@ -103,14 +103,14 @@ pub mod tests {
     };
     use datafusion_expr::{LogicalPlan, TableScan};
     use runtime_datafusion_index::Index;
-    use search::generation::util::append_fields;
-    use search::metadata::{MetadataColumn, MetadataColumns};
+    use search::{generation::util::append_fields, index::SearchIndex};
+    use search::{
+        index::VectorIndex,
+        metadata::{MetadataColumn, MetadataColumns},
+    };
     use snafu::ResultExt;
 
-    use crate::{
-        embedding_col,
-        embeddings::index::{SearchIndex, VectorIndex},
-    };
+    use crate::embedding_col;
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.

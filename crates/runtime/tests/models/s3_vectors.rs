@@ -139,7 +139,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_filters",
                     SearchTestType::Sql(
-                        "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id> 10 order by score desc LIMIT 4",
+                        "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id > 10 order by score desc LIMIT 4",
                     ),
                 )]
             ].concat(),
@@ -160,7 +160,7 @@ mod search {
                     row_ids: Some(vec!["id".to_string()]),
                     chunking: Some(EmbeddingChunkConfig {
                         enabled: true,
-                        target_chunk_size: 16,
+                        target_chunk_size: 32,
                         overlap_size: 4,
                         trim_whitespace: true,
                     }),

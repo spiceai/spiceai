@@ -9,22 +9,42 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": " is secondary t"
+        "answer": " decrease systemic vascular r"
       },
       "primary_key": {
-        "id": 890
+        "id": 1035
       },
-      "score": 0.99
+      "score": 0.35
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": " an intermediat"
+        "answer": " not an intermediate of the TC"
       },
       "primary_key": {
         "id": 1279
       },
-      "score": 0.36
+      "score": 0.3
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " in the reagents can partially o"
+      },
+      "primary_key": {
+        "id": 938
+      },
+      "score": 0.3
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " radiology personnel"
+      },
+      "primary_key": {
+        "id": 929
+      },
+      "score": 0.25
     }
   ]
 }

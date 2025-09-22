@@ -26,6 +26,7 @@ use datafusion::logical_expr::{LogicalPlanBuilder, SortExpr};
 use datafusion::prelude::{DataFrame, Expr as LogicalExpr};
 
 use datafusion::{execution::SendableRecordBatchStream, sql::TableReference};
+use datafusion_expr::sqlparser::ast::Ident;
 use itertools::Itertools;
 use search::generation::{CandidateGeneration, Error as SearchGenerationError};
 use search::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
@@ -111,13 +112,17 @@ impl VectorUDTFGeneration {
             .primary_keys
             .iter()
             .cloned()
-            .chain(addition_projection.iter().map(|&e| format!("{e}")))
+            .chain(addition_projection.iter().filter_map(|&e| match e {
+                Expr::Identifier(Ident { value, .. }) => Some(format!("{value}")),
+                _ => None,
+            }))
             .chain([
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
                 format!("\"{search_value}\" as {SEARCH_VALUE_COLUMN_NAME}"),
             ])
             .unique()
             .collect();
+
         let projection_ref = projection.iter().map(String::as_str).collect::<Vec<_>>();
 
         udtf.select_exprs(&projection_ref)?
