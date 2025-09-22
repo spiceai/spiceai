@@ -398,6 +398,16 @@
     "Caching": {
       "type": "object",
       "properties": {
+        "embeddings": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "search_results": {
           "anyOf": [
             {
@@ -1054,7 +1064,11 @@
       "type": "string",
       "enum": [
         "siphash",
-        "ahash"
+        "ahash",
+        "xxh3",
+        "xxh32",
+        "xxh64",
+        "xxh128"
       ]
     },
     "IndexType": {
@@ -1250,6 +1264,14 @@
         "upsert",
         "upsert_dedup",
         "upsert_dedup_by_row_id"
+      ]
+    },
+    "OutputLevel": {
+      "type": "string",
+      "enum": [
+        "info",
+        "verbose",
+        "very_verbose"
       ]
     },
     "ParamValue": {
@@ -1449,6 +1471,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "output_level": {
+          "description": "Configures log level for the runtime. Can be overriden if flags or environment variables\n are set.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutputLevel"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "params": {

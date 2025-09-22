@@ -4399,7 +4399,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=418a42a7dea3c46dc9f28828f18a267ee44e7d7a#418a42a7dea3c46dc9f28828f18a267ee44e7d7a"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=4cf111b947dc42efa945aa4d0250b02ee615273e#4cf111b947dc42efa945aa4d0250b02ee615273e"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -12358,14 +12358,15 @@ dependencies = [
 
 [[package]]
 name = "rust_decimal"
-version = "1.37.1"
+version = "1.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faa7de2ba56ac291bd90c6b9bece784a52ae1411f9506544b3eae36dd2356d50"
+checksum = "c8975fc98059f365204d635119cf9c5a60ae67b841ed49b5422a9a7e56cdfac0"
 dependencies = [
  "arrayvec",
  "borsh",
  "bytes",
  "num-traits",
+ "postgres-types",
  "rand 0.8.5",
  "rkyv",
  "serde",
