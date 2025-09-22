@@ -204,7 +204,9 @@ pub async fn run(args: Args) -> Result<()> {
         extension_factories.push(Box::new(spice_extension_factory));
     }
     #[cfg(feature = "tpc-extension")]
-    if let Some(manifest) = app.extensions.get("tpc") {
+    if let Some(app) = &app
+        && let Some(manifest) = app.extensions.get("tpc")
+    {
         let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
         extension_factories.push(Box::new(tpc_extension_factory));
     }
