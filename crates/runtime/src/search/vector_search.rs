@@ -93,14 +93,16 @@ impl VectorSearch {
         let tbl = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
         tbl.get_all_indexes().into_iter().find_map(|idx| {
             if let Some(chunked) = idx.as_any().downcast_ref::<ChunkedSearchIndex>()
-                && chunked.search_column() == embedding_column {
-                    return Some(Arc::new(chunked.clone()) as Arc<dyn SearchIndex>);
-                }
+                && chunked.search_column() == embedding_column
+            {
+                return Some(Arc::new(chunked.clone()) as Arc<dyn SearchIndex>);
+            }
             #[cfg(feature = "s3_vectors")]
             if let Some(s3v) = idx.as_any().downcast_ref::<S3Vector>()
-                && s3v.search_column() == embedding_column {
-                    return Some(Arc::new(s3v.clone()) as Arc<dyn SearchIndex>);
-                }
+                && s3v.search_column() == embedding_column
+            {
+                return Some(Arc::new(s3v.clone()) as Arc<dyn SearchIndex>);
+            }
             None
         })
     }
