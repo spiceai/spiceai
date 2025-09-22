@@ -119,11 +119,12 @@ assignees: ''
      - [ ] [Model-Context-Protocol (MCP)](https://github.com/spiceai/cookbook/tree/trunk/mcp)
 
    - **SDK Samples**
-     - [ ] [Spice with gospice SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
-     - [ ] [Spice with Java SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
-     - [ ] [Spice with rust SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
-     - [ ] [Spice with spice.js SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
-     - [ ] [Spice with spicepy SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
+     - [ ] [Spice with gospice SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
+     - [ ] [Spice with Java SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
+     - [ ] [Spice with rust SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
+     - [ ] [Spice with spice.js SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
+     - [ ] [Spice with spicepy SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
+     - [ ] [Spice with Dotnet SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-dotnet-sdk-sample/README.md)
 
    - **Other Cookbook Recipes**
      - [ ] [Sales BI (Apache Superset)](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
