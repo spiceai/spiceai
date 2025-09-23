@@ -21,6 +21,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
 use arrow_tools::schema;
 use async_trait::async_trait;
+use chunking::{Chunker, ChunkingConfig};
 use datafusion::catalog::Session;
 use datafusion::common::{Constraints, Statistics, project_schema};
 use datafusion::error::Result as DataFusionResult;
@@ -32,10 +33,7 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
-use llms::{
-    chunking::{Chunker, ChunkingConfig},
-    embeddings::Error as EmbedError,
-};
+use llms::embeddings::Error as EmbedError;
 use snafu::prelude::*;
 
 use crate::embeddings::common::base_col;
@@ -224,17 +222,16 @@ impl EmbeddingTable {
         if let DataType::List(inner)
         | DataType::LargeList(inner)
         | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
+            && let DataType::FixedSizeList(_, _) = inner.data_type()
         {
-            if let DataType::FixedSizeList(_, _) = inner.data_type() {
-                let Some((_, offsets_field)) =
-                    base_schema.column_with_name(offset_col!(column).as_str())
-                else {
-                    return false;
-                };
+            let Some((_, offsets_field)) =
+                base_schema.column_with_name(offset_col!(column).as_str())
+            else {
+                return false;
+            };
 
-                if !is_valid_offset_type(offsets_field.data_type()) {
-                    return false;
-                }
+            if !is_valid_offset_type(offsets_field.data_type()) {
+                return false;
             }
         }
         true

@@ -45,7 +45,7 @@ pub struct Args {
     pub tls_root_certificate_file: Option<String>,
 }
 
-/// Reads a Parquet file and sends it via DoPut to an Apache Arrow Flight endpoint.
+/// Reads a Parquet file and sends it via `DoPut` to an Apache Arrow Flight endpoint.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();

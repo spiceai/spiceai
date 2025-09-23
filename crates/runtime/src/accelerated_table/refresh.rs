@@ -672,18 +672,16 @@ impl Refresher {
 
                             if let Some(cache_provider_ref) = caching.as_ref() {
                                 // No cache provider means runtime is shutting down and cache is already cleaned up
-                                if let Some(cache_provider) = cache_provider_ref.upgrade() {
-                                    if let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
+                                if let Some(cache_provider) = cache_provider_ref.upgrade()
+                                    && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
                                         tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                     }
-                                }
                             }
 
-                            if let Some(checkpointer) = &checkpointer {
-                                if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
+                            if let Some(checkpointer) = &checkpointer
+                                && let Err(e) = checkpointer.checkpoint(&federated_schema).await {
                                     tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
                                 }
-                            }
                         }
 
                         // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
@@ -1020,12 +1018,11 @@ mod tests {
                 if let Some(metric) = metrics
                     .iter()
                     .find(|m| m.get_name() == "dataset_load_state")
+                    && metric.get_field_type() == MetricType::GAUGE
                 {
-                    if metric.get_field_type() == MetricType::GAUGE {
-                        let value = metric.get_metric()[0].get_gauge().get_value();
-                        if value.is_eq(f64::from(desired as i32)) {
-                            return true;
-                        }
+                    let value = metric.get_metric()[0].get_gauge().get_value();
+                    if value.is_eq(f64::from(desired as i32)) {
+                        return true;
                     }
                 }
                 tokio::time::sleep(delay).await;

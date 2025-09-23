@@ -257,10 +257,10 @@ impl<S> Drop for TracedResponseStream<S> {
     fn drop(&mut self) {
         if let Ok(output) = self.accumulated_response.lock() {
             let _guard = self.span.enter();
-            if let Some(response) = &*output {
-                if let Ok(resp_str) = serde_json::to_string(response) {
-                    tracing::info!(target: "task_history", captured_output = %resp_str);
-                }
+            if let Some(response) = &*output
+                && let Ok(resp_str) = serde_json::to_string(response)
+            {
+                tracing::info!(target: "task_history", captured_output = %resp_str);
             }
         } else {
             tracing::warn!(

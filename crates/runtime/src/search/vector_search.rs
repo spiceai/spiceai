@@ -370,12 +370,11 @@ fn wrap_cache_to_result(
             let cache_max_size = cloned_cache_provider.max_size();
 
             while let Some(batch_result) = stream.next().await {
-                if records_size < cache_max_size {
-                    if let Ok(batch) = &batch_result {
+                if records_size < cache_max_size
+                    && let Ok(batch) = &batch_result {
                         records.push(batch.clone());
                         records_size += batch.get_array_memory_size();
                     }
-                }
 
                 yield batch_result;
             }

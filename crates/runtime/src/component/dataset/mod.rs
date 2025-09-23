@@ -461,47 +461,47 @@ impl Dataset {
 
     #[must_use]
     pub fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if acceleration.refresh_jitter_enabled {
-                // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-                return match acceleration.refresh_jitter_max {
-                    Some(jitter) => Some(jitter),
-                    None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-                };
-            }
+        if let Some(acceleration) = &self.acceleration
+            && acceleration.refresh_jitter_enabled
+        {
+            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
+            return match acceleration.refresh_jitter_max {
+                Some(jitter) => Some(jitter),
+                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
+            };
         }
         None
     }
 
     pub fn retention_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if let Some(retention_check_interval) = &acceleration.retention_check_interval {
-                if let Ok(duration) = fundu::parse_duration(retention_check_interval) {
-                    return Some(duration);
-                }
-                tracing::warn!(
-                    "Unable to parse retention check interval for dataset {}: {}",
-                    self.name,
-                    retention_check_interval
-                );
+        if let Some(acceleration) = &self.acceleration
+            && let Some(retention_check_interval) = &acceleration.retention_check_interval
+        {
+            if let Ok(duration) = fundu::parse_duration(retention_check_interval) {
+                return Some(duration);
             }
+            tracing::warn!(
+                "Unable to parse retention check interval for dataset {}: {}",
+                self.name,
+                retention_check_interval
+            );
         }
 
         None
     }
 
     pub fn retention_period(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if let Some(retention_period) = &acceleration.retention_period {
-                if let Ok(duration) = fundu::parse_duration(retention_period) {
-                    return Some(duration);
-                }
-                tracing::warn!(
-                    "Unable to parse retention period for dataset {}: {}",
-                    self.name,
-                    retention_period
-                );
+        if let Some(acceleration) = &self.acceleration
+            && let Some(retention_period) = &acceleration.retention_period
+        {
+            if let Ok(duration) = fundu::parse_duration(retention_period) {
+                return Some(duration);
             }
+            tracing::warn!(
+                "Unable to parse retention period for dataset {}: {}",
+                self.name,
+                retention_period
+            );
         }
 
         None
@@ -527,17 +527,17 @@ impl Dataset {
 
     #[must_use]
     pub fn refresh_data_window(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_data_window) = &acceleration.refresh_data_window {
-                if let Ok(duration) = fundu::parse_duration(refresh_data_window) {
-                    return Some(duration);
-                }
-                tracing::warn!(
-                    "Unable to parse refresh period for dataset {}: {}",
-                    self.name,
-                    refresh_data_window
-                );
+        if let Some(acceleration) = &self.acceleration
+            && let Some(refresh_data_window) = &acceleration.refresh_data_window
+        {
+            if let Ok(duration) = fundu::parse_duration(refresh_data_window) {
+                return Some(duration);
             }
+            tracing::warn!(
+                "Unable to parse refresh period for dataset {}: {}",
+                self.name,
+                refresh_data_window
+            );
         }
 
         None

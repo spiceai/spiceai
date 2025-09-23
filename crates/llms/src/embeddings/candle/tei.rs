@@ -20,11 +20,16 @@ use std::{
     sync::Arc,
 };
 
+use crate::embeddings::{
+    Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
+    candle::util::link_files_into_tmp_dir, encode_embedding,
+};
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
 };
 use async_trait::async_trait;
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use futures::future::join_all;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
@@ -35,14 +40,6 @@ use tei_core::{
     tokenization::{EncodingInput, Tokenization},
 };
 use tokenizers::{Tokenizer, TruncationDirection};
-
-use crate::{
-    chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker},
-    embeddings::{
-        Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
-        candle::util::link_files_into_tmp_dir, encode_embedding,
-    },
-};
 
 use super::util::{
     download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer,

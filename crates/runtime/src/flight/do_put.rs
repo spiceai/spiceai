@@ -73,12 +73,11 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
-    if let Ok(message) = Any::decode(&*fd.cmd) {
-        if let Command::CommandPreparedStatementQuery(query) =
+    if let Ok(message) = Any::decode(&*fd.cmd)
+        && let Command::CommandPreparedStatementQuery(query) =
             Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
-        {
-            return prepared_statement_query::do_put_query(query, streaming_flight).await;
-        }
+    {
+        return prepared_statement_query::do_put_query(query, streaming_flight).await;
     }
 
     // Check if the request should be rate limited.

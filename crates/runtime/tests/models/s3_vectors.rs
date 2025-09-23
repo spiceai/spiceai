@@ -40,7 +40,7 @@ mod search {
     use app::AppBuilder;
     use serde_json::json;
     use spicepod::{
-        semantic::{Column, ColumnLevelEmbeddingConfig},
+        semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig},
         vector::VectorStore,
     };
     use std::{collections::HashMap, sync::Arc};
@@ -145,6 +145,118 @@ mod search {
                     SearchTestType::Sql(
                         "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
                     ))
+            ],
+            true
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            Some(Column {
+                name: "question".to_string(),
+                embeddings: vec![],
+                description: None,
+                full_text_search: Some(FullTextSearchConfig {
+                    enabled: true,
+                    row_ids: Some(vec!["id".to_string()]),
+                }),
+                metadata: HashMap::new(),
+            }),
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["id".to_string()]),
+                    chunking: None,
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: HashMap::new(),
+            }),
+        );
+        let bucket_name = "spice-ci-tests-s3-vectors-hybrid";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                SearchTestCase::new(
+                    "s3vectors_hybrid_basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_additional_columns",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["question"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_additional_columns2",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["answer"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_vector_search_sql_basic",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_vector_search_sql_w_question",
+                    SearchTestType::Sql(
+                        "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_vector_search_text_search",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_vector_search_text_search_w_embedding",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_hybrid_vector_search_text_search_w_answer",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
             ],
             true
         )

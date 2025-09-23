@@ -110,46 +110,43 @@ pub fn to_primitive_type_list(
     column: &ArrayRef,
     field: &Arc<Field>,
 ) -> Result<(ArrayRef, Arc<Field>), ArrowError> {
-    if let DataType::List(inner_field) = field.data_type() {
-        if let DataType::Struct(struct_fields) = inner_field.data_type() {
-            if struct_fields.len() == 1 {
-                let list_item_field = Arc::clone(&struct_fields[0]);
+    if let DataType::List(inner_field) = field.data_type()
+        && let DataType::Struct(struct_fields) = inner_field.data_type()
+        && struct_fields.len() == 1
+    {
+        let list_item_field = Arc::clone(&struct_fields[0]);
 
-                let original_list_array =
-                    column
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .ok_or(ArrowError::CastError(
-                            "Failed to downcast to ListArray".into(),
-                        ))?;
+        let original_list_array =
+            column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or(ArrowError::CastError(
+                    "Failed to downcast to ListArray".into(),
+                ))?;
 
-                let struct_array = original_list_array
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or(ArrowError::CastError(
-                        "Failed to downcast to StructArray".into(),
-                    ))?;
+        let struct_array = original_list_array
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or(ArrowError::CastError(
+                "Failed to downcast to StructArray".into(),
+            ))?;
 
-                let struct_column_array = Arc::clone(struct_array.column(0));
+        let struct_column_array = Arc::clone(struct_array.column(0));
 
-                let new_list_field = Arc::new(Field::new(
-                    field.name(),
-                    DataType::List(Arc::clone(&list_item_field)),
-                    field.is_nullable(),
-                ));
-                let new_list_array = ListArray::new(
-                    list_item_field,
-                    OffsetBuffer::new(
-                        Buffer::from_slice_ref(original_list_array.value_offsets()).into(),
-                    ),
-                    struct_column_array,
-                    original_list_array.logical_nulls(),
-                );
+        let new_list_field = Arc::new(Field::new(
+            field.name(),
+            DataType::List(Arc::clone(&list_item_field)),
+            field.is_nullable(),
+        ));
+        let new_list_array = ListArray::new(
+            list_item_field,
+            OffsetBuffer::new(Buffer::from_slice_ref(original_list_array.value_offsets()).into()),
+            struct_column_array,
+            original_list_array.logical_nulls(),
+        );
 
-                return Ok((Arc::new(new_list_array), new_list_field));
-            }
-        }
+        return Ok((Arc::new(new_list_array), new_list_field));
     }
 
     Err(ArrowError::CastError("Invalid column type".into()))
@@ -272,6 +269,53 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
         | DataType::List(inner) => inner.data_type().is_numeric(),
         _ => false,
     }
+}
+
+/// For a given [`RecordBatch`], replace a given column, by name, with a new [`ArrayRef`] data.
+///
+/// If `col` is not in [`RecordBatch`], no change occurs.
+///
+/// # Errors
+///
+/// This function will return an error if it unexpectedly fails to create a new [`RecordBatch`].
+pub fn replace_column_in_record(
+    rb: RecordBatch,
+    col: &str,
+    data: &ArrayRef,
+) -> Result<RecordBatch, ArrowError> {
+    let Some((idx, _)) = rb.schema().column_with_name(col) else {
+        return Ok(rb);
+    };
+    let schema = Schema::new(
+        rb.schema()
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == col {
+                    Arc::unwrap_or_clone(Arc::clone(f))
+                        .with_data_type(data.data_type().clone())
+                        .into()
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let columns = rb
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, arr)| {
+            if i == idx {
+                Arc::clone(data)
+            } else {
+                Arc::clone(arr)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new(schema.into(), columns)
 }
 
 #[cfg(test)]

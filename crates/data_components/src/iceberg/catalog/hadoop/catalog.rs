@@ -155,14 +155,10 @@ impl HadoopCatalogBuilder {
                 for table in tables {
                     let metadata = catalog.load_metadata(&table).await;
                     // lazy scheme inferring - only check until we get the first valid metadata
-                    if let Ok(m) = metadata {
-                        if let Some((scheme, _)) = m.location().split_once("://") {
-                            if !cloned_warehouse_root.starts_with(scheme) {
+                    if let Ok(m) = metadata && let Some((scheme, _)) = m.location().split_once("://") && !cloned_warehouse_root.starts_with(scheme) {
                                 inferred_scheme = Some(scheme.to_string());
                                 break;
                             }
-                        }
-                    }
                 }
 
                 if let Some(scheme) = inferred_scheme {

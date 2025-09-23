@@ -27,6 +27,6 @@ description: "Query: clickbench_q22"
 |               |                           CoalescePartitionsExec                                                                                                                                        |
 |               |                             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                       |
 |               |                               CooperativeExec                                                                                                                                           |
-|               |                                 DuckSqlExec sql= SELECT "URL", "SearchPhrase" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%' AND (CAST(SearchPhrase AS VARCHAR) <> '')             |
+|               |                                 DuckSqlExec sql= SELECT "URL", "SearchPhrase" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%' AND (CAST("SearchPhrase" AS VARCHAR) <> '')           |
 |               |                                                                                                                                                                                         |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

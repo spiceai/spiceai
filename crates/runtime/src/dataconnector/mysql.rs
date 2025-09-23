@@ -249,18 +249,17 @@ impl DataConnector for MySQL {
         match Read::table_provider(&self.mysql_factory, tbl, dataset.schema()).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
-                if let Some(err_source) = e.source() {
-                    if let Some(dbconnection::Error::UndefinedTable {
+                if let Some(err_source) = e.source()
+                    && let Some(dbconnection::Error::UndefinedTable {
                         table_name,
                         source: _,
                     }) = err_source.downcast_ref::<dbconnection::Error>()
-                    {
-                        return Err(DataConnectorError::InvalidTableName {
-                            dataconnector: "mysql".to_string(),
-                            connector_component: ConnectorComponent::from(dataset),
-                            table_name: table_name.clone(),
-                        });
-                    }
+                {
+                    return Err(DataConnectorError::InvalidTableName {
+                        dataconnector: "mysql".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        table_name: table_name.clone(),
+                    });
                 }
 
                 return Err(DataConnectorError::UnableToGetReadProvider {

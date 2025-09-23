@@ -168,11 +168,11 @@ impl UnityCatalogSchemaProvider {
 
             let schema_with_table = format!("{}.{}", schema.name, table_name);
             tracing::debug!("Checking if table {} should be included", schema_with_table);
-            if let Some(include) = &include {
-                if !include.is_match(&schema_with_table) {
-                    tracing::debug!("Table {} is not included", schema_with_table);
-                    continue;
-                }
+            if let Some(include) = &include
+                && !include.is_match(&schema_with_table)
+            {
+                tracing::debug!("Table {} is not included", schema_with_table);
+                continue;
             }
 
             let table_provider = match table_creator
@@ -291,11 +291,11 @@ impl UnityCatalogSchemaProvider {
 
         let schema_with_table = format!("{}.{}", schema.name, table_name);
         tracing::debug!("Checking if table {} should be included", schema_with_table);
-        if let Some(include) = &include {
-            if !include.is_match(&schema_with_table) {
-                tracing::debug!("Table {} is not included", schema_with_table);
-                return None;
-            }
+        if let Some(include) = &include
+            && !include.is_match(&schema_with_table)
+        {
+            tracing::debug!("Table {} is not included", schema_with_table);
+            return None;
         }
 
         let table_provider = match table_creator

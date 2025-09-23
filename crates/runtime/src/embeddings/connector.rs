@@ -29,6 +29,7 @@ use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
+use chunking::ChunkingConfig;
 use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
 use data_components::cdc::StreamError;
@@ -36,7 +37,6 @@ use data_components::cdc::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::vector::VectorStore;
@@ -94,12 +94,12 @@ impl EmbeddingConnector {
         }
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
-        if let Some(vector_engine) = &dataset.vectors {
-            if vector_engine.enabled {
-                return self
-                    .wrap_table_as_index(dataset, Arc::clone(&inner_table_provider), vector_engine)
-                    .await;
-            }
+        if let Some(vector_engine) = &dataset.vectors
+            && vector_engine.enabled
+        {
+            return self
+                .wrap_table_as_index(dataset, Arc::clone(&inner_table_provider), vector_engine)
+                .await;
         }
 
         // Add in embedding columns from `dataset.columns.embeddings`.

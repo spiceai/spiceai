@@ -520,7 +520,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     }
 
     /// A hook that is called when an accelerated table is registered to the
-    /// DataFusion context for this data connector.
+    /// `DataFusion` context for this data connector.
     ///
     /// Allows running any setup logic specific to the data connector when its
     /// accelerated table is registered, i.e. setting up a file watcher to refresh

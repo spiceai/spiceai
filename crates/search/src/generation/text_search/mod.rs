@@ -622,15 +622,13 @@ pub(crate) mod tests {
             for v in vv {
                 if let Value::Object(obj) = v {
                     obj.sort_keys();
-                    if let Some(Value::Number(n)) = obj.get("score") {
-                        if let Some(score) = n.as_f64() {
-                            if let Some(truncated_score) =
-                                serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
-                            // Keep 2 decimals
-                            {
-                                obj.insert("score".to_string(), Value::Number(truncated_score));
-                            }
-                        }
+                    if let Some(Value::Number(n)) = obj.get("score")
+                        && let Some(score) = n.as_f64()
+                        && let Some(truncated_score) =
+                            serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
+                    // Keep 2 decimals
+                    {
+                        obj.insert("score".to_string(), Value::Number(truncated_score));
                     }
                 }
             }

@@ -71,22 +71,22 @@ impl EnvSecretStore {
                 }
             }
         }
-        if let Err(err) = dotenvy::from_filename(".env.local") {
-            if matches!(err, dotenvy::Error::LineParse(_, _)) {
-                tracing::warn!(".env.local: {err}");
-            }
+        if let Err(err) = dotenvy::from_filename(".env.local")
+            && matches!(err, dotenvy::Error::LineParse(_, _))
+        {
+            tracing::warn!(".env.local: {err}");
         }
-        if let Err(err) = dotenvy::from_filename(".env") {
-            if matches!(err, dotenvy::Error::LineParse(_, _)) {
-                tracing::warn!(".env: {err}");
-            }
+        if let Err(err) = dotenvy::from_filename(".env")
+            && matches!(err, dotenvy::Error::LineParse(_, _))
+        {
+            tracing::warn!(".env: {err}");
         }
     }
 }
 
 #[async_trait]
 impl SecretStore for EnvSecretStore {
-    /// The key for std::env::var is case-sensitive. Calling `std::env::var("my_key")` is distinct from `std::env::var("MY_KEY")`.
+    /// The key for `std::env::var` is case-sensitive. Calling `std::env::var("my_key")` is distinct from `std::env::var("MY_KEY")`.
     ///
     /// However, the convention is to use uppercase for environment variables - so to make the experience
     /// consistent across secret stores that don't have this convention we will search for both original and uppercased keys.

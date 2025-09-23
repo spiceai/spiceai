@@ -295,11 +295,10 @@ fn create_sse_response(
                     if id.is_none() {
                         id = Some(resp.id.clone());
                     }
-                    if let Some(choice) = resp.choices.first() {
-                        if let Some(intermediate_chat_output) = &choice.delta.content {
+                    if let Some(choice) = resp.choices.first()
+                        && let Some(intermediate_chat_output) = &choice.delta.content {
                             chat_output.push_str(intermediate_chat_output);
                         }
-                    }
 
                     yield Ok::<Event, Infallible>(Event::default().json_data(resp).unwrap_or_else(|e| {
                         tracing::error!("Failed to serialize chat completion message: {e}");

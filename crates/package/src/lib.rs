@@ -322,10 +322,10 @@ where
     ComponentType: serde::de::DeserializeOwned,
 {
     for component in components {
-        if let ComponentOrReference::Component(component) = component {
-            if let Some(ref extract_linked_files) = extract_linked_files {
-                linked_files.extend(extract_linked_files(component)?);
-            }
+        if let ComponentOrReference::Component(component) = component
+            && let Some(ref extract_linked_files) = extract_linked_files
+        {
+            linked_files.extend(extract_linked_files(component)?);
         }
 
         let ComponentOrReference::Reference(component_ref) = component else {

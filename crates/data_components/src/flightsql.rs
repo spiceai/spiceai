@@ -218,10 +218,10 @@ impl FlightSQLTable {
     }
 
     fn get_str_from_record_batch(b: &RecordBatch, row: usize, col_name: &str) -> Option<String> {
-        if let Some(col_array) = b.column_by_name(col_name) {
-            if let Some(y) = col_array.as_any().downcast_ref::<array::StringArray>() {
-                return Some(y.value(row).to_string());
-            }
+        if let Some(col_array) = b.column_by_name(col_name)
+            && let Some(y) = col_array.as_any().downcast_ref::<array::StringArray>()
+        {
+            return Some(y.value(row).to_string());
         }
         None
     }

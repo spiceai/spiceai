@@ -118,12 +118,11 @@ pub(crate) async fn get(
         .collect_vec();
 
     let mut format = Format::Json;
-    if let Some(accept) = accept {
-        if let Some(media_type) = accept.negotiate(ACCEPT_LIST.iter()) {
-            if let ("text", "csv") = (media_type.ty.as_str(), media_type.subty.as_str()) {
-                format = Format::Csv;
-            }
-        }
+    if let Some(accept) = accept
+        && let Some(media_type) = accept.negotiate(ACCEPT_LIST.iter())
+        && let ("text", "csv") = (media_type.ty.as_str(), media_type.subty.as_str())
+    {
+        format = Format::Csv;
     }
 
     match format {
