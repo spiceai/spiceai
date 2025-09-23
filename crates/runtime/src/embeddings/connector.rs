@@ -34,10 +34,22 @@ use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
 use data_components::cdc::StreamError;
 use data_components::cdc::replace_change_batch_data;
+use datafusion::common::Column;
+use datafusion::common::DFSchema;
+use datafusion::common::ToDFSchema;
 use datafusion::datasource::TableProvider;
+use datafusion::prelude::SessionContext;
+use datafusion_expr::Expr;
+use datafusion_expr::expr::ScalarFunction;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_table_partition::expression::CriterionFailedSnafu;
+use runtime_table_partition::expression::{
+    Criterion, Error as ValidationError, ValidationResult, partition_by_expressions,
+};
+use snafu::OptionExt;
+use snafu::ensure;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
@@ -186,8 +198,13 @@ impl EmbeddingConnector {
         match vector_store.engine.as_deref() {
             #[cfg(feature = "s3_vectors")]
             Some("s3" | "s3_vectors") => {
+                use datafusion::prelude::SessionContext;
+
                 tracing::info!("S3 Vectors for dataset {} initializing...", dataset.name);
                 let start = std::time::Instant::now();
+
+                let partition_by =
+                    get_and_validate_partition_by(dataset, vector_store, &SessionContext::new())?;
 
                 let embedding_columns: Vec<_> = dataset
                     .columns
@@ -213,6 +230,7 @@ impl EmbeddingConnector {
                         Arc::clone(&self.embedding_models),
                         dataset.columns.clone(),
                         Arc::clone(&self.secrets),
+                        partition_by.clone(),
                     )
                     .await
                     .map_err(|e| {
@@ -291,6 +309,79 @@ impl EmbeddingConnector {
 
         Ok(ChangeEnvelope::new(change_committer, new_change_batch))
     }
+}
+
+fn get_and_validate_partition_by(
+    dataset: &Dataset,
+    vector_store: &VectorStore,
+    ctx: &SessionContext,
+) -> DataConnectorResult<Vec<Expr>> {
+    // Expression must use the bucket UDF with a column in the dataset
+    struct BucketCriterion;
+
+    impl Criterion for BucketCriterion {
+        fn doc(&self) -> String {
+            "expression must use bucket directly on a column in the dataset".to_string()
+        }
+
+        fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
+            let err = CriterionFailedSnafu {
+                expr: expr.to_string(),
+                criterion: self.doc(),
+            };
+
+            let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
+                return err.fail();
+            };
+
+            ensure!(func.name() == "bucket", err);
+
+            let Expr::Column(Column { name, .. }) =
+                args.iter().skip(1).next().with_context(|| err.clone())?
+            else {
+                return Err(ValidationError::InvalidExpression {
+                    message: self.doc(),
+                });
+            };
+
+            ensure!(schema.columns().iter().any(|c| c.name() == name), err);
+
+            Ok(())
+        }
+    }
+
+    let df_schema = &dataset
+        .schema()
+        .ok_or_else(|| DataConnectorError::UnableToGetSchema {
+            dataconnector: dataset.source().to_string(),
+            connector_component: dataset.into(),
+            table_name: dataset.name.to_string(),
+        })?
+        .to_dfschema()
+        .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+            dataconnector: dataset.source().to_string(),
+            connector_component: dataset.into(),
+            source: e.into(),
+        })?;
+
+    let partition_by = if vector_store.partition_by.is_empty() {
+        vec![]
+    } else {
+        partition_by_expressions(
+            &vector_store.partition_by,
+            ctx,
+            &df_schema,
+            &BucketCriterion,
+        )
+        .map(|p| p.expressions)
+        .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+            dataconnector: dataset.source().to_string(),
+            connector_component: dataset.into(),
+            source: e.into(),
+        })?
+    };
+
+    Ok(partition_by)
 }
 
 #[async_trait]
@@ -462,5 +553,57 @@ fn underlying_federated_table_for_indexed_table(
     #[cfg(not(feature = "s3_vectors"))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use app::AppBuilder;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::component::dataset::builder::DatasetBuilder;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn validate_partition_by() {
+        let spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("test".to_string(), "test".to_string());
+
+        let app = AppBuilder::new("test")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let dataset = DatasetBuilder::try_from(spicepod_dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("valid dataset")
+            .with_schema(Arc::new(Schema::new(vec![Field::new(
+                "col",
+                DataType::Utf8,
+                false,
+            )])));
+
+        let mut vector_store = VectorStore {
+            enabled: true,
+            engine: None,
+            partition_by: vec!["bucket(100, col)".to_string()],
+            params: None,
+        };
+
+        let exprs = get_and_validate_partition_by(&dataset, &vector_store, &rt.df.ctx)
+            .expect("expressions");
+
+        assert_eq!(exprs.len(), 1);
+        assert!(matches!(exprs[0], Expr::ScalarFunction(_)));
+
+        vector_store.partition_by = vec!["col < 10".to_string()];
+
+        assert!(
+            get_and_validate_partition_by(&dataset, &vector_store, &SessionContext::new()).is_err()
+        );
     }
 }

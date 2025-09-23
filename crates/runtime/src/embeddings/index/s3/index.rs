@@ -70,6 +70,8 @@ pub struct S3Vector {
     pub model_name: String,
 
     pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+
+    _partition_by: Vec<Expr>,
 }
 
 impl S3Vector {
@@ -83,6 +85,7 @@ impl S3Vector {
         model_name: String,
         dimension: usize,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+        partition_by: Vec<Expr>,
     ) -> Self {
         // Build complete metadata columns including the embedding column as non-filterable
         let mut complete_columns: Vec<MetadataColumn> =
@@ -109,6 +112,7 @@ impl S3Vector {
             complete_metadata_columns,
             model_name,
             embedding_models,
+            _partition_by: partition_by,
         }
     }
 

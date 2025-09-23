@@ -689,6 +689,7 @@ mod search {
             enabled: true,
             engine: Some("s3_vectors".to_string()),
             params: Some(params),
+            partition_by: vec![],
         })
     }
 
