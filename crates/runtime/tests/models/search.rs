@@ -1049,7 +1049,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_question",
                 SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 // When there are multiple columns, `text_search` needs column explicitly as input.
                 "multi_text_column_sql_text_search_error_without_column",
@@ -1058,7 +1058,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_projection",
                 SearchTestType::Sql("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_filters",
                 SearchTestType::Sql("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),
