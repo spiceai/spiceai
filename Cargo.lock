@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.7.0-unstable"
+version = "1.7.0-enterprise-beta"
 dependencies = [
  "async-trait",
  "pulldown-cmark 0.13.0",
