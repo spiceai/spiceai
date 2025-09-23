@@ -26,7 +26,7 @@ use args::{
     HttpOverheadTestArgs, LoadTestArgs, TestCommands,
 };
 
-use crate::args::VectorSearchTestArgs;
+use crate::args::SearchTestArgs;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
             | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
             | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
             | TestCommands::Evals(EvalsTestArgs { common, .. })
-            | TestCommands::VectorSearch(VectorSearchTestArgs { common, .. })
+            | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -89,8 +89,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Export(TestCommands::Append(args)) => {
             commands::env_export(&args.common).await?;
         }
-        Commands::Run(TestCommands::VectorSearch(args)) => {
-            commands::vector_search::run(&args).await?;
+        Commands::Run(TestCommands::Search(args)) => {
+            commands::search::run(&args).await?;
         }
     }
 

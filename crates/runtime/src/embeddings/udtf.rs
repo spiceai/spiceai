@@ -485,7 +485,7 @@ impl TableProvider for VectorSearchUDTFProvider {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        telemetry::track_vector_search(&request_context.to_dimensions());
+        telemetry::track_search(&request_context.to_dimensions());
 
         let (col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
 

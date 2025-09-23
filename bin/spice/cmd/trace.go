@@ -51,7 +51,7 @@ var supported_trace_tasks = []string{
 	"ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
 	"tool_use::search", "tool_use::list_datasets", "tool_use::load_memory",
 	"tool_use::sample_data", "tool_use::sql", "tool_use::store_memory",
-	"tool_use::table_schema", "vector_search", "scheduled_worker", "text_embed",
+	"tool_use::table_schema", "search", "scheduled_worker", "text_embed",
 }
 
 func isValidTraceTask(task string) bool {

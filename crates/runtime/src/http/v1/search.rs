@@ -18,8 +18,8 @@ use crate::{
     search::{
         Error as VectorSearchError,
         request::{SearchRequest, SearchRequestHTTPJson},
+        search::VectorSearch,
         types::{Match, to_matches_sorted},
-        vector_search::VectorSearch,
     },
 };
 use axum::{
@@ -139,7 +139,7 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
     }
 
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.base.text);
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "search", input = %payload.base.text);
 
     let search_request = match SearchRequest::try_from(payload) {
         Ok(r) => r,

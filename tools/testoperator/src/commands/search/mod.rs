@@ -17,7 +17,7 @@ limitations under the License.
 mod mteb_quora;
 
 use super::get_app_and_start_request;
-use crate::{args::VectorSearchTestArgs, wait_test_and_memory};
+use crate::{args::SearchTestArgs, wait_test_and_memory};
 use std::time::{Duration, SystemTime};
 use test_framework::{
     TestType, anyhow, git,
@@ -27,7 +27,7 @@ use test_framework::{
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
-        vector_search::{NotStarted, SearchRunMetric},
+        search::{NotStarted, SearchRunMetric},
     },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
@@ -35,7 +35,7 @@ use test_framework::{
 };
 use tokio::time::sleep;
 
-pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
 
     match args.benchmark_dataset.as_deref() {
@@ -107,7 +107,7 @@ pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
     })?;
 
     let metrics: QueryMetrics<_, _> = test
-        .collect(TestType::VectorSearch)?
+        .collect(TestType::Search)?
         .with_run_metric(SearchRunMetric::new(rps, p95, score));
 
     let mut spiced_instance = test.end()?;
@@ -120,7 +120,7 @@ pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
     // Record benchmark results
     let benchmark_resource = Resource::new(vec![
         KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "vector_search"),
+        KeyValue::new("type", "search"),
         KeyValue::new("name", app.name.clone()),
         KeyValue::new("spiced_version", spiced_instance.version().to_string()),
         KeyValue::new("spiced_commit_sha", spiced_commit_sha),

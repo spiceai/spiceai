@@ -25,7 +25,7 @@ use test_framework::{
     arrow::{self, array::RecordBatch},
     futures::TryStreamExt,
     spiced::SpicedInstance,
-    spicetest::vector_search::{SearchConfig, SearchRequest, SearchResult},
+    spicetest::search::{SearchConfig, SearchRequest, SearchResult},
 };
 
 /// The `QuoraRetrieval` MTEB dataset is a benchmark dataset used for evaluating retrieval models.

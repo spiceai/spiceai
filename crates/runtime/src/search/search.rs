@@ -239,7 +239,7 @@ impl VectorSearch {
 
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        telemetry::track_vector_search(&request_context.to_dimensions());
+        telemetry::track_search(&request_context.to_dimensions());
 
         let SearchRequest {
             text: query,
@@ -260,15 +260,15 @@ impl VectorSearch {
         }
 
         let span = match Span::current() {
-            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "vector_search") => {
+            span if matches!(span.metadata(), Some(metadata) if metadata.name() == "search") => {
                 span
             }
             _ => {
-                tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = query)
+                tracing::span!(target: "task_history", tracing::Level::INFO, "search", input = query)
             }
         };
 
-        let vector_search_result = async {
+        let search_result = async {
             tracing::info!(target: "task_history", tables = tables.iter().join(","), limit = %limit, "labels");
             let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys)
                 .await?;
@@ -314,7 +314,7 @@ impl VectorSearch {
 
         }.instrument(span.clone()).await;
 
-        match vector_search_result {
+        match search_result {
             Ok(result) => {
                 let displayable: HashMap<String, serde_json::Value> = result
                     .iter()

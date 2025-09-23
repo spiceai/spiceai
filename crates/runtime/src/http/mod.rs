@@ -29,7 +29,7 @@ use tokio::sync::watch::{self, Receiver};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
-use crate::search::vector_search::VectorSearch;
+use crate::search::search::VectorSearch;
 use crate::{
     Runtime, config, metrics as runtime_metrics, search::util::parse_explicit_primary_keys,
     tls::TlsConfig,

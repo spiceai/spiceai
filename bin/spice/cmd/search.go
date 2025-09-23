@@ -108,8 +108,8 @@ spice search --cloud
 
 		for _, dataset := range datasets {
 			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
-				// warn only if vector_search is supported by the dataset
-				prop_val, _ := dataset.GetPropertyValue("vector_search")
+				// warn only if search is supported by the dataset
+				prop_val, _ := dataset.GetPropertyValue("search")
 				if prop_val == "supported" {
 					slog.Warn(fmt.Sprintf("Dataset %s is not ready (%s) and will be excluded from the search.", dataset.Name, dataset.Status))
 				}

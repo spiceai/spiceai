@@ -24,9 +24,9 @@ use crate::{
     Runtime,
     search::{
         request::{SearchRequest, SearchRequestBaseJson},
+        search::VectorSearch,
         types::to_pretty,
         util::parse_explicit_primary_keys,
-        vector_search::VectorSearch,
     },
     tools::{SpiceModelTool, utils::parameters},
 };
