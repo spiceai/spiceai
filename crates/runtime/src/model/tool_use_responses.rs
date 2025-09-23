@@ -454,13 +454,10 @@ fn make_responses_stream(
                     let response_event = match result {
                         Ok(event) => event,
                         Err(e) => {
-                            if let Err(e) = sender_clone.send(Err(e)).await {
-                                if !sender_clone.is_closed() {
-                                    tracing::error!(
-                                        "Unable to send error to response stream: {}",
-                                        e
-                                    );
-                                }
+                            if let Err(e) = sender_clone.send(Err(e)).await
+                                && !sender_clone.is_closed()
+                            {
+                                tracing::error!("Unable to send error to response stream: {}", e);
                             }
                             return;
                         }
@@ -578,10 +575,10 @@ fn make_responses_stream(
 
                         if spice_tools.is_empty() {
                             // No spice tools, forward the completion event normally
-                            if let Err(e) = sender_clone.send(Ok(response_event)).await {
-                                if !sender_clone.is_closed() {
-                                    tracing::error!("Error sending event: {}", e);
-                                }
+                            if let Err(e) = sender_clone.send(Ok(response_event)).await
+                                && !sender_clone.is_closed()
+                            {
+                                tracing::error!("Error sending event: {}", e);
                             }
                         } else {
                             // Process spice tools - don't forward the completion event
@@ -595,18 +592,18 @@ fn make_responses_stream(
                                 Ok(Some(messages)) => messages,
                                 Ok(None) => {
                                     // No spice tools within returned tools, forward the event
-                                    if let Err(e) = sender_clone.send(Ok(response_event)).await {
-                                        if !sender_clone.is_closed() {
-                                            tracing::error!("Error sending event: {}", e);
-                                        }
+                                    if let Err(e) = sender_clone.send(Ok(response_event)).await
+                                        && !sender_clone.is_closed()
+                                    {
+                                        tracing::error!("Error sending event: {}", e);
                                     }
                                     continue;
                                 }
                                 Err(e) => {
-                                    if let Err(e) = sender_clone.send(Err(e)).await {
-                                        if !sender_clone.is_closed() {
-                                            tracing::error!("Error sending error: {}", e);
-                                        }
+                                    if let Err(e) = sender_clone.send(Err(e)).await
+                                        && !sender_clone.is_closed()
+                                    {
+                                        tracing::error!("Error sending error: {}", e);
                                     }
                                     return;
                                 }
@@ -636,10 +633,10 @@ fn make_responses_stream(
                                     // Continue processing the original stream after recursive stream completes
                                 }
                                 Err(e) => {
-                                    if let Err(e) = sender_clone.send(Err(e)).await {
-                                        if !sender_clone.is_closed() {
-                                            tracing::error!("Error sending recursive error: {}", e);
-                                        }
+                                    if let Err(e) = sender_clone.send(Err(e)).await
+                                        && !sender_clone.is_closed()
+                                    {
+                                        tracing::error!("Error sending recursive error: {}", e);
                                     }
                                     return;
                                 }
@@ -647,10 +644,10 @@ fn make_responses_stream(
                         }
                     } else if should_forward {
                         // Forward the event normally
-                        if let Err(e) = sender_clone.send(Ok(response_event)).await {
-                            if !sender_clone.is_closed() {
-                                tracing::error!("Error sending event: {}", e);
-                            }
+                        if let Err(e) = sender_clone.send(Ok(response_event)).await
+                            && !sender_clone.is_closed()
+                        {
+                            tracing::error!("Error sending event: {}", e);
                         }
                     }
                 }
@@ -695,10 +692,10 @@ fn create_new_recursive_req(
     }
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
-    if let Some(max_output_tokens) = new_req.max_output_tokens {
-        if let Some(usage) = marginal_usage {
-            new_req.max_output_tokens = Some(max_output_tokens.saturating_sub(usage.output_tokens));
-        }
+    if let Some(max_output_tokens) = new_req.max_output_tokens
+        && let Some(usage) = marginal_usage
+    {
+        new_req.max_output_tokens = Some(max_output_tokens.saturating_sub(usage.output_tokens));
     }
 
     new_req

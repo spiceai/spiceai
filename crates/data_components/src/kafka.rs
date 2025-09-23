@@ -268,7 +268,7 @@ impl KafkaConsumer {
     /// Receive a JSON message from the Kafka topic.
     pub async fn next_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
-    ) -> Result<Option<KafkaMessage<K, V>>> {
+    ) -> Result<Option<KafkaMessage<'_, K, V>>> {
         let mut stream = Box::pin(self.stream_json::<K, V>());
         stream.next().await.transpose()
     }
@@ -276,7 +276,7 @@ impl KafkaConsumer {
     /// Stream JSON messages from the Kafka topic.
     pub fn stream_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
-    ) -> impl Stream<Item = Result<KafkaMessage<K, V>>> {
+    ) -> impl Stream<Item = Result<KafkaMessage<'_, K, V>>> {
         self.consumer.stream().filter_map(move |msg| async move {
             let msg = match msg {
                 Ok(msg) => msg,

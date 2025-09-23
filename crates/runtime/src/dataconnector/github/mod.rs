@@ -305,16 +305,15 @@ fn github_gql_raw_schema_cast(
 
     for (idx, field) in record_batch.schema().fields().iter().enumerate() {
         let column = record_batch.column(idx);
-        if let DataType::List(inner_field) = field.data_type() {
-            if let DataType::Struct(struct_fields) = inner_field.data_type() {
-                if struct_fields.len() == 1 {
-                    let (new_column, new_field) =
-                        arrow_tools::record_batch::to_primitive_type_list(column, field)?;
-                    fields.push(new_field);
-                    columns.push(new_column);
-                    continue;
-                }
-            }
+        if let DataType::List(inner_field) = field.data_type()
+            && let DataType::Struct(struct_fields) = inner_field.data_type()
+            && struct_fields.len() == 1
+        {
+            let (new_column, new_field) =
+                arrow_tools::record_batch::to_primitive_type_list(column, field)?;
+            fields.push(new_field);
+            columns.push(new_column);
+            continue;
         }
 
         fields.push(Arc::clone(field));
@@ -905,60 +904,53 @@ fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
 pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     let column_matches = expr_to_match(expr);
 
-    if let Some((column, value, op)) = column_matches {
-        if let Some(column_support) = GITHUB_FILTER_PUSHDOWNS_SUPPORTED.get(column.name.as_str()) {
-            if !column_support.ops.contains(&op) {
-                tracing::debug!("Unsupported operator {op} for column {}", column.name);
+    if let Some((column, value, op)) = column_matches
+        && let Some(column_support) = GITHUB_FILTER_PUSHDOWNS_SUPPORTED.get(column.name.as_str())
+    {
+        if !column_support.ops.contains(&op) {
+            tracing::debug!("Unsupported operator {op} for column {}", column.name);
 
-                return FilterPushdownResult {
-                    filter_pushdown: TableProviderFilterPushDown::Unsupported,
-                    expr: expr.clone(),
-                    context: None,
-                };
-            }
+            return FilterPushdownResult {
+                filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                expr: expr.clone(),
+                context: None,
+            };
+        }
 
-            let column_name = if let Some(remaps) = &column_support.remaps {
-                let mut column_name: Option<&str> = None;
-                for remap in remaps {
-                    match remap {
-                        GitHubFilterRemap::Column(remap_column) => {
+        let column_name = if let Some(remaps) = &column_support.remaps {
+            let mut column_name: Option<&str> = None;
+            for remap in remaps {
+                match remap {
+                    GitHubFilterRemap::Column(remap_column) => {
+                        column_name = Some(remap_column);
+                    }
+                    GitHubFilterRemap::Operator((remap_op, remap_column)) => {
+                        if *remap_op == op {
                             column_name = Some(remap_column);
                         }
-                        GitHubFilterRemap::Operator((remap_op, remap_column)) => {
-                            if *remap_op == op {
-                                column_name = Some(remap_column);
-                            }
-                        }
                     }
                 }
+            }
 
-                column_name.unwrap_or(column.name.as_str())
-            } else {
-                column.name.as_str()
-            };
+            column_name.unwrap_or(column.name.as_str())
+        } else {
+            column.name.as_str()
+        };
 
-            let value = match value {
-                ScalarValue::Utf8(Some(v)) => {
-                    if column.name == "state" {
-                        v.to_lowercase()
-                    } else {
-                        v
-                    }
+        let value = match value {
+            ScalarValue::Utf8(Some(v)) => {
+                if column.name == "state" {
+                    v.to_lowercase()
+                } else {
+                    v
                 }
-                ScalarValue::TimestampMillisecond(Some(millis), _) => {
-                    let dt = Utc.timestamp_millis_opt(millis);
-                    match dt {
-                        LocalResult::Single(dt) => match column_name {
-                            "updated" | "created" | "closed" | "merged" => dt.to_rfc3339(),
-                            "since" | "until" => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
-                            _ => {
-                                return FilterPushdownResult {
-                                    filter_pushdown: TableProviderFilterPushDown::Unsupported,
-                                    expr: expr.clone(),
-                                    context: None,
-                                };
-                            }
-                        },
+            }
+            ScalarValue::TimestampMillisecond(Some(millis), _) => {
+                let dt = Utc.timestamp_millis_opt(millis);
+                match dt {
+                    LocalResult::Single(dt) => match column_name {
+                        "updated" | "created" | "closed" | "merged" => dt.to_rfc3339(),
+                        "since" | "until" => dt.to_rfc3339_opts(SecondsFormat::Secs, true),
                         _ => {
                             return FilterPushdownResult {
                                 filter_pushdown: TableProviderFilterPushDown::Unsupported,
@@ -966,39 +958,46 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                                 context: None,
                             };
                         }
+                    },
+                    _ => {
+                        return FilterPushdownResult {
+                            filter_pushdown: TableProviderFilterPushDown::Unsupported,
+                            expr: expr.clone(),
+                            context: None,
+                        };
                     }
                 }
-                _ => value.to_string(),
-            };
+            }
+            _ => value.to_string(),
+        };
 
-            let neq = match op {
-                Operator::NotEq => "-",
-                _ => "",
-            };
+        let neq = match op {
+            Operator::NotEq => "-",
+            _ => "",
+        };
 
-            let modifier = match (column_support.uses_modifiers, op) {
-                (true, Operator::LtEq) => "<=",
-                (true, Operator::Lt) => "<",
-                (true, Operator::GtEq) => ">=",
-                (true, Operator::Gt) => ">",
-                _ => "",
-            };
+        let modifier = match (column_support.uses_modifiers, op) {
+            (true, Operator::LtEq) => "<=",
+            (true, Operator::Lt) => "<",
+            (true, Operator::GtEq) => ">=",
+            (true, Operator::Gt) => ">",
+            _ => "",
+        };
 
-            let parameter = match column_name {
-                "title" => format!("{value} in:title"),
-                "body" => format!("{value} in:body"),
-                "state" => format!("is:{value}"), // is:merged, is:closed, is:open provides more granular results than state:closed
-                // state:closed returns both closed and merged PRs, but is:merged returns only merged PRs
-                // is:closed still returns both closed and merged PRs
-                _ => format!("{neq}{column_name}:{modifier}{value}"),
-            };
+        let parameter = match column_name {
+            "title" => format!("{value} in:title"),
+            "body" => format!("{value} in:body"),
+            "state" => format!("is:{value}"), // is:merged, is:closed, is:open provides more granular results than state:closed
+            // state:closed returns both closed and merged PRs, but is:merged returns only merged PRs
+            // is:closed still returns both closed and merged PRs
+            _ => format!("{neq}{column_name}:{modifier}{value}"),
+        };
 
-            return FilterPushdownResult {
-                filter_pushdown: TableProviderFilterPushDown::Inexact,
-                expr: expr.clone(),
-                context: Some(parameter),
-            };
-        }
+        return FilterPushdownResult {
+            filter_pushdown: TableProviderFilterPushDown::Inexact,
+            expr: expr.clone(),
+            context: Some(parameter),
+        };
     }
 
     FilterPushdownResult {

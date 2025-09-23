@@ -80,7 +80,7 @@ impl SpiceCloudPlatformCatalog {
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
-            connector: "iceberg".into(),
+            connector: "spice.ai".into(),
             connector_component: ConnectorComponent::from(catalog),
             source: Box::new(e),
         })?;

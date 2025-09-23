@@ -51,10 +51,10 @@ impl Backoff for FibonacciBackoff {
     fn next_backoff(&mut self) -> Option<Duration> {
         self.num_retries += 1;
 
-        if let Some(max_retries) = self.max_retries {
-            if self.num_retries > max_retries {
-                return None;
-            }
+        if let Some(max_retries) = self.max_retries
+            && self.num_retries > max_retries
+        {
+            return None;
         }
 
         let interval = if self.num_retries >= BACKOFF_INTERVALS_MS.len() {

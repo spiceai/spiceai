@@ -298,11 +298,9 @@ fn to_sendable_stream(
             }
 
             // Early exit on LIMIT clause
-            if let Some(limit) = limit {
-                if count >= limit {
+            if let Some(limit) = limit && count >= limit {
                     break;
                 }
-            }
         }
     }
 }

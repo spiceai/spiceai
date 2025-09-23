@@ -382,7 +382,7 @@ mod tests {
 
         // Test conversion without SQL
         let result_without_sql =
-            arrow_to_vnd_sql_json_v1(&[batch.clone()], ResponseMetadata::empty())
+            arrow_to_vnd_sql_json_v1(std::slice::from_ref(&batch), ResponseMetadata::empty())
                 .expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_without_sql",

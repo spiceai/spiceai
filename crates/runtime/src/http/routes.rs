@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::needless_for_each)]
+
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
@@ -67,6 +69,7 @@ use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 #[cfg(feature = "openapi")]
+#[allow(clippy::needless_for_each)]
 #[derive(OpenApi)]
 #[openapi(
     servers(
@@ -104,6 +107,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
     components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
 )]
+#[allow(clippy::needless_for_each)]
 pub(crate) struct ApiDoc;
 
 /// Returns the `OpenAPI` documentation for the HTTP API. Adds MCP endpoints if the feature is enabled.

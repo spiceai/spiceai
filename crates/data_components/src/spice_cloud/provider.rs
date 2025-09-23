@@ -232,11 +232,11 @@ impl SpiceCloudPlatformSchemaProvider {
                             table_name.name().to_string(),
                         ),
                     };
-                if let Some(include) = &include {
-                    if !include.is_match(schema_and_table) {
-                        tracing::debug!("Table {} is not included", table_reference);
-                        return None;
-                    }
+                if let Some(include) = &include
+                    && !include.is_match(schema_and_table)
+                {
+                    tracing::debug!("Table {} is not included", table_reference);
+                    return None;
                 }
                 Some(table_reference)
             })

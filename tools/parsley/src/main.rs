@@ -20,8 +20,8 @@ use std::{path::PathBuf, str::from_utf8, sync::Arc};
 use tiktoken_rs::{get_bpe_from_tokenizer, tokenizer::get_tokenizer};
 use tokenizers::Tokenizer;
 
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper};
 use document_parse::{DocumentParser, DocxParser, PdfParser};
-use llms::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper};
 
 use crate::output::StructuredOutput;
 

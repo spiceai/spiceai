@@ -29,7 +29,7 @@ use rand::Rng;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use spicepod::component::runtime::CorsConfig;
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 #[tokio::test]
 async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {

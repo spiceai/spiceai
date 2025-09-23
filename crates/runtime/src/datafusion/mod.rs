@@ -395,15 +395,15 @@ impl DataFusion {
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
-        if let Some(schema) = table_name.schema() {
-            if let Some(eval_schema) = self.schema(schema) {
-                eval_schema
-                    .register_table(table_name.table().to_string(), table)
-                    .map_err(find_datafusion_root)
-                    .context(UnableToRegisterTableToDataFusionSchemaSnafu {
-                        schema: SPICE_EVAL_SCHEMA,
-                    })?;
-            }
+        if let Some(schema) = table_name.schema()
+            && let Some(eval_schema) = self.schema(schema)
+        {
+            eval_schema
+                .register_table(table_name.table().to_string(), table)
+                .map_err(find_datafusion_root)
+                .context(UnableToRegisterTableToDataFusionSchemaSnafu {
+                    schema: SPICE_EVAL_SCHEMA,
+                })?;
         }
 
         self.data_writers
@@ -538,25 +538,25 @@ impl DataFusion {
     ) -> Result<Arc<dyn TableProvider>> {
         let table_name = table_reference.table();
 
-        if let Some(schema_name) = table_reference.schema() {
-            if let Some(schema) = self.schema(schema_name) {
-                let table_provider = schema
-                    .table(table_name)
-                    .await
-                    .map_err(find_datafusion_root)
-                    .context(UnableToGetTableSnafu)?
-                    .ok_or_else(|| {
-                        TableMissingSnafu {
-                            schema: schema_name.to_string(),
-                            table: table_name.to_string(),
-                        }
-                        .build()
-                    })
-                    .boxed()
-                    .context(UnableToGetSchemaTableSnafu)?;
+        if let Some(schema_name) = table_reference.schema()
+            && let Some(schema) = self.schema(schema_name)
+        {
+            let table_provider = schema
+                .table(table_name)
+                .await
+                .map_err(find_datafusion_root)
+                .context(UnableToGetTableSnafu)?
+                .ok_or_else(|| {
+                    TableMissingSnafu {
+                        schema: schema_name.to_string(),
+                        table: table_name.to_string(),
+                    }
+                    .build()
+                })
+                .boxed()
+                .context(UnableToGetSchemaTableSnafu)?;
 
-                return Ok(table_provider);
-            }
+            return Ok(table_provider);
         }
 
         let table_provider = self
@@ -912,12 +912,12 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await {
-            if checkpoint.exists().await {
-                self.runtime_status
-                    .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-                initial_load_complete = true;
-            }
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await
+            && checkpoint.exists().await
+        {
+            self.runtime_status
+                .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+            initial_load_complete = true;
         }
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -1418,20 +1418,20 @@ impl DataFusion {
                 }
             };
 
-            if let Some(acceleration) = &view.acceleration {
-                if acceleration.enabled {
-                    match df_ref
-                        .create_accelerated_view(&view, view_table, secrets)
-                        .await
-                    {
-                        Ok(is_ready) => {
-                            return is_ready;
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to create view {table}: {e}");
-                            status.update_view(table, status::ComponentStatus::Error);
-                            return None;
-                        }
+            if let Some(acceleration) = &view.acceleration
+                && acceleration.enabled
+            {
+                match df_ref
+                    .create_accelerated_view(&view, view_table, secrets)
+                    .await
+                {
+                    Ok(is_ready) => {
+                        return is_ready;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create view {table}: {e}");
+                        status.update_view(table, status::ComponentStatus::Error);
+                        return None;
                     }
                 }
             }
@@ -1488,10 +1488,10 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view).await {
-            if checkpoint.exists().await {
-                initial_load_complete = true;
-            }
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view).await
+            && checkpoint.exists().await
+        {
+            initial_load_complete = true;
         }
 
         let mut refresh = Refresh::new(RefreshMode::Full).with_retry(

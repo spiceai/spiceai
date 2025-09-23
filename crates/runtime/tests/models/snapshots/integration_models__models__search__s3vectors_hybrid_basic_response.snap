@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+      },
+      "primary_key": {
+        "id": 6
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+      },
+      "primary_key": {
+        "id": 361
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\(\\boxed{x = A + E}\\)"
+      },
+      "primary_key": {
+        "id": 590
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\(\\boxed{2a + 4b}\\)"
+      },
+      "primary_key": {
+        "id": 1316
+      },
+      "score": 0.01
+    }
+  ]
+}

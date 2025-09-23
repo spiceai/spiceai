@@ -249,12 +249,11 @@ impl GitHubTableArgs for PullRequestTableArgs {
 }
 
 fn flatten_author_field(comment: &mut Value) {
-    if let Value::Object(comment_obj) = comment {
-        if let Some(Value::Object(author_obj)) = comment_obj.get("author") {
-            if let Some(Value::String(author_name)) = author_obj.get("author") {
-                comment_obj.insert("author".to_string(), Value::String(author_name.clone()));
-            }
-        }
+    if let Value::Object(comment_obj) = comment
+        && let Some(Value::Object(author_obj)) = comment_obj.get("author")
+        && let Some(Value::String(author_name)) = author_obj.get("author")
+    {
+        comment_obj.insert("author".to_string(), Value::String(author_name.clone()));
     }
 }
 
