@@ -69,6 +69,7 @@ pub fn partition_by_expressions(
     partition_by: &[String],
     ctx: &SessionContext,
     df_schema: &DFSchema,
+    criteria: &dyn Criterion,
 ) -> Result<PartitionBy, Error> {
     let mut hasher = DefaultHasher::new();
     partition_by.hash(&mut hasher);
@@ -80,7 +81,7 @@ pub fn partition_by_expressions(
             let expr = ctx
                 .parse_sql_expr(sql, df_schema)
                 .context(ParsingExpressionSnafu)?;
-            PartitionCriteria.validate(&expr, df_schema)?;
+            criteria.validate(&expr, df_schema)?;
             Ok(expr)
         })
         .collect::<Result<Vec<_>, _>>()?;
