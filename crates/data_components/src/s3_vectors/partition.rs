@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -169,9 +169,154 @@ fn hash_to_hex(input: &str) -> String {
 fn to_stable_string(exprs: &[Expr]) -> Result<String, DataFusionError> {
     Ok(exprs
         .iter()
-        .map(|expr| expr_to_sql(expr).map(|e| e.to_string()))
+        .map(stable_expr_string)
         .collect::<Result<Vec<String>, DataFusionError>>()?
         .join(PARTS_SEPARATOR))
+}
+
+fn stable_expr_string(expr: &Expr) -> String {
+    match expr {
+        Expr::Alias(alias) => {
+            let name = &alias.name;
+            let expr_str = stable_expr_string(&alias.expr);
+            format!("Alias({name}, {expr_str})")
+        }
+        Expr::Column(col) => {
+            format!("Column({})", col.name())
+        }
+        Expr::ScalarVariable(_, vars) => {
+            format!("ScalarVariable({})", vars.join("."))
+        }
+        Expr::Literal(scalar, _) => {
+            format!("Literal({scalar})")
+        }
+        Expr::BinaryExpr(binary) => {
+            let left = stable_expr_string(&binary.left);
+            let op = binary.op;
+            let right = stable_expr_string(&binary.right);
+            format!("BinaryExpr({left} {op} {right})")
+        }
+        Expr::Like(like) => {
+            let expr = stable_expr_string(&like.expr);
+            let pattern = stable_expr_string(&like.pattern);
+            format!("Like({expr}, {pattern})")
+        }
+        Expr::SimilarTo(_) => "SimilarTo(...)".to_string(),
+        Expr::Not(inner) => {
+            format!("Not({})", stable_expr_string(inner))
+        }
+        Expr::IsNotNull(inner) => {
+            format!("IsNotNull({})", stable_expr_string(inner))
+        }
+        Expr::IsNull(inner) => {
+            format!("IsNull({})", stable_expr_string(inner))
+        }
+        Expr::IsTrue(inner) => {
+            format!("IsTrue({})", stable_expr_string(inner))
+        }
+        Expr::IsFalse(inner) => {
+            format!("IsFalse({})", stable_expr_string(inner))
+        }
+        Expr::IsUnknown(inner) => {
+            format!("IsUnknown({})", stable_expr_string(inner))
+        }
+        Expr::IsNotTrue(inner) => {
+            format!("IsNotTrue({})", stable_expr_string(inner))
+        }
+        Expr::IsNotFalse(inner) => {
+            format!("IsNotFalse({})", stable_expr_string(inner))
+        }
+        Expr::IsNotUnknown(inner) => {
+            format!("IsNotUnknown({})", stable_expr_string(inner))
+        }
+        Expr::Negative(inner) => {
+            format!("Negative({})", stable_expr_string(inner))
+        }
+        Expr::Between(between) => {
+            let expr = stable_expr_string(&between.expr);
+            let low = stable_expr_string(&between.low);
+            let high = stable_expr_string(&between.high);
+            format!("Between({expr}, {low}, {high})")
+        }
+        Expr::Case(case) => {
+            let else_expr = case
+                .else_expr
+                .as_ref()
+                .map(|e| stable_expr_string(e))
+                .unwrap_or_else(|| "None".to_string());
+            let when_then_pairs = case
+                .when_then_pairs
+                .iter()
+                .map(|(w, t)| format!("({} => {})", stable_expr_string(w), stable_expr_string(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Case({when_then_pairs}, {else_expr})")
+        }
+        Expr::Cast(cast) => {
+            let expr = stable_expr_string(&cast.expr);
+            format!("Cast({expr}, {})", cast.data_type)
+        }
+        Expr::TryCast(cast) => {
+            let expr = stable_expr_string(&cast.expr);
+            format!("TryCast({expr}, {})", cast.data_type)
+        }
+        Expr::ScalarFunction(func) => {
+            // For simplicity, use function name and first few args
+            let args_str = func
+                .args
+                .iter()
+                .map(stable_expr_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("ScalarFunction({}({args_str}))", func.func)
+        }
+        Expr::AggregateFunction(agg) => {
+            let args_str = agg
+                .args
+                .iter()
+                .map(stable_expr_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("AggregateFunction({}({args_str}))", agg.func)
+        }
+        Expr::WindowFunction(window) => {
+            format!("WindowFunction({window})")
+        }
+        Expr::InList(in_list) => {
+            let expr = stable_expr_string(&in_list.expr);
+            let list_str = in_list
+                .list
+                .iter()
+                .map(stable_expr_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("InList({expr}, [{list_str}])")
+        }
+        Expr::Exists(_) => "Exists(...)".to_string(),
+        Expr::InSubquery(in_sub) => {
+            let expr = stable_expr_string(&in_sub.expr);
+            format!("InSubquery({expr}, ...)")
+        }
+        Expr::ScalarSubquery(_) => "ScalarSubquery(...)".to_string(),
+        Expr::Wildcard { qualifier, options } => {
+            let qual = qualifier
+                .as_ref()
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| "None".to_string());
+            format!("Wildcard({qual}, {options})")
+        }
+        Expr::GroupingSet(_) => "GroupingSet(...)".to_string(),
+        Expr::Placeholder(placeholder) => {
+            format!("Placeholder({placeholder})")
+        }
+        Expr::OuterReferenceColumn(_, col) => {
+            format!("OuterReferenceColumn({}, {})", col.data_type, col.name())
+        }
+        Expr::Unnest(unnest) => {
+            let expr = stable_expr_string(&unnest.expr);
+            format!("Unnest({expr})")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -196,10 +341,13 @@ mod tests {
         let partition_value = ScalarValue::from("val");
         let partition_by = vec![col("col1")];
 
-        assert!(
-            PartitionedIndexName::new(&index_name, column_name, &partition_value, &partition_by)
-                .is_err()
-        );
+        assert!(PartitionedIndexName::new(
+            &index_name,
+            column_name,
+            &partition_value,
+            &partition_by
+        )
+        .is_err());
     }
 
     #[test]
