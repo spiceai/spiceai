@@ -872,18 +872,17 @@ impl RefreshTask {
     }
 
     async fn log_refresh_error(&self, error: &super::Error, refresh_sql: Option<&str>) {
-        if let super::Error::UnableToGetDataFromConnector { source } = error {
-            if let Some(SpiceExternalError::AccelerationNotReady { dataset_name }) =
+        if let super::Error::UnableToGetDataFromConnector { source } = error
+            && let Some(SpiceExternalError::AccelerationNotReady { dataset_name }) =
                 get_spice_df_error(source)
-            {
-                tracing::warn!(
-                    "Dataset {} is waiting for {dataset_name} to finish loading initial acceleration.",
-                    self.dataset_name
-                );
-                self.set_refresh_status(refresh_sql, status::ComponentStatus::Initializing)
-                    .await;
-                return;
-            }
+        {
+            tracing::warn!(
+                "Dataset {} is waiting for {dataset_name} to finish loading initial acceleration.",
+                self.dataset_name
+            );
+            self.set_refresh_status(refresh_sql, status::ComponentStatus::Initializing)
+                .await;
+            return;
         }
 
         // For all errors that result from calling DataFusion, check if they are due to the task being cancelled and ignore them
@@ -896,13 +895,12 @@ impl RefreshTask {
             | super::Error::FailedToWriteData { source } => {
                 // Match against an Internal error with the message "Non Panic Task error":
                 // <https://github.com/apache/datafusion/blob/f6c92fecb23c927bdc6a9feb058f03a2fb61d63f/datafusion/physical-plan/src/stream.rs#L132>
-                if let DataFusionError::Internal(msg) = &source {
-                    if msg.contains("Non Panic Task error") && msg.contains("was cancelled") {
-                        tracing::debug!(
-                            "Ignoring DataFusion error due to task cancellation: {source}"
-                        );
-                        return;
-                    }
+                if let DataFusionError::Internal(msg) = &source
+                    && msg.contains("Non Panic Task error")
+                    && msg.contains("was cancelled")
+                {
+                    tracing::debug!("Ignoring DataFusion error due to task cancellation: {source}");
+                    return;
                 }
             }
             _ => (),

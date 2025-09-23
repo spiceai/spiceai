@@ -35,7 +35,7 @@ use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 #[allow(clippy::too_many_lines)]
 #[tokio::test]

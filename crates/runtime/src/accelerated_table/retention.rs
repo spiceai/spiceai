@@ -138,17 +138,15 @@ impl super::AcceleratedTable {
 
                             log_retention_result(&dataset_name, num_records);
 
-                            if num_records > 0 {
-                                if let Some(cache_provider) = caching.as_ref() {
-                                    if let Err(e) =
-                                        cache_provider.invalidate_for_table(dataset_name.clone())
-                                    {
-                                        tracing::error!(
-                                            "Failed to invalidate cached results for dataset {}: {e}",
-                                            &dataset_name
-                                        );
-                                    }
-                                }
+                            if num_records > 0
+                                && let Some(cache_provider) = caching.as_ref()
+                                && let Err(e) =
+                                    cache_provider.invalidate_for_table(dataset_name.clone())
+                            {
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name
+                                );
                             }
                         }
                     },

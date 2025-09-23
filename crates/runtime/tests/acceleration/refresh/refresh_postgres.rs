@@ -41,7 +41,6 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
                 ("pg_db".to_string(), "acceleration".to_string()),
                 ("pg_sslmode".to_string(), "disable".to_string()),
                 ("pg_port".to_string(), port.to_string()),
-                ("pg_port".to_string(), port.to_string()),
             ]
             .iter()
             .cloned()

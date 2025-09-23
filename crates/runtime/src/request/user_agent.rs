@@ -123,10 +123,10 @@ impl Parsed {
         let mut system = None;
         if !rest.is_empty() {
             let rest = rest.trim();
-            if rest.starts_with('(') {
-                if let Some(end_paren) = find_matching_parenthesis(rest) {
-                    system = Some(Arc::from(&rest[1..end_paren]));
-                }
+            if rest.starts_with('(')
+                && let Some(end_paren) = find_matching_parenthesis(rest)
+            {
+                system = Some(Arc::from(&rest[1..end_paren]));
             }
         }
 

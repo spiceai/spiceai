@@ -214,12 +214,11 @@ impl DuckDBAccelerator {
 
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
-                    if acceleration.mode == Mode::File {
-                        if let Ok(file_path) = self.file_path(ds.as_ref()) {
-                            if this_file_path == file_path {
-                                instance_usage += 1;
-                            }
-                        }
+                    if acceleration.mode == Mode::File
+                        && let Ok(file_path) = self.file_path(ds.as_ref())
+                        && this_file_path == file_path
+                    {
+                        instance_usage += 1;
                     }
                 } else {
                     // If the path is None, we're just counting the number of memory instances

@@ -256,10 +256,10 @@ impl GithubRestClient {
             HeaderValue::from_static("application/vnd.github.v3+json"),
         );
 
-        if let Some(token) = self.token.as_ref() {
-            if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
-                headers.insert(AUTHORIZATION, header);
-            }
+        if let Some(token) = self.token.as_ref()
+            && let Ok(header) = HeaderValue::from_str(&format!("token {token}"))
+        {
+            headers.insert(AUTHORIZATION, header);
         }
 
         tracing::debug!("fetch_git_tree: endpoint: {}", endpoint);

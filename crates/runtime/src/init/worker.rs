@@ -21,6 +21,7 @@ use opentelemetry::KeyValue;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
+#[allow(dead_code)]
 pub enum Error {}
 
 impl Runtime {

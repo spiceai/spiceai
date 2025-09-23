@@ -936,10 +936,10 @@ impl GraphQLClient {
             }
 
             while let Some(next_cursor_val) = result.cursor {
-                if let Some(p) = query.pagination_parameters.as_ref() {
-                    if let Some(value) = limit {
-                        limit = Some(p.reduce_limit(value));
-                    }
+                if let Some(p) = query.pagination_parameters.as_ref()
+                    && let Some(value) = limit
+                {
+                    limit = Some(p.reduce_limit(value));
                 }
 
                 result = self

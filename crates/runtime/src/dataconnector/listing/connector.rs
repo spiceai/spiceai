@@ -294,10 +294,10 @@ pub trait ListingTableConnector: DataConnector {
             format = format.with_format(json_format);
         }
 
-        if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose() {
-            if flatten_json.eq_ignore_ascii_case("true") {
-                format = format.with_flatten_json(".".to_string());
-            }
+        if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose()
+            && flatten_json.eq_ignore_ascii_case("true")
+        {
+            format = format.with_flatten_json(".".to_string());
         }
 
         Ok(Arc::new(format))
@@ -428,7 +428,7 @@ pub trait ListingTableConnector: DataConnector {
     }
 
     /// A hook that is called when an accelerated table is registered to the
-    /// DataFusion context for this data connector.
+    /// `DataFusion` context for this data connector.
     ///
     /// Allows running any setup logic specific to the data connector when its
     /// accelerated table is registered, i.e. setting up a file watcher to refresh
@@ -668,7 +668,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 
     /// A hook that is called when an accelerated table is registered to the
-    /// DataFusion context for this data connector.
+    /// `DataFusion` context for this data connector.
     ///
     /// Allows running any setup logic specific to the data connector when its
     /// accelerated table is registered, i.e. setting up a file watcher to refresh
@@ -845,10 +845,10 @@ async fn verify_schema_source_path(
                 source: err.into(),
             })?
     {
-        if let Some(ext) = file.location.extension() {
-            if format!(".{ext}") == extension {
-                return Ok(Some(file));
-            }
+        if let Some(ext) = file.location.extension()
+            && format!(".{ext}") == extension
+        {
+            return Ok(Some(file));
         }
 
         scanned_files += 1;

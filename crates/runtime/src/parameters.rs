@@ -118,12 +118,12 @@ impl Parameters {
 
         // Check for deprecated parameters
         for parameter in all_params {
-            if let Some(deprecation_message) = parameter.deprecation_message {
-                if let Some((param, _)) = params.iter().find(|p| p.0 == parameter.name) {
-                    tracing::warn!(
-                        "Parameter '{param}' is deprecated for {component_name}: {deprecation_message}",
-                    );
-                }
+            if let Some(deprecation_message) = parameter.deprecation_message
+                && let Some((param, _)) = params.iter().find(|p| p.0 == parameter.name)
+            {
+                tracing::warn!(
+                    "Parameter '{param}' is deprecated for {component_name}: {deprecation_message}",
+                );
             }
         }
 
@@ -151,11 +151,9 @@ impl Parameters {
         for parameter in all_params {
             // If the parameter is missing and has a default value, add it to the params
             let missing = !params.iter().any(|p| p.0 == parameter.name);
-            if missing {
-                if let Some(default_value) = parameter.default {
-                    params.push((parameter.name.to_string(), default_value.to_string().into()));
-                    continue;
-                }
+            if missing && let Some(default_value) = parameter.default {
+                params.push((parameter.name.to_string(), default_value.to_string().into()));
+                continue;
             }
 
             if parameter.required && missing {

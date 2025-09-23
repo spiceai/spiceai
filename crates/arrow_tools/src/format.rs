@@ -376,7 +376,7 @@ Cras venenatis euismod malesuada.",
         )?;
 
         let formatted = to_markdown_documents(
-            &[batch.clone()],
+            std::slice::from_ref(&batch),
             "content_chunk",
             None,
             &["location".to_string(), "dist".to_string()],

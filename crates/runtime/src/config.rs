@@ -50,12 +50,9 @@ impl Config {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8090),
-            flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50051),
-            open_telemetry_bind_address: SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                50052,
-            ),
+            http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8090),
+            flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051),
+            open_telemetry_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
         }
     }
 
