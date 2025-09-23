@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use datafusion::{
-    error::DataFusionError, prelude::Expr, scalar::ScalarValue, sql::unparser::expr_to_sql,
+    error::DataFusionError,
+    logical_expr::{Case, expr::ScalarFunction},
+    prelude::Expr,
+    scalar::ScalarValue,
 };
 use snafu::prelude::*;
 use twox_hash::XxHash64;
@@ -174,13 +177,8 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, DataFusionError> {
         .join(PARTS_SEPARATOR))
 }
 
-fn stable_expr_string(expr: &Expr) -> String {
-    match expr {
-        Expr::Alias(alias) => {
-            let name = &alias.name;
-            let expr_str = stable_expr_string(&alias.expr);
-            format!("Alias({name}, {expr_str})")
-        }
+fn stable_expr_string(expr: &Expr) -> Result<String, DataFusionError> {
+    Ok(match expr {
         Expr::Column(col) => {
             format!("Column({})", col.name())
         }
@@ -191,136 +189,111 @@ fn stable_expr_string(expr: &Expr) -> String {
             format!("Literal({scalar})")
         }
         Expr::BinaryExpr(binary) => {
-            let left = stable_expr_string(&binary.left);
+            let left = stable_expr_string(&binary.left)?;
             let op = binary.op;
-            let right = stable_expr_string(&binary.right);
+            let right = stable_expr_string(&binary.right)?;
             format!("BinaryExpr({left} {op} {right})")
         }
-        Expr::Like(like) => {
-            let expr = stable_expr_string(&like.expr);
-            let pattern = stable_expr_string(&like.pattern);
-            format!("Like({expr}, {pattern})")
-        }
-        Expr::SimilarTo(_) => "SimilarTo(...)".to_string(),
         Expr::Not(inner) => {
-            format!("Not({})", stable_expr_string(inner))
+            format!("Not({})", stable_expr_string(inner)?)
         }
         Expr::IsNotNull(inner) => {
-            format!("IsNotNull({})", stable_expr_string(inner))
+            format!("IsNotNull({})", stable_expr_string(inner)?)
         }
         Expr::IsNull(inner) => {
-            format!("IsNull({})", stable_expr_string(inner))
+            format!("IsNull({})", stable_expr_string(inner)?)
         }
         Expr::IsTrue(inner) => {
-            format!("IsTrue({})", stable_expr_string(inner))
+            format!("IsTrue({})", stable_expr_string(inner)?)
         }
         Expr::IsFalse(inner) => {
-            format!("IsFalse({})", stable_expr_string(inner))
+            format!("IsFalse({})", stable_expr_string(inner)?)
         }
         Expr::IsUnknown(inner) => {
-            format!("IsUnknown({})", stable_expr_string(inner))
+            format!("IsUnknown({})", stable_expr_string(inner)?)
         }
         Expr::IsNotTrue(inner) => {
-            format!("IsNotTrue({})", stable_expr_string(inner))
+            format!("IsNotTrue({})", stable_expr_string(inner)?)
         }
         Expr::IsNotFalse(inner) => {
-            format!("IsNotFalse({})", stable_expr_string(inner))
+            format!("IsNotFalse({})", stable_expr_string(inner)?)
         }
         Expr::IsNotUnknown(inner) => {
-            format!("IsNotUnknown({})", stable_expr_string(inner))
+            format!("IsNotUnknown({})", stable_expr_string(inner)?)
         }
         Expr::Negative(inner) => {
-            format!("Negative({})", stable_expr_string(inner))
+            format!("Negative({})", stable_expr_string(inner)?)
         }
         Expr::Between(between) => {
-            let expr = stable_expr_string(&between.expr);
-            let low = stable_expr_string(&between.low);
-            let high = stable_expr_string(&between.high);
-            format!("Between({expr}, {low}, {high})")
+            let expr = stable_expr_string(&between.expr)?;
+            let low = stable_expr_string(&between.low)?;
+            let high = stable_expr_string(&between.high)?;
+            format!(
+                "Between({expr}, {negated}, {low}, {high})",
+                negated = between.negated
+            )
         }
-        Expr::Case(case) => {
-            let else_expr = case
-                .else_expr
+        Expr::Case(Case {
+            expr,
+            when_then_expr,
+            else_expr,
+        }) => {
+            let expr = match expr {
+                Some(expr) => &format!("Some({expr})"),
+                None => "None",
+            };
+            let else_expr = else_expr
                 .as_ref()
-                .map(|e| stable_expr_string(e))
+                .and_then(|e| stable_expr_string(e).ok())
                 .unwrap_or_else(|| "None".to_string());
-            let when_then_pairs = case
-                .when_then_pairs
+            let when_then_expr = when_then_expr
                 .iter()
-                .map(|(w, t)| format!("({} => {})", stable_expr_string(w), stable_expr_string(t)))
-                .collect::<Vec<_>>()
+                .map(|(w, t)| {
+                    Ok(format!(
+                        "({} => {})",
+                        stable_expr_string(w)?,
+                        stable_expr_string(t)?
+                    ))
+                })
+                .collect::<Result<Vec<_>, DataFusionError>>()?
                 .join(", ");
-            format!("Case({when_then_pairs}, {else_expr})")
+            format!("Case({expr}, {when_then_expr}, {else_expr})")
         }
         Expr::Cast(cast) => {
-            let expr = stable_expr_string(&cast.expr);
+            let expr = stable_expr_string(&cast.expr)?;
             format!("Cast({expr}, {})", cast.data_type)
         }
         Expr::TryCast(cast) => {
-            let expr = stable_expr_string(&cast.expr);
+            let expr = stable_expr_string(&cast.expr)?;
             format!("TryCast({expr}, {})", cast.data_type)
         }
-        Expr::ScalarFunction(func) => {
-            // For simplicity, use function name and first few args
-            let args_str = func
-                .args
+        Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            let args_str = args
                 .iter()
                 .map(stable_expr_string)
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
-            format!("ScalarFunction({}({args_str}))", func.func)
-        }
-        Expr::AggregateFunction(agg) => {
-            let args_str = agg
-                .args
-                .iter()
-                .map(stable_expr_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("AggregateFunction({}({args_str}))", agg.func)
-        }
-        Expr::WindowFunction(window) => {
-            format!("WindowFunction({window})")
+            format!("ScalarFunction({}({args_str}))", func.name())
         }
         Expr::InList(in_list) => {
-            let expr = stable_expr_string(&in_list.expr);
+            let expr = stable_expr_string(&in_list.expr)?;
             let list_str = in_list
                 .list
                 .iter()
                 .map(stable_expr_string)
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             format!("InList({expr}, [{list_str}])")
         }
-        Expr::Exists(_) => "Exists(...)".to_string(),
-        Expr::InSubquery(in_sub) => {
-            let expr = stable_expr_string(&in_sub.expr);
-            format!("InSubquery({expr}, ...)")
+        e => {
+            return Err(DataFusionError::External(
+                format!("expression {e:?} is not supported in 'partition_by'").into(),
+            ));
         }
-        Expr::ScalarSubquery(_) => "ScalarSubquery(...)".to_string(),
-        Expr::Wildcard { qualifier, options } => {
-            let qual = qualifier
-                .as_ref()
-                .map(|q| q.to_string())
-                .unwrap_or_else(|| "None".to_string());
-            format!("Wildcard({qual}, {options})")
-        }
-        Expr::GroupingSet(_) => "GroupingSet(...)".to_string(),
-        Expr::Placeholder(placeholder) => {
-            format!("Placeholder({placeholder})")
-        }
-        Expr::OuterReferenceColumn(_, col) => {
-            format!("OuterReferenceColumn({}, {})", col.data_type, col.name())
-        }
-        Expr::Unnest(unnest) => {
-            let expr = stable_expr_string(&unnest.expr);
-            format!("Unnest({expr})")
-        }
-    }
+    })
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::sync::Arc;
 
@@ -333,6 +306,7 @@ mod tests {
     };
     use datafusion::prelude::{case, col, lit};
     use datafusion::scalar::ScalarValue;
+    use insta::assert_snapshot;
 
     #[test]
     fn index_name_length_restricted() {
@@ -341,13 +315,10 @@ mod tests {
         let partition_value = ScalarValue::from("val");
         let partition_by = vec![col("col1")];
 
-        assert!(PartitionedIndexName::new(
-            &index_name,
-            column_name,
-            &partition_value,
-            &partition_by
-        )
-        .is_err());
+        assert!(
+            PartitionedIndexName::new(&index_name, column_name, &partition_value, &partition_by)
+                .is_err()
+        );
     }
 
     #[test]
@@ -465,16 +436,16 @@ mod tests {
     #[test]
     fn partition_by_stability() {
         let partition_by = &[col("id").eq(lit(7))];
-        assert_eq!(to_stable_string(partition_by).unwrap(), "(id = 7)");
+        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
         let partition_by = &[Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(Bucket::new())),
             args: vec![lit(10i64), col("a")],
         })];
-        assert_eq!(to_stable_string(partition_by).unwrap(), "bucket(10, a)");
+        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
         let partition_by = &[col("a") % lit(10)];
-        assert_eq!(to_stable_string(partition_by).unwrap(), "(a % 10)");
+        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
         let partition_by = &[col("region")];
-        assert_eq!(to_stable_string(partition_by).unwrap(), "region");
+        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
         let partition_by = &[case(Expr::ScalarFunction(ScalarFunction {
             func: regexp_match(),
             args: vec![col("a"), lit("^DATAFUSION(-cli)*")],
@@ -482,9 +453,6 @@ mod tests {
         .when(lit(true), lit("datafusion"))
         .otherwise(lit("other"))
         .unwrap()];
-        assert_eq!(
-            to_stable_string(partition_by).unwrap(),
-            "CASE regexp_match(a, '^DATAFUSION(-cli)*') WHEN true THEN 'datafusion' ELSE 'other' END"
-        );
+        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
     }
 }
