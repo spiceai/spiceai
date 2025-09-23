@@ -40,7 +40,7 @@ impl DocumentSimilarityTool {
     #[must_use]
     pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
-            name: name.unwrap_or("document_similarity").to_string(),
+            name: name.unwrap_or("search").to_string(),
             description: description
                 .unwrap_or("Search and retrieve documents from available datasets")
                 .to_string(),
@@ -64,11 +64,11 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name().to_string(), input = arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::search", tool = self.name().to_string(), input = arg);
 
         let tool_use_result = async {
             let req: SearchRequestBaseJson = serde_json::from_str(arg)?;
-            tracing::trace!("document_similarity tool use function call request: {req:?}");
+            tracing::trace!("search tool use function call request: {req:?}");
 
             let vs = VectorSearch::new(
                 self.rt.datafusion(),

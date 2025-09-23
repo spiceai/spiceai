@@ -14,7 +14,7 @@ model_system_prompt: &model_system_prompt |
   - If the answer is not found, respond with "I don't know".
 
   # Search Guidelines
-  - Use the document_similarity tool for searches.
+  - Use the search tool for searches.
   - Don't include 'content' to additional columns during search.
   - Query both 'content' and 'location' columns.
   - Limit search results to the top 3 items.
@@ -30,21 +30,21 @@ models:
   - name: gpt-4o
     from: openai:gpt-4o-2024-08-06
     params:
-      tools: list_datasets, table_schema, document_similarity
+      tools: list_datasets, table_schema, search
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: *model_system_prompt
 
   - name: gpt-4.1
     from: openai:gpt-4.1-2025-04-14
     params:
-      tools: list_datasets, table_schema, document_similarity
+      tools: list_datasets, table_schema, search
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: *model_system_prompt
 
   - name: gpt-5
     from: openai:gpt-5-2025-08-07
     params:
-      tools: list_datasets, table_schema, document_similarity
+      tools: list_datasets, table_schema, search
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: *model_system_prompt
 
@@ -52,7 +52,7 @@ models:
     from: openai:o1-2024-12-17
     params:
       openai_reasoning_effort: high
-      tools: list_datasets, table_schema, document_similarity
+      tools: list_datasets, table_schema, search
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: *model_system_prompt
 
@@ -60,7 +60,7 @@ models:
     from: openai:o3-mini-2025-01-31
     params:
       openai_reasoning_effort: high
-      tools: list_datasets, table_schema, document_similarity
+      tools: list_datasets, table_schema, search
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: *model_system_prompt
 
@@ -68,7 +68,7 @@ models:
     from: openai:o4-mini-2025-04-16
     params:
       openai_reasoning_effort: high
-      tools: list_datasets, table_schema, document_similarity
+      tools: list_datasets, table_schema, search
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: *model_system_prompt
 
