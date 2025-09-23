@@ -30,6 +30,8 @@ use itertools::Itertools;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
+use datafusion_expr::expr::ScalarFunction;
+use tract_core::ops::math::Recip;
 
 pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
@@ -54,8 +56,29 @@ pub static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 #[derive(Debug, Default)]
+struct ReciprocalRankFusionSubqueryArgs {
+    pub rank_boost: Option<f64>,
+}
+
+impl ReciprocalRankFusionSubqueryArgs {
+    pub fn from_scalar_function_expr(expr: &Expr) -> Result<ReciprocalRankFusionSubqueryArgs> {
+        if let Expr::ScalarFunction(ScalarFunction { args, .. })  = expr {
+            println!("{args:?}");
+            Ok(ReciprocalRankFusionSubqueryArgs::default())
+        } else {
+            Err(DataFusionError::NotImplemented(
+                format!(
+                    "{RRF_UDF_NAME} subquery arguments require a scalar function invocation."
+                )
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct ReciprocalRankFusionArgs {
     pub search_udtf_exprs: Vec<Expr>,
+    pub rrf_subquery_arguments: Vec<ReciprocalRankFusionSubqueryArgs>,
     pub k: f64,
     pub join_key: Option<Expr>,
 }
@@ -76,12 +99,16 @@ impl ReciprocalRankFusionArgs {
     /// * `Err` - If fewer than 2 search queries are provided or if unparsing fails
     pub fn from_udtf_exprs(args: &[Expr]) -> Result<ReciprocalRankFusionArgs> {
         let mut search_udtfs: Vec<Expr> = vec![];
+        let mut subquery_args: Vec<ReciprocalRankFusionSubqueryArgs> = vec![];
         let mut k_argument: Option<f64> = None;
         let mut join_pk_argument: Option<Expr> = None;
 
         for expr in args {
             match expr {
-                e @ Expr::ScalarFunction(_) => search_udtfs.push(e.clone()),
+                e @ Expr::ScalarFunction(_) => {
+                    subquery_args.push(ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(e)?);
+                    search_udtfs.push(e.clone())
+                },
                 Expr::Literal(ScalarValue::Float64(Some(k)), ..) if k_argument.is_none() => {
                     k_argument = Some(*k);
                 }
@@ -105,6 +132,7 @@ impl ReciprocalRankFusionArgs {
 
         Ok(Self {
             search_udtf_exprs: search_udtfs,
+            rrf_subquery_arguments: subquery_args,
             k: k_argument.unwrap_or(60.0),
             join_key: join_pk_argument,
         })
