@@ -22,6 +22,7 @@ use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
 
 pub mod list_provider;
+pub mod put_vectors_sink;
 pub mod query_provider;
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};

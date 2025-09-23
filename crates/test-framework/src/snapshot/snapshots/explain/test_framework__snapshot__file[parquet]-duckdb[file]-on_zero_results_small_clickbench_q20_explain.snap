@@ -2,21 +2,21 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q20"
 ---
-+---------------+----------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                               |
-+---------------+----------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                 |
-|               |   Filter: hits.UserID = Int64(435090932899640449)                                                  |
-|               |     TableScan: hits projection=[UserID], partial_filters=[hits.UserID = Int64(435090932899640449)] |
-| physical_plan | BytesProcessedExec                                                                                 |
-|               |   CoalesceBatchesExec: target_batch_size=8192                                                      |
-|               |     FilterExec: UserID@0 = 435090932899640449                                                      |
-|               |       SchemaCastScanExec                                                                           |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                      |
-|               |           FallbackOnZeroResultsScanExec                                                            |
-|               |             CoalescePartitionsExec                                                                 |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                |
-|               |                 CooperativeExec                                                                    |
-|               |                   DuckSqlExec sql= SELECT "UserID" FROM hits WHERE (UserID = 435090932899640449)   |
-|               |                                                                                                    |
-+---------------+----------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                |
++---------------+-----------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                  |
+|               |   Filter: hits.UserID = Int64(435090932899640449)                                                   |
+|               |     TableScan: hits projection=[UserID], partial_filters=[hits.UserID = Int64(435090932899640449)]  |
+| physical_plan | BytesProcessedExec                                                                                  |
+|               |   CoalesceBatchesExec: target_batch_size=8192                                                       |
+|               |     FilterExec: UserID@0 = 435090932899640449                                                       |
+|               |       SchemaCastScanExec                                                                            |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
+|               |           FallbackOnZeroResultsScanExec                                                             |
+|               |             CoalescePartitionsExec                                                                  |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                 |
+|               |                 CooperativeExec                                                                     |
+|               |                   DuckSqlExec sql= SELECT "UserID" FROM hits WHERE ("UserID" = 435090932899640449)  |
+|               |                                                                                                     |
++---------------+-----------------------------------------------------------------------------------------------------+

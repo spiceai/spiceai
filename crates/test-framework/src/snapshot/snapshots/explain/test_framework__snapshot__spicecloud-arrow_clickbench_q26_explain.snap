@@ -15,6 +15,6 @@ description: "Query: clickbench_q26"
 |               |       CoalesceBatchesExec: target_batch_size=8192                                                                                                           |
 |               |         FilterExec: SearchPhrase@0 !=                                                                                                                       |
 |               |           SchemaCastScanExec                                                                                                                                |
-|               |             DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1525] |
+|               |             DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
 |               |                                                                                                                                                             |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------+
