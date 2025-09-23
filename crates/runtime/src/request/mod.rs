@@ -19,10 +19,12 @@ mod cache_control;
 mod context;
 mod databricks;
 mod protocol;
+mod table_provider;
 mod user_agent;
 
 pub use cache_control::*;
 pub use context::*;
 pub use databricks::*;
 pub use protocol::*;
+pub use table_provider::*;
 pub use user_agent::*;

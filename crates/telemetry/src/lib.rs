@@ -128,14 +128,14 @@ pub fn track_text_search(dimensions: &[KeyValue]) {
     TEXT_SEARCHES.add(1, dimensions);
 }
 
-static SEARCHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static VECTOR_SEARCHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("searches")
-        .with_description("Number of search requests.")
+        .u64_counter("vector_searches")
+        .with_description("Number of vector search requests.")
         .with_unit("search")
         .build()
 });
 
-pub fn track_search(dimensions: &[KeyValue]) {
-    SEARCHES.add(1, dimensions);
+pub fn track_vector_search(dimensions: &[KeyValue]) {
+    VECTOR_SEARCHES.add(1, dimensions);
 }

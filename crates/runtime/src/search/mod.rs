@@ -17,7 +17,7 @@ pub mod candidate;
 pub mod full_text;
 pub mod request;
 pub mod rrf;
-pub mod search;
+pub mod search_engine;
 pub mod types;
 pub mod util;
 

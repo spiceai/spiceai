@@ -19,7 +19,7 @@ limitations under the License.
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
-use crate::{search::search, status::RuntimeStatus};
+use crate::{search::search_engine, status::RuntimeStatus};
 
 use crate::Runtime;
 #[cfg(feature = "openapi")]
@@ -189,7 +189,7 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
-    search: Arc<search::VectorSearch>,
+    search: Arc<search_engine::SearchEngine>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
 ) -> Router {

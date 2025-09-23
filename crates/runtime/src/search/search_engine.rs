@@ -56,8 +56,8 @@ use tracing::{Instrument, Span};
 
 use super::types::VectorSearchResult;
 
-/// A Component that can perform vector search operations.
-pub struct VectorSearch {
+/// A Component that can perform search operations.
+pub struct SearchEngine {
     pub df: Arc<DataFusion>,
     embeddings: Arc<RwLock<EmbeddingModelStore>>,
 
@@ -67,13 +67,13 @@ pub struct VectorSearch {
     explicit_primary_keys: HashMap<TableReference, Vec<String>>,
 }
 
-impl VectorSearch {
+impl SearchEngine {
     pub fn new(
         df: Arc<DataFusion>,
         embeddings: Arc<RwLock<EmbeddingModelStore>>,
         explicit_primary_keys: HashMap<TableReference, Vec<String>>,
     ) -> Self {
-        VectorSearch {
+        SearchEngine {
             df,
             embeddings,
             explicit_primary_keys,
@@ -238,9 +238,6 @@ impl VectorSearch {
     }
 
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
-        let request_context = RequestContext::current(AsyncMarker::new().await);
-        telemetry::track_search(&request_context.to_dimensions());
-
         let SearchRequest {
             text: query,
             datasets: data_source_opt,

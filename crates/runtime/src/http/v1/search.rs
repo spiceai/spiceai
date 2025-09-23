@@ -18,7 +18,7 @@ use crate::{
     search::{
         Error as VectorSearchError,
         request::{SearchRequest, SearchRequestHTTPJson},
-        search::VectorSearch,
+        search_engine::SearchEngine,
         types::{Match, to_matches_sorted},
     },
 };
@@ -120,7 +120,7 @@ struct SearchResponse {
     )
 ))]
 pub(crate) async fn post(
-    Extension(vs): Extension<Arc<VectorSearch>>,
+    Extension(vs): Extension<Arc<SearchEngine>>,
     Json(payload): Json<SearchRequestHTTPJson>,
 ) -> Response {
     let start_time = Instant::now();

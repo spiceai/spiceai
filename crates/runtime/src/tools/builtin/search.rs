@@ -24,7 +24,6 @@ use crate::{
     Runtime,
     search::{
         request::{SearchRequest, SearchRequestBaseJson},
-        search::VectorSearch,
         types::to_pretty,
         util::parse_explicit_primary_keys,
     },
@@ -70,7 +69,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
             let req: SearchRequestBaseJson = serde_json::from_str(arg)?;
             tracing::trace!("search tool use function call request: {req:?}");
 
-            let vs = VectorSearch::new(
+            let vs = Search::new(
                 self.rt.datafusion(),
                 Arc::clone(&self.rt.embeds),
                 parse_explicit_primary_keys(Arc::clone(&self.rt.app)).await,
