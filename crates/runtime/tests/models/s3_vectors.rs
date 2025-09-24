@@ -304,7 +304,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_offset",
                     SearchTestType::Sql(
-                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score DESC, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(

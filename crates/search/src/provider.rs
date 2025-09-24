@@ -220,6 +220,7 @@ impl SearchQueryProvider {
         )?))
     }
 
+    #[allow(clippy::too_many_lines)] // Removed in `https://github.com/spiceai/spiceai/issues/7242`.
     fn join_with_base(
         &self,
         projection: Option<&Vec<usize>>,
