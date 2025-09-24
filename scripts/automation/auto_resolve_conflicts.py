@@ -114,7 +114,7 @@ def resolve_file(client: OpenAI, model: str, path: Path) -> ResolutionResult:
 
 def main() -> int:
     report_path = Path(os.environ.get("LLM_REPORT_PATH", "merge_conflict_report.md"))
-    model = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+    model = os.environ.get("LLM_MODEL", "gpt-5-mini")
 
     try:
         files = git_conflict_files()
