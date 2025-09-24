@@ -300,18 +300,17 @@ impl Runtime {
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        if let Some(acceleration) = &ds.acceleration {
-            if data_connector.resolve_refresh_mode(acceleration.refresh_mode)
+        if let Some(acceleration) = &ds.acceleration
+            && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
                 == RefreshMode::Changes
-                && !data_connector.supports_changes_stream()
-            {
-                let err = AcceleratedTableInvalidChangesSnafu {
-                    dataset_name: ds.name.to_string(),
-                }
-                .build();
-                warn_spaced!(spaced_tracer, "{}{err}", "");
-                return Err(err);
+            && !data_connector.supports_changes_stream()
+        {
+            let err = AcceleratedTableInvalidChangesSnafu {
+                dataset_name: ds.name.to_string(),
             }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
         }
 
         // Test dataset connectivity by attempting to get a read provider.
@@ -369,15 +368,14 @@ impl Runtime {
                         self.df.results_cache_provider().is_some()
                     )
                 );
-                if !data_connector.initialization().is_on_trigger() {
-                    if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
-                        if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
-                            tracing::warn!(
-                                "Unable to add dataset {} for availability monitoring: {err}",
-                                &ds.name
-                            );
-                        }
-                    }
+                if !data_connector.initialization().is_on_trigger()
+                    && let Some(datasets_health_monitor) = &self.datasets_health_monitor
+                    && let Err(err) = datasets_health_monitor.register_dataset(&ds).await
+                {
+                    tracing::warn!(
+                        "Unable to add dataset {} for availability monitoring: {err}",
+                        &ds.name
+                    );
                 }
                 let engine = ds.acceleration.as_ref().map_or_else(
                     || "None".to_string(),
@@ -443,13 +441,12 @@ impl Runtime {
             },
         );
 
-        if ds_acceleration.is_some() {
-            if let Err(e) = Arc::clone(&self)
+        if ds_acceleration.is_some()
+            && let Err(e) = Arc::clone(&self)
                 .remove_dataset_or_view_schedule(&ds_name)
                 .await
-            {
-                tracing::warn!("Unable to remove dataset schedule for {}: {e}", &ds_name);
-            }
+        {
+            tracing::warn!("Unable to remove dataset schedule for {}: {e}", &ds_name);
         }
 
         metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);

@@ -329,11 +329,11 @@ fn database_might_match(database: &str, patterns: &[String]) -> bool {
 
 fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) -> bool {
     let database_with_table = format!("{database}.{table}");
-    if let Some(include) = include {
-        if !include.is_match(&database_with_table) {
-            tracing::debug!("skipping table {database_with_table}");
-            return false;
-        }
+    if let Some(include) = include
+        && !include.is_match(&database_with_table)
+    {
+        tracing::debug!("skipping table {database_with_table}");
+        return false;
     }
     true
 }

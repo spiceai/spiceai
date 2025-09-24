@@ -134,26 +134,26 @@ impl ListingTableConnector for Https {
             let _ = u.set_port(Some(n));
         }
 
-        if let Some(p) = self.params.get("password").expose().ok() {
-            if u.set_password(Some(p)).is_err() {
-                return Err(
-                    DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-                        dataconnector: "https".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                    },
-                );
-            }
+        if let Some(p) = self.params.get("password").expose().ok()
+            && u.set_password(Some(p)).is_err()
+        {
+            return Err(
+                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            );
         }
 
-        if let Some(p) = self.params.get("username").expose().ok() {
-            if u.set_username(p).is_err() {
-                return Err(
-                    DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-                        dataconnector: "https".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                    },
-                );
-            }
+        if let Some(p) = self.params.get("username").expose().ok()
+            && u.set_username(p).is_err()
+        {
+            return Err(
+                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            );
         }
 
         u.set_fragment(Some(&listing::build_fragments(

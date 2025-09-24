@@ -13,8 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::array::RecordBatch;
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
@@ -64,7 +63,7 @@ struct ReciprocalRankFusionArgs {
 impl ReciprocalRankFusionArgs {
     /// Constructs `ReciprocalRankFusionArgs` from an rrf UDTF invocation, which is a `TableScan` node
     /// that looks like this...
-    /// ```
+    /// ```text
     /// TableScan: rrf(text_search(wiki_a_potion, Utf8("apple")), vector_search(wiki_a_potion, Utf8("apple")))
     /// ```
     /// ...into a neat struct of subquery expressions and an optional user-provided smoothing parameter.
@@ -150,30 +149,24 @@ impl ReciprocalRankFusion {
         )
     }
 
-    fn empty_df(&self) -> DataFrame {
-        let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-
-        match self.session_context.read_batch(empty_batch) {
-            Ok(batch) => batch,
-            Err(_) => unreachable!("Must be able to make an empty DataFrame."),
-        }
-    }
-
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
     // then finally re-rank and sort fused results
     fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
         let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
 
-        let score_expr = coalesce(
-            (0..subquery_dfs.len())
-                .map(|i| {
-                    lit(1.0f64)
-                        / (lit(args.k)
-                            + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
-                })
-                .collect(),
-        )
-        .alias("fused_score");
+        let score_expr = (0..subquery_dfs.len())
+            .map(|i| {
+                lit(1.0f64)
+                    / (lit(args.k)
+                        + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
+            })
+            .reduce(|a, b| a + b);
+
+        let score_expr = if let Some(score_expr) = score_expr {
+            score_expr.alias("fused_score")
+        } else {
+            return exec_err!("{RRF_UDF_NAME} unable to compute fused_score");
+        };
 
         // Create column expressions for final projection
         let mut columns: Vec<Expr> = vec![score_expr];
@@ -206,7 +199,9 @@ impl ReciprocalRankFusion {
                 Ok(joined) => joined,
                 Err(e) => {
                     join_err = Some(e);
-                    self.empty_df()
+                    self.session_context
+                        .read_empty()
+                        .unwrap_or_else(|_| unreachable!("must be able to make an empty DataFrame"))
                 }
             }
         });
@@ -431,6 +426,7 @@ mod tests {
     use datafusion::catalog::MemTable;
     use datafusion::catalog::TableProvider;
     use datafusion::common::Result;
+    use datafusion::common::cast::as_float64_array;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::lit;
@@ -443,18 +439,10 @@ mod tests {
     use std::sync::{Arc, LazyLock};
     use tokio::sync::RwLock;
 
-    pub static TEST_DATA: LazyLock<Vec<&str>> = LazyLock::new(|| {
-        vec![
-            "banana yellow curved fruit",
-            "orange citrus round juicy",
-            "apple fruit sweet red crispy",
-        ]
-    });
-
     pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-    fn make_test_table() -> Result<Arc<dyn TableProvider>> {
+    fn make_test_table(test_data: &[&str]) -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("content", DataType::Utf8, false),
@@ -493,15 +481,15 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from_iter_values(
-                    0i64..i64::try_from(TEST_DATA.len()).expect("Must cast"),
+                    0i64..i64::try_from(test_data.len()).expect("Must cast"),
                 )),
-                Arc::new(StringArray::from_iter_values(TEST_DATA.iter())),
+                Arc::new(StringArray::from_iter_values(test_data.iter())),
                 Arc::new(FixedSizeListArray::from_iter_primitive::<
                     arrow::datatypes::Float32Type,
                     _,
                     _,
                 >(
-                    TEST_DATA.iter().map(|s| {
+                    test_data.iter().map(|s| {
                         embedding_model
                             .embed_sync(EmbeddingInput::String((*s).to_string()))
                             .map(|e| e[0].iter().map(|f| Some(*f)).collect::<Vec<Option<_>>>())
@@ -531,7 +519,11 @@ mod tests {
             .config_mut()
             .set_extension(Arc::clone(&TEST_REQUEST_CONTEXT));
 
-        let test_table = make_test_table()?;
+        let test_table = make_test_table(&[
+            "banana yellow curved fruit",
+            "orange citrus round juicy",
+            "apple fruit sweet red crispy",
+        ])?;
         rt.df
             .ctx
             .register_table("foo", test_table)
@@ -564,7 +556,66 @@ mod tests {
                 .column_by_name("content")
                 .expect("Must have content column"),
         );
-        assert_eq!(content.value(0), TEST_DATA[2]);
+        assert_eq!(content.value(0), "apple fruit sweet red crispy");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_score_computation() {
+        let runtime = make_test_runtime()
+            .await
+            .expect("Failed to create test runtime");
+
+        let empty_table = make_test_table(&[]).expect("Failed to create empty table");
+        runtime
+            .df
+            .ctx
+            .register_table("bar", empty_table)
+            .expect("Failed to register bar table");
+
+        let query_empty_red =
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), id, 600.0)";
+        let query_empty_red = QueryBuilder::new(query_empty_red, runtime.datafusion()).build();
+        let query_empty_red_results = query_empty_red
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("Must collect results");
+
+        let query_empty_red_content = as_float64_array(
+            query_empty_red_results[0]
+                .column_by_name("fused_score")
+                .expect("Must have score column"),
+        )
+        .expect("Must be f64[]");
+
+        let query_empty_red_score = query_empty_red_content.value(0);
+
+        let query_red_empty =
+            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'), id, 600.0)";
+        let query_red_empty = QueryBuilder::new(query_red_empty, runtime.datafusion()).build();
+        let query_red_empty_results = query_red_empty
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("Must collect results");
+
+        let query_red_empty_content = as_float64_array(
+            query_red_empty_results[0]
+                .column_by_name("fused_score")
+                .expect("Must have score column"),
+        )
+        .expect("Must be f64[]");
+
+        let query_red_empty_score = query_red_empty_content.value(0);
+
+        let score_diff = (query_red_empty_score - query_empty_red_score).abs();
+        assert!(score_diff < 0.0001f64);
     }
 
     fn stub_scalar_function(name: &str) -> Expr {

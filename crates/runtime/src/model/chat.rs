@@ -159,10 +159,10 @@ pub async fn construct_model(
         get_openai_request_overrides(component, params.prefix),
     );
 
-    if let Some(Value::String(s)) = component.params.get("parameterized_prompt") {
-        if matches!(s.as_str(), "enabled") {
-            wrapper = wrapper.allowed_to_parameterise();
-        }
+    if let Some(Value::String(s)) = component.params.get("parameterized_prompt")
+        && matches!(s.as_str(), "enabled")
+    {
+        wrapper = wrapper.allowed_to_parameterise();
     }
 
     Ok(Arc::new(wrapper))
@@ -258,10 +258,10 @@ async fn huggingface(
         .iter()
         .find_map(|p| {
             let path = PathBuf::from_str(p.as_str());
-            if let Ok(Some(ext)) = path.as_ref().map(|pp| pp.extension()) {
-                if ext.eq_ignore_ascii_case("gguf") {
-                    return PathBuf::from_str(p.as_str()).ok();
-                }
+            if let Ok(Some(ext)) = path.as_ref().map(|pp| pp.extension())
+                && ext.eq_ignore_ascii_case("gguf")
+            {
+                return PathBuf::from_str(p.as_str()).ok();
             }
             None
         });
@@ -514,19 +514,17 @@ pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String,
 
     for (k, v) in &model.params {
         if k.starts_with(&prefix_str) {
-            if let Some(new_k) = k.strip_prefix(&prefix_str) {
-                if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k) {
-                    request_overrides.insert(new_k.to_string(), v.clone());
-                }
+            if let Some(new_k) = k.strip_prefix(&prefix_str)
+                && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
+            {
+                request_overrides.insert(new_k.to_string(), v.clone());
             }
-        } else if k.starts_with("openai_") {
-            if let Some(new_k) = k.strip_prefix("openai_") {
-                if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-                    && !request_overrides.contains_key(new_k)
-                {
-                    request_overrides.insert(new_k.to_string(), v.clone());
-                }
-            }
+        } else if k.starts_with("openai_")
+            && let Some(new_k) = k.strip_prefix("openai_")
+            && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
+            && !request_overrides.contains_key(new_k)
+        {
+            request_overrides.insert(new_k.to_string(), v.clone());
         }
     }
 

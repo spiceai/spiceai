@@ -179,17 +179,14 @@ fn normalize_search_response(mut json: Value) -> String {
             format!("{b_pks:?}").cmp(&format!("{a_pks:?}"))
         });
         for m in matches {
-            if let Some(obj) = m.as_object_mut() {
-                if let Some(Value::Number(n)) = obj.get("score") {
-                    if let Some(score) = n.as_f64() {
-                        if let Some(truncated_score) =
-                            serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
-                        // Keep 4 decimals
-                        {
-                            obj.insert("score".to_string(), Value::Number(truncated_score));
-                        }
-                    }
-                }
+            if let Some(obj) = m.as_object_mut()
+                && let Some(Value::Number(n)) = obj.get("score")
+                && let Some(score) = n.as_f64()
+                && let Some(truncated_score) =
+                    serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
+            // Keep 4 decimals
+            {
+                obj.insert("score".to_string(), Value::Number(truncated_score));
             }
         }
     }
@@ -1052,7 +1049,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_question",
                 SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 // When there are multiple columns, `text_search` needs column explicitly as input.
                 "multi_text_column_sql_text_search_error_without_column",
@@ -1061,7 +1058,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_projection",
                 SearchTestType::Sql("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_filters",
                 SearchTestType::Sql("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),
@@ -1198,15 +1195,15 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 
     let cache_config = CacheConfig {
         enabled: true,
-        item_ttl: Some("10s".to_string()),
+        item_ttl: Some("30s".to_string()),
+        max_size: Some("512mb".to_string()),
         ..Default::default()
     };
 
-    // get_model_to_vec_embeddings("minishlab/potion-base-2M", "hf_minilm")
     let app = AppBuilder::new("cached_search")
         .with_dataset(chunked)
         .with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-2M",
+            "minishlab/potion-base-32M",
             "hf_minilm",
         ))
         .with_search_cache(cache_config)
@@ -1223,19 +1220,28 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                 "with_cache_pre_cache",
                 SearchTestType::Http(json!({
                     "text": "new patient",
-                    "limit": 2,
+                    "limit": 50,
                 })),
             ), None, false).await?;
             let duration = start.elapsed();
-            let start = Instant::now();
-            run_search_test(http_base_url.as_str(), &SearchTestCase::new(
-                "with_cache_post_cache",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                })),
-            ), None, false).await?;
-            let duration_cached = start.elapsed();
+            let mut measured_cache_times = Vec::new();
+            for _ in 0..10 {
+                let start = Instant::now();
+                run_search_test(http_base_url.as_str(), &SearchTestCase::new(
+                    "with_cache_post_cache",
+                    SearchTestType::Http(json!({
+                        "text": "new patient",
+                        "limit": 50,
+                    })),
+                ), None, false).await?;
+                let duration_cached = start.elapsed();
+                measured_cache_times.push(duration_cached);
+            }
+
+            // take the median time from the cached responses
+            measured_cache_times.sort();
+            let duration_cached = measured_cache_times[measured_cache_times.len() / 2];
+
             assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
             Ok(())
         })

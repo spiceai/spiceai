@@ -161,10 +161,10 @@ pub fn validate_guardrail_version(
             return Ok(GuardrailVersion::Number(num));
         }
         // Check if it matched "DRAFT"
-        if let Some(draft) = caps.get(2) {
-            if draft.as_str() == "DRAFT" {
-                return Ok(GuardrailVersion::Draft);
-            }
+        if let Some(draft) = caps.get(2)
+            && draft.as_str() == "DRAFT"
+        {
+            return Ok(GuardrailVersion::Draft);
         }
     }
     Err(GuardrailError::VersionPatternMismatch { version: value })

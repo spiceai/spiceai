@@ -485,22 +485,22 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         let mut response = self.api.execute_request(&token, &payload).await?;
 
         // Check if the response indicates a query failure
-        if let Some(status) = response.get("status").and_then(|s| s.get("state")) {
-            if status == "FAILED" {
-                let message = response
-                    .get("status")
-                    .and_then(|s| s.get("error"))
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(ToString::to_string)
-                    .ok_or_else(|| {
-                        MissingJsonFieldSnafu {
-                            field: "status.error.message".to_string(),
-                        }
-                        .build()
-                    })?;
-                return Err(Error::QueryFailure { message }.into());
-            }
+        if let Some(status) = response.get("status").and_then(|s| s.get("state"))
+            && status == "FAILED"
+        {
+            let message = response
+                .get("status")
+                .and_then(|s| s.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    MissingJsonFieldSnafu {
+                        field: "status.error.message".to_string(),
+                    }
+                    .build()
+                })?;
+            return Err(Error::QueryFailure { message }.into());
         }
 
         // Get the result object if no error

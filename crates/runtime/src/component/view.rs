@@ -95,14 +95,14 @@ impl View {
 
     #[must_use]
     pub fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if acceleration.refresh_jitter_enabled {
-                // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-                return match acceleration.refresh_jitter_max {
-                    Some(jitter) => Some(jitter),
-                    None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-                };
-            }
+        if let Some(acceleration) = &self.acceleration
+            && acceleration.refresh_jitter_enabled
+        {
+            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
+            return match acceleration.refresh_jitter_max {
+                Some(jitter) => Some(jitter),
+                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
+            };
         }
         None
     }

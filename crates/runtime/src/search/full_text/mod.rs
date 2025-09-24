@@ -24,9 +24,9 @@ use search::generation::{
     CandidateGeneration, post_apply::PostApplyCandidateGeneration,
     text_search::index::FullTextDatabaseIndex,
 };
-use snafu::ResultExt;
 
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use snafu::ResultExt;
 
 use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
 

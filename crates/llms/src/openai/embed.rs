@@ -27,8 +27,8 @@ use std::time::Instant;
 use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
 use util::{RetryError, retry};
 
-use crate::chunking::{
-    ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
+use chunking::{
+    ArcSizer, ChunkSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
 };
 
 use crate::embeddings::{
@@ -42,7 +42,6 @@ use async_openai::types::{
 use async_trait::async_trait;
 use futures::future::try_join_all;
 use snafu::ResultExt;
-use text_splitter::ChunkSizer;
 use tokenizers::Tokenizer;
 
 use super::{Openai, default_rate_controller};

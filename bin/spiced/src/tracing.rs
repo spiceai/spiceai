@@ -120,20 +120,20 @@ pub(crate) async fn init_tracing(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let filter: EnvFilter = verbosity.into();
 
-    if let Some(app) = app.as_ref() {
-        if !app.runtime.task_history.enabled {
-            let subscriber = tracing_subscriber::registry().with(filter).with(
-                fmt::layer()
-                    .with_ansi(true)
-                    .with_filter(filter::filter_fn(|metadata| {
-                        metadata.target() != "task_history"
-                    })),
-            );
+    if let Some(app) = app.as_ref()
+        && !app.runtime.task_history.enabled
+    {
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            fmt::layer()
+                .with_ansi(true)
+                .with_filter(filter::filter_fn(|metadata| {
+                    metadata.target() != "task_history"
+                })),
+        );
 
-            tracing::subscriber::set_global_default(subscriber)?;
+        tracing::subscriber::set_global_default(subscriber)?;
 
-            return Ok(());
-        }
+        return Ok(());
     }
 
     let subscriber = tracing_subscriber::registry()

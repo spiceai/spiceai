@@ -154,14 +154,14 @@ impl DataConnectorFactory for S3Factory {
         &self,
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
-            if endpoint.ends_with('/') {
-                tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
-                params.parameters.insert(
-                    "endpoint".to_string(),
-                    endpoint.trim_end_matches('/').to_string().into(),
-                );
-            }
+        if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
+            && endpoint.ends_with('/')
+        {
+            tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
+            params.parameters.insert(
+                "endpoint".to_string(),
+                endpoint.trim_end_matches('/').to_string().into(),
+            );
         }
 
         Box::pin(async move {

@@ -246,7 +246,7 @@ impl TableProvider for MemTable {
         ))))
     }
 
-    /// Returns an ExecutionPlan that inserts the execution results of a given [`ExecutionPlan`] into this [`MemTable`].
+    /// Returns an `ExecutionPlan` that inserts the execution results of a given [`ExecutionPlan`] into this [`MemTable`].
     ///
     /// The [`ExecutionPlan`] must have the same schema as this [`MemTable`].
     ///

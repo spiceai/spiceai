@@ -156,10 +156,10 @@ fn get_json_format(params: &Parameters) -> Result<Arc<SpiceJsonOptions>> {
         options.schema_infer_max_rec = Some(schema_infer_max_rec);
     }
 
-    if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose() {
-        if flatten_json.eq_ignore_ascii_case("true") {
-            options.flatten_json = Some(".".to_string());
-        }
+    if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose()
+        && flatten_json.eq_ignore_ascii_case("true")
+    {
+        options.flatten_json = Some(".".to_string());
     }
 
     Ok(Arc::new(options))

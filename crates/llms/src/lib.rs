@@ -18,7 +18,6 @@ pub mod accumulate;
 pub mod anthropic;
 pub mod bedrock;
 pub mod chat;
-pub mod chunking;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;

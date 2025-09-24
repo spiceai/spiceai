@@ -70,10 +70,10 @@ pub fn convert_datafusion_filters_to_s3_vectors(
             return Ok(None);
         }
 
-        if and_filters.len() == 1 {
-            if let Some(filter_expr) = and_filters.pop() {
-                return Ok(Some(MetadataFilter::Complex(filter_expr)));
-            }
+        if and_filters.len() == 1
+            && let Some(filter_expr) = and_filters.pop()
+        {
+            return Ok(Some(MetadataFilter::Complex(filter_expr)));
         }
 
         let logical_op = LogicalOperation {

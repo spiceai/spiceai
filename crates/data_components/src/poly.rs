@@ -65,6 +65,11 @@ impl PolyTableProvider {
 
         adaptor.map(|f| Arc::clone(&f.source))
     }
+
+    #[must_use]
+    pub fn get_federated_table_provider(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.fed)
+    }
 }
 
 #[async_trait]
@@ -107,7 +112,7 @@ impl TableProvider for PolyTableProvider {
     fn table_type(&self) -> TableType {
         self.write.table_type()
     }
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.write.get_logical_plan()
     }
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
