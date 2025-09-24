@@ -336,8 +336,7 @@ fn get_and_validate_partition_by(
 
             ensure!(func.name() == "bucket", err);
 
-            let Expr::Column(Column { name, .. }) =
-                args.iter().skip(1).next().with_context(|| err.clone())?
+            let Expr::Column(Column { name, .. }) = args.get(1).with_context(|| err.clone())?
             else {
                 return Err(ValidationError::InvalidExpression {
                     message: self.doc(),
@@ -367,18 +366,13 @@ fn get_and_validate_partition_by(
     let partition_by = if vector_store.partition_by.is_empty() {
         vec![]
     } else {
-        partition_by_expressions(
-            &vector_store.partition_by,
-            ctx,
-            &df_schema,
-            &BucketCriterion,
-        )
-        .map(|p| p.expressions)
-        .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
-            dataconnector: dataset.source().to_string(),
-            connector_component: dataset.into(),
-            source: e.into(),
-        })?
+        partition_by_expressions(&vector_store.partition_by, ctx, df_schema, &BucketCriterion)
+            .map(|p| p.expressions)
+            .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: dataset.source().to_string(),
+                connector_component: dataset.into(),
+                source: e.into(),
+            })?
     };
 
     Ok(partition_by)
