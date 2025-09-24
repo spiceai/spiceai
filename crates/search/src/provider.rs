@@ -232,11 +232,35 @@ impl SearchQueryProvider {
             .collect();
 
         // Ensure primary keys are retrieved from underlying table.
+        // Ensure all columns needed for filters are here (or in index).
         let table_proj: Option<Vec<_>> = projection.map(|proj| {
             let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
-            for pp in primary_key_projection {
-                p.insert(pp);
-            }
+            p.extend(primary_key_projection);
+
+            let search_index_cols = search_index_proj
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<HashSet<_>>();
+            // These columns may be needed to handle filters in the JOIN.
+            // Don't add any that will be in search index.
+            let filter_cols = filters
+                .iter()
+                .flat_map(|f| {
+                    let filter_cols = f
+                        .column_refs()
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<HashSet<_>>();
+                    filter_cols
+                        .difference(&search_index_cols)
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|c| self.schema().index_of(c).ok())
+                .collect::<Vec<_>>();
+            p.extend(filter_cols);
             p.into_iter().collect()
         });
 
