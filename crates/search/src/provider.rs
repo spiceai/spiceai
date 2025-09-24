@@ -243,12 +243,11 @@ impl SearchQueryProvider {
                 .iter()
                 .map(|f| f.name().as_str())
                 .collect::<HashSet<_>>();
-
             // These columns may be needed to handle filters in the JOIN.
             // Don't add any that will be in search index.
             let filter_cols = filters
                 .iter()
-                .map(|f| {
+                .flat_map(|f| {
                     let filter_cols = f
                         .column_refs()
                         .iter()
@@ -256,13 +255,11 @@ impl SearchQueryProvider {
                         .collect::<HashSet<_>>();
                     filter_cols
                         .difference(&search_index_cols)
-                        .cloned()
+                        .copied()
                         .collect::<Vec<_>>()
                 })
-                .flatten()
                 .filter_map(|c| self.schema().index_of(c).ok())
                 .collect::<Vec<_>>();
-
             p.extend(filter_cols);
             p.into_iter().collect()
         });
