@@ -30,6 +30,7 @@ use axum::{
 use http::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
+use tracing::Instrument;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -157,6 +158,7 @@ pub(crate) async fn post(
             cache_provider,
             Arc::clone(&request_context),
         )
+        .instrument(span.clone())
         .await
     {
         Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {

@@ -31,10 +31,9 @@ use arrow_schema::DataType;
 use datafusion::common::exec_err;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
+    catalog::{TableFunctionImpl, TableProvider},
     common::Column,
     error::{DataFusionError, Result as DataFusionResult},
-    physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
     sql::TableReference,

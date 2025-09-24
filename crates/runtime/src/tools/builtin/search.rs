@@ -20,6 +20,7 @@ use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::request::{AsyncMarker, RequestContext};
+use crate::search::search_engine::SearchEngine;
 use crate::{
     Runtime,
     search::{
@@ -69,7 +70,7 @@ impl SpiceModelTool for SearchTool {
             let req: SearchRequestBaseJson = serde_json::from_str(arg)?;
             tracing::trace!("search tool use function call request: {req:?}");
 
-            let vs = Search::new(
+            let vs = SearchEngine::new(
                 self.rt.datafusion(),
                 Arc::clone(&self.rt.embeds),
                 parse_explicit_primary_keys(Arc::clone(&self.rt.app)).await,

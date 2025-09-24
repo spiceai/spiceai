@@ -49,7 +49,7 @@ impl<F: Fn(&[KeyValue]) + Send + Sync> TableProvider for DimensionTrackedTablePr
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        let track_fn = self.track;
+        let track_fn = &self.track;
         track_fn(&request_context.to_dimensions());
 
         self.inner.scan(state, projection, filters, limit).await
