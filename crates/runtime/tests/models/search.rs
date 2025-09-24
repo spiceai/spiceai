@@ -1237,7 +1237,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                 let duration_cached = start.elapsed();
                 measured_cache_times.push(duration_cached);
             }
-            
+
             // take the median time from the cached responses
             measured_cache_times.sort();
             let duration_cached = measured_cache_times[measured_cache_times.len() / 2];
