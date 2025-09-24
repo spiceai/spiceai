@@ -250,6 +250,31 @@ impl SearchQueryProvider {
                 let _ = p.remove(&idx);
             }
 
+            let search_index_cols = search_index_proj
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<HashSet<_>>();
+            // These columns may be needed to handle filters in the JOIN.
+            // Don't add any that will be in search index.
+            let filter_cols = filters
+                .iter()
+                .flat_map(|f| {
+                    let filter_cols = f
+                        .column_refs()
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<HashSet<_>>();
+                    filter_cols
+                        .difference(&search_index_cols)
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|c| self.schema().index_of(c).ok())
+                .collect::<Vec<_>>();
+            p.extend(filter_cols);
+
             if let Some((idx, _)) = self.schema().column_with_name(
                 format!("{}_embedding", self.search_index.search_column()).as_str(),
             ) {
