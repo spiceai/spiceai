@@ -169,7 +169,7 @@ impl FullTextDatabaseIndex {
             &index_read,
             search_field.to_string(),
             self.primary_key.clone(),
-            Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
+            Some(self.metadata_columns.all_names()),
         )?;
         search_index.add_type_hints(&self.underlying_table().schema());
         Ok(search_index)
