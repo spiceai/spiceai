@@ -163,6 +163,8 @@ mod search {
                 full_text_search: Some(FullTextSearchConfig {
                     enabled: true,
                     row_ids: Some(vec!["id".to_string()]),
+                    index_store: None,
+                    index_directory: None,
                 }),
                 metadata: HashMap::new(),
             }),
