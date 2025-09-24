@@ -24,7 +24,9 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, md5};
+use datafusion::prelude::{
+    DataFrame, SessionContext, coalesce, exp, greatest, make_array, md5, now, to_unixtime,
+};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, lit};
 use itertools::Itertools;
@@ -33,7 +35,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
-use tract_core::ops::math::Recip;
 
 pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
@@ -90,7 +91,7 @@ macro_rules! extract_string {
       };
   }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RecencyDecay {
     Linear,
     Exponential,
@@ -111,7 +112,6 @@ impl FromStr for RecencyDecay {
 #[derive(Debug, Default)]
 struct ReciprocalRankFusionSubqueryArgs {
     pub rank_boost: Option<f64>,
-    pub recency_decay: Option<RecencyDecay>,
 }
 
 impl ReciprocalRankFusionSubqueryArgs {
@@ -140,7 +140,6 @@ impl ReciprocalRankFusionSubqueryArgs {
                 }),
                 ReciprocalRankFusionSubqueryArgs {
                     rank_boost: extract_f64!(rrf_args, "rank_boost"),
-                    recency_decay: None,
                 },
             ))
         } else {
@@ -155,7 +154,11 @@ struct ReciprocalRankFusionArgs {
     pub rrf_subquery_arguments: Vec<ReciprocalRankFusionSubqueryArgs>,
     pub k: f64,
     pub join_key: Option<Expr>,
+    pub recency_column: Option<Expr>,
     pub recency_decay: Option<RecencyDecay>,
+    pub recency_decay_alpha: Option<f64>,
+    pub recency_time_unit_seconds: Option<f64>,
+    pub recency_window_seconds: Option<f64>,
 }
 
 impl ReciprocalRankFusionArgs {
@@ -167,7 +170,7 @@ impl ReciprocalRankFusionArgs {
     /// ...into a neat struct of subquery expressions and an optional user-provided smoothing parameter.
     ///
     /// # Arguments
-    /// * `args` - A slice of `Expr` containing search UDTF invocations and an optional `k` parameter
+    /// * `args` - A slice of `Expr` containing search UDTF invocations and optional named arguments
     ///
     /// # Returns
     /// * `Ok(ReciprocalRankFusionArgs)` - Successfully parsed arguments
@@ -213,7 +216,12 @@ impl ReciprocalRankFusionArgs {
             rrf_subquery_arguments: subquery_args,
             k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
             join_key: extract_string!(rrf_args, "join_key").map(col),
-            recency_decay: extract_string!(rrf_args, "recency_decay").and_then(|rd| RecencyDecay::from_str(&rd).ok()),
+            recency_column: extract_string!(rrf_args, "recency_column").map(col),
+            recency_decay: extract_string!(rrf_args, "recency_decay")
+                .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
+            recency_decay_alpha: extract_f64!(rrf_args, "recency_decay_alpha"),
+            recency_time_unit_seconds: extract_f64!(rrf_args, "recency_time_unit_seconds"),
+            recency_window_seconds: extract_f64!(rrf_args, "recency_window_seconds"),
         })
     }
 }
@@ -256,11 +264,12 @@ impl ReciprocalRankFusion {
         )
     }
 
-    // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
-    // then finally re-rank and sort fused results
-    fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
-        let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
-
+    fn compute_score_expr(
+        &self,
+        args: &ReciprocalRankFusionArgs,
+        subquery_dfs: &Vec<DataFrame>,
+    ) -> Result<Expr> {
+        // Compute base score expression with boost
         let score_expr = (0..subquery_dfs.len())
             .map(|i| {
                 // Either use 1 as dividend or user provided boost
@@ -281,6 +290,50 @@ impl ReciprocalRankFusion {
         } else {
             return exec_err!("{RRF_UDF_NAME} unable to compute fused_score");
         };
+
+        if args.recency_column.is_none() {
+            return Ok(score_expr);
+        }
+
+        // If user specifies a recency column, we enable recency boosting
+        let recency_col = args.recency_column.as_ref().unwrap().clone();
+        let (_, recency_col) = recency_col.qualified_name();
+        let qualified_recency_col = Self::first_qualified_field(&subquery_dfs[0], &recency_col)?;
+
+        // Defaults: exponential decay over days (86400s)
+        let recency_decay = args
+            .recency_decay
+            .clone()
+            .unwrap_or(RecencyDecay::Exponential);
+        let recency_time_unit_seconds = args.recency_time_unit_seconds.unwrap_or(86400.0);
+
+        // Lots of casting annoyances are avoided by treating everything as `long`
+        let today_epoch = to_unixtime(vec![now()]);
+        let recency_col_epoch = to_unixtime(vec![col(qualified_recency_col)]);
+        let age_in_units = (today_epoch - recency_col_epoch) / lit(recency_time_unit_seconds);
+
+        let recency_expr = match recency_decay {
+            // e^(-alpha * age units)
+            RecencyDecay::Exponential => {
+                let recency_decay_alpha = args.recency_decay_alpha.unwrap_or(0.01);
+                exp(lit(-1.0f64 * recency_decay_alpha) * age_in_units)
+            }
+            // 1 - (age units / boost window)
+            RecencyDecay::Linear => {
+                let recency_window_seconds = args.recency_window_seconds.unwrap_or(86400.0);
+                let boost = lit(1) - (age_in_units / lit(recency_window_seconds));
+                greatest(vec![lit(0), boost])
+            }
+        };
+
+        Ok((score_expr * recency_expr).alias("fused_score"))
+    }
+
+    // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
+    // then finally re-rank and sort fused results
+    fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
+        let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
+        let score_expr = self.compute_score_expr(args, &subquery_dfs)?;
 
         // Create column expressions for final projection
         let mut columns: Vec<Expr> = vec![score_expr];
