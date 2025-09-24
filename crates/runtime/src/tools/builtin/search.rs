@@ -30,12 +30,12 @@ use crate::{
     tools::{SpiceModelTool, utils::parameters},
 };
 
-pub struct DocumentSimilarityTool {
+pub struct SearchTool {
     name: String,
     description: String,
     rt: Arc<Runtime>,
 }
-impl DocumentSimilarityTool {
+impl SearchTool {
     #[must_use]
     pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
@@ -49,7 +49,7 @@ impl DocumentSimilarityTool {
 }
 
 #[async_trait]
-impl SpiceModelTool for DocumentSimilarityTool {
+impl SpiceModelTool for SearchTool {
     fn name(&self) -> Cow<'_, str> {
         self.name.clone().into()
     }
