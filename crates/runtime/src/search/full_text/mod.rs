@@ -26,6 +26,7 @@ use search::generation::{
 };
 
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use snafu::ResultExt;
 
 use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
 
