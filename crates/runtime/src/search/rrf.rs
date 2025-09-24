@@ -16,7 +16,7 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
+use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err};
 use datafusion::datasource::TableType;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -31,6 +31,7 @@ use itertools::Itertools;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use tract_core::ops::math::Recip;
 
@@ -56,9 +57,61 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 pub static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
+macro_rules! extract_scalar_base {
+    ($map:expr, $key:literal, $datatype:expr, $pattern:pat => $value:expr) => {
+        $map.get($key)
+            .and_then(|sv| sv.cast_to(&$datatype).ok())
+            .and_then(|sv| match sv {
+                $pattern => Some($value),
+                _ => None,
+            })
+    };
+}
+
+macro_rules! extract_f64 {
+      ($map:expr, $key:literal) => {
+          extract_scalar_base!(
+              $map,
+              $key,
+              DataType::Float64,
+              ScalarValue::Float64(Some(val), ..) => val
+          )
+      };
+  }
+
+macro_rules! extract_string {
+      ($map:expr, $key:literal) => {
+          extract_scalar_base!(
+              $map,
+              $key,
+              DataType::Utf8,
+              ScalarValue::Utf8(Some(val), ..) => val
+          )
+      };
+  }
+
+#[derive(Debug)]
+enum RecencyDecay {
+    Linear,
+    Exponential,
+}
+
+impl FromStr for RecencyDecay {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "linear" => Ok(RecencyDecay::Linear),
+            "exponential" => Ok(RecencyDecay::Exponential),
+            other => not_impl_err!("{RRF_UDF_NAME} does not implement decay function {other}"),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReciprocalRankFusionSubqueryArgs {
-    pub rank_boost: Option<i64>,
+    pub rank_boost: Option<f64>,
+    pub recency_decay: Option<RecencyDecay>,
 }
 
 impl ReciprocalRankFusionSubqueryArgs {
@@ -69,16 +122,16 @@ impl ReciprocalRankFusionSubqueryArgs {
             let mut args = args.clone();
             let rrf_args = args
                 .extract_if(.., |arg| {
-                    matches!(arg, Expr::Literal(ScalarValue::Int64(Some(_)), Some(_)))
+                    matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
                 })
                 .filter_map(|arg| match arg {
-                    Expr::Literal(ScalarValue::Int64(Some(value)), Some(meta)) => meta
+                    Expr::Literal(value, Some(meta)) => meta
                         .inner()
                         .get("spice.parameter_name")
                         .map(|name| (name.clone(), value)),
                     _ => None,
                 })
-                .collect::<HashMap<String, i64>>();
+                .collect::<HashMap<String, ScalarValue>>();
 
             Ok((
                 Expr::ScalarFunction(ScalarFunction {
@@ -86,13 +139,12 @@ impl ReciprocalRankFusionSubqueryArgs {
                     func: func.clone(),
                 }),
                 ReciprocalRankFusionSubqueryArgs {
-                    rank_boost: rrf_args.get("rank_boost").copied(),
+                    rank_boost: extract_f64!(rrf_args, "rank_boost"),
+                    recency_decay: None,
                 },
             ))
         } else {
-            Err(DataFusionError::NotImplemented(format!(
-                "{RRF_UDF_NAME} subquery arguments require a scalar function invocation."
-            )))
+            not_impl_err!("{RRF_UDF_NAME} subquery arguments require a scalar function invocation.")
         }
     }
 }
@@ -103,6 +155,7 @@ struct ReciprocalRankFusionArgs {
     pub rrf_subquery_arguments: Vec<ReciprocalRankFusionSubqueryArgs>,
     pub k: f64,
     pub join_key: Option<Expr>,
+    pub recency_decay: Option<RecencyDecay>,
 }
 
 impl ReciprocalRankFusionArgs {
@@ -120,34 +173,34 @@ impl ReciprocalRankFusionArgs {
     /// * `Ok(ReciprocalRankFusionArgs)` - Successfully parsed arguments
     /// * `Err` - If fewer than 2 search queries are provided or if unparsing fails
     pub fn from_udtf_exprs(args: &[Expr]) -> Result<ReciprocalRankFusionArgs> {
-        let mut search_udtfs: Vec<Expr> = vec![];
-        let mut subquery_args: Vec<ReciprocalRankFusionSubqueryArgs> = vec![];
-        let mut k_argument: Option<f64> = None;
-        let mut join_pk_argument: Option<Expr> = None;
+        let mut rrf_args = args.to_vec();
 
-        for expr in args {
-            match expr {
-                e @ Expr::ScalarFunction(_) => {
-                    let (subquery_expr, rrf_subquery_args) =
-                        ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(e)?;
+        let (search_udtfs, subquery_args): (Vec<_>, Vec<_>) = rrf_args
+            .extract_if(.., |arg| matches!(arg, Expr::ScalarFunction(_)))
+            .map(|e| ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(&e))
+            .collect::<Result<Vec<(Expr, ReciprocalRankFusionSubqueryArgs)>>>()?
+            .into_iter()
+            .unzip();
 
-                    subquery_args.push(rrf_subquery_args);
-                    search_udtfs.push(subquery_expr)
-                }
-                Expr::Literal(ScalarValue::Float64(Some(k)), ..) if k_argument.is_none() => {
-                    k_argument = Some(*k);
-                }
-                Expr::Column(c) if join_pk_argument.is_none() => {
-                    join_pk_argument = Some(col(c.name.clone()));
+        let rrf_args = rrf_args
+            .iter()
+            .map(|arg| match arg {
+                Expr::Literal(value, Some(meta)) => {
+                    match meta.inner().get("spice.parameter_name") {
+                        Some(name) => Ok((name.clone(), value.clone())),
+                        None => {
+                            return not_impl_err!(
+                                "{RRF_UDF_NAME} does not yet support {arg} arguments."
+                            );
+                        }
+                    }
                 }
                 // Show a useful error for the rest
                 other_expr => {
-                    return Err(DataFusionError::NotImplemented(format!(
-                        "{RRF_UDF_NAME} does not yet support {other_expr} arguments."
-                    )));
+                    not_impl_err!("{RRF_UDF_NAME} does not yet support {other_expr} arguments.")
                 }
-            }
-        }
+            })
+            .collect::<Result<HashMap<String, ScalarValue>>>()?;
 
         if search_udtfs.len() < 2 {
             return Err(DataFusionError::Plan(format!(
@@ -158,8 +211,9 @@ impl ReciprocalRankFusionArgs {
         Ok(Self {
             search_udtf_exprs: search_udtfs,
             rrf_subquery_arguments: subquery_args,
-            k: k_argument.unwrap_or(60.0),
-            join_key: join_pk_argument,
+            k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
+            join_key: extract_string!(rrf_args, "join_key").map(col),
+            recency_decay: extract_string!(rrf_args, "recency_decay").and_then(|rd| RecencyDecay::from_str(&rd).ok()),
         })
     }
 }
@@ -210,11 +264,10 @@ impl ReciprocalRankFusion {
         let score_expr = (0..subquery_dfs.len())
             .map(|i| {
                 // Either use 1 as dividend or user provided boost
-                let dividend = args
+                let dividend: f64 = args
                     .rrf_subquery_arguments
                     .get(i)
                     .and_then(|args| args.rank_boost)
-                    .map(|rb| rb as f64)
                     .unwrap_or(1.0f64);
 
                 lit(dividend)
