@@ -48,7 +48,14 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
             "query...".to_string(),
             "Inline text_search or vector_search UDTF invocations".to_string(),
         ),
-        ("k".to_string(), "RRF smoothing parameter".to_string()),
+        ("k".to_string(), "RRF smoothing parameter (default: 60.0)".to_string()),
+        ("join_key".to_string(), "Column name to use for joining results instead of auto-generated row ID".to_string()),
+        ("time_column".to_string(), "Column name containing timestamps for recency boosting".to_string()),
+        ("recency_decay".to_string(), "Type of decay function: 'linear' or 'exponential' (default: 'exponential')".to_string()),
+        ("decay_constant".to_string(), "Decay rate constant for exponential decay (default: 0.01)".to_string()),
+        ("decay_scale_secs".to_string(), "Time scale in seconds for decay calculation (default: 86400)".to_string()),
+        ("decay_window".to_string(), "Window size for linear decay function (default: 86400)".to_string()),
+        ("rank_weight".to_string(), "Per-query rank weighting factor (used within individual search queries)".to_string()),
     ]),
     alternative_syntax: None,
     related_udfs: Some(vec!["text_search".to_string(), "vector_search".to_string()]),
@@ -157,7 +164,7 @@ struct ReciprocalRankFusionArgs {
     pub time_column: Option<Expr>,
     pub recency_decay: Option<RecencyDecay>,
     pub decay_constant: Option<f64>,
-    pub decay_scale_seconds: Option<f64>,
+    pub decay_scale_secs: Option<f64>,
     pub decay_window: Option<f64>,
 }
 
@@ -218,7 +225,7 @@ impl ReciprocalRankFusionArgs {
             recency_decay: extract_string!(rrf_args, "recency_decay")
                 .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
             decay_constant: extract_f64!(rrf_args, "decay_constant"),
-            decay_scale_seconds: extract_f64!(rrf_args, "decay_scale_seconds"),
+            decay_scale_secs: extract_f64!(rrf_args, "decay_scale_secs"),
             decay_window: extract_f64!(rrf_args, "decay_window"),
         })
     }
@@ -301,12 +308,12 @@ impl ReciprocalRankFusion {
             .recency_decay
             .clone()
             .unwrap_or(RecencyDecay::Exponential);
-        let decay_scale_seconds = args.decay_scale_seconds.unwrap_or(86400.0);
+        let decay_scale_secs = args.decay_scale_secs.unwrap_or(86400.0);
 
         // Lots of casting annoyances are avoided by treating everything as `long`
         let today_epoch = to_unixtime(vec![now()]);
         let recency_col_epoch = to_unixtime(vec![col(qualified_recency_col)]);
-        let age_in_units = (today_epoch - recency_col_epoch) / lit(decay_scale_seconds);
+        let age_in_units = (today_epoch - recency_col_epoch) / lit(decay_scale_secs);
 
         let recency_expr = match recency_decay {
             // e^(-alpha * age units)
@@ -890,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_argument_exprs() -> Result<()> {
+    fn test_parse_argument_exprs() {
         // Empty call
         let empty_args = ReciprocalRankFusionArgs::from_udtf_exprs(&[]);
         assert!(empty_args.is_err());
@@ -949,7 +956,5 @@ mod tests {
         assert_eq!(many_with_k_and_column.search_udtf_exprs.len(), 100);
         // assert_eq!(many_with_k_and_column.k, 1337.0f64);
         assert_eq!(many_with_k_and_column.join_key, Some(col("hello")));
-
-        Ok(())
     }
 }
