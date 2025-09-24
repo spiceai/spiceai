@@ -125,11 +125,11 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
     - https://spice.ai/spiceai/tailwindcss
 - [ ] Run [Publish to AWS Marketplace](https://github.com/spicehq/spiceai/actions/workflows/aws_marketplace_publish.yml) with both configurations (these will require manual approval by either @lukekim or @phillipleblanc):
 - Standard
-  - Docker image: `X.Y.Z-models`
+  - Docker image: `X.Y.Z-enterprise-models`
   - Target ECR repository: `spice-ai/spiceai-enterprise`
   - Platforms to publish: `linux/amd64,linux/arm64`
 - BYOL
-  - Docker image: `X.Y.Z-models`
+  - Docker image: `X.Y.Z-enterprise-models`
   - Target ECR repository: `spice-ai/spiceai-enterprise-byol`
   - Platforms to publish: `linux/amd64,linux/arm64`
 

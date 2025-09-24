@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Docker image tag to publish (e.g., 1.3.0-models)'
+        description: 'Docker image tag to publish (e.g., 1.3.0-enterprise-models)'
         required: true
         type: string
       repository:
