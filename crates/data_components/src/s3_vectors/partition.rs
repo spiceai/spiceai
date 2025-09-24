@@ -177,6 +177,7 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, DataFusionError> {
         .join(PARTS_SEPARATOR))
 }
 
+#[allow(clippy::too_many_lines)]
 fn stable_expr_string(expr: &Expr) -> Result<String, DataFusionError> {
     Ok(match expr {
         Expr::Column(col) => {
@@ -452,7 +453,7 @@ mod tests {
         }))
         .when(lit(true), lit("datafusion"))
         .otherwise(lit("other"))
-        .unwrap()];
+        .expect("otherwise")];
         assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
     }
 }
