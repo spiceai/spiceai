@@ -668,7 +668,7 @@ impl Dataset {
                 };
 
                 if index_store.is_some_and(|is| is == IndexStore::Memory) && index_directory.is_some() {
-                    tracing::warn!("Dataset '{}' has in-memory full text search configured for column '{}', but has 'index_directory' set", self.name, c.name);
+                    tracing::warn!("Dataset '{}' column '{}' has `index_store: memory` but also sets `index_directory`. These options are mutually exclusive. Defaulting to `index_store: memory`.", self.name, c.name);
                 }
                 Some(((c.name.clone(), row_ids.clone()), (index_store.unwrap_or_default(), index_directory.clone())))
             })
