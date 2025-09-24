@@ -91,6 +91,17 @@ macro_rules! extract_string {
       };
   }
 
+macro_rules! spice_named_lit {
+    ($name:literal, $value:expr) => {{
+        let scalar_value = ScalarValue::from($value);
+        let spice_metadata = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            $name.to_string(),
+        )]));
+        Expr::Literal(scalar_value, Some(spice_metadata))
+    }};
+}
+
 #[derive(Debug, Clone)]
 enum RecencyDecay {
     Linear,
@@ -111,7 +122,7 @@ impl FromStr for RecencyDecay {
 
 #[derive(Debug, Default)]
 struct ReciprocalRankFusionSubqueryArgs {
-    pub rank_boost: Option<f64>,
+    pub rank_weight: Option<f64>,
 }
 
 impl ReciprocalRankFusionSubqueryArgs {
@@ -139,7 +150,7 @@ impl ReciprocalRankFusionSubqueryArgs {
                     func: func.clone(),
                 }),
                 ReciprocalRankFusionSubqueryArgs {
-                    rank_boost: extract_f64!(rrf_args, "rank_boost"),
+                    rank_weight: extract_f64!(rrf_args, "rank_weight"),
                 },
             ))
         } else {
@@ -154,11 +165,11 @@ struct ReciprocalRankFusionArgs {
     pub rrf_subquery_arguments: Vec<ReciprocalRankFusionSubqueryArgs>,
     pub k: f64,
     pub join_key: Option<Expr>,
-    pub recency_column: Option<Expr>,
+    pub time_column: Option<Expr>,
     pub recency_decay: Option<RecencyDecay>,
-    pub recency_decay_alpha: Option<f64>,
-    pub recency_time_unit_seconds: Option<f64>,
-    pub recency_window_seconds: Option<f64>,
+    pub decay_constant: Option<f64>,
+    pub decay_scale_seconds: Option<f64>,
+    pub decay_window: Option<f64>,
 }
 
 impl ReciprocalRankFusionArgs {
@@ -216,12 +227,12 @@ impl ReciprocalRankFusionArgs {
             rrf_subquery_arguments: subquery_args,
             k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
             join_key: extract_string!(rrf_args, "join_key").map(col),
-            recency_column: extract_string!(rrf_args, "recency_column").map(col),
+            time_column: extract_string!(rrf_args, "time_column").map(col),
             recency_decay: extract_string!(rrf_args, "recency_decay")
                 .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
-            recency_decay_alpha: extract_f64!(rrf_args, "recency_decay_alpha"),
-            recency_time_unit_seconds: extract_f64!(rrf_args, "recency_time_unit_seconds"),
-            recency_window_seconds: extract_f64!(rrf_args, "recency_window_seconds"),
+            decay_constant: extract_f64!(rrf_args, "decay_constant"),
+            decay_scale_seconds: extract_f64!(rrf_args, "decay_scale_seconds"),
+            decay_window: extract_f64!(rrf_args, "decay_window"),
         })
     }
 }
@@ -276,7 +287,7 @@ impl ReciprocalRankFusion {
                 let dividend: f64 = args
                     .rrf_subquery_arguments
                     .get(i)
-                    .and_then(|args| args.rank_boost)
+                    .and_then(|args| args.rank_weight)
                     .unwrap_or(1.0f64);
 
                 lit(dividend)
@@ -291,12 +302,12 @@ impl ReciprocalRankFusion {
             return exec_err!("{RRF_UDF_NAME} unable to compute fused_score");
         };
 
-        if args.recency_column.is_none() {
+        if args.time_column.is_none() {
             return Ok(score_expr);
         }
 
         // If user specifies a recency column, we enable recency boosting
-        let recency_col = args.recency_column.as_ref().unwrap().clone();
+        let recency_col = args.time_column.as_ref().unwrap().clone();
         let (_, recency_col) = recency_col.qualified_name();
         let qualified_recency_col = Self::first_qualified_field(&subquery_dfs[0], &recency_col)?;
 
@@ -305,23 +316,23 @@ impl ReciprocalRankFusion {
             .recency_decay
             .clone()
             .unwrap_or(RecencyDecay::Exponential);
-        let recency_time_unit_seconds = args.recency_time_unit_seconds.unwrap_or(86400.0);
+        let decay_scale_seconds = args.decay_scale_seconds.unwrap_or(86400.0);
 
         // Lots of casting annoyances are avoided by treating everything as `long`
         let today_epoch = to_unixtime(vec![now()]);
         let recency_col_epoch = to_unixtime(vec![col(qualified_recency_col)]);
-        let age_in_units = (today_epoch - recency_col_epoch) / lit(recency_time_unit_seconds);
+        let age_in_units = (today_epoch - recency_col_epoch) / lit(decay_scale_seconds);
 
         let recency_expr = match recency_decay {
             // e^(-alpha * age units)
             RecencyDecay::Exponential => {
-                let recency_decay_alpha = args.recency_decay_alpha.unwrap_or(0.01);
-                exp(lit(-1.0f64 * recency_decay_alpha) * age_in_units)
+                let decay_constant = args.decay_constant.unwrap_or(0.01);
+                exp(lit(-1.0f64 * decay_constant) * age_in_units)
             }
             // 1 - (age units / boost window)
             RecencyDecay::Linear => {
-                let recency_window_seconds = args.recency_window_seconds.unwrap_or(86400.0);
-                let boost = lit(1) - (age_in_units / lit(recency_window_seconds));
+                let decay_window = args.decay_window.unwrap_or(86400.0);
+                let boost = lit(1) - (age_in_units / lit(decay_window));
                 greatest(vec![lit(0), boost])
             }
         };
@@ -596,12 +607,13 @@ mod tests {
     use datafusion::common::cast::as_float64_array;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::col;
-    use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use llms::embeddings::Embed;
     use llms::model2vec::Model2Vec;
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock};
     use tokio::sync::RwLock;
@@ -706,8 +718,7 @@ mod tests {
             .await
             .expect("Failed to create test runtime");
 
-        let query =
-            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), id, 600.0)";
+        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)";
         let query = QueryBuilder::new(query, runtime.datafusion()).build();
         let results = query
             .run()
@@ -740,7 +751,7 @@ mod tests {
             .expect("Failed to register bar table");
 
         let query_empty_red =
-            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), id, 600.0)";
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'))";
         let query_empty_red = QueryBuilder::new(query_empty_red, runtime.datafusion()).build();
         let query_empty_red_results = query_empty_red
             .run()
@@ -761,7 +772,7 @@ mod tests {
         let query_empty_red_score = query_empty_red_content.value(0);
 
         let query_red_empty =
-            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'), id, 600.0)";
+            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))";
         let query_red_empty = QueryBuilder::new(query_red_empty, runtime.datafusion()).build();
         let query_red_empty_results = query_red_empty
             .run()
@@ -802,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_argument_exprs() {
+    fn test_parse_argument_exprs() -> Result<()> {
         // Empty call
         let empty_args = ReciprocalRankFusionArgs::from_udtf_exprs(&[]);
         assert!(empty_args.is_err());
@@ -817,7 +828,7 @@ mod tests {
         // Call with at least 2 arguments, but one of them overrides k only
         let one_search_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(&[
             stub_scalar_function("one_search_with_k"),
-            lit(1337.0f64),
+            spice_named_lit!("k", 42.0),
         ]);
         assert!(one_search_with_k.is_err());
         assert_eq!(
@@ -844,7 +855,7 @@ mod tests {
         );
 
         // Call with many searches + k override
-        many_search_exprs.push(lit(1337.0f64));
+        many_search_exprs.push(spice_named_lit!("k", 1337.0f64));
         let many_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(&many_search_exprs);
         assert!(many_with_k.is_ok());
 
@@ -853,7 +864,7 @@ mod tests {
         // assert_eq!(many_with_k.k, 1337.0f64);
 
         // Call with many searches + k override + join key specified
-        many_search_exprs.push(col("hello"));
+        many_search_exprs.push(spice_named_lit!("join_key", "hello"));
         let many_with_k_and_column = ReciprocalRankFusionArgs::from_udtf_exprs(&many_search_exprs);
         assert!(many_with_k_and_column.is_ok());
 
@@ -861,5 +872,7 @@ mod tests {
         assert_eq!(many_with_k_and_column.search_udtf_exprs.len(), 100);
         // assert_eq!(many_with_k_and_column.k, 1337.0f64);
         assert_eq!(many_with_k_and_column.join_key, Some(col("hello")));
+
+        Ok(())
     }
 }
