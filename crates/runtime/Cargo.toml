@@ -186,7 +186,7 @@ azure_core = "0.27.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
-dirs = "5.0.1"
+dirs = "6.0.0"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
