@@ -40,13 +40,13 @@ on:
           - 'macOS x64 (Intel)'
         default: 'all'
       profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
+        description: 'Which Rust build profile to use? (Default is release-lto)'
         required: false
         type: choice
         options:
           - 'release'
           - 'release-lto'
-        default: 'release'
+        default: 'release-lto'
 
 permissions:
   contents: write
@@ -95,6 +95,11 @@ jobs:
               }
             ];
 
+            // Filter out Windows for releases
+            if (context.ref && context.ref.startsWith('refs/tags/v')) {
+              return matrix.filter(m => m.target_os !== 'windows');
+            }
+
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
               const platform_option = context.payload.inputs.platform_option;
@@ -103,7 +108,7 @@ jobs:
                 return matrix;
               }
 
-              return matrix.filter(m => m.name === platform_option);
+              return matrix;
             }
 
             return matrix;
@@ -116,7 +121,7 @@ jobs:
       GOVER: 1.24.2
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
 
     strategy:
       matrix:
@@ -424,8 +429,6 @@ jobs:
             target_arch: aarch64
           - target_os: darwin
             target_arch: aarch64
-          - target_os: windows
-            target_arch: x86_64
 
     runs-on: ubuntu-latest
     steps:
