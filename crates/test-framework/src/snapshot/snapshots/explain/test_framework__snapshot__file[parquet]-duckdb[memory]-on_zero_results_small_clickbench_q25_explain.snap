@@ -2,28 +2,28 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q25"
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                  |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: hits.SearchPhrase                                                                                                         |
-|               |   Sort: to_timestamp(hits.EventTime) ASC NULLS LAST, fetch=10                                                                         |
-|               |     Projection: hits.SearchPhrase, hits.EventTime                                                                                     |
-|               |       BytesProcessedNode                                                                                                              |
-|               |         Filter: CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")                                                                   |
-|               |           TableScan: hits projection=[EventTime, SearchPhrase], partial_filters=[CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")] |
-| physical_plan | ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]                                                                                 |
-|               |   SortExec: TopK(fetch=10), expr=[to_timestamp(EventTime@1) ASC NULLS LAST], preserve_partitioning=[false]                            |
-|               |     CoalescePartitionsExec                                                                                                            |
-|               |       ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]                                                 |
-|               |         BytesProcessedExec                                                                                                            |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                 |
-|               |             FilterExec: CAST(SearchPhrase@1 AS Utf8View) !=                                                                           |
-|               |               SchemaCastScanExec                                                                                                      |
-|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                 |
-|               |                   FallbackOnZeroResultsScanExec                                                                                       |
-|               |                     CoalescePartitionsExec                                                                                            |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                           |
-|               |                         CooperativeExec                                                                                               |
-|               |                           DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM hits WHERE (CAST(SearchPhrase AS VARCHAR) <> '')   |
-|               |                                                                                                                                       |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                   |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: hits.SearchPhrase                                                                                                          |
+|               |   Sort: to_timestamp(hits.EventTime) ASC NULLS LAST, fetch=10                                                                          |
+|               |     Projection: hits.SearchPhrase, hits.EventTime                                                                                      |
+|               |       BytesProcessedNode                                                                                                               |
+|               |         Filter: CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")                                                                    |
+|               |           TableScan: hits projection=[EventTime, SearchPhrase], partial_filters=[CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")]  |
+| physical_plan | ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]                                                                                  |
+|               |   SortExec: TopK(fetch=10), expr=[to_timestamp(EventTime@1) ASC NULLS LAST], preserve_partitioning=[false]                             |
+|               |     CoalescePartitionsExec                                                                                                             |
+|               |       ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]                                                  |
+|               |         BytesProcessedExec                                                                                                             |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                  |
+|               |             FilterExec: CAST(SearchPhrase@1 AS Utf8View) !=                                                                            |
+|               |               SchemaCastScanExec                                                                                                       |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                  |
+|               |                   FallbackOnZeroResultsScanExec                                                                                        |
+|               |                     CoalescePartitionsExec                                                                                             |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                            |
+|               |                         CooperativeExec                                                                                                |
+|               |                           DuckSqlExec sql= SELECT "EventTime", "SearchPhrase" FROM hits WHERE (CAST("SearchPhrase" AS VARCHAR) <> '')  |
+|               |                                                                                                                                        |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------+

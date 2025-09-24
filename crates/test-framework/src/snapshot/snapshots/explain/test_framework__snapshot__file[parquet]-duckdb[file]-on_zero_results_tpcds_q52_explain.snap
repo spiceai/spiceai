@@ -48,7 +48,7 @@ description: "Query: tpcds_q52"
 |               |                                             CoalescePartitionsExec                                                                                                                                     |
 |               |                                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                    |
 |               |                                                 CooperativeExec                                                                                                                                        |
-|               |                                                   DuckSqlExec sql= SELECT "d_date_sk", "d_year", "d_moy" FROM date_dim WHERE (d_moy = 11) AND (d_year = 2000)                                          |
+|               |                                                   DuckSqlExec sql= SELECT "d_date_sk", "d_year", "d_moy" FROM date_dim WHERE ("d_moy" = 11) AND ("d_year" = 2000)                                      |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                                                  |
 |               |                             RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 16), input_partitions=16                                                                                           |
 |               |                               BytesProcessedExec                                                                                                                                                       |
@@ -71,6 +71,6 @@ description: "Query: tpcds_q52"
 |               |                                     CoalescePartitionsExec                                                                                                                                             |
 |               |                                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                            |
 |               |                                         CooperativeExec                                                                                                                                                |
-|               |                                           DuckSqlExec sql= SELECT "i_item_sk", "i_brand_id", "i_brand", "i_manager_id" FROM item WHERE (i_manager_id = 1)                                              |
+|               |                                           DuckSqlExec sql= SELECT "i_item_sk", "i_brand_id", "i_brand", "i_manager_id" FROM item WHERE ("i_manager_id" = 1)                                            |
 |               |                                                                                                                                                                                                        |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

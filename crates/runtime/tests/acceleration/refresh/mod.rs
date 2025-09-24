@@ -1,3 +1,4 @@
+#[cfg(feature = "postgres")]
 mod common;
 #[cfg(all(feature = "duckdb", feature = "postgres"))]
 mod refresh_duckdb;

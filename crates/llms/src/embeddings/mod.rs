@@ -148,6 +148,22 @@ pub trait Embed: Debug + Sync + Send {
         None
     }
 
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {
+        if let Some(model_name) = self.model_name() {
+            Some((model_name, input).into())
+        } else {
+            tracing::trace!(
+                "dyn Embed does not implement model_name, therefore cannot generate cache key solely against embedding input: {:?} ",
+                self
+            );
+            None
+        }
+    }
+
     async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
         if let Some(embeddings_cache) = self.cache()
             && let Some(cached) = embeddings_cache
