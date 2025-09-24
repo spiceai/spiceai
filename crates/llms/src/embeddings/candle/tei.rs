@@ -258,9 +258,15 @@ impl Embed for TeiEmbed {
     }
 
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
-        if let Some(CachedEmbeddingResult::Vector(cached)) =
-            self.get_cached_embed((&input).into()).await
-        {
+        let cache_key = self.embedding_input_cache_key(&input);
+
+        let cached_response = if let Some(key) = cache_key {
+            self.get_cached_embed(key).await
+        } else {
+            None
+        };
+
+        if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
             return Ok(cached);
         }
 
@@ -273,11 +279,11 @@ impl Embed for TeiEmbed {
                 })?;
 
         let results: Vec<Vec<f32>> = resp.into_iter().map(|r| r.results).collect();
-        self.put_cached_embed(
-            (&input).into(),
-            CachedEmbeddingResult::Vector(results.clone()),
-        )
-        .await;
+
+        if let Some(key) = cache_key {
+            self.put_cached_embed(key, CachedEmbeddingResult::Vector(results.clone()))
+                .await;
+        }
 
         Ok(results)
     }
