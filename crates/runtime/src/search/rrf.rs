@@ -54,7 +54,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
         ("recency_decay".to_string(), "Type of decay function: 'linear' or 'exponential' (default: 'exponential')".to_string()),
         ("decay_constant".to_string(), "Decay rate constant for exponential decay (default: 0.01)".to_string()),
         ("decay_scale_secs".to_string(), "Time scale in seconds for decay calculation (default: 86400)".to_string()),
-        ("decay_window".to_string(), "Window size for linear decay function (default: 86400)".to_string()),
+        ("decay_window_secs".to_string(), "Window size for linear decay function (default: 86400)".to_string()),
         ("rank_weight".to_string(), "Per-query rank weighting factor (used within individual search queries)".to_string()),
     ]),
     alternative_syntax: None,
@@ -165,7 +165,7 @@ struct ReciprocalRankFusionArgs {
     pub recency_decay: Option<RecencyDecay>,
     pub decay_constant: Option<f64>,
     pub decay_scale_secs: Option<f64>,
-    pub decay_window: Option<f64>,
+    pub decay_window_secs: Option<f64>,
 }
 
 impl ReciprocalRankFusionArgs {
@@ -226,7 +226,7 @@ impl ReciprocalRankFusionArgs {
                 .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
             decay_constant: extract_f64!(rrf_args, "decay_constant"),
             decay_scale_secs: extract_f64!(rrf_args, "decay_scale_secs"),
-            decay_window: extract_f64!(rrf_args, "decay_window"),
+            decay_window_secs: extract_f64!(rrf_args, "decay_window_secs"),
         })
     }
 }
@@ -324,8 +324,8 @@ impl ReciprocalRankFusion {
             }
             // 1 - (age units / boost window)
             RecencyDecay::Linear => {
-                let decay_window = args.decay_window.unwrap_or(86400.0);
-                let boost = lit(1) - (age_in_units / lit(decay_window));
+                let decay_window_secs = args.decay_window_secs.unwrap_or(86400.0);
+                let boost = lit(1) - (age_in_units / lit(decay_window_secs));
                 greatest(vec![lit(0), boost])
             }
         };
