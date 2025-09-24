@@ -25,12 +25,13 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, md5};
+use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, lit};
 use itertools::Itertools;
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
-use datafusion_expr::expr::ScalarFunction;
 use tract_core::ops::math::Recip;
 
 pub static RRF_UDF_NAME: &str = "rrf";
@@ -57,20 +58,41 @@ pub static SIGNATURE: LazyLock<Signature> =
 
 #[derive(Debug, Default)]
 struct ReciprocalRankFusionSubqueryArgs {
-    pub rank_boost: Option<f64>,
+    pub rank_boost: Option<i64>,
 }
 
 impl ReciprocalRankFusionSubqueryArgs {
-    pub fn from_scalar_function_expr(expr: &Expr) -> Result<ReciprocalRankFusionSubqueryArgs> {
-        if let Expr::ScalarFunction(ScalarFunction { args, .. })  = expr {
-            println!("{args:?}");
-            Ok(ReciprocalRankFusionSubqueryArgs::default())
-        } else {
-            Err(DataFusionError::NotImplemented(
-                format!(
-                    "{RRF_UDF_NAME} subquery arguments require a scalar function invocation."
-                )
+    pub fn from_scalar_function_expr(
+        expr: &Expr,
+    ) -> Result<(Expr, ReciprocalRankFusionSubqueryArgs)> {
+        if let Expr::ScalarFunction(ScalarFunction { args, func }) = expr {
+            let mut args = args.clone();
+            let rrf_args = args
+                .extract_if(.., |arg| {
+                    matches!(arg, Expr::Literal(ScalarValue::Int64(Some(_)), Some(_)))
+                })
+                .filter_map(|arg| match arg {
+                    Expr::Literal(ScalarValue::Int64(Some(value)), Some(meta)) => meta
+                        .inner()
+                        .get("spice.parameter_name")
+                        .map(|name| (name.clone(), value)),
+                    _ => None,
+                })
+                .collect::<HashMap<String, i64>>();
+
+            Ok((
+                Expr::ScalarFunction(ScalarFunction {
+                    args,
+                    func: func.clone(),
+                }),
+                ReciprocalRankFusionSubqueryArgs {
+                    rank_boost: rrf_args.get("rank_boost").copied(),
+                },
             ))
+        } else {
+            Err(DataFusionError::NotImplemented(format!(
+                "{RRF_UDF_NAME} subquery arguments require a scalar function invocation."
+            )))
         }
     }
 }
@@ -106,9 +128,12 @@ impl ReciprocalRankFusionArgs {
         for expr in args {
             match expr {
                 e @ Expr::ScalarFunction(_) => {
-                    subquery_args.push(ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(e)?);
-                    search_udtfs.push(e.clone())
-                },
+                    let (subquery_expr, rrf_subquery_args) =
+                        ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(e)?;
+
+                    subquery_args.push(rrf_subquery_args);
+                    search_udtfs.push(subquery_expr)
+                }
                 Expr::Literal(ScalarValue::Float64(Some(k)), ..) if k_argument.is_none() => {
                     k_argument = Some(*k);
                 }
@@ -184,7 +209,15 @@ impl ReciprocalRankFusion {
 
         let score_expr = (0..subquery_dfs.len())
             .map(|i| {
-                lit(1.0f64)
+                // Either use 1 as dividend or user provided boost
+                let dividend = args
+                    .rrf_subquery_arguments
+                    .get(i)
+                    .and_then(|args| args.rank_boost)
+                    .map(|rb| rb as f64)
+                    .unwrap_or(1.0f64);
+
+                lit(dividend)
                     / (lit(args.k)
                         + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
             })
