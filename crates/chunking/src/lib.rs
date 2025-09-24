@@ -44,11 +44,9 @@ type ChunkIter<'a> = Box<dyn Iterator<Item = &'a str> + 'a>;
 
 pub trait Chunker: Sync + Send {
     fn chunk_indices<'a>(&self, text: &'a str) -> ChunkIndicesIter<'a>;
-}
 
-impl dyn Chunker {
     /// Chunks a given `text`, and for each returning the starting (inclusive) and ending (exclusive) indexes into the input `text`.
-    pub fn chunk_with_offsets<'a>(
+    fn chunk_with_offsets<'a>(
         &self,
         text: &'a str,
     ) -> Box<dyn Iterator<Item = ((usize, usize), &'a str)> + 'a> {
@@ -58,7 +56,7 @@ impl dyn Chunker {
         )
     }
 
-    pub fn chunks<'a>(&self, text: &'a str) -> ChunkIter<'a> {
+    fn chunks<'a>(&self, text: &'a str) -> ChunkIter<'a> {
         Box::new(self.chunk_indices(text).map(|(_, chunk)| chunk))
     }
 }

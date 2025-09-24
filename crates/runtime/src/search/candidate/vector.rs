@@ -286,8 +286,6 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             limit,
         );
 
-        tracing::warn!("jeadie=query={query}");
-
         let data = self
             .df
             .query_builder(&query)

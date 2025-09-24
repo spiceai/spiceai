@@ -30,6 +30,8 @@ use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
+pub static CHUNKED_INDEX_CHUNK_KEY: &str = "_spice.chunk_id";
+
 /// A [`SearchIndex`] that chunks the [`SearchIndex::search_column`] before each [`SearchIndex::write`].
 ///
 /// Two new [`FieldRef`]s augment the table:
@@ -51,7 +53,8 @@ impl Index for ChunkedSearchIndex {
     fn required_columns(&self) -> Vec<String> {
         let mut cols = self.inner.required_columns();
         cols.retain(|s| {
-            s != "_spice.chunk_id" && *s != Self::chunking_offset_col(self.search_column().as_str())
+            s != CHUNKED_INDEX_CHUNK_KEY
+                && *s != Self::chunking_offset_col(self.search_column().as_str())
         });
         cols
     }
@@ -131,7 +134,7 @@ impl ChunkedSearchIndex {
     pub fn augment_primary_key(pk: Vec<Field>) -> Vec<Field> {
         [
             pk,
-            vec![Field::new("_spice.chunk_id", DataType::UInt64, false)],
+            vec![Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false)],
         ]
         .concat()
     }
@@ -163,7 +166,7 @@ impl SearchIndex for ChunkedSearchIndex {
         self.inner
             .primary_fields()
             .into_iter()
-            .filter(|pk| pk.name() != "_spice.chunk_id")
+            .filter(|pk| pk.name() != CHUNKED_INDEX_CHUNK_KEY)
             .collect::<Vec<_>>()
     }
 
@@ -265,8 +268,6 @@ impl SearchIndex for ChunkedSearchIndex {
                 if i == idx {
                     Ok((
                         field,
-                        // This is lazy, avoid clone here.
-                        // WRONG this should still be the full content.
                         Arc::new(StringArray::from(flatten_chunks.clone())) as ArrayRef,
                     ))
                 } else {
@@ -277,7 +278,7 @@ impl SearchIndex for ChunkedSearchIndex {
             .into_iter()
             .unzip();
 
-        fields.push(Field::new("_spice.chunk_id", DataType::UInt64, false));
+        fields.push(Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false));
         arrays.push(Arc::new(UInt64Array::from(chunk_index)) as ArrayRef);
 
         fields.push(Field::new(
@@ -407,7 +408,7 @@ impl VectorIndex for ChunkedVectorIndex {
                 ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
             )))
             .order_by(vec![SortExpr::new(
-                Expr::Column(Column::new_unqualified("_spice.chunk_id")),
+                Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
                 true,
                 false,
             )])
@@ -418,7 +419,7 @@ impl VectorIndex for ChunkedVectorIndex {
                 ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
             )))
             .order_by(vec![SortExpr::new(
-                Expr::Column(Column::new_unqualified("_spice.chunk_id")),
+                Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
                 true,
                 false,
             )])

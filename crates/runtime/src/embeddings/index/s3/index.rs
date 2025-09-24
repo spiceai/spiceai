@@ -205,7 +205,7 @@ impl VectorIndex for S3Vector {
             .map(|(_, f)| {
                 match f.data_type() {
                     DataType::FixedSizeList(_, dim) => *dim,
-                    _ => 0, // Should not be reachable
+                    _ => unreachable!("S3 vector index schema is missing a 'FixedSizeList' field named '{S3_VECTOR_EMBEDDING_NAME}'")
                 }
             })
             .unwrap_or_default()

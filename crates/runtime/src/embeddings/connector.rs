@@ -227,7 +227,7 @@ impl EmbeddingConnector {
                         && chunking.enabled
                     {
                         let chunker = construct_chunker(
-                            config.model.clone().as_str(),
+                            config.model.as_str(),
                             &ChunkingConfig {
                                 target_chunk_size: chunking.target_chunk_size,
                                 overlap_size: chunking.overlap_size,
