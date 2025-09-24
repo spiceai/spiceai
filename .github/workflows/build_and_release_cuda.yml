@@ -106,31 +106,31 @@ jobs:
               },
               {
                 compute_cap: "80",
-                runner: "windows-latest",
+                runner: "windows-latest-8core",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "windows-latest",
+                runner: "windows-latest-8core",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "windows-latest",
+                runner: "windows-latest-8core",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "windows-latest",
+                runner: "windows-latest-8core",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "windows-latest",
+                runner: "windows-latest-8core",
                 target_os: "windows",
                 target_arch: "x86_64"
               }
