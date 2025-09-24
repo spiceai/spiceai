@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use datafusion::sql::TableReference;
 use search::generation::{CandidateGeneration, text_search::index::FullTextDatabaseIndex};
-use snafu::ResultExt;
 
 use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
 
