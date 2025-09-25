@@ -24,14 +24,13 @@ use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
 use iceberg::{TableIdent, io::CustomAwsCredentialLoader};
-use iceberg_catalog_rest::RestCatalog;
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
 
 use super::DataConnectorFactory;
 use crate::{
     catalogconnector::iceberg::{
-        ICEBERG_PARAM_LEN, get_rest_catalog_config, map_param_name_to_iceberg_prop,
+        ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
     component::dataset::Dataset,
@@ -273,9 +272,13 @@ impl DataConnector for IcebergDataConnector {
 
         props.extend(new_props);
 
-        let catalog_config = get_rest_catalog_config(base_uri, props);
-
-        let mut catalog_client = RestCatalog::new(catalog_config);
+        let mut catalog_client = get_rest_catalog(base_uri, props).await.map_err(|e| {
+            Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })?;
         if let Some(custom_loader) = custom_credential_loader {
             catalog_client = catalog_client.with_file_io_extension(custom_loader);
         }
