@@ -198,8 +198,6 @@ impl EmbeddingConnector {
         match vector_store.engine.as_deref() {
             #[cfg(feature = "s3_vectors")]
             Some("s3" | "s3_vectors") => {
-                use datafusion::prelude::SessionContext;
-
                 tracing::info!("S3 Vectors for dataset {} initializing...", dataset.name);
                 let start = std::time::Instant::now();
 
@@ -211,13 +209,18 @@ impl EmbeddingConnector {
                     }
                 })?;
 
-                let partition_by =
-                    get_and_validate_partition_by(df_schema, vector_store, &SessionContext::new())
-                        .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
-                            dataconnector: dataset.source().to_string(),
-                            connector_component: dataset.into(),
-                            source: e.into(),
-                        })?;
+                let partition_by = get_and_validate_partition_by(
+                    df_schema,
+                    vector_store,
+                    &dataset.runtime().df.ctx,
+                )
+                .map_err(|e| {
+                    DataConnectorError::InvalidConfigurationSourceOnly {
+                        dataconnector: dataset.source().to_string(),
+                        connector_component: dataset.into(),
+                        source: e.into(),
+                    }
+                })?;
 
                 let embedding_columns: Vec<_> = dataset
                     .columns
