@@ -20,8 +20,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -29,12 +28,19 @@ use datafusion::{
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
-        Filter, Join, LogicalPlan, Projection, Sort, SortExpr, SubqueryAlias,
-        TableProviderFilterPushDown, TableScan,
+        BinaryExpr, Cast, Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr,
+        SubqueryAlias, TableProviderFilterPushDown, TableScan, expr::Alias,
     },
     physical_plan::ExecutionPlan,
-    prelude::Expr,
+    prelude::{Expr, array_element, substring},
+    scalar::ScalarValue,
     sql::TableReference,
+};
+
+use crate::{
+    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
+    chunking::{ChunkedSearchIndex, is_chunked},
+    index::SearchIndex,
 };
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]
@@ -124,7 +130,13 @@ impl SearchQueryProvider {
             &self.schema().fields,
             &[
                 all_metadata_columns,
-                &[SEARCH_SCORE_COLUMN_NAME.to_string()],
+                &[
+                    SEARCH_SCORE_COLUMN_NAME.to_string(),
+                    SEARCH_MATCH_COLUMN_NAME.to_string(),
+                    ChunkedSearchIndex::chunking_offset_col(
+                        self.search_index.search_column().as_str(),
+                    ),
+                ],
             ]
             .concat(),
             projection,
@@ -159,11 +171,6 @@ impl SearchQueryProvider {
             underlying_filters,
             None,
         )?))
-    }
-
-    /// Get all metadata columns that should be excluded from base table projections
-    fn all_metadata_columns(&self) -> Vec<String> {
-        self.search_index.metadata_columns().all_names()
     }
 
     /// Get filters that can be handled by the search index
@@ -213,6 +220,7 @@ impl SearchQueryProvider {
         )?))
     }
 
+    #[allow(clippy::too_many_lines)] // Removed in `https://github.com/spiceai/spiceai/issues/7242`.
     fn join_with_base(
         &self,
         projection: Option<&Vec<usize>>,
@@ -231,11 +239,17 @@ impl SearchQueryProvider {
             .filter_map(|f| self.schema().index_of(f.name()).ok())
             .collect();
 
-        // Ensure primary keys are retrieved from underlying table.
-        // Ensure all columns needed for filters are here (or in index).
         let table_proj: Option<Vec<_>> = projection.map(|proj| {
             let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
-            p.extend(primary_key_projection);
+            // Ensure primary keys are retrieved from underlying table.
+            for pp in primary_key_projection {
+                p.insert(pp);
+            }
+
+            // Remove 'match'. Not in base table, calculated from offsets and search column.
+            if let Some((idx, _)) = self.schema().column_with_name(SEARCH_MATCH_COLUMN_NAME) {
+                let _ = p.remove(&idx);
+            }
 
             let search_index_cols = search_index_proj
                 .schema()
@@ -261,12 +275,22 @@ impl SearchQueryProvider {
                 .filter_map(|c| self.schema().index_of(c).ok())
                 .collect::<Vec<_>>();
             p.extend(filter_cols);
+
+            if let Some((idx, _)) = self.schema().column_with_name(
+                format!("{}_embedding", self.search_index.search_column()).as_str(),
+            ) {
+                let _ = p.remove(&idx);
+            }
+
             p.into_iter().collect()
         });
 
         // Need to join with base table
-        let underlying_table_scan =
-            self.underlying_table_scan(table_proj.as_ref(), filters, &self.all_metadata_columns())?;
+        let underlying_table_scan = self.underlying_table_scan(
+            table_proj.as_ref(),
+            filters,
+            &self.search_index.metadata_columns().all_names(),
+        )?;
 
         // Build join conditions based on primary keys
         let join_conditions: Vec<(Column, Column)> = self
@@ -341,6 +365,70 @@ impl SearchQueryProvider {
             Ok(proj)
         }
     }
+
+    fn match_column_index(&self) -> Option<usize> {
+        self.schema()
+            .column_with_name(SEARCH_MATCH_COLUMN_NAME)
+            .map(|(i, _)| i)
+    }
+
+    pub fn add_match_column(
+        &self,
+        projection: Option<&Vec<usize>>,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        // If projection doesn't include/need the 'match' column, early exit.
+        if !is_chunked(&self.search_index)
+            || projection
+                .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)))
+        {
+            return Ok(input);
+        }
+        let mut initial: Vec<_> = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
+
+        let first = array_element(
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
+            )),
+            Expr::Literal(ScalarValue::Int64(Some(1)), None),
+        );
+        let second = array_element(
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
+            )),
+            Expr::Literal(ScalarValue::Int64(Some(2)), None),
+        );
+
+        // substring(search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]) as 'match'
+        let substr = Expr::Cast(Cast::new(
+            Box::new(substring(
+                Expr::Column(Column::new_unqualified(self.search_index.search_column())),
+                first.clone(),
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(second),
+                    Operator::Minus,
+                    Box::new(first),
+                )),
+            )),
+            DataType::Utf8,
+        ));
+
+        initial.push(Expr::Alias(Alias::new(
+            substr,
+            None::<TableReference>,
+            "match",
+        )));
+
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            initial,
+            input.into(),
+        )?))
+    }
 }
 
 #[async_trait]
@@ -365,6 +453,35 @@ impl TableProvider for SearchQueryProvider {
             arrow_schema::DataType::Float64,
             false,
         )));
+
+        if is_chunked(&self.search_index) {
+            fields.extend([
+                Arc::new(Field::new(
+                    ChunkedSearchIndex::chunking_offset_col(
+                        self.search_index.search_column().as_str(),
+                    ),
+                    DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
+                    false,
+                )),
+                Arc::new(Field::new(
+                    SEARCH_MATCH_COLUMN_NAME.to_string(),
+                    arrow_schema::DataType::Utf8,
+                    false,
+                )),
+            ]);
+
+            if let Some(vector_index) = Arc::clone(&self.search_index).as_vector_index() {
+                fields.push(Arc::new(Field::new(
+                    ChunkedSearchIndex::embedding_col(self.search_index.search_column().as_str()),
+                    DataType::new_fixed_size_list(
+                        DataType::Float32,
+                        vector_index.dimension(),
+                        false,
+                    ),
+                    true,
+                )));
+            }
+        }
 
         Arc::new(Schema::new(fields))
     }
@@ -424,30 +541,49 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let primary_key_fields = self.search_index.primary_fields();
-        // Check primary key constraints
-        if primary_key_fields.is_empty() {
+        if self.search_index.primary_fields().is_empty() {
             return Err(DataFusionError::Execution(
                 "The search index was created without a primary key.\n\
                 Ensure a primary key is available in the dataset source, or specified in the column configuration."
                 .to_string(),
             ));
         }
-
         let search_index_table = self.search_index_table(filters).await?;
 
-        // Check if search index alone is sufficient
-        let base_logical_plan: LogicalPlan =
-            if self.search_index_table_is_sufficient(&search_index_table, projection, filters)? {
-                // Search index can handle everything - no join needed
-                if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                    LogicalPlan::Filter(Filter::try_new(filter, search_index_table.into())?)
-                } else {
-                    search_index_table
-                }
-            } else {
-                self.join_with_base(projection, search_index_table, filters)?
+        let inner_proj: Option<Vec<_>> = projection.cloned().map(|proj| {
+            let Some(match_idx) = self.match_column_index() else {
+                return proj;
             };
+            if !proj.contains(&match_idx) {
+                return proj;
+            }
+            let mut proj2 = proj.clone();
+            if let Some(search_idx) = self
+                .schema()
+                .column_with_name(self.search_index.search_column().as_str())
+                .map(|(i, _)| i)
+                && !proj2.contains(&search_idx)
+            {
+                proj2.push(search_idx);
+            }
+            proj2
+        });
+
+        // Check if search index alone is sufficient
+        let base_logical_plan: LogicalPlan = if self.search_index_table_is_sufficient(
+            &search_index_table,
+            inner_proj.as_ref(),
+            filters,
+        )? {
+            // Search index can handle everything - no join needed
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, search_index_table.into())?)
+            } else {
+                search_index_table
+            }
+        } else {
+            self.join_with_base(inner_proj.as_ref(), search_index_table, filters)?
+        };
 
         // Add sorting by search score (descending)
         let sort = LogicalPlan::Sort(Sort {
@@ -459,6 +595,8 @@ impl TableProvider for SearchQueryProvider {
             input: Arc::new(base_logical_plan),
             fetch: limit,
         });
+
+        let with_columns = self.add_match_column(inner_proj.as_ref(), sort)?;
 
         // Final projection to match requested schema
         let schema_proj: SchemaRef = match projection {
@@ -473,7 +611,7 @@ impl TableProvider for SearchQueryProvider {
         };
 
         let final_proj = LogicalPlan::Projection(Projection::new_from_schema(
-            Arc::new(sort),
+            Arc::new(with_columns),
             Arc::new(DFSchema::from_unqualified_fields(
                 schema_proj.fields().clone(),
                 HashMap::default(),

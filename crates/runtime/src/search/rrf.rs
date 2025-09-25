@@ -16,7 +16,7 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
+use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err};
 use datafusion::datasource::TableType;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -24,26 +24,38 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, md5};
+use datafusion::prelude::{
+    DataFrame, SessionContext, coalesce, exp, greatest, make_array, md5, now, to_unixtime,
+};
+use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, lit};
 use itertools::Itertools;
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
-    description: "Merge and rank several search queries into a single result set solely considering the order and not score of the input search queries".to_string(),
-    syntax_example: "rrf(query_1, query_2, ..., k)".to_string(),
+    description: "Merge several search queries by re-ranking them into a single result set considering each result set's orders, rank weights (if requested), and recency (if requested).".to_string(),
+    syntax_example: "rrf(query_1, query_2, ..., [named_arguments])".to_string(),
     sql_example: None,
     arguments: Some(vec![
         (
             "query...".to_string(),
             "Inline text_search or vector_search UDTF invocations".to_string(),
         ),
-        ("k".to_string(), "RRF smoothing parameter".to_string()),
+        ("k".to_string(), "RRF smoothing parameter (default: 60.0)".to_string()),
+        ("join_key".to_string(), "Column name to use for joining results instead of auto-generated row ID".to_string()),
+        ("time_column".to_string(), "Column name containing timestamps for recency boosting".to_string()),
+        ("recency_decay".to_string(), "Type of decay function: 'linear' or 'exponential' (default: 'exponential')".to_string()),
+        ("decay_constant".to_string(), "Decay rate constant for exponential decay (default: 0.01)".to_string()),
+        ("decay_scale_secs".to_string(), "Time scale in seconds for decay calculation (default: 86400)".to_string()),
+        ("decay_window_secs".to_string(), "Window size for linear decay function (default: 86400)".to_string()),
+        ("rank_weight".to_string(), "Per-query rank weighting factor (used within individual search queries)".to_string()),
     ]),
     alternative_syntax: None,
     related_udfs: Some(vec!["text_search".to_string(), "vector_search".to_string()]),
@@ -53,11 +65,107 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 pub static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
+macro_rules! extract_scalar_base {
+    ($map:expr, $key:literal, $datatype:expr, $pattern:pat => $value:expr) => {
+        $map.get($key)
+            .and_then(|sv| sv.cast_to(&$datatype).ok())
+            .and_then(|sv| match sv {
+                $pattern => Some($value),
+                _ => None,
+            })
+    };
+}
+
+macro_rules! extract_f64 {
+      ($map:expr, $key:literal) => {
+          extract_scalar_base!(
+              $map,
+              $key,
+              DataType::Float64,
+              ScalarValue::Float64(Some(val), ..) => val
+          )
+      };
+  }
+
+macro_rules! extract_string {
+      ($map:expr, $key:literal) => {
+          extract_scalar_base!(
+              $map,
+              $key,
+              DataType::Utf8,
+              ScalarValue::Utf8(Some(val), ..) => val
+          )
+      };
+  }
+
+#[derive(Debug, Clone)]
+enum RecencyDecay {
+    Linear,
+    Exponential,
+}
+
+impl FromStr for RecencyDecay {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "linear" => Ok(RecencyDecay::Linear),
+            "exponential" => Ok(RecencyDecay::Exponential),
+            other => not_impl_err!("{RRF_UDF_NAME} does not implement decay function {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReciprocalRankFusionSubqueryArgs {
+    pub rank_weight: Option<f64>,
+}
+
+impl ReciprocalRankFusionSubqueryArgs {
+    pub fn from_scalar_function_expr(
+        expr: &Expr,
+    ) -> Result<(Expr, ReciprocalRankFusionSubqueryArgs)> {
+        if let Expr::ScalarFunction(ScalarFunction { args, func }) = expr {
+            let mut args = args.clone();
+            let rrf_args = args
+                .extract_if(.., |arg| {
+                    matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+                })
+                .filter_map(|arg| match arg {
+                    Expr::Literal(value, Some(meta)) => meta
+                        .inner()
+                        .get("spice.parameter_name")
+                        .map(|name| (name.clone(), value)),
+                    _ => None,
+                })
+                .collect::<HashMap<String, ScalarValue>>();
+
+            Ok((
+                Expr::ScalarFunction(ScalarFunction {
+                    args,
+                    func: Arc::clone(func),
+                }),
+                ReciprocalRankFusionSubqueryArgs {
+                    rank_weight: extract_f64!(rrf_args, "rank_weight"),
+                },
+            ))
+        } else {
+            not_impl_err!("{RRF_UDF_NAME} subquery arguments require a scalar function invocation.")
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReciprocalRankFusionArgs {
     pub search_udtf_exprs: Vec<Expr>,
+    pub rrf_subquery_arguments: Vec<ReciprocalRankFusionSubqueryArgs>,
     pub k: f64,
     pub join_key: Option<Expr>,
+    pub time_column: Option<Expr>,
+    pub recency_decay: Option<RecencyDecay>,
+    pub decay_constant: Option<f64>,
+    pub decay_scale_secs: Option<f64>,
+    pub decay_window_secs: Option<f64>,
 }
 
 impl ReciprocalRankFusionArgs {
@@ -69,33 +177,38 @@ impl ReciprocalRankFusionArgs {
     /// ...into a neat struct of subquery expressions and an optional user-provided smoothing parameter.
     ///
     /// # Arguments
-    /// * `args` - A slice of `Expr` containing search UDTF invocations and an optional `k` parameter
+    /// * `args` - A slice of `Expr` containing search UDTF invocations and optional named arguments
     ///
     /// # Returns
     /// * `Ok(ReciprocalRankFusionArgs)` - Successfully parsed arguments
     /// * `Err` - If fewer than 2 search queries are provided or if unparsing fails
     pub fn from_udtf_exprs(args: &[Expr]) -> Result<ReciprocalRankFusionArgs> {
-        let mut search_udtfs: Vec<Expr> = vec![];
-        let mut k_argument: Option<f64> = None;
-        let mut join_pk_argument: Option<Expr> = None;
+        let mut rrf_args = args.to_vec();
 
-        for expr in args {
-            match expr {
-                e @ Expr::ScalarFunction(_) => search_udtfs.push(e.clone()),
-                Expr::Literal(ScalarValue::Float64(Some(k)), ..) if k_argument.is_none() => {
-                    k_argument = Some(*k);
-                }
-                Expr::Column(c) if join_pk_argument.is_none() => {
-                    join_pk_argument = Some(col(c.name.clone()));
+        let (search_udtfs, subquery_args): (Vec<_>, Vec<_>) = rrf_args
+            .extract_if(.., |arg| matches!(arg, Expr::ScalarFunction(_)))
+            .map(|e| ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(&e))
+            .collect::<Result<Vec<(Expr, ReciprocalRankFusionSubqueryArgs)>>>()?
+            .into_iter()
+            .unzip();
+
+        let rrf_args = rrf_args
+            .iter()
+            .map(|arg| match arg {
+                Expr::Literal(value, Some(meta)) => {
+                    match meta.inner().get("spice.parameter_name") {
+                        Some(name) => Ok((name.clone(), value.clone())),
+                        None => {
+                            not_impl_err!("{RRF_UDF_NAME} does not yet support {arg} arguments.")
+                        }
+                    }
                 }
                 // Show a useful error for the rest
                 other_expr => {
-                    return Err(DataFusionError::NotImplemented(format!(
-                        "{RRF_UDF_NAME} does not yet support {other_expr} arguments."
-                    )));
+                    not_impl_err!("{RRF_UDF_NAME} does not yet support {other_expr} arguments.")
                 }
-            }
-        }
+            })
+            .collect::<Result<HashMap<String, ScalarValue>>>()?;
 
         if search_udtfs.len() < 2 {
             return Err(DataFusionError::Plan(format!(
@@ -105,8 +218,15 @@ impl ReciprocalRankFusionArgs {
 
         Ok(Self {
             search_udtf_exprs: search_udtfs,
-            k: k_argument.unwrap_or(60.0),
-            join_key: join_pk_argument,
+            rrf_subquery_arguments: subquery_args,
+            k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
+            join_key: extract_string!(rrf_args, "join_key").map(col),
+            time_column: extract_string!(rrf_args, "time_column").map(col),
+            recency_decay: extract_string!(rrf_args, "recency_decay")
+                .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
+            decay_constant: extract_f64!(rrf_args, "decay_constant"),
+            decay_scale_secs: extract_f64!(rrf_args, "decay_scale_secs"),
+            decay_window_secs: extract_f64!(rrf_args, "decay_window_secs"),
         })
     }
 }
@@ -149,14 +269,21 @@ impl ReciprocalRankFusion {
         )
     }
 
-    // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
-    // then finally re-rank and sort fused results
-    fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
-        let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
-
+    fn compute_score_expr(
+        args: &ReciprocalRankFusionArgs,
+        subquery_dfs: &[DataFrame],
+    ) -> Result<Expr> {
+        // Compute base score expression with boost
         let score_expr = (0..subquery_dfs.len())
             .map(|i| {
-                lit(1.0f64)
+                // Either use 1 as dividend or user provided boost
+                let dividend: f64 = args
+                    .rrf_subquery_arguments
+                    .get(i)
+                    .and_then(|args| args.rank_weight)
+                    .unwrap_or(1.0f64);
+
+                lit(dividend)
                     / (lit(args.k)
                         + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
             })
@@ -167,6 +294,50 @@ impl ReciprocalRankFusion {
         } else {
             return exec_err!("{RRF_UDF_NAME} unable to compute fused_score");
         };
+
+        // If user specifies a recency column, we enable recency boosting
+        let qualified_recency_col = if let Some(recency_col) = args.time_column.clone() {
+            let (_, qname) = recency_col.qualified_name();
+            Self::first_qualified_field(&subquery_dfs[0], &qname)?
+        } else {
+            return Ok(score_expr);
+        };
+
+        // Defaults: exponential decay over days (86400s)
+        let recency_decay = args
+            .recency_decay
+            .clone()
+            .unwrap_or(RecencyDecay::Exponential);
+        let decay_scale_secs = args.decay_scale_secs.unwrap_or(86400.0);
+
+        // Lots of casting annoyances are avoided by treating everything as `long`
+        let today_epoch = to_unixtime(vec![now()]);
+        let recency_col_epoch = to_unixtime(vec![col(qualified_recency_col)]);
+        let age_in_units = (today_epoch - recency_col_epoch) / lit(decay_scale_secs);
+
+        let recency_expr = match recency_decay {
+            // e^(-alpha * age units)
+            RecencyDecay::Exponential => {
+                let decay_constant = args.decay_constant.unwrap_or(0.01);
+                #[allow(clippy::neg_multiply)]
+                exp(lit(-1.0f64 * decay_constant) * age_in_units)
+            }
+            // 1 - (age units / boost window)
+            RecencyDecay::Linear => {
+                let decay_window_secs = args.decay_window_secs.unwrap_or(86400.0);
+                let boost = lit(1) - (age_in_units / lit(decay_window_secs));
+                greatest(vec![lit(0), boost])
+            }
+        };
+
+        Ok((score_expr * recency_expr).alias("fused_score"))
+    }
+
+    // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
+    // then finally re-rank and sort fused results
+    fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
+        let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
+        let score_expr = Self::compute_score_expr(args, &subquery_dfs)?;
 
         // Create column expressions for final projection
         let mut columns: Vec<Expr> = vec![score_expr];
@@ -416,43 +587,44 @@ mod tests {
     use crate::embeddings::table::EmbeddingTable;
     use crate::request::{Protocol, RequestContext};
     use crate::search::rrf::ReciprocalRankFusionArgs;
-    use arrow::array::Int64Array;
-    use arrow::array::StringArray;
-    use arrow::array::{FixedSizeListArray, as_string_array};
+    use arrow::array::as_string_array;
     use arrow::record_batch::RecordBatch;
     use async_graphql::futures_util::TryStreamExt;
-    use async_openai::types::EmbeddingInput;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::catalog::MemTable;
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::catalog::TableProvider;
     use datafusion::common::Result;
     use datafusion::common::cast::as_float64_array;
+    use datafusion::functions_window::expr_fn::row_number;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::col;
-    use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use datafusion::prelude::{DataFrame, now, to_unixtime};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
-    use llms::embeddings::Embed;
+    use datafusion_expr::{ExprFunctionExt, lit};
     use llms::model2vec::Model2Vec;
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use std::process::ExitCode;
     use std::sync::{Arc, LazyLock};
-    use tokio::sync::RwLock;
 
     pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-    fn make_test_table(test_data: &[&str]) -> Result<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("content", DataType::Utf8, false),
-            Field::new(
-                "content_embedding",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 64),
-                true,
-            ),
-        ]));
+    macro_rules! spice_named_lit {
+        ($name:literal, $value:expr) => {{
+            let scalar_value = ScalarValue::from($value);
+            let spice_metadata = FieldMetadata::new(BTreeMap::from([(
+                "spice.parameter_name".to_string(),
+                $name.to_string(),
+            )]));
+            Expr::Literal(scalar_value, Some(spice_metadata))
+        }};
+    }
 
+    // Assumes column "content" is embedded
+    fn df_as_embedding_table(runtime: &Runtime, df: DataFrame) -> Arc<dyn TableProvider> {
         let mut embedded_columns = HashMap::new();
         embedded_columns.insert(
             "content".to_string(),
@@ -463,6 +635,21 @@ mod tests {
                 chunker: None,
             },
         );
+
+        Arc::new(EmbeddingTable {
+            base_table: df.into_view(),
+            embedded_columns,
+            embedding_models: Arc::clone(&runtime.embeds),
+        })
+    }
+
+    async fn make_test_runtime() -> Result<Runtime> {
+        let rt = RuntimeBuilder::new().build().await;
+        rt.df
+            .ctx
+            .state()
+            .config_mut()
+            .set_extension(Arc::clone(&TEST_REQUEST_CONTEXT));
 
         let embedding_model = Arc::new(
             Model2Vec::from_params(
@@ -476,146 +663,38 @@ mod tests {
             )
             .expect("Must make embedding model"),
         );
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from_iter_values(
-                    0i64..i64::try_from(test_data.len()).expect("Must cast"),
-                )),
-                Arc::new(StringArray::from_iter_values(test_data.iter())),
-                Arc::new(FixedSizeListArray::from_iter_primitive::<
-                    arrow::datatypes::Float32Type,
-                    _,
-                    _,
-                >(
-                    test_data.iter().map(|s| {
-                        embedding_model
-                            .embed_sync(EmbeddingInput::String((*s).to_string()))
-                            .map(|e| e[0].iter().map(|f| Some(*f)).collect::<Vec<Option<_>>>())
-                            .ok()
-                    }),
-                    64,
-                )),
-            ],
-        )?;
-
-        let mem_table = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
-        let mut embedding_model_store: HashMap<String, Arc<dyn Embed>> = HashMap::new();
-        embedding_model_store.insert("test_model".to_string(), embedding_model);
-
-        Ok(Arc::new(EmbeddingTable {
-            base_table: mem_table,
-            embedded_columns,
-            embedding_models: Arc::new(RwLock::new(embedding_model_store)),
-        }))
-    }
-
-    async fn make_test_runtime() -> Result<Runtime> {
-        let rt = RuntimeBuilder::new().build().await;
-        rt.df
-            .ctx
-            .state()
-            .config_mut()
-            .set_extension(Arc::clone(&TEST_REQUEST_CONTEXT));
-
-        let test_table = make_test_table(&[
-            "banana yellow curved fruit",
-            "orange citrus round juicy",
-            "apple fruit sweet red crispy",
-        ])?;
-        rt.df
-            .ctx
-            .register_table("foo", test_table)
-            .expect("Failed to register foo table");
+        rt.embeds
+            .write()
+            .await
+            .insert("test_model".to_string(), embedding_model);
 
         register_udfs(&rt);
         Ok(rt)
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_fuse_queries() {
-        let runtime = make_test_runtime()
-            .await
-            .expect("Failed to create test runtime");
+    async fn make_fruit_dataframe(runtime: &Runtime) -> Result<DataFrame> {
+        let rowid_expr = row_number()
+            .order_by(vec![col("content").sort(false, false)])
+            .build()?
+            .alias("id");
 
-        let query =
-            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), id, 600.0)";
-        let query = QueryBuilder::new(query, runtime.datafusion()).build();
-        let results = query
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect("Must collect results");
-
-        let content = as_string_array(
-            results[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
-        );
-        assert_eq!(content.value(0), "apple fruit sweet red crispy");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_score_computation() {
-        let runtime = make_test_runtime()
-            .await
-            .expect("Failed to create test runtime");
-
-        let empty_table = make_test_table(&[]).expect("Failed to create empty table");
-        runtime
+        let df = runtime
             .df
             .ctx
-            .register_table("bar", empty_table)
-            .expect("Failed to register bar table");
+            .sql(
+                "SELECT
+              unnest([
+                  'banana yellow curved fruit',
+                  'orange citrus round juicy',
+                  'apple fruit sweet red crispy'
+              ]) as content",
+            )
+            .await?;
 
-        let query_empty_red =
-            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), id, 600.0)";
-        let query_empty_red = QueryBuilder::new(query_empty_red, runtime.datafusion()).build();
-        let query_empty_red_results = query_empty_red
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect("Must collect results");
+        let embed_expr = df.parse_sql_expr("embed(content, 'test_model')")?;
 
-        let query_empty_red_content = as_float64_array(
-            query_empty_red_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
-        )
-        .expect("Must be f64[]");
-
-        let query_empty_red_score = query_empty_red_content.value(0);
-
-        let query_red_empty =
-            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'), id, 600.0)";
-        let query_red_empty = QueryBuilder::new(query_red_empty, runtime.datafusion()).build();
-        let query_red_empty_results = query_red_empty
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .expect("Must collect results");
-
-        let query_red_empty_content = as_float64_array(
-            query_red_empty_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
-        )
-        .expect("Must be f64[]");
-
-        let query_red_empty_score = query_red_empty_content.value(0);
-
-        let score_diff = (query_red_empty_score - query_empty_red_score).abs();
-        assert!(score_diff < 0.0001f64);
+        df.window(vec![rowid_expr])?
+            .with_column("content_embedding", embed_expr)
     }
 
     fn stub_scalar_function(name: &str) -> Expr {
@@ -634,6 +713,189 @@ mod tests {
         Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(stub_udf), vec![]))
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_recency_scoring() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime)
+            .await?
+            .with_column("picked_at", now())?
+            .with_column(
+                "picked_at",
+                to_unixtime(vec![col("picked_at")]) - (lit(43200) * col("id")),
+            )?;
+
+        let picked_at_expr = fruit_df.parse_sql_expr("to_timestamp(cast(picked_at as bigint))")?;
+
+        let fruit_df = fruit_df
+            .with_column("picked_at", picked_at_expr)?
+            .sort(vec![col("picked_at").sort(false, false)])?;
+
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df.clone());
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        // decay_constant is made more aggressive in this query to further deprioritize
+        // old results. The test will/should fail if you use the default of 0.01.
+        let query = "select * from rrf(vector_search(foo, 'red crispy'), vector_search(foo, 'fruit'), time_column => 'picked_at', decay_constant => 0.1)";
+        let query = QueryBuilder::new(query, runtime.datafusion()).build();
+        let results = query
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+
+        let content = as_string_array(
+            results[0]
+                .column_by_name("content")
+                .expect("Must have content column"),
+        );
+
+        let fruit_df_batches = fruit_df.collect().await?;
+        let fruit_df_recent = as_string_array(
+            fruit_df_batches[0]
+                .column_by_name("content")
+                .expect("Must have content column"),
+        );
+
+        // fruit_df.show() to debug me
+        assert_eq!(content.value(0), fruit_df_recent.value(0));
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rank_weighting() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let query = "select * from rrf(vector_search(foo, 'yellow', rank_weight => 100), vector_search(foo, 'red', rank_weight => 10))";
+        let query = QueryBuilder::new(query, runtime.datafusion()).build();
+        let results = query
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+
+        let content = as_string_array(
+            results[0]
+                .column_by_name("content")
+                .expect("Must have content column"),
+        );
+        assert_eq!(content.value(0), "banana yellow curved fruit");
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_queries() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)";
+        let query = QueryBuilder::new(query, runtime.datafusion()).build();
+        let results = query
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+
+        let content = as_string_array(
+            results[0]
+                .column_by_name("content")
+                .expect("Must have content column"),
+        );
+        assert_eq!(content.value(0), "apple fruit sweet red crispy");
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_score_computation() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?;
+        let fruit_table = df_as_embedding_table(&runtime, fruit_df.clone());
+
+        let no_fruit_df = fruit_df
+            .clone()
+            .limit(0, Some(0))
+            .expect("Must have fruit DF");
+        let no_fruit_table = df_as_embedding_table(&runtime, no_fruit_df);
+
+        runtime.df.ctx.register_table("foo", fruit_table)?;
+
+        runtime.df.ctx.register_table("bar", no_fruit_table)?;
+
+        let query_empty_red =
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'))";
+        let query_empty_red = QueryBuilder::new(query_empty_red, runtime.datafusion()).build();
+        let query_empty_red_results = query_empty_red
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+
+        let query_empty_red_content = as_float64_array(
+            query_empty_red_results[0]
+                .column_by_name("fused_score")
+                .expect("Must have score column"),
+        )
+        .expect("Must be f64[]");
+
+        let query_empty_red_score = query_empty_red_content.value(0);
+
+        let query_red_empty =
+            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))";
+        let query_red_empty = QueryBuilder::new(query_red_empty, runtime.datafusion()).build();
+        let query_red_empty_results = query_red_empty
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+
+        let query_red_empty_content = as_float64_array(
+            query_red_empty_results[0]
+                .column_by_name("fused_score")
+                .expect("Must have score column"),
+        )
+        .expect("Must be f64[]");
+
+        let query_red_empty_score = query_red_empty_content.value(0);
+
+        let score_diff = (query_red_empty_score - query_empty_red_score).abs();
+        assert!(score_diff < 0.0001f64);
+
+        Ok(ExitCode::SUCCESS)
+    }
+
     #[test]
     fn test_parse_argument_exprs() {
         // Empty call
@@ -650,7 +912,7 @@ mod tests {
         // Call with at least 2 arguments, but one of them overrides k only
         let one_search_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(&[
             stub_scalar_function("one_search_with_k"),
-            lit(1337.0f64),
+            spice_named_lit!("k", 42.0),
         ]);
         assert!(one_search_with_k.is_err());
         assert_eq!(
@@ -677,7 +939,7 @@ mod tests {
         );
 
         // Call with many searches + k override
-        many_search_exprs.push(lit(1337.0f64));
+        many_search_exprs.push(spice_named_lit!("k", 1337.0f64));
         let many_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(&many_search_exprs);
         assert!(many_with_k.is_ok());
 
@@ -686,7 +948,7 @@ mod tests {
         // assert_eq!(many_with_k.k, 1337.0f64);
 
         // Call with many searches + k override + join key specified
-        many_search_exprs.push(col("hello"));
+        many_search_exprs.push(spice_named_lit!("join_key", "hello"));
         let many_with_k_and_column = ReciprocalRankFusionArgs::from_udtf_exprs(&many_search_exprs);
         assert!(many_with_k_and_column.is_ok());
 
