@@ -402,7 +402,7 @@ async fn create_iceberg_provider(
 
     if let Some(catalog_id) = table.catalog_id.clone() {
         props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), catalog_id);
-    };
+    }
 
     let catalog = GlueCatalogBuilder::default()
         .load("glue", props)

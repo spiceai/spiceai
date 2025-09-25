@@ -583,7 +583,6 @@ pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Na
 }
 
 /// Builds an `IcebergRestCatalog` from a base URI and properties.
-#[must_use]
 pub async fn get_rest_catalog(
     base_uri: String,
     mut props: HashMap<String, String, std::hash::RandomState>,

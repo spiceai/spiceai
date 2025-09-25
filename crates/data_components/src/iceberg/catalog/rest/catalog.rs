@@ -146,6 +146,8 @@ impl Catalog for RestCatalog {
 #[cfg(test)]
 mod tests {
     use datafusion::prelude::SessionContext;
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_rest::RestCatalogBuilder;
     use iceberg_datafusion::IcebergTableProvider;
     use std::sync::Arc;
 
@@ -161,18 +163,22 @@ mod tests {
     #[ignore = "requires local minio and spark cluster"]
     async fn test_rest_catalog() {
         let catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri("http://localhost:8181".to_string())
-                .props(HashMap::from([
-                    (
-                        "s3.endpoint".to_string(),
-                        "http://localhost:9000".to_string(),
-                    ),
-                    ("s3.access-key-id".to_string(), "admin".to_string()),
-                    ("s3.secret-access-key".to_string(), "password".to_string()),
-                    ("s3.region".to_string(), "us-east-1".to_string()),
-                ]))
-                .build(),
+            RestCatalogBuilder::default()
+                .load(
+                    "rest",
+                    HashMap::from([
+                        ("uri".to_string(), "http://localhost:8181".to_string()),
+                        (
+                            "s3.endpoint".to_string(),
+                            "http://localhost:9000".to_string(),
+                        ),
+                        ("s3.access-key-id".to_string(), "admin".to_string()),
+                        ("s3.secret-access-key".to_string(), "password".to_string()),
+                        ("s3.region".to_string(), "us-east-1".to_string()),
+                    ]),
+                )
+                .await
+                .expect("valid catalog"),
         );
 
         let namespaces = catalog.list_namespaces(None).await;
