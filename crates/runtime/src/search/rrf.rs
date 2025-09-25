@@ -13,8 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::array::RecordBatch;
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
@@ -64,7 +63,7 @@ struct ReciprocalRankFusionArgs {
 impl ReciprocalRankFusionArgs {
     /// Constructs `ReciprocalRankFusionArgs` from an rrf UDTF invocation, which is a `TableScan` node
     /// that looks like this...
-    /// ```
+    /// ```text
     /// TableScan: rrf(text_search(wiki_a_potion, Utf8("apple")), vector_search(wiki_a_potion, Utf8("apple")))
     /// ```
     /// ...into a neat struct of subquery expressions and an optional user-provided smoothing parameter.
@@ -150,15 +149,6 @@ impl ReciprocalRankFusion {
         )
     }
 
-    fn empty_df(&self) -> DataFrame {
-        let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-
-        match self.session_context.read_batch(empty_batch) {
-            Ok(batch) => batch,
-            Err(_) => unreachable!("Must be able to make an empty DataFrame."),
-        }
-    }
-
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
     // then finally re-rank and sort fused results
     fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
@@ -209,7 +199,9 @@ impl ReciprocalRankFusion {
                 Ok(joined) => joined,
                 Err(e) => {
                     join_err = Some(e);
-                    self.empty_df()
+                    self.session_context
+                        .read_empty()
+                        .unwrap_or_else(|_| unreachable!("must be able to make an empty DataFrame"))
                 }
             }
         });
