@@ -330,6 +330,7 @@ impl ReciprocalRankFusion {
             }
         };
 
+        // Fall back to the original score expression if a recency boost cannot be computed
         Ok((score_expr * coalesce(vec![recency_expr, lit(1.0)])).alias("fused_score"))
     }
 
