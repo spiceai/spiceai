@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::error::ArrowError;
-use opendal::services::S3;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
     GetVectorBucketError, PutVectorsError, QueryVectorsError,
