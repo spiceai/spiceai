@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::error::ArrowError;
+use opendal::services::S3;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
     GetVectorBucketError, PutVectorsError, QueryVectorsError,
@@ -111,6 +112,18 @@ pub enum S3VectorIdentifier {
         bucket_name: String,
         index_name: String,
     },
+}
+
+impl Display for S3VectorIdentifier {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexArn(arn) => write!(f, "{arn}"),
+            Self::Index {
+                bucket_name,
+                index_name,
+            } => write!(f, "{bucket_name}/{index_name}"),
+        }
+    }
 }
 
 impl S3VectorIdentifier {
