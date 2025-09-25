@@ -15,29 +15,14 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v1.7 (September 2025)](https://github.com/spiceai/spiceai/milestone/75)
-
-**Focus:** Real-Time Write-Through Caching - Streamlined data and embedding caching with real-time ingestion.
-
-- **Query**:
-  - Regex support for DuckDB accelerator/connector.
-- **Search**:
-  - Amazon S3 Vectors cross-index query.
-  - Amazon S3 Vectors chunking support.
-  - Reciprocal Rank Fusion (RRF) UDTF
-- **Caching**:
-  - Real-time write-through caching/acceleration for data and embeddings.
-  - xxHash (XXH3) results-caching algorithm support.
-- **Ingestion**:
-  - Real-time data consumption via Apache Kafka.
-  - Improved Debezium/Change Data Capture (CDC) mechanisms.
-- **DataFusion**: Upgrade to v49.
-
 ### [v1.8 (October 2025)](https://github.com/spiceai/spiceai/milestone/77)
 
 **Focus:** Resource Management & Expanded Write Support - Fine-grained resource control and broader database compatibility.
 
 - **Resource Management**: Finer-grained runtime-wide control for optimized performance.
+- **Search**:
+  - Amazon S3 Vectors cross-index query.
+  - Amazon S3 Vectors chunking support.
 - **Hash Partitioning**: Improved query distribution and performance.
 - **Write Support**:
   - Write-through support to Apache Iceberg.
