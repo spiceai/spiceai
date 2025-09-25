@@ -15,15 +15,8 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use datafusion::{
-    execution::runtime_env::RuntimeEnvBuilder,
-    prelude::{SessionConfig, SessionContext},
-    sql::TableReference,
-};
+use datafusion::sql::TableReference;
 use search::generation::{CandidateGeneration, text_search::index::FullTextDatabaseIndex};
-
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use snafu::ResultExt;
 
 use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
 
