@@ -25,9 +25,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::{fmt::Debug, path::PathBuf};
 
-#[cfg(feature = "schemars")]
-use schemars::JsonSchema;
-
 #[cfg(feature = "object-store")]
 use std::sync::Arc;
 
@@ -95,7 +92,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spicepod {
     pub version: SpicepodVersion,
