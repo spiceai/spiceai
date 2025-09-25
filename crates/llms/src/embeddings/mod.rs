@@ -17,9 +17,7 @@ use async_openai::types::{
     EmbeddingVector, EncodingFormat,
 };
 use async_trait::async_trait;
-use cache::CacheProvider;
-use cache::key::CacheKey;
-use cache::result::embeddings::CachedEmbeddingResult;
+use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};

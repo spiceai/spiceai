@@ -17,31 +17,33 @@ pub mod common;
 pub mod connector;
 pub mod execution_plan;
 
-#[cfg(feature = "s3_vectors")]
 pub mod index;
 pub mod metrics;
 pub mod table;
 pub mod task;
 pub mod udtf;
 
-/// Converts string-like Arrow types into an iterator [`Option<Box<dyn Iterator<Item = Option<&str>>>>`]. If the downcast conversion
-/// fails, returns `None`.
-#[macro_export]
-macro_rules! convert_string_arrow_to_iterator {
-    ($data:expr) => {{
-        None.or($data
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + Send>))
-            .or($data
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + Send>))
-            .or($data
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + Send>))
-    }};
+use std::sync::Arc;
+
+use chunking::{Chunker, ChunkingConfig};
+use llms::embeddings::Error as EmbedError;
+
+use crate::model::EmbeddingModelStore;
+use tokio::sync::RwLock;
+
+/// Makes a [`Chunker`] from [`ChunkingConfig`] and a column's embedding model in [`EmbeddingModelStore`].
+async fn construct_chunker(
+    model_name: &str,
+    chunk_config: &ChunkingConfig<'_>,
+    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+) -> Result<Arc<dyn Chunker>, EmbedError> {
+    let embedding_models_guard = embedding_models.read().await;
+    let Some(embed_model) = embedding_models_guard.get(model_name) else {
+        return Err(EmbedError::ModelDoesNotExist {
+            model_name: model_name.to_string(),
+        });
+    };
+    embed_model.chunker(chunk_config)
 }
 
 #[cfg(test)]

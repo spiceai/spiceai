@@ -43,11 +43,12 @@ use std::{any::Any, sync::Arc, thread};
 
 use super::table::EmbeddingColumnConfig;
 use crate::model::EmbeddingModelStore;
-use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
+use crate::{embedding_col, offset_col};
 use rayon::ThreadPool;
 use std::fmt;
 use tokio::sync::RwLock;
 use tokio::task;
+use util::convert_string_arrow_to_iterator;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,

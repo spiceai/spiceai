@@ -77,6 +77,8 @@ use crate::{
         to_column_expr,
     },
 };
+
+use search::chunking::ChunkedSearchIndex;
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
@@ -291,13 +293,22 @@ impl VectorSearchTableFunc {
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        let Some((mut vector_indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl) else {
-            return Ok(None);
+        let mut vector_indexes: Vec<Arc<dyn SearchIndex>> = match (
+            find_index_in_table_provider::<S3Vector>(tbl),
+            find_index_in_table_provider::<ChunkedSearchIndex>(tbl),
+        ) {
+            (_, Some((chunked_index, _))) => chunked_index
+                .into_iter()
+                .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
+                .collect::<Vec<_>>(),
+            (Some((vector_index, _)), None) => vector_index
+                .into_iter()
+                .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
+                .collect::<Vec<_>>(),
+            (None, None) => return Ok(None),
         };
 
         let vector_index_opt = if let Some(col) = &args.column {
-            use search::index::SearchIndex;
-
             vector_indexes
                 .into_iter()
                 .find(|idx| *idx.search_column() == *col)
@@ -316,7 +327,7 @@ impl VectorSearchTableFunc {
         };
 
         Ok(Some(Arc::new(SearchQueryProvider::new(
-            Arc::new(vector_index.clone()) as Arc<dyn SearchIndex>,
+            vector_index,
             Arc::clone(tbl),
             args.query.clone(),
             args.limit,
