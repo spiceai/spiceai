@@ -23,6 +23,7 @@ cache = { path = "../cache" }
 chunking = {path="../chunking"}
 futures = { workspace = true }
 governor.workspace = true
+
 hf-hub.workspace = true
 insta = { workspace = true, features = ["filters"] }
 itertools.workspace = true

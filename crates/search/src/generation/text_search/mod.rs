@@ -57,6 +57,9 @@ pub enum Error {
     #[snafu(display("Error occurred during text search: {source}"))]
     TextSearchError { source: TantivyError },
 
+    #[snafu(display("Error occurred during indexing text search index: {source}"))]
+    TextSearchIndexingError { source: TantivyError },
+
     #[snafu(display("User provided query '{query}' is invalid: {source}"))]
     InvalidTextSearchQueryError {
         source: QueryParserError,
