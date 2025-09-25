@@ -12147,7 +12147,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.7.0-unstable"
+version = "1.8.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
