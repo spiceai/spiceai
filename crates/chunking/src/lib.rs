@@ -45,6 +45,17 @@ type ChunkIter<'a> = Box<dyn Iterator<Item = &'a str> + 'a>;
 pub trait Chunker: Sync + Send {
     fn chunk_indices<'a>(&self, text: &'a str) -> ChunkIndicesIter<'a>;
 
+    /// Chunks a given `text`, and for each returning the starting (inclusive) and ending (exclusive) indexes into the input `text`.
+    fn chunk_with_offsets<'a>(
+        &self,
+        text: &'a str,
+    ) -> Box<dyn Iterator<Item = ((usize, usize), &'a str)> + 'a> {
+        Box::new(
+            self.chunk_indices(text)
+                .map(|(idx, chunk)| ((idx, idx + chunk.len()), chunk)),
+        )
+    }
+
     fn chunks<'a>(&self, text: &'a str) -> ChunkIter<'a> {
         Box::new(self.chunk_indices(text).map(|(_, chunk)| chunk))
     }
@@ -168,7 +179,7 @@ mod tests {
         let chunker = Arc::new(
             RecursiveSplittingChunker::for_openai_model("text-embedding-3-small", &cfg)
                 .expect("failed to make chunker"),
-        );
+        ) as Arc<dyn Chunker>;
 
         let chunks: Vec<_> = chunker
             .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")

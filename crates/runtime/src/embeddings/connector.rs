@@ -19,25 +19,29 @@ use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorError;
-use crate::dataconnector::DataConnectorResult;
-use crate::embeddings::execution_plan::compute_additional_embedding_columns;
-use crate::embeddings::execution_plan::construct_record_batch;
+use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::embeddings::construct_chunker;
+use crate::embeddings::execution_plan::{
+    compute_additional_embedding_columns, construct_record_batch,
+};
+use crate::embeddings::index::VectorScanTableProvider;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
 use chunking::ChunkingConfig;
-use data_components::cdc::ChangeEnvelope;
-use data_components::cdc::ChangesStream;
-use data_components::cdc::StreamError;
-use data_components::cdc::replace_change_batch_data;
+use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
+use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
+use search::{
+    chunking::ChunkedSearchIndex,
+    index::{SearchIndex, VectorIndex},
+};
+use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
@@ -200,14 +204,10 @@ impl EmbeddingConnector {
                     .collect();
                 let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
                 for (column, config) in embedding_columns {
-                    use runtime_datafusion_index::Index;
-
-                    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
-
-                    let vector_index = super::index::s3::try_from_dataset(
+                    let mut vector_index = super::index::s3::try_from_dataset(
                         &dataset.name,
                         column,
-                        config,
+                        config.clone(),
                         vector_store,
                         Arc::clone(&inner_table_provider),
                         Arc::clone(&self.embedding_models),
@@ -223,14 +223,53 @@ impl EmbeddingConnector {
                         }
                     })?;
 
-                    let idx = Arc::new(vector_index);
-                    // augment the previous underlying table provider with the vector index
-                    // this will result in recursive augmentation of the underlying table for N embedding columns
-                    provider.underlying = Arc::new(VectorScanTableProvider::new(
-                        provider.underlying,
-                        Arc::clone(&idx) as Arc<dyn VectorIndex>,
-                    )) as Arc<dyn TableProvider>;
-                    provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
+                    if let Some(ref chunking) = config.chunking
+                        && chunking.enabled
+                    {
+                        let chunker = construct_chunker(
+                            config.model.as_str(),
+                            &ChunkingConfig {
+                                target_chunk_size: chunking.target_chunk_size,
+                                overlap_size: chunking.overlap_size,
+                                trim_whitespace: chunking.trim_whitespace,
+                                file_format: dataset.params.get("file_format").map(String::as_str),
+                            },
+                            &Arc::clone(&self.embedding_models),
+                        )
+                        .await
+                        .boxed()
+                        .map_err(|e| {
+                            DataConnectorError::UnableToConnectInternal {
+                                dataconnector: dataset.source().to_string(),
+                                connector_component: dataset.into(),
+                                source: e,
+                            }
+                        })?;
+
+                        let additional_meta = ChunkedSearchIndex::additional_metadata(
+                            vector_index.search_column().as_str(),
+                        );
+                        vector_index = vector_index.add_metadata(additional_meta);
+                        vector_index.primary_key =
+                            ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
+
+                        let idx = Arc::new(vector_index);
+                        let chunked_idx =
+                            ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);
+
+                        provider = provider.add_index(Arc::new(chunked_idx) as Arc<dyn Index>);
+                    } else {
+                        let idx = Arc::new(vector_index);
+                        let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
+
+                        // augment the previous underlying table provider with the vector index
+                        // this will result in recursive augmentation of the underlying table for N embedding columns
+                        provider.underlying = Arc::new(VectorScanTableProvider::new(
+                            provider.underlying,
+                            vector_index,
+                        )) as Arc<dyn TableProvider>;
+                        provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
+                    }
                 }
                 tracing::info!(
                     "S3 Vectors for dataset {} initialized in {:?}",
