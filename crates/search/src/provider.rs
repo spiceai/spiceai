@@ -261,6 +261,19 @@ impl SearchQueryProvider {
                 .filter_map(|c| self.schema().index_of(c).ok())
                 .collect::<Vec<_>>();
             p.extend(filter_cols);
+
+            // If base and index has embedding column, use index.
+            let embedding_col = format!("{}_embedding", self.search_index.search_column());
+            let index_has_embedding = !search_index_proj
+                .schema()
+                .columns_with_unqualified_name(embedding_col.as_str())
+                .is_empty();
+            if let Some((idx, _)) = self.schema().column_with_name(embedding_col.as_str())
+                && index_has_embedding
+            {
+                let _ = p.remove(&idx);
+            }
+
             p.into_iter().collect()
         });
 
