@@ -56,11 +56,19 @@ use tokio::sync::mpsc::Sender;
 
 /// An S3 Vector index that implements a [`TableProvider`] as a list records operation.
 #[derive(Debug, Clone)]
-pub struct S3VectorsListTable(S3VectorsTable);
+pub struct S3VectorsListTable {
+    table: S3VectorsTable,
+    column_name: String,
+    partition_by: Vec<Expr>,
+}
 
-impl From<S3VectorsTable> for S3VectorsListTable {
-    fn from(tbl: S3VectorsTable) -> Self {
-        Self(tbl)
+impl S3VectorsListTable {
+    pub fn new(table: S3VectorsTable, column_name: String, partition_by: Vec<Expr>) -> Self {
+        Self {
+            table,
+            column_name,
+            partition_by,
+        }
     }
 }
 
@@ -71,7 +79,7 @@ impl TableProvider for S3VectorsListTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.as_ref().schema)
+        Arc::clone(&self.table.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -79,7 +87,7 @@ impl TableProvider for S3VectorsListTable {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        Some(&self.as_ref().constraints)
+        Some(&self.table.constraints)
     }
 
     /// S3 vectors `ListVectors` API operation does not support filtering.
@@ -107,12 +115,6 @@ impl TableProvider for S3VectorsListTable {
 impl std::fmt::Debug for S3VectorsListExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3VectorsListExec").finish_non_exhaustive()
-    }
-}
-
-impl AsRef<S3VectorsTable> for S3VectorsListTable {
-    fn as_ref(&self) -> &S3VectorsTable {
-        &self.0
     }
 }
 
@@ -153,8 +155,8 @@ impl S3VectorsListExec {
         );
 
         Self {
-            idx: table.as_ref().idx.clone(),
-            client: Arc::clone(&table.as_ref().client),
+            idx: table.table.idx.clone(),
+            client: Arc::clone(&table.table.client),
             plan_properties: properties,
             limit,
         }

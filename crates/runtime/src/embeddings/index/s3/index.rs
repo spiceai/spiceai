@@ -21,6 +21,7 @@ use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::S3VectorIdentifier;
+use data_components::s3_vectors::partition::PartitionedIndexName;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
@@ -196,8 +197,17 @@ impl SearchIndex for S3Vector {
                             bucket_name,
                             index_name,
                         } => {
-                            let index_name = format!("{index_name}-{partition_value}");
-                            tracing::debug!("Using partitioned S3 index: {index_name}");
+                            let partitioned_index_name = PartitionedIndexName::new(
+                                index_name,
+                                &self.embedded_column,
+                                &partition_value,
+                                &self.partition_by,
+                            )?;
+                            let index_name = partitioned_index_name.to_index_name();
+                            tracing::trace!(
+                                "writing {} records to index: {index_name}",
+                                partition_record.num_rows(),
+                            );
                             S3VectorIdentifier::Index {
                                 bucket_name: bucket_name.clone(),
                                 index_name,
@@ -256,7 +266,12 @@ impl SearchIndex for S3Vector {
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
         let vector = self.query_vector(query).await?;
-        let tp = Arc::new(S3VectorsQueryTable::new(self.table.clone(), vector));
+        let tp = Arc::new(S3VectorsQueryTable::new(
+            self.table.clone(),
+            vector,
+            self.embedded_column.clone(),
+            self.partition_by.clone(),
+        ));
 
         let lp = table_with_projection(tp, projection).boxed()?;
         Ok(Arc::new(ViewTable::new(lp, None)) as Arc<dyn TableProvider>)
@@ -270,16 +285,23 @@ impl VectorIndex for S3Vector {
     fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
         let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
+
+        let column_name = embedding_col!(self.search_column());
+
         projection.push(Expr::Alias(Alias::new(
             Expr::Column(datafusion::common::Column::new_unqualified(
                 S3_VECTOR_EMBEDDING_NAME,
             )),
             None::<TableReference>,
-            embedding_col!(self.search_column()),
+            &column_name,
         )));
 
         table_with_projection(
-            Arc::new(S3VectorsListTable::from(self.table.clone())),
+            Arc::new(S3VectorsListTable::new(
+                self.table.clone(),
+                column_name,
+                self.partition_by.clone(),
+            )),
             projection,
         )
         .boxed()

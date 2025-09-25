@@ -16,7 +16,7 @@ limitations under the License.
 use arrow::error::ArrowError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, PutVectorsError, QueryVectorsError,
+    GetVectorBucketError, ListIndexesError, PutVectorsError, QueryVectorsError,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
@@ -101,6 +101,8 @@ pub enum Error {
         exists: DistanceMetric,
         specified: DistanceMetric,
     },
+    #[snafu(display("S3 vector indexes cannot be listed"))]
+    S3VectorListIndexesError { source: ListIndexesError },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
