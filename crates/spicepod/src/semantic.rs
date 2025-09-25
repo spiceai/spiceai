@@ -15,7 +15,7 @@ limitations under the License.
 */
 //! Data types for semantic information about tables (datasets or views).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -161,6 +161,29 @@ pub struct FullTextSearchConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub row_ids: Option<Vec<String>>,
+
+    pub index_store: Option<IndexStore>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum IndexStore {
+    #[default]
+    Memory,
+    File,
+}
+
+impl Display for IndexStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory => write!(f, "memory"),
+            Self::File => write!(f, "file"),
+        }
+    }
 }
 
 impl FullTextSearchConfig {
@@ -169,6 +192,8 @@ impl FullTextSearchConfig {
         FullTextSearchConfig {
             enabled: false,
             row_ids: None,
+            index_store: Some(IndexStore::default()),
+            index_directory: None,
         }
     }
 
@@ -177,6 +202,8 @@ impl FullTextSearchConfig {
         FullTextSearchConfig {
             enabled: true,
             row_ids: None,
+            index_store: Some(IndexStore::default()),
+            index_directory: None,
         }
     }
 
