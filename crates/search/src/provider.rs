@@ -171,7 +171,6 @@ impl TableProvider for SearchQueryProvider {
             })
             .collect();
 
-        tracing::warn!("Hello!");
         let join_schema = Arc::new(search_index.schema().join(base_table.schema())?);
 
         let join = LogicalPlan::Join(Join {

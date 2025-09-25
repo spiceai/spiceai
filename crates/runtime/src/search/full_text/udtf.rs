@@ -43,7 +43,6 @@ use datafusion::{
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
-use search::provider::SearchQueryProvider;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
     provider::SearchQueryProvider,
