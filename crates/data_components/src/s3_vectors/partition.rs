@@ -50,11 +50,11 @@ static PARTS_SEPARATOR: &str = ".";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Expected exactly 4 parts in index name separated by hyphens, but found {num_parts}"
+        "Expected exactly 4 parts in index name separated by periods, but found {num_parts}"
     ))]
     IncorrectNumPartsInName { num_parts: usize },
     #[snafu(display("The 'partition_by' expression, {expr}, is not supported"))]
-    UnsupportedPartitionByExpression { expr: Expr },
+    UnsupportedPartitionByExpression { expr: Box<Expr> },
     #[snafu(display("Index names cannot contain hyphens"))]
     InvalidIndexNameHyphen,
     #[snafu(display(
@@ -76,7 +76,7 @@ pub enum BelongsWith {
     ThisDataset,
     DifferentDataset,
     DifferentColumn,
-    DifferentParitionByExpressions,
+    DifferentPartitionByExpressions,
 }
 
 impl PartitionedIndexName {
@@ -149,7 +149,7 @@ impl PartitionedIndexName {
         } else if self.column_name_hash != column_name_hash {
             BelongsWith::DifferentColumn
         } else if self.partition_by_hash != partition_by_hash {
-            BelongsWith::DifferentParitionByExpressions
+            BelongsWith::DifferentPartitionByExpressions
         } else {
             BelongsWith::ThisDataset
         }
@@ -255,8 +255,8 @@ fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
             else_expr,
         }) => {
             let expr = match expr {
-                Some(expr) => &format!("Some({expr})"),
-                None => "None",
+                Some(expr) => format!("Some({})", stable_expr_string(expr)?),
+                None => "None".to_string(),
             };
             let else_expr = else_expr
                 .as_ref()
@@ -302,7 +302,9 @@ fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
             format!("InList({expr}, [{list_str}])")
         }
         e => {
-            return Err(Error::UnsupportedPartitionByExpression { expr: e.clone() });
+            return Err(Error::UnsupportedPartitionByExpression {
+                expr: Box::new(e.clone()),
+            });
         }
     })
 }
@@ -343,7 +345,7 @@ mod tests {
         );
         assert_eq!(
             this.belongs_with(index_name, column_name, &[]),
-            BelongsWith::DifferentParitionByExpressions
+            BelongsWith::DifferentPartitionByExpressions
         );
         assert_eq!(
             this.belongs_with("yourdataset", column_name, partition_by),
