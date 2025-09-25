@@ -163,7 +163,7 @@ fn sanitize_column(s: &str) -> String {
 fn validate_index(index: &str) -> Result<(), Error> {
     let len = index.len();
     ensure!(
-        len < INDEX_NAME_MAX_LENGTH,
+        len <= INDEX_NAME_MAX_LENGTH,
         InvalidIndexNameLengthSnafu {
             index: index.to_string(),
             len
