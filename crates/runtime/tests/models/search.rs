@@ -45,6 +45,7 @@ use std::time::Instant;
 
 use super::{get_tpcds_dataset, sort_json_keys};
 
+#[derive(Clone)]
 pub enum SearchTestType {
     Http(serde_json::Value),
     Sql(&'static str),
@@ -59,17 +60,18 @@ impl Display for SearchTestType {
     }
 }
 
+#[derive(Clone)]
 pub struct SearchTestCase {
-    pub name: &'static str,
+    pub name: String,
     pub body: SearchTestType,
     pub should_fail: bool,
     pub skip: bool,
 }
 
 impl SearchTestCase {
-    pub fn new(name: &'static str, body: SearchTestType) -> Self {
+    pub fn new(name: impl Into<String>, body: SearchTestType) -> Self {
         Self {
-            name,
+            name: name.into(),
             body,
             should_fail: false,
             skip: false,
@@ -324,24 +326,24 @@ pub(crate) async fn run_search_w_explain(
                         run_search_test(http_base_url.as_str(), &ts, None, ts.should_fail).await?;
                     }
                     SearchTestType::Sql(sql) => {
+                        let test_name = ts.name.clone();
                         let resp = http_sql(http_base_url.as_str(), sql).await;
                         if ts.should_fail {
                             if resp.is_ok() {
                                 return Err(anyhow::anyhow!(format!(
-                                    "Test {} was expected to fail but succeeded",
-                                    ts.name
+                                    "Test {test_name} was expected to fail but succeeded",
                                 )));
                             }
 
                             let err = resp.err().context("Test was expected to fail")?;
                             insta::assert_snapshot!(
-                                format!("{}_error_response", ts.name),
+                                format!("{test_name}_error_response"),
                                 err.to_string()
                             );
                             continue;
                         }
 
-                        insta::assert_json_snapshot!(ts.name, resp?);
+                        insta::assert_json_snapshot!(test_name.clone(), resp?);
 
                         if explain_sql {
                             let c = client
@@ -355,7 +357,7 @@ pub(crate) async fn run_search_w_explain(
                             insta::with_settings!({
                                 omit_expression => true,
                                 description => sql
-                            }, {insta::assert_snapshot!(format!("{}_explain", ts.name), disp)});
+                            }, {insta::assert_snapshot!(format!("{test_name}_explain"), disp)});
                         }
                     }
                 }

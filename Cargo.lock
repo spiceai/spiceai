@@ -12845,15 +12845,18 @@ dependencies = [
  "arrow-schema",
  "async-stream",
  "async-trait",
+ "chunking",
  "datafusion",
  "futures",
  "insta",
+ "itertools 0.14.0",
  "runtime-datafusion-index",
  "serde_json",
  "snafu",
  "tantivy",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -16029,6 +16032,8 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 name = "util"
 version = "1.8.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-schema",
  "backoff",
  "ctrlc",
  "humantime",

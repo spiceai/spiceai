@@ -27,6 +27,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
+
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::{
     common::{Constraint, Constraints},
