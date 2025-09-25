@@ -167,7 +167,7 @@ impl DataConnector for DuckDB {
             });
         }
 
-        Ok(Read::table_provider(&self.duckdb_factory, path, None)
+        Ok(Read::table_provider(&self.duckdb_factory, path)
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "duckdb",

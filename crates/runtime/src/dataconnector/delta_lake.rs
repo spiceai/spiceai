@@ -141,7 +141,7 @@ impl DataConnector for DeltaLake {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
-            Read::table_provider(&self.delta_table_factory, dataset.path().into(), None)
+            Read::table_provider(&self.delta_table_factory, dataset.path().into())
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "delta_lake",

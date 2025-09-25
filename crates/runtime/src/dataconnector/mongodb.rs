@@ -237,7 +237,7 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Read::table_provider(&self.mongodb_factory, dataset.path().into(), None)
+        Read::table_provider(&self.mongodb_factory, dataset.path().into())
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",

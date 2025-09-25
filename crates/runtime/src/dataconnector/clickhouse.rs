@@ -234,7 +234,7 @@ impl DataConnector for Clickhouse {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
-            Read::table_provider(&self.clickhouse_factory, dataset.path().into(), None)
+            Read::table_provider(&self.clickhouse_factory, dataset.path().into())
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "clickhouse",

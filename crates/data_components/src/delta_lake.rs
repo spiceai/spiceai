@@ -99,7 +99,6 @@ impl Read for DeltaTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
         let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone()).boxed()?;

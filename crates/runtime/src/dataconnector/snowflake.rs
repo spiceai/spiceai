@@ -145,7 +145,7 @@ impl DataConnector for Snowflake {
             })
             .join(".");
 
-        Ok(Read::table_provider(&self.table_factory, path.into(), None)
+        Ok(Read::table_provider(&self.table_factory, path.into())
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "snowflake",

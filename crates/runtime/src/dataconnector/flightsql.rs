@@ -156,7 +156,7 @@ impl DataConnector for FlightSQL {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
-            Read::table_provider(&self.flightsql_factory, dataset.path().into(), None)
+            Read::table_provider(&self.flightsql_factory, dataset.path().into())
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "flightsql",

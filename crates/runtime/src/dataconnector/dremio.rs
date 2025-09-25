@@ -204,7 +204,7 @@ impl DataConnector for Dremio {
                 });
             }
         };
-        match FlightFactory::table_provider(&self.flight_factory, table_reference, None).await {
+        match FlightFactory::table_provider(&self.flight_factory, table_reference).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -234,7 +234,7 @@ impl DataConnector for Dremio {
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let read_write_result =
-            ReadWrite::table_provider(&self.flight_factory, dataset.path().into(), None)
+            ReadWrite::table_provider(&self.flight_factory, dataset.path().into())
                 .await
                 .context(super::UnableToGetReadWriteProviderSnafu {
                     dataconnector: "dremio",

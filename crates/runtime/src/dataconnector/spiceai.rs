@@ -260,7 +260,7 @@ impl DataConnector for SpiceAI {
 
         let (flight_factory, table_reference) = self.flight_factory(dataset_path);
 
-        match Read::table_provider(&flight_factory, table_reference, None).await {
+        match Read::table_provider(&flight_factory, table_reference).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -309,7 +309,7 @@ impl DataConnector for SpiceAI {
             SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
         };
 
-        let read_write_result = ReadWrite::table_provider(&flight_factory, table_reference, None)
+        let read_write_result = ReadWrite::table_provider(&flight_factory, table_reference)
             .await
             .context(super::UnableToGetReadWriteProviderSnafu {
                 dataconnector: "spice.ai",
