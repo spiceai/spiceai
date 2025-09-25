@@ -354,10 +354,10 @@ pub mod tests {
             Ok(record)
         }
 
-        async fn query_table_provider(
+        fn query_table_provider(
             &self,
             _query: &str,
-        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
                 vec![Arc::new(Field::new("score", DataType::Float64, false))],

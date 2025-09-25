@@ -40,6 +40,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::sql::federation_analyzer_rule;
+use runtime_datafusion_analyzer::RedundantJoinAnalyzerRule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -254,6 +255,7 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
+        Arc::new(RedundantJoinAnalyzerRule {}),
     ]
 }
 

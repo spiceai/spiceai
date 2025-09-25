@@ -43,6 +43,7 @@ use datafusion::{
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
+use search::provider::SearchQueryProvider;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
     provider::SearchQueryProvider,
@@ -281,12 +282,12 @@ impl TableFunctionImpl for TextSearchTableFunc {
         fts_index.search_fields = vec![column];
 
         Ok(Arc::new(TextSearchIndexProviderWrapper {
-            inner: Arc::new(SearchQueryProvider::new(
+            inner: Arc::new(SearchQueryProvider::try_from_index(
                 Arc::new(fts_index) as Arc<dyn SearchIndex>,
                 table_provider,
                 args.query.clone(),
                 args.limit,
-            )),
+            )?),
         }))
     }
 }

@@ -131,6 +131,9 @@ pub enum Error {
 
     #[snafu(display("Failed to retrieve primary key from the table: {source}."))]
     FailedToRetrievePrimaryKey { source: ArrowError },
+
+    #[snafu(display("Temporarily failed to access full text search index"))]
+    TemporarilyFailedToAccessSearchIndex {},
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

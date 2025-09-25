@@ -21,6 +21,7 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
+    "crates/runtime-datafusion-analyzer",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-table-partition",

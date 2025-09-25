@@ -128,6 +128,7 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-streamable-http-server",
 ] }
 runtime-auth = { path = "../runtime-auth" }
+runtime-datafusion-analyzer = { path = "../runtime-datafusion-analyzer" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }

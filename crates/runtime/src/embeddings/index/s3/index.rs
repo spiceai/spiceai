@@ -113,11 +113,11 @@ impl S3Vector {
         Some(Arc::clone(model))
     }
 
-    pub async fn query_vector(
+    pub fn query_vector(
         &self,
         query: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        let models = self.embedding_models.read().await;
+        let models = self.embedding_models.try_read().boxed()?;
         let Some(embedding_model) = models.get(&self.model_name) else {
             return Err(Box::from(format!(
                 "Vector index requires '{}' embedding model, but is not available.",
@@ -125,8 +125,7 @@ impl S3Vector {
             )));
         };
         let mut resp = embedding_model
-            .embed(EmbeddingInput::String(query.to_string()))
-            .await
+            .embed_sync(EmbeddingInput::String(query.to_string()))
             .boxed()?;
         let Some(query_vector) = resp.pop() else {
             return Err(Box::from(format!(
@@ -164,10 +163,7 @@ impl SearchIndex for S3Vector {
         Some(Arc::clone(&self) as Arc<dyn VectorIndex>)
     }
 
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let mut projection = s3_vectors_primary_key_cast(&self.primary_fields());
         projection.extend(vec![
             Expr::Alias(Alias::new(
@@ -189,10 +185,12 @@ impl SearchIndex for S3Vector {
 
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
-        let vector = self.query_vector(query).await?;
+        let vector = self
+            .query_vector(query)
+            .map_err(DataFusionError::External)?;
         let tp = Arc::new(S3VectorsQueryTable::new(self.table.clone(), vector));
 
-        let lp = table_with_projection(tp, projection).boxed()?;
+        let lp = table_with_projection(tp, projection)?;
         Ok(Arc::new(ViewTable::new(lp, None)) as Arc<dyn TableProvider>)
     }
 }

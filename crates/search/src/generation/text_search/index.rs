@@ -181,11 +181,15 @@ impl FullTextDatabaseIndex {
             .into()
     }
 
-    pub async fn full_text_search_field_index(
+    pub fn full_text_search_field_index(
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self.index.read().await;
+        let index_read = self
+            .index
+            .try_read()
+            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
+
         let mut search_index = FullTextSearchFieldIndex::try_new(
             &index_read,
             search_field.to_string(),
@@ -423,13 +427,11 @@ impl SearchIndex for FullTextDatabaseIndex {
         Ok(record)
     }
 
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let field_index = self
             .full_text_search_field_index(&self.search_column())
-            .await?;
+            .boxed()
+            .map_err(DataFusionError::External)?;
 
         Ok(Arc::new(FullTextSearchQuery {
             index: field_index,

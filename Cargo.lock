@@ -12089,6 +12089,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "runtime-auth",
+ "runtime-datafusion-analyzer",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",
@@ -12156,6 +12157,18 @@ dependencies = [
  "pin-project",
  "tonic",
  "tower 0.5.2",
+ "tracing",
+]
+
+[[package]]
+name = "runtime-datafusion-analyzer"
+version = "1.8.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "futures",
+ "itertools 0.14.0",
+ "tokio",
  "tracing",
 ]
 

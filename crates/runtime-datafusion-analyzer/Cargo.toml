@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "runtime-datafusion-analyzer"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+itertools.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
