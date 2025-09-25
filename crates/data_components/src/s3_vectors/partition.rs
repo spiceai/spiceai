@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use datafusion::{
-    error::DataFusionError,
     logical_expr::{Case, expr::ScalarFunction},
     prelude::Expr,
     scalar::ScalarValue,
@@ -53,8 +52,8 @@ pub enum Error {
         "Expected exactly 4 parts in index name separated by hyphens, but found {num_parts}"
     ))]
     IncorrectNumPartsInName { num_parts: usize },
-    #[snafu(display("Failed to unparse a partition_by expression: {source}"))]
-    UnparsingExpression { source: DataFusionError },
+    #[snafu(display("The "))]
+    UnsupportedExpression { expr: Expr },
     #[snafu(display("Index names cannot contain hyphens"))]
     InvalidIndexNameHyphen,
     #[snafu(display(
@@ -93,7 +92,7 @@ impl PartitionedIndexName {
             PARTITION_VALUE_MAX_LENGTH,
         );
         let partition_by_hash = truncate(
-            &hash_to_hex(&to_stable_string(partition_by).context(UnparsingExpressionSnafu)?),
+            &hash_to_hex(&to_stable_string(partition_by)?),
             PARTITION_BY_MAX_LENGTH,
         );
         Ok(Self {
@@ -142,7 +141,7 @@ impl PartitionedIndexName {
 }
 
 fn sanitize_column(s: &str) -> String {
-    s.replace('_', "-")
+    s.replace('_', "-").replace('.', "-")
 }
 
 fn validate_index(index: &str) -> Result<(), Error> {
@@ -169,16 +168,16 @@ fn hash_to_hex(input: &str) -> String {
 }
 
 // Provide a stable string representation of the expressions
-fn to_stable_string(exprs: &[Expr]) -> Result<String, DataFusionError> {
+fn to_stable_string(exprs: &[Expr]) -> Result<String, Error> {
     Ok(exprs
         .iter()
         .map(stable_expr_string)
-        .collect::<Result<Vec<String>, DataFusionError>>()?
+        .collect::<Result<Vec<_>, _>>()?
         .join(PARTS_SEPARATOR))
 }
 
 #[allow(clippy::too_many_lines)]
-fn stable_expr_string(expr: &Expr) -> Result<String, DataFusionError> {
+fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
     Ok(match expr {
         Expr::Column(col) => {
             format!("Column({})", col.name())
@@ -256,7 +255,7 @@ fn stable_expr_string(expr: &Expr) -> Result<String, DataFusionError> {
                         stable_expr_string(t)?
                     ))
                 })
-                .collect::<Result<Vec<_>, DataFusionError>>()?
+                .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             format!("Case({expr}, {when_then_expr}, {else_expr})")
         }
@@ -286,11 +285,7 @@ fn stable_expr_string(expr: &Expr) -> Result<String, DataFusionError> {
                 .join(", ");
             format!("InList({expr}, [{list_str}])")
         }
-        e => {
-            return Err(DataFusionError::External(
-                format!("expression {e:?} is not supported in 'partition_by'").into(),
-            ));
-        }
+        e => return Err(Error::UnsupportedExpression { expr: e.clone() }),
     })
 }
 
@@ -300,6 +295,7 @@ mod tests {
 
     use super::*;
     use arrow::datatypes::DataType;
+    use datafusion::error::DataFusionError;
     use datafusion::functions::regex::regexp_match;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{
@@ -434,6 +430,7 @@ mod tests {
             unimplemented!()
         }
     }
+
     #[test]
     fn partition_by_stability() {
         let partition_by = &[col("id").eq(lit(7))];

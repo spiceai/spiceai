@@ -405,7 +405,7 @@ impl DisplayAs for PartitionInputExec {
 /// Evaluate the `physical_expr` for each row in `batch`. A partition batch is
 /// created for each unique value produced by evaluating the expression
 /// containing the rows that produced that unique partition value.
-fn partition_batch(
+pub fn partition_batch(
     batch: &RecordBatch,
     physical_expr: &dyn PhysicalExpr,
 ) -> Result<HashMap<String, (ScalarValue, RecordBatch)>, DataFusionError> {

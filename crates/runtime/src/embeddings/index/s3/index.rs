@@ -20,13 +20,18 @@ use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
+use data_components::s3_vectors::S3VectorIdentifier;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
+use datafusion::common::DFSchema;
+use datafusion::physical_expr::create_physical_expr;
+use datafusion_expr::execution_props::ExecutionProps;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
+use runtime_table_partition::insert::partition_batch;
 use search::SEARCH_SCORE_COLUMN_NAME;
 use search::index::SearchIndex;
 use search::metadata::{MetadataColumn, MetadataColumns};
@@ -71,7 +76,7 @@ pub struct S3Vector {
 
     pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 
-    _partition_by: Vec<Expr>,
+    pub partition_by: Vec<Expr>,
 }
 
 impl S3Vector {
@@ -116,7 +121,7 @@ impl S3Vector {
             complete_metadata_columns,
             model_name,
             embedding_models,
-            _partition_by: partition_by,
+            partition_by,
         }
     }
 
@@ -170,7 +175,59 @@ impl SearchIndex for S3Vector {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        write::write(self, record).await.boxed()
+        match self.partition_by.first() {
+            Some(partition_by) => {
+                let input_dfschema = DFSchema::try_from(record.schema()).unwrap();
+                let execution_props = ExecutionProps::new();
+                let physical_expr =
+                    create_physical_expr(partition_by, &input_dfschema, &execution_props).unwrap();
+                let partitions = partition_batch(&record, physical_expr.as_ref()).unwrap();
+
+                for (partition_value, partition_record) in partitions.into_values() {
+                    // change the index name to a partition name
+                    let id = match &self.table.idx {
+                        S3VectorIdentifier::IndexArn(_) => {
+                            tracing::debug!(
+                                "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
+                            );
+                            return Ok(write::write(self, &self.table, record).await.boxed()?);
+                        }
+                        S3VectorIdentifier::Index {
+                            bucket_name,
+                            index_name,
+                        } => {
+                            let index_name = format!("{index_name}-{partition_value}");
+                            tracing::debug!("Using partitioned S3 index: {index_name}");
+                            S3VectorIdentifier::Index {
+                                bucket_name: bucket_name.clone(),
+                                index_name,
+                            }
+                        }
+                    };
+
+                    let table = S3VectorsTable::try_create_new_table(
+                        id,
+                        Arc::clone(&self.table.client),
+                        self.table.dimension,
+                        self.table.columns.clone(),
+                        Some(self.table.distance_metric.clone()),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "S3 vector index could not be read or created".to_string(),
+                        )
+                    })?;
+
+                    write::write(self, &table, partition_record).await.boxed()?;
+                }
+            }
+            None => {
+                return Ok(write::write(self, &self.table, record).await.boxed()?);
+            }
+        };
+
+        Ok(record)
     }
 
     async fn query_table_provider(
