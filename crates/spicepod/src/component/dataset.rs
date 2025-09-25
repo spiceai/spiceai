@@ -290,6 +290,7 @@ pub enum InvalidTypeAction {
 }
 
 /// Helper struct for deserializing Dataset with custom logic for handling `InvalidTypeAction` migration
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DatasetDeserializer {
