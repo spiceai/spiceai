@@ -24,8 +24,8 @@ use twox_hash::XxHash64;
 
 const HASH_SEED: u64 = 7;
 
-const INDEX_NAME_MAX_LENGTH: usize = 25;
-const COLUMN_NAME_MAX_LENGTH: usize = 25;
+const INDEX_NAME_MAX_LENGTH: usize = 45;
+const COLUMN_NAME_MAX_LENGTH: usize = 5;
 const PARTITION_VALUE_MAX_LENGTH: usize = 5;
 const PARTITION_BY_MAX_LENGTH: usize = 5;
 
@@ -33,6 +33,7 @@ const _NUM_SEPARATORS: usize = 3; // 3 periods '.' separate the 4 parts
 /// See [CreateIndex](https://docs.aws.amazon.com/AmazonS3/latest/API/API_S3VectorBuckets_CreateIndex.html#API_S3VectorBuckets_CreateIndex_RequestSyntax)
 const _S3_VECTOR_INDEX_NAME_MAX_LENGTH: usize = 63;
 
+// Check at compile time that we use the full amount allowed from S3
 const _: () = {
     assert!(
         INDEX_NAME_MAX_LENGTH
@@ -65,15 +66,16 @@ pub enum Error {
 #[derive(Debug)]
 pub struct PartitionedIndexName {
     index_name: String,
-    column_name: String,
+    column_name_hash: String,
     partition_value_hash: String,
     partition_by_hash: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum BelongsWith {
-    SameDataset,
+    ThisDataset,
     DifferentDataset,
+    DifferentColumn,
     DifferentParitionByExpressions,
 }
 
@@ -86,7 +88,7 @@ impl PartitionedIndexName {
     ) -> Result<Self, Error> {
         validate_index(index_name)?;
         let index_name = truncate(&sanitize_column(index_name), INDEX_NAME_MAX_LENGTH);
-        let column_name = truncate(&sanitize_column(column_name), COLUMN_NAME_MAX_LENGTH);
+        let column_name_hash = truncate(&hash_to_hex(column_name), COLUMN_NAME_MAX_LENGTH);
         let partition_value_hash = truncate(
             &hash_to_hex(&partition_value.to_string()),
             PARTITION_VALUE_MAX_LENGTH,
@@ -97,7 +99,7 @@ impl PartitionedIndexName {
         );
         Ok(Self {
             index_name,
-            column_name,
+            column_name_hash,
             partition_value_hash,
             partition_by_hash,
         })
@@ -108,7 +110,7 @@ impl PartitionedIndexName {
     pub fn to_index_name(&self) -> String {
         [
             self.index_name.clone(),
-            self.column_name.clone(),
+            self.column_name_hash.clone(),
             self.partition_value_hash.clone(),
             self.partition_by_hash.clone(),
         ]
@@ -121,7 +123,7 @@ impl PartitionedIndexName {
         ensure!(num_parts == 4, IncorrectNumPartsInNameSnafu { num_parts });
         Ok(Self {
             index_name: parts[0].to_string(),
-            column_name: parts[1].to_string(),
+            column_name_hash: parts[1].to_string(),
             partition_value_hash: parts[2].to_string(),
             partition_by_hash: parts[3].to_string(),
         })
@@ -129,14 +131,28 @@ impl PartitionedIndexName {
 
     /// Determines if the partitions come from the same dataset
     #[must_use]
-    pub fn belongs_with(&self, other: &Self) -> BelongsWith {
-        if self.index_name != other.index_name || self.column_name != other.column_name {
-            return BelongsWith::DifferentDataset;
+    pub fn belongs_with(
+        &self,
+        index_name: &str,
+        column_name: &str,
+        partition_by: &[Expr],
+    ) -> BelongsWith {
+        let index_name = truncate(&sanitize_column(index_name), INDEX_NAME_MAX_LENGTH);
+        let column_name_hash = truncate(&hash_to_hex(column_name), COLUMN_NAME_MAX_LENGTH);
+        let partition_by_hash = truncate(
+            &hash_to_hex(&to_stable_string(partition_by).unwrap_or_default()),
+            PARTITION_BY_MAX_LENGTH,
+        );
+
+        if self.index_name != index_name {
+            BelongsWith::DifferentDataset
+        } else if self.column_name_hash != column_name_hash {
+            BelongsWith::DifferentColumn
+        } else if self.partition_by_hash != partition_by_hash {
+            BelongsWith::DifferentParitionByExpressions
+        } else {
+            BelongsWith::ThisDataset
         }
-        if self.partition_by_hash != other.partition_by_hash {
-            return BelongsWith::DifferentParitionByExpressions;
-        }
-        BelongsWith::SameDataset
     }
 }
 
@@ -297,6 +313,7 @@ mod tests {
 
     use super::*;
     use arrow::datatypes::DataType;
+    use datafusion::error::DataFusionError;
     use datafusion::functions::regex::regexp_match;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{
@@ -305,6 +322,36 @@ mod tests {
     use datafusion::prelude::{case, col, lit};
     use datafusion::scalar::ScalarValue;
     use insta::assert_snapshot;
+
+    type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    #[test]
+    fn belongs_with() -> Result<()> {
+        let index_name = "mydataset";
+        let column_name = "_my.column";
+        let partition_by = &[col(column_name)];
+
+        let this = PartitionedIndexName::from_index_name("mydataset.29d6f.b0543.7f7c5")?;
+
+        assert_eq!(
+            this.belongs_with(index_name, column_name, partition_by),
+            BelongsWith::ThisDataset
+        );
+        assert_eq!(
+            this.belongs_with(index_name, "_your.column", partition_by),
+            BelongsWith::DifferentColumn
+        );
+        assert_eq!(
+            this.belongs_with(index_name, column_name, &[]),
+            BelongsWith::DifferentParitionByExpressions
+        );
+        assert_eq!(
+            this.belongs_with("yourdataset", column_name, partition_by),
+            BelongsWith::DifferentDataset
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn index_name_length_restricted() {
@@ -320,34 +367,37 @@ mod tests {
     }
 
     #[test]
-    fn new_index_partition_name() {
+    fn new_index_partition_name() -> Result<()> {
         let index_name = "test_index";
         let column_name = "test_col";
         let partition_value = ScalarValue::from("value");
         let partition_by = vec![col("col1")];
 
         let result =
-            PartitionedIndexName::new(index_name, column_name, &partition_value, &partition_by)
-                .expect("new");
+            PartitionedIndexName::new(index_name, column_name, &partition_value, &partition_by)?;
 
         assert_eq!(result.index_name, "test-index");
-        assert_eq!(result.column_name, "test-col");
+        assert_eq!(result.column_name_hash.len(), COLUMN_NAME_MAX_LENGTH);
         assert_eq!(
             result.partition_value_hash.len(),
             PARTITION_VALUE_MAX_LENGTH
         );
         assert_eq!(result.partition_by_hash.len(), PARTITION_BY_MAX_LENGTH);
+
+        Ok(())
     }
 
     #[test]
-    fn from_index_name_valid() {
+    fn from_index_name_valid() -> Result<()> {
         let name = "test-index.test-col.12345.abcde";
-        let result = PartitionedIndexName::from_index_name(name).expect("from_index_name");
+        let result = PartitionedIndexName::from_index_name(name)?;
 
         assert_eq!(result.index_name, "test-index");
-        assert_eq!(result.column_name, "test-col");
+        assert_eq!(result.column_name_hash, "test-col");
         assert_eq!(result.partition_value_hash, "12345");
         assert_eq!(result.partition_by_hash, "abcde");
+
+        Ok(())
     }
 
     #[test]
@@ -384,7 +434,7 @@ mod tests {
     fn to_index_name_format() {
         let index = PartitionedIndexName {
             index_name: "idx".to_string(),
-            column_name: "col".to_string(),
+            column_name_hash: "col".to_string(),
             partition_value_hash: "12345".to_string(),
             partition_by_hash: "abcde".to_string(),
         };
@@ -420,37 +470,41 @@ mod tests {
             &self.signature
         }
 
-        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
+        fn return_type(
+            &self,
+            _arg_types: &[DataType],
+        ) -> std::result::Result<DataType, DataFusionError> {
             Ok(DataType::Int32)
         }
 
         fn invoke_with_args(
             &self,
             _args: ScalarFunctionArgs,
-        ) -> Result<ColumnarValue, DataFusionError> {
+        ) -> std::result::Result<ColumnarValue, DataFusionError> {
             unimplemented!()
         }
     }
+
     #[test]
-    fn partition_by_stability() {
+    fn partition_by_stability() -> Result<()> {
         let partition_by = &[col("id").eq(lit(7))];
-        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
+        assert_snapshot!(to_stable_string(partition_by)?);
         let partition_by = &[Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(Bucket::new())),
             args: vec![lit(10i64), col("a")],
         })];
-        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
+        assert_snapshot!(to_stable_string(partition_by)?);
         let partition_by = &[col("a") % lit(10)];
-        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
+        assert_snapshot!(to_stable_string(partition_by)?);
         let partition_by = &[col("region")];
-        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
+        assert_snapshot!(to_stable_string(partition_by)?);
         let partition_by = &[case(Expr::ScalarFunction(ScalarFunction {
             func: regexp_match(),
             args: vec![col("a"), lit("^DATAFUSION(-cli)*")],
         }))
         .when(lit(true), lit("datafusion"))
-        .otherwise(lit("other"))
-        .expect("otherwise")];
-        assert_snapshot!(to_stable_string(partition_by).expect("stable string"));
+        .otherwise(lit("other"))?];
+        assert_snapshot!(to_stable_string(partition_by)?);
+        Ok(())
     }
 }
