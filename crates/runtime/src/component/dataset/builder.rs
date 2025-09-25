@@ -240,7 +240,6 @@ impl DatasetBuilder {
             acceleration: self.acceleration,
             embeddings: self.embeddings,
             app,
-            schema: None,
             unsupported_type_action: self.unsupported_type_action,
             ready_state: self.ready_state,
             metrics: self.metrics,

@@ -18,7 +18,6 @@ use super::{find_first_delimiter, validate_identifier};
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
 use app::App;
-use arrow::datatypes::SchemaRef;
 use datafusion::sql::{
     TableReference,
     sqlparser::{
@@ -271,7 +270,6 @@ pub struct Dataset {
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Arc<App>,
-    schema: Option<SchemaRef>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
@@ -298,7 +296,6 @@ impl std::fmt::Debug for Dataset {
             .field("acceleration", &self.acceleration)
             .field("embeddings", &self.embeddings)
             .field("app", &self.app)
-            .field("schema", &self.schema)
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
@@ -325,7 +322,6 @@ impl PartialEq for Dataset {
             && self.time_partition_format == other.time_partition_format
             && self.acceleration == other.acceleration
             && self.embeddings == other.embeddings
-            && self.schema == other.schema
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
@@ -345,20 +341,9 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
-        self
-    }
-
-    #[must_use]
     pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
         self.params = params;
         self
-    }
-
-    #[must_use]
-    pub fn schema(&self) -> Option<SchemaRef> {
-        self.schema.clone()
     }
 
     #[allow(clippy::result_large_err)]
