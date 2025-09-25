@@ -181,6 +181,11 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
 
+    // TODO: partition the updated_record RecordBatch.
+    // or really just use the RecordBatch to partition the Vecs to write_data
+    // then just iterate over index.table.write_data making sure index is changed
+    // to the index name corresponding with the partition
+
     index
         .table
         .write_data(filtered_embeddings, filtered_primary_key, filtered_metadata)
