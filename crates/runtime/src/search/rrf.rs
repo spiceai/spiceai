@@ -624,7 +624,7 @@ mod tests {
     }
 
     // Assumes column "content" is embedded
-    fn df_as_embedding_table(runtime: &Runtime, df: DataFrame) -> Result<Arc<dyn TableProvider>> {
+    fn df_as_embedding_table(runtime: &Runtime, df: DataFrame) -> Arc<dyn TableProvider> {
         let mut embedded_columns = HashMap::new();
         embedded_columns.insert(
             "content".to_string(),
@@ -636,11 +636,11 @@ mod tests {
             },
         );
 
-        Ok(Arc::new(EmbeddingTable {
+        Arc::new(EmbeddingTable {
             base_table: df.into_view(),
             embedded_columns,
-            embedding_models: runtime.embeds.clone(),
-        }))
+            embedding_models: Arc::clone(&runtime.embeds),
+        })
     }
 
     async fn make_test_runtime() -> Result<Runtime> {
@@ -731,7 +731,7 @@ mod tests {
             .with_column("picked_at", picked_at_expr)?
             .sort(vec![col("picked_at").sort(false, false)])?;
 
-        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df.clone())?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df.clone());
 
         runtime
             .df
@@ -774,7 +774,7 @@ mod tests {
         let runtime = make_test_runtime().await?;
 
         let fruit_df = make_fruit_dataframe(&runtime).await?;
-        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df)?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
 
         runtime
             .df
@@ -806,7 +806,7 @@ mod tests {
         let runtime = make_test_runtime().await?;
 
         let fruit_df = make_fruit_dataframe(&runtime).await?;
-        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df)?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
 
         runtime
             .df
@@ -838,13 +838,13 @@ mod tests {
         let runtime = make_test_runtime().await?;
 
         let fruit_df = make_fruit_dataframe(&runtime).await?;
-        let fruit_table = df_as_embedding_table(&runtime, fruit_df.clone())?;
+        let fruit_table = df_as_embedding_table(&runtime, fruit_df.clone());
 
         let no_fruit_df = fruit_df
             .clone()
             .limit(0, Some(0))
             .expect("Must have fruit DF");
-        let no_fruit_table = df_as_embedding_table(&runtime, no_fruit_df)?;
+        let no_fruit_table = df_as_embedding_table(&runtime, no_fruit_df);
 
         runtime.df.ctx.register_table("foo", fruit_table)?;
 
