@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 
 use crate::Runtime;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
-use crate::component::dataset::{Mode, acceleration::Acceleration, builder::DatasetBuilder};
+use crate::component::dataset::{AccessMode, acceleration::Acceleration, builder::DatasetBuilder};
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
@@ -95,7 +95,7 @@ async fn get_local_table_provider(
             code: "IT-GLTP-BD-B".to_string(), // InternalTable - GetLocalTableProvider - DatasetBuilder - Build
         })?;
 
-    dataset.mode = Mode::ReadWrite;
+    dataset.access = AccessMode::ReadWrite;
 
     let mut sink = SinkConnector::new(Arc::clone(schema));
     if let Some(pk) = primary_key {

@@ -680,7 +680,7 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        if ds.mode() == dataset::Mode::ReadWrite && !replicate {
+        if ds.mode() == dataset::AccessMode::ReadWrite && !replicate {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 

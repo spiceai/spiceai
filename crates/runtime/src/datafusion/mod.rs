@@ -23,7 +23,7 @@ use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::dataset::{Dataset, Mode, ReadyState};
+use crate::component::dataset::{AccessMode, Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
@@ -505,7 +505,7 @@ impl DataFusion {
             }
         };
 
-        if matches!(dataset_mode, Mode::ReadWrite) {
+        if matches!(dataset_mode, AccessMode::ReadWrite) {
             self.data_writers
                 .write()
                 .map_err(|_| Error::UnableToLockDataWriters {})?
@@ -851,8 +851,8 @@ impl DataFusion {
     ) -> Result<AcceleratedTable> {
         tracing::debug!("Creating accelerated table {dataset:?}");
         let source_table_provider = match dataset.mode() {
-            Mode::Read => Arc::new(federated_read_table),
-            Mode::ReadWrite => {
+            AccessMode::Read => Arc::new(federated_read_table),
+            AccessMode::ReadWrite => {
                 let read_write_provider = source
                     .read_write_provider(dataset)
                     .await
@@ -1272,8 +1272,8 @@ impl DataFusion {
         let federated_table_provider = federated_read_table.table_provider().await;
 
         let source_table_provider = match dataset.mode() {
-            Mode::Read => federated_table_provider,
-            Mode::ReadWrite => source
+            AccessMode::Read => federated_table_provider,
+            AccessMode::ReadWrite => source
                 .read_write_provider(dataset)
                 .await
                 .ok_or_else(|| {
