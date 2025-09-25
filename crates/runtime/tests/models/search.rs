@@ -761,13 +761,13 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_explicit_join",
                 SearchTestType::Sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), id) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'id') order by fused_score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_explicit_join_wrong_column",
                 SearchTestType::Sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), foobar) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'foobar') order by fused_score desc LIMIT 4",
                 ),
             ).should_fail(),
             SearchTestCase::new(
