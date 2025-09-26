@@ -230,10 +230,8 @@ impl ReciprocalRankFusionArgs {
             search_udtf_exprs: search_udtfs,
             rrf_subquery_arguments: subquery_args,
             k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
-            join_key: extract_string!(rrf_args, "join_key")
-                .map(ident),
-            time_column: extract_string!(rrf_args, "time_column")
-                .map(ident),
+            join_key: extract_string!(rrf_args, "join_key").map(ident),
+            time_column: extract_string!(rrf_args, "time_column").map(ident),
             recency_decay: extract_string!(rrf_args, "recency_decay")
                 .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
             decay_constant: extract_f64!(rrf_args, "decay_constant"),
@@ -497,7 +495,7 @@ impl ReciprocalRankFusion {
             .first()
             .and_then(|(maybe_table_reference, f)| {
                 maybe_table_reference
-                    .map(|tr| format!("{}.{}", tr.table(), quote_identifier(&f.name())))
+                    .map(|tr| format!("{}.{}", tr.table(), quote_identifier(f.name())))
             })
             .ok_or(DataFusionError::Execution(format!(
                 "{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"
@@ -533,9 +531,7 @@ impl ReciprocalRankFusion {
             .filter_map(|c| match c.name() {
                 "score" => None,
                 name if name.ends_with("_embedding") => None,
-                name => {
-                    Some(ident(name).cast_to(&DataType::Utf8, df.schema()))
-                }
+                name => Some(ident(name).cast_to(&DataType::Utf8, df.schema())),
             })
             .collect::<Result<Vec<_>>>()?;
 
