@@ -364,7 +364,7 @@ impl RefreshTask {
 
     async fn handle_metrics(
         &self,
-        dataset_metrics_label_sets: &Vec<Vec<KeyValue>>,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
         max_timestamp_before_refresh_ms: Option<i64>,
         max_timestamp_after_refresh_ms: Option<Arc<Mutex<Option<i64>>>>,
     ) {
