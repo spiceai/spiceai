@@ -300,12 +300,8 @@ impl ReciprocalRankFusion {
             let (_, qname) = recency_col.qualified_name();
             let cols = subquery_dfs
                 .iter()
-                .map(|df| Self::first_qualified_field(df, &qname))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .map(col)
-                .collect::<Vec<_>>();
-
+                .map(|df| Self::first_qualified_field(df, &qname).map(col))
+                .collect::<Result<Vec<_>>>()?;
             coalesce(cols)
         } else {
             return Ok(score_expr);
