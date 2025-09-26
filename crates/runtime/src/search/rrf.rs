@@ -432,7 +432,7 @@ impl ReciprocalRankFusion {
 
             joined
                 .select(columns)?
-                .aggregate(vec![col(&join_key)], agg_cols)?
+                .aggregate(vec![ident(&join_key)], agg_cols)?
                 .drop_columns(&["__spice_rrf_row_id"])?
                 .sort(vec![col("fused_score").sort(false, false)])
         } else {
@@ -936,6 +936,37 @@ mod tests {
         let results = test_query!(
             runtime,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
+        );
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_with_case_sensitive_columns() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?.select(vec![
+            col("id").alias("Id"),
+            col("content"),
+            col("content_embedding"),
+            now().alias("pIckEd_AT"),
+        ])?;
+
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'Id', k => 600.0, time_column => 'pIckEd_AT')"
         );
 
         assert_eq!(
