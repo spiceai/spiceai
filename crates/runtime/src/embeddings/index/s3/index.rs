@@ -170,6 +170,7 @@ impl SearchIndex for S3Vector {
             )),
             projection,
         )
+        .map(Arc::new)
     }
 }
 
@@ -260,8 +261,8 @@ impl Index for S3Vector {
 fn table_with_projection(
     tbl: Arc<dyn TableProvider>,
     projection: Vec<Expr>,
-) -> Result<Arc<LogicalPlan>, DataFusionError> {
-    Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(
+) -> Result<LogicalPlan, DataFusionError> {
+    Ok(LogicalPlan::Projection(Projection::try_new(
         projection,
         Arc::new(LogicalPlan::TableScan(TableScan::try_new(
             "tbl",
@@ -270,7 +271,7 @@ fn table_with_projection(
             vec![],
             None,
         )?)),
-    )?)))
+    )?))
 }
 
 /// For a given data type, determine the variant within the JSON `Union(_, Sparse)` that would be populated from the associated [`datafusion_functions_json::udfs::json_get_udf`].
