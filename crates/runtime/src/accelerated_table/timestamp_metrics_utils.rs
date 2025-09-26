@@ -663,6 +663,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unsupported_time_column() {
+        let array = Date64Array::from(vec![Some(0), Some(18262), None]);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Date64, true)]));
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array) as ArrayRef])
+            .expect("created batch");
+
+        let (new_data_update, max_ts_arc_opt) =
+            prepare_and_run(batch, Some(TimeFormat::UnixSeconds)).await;
+
+        let max_ts_arc = max_ts_arc_opt.expect("max_ts Arc should be returned");
+        let mut stream = new_data_update.data;
+
+        while let Some(_batch_result) = stream.next().await {}
+
+        let max_ts = {
+            let guard = max_ts_arc.lock().await;
+            *guard
+        };
+
+        assert!(max_ts.is_none());
+    }
+
+    #[tokio::test]
     async fn test_empty_batch() {
         let array = UInt16Array::from(vec![] as Vec<u16>);
 
