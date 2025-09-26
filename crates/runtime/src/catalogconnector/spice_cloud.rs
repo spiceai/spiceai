@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
+use crate::catalogconnector::iceberg::{Error as IcebergError, UnableToBuildCatalogSnafu};
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
     App, Runtime,
@@ -31,8 +32,8 @@ use data_components::{
     Read, RefreshableCatalogProvider, iceberg::catalog::rest::RestCatalog,
     spice_cloud::provider::SpiceCloudPlatformCatalogProvider,
 };
-use iceberg::NamespaceIdent;
-use iceberg_catalog_rest::RestCatalogConfig;
+use iceberg::{CatalogBuilder, NamespaceIdent};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
@@ -63,7 +64,7 @@ impl SpiceCloudPlatformCatalog {
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let (org, app, catalog_name) = Self::parse_and_validate_catalog_id(catalog)?;
-        let catalog_client = self.create_rest_catalog_client();
+        let catalog_client = self.create_rest_catalog_client().await?;
         let read_provider = self
             .create_read_provider(runtime, catalog, &org, &app, &catalog_name)
             .await?;
@@ -112,24 +113,24 @@ impl SpiceCloudPlatformCatalog {
         }
     }
 
-    fn create_rest_catalog_client(&self) -> RestCatalog {
+    async fn create_rest_catalog_client(&self) -> Result<RestCatalog, IcebergError> {
         let endpoint = self
             .params
             .get("http_endpoint")
             .expose()
             .unwrap_or_else(|_| "https://data.spiceai.io");
-
         let mut props = HashMap::new();
         if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
             props.insert("token".to_string(), api_key.to_string());
         }
 
-        let catalog_config = RestCatalogConfig::builder()
-            .uri(endpoint.to_string())
-            .props(props)
-            .build();
+        props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint.to_string());
+        let iceberg_rest_catalog = RestCatalogBuilder::default()
+            .load("rest", props)
+            .await
+            .context(UnableToBuildCatalogSnafu)?;
 
-        RestCatalog::new(catalog_config)
+        Ok(RestCatalog::new(iceberg_rest_catalog))
     }
 
     async fn create_read_provider(
