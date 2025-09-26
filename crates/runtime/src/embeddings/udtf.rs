@@ -459,7 +459,7 @@ impl VectorSearchUDTFProvider {
     fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
         match (self.args.limit, limit) {
             (Some(l), None) | (None, Some(l)) => Some(l),
-            (None, None) => None,
+            (None, None) => Some(1000), // Default limit when none specified
 
             // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
             (Some(a), Some(b)) => Some(min(a, b)),
