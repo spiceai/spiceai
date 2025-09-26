@@ -170,8 +170,6 @@ pub async fn max_timestamp_in_stream(
                             );
                         }
                     }
-
-
                 }
 
             yield batch_result;

@@ -81,6 +81,8 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 mod changes;
 mod streaming_append;
 
+const NANOS_TO_MILLIS: u128 = 1_000_000;
+
 #[derive(Debug, Clone, Default)]
 struct RefreshStat {
     pub num_rows: usize,
@@ -336,11 +338,11 @@ impl RefreshTask {
         Ok(())
     }
 
-    async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<u64> {
+    async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<i64> {
         if refresh.time_column.is_some() {
             match self.timestamp_nanos_for_append_query(refresh).await {
                 #[allow(clippy::cast_possible_truncation)]
-                Ok(Some(time_nanos)) => Some((time_nanos / 1_000_000) as u64),
+                Ok(Some(time_nanos)) => Some((time_nanos / NANOS_TO_MILLIS) as i64),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(
@@ -363,7 +365,7 @@ impl RefreshTask {
     async fn handle_metrics(
         &self,
         dataset_metrics_label_sets: &Vec<Vec<KeyValue>>,
-        max_timestamp_before_refresh_ms: Option<u64>,
+        max_timestamp_before_refresh_ms: Option<i64>,
         max_timestamp_after_refresh_ms: Option<Arc<Mutex<Option<i64>>>>,
     ) {
         if let (Some(max_timestamp_before_refresh_ms), Some(max_timestamp_after_refresh_ms)) = (
@@ -376,9 +378,6 @@ impl RefreshTask {
             };
 
             if let Some(max_timestamp_after_refresh_ms) = max_timestamp_after_refresh_ms {
-                #[allow(clippy::cast_possible_wrap)]
-                let max_timestamp_before_refresh_ms = max_timestamp_before_refresh_ms as i64;
-
                 #[allow(clippy::cast_possible_truncation)]
                 let current_time_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
