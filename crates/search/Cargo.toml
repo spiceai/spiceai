@@ -18,11 +18,15 @@ async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+chunking = { path = "../chunking" }
 serde_json.workspace = true
+itertools.workspace = true
 snafu.workspace = true
 tantivy = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
+util = { path = "../util" }
+
 [features]
 default = ["text_search"]
 text_search = ["dep:tantivy"]

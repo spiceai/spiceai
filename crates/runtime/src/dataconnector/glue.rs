@@ -21,12 +21,12 @@ use aws_sdk_glue::{Client, types::Table};
 use aws_sdk_sts::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
-    NamespaceIdent, TableIdent,
+    CatalogBuilder, NamespaceIdent, TableIdent,
     io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
 };
 use iceberg_catalog_glue::{
-    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GlueCatalog,
-    GlueCatalogConfig,
+    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+    GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
@@ -395,19 +395,25 @@ async fn create_iceberg_provider(
         props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
     }
 
-    let config = GlueCatalogConfig::builder()
-        .warehouse(metadata_location)
-        .catalog_id_opt(table.catalog_id.clone())
-        .props(props)
-        .build();
+    props.insert(
+        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+        metadata_location.to_string(),
+    );
 
-    let catalog = GlueCatalog::new(config).await.map_err(|e| {
-        super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
-            source: e.into(),
-        }
+    if let Some(catalog_id) = table.catalog_id.clone() {
+        props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), catalog_id);
+    }
+
+    let catalog = GlueCatalogBuilder::default()
+        .load("glue", props)
+        .await
+        .map_err(|e| {
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
+                source: e.into(),
+            }
     })?;
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());

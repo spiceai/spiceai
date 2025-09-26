@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use std::sync::Arc;
@@ -79,11 +78,7 @@ impl Read for DatabricksSparkConnect {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
-            .spark_connect
-            .table_provider(table_reference, schema)
-            .await?)
+        Ok(self.spark_connect.table_provider(table_reference).await?)
     }
 }

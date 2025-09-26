@@ -20,6 +20,7 @@ use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
 
 use futures::StreamExt;
 pub mod aggregation;
+pub mod chunking;
 pub mod generation;
 pub mod index;
 pub mod metadata;
@@ -28,6 +29,7 @@ pub mod provider;
 
 pub static SEARCH_SCORE_COLUMN_NAME: &str = "score";
 pub static SEARCH_VALUE_COLUMN_NAME: &str = "value";
+pub static SEARCH_MATCH_COLUMN_NAME: &str = "match";
 
 pub async fn collect_batches(
     mut stream: SendableRecordBatchStream,

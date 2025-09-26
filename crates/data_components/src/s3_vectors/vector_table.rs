@@ -27,6 +27,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
+
 use aws_credential_types::provider::error::CredentialsError;
 use datafusion::{
     common::{Constraint, Constraints},
@@ -448,8 +449,9 @@ impl S3VectorsTable {
         }
 
         tracing::info!(
-            "S3 Vectors Index updated; records={} records, duration={duration:?}",
-            vectors.len(),
+            "S3 Vectors Index {index_name} updated; records={records}, duration={duration:?}",
+            index_name = self.idx,
+            records = vectors.len(),
             duration = start.elapsed()
         );
 

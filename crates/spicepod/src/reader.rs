@@ -16,9 +16,13 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{io, path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf};
+
+#[cfg(feature = "object-store")]
+use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "object-store")]
 use object_store::{DynObjectStore, ObjectStore};
 use snafu::prelude::*;
 
@@ -30,12 +34,14 @@ pub enum Error {
         path: PathBuf,
     },
 
+    #[cfg(feature = "object-store")]
     #[snafu(display("Unable to open object store path {}: {source}", path))]
     UnableToOpenObjectStorePath {
         source: object_store::Error,
         path: String,
     },
 
+    #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse object store path {}: {source}", path))]
     UnableToParseObjectStorePath {
         source: object_store::path::Error,
@@ -89,16 +95,19 @@ pub trait ReadableYaml: ReadablePath {
 
 impl ReadableYaml for StdFileSystem {}
 
+#[cfg(feature = "object-store")]
 pub struct ObjectStoreFilesystem {
     store: Arc<DynObjectStore>,
 }
 
+#[cfg(feature = "object-store")]
 impl ObjectStoreFilesystem {
     pub fn new(store: Arc<DynObjectStore>) -> Self {
         Self { store }
     }
 }
 
+#[cfg(feature = "object-store")]
 #[async_trait]
 impl ReadablePath for ObjectStoreFilesystem {
     async fn open(&self, path: PathBuf) -> Result<Box<dyn io::Read + Send + Sync>> {
@@ -125,4 +134,5 @@ impl ReadablePath for ObjectStoreFilesystem {
     }
 }
 
+#[cfg(feature = "object-store")]
 impl ReadableYaml for ObjectStoreFilesystem {}

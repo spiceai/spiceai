@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session, datasource::TableProvider, logical_expr::Expr, physical_plan::ExecutionPlan,
@@ -38,7 +37,6 @@ impl Read for PostgresTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.table_provider(table_reference).await
     }
@@ -49,7 +47,6 @@ impl ReadWrite for PostgresTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.read_write_table_provider(table_reference).await
     }

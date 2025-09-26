@@ -17,7 +17,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::S3VectorIdentifier;
@@ -34,11 +34,10 @@ use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use runtime_table_partition::insert::partition_batch;
 use search::SEARCH_SCORE_COLUMN_NAME;
-use search::index::SearchIndex;
+use search::index::{SearchIndex, VectorIndex};
 use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
-use crate::embeddings::index::VectorIndex;
 use crate::{embedding_col, embeddings::index::s3::write, model::EmbeddingModelStore};
 use datafusion::{
     catalog::TableProvider,
@@ -67,11 +66,7 @@ pub struct S3Vector {
     pub primary_key: Vec<Field>,
 
     /// Additional columns to add as metadata to the S3 vector index from the original dataset columns.
-    /// Note: This does not include the embedding column itself.
-    pub base_metadata_columns: MetadataColumns,
-
-    /// All metadata columns including the embedding column as non-filterable metadata.
-    pub complete_metadata_columns: MetadataColumns,
+    pub metadata_columns: MetadataColumns,
 
     pub model_name: String,
 
@@ -93,37 +88,37 @@ impl S3Vector {
         primary_key: Vec<Field>,
         metadata_columns: MetadataColumns,
         model_name: String,
-        dimension: usize,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         partition_by: Vec<Expr>,
     ) -> Self {
-        // Build complete metadata columns including the embedding column as non-filterable
-        let mut complete_columns: Vec<MetadataColumn> =
-            metadata_columns.clone().into_iter().collect();
-
-        // Add the embedding column as non-filterable metadata
-        let embedding_field = Arc::new(Field::new(
-            embedding_col!(embedded_column),
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, false)),
-                dimension as i32,
-            ),
-            false,
-        ));
-        complete_columns.push(MetadataColumn::NonFilterable(embedding_field));
-
-        let complete_metadata_columns = MetadataColumns::from(complete_columns);
-
         Self {
             table,
             embedded_column,
             primary_key,
-            base_metadata_columns: metadata_columns,
-            complete_metadata_columns,
+            metadata_columns,
             model_name,
             embedding_models,
             partition_by,
         }
+    }
+
+    /// Add extra metadata columns to the `S3Vector` table schema.
+    #[must_use]
+    pub fn add_metadata(mut self, cols: Vec<MetadataColumn>) -> Self {
+        // Add to schema too.
+        let mut fields: Vec<_> = self.table.schema.fields().into_iter().cloned().collect();
+        fields.extend(
+            cols.iter()
+                .map(|c| Arc::clone(&c.field()))
+                .collect::<Vec<_>>(),
+        );
+        self.table.schema = Schema::new(fields).into();
+
+        let mut new: Vec<_> = self.metadata_columns.into_iter().collect();
+        new.extend(cols);
+        self.metadata_columns = new.into();
+
+        self
     }
 
     pub async fn embedding_model(&self) -> Option<Arc<dyn Embed>> {
@@ -169,7 +164,7 @@ impl SearchIndex for S3Vector {
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
-        &self.complete_metadata_columns
+        &self.metadata_columns
     }
 
     async fn write(
@@ -240,6 +235,10 @@ impl SearchIndex for S3Vector {
         Ok(record)
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
+        Some(Arc::clone(&self) as Arc<dyn VectorIndex>)
+    }
+
     async fn query_table_provider(
         &self,
         query: &str,
@@ -261,7 +260,7 @@ impl SearchIndex for S3Vector {
                 SEARCH_SCORE_COLUMN_NAME,
             )),
         ]);
-        projection.extend(metadata_columns_to_exprs(&self.base_metadata_columns));
+        projection.extend(metadata_columns_to_exprs(&self.metadata_columns));
 
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
@@ -279,11 +278,24 @@ impl SearchIndex for S3Vector {
 }
 
 impl VectorIndex for S3Vector {
+    fn dimension(&self) -> i32 {
+        self.table
+            .schema
+            .column_with_name(S3_VECTOR_EMBEDDING_NAME)
+            .map(|(_, f)| {
+                match f.data_type() {
+                    DataType::FixedSizeList(_, dim) => *dim,
+                    _ => unreachable!("S3 vector index schema is missing a 'FixedSizeList' field named '{S3_VECTOR_EMBEDDING_NAME}'")
+                }
+            })
+            .unwrap_or_default()
+    }
+
     /// Use a [`S3VectorsListTable`] and then:
     ///   1. Convert the primary key to its appropriate name and data type
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
     fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
-        let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
+        let mut projection: Vec<_> = metadata_columns_to_exprs(&self.metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
         projection.push(Expr::Alias(Alias::new(
             Expr::Column(datafusion::common::Column::new_unqualified(
@@ -302,19 +314,6 @@ impl VectorIndex for S3Vector {
             projection,
         )
         .boxed()
-    }
-
-    fn dimension(&self) -> i32 {
-        self.table
-            .schema
-            .column_with_name(S3_VECTOR_EMBEDDING_NAME)
-            .map(|(_, f)| {
-                match f.data_type() {
-                    DataType::FixedSizeList(_, dim) => *dim,
-                    _ => 0, // Should not be reachable
-                }
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -346,7 +345,7 @@ impl Index for S3Vector {
             .collect();
         pks.push(self.embedded_column.clone());
         pks.extend(
-            self.base_metadata_columns
+            self.metadata_columns
                 .iter()
                 .filter(|c| *c.name() != embedding_col!(self.embedded_column))
                 .map(|c| c.name().to_string()),
