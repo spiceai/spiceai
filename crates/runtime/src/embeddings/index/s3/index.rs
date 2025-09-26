@@ -285,21 +285,18 @@ impl VectorIndex for S3Vector {
     fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
         let mut projection: Vec<_> = metadata_columns_to_exprs(&self.base_metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
-
-        let column_name = embedding_col!(self.search_column());
-
         projection.push(Expr::Alias(Alias::new(
             Expr::Column(datafusion::common::Column::new_unqualified(
                 S3_VECTOR_EMBEDDING_NAME,
             )),
             None::<TableReference>,
-            &column_name,
+            embedding_col!(self.search_column()),
         )));
 
         table_with_projection(
             Arc::new(S3VectorsListTable::new(
                 self.table.clone(),
-                column_name,
+                self.search_column(),
                 self.partition_by.clone(),
             )),
             projection,
