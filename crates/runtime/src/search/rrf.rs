@@ -17,7 +17,10 @@ use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err};
+use datafusion::common::utils::quote_identifier;
+use datafusion::common::{
+    Column, DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err,
+};
 use datafusion::datasource::TableType;
 use datafusion::functions_aggregate::expr_fn::{first_value, max};
 use datafusion::functions_window::expr_fn::row_number;
@@ -30,7 +33,7 @@ use datafusion::prelude::{
     DataFrame, SessionContext, coalesce, exp, greatest, make_array, md5, now, to_unixtime,
 };
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, lit};
+use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, ident, lit};
 use itertools::Itertools;
 use std::any::Any;
 use std::collections::HashMap;
@@ -99,6 +102,12 @@ macro_rules! extract_string {
           )
       };
   }
+
+macro_rules! col_qualified {
+    ($column:expr) => {
+        Expr::Column(Column::from_qualified_name_ignore_case($column))
+    };
+}
 
 #[derive(Debug, Clone)]
 enum RecencyDecay {
@@ -222,8 +231,8 @@ impl ReciprocalRankFusionArgs {
             search_udtf_exprs: search_udtfs,
             rrf_subquery_arguments: subquery_args,
             k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
-            join_key: extract_string!(rrf_args, "join_key").map(col),
-            time_column: extract_string!(rrf_args, "time_column").map(col),
+            join_key: extract_string!(rrf_args, "join_key").map(ident),
+            time_column: extract_string!(rrf_args, "time_column").map(ident),
             recency_decay: extract_string!(rrf_args, "recency_decay")
                 .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
             decay_constant: extract_f64!(rrf_args, "decay_constant"),
@@ -296,7 +305,10 @@ impl ReciprocalRankFusion {
 
                 lit(dividend)
                     / (lit(args.k)
-                        + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
+                        + coalesce(vec![
+                            col_qualified!(format!("search_{i}.rank")),
+                            lit(f64::INFINITY),
+                        ]))
             })
             .reduce(|a, b| a + b);
 
@@ -311,7 +323,7 @@ impl ReciprocalRankFusion {
             let (_, qname) = recency_col.qualified_name();
             let cols = subquery_dfs
                 .iter()
-                .map(|df| Self::first_qualified_field(df, &qname).map(col))
+                .map(|df| Self::first_qualified_field(df, &qname).map(|q| col_qualified!(q)))
                 .collect::<Result<Vec<_>>>()?;
             coalesce(cols)
         } else {
@@ -365,7 +377,9 @@ impl ReciprocalRankFusion {
                 other => Some(
                     coalesce(
                         (0..subquery_dfs.len())
-                            .map(|i| col(format!("search_{i}.{other}")))
+                            .map(|i| {
+                                col_qualified!(format!("search_{i}.{}", quote_identifier(other)))
+                            })
                             .collect(),
                     )
                     .alias(other),
@@ -415,15 +429,18 @@ impl ReciprocalRankFusion {
                     None
                 } else {
                     Some(
-                        first_value(col(&cname), vec![col("fused_score").sort(false, false)])
-                            .alias(&cname),
+                        first_value(
+                            col_qualified!(&cname),
+                            vec![col("fused_score").sort(false, false)],
+                        )
+                        .alias(&cname),
                     )
                 }
             }));
 
             joined
                 .select(columns)?
-                .aggregate(vec![col(&join_key)], agg_cols)?
+                .aggregate(vec![ident(&join_key)], agg_cols)?
                 .drop_columns(&["__spice_rrf_row_id"])?
                 .sort(vec![col("fused_score").sort(false, false)])
         } else {
@@ -485,7 +502,8 @@ impl ReciprocalRankFusion {
             .qualified_fields_with_unqualified_name(name)
             .first()
             .and_then(|(maybe_table_reference, f)| {
-                maybe_table_reference.map(|tr| format!("{}.{}", tr.table(), &f.name()))
+                maybe_table_reference
+                    .map(|tr| format!("{}.{}", tr.table(), quote_identifier(f.name())))
             })
             .ok_or(DataFusionError::Execution(format!(
                 "{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"
@@ -521,7 +539,7 @@ impl ReciprocalRankFusion {
             .filter_map(|c| match c.name() {
                 "score" => None,
                 name if name.ends_with("_embedding") => None,
-                name => Some(col(name).cast_to(&DataType::Utf8, df.schema())),
+                name => Some(ident(name).cast_to(&DataType::Utf8, df.schema())),
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -604,7 +622,7 @@ impl TableProvider for ReciprocalRankFusion {
                         .project(projection)?
                         .fields
                         .iter()
-                        .map(|f| col(f.name())),
+                        .map(|f| ident(f.name())),
                 )?;
             }
 
@@ -926,6 +944,37 @@ mod tests {
         let results = test_query!(
             runtime,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
+        );
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_with_case_sensitive_columns() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?.select(vec![
+            col("id").alias("Id"),
+            col("content"),
+            col("content_embedding"),
+            now().alias("pIckEd_AT"),
+        ])?;
+
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'Id', k => 600.0, time_column => 'pIckEd_AT')"
         );
 
         assert_eq!(
