@@ -588,7 +588,7 @@ mod tests {
     use crate::embeddings::table::EmbeddingTable;
     use crate::request::{Protocol, RequestContext};
     use crate::search::rrf::ReciprocalRankFusionArgs;
-    use arrow::array::as_string_array;
+    use arrow::array::{StringArray, as_string_array};
     use arrow::record_batch::RecordBatch;
     use async_graphql::futures_util::TryStreamExt;
     use datafusion::arrow::datatypes::DataType;
@@ -622,6 +622,34 @@ mod tests {
             )]));
             Expr::Literal(scalar_value, Some(spice_metadata))
         }};
+    }
+
+    macro_rules! extract_column {
+        ($batches:expr, $column_name:expr, $array_cast_fn:ident, $nth:expr) => {
+            $array_cast_fn(
+                $batches[$nth]
+                    .column_by_name($column_name)
+                    .expect(format!("Must have {}", $column_name).as_str()),
+            )
+        };
+
+        ($batches:expr, $column_name:expr, $array_cast_fn:ident) => {
+            extract_column!($batches, $column_name, $array_cast_fn, 0)
+        };
+    }
+
+    macro_rules! test_query {
+        ($runtime:ident, $query:expr) => {{
+            let query = "select * from rrf(vector_search(foo, 'red crispy'), vector_search(foo, 'fruit'), time_column => 'picked_at', decay_constant => 0.1)";
+            let query = QueryBuilder::new($query, $runtime.datafusion()).build();
+            query
+                .run()
+                .await
+                .expect("Must run query")
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await?
+        }}
     }
 
     // Assumes column "content" is embedded
@@ -741,28 +769,16 @@ mod tests {
 
         // decay_constant is made more aggressive in this query to further deprioritize
         // old results. The test will/should fail if you use the default of 0.01.
-        let query = "select * from rrf(vector_search(foo, 'red crispy'), vector_search(foo, 'fruit'), time_column => 'picked_at', decay_constant => 0.1)";
-        let query = QueryBuilder::new(query, runtime.datafusion()).build();
-        let results = query
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
 
-        let content = as_string_array(
-            results[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'red crispy'), vector_search(foo, 'fruit'), time_column => 'picked_at', decay_constant => 0.1)"
         );
+
+        let content = extract_column!(results, "content", as_string_array);
 
         let fruit_df_batches = fruit_df.collect().await?;
-        let fruit_df_recent = as_string_array(
-            fruit_df_batches[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
-        );
+        let fruit_df_recent = extract_column!(fruit_df_batches, "content", as_string_array);
 
         // fruit_df.show() to debug me
         assert_eq!(content.value(0), fruit_df_recent.value(0));
@@ -782,22 +798,15 @@ mod tests {
             .ctx
             .register_table("foo", fruit_embedding_table)?;
 
-        let query = "select * from rrf(vector_search(foo, 'yellow', rank_weight => 100), vector_search(foo, 'red', rank_weight => 10))";
-        let query = QueryBuilder::new(query, runtime.datafusion()).build();
-        let results = query
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let content = as_string_array(
-            results[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'yellow', rank_weight => 100), vector_search(foo, 'red', rank_weight => 10))"
         );
-        assert_eq!(content.value(0), "banana yellow curved fruit");
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "banana yellow curved fruit"
+        );
 
         Ok(ExitCode::SUCCESS)
     }
@@ -814,22 +823,15 @@ mod tests {
             .ctx
             .register_table("foo", fruit_embedding_table)?;
 
-        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)";
-        let query = QueryBuilder::new(query, runtime.datafusion()).build();
-        let results = query
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let content = as_string_array(
-            results[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
         );
-        assert_eq!(content.value(0), "apple fruit sweet red crispy");
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
 
         Ok(ExitCode::SUCCESS)
     }
@@ -850,46 +852,24 @@ mod tests {
         let no_fruit_table = df_as_embedding_table(&runtime, no_fruit_df);
 
         runtime.df.ctx.register_table("foo", fruit_table)?;
-
         runtime.df.ctx.register_table("bar", no_fruit_table)?;
 
-        let query_empty_red = "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by fused_score desc";
-        let query_empty_red = QueryBuilder::new(query_empty_red, runtime.datafusion()).build();
-        let query_empty_red_results = query_empty_red
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let query_empty_red_content = as_float64_array(
-            query_empty_red_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
-        )
-        .expect("Must be f64[]");
-
+        let query_empty_red_results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by fused_score desc"
+        );
+        let query_empty_red_content =
+            extract_column!(query_empty_red_results, "fused_score", as_float64_array)
+                .expect("Must be f64[]");
         let query_empty_red_score = query_empty_red_content.value(0);
 
-        let query_red_empty =
-            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))";
-        let query_red_empty = QueryBuilder::new(query_red_empty, runtime.datafusion()).build();
-        let query_red_empty_results = query_red_empty
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let query_red_empty_content = as_float64_array(
-            query_red_empty_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
-        )
-        .expect("Must be f64[]");
-
+        let query_red_empty_results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))"
+        );
+        let query_red_empty_content =
+            extract_column!(query_red_empty_results, "fused_score", as_float64_array)
+                .expect("Must be f64[]");
         let query_red_empty_score = query_red_empty_content.value(0);
 
         // Compare permutation of RRF invocations to ensure score is consistent regardless of order
@@ -897,21 +877,14 @@ mod tests {
         assert!(score_diff < 0.0001f64);
 
         // If timestamp column is missing due to FULL OUTER JOIN, ensure a score is still output
-        let query_empty_red_recency = "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), time_column => 'timestamp')";
-        let query_empty_red_recency =
-            QueryBuilder::new(query_empty_red_recency, runtime.datafusion()).build();
-        let query_empty_red_recency_results = query_empty_red_recency
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let query_empty_red_recency_scores = as_float64_array(
-            query_empty_red_recency_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
+        let query_empty_red_recency_results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), time_column => 'timestamp')"
+        );
+        let query_empty_red_recency_scores = extract_column!(
+            query_empty_red_recency_results,
+            "fused_score",
+            as_float64_array
         )
         .expect("Must be f64[]");
 
