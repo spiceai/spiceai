@@ -367,11 +367,10 @@ impl ReciprocalRankFusion {
         let join_key = args
             .join_key
             .clone()
-            .map(|k| {
+            .map_or("__spice_rrf_row_id".to_string(), |k| {
                 let (_, qname) = k.qualified_name();
                 qname
-            })
-            .unwrap_or("__spice_rrf_row_id".to_string());
+            });
 
         let mut join_err: Option<DataFusionError> = None;
         let maybe_joined = subquery_dfs.into_iter().reduce(|a, b| {
@@ -400,7 +399,7 @@ impl ReciprocalRankFusion {
 
             // The first column is the score_expr, which gets special treatment above.
             // These are unaliased, because they get flattened by coalesce() in the first select
-            agg_cols.extend(columns.iter().dropping(1).filter_map(|c| {
+            agg_cols.extend(columns.iter().skip(1).filter_map(|c| {
                 let (_, cname) = c.qualified_name();
 
                 // Do not aggregate the join key
