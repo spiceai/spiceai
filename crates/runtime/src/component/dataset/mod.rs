@@ -551,7 +551,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn mode(&self) -> AccessMode {
+    pub fn access(&self) -> AccessMode {
         self.access
     }
 

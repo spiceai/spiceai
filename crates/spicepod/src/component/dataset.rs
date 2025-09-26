@@ -302,7 +302,7 @@ struct DatasetDeserializer {
     metadata: HashMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     columns: Vec<Column>,
-    #[serde(default, skip_serializing_if = "is_default")]
+    #[serde(default, skip_serializing_if = "is_default", alias = "mode")]
     access: AccessMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     params: Option<Params>,

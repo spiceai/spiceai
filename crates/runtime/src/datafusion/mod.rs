@@ -440,7 +440,7 @@ impl DataFusion {
     ) -> Result<Option<Arc<Notify>>> {
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
-        let dataset_mode = dataset.mode();
+        let dataset_access_mode = dataset.access();
         let dataset_table_ref = dataset.name.clone();
 
         let is_ready = match table {
@@ -506,7 +506,7 @@ impl DataFusion {
             }
         };
 
-        if matches!(dataset_mode, AccessMode::ReadWrite) {
+        if matches!(dataset_access_mode, AccessMode::ReadWrite) {
             self.data_writers
                 .write()
                 .map_err(|_| Error::UnableToLockDataWriters {})?
@@ -851,7 +851,7 @@ impl DataFusion {
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<AcceleratedTable> {
         tracing::debug!("Creating accelerated table {dataset:?}");
-        let source_table_provider = match dataset.mode() {
+        let source_table_provider = match dataset.access() {
             AccessMode::Read => Arc::new(federated_read_table),
             AccessMode::ReadWrite => {
                 let read_write_provider = source
@@ -1272,7 +1272,7 @@ impl DataFusion {
 
         let federated_table_provider = federated_read_table.table_provider().await;
 
-        let source_table_provider = match dataset.mode() {
+        let source_table_provider = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite => source
                 .read_write_provider(dataset)
