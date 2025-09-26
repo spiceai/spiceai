@@ -276,9 +276,15 @@ impl SearchQueryProvider {
                 .collect::<Vec<_>>();
             p.extend(filter_cols);
 
-            if let Some((idx, _)) = self.schema().column_with_name(
-                format!("{}_embedding", self.search_index.search_column()).as_str(),
-            ) {
+            // If base and index has embedding column, use index.
+            let embedding_col = format!("{}_embedding", self.search_index.search_column());
+            let index_has_embedding = !search_index_proj
+                .schema()
+                .columns_with_unqualified_name(embedding_col.as_str())
+                .is_empty();
+            if let Some((idx, _)) = self.schema().column_with_name(embedding_col.as_str())
+                && index_has_embedding
+            {
                 let _ = p.remove(&idx);
             }
 

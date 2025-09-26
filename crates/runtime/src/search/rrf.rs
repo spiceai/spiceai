@@ -330,7 +330,8 @@ impl ReciprocalRankFusion {
             }
         };
 
-        Ok((score_expr * recency_expr).alias("fused_score"))
+        // Fall back to the original score expression if a recency boost cannot be computed
+        Ok((score_expr * coalesce(vec![recency_expr, lit(1.0)])).alias("fused_score"))
     }
 
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
@@ -837,7 +838,9 @@ mod tests {
     async fn test_score_computation() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
 
-        let fruit_df = make_fruit_dataframe(&runtime).await?;
+        let fruit_df = make_fruit_dataframe(&runtime)
+            .await?
+            .with_column("timestamp", now())?;
         let fruit_table = df_as_embedding_table(&runtime, fruit_df.clone());
 
         let no_fruit_df = fruit_df
@@ -850,8 +853,7 @@ mod tests {
 
         runtime.df.ctx.register_table("bar", no_fruit_table)?;
 
-        let query_empty_red =
-            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'))";
+        let query_empty_red = "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by fused_score desc";
         let query_empty_red = QueryBuilder::new(query_empty_red, runtime.datafusion()).build();
         let query_empty_red_results = query_empty_red
             .run()
@@ -890,9 +892,34 @@ mod tests {
 
         let query_red_empty_score = query_red_empty_content.value(0);
 
+        // Compare permutation of RRF invocations to ensure score is consistent regardless of order
         let score_diff = (query_red_empty_score - query_empty_red_score).abs();
         assert!(score_diff < 0.0001f64);
 
+        // If timestamp column is missing due to FULL OUTER JOIN, ensure a score is still output
+        let query_empty_red_recency = "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), time_column => 'timestamp')";
+        let query_empty_red_recency =
+            QueryBuilder::new(query_empty_red_recency, runtime.datafusion()).build();
+        let query_empty_red_recency_results = query_empty_red_recency
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await?;
+
+        let query_empty_red_recency_scores = as_float64_array(
+            query_empty_red_recency_results[0]
+                .column_by_name("fused_score")
+                .expect("Must have score column"),
+        )
+        .expect("Must be f64[]");
+
+        assert!(
+            query_empty_red_recency_scores
+                .into_iter()
+                .all(|f| f.is_some())
+        );
         Ok(ExitCode::SUCCESS)
     }
 

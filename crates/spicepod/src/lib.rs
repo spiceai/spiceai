@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
-use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use std::{fmt::Debug, path::PathBuf};
+
+#[cfg(feature = "object-store")]
+use std::sync::Arc;
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, model::Model,
@@ -61,9 +64,7 @@ pub enum Error {
     #[snafu(display("Unable to load duplicate spicepod {component} component '{name}'"))]
     DuplicateComponent { component: String, name: String },
 
-    #[snafu(display("Unable to create tokio runtime: {source}"))]
-    UnableToCreateTokioRuntime { source: std::io::Error },
-
+    #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse URL {}: {source}", path))]
     UnableToParseUrl {
         source: object_store::Error,
@@ -76,6 +77,7 @@ pub enum Error {
         path: PathBuf,
     },
 
+    #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse S3 URL {}: {source}", path))]
     UnableToParseS3Url {
         source: aws_sdk_credential_bridge::Error,
@@ -154,9 +156,8 @@ fn check_for_reserved_keywords(components: &[Dataset]) -> Result<()> {
 impl Spicepod {
     pub async fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let path_str = path.to_string_lossy();
-
-        match url::Url::parse(&path_str) {
+        #[cfg(feature = "object-store")]
+        match url::Url::parse(&path.to_string_lossy()) {
             Ok(url)
                 if matches!(
                     url.scheme(),
@@ -167,8 +168,14 @@ impl Spicepod {
             }
             _ => Self::load_from(&reader::StdFileSystem, path).await,
         }
+
+        #[cfg(not(feature = "object-store"))]
+        {
+            Self::load_from(&reader::StdFileSystem, path).await
+        }
     }
 
+    #[cfg(feature = "object-store")]
     pub async fn load_from_object_store(url: url::Url) -> Result<Self> {
         let (store, path) = match (url.scheme(), url.path()) {
             ("s3", path) => {

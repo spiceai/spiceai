@@ -246,7 +246,7 @@ impl DataConnector for MySQL {
                 connector_component: ConnectorComponent::from(dataset),
             })?;
 
-        match Read::table_provider(&self.mysql_factory, tbl, dataset.schema()).await {
+        match Read::table_provider(&self.mysql_factory, tbl).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source()
