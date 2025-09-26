@@ -58,10 +58,10 @@ pub fn validate_sql_query_operations(
                 if df.is_writable(&dml.table_name) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
-                plan_err!(
-                    "INSERT operations are not allowed on read-only dataset '{}'. Verify the dataset is configured as writable and try again.",
-                    dml.table_name
-                )
+                    plan_err!(
+                        "INSERT operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
+                        dml.table_name
+                    )
                 }
             } else { plan_err!("Operation is not allowed: {}", dml.name()) }
         }
