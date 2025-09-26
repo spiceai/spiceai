@@ -34,22 +34,11 @@ use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
 use data_components::cdc::StreamError;
 use data_components::cdc::replace_change_batch_data;
-use datafusion::common::Column;
-use datafusion::common::DFSchema;
 use datafusion::common::ToDFSchema;
 use datafusion::datasource::TableProvider;
-use datafusion::prelude::SessionContext;
-use datafusion_expr::Expr;
-use datafusion_expr::expr::ScalarFunction;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
-use runtime_table_partition::expression::CriterionFailedSnafu;
-use runtime_table_partition::expression::{
-    Criterion, Error as ValidationError, ValidationResult, partition_by_expressions,
-};
-use snafu::OptionExt;
-use snafu::ensure;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
@@ -198,6 +187,8 @@ impl EmbeddingConnector {
         match vector_store.engine.as_deref() {
             #[cfg(feature = "s3_vectors")]
             Some("s3" | "s3_vectors") => {
+                use runtime_table_partition::expression::partition_by_expressions;
+
                 tracing::info!("S3 Vectors for dataset {} initializing...", dataset.name);
                 let start = std::time::Instant::now();
 
@@ -209,11 +200,12 @@ impl EmbeddingConnector {
                     }
                 })?;
 
-                let partition_by = get_and_validate_partition_by(
-                    df_schema,
-                    vector_store,
+                let partition_by = partition_by_expressions(
+                    &vector_store.partition_by,
                     &dataset.runtime().df.ctx,
+                    df_schema,
                 )
+                .map(|p| p.expressions)
                 .map_err(|e| {
                     DataConnectorError::InvalidConfigurationSourceOnly {
                         dataconnector: dataset.source().to_string(),
@@ -325,54 +317,6 @@ impl EmbeddingConnector {
 
         Ok(ChangeEnvelope::new(change_committer, new_change_batch))
     }
-}
-
-fn get_and_validate_partition_by(
-    df_schema: &DFSchema,
-    vector_store: &VectorStore,
-    ctx: &SessionContext,
-) -> Result<Vec<Expr>, ValidationError> {
-    // Expression must use the bucket UDF with a column in the dataset
-    struct BucketCriterion;
-
-    impl Criterion for BucketCriterion {
-        fn doc(&self) -> String {
-            "expression must use bucket directly on a column in the dataset".to_string()
-        }
-
-        fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
-            let err = CriterionFailedSnafu {
-                expr: expr.to_string(),
-                criterion: self.doc(),
-            };
-
-            let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
-                return err.fail();
-            };
-
-            ensure!(func.name() == "bucket", err);
-
-            let Expr::Column(Column { name, .. }) = args.get(1).with_context(|| err.clone())?
-            else {
-                return Err(ValidationError::InvalidExpression {
-                    message: self.doc(),
-                });
-            };
-
-            ensure!(schema.columns().iter().any(|c| c.name() == name), err);
-
-            Ok(())
-        }
-    }
-
-    let partition_by = if vector_store.partition_by.is_empty() {
-        vec![]
-    } else {
-        partition_by_expressions(&vector_store.partition_by, ctx, df_schema, &BucketCriterion)
-            .map(|p| p.expressions)?
-    };
-
-    Ok(partition_by)
 }
 
 #[async_trait]
@@ -544,43 +488,5 @@ fn underlying_federated_table_for_indexed_table(
     #[cfg(not(feature = "s3_vectors"))]
     {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow_schema::{DataType, Field, Schema};
-    use runtime_datafusion_udfs::bucket;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn validate_partition_by() {
-        let ctx = SessionContext::new();
-        ctx.register_udf(bucket::Bucket::new().into());
-
-        let df_schema = Schema::new(vec![Field::new("col", DataType::Utf8, false)])
-            .to_dfschema()
-            .expect("DFSchema");
-
-        let mut vector_store = VectorStore {
-            enabled: true,
-            engine: None,
-            partition_by: vec!["bucket(100, col)".to_string()],
-            params: None,
-        };
-
-        let exprs =
-            get_and_validate_partition_by(&df_schema, &vector_store, &ctx).expect("expressions");
-
-        assert_eq!(exprs.len(), 1);
-        assert!(matches!(exprs[0], Expr::ScalarFunction(_)));
-
-        vector_store.partition_by = vec!["col < 10".to_string()];
-
-        assert!(
-            get_and_validate_partition_by(&df_schema, &vector_store, &SessionContext::new())
-                .is_err()
-        );
     }
 }

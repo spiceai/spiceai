@@ -70,7 +70,6 @@ pub fn partition_by_expressions(
     partition_by: &[String],
     ctx: &SessionContext,
     df_schema: &DFSchema,
-    criteria: &dyn Criterion,
 ) -> Result<PartitionBy, Error> {
     let mut hasher = DefaultHasher::new();
     partition_by.hash(&mut hasher);
@@ -82,7 +81,7 @@ pub fn partition_by_expressions(
             let expr = ctx
                 .parse_sql_expr(sql, df_schema)
                 .context(ParsingExpressionSnafu)?;
-            criteria.validate(&expr, df_schema)?;
+            PartitionCriteria.validate(&expr, df_schema)?;
             Ok(expr)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -127,7 +126,7 @@ pub trait Criterion: Send + Sync {
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult;
 }
 
-pub struct PartitionCriteria;
+struct PartitionCriteria;
 
 impl PartitionCriteria {
     const CRITERIA: &[&dyn Criterion] = &[

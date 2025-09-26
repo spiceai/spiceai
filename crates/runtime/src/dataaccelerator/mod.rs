@@ -32,9 +32,7 @@ use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use runtime_table_partition::expression::{
-    PartitionBy, PartitionCriteria, partition_by_expressions,
-};
+use runtime_table_partition::expression::{PartitionBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -253,13 +251,8 @@ impl AcceleratorEngineRegistry {
             None
         } else {
             Some(
-                partition_by_expressions(
-                    &acceleration_settings.partition_by,
-                    &ctx,
-                    &df_schema,
-                    &PartitionCriteria,
-                )
-                .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?,
+                partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                    .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?,
             )
         };
 
