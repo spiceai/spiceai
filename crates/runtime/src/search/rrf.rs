@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err};
 use datafusion::datasource::TableType;
+use datafusion::functions_aggregate::expr_fn::{first_value, max};
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
     ColumnarValue, DocSection, Documentation, Expr, ScalarFunctionArgs, ScalarUDFImpl, Signature,
@@ -358,7 +359,7 @@ impl ReciprocalRankFusion {
         let mut columns: Vec<Expr> = vec![score_expr];
         columns.extend(subquery_dfs[0].schema().columns().iter().filter_map(|c| {
             match c.name.as_str() {
-                "__spice_rrf_row_id" | "rank" | "score" => None,
+                "rank" | "score" => None,
                 // TODO: do we want the embedding in the final projection?
                 other if other.ends_with("_embedding") => None,
                 other => Some(
@@ -373,12 +374,17 @@ impl ReciprocalRankFusion {
         }));
 
         // Join DFs together, apply final projection, and sort by the new fused score
+        let join_key = args
+            .join_key
+            .clone()
+            .map_or("__spice_rrf_row_id".to_string(), |k| {
+                let (_, qname) = k.qualified_name();
+                qname
+            });
+
         let mut join_err: Option<DataFusionError> = None;
         let maybe_joined = subquery_dfs.into_iter().reduce(|a, b| {
-            let joined = match args.join_key.clone().map(|e| e.qualified_name()) {
-                Some((_, join_key)) => Self::fold_join(a, b, &join_key),
-                None => Self::fold_join(a, b, "__spice_rrf_row_id"),
-            };
+            let joined = Self::fold_join(a, b, &join_key);
 
             // No way to short circuit reduce, so we will surface the error at the end
             match joined {
@@ -396,10 +402,29 @@ impl ReciprocalRankFusion {
 
         if let Some(joined) = maybe_joined {
             tracing::trace!("{RRF_UDF_NAME} made reranked & fused DF for: {args:?}");
+            // Take the highest scores from multiple matches
+            let mut agg_cols = vec![max(col("fused_score")).alias("fused_score")];
+
+            // The first column is the score_expr, which gets special treatment above.
+            // These are unaliased, because they get flattened by coalesce() in the first select
+            agg_cols.extend(columns.iter().skip(1).filter_map(|c| {
+                let (_, cname) = c.qualified_name();
+
+                // Do not aggregate the join key
+                if cname == join_key {
+                    None
+                } else {
+                    Some(
+                        first_value(col(&cname), vec![col("fused_score").sort(false, false)])
+                            .alias(&cname),
+                    )
+                }
+            }));
 
             joined
                 .select(columns)?
-                .distinct()?
+                .aggregate(vec![col(&join_key)], agg_cols)?
+                .drop_columns(&["__spice_rrf_row_id"])?
                 .sort(vec![col("fused_score").sort(false, false)])
         } else {
             exec_err!("{RRF_UDF_NAME}: Unable to join result sets")
@@ -907,6 +932,30 @@ mod tests {
             extract_column!(results, "content", as_string_array).value(0),
             "apple fruit sweet red crispy"
         );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_with_dupes() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?;
+        let fruit_df = fruit_df.clone().union(fruit_df)?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
+        );
+
+        // There are only 3 unique rows for (id)
+        assert_eq!(results[0].num_rows(), 3);
 
         Ok(ExitCode::SUCCESS)
     }
