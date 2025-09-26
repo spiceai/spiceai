@@ -175,10 +175,7 @@ impl UnityCatalogSchemaProvider {
                 continue;
             }
 
-            let table_provider = match table_creator
-                .table_provider(table_reference.clone(), None)
-                .await
-            {
+            let table_provider = match table_creator.table_provider(table_reference.clone()).await {
                 Ok(provider) => provider,
                 Err(source) => {
                     tracing::warn!("Couldn't get table provider for {table_reference}: {source}");
@@ -298,10 +295,7 @@ impl UnityCatalogSchemaProvider {
             return None;
         }
 
-        let table_provider = match table_creator
-            .table_provider(table_reference.clone(), None)
-            .await
-        {
+        let table_provider = match table_creator.table_provider(table_reference.clone()).await {
             Ok(provider) => provider,
             Err(source) => {
                 tracing::warn!("Couldn't get table provider for {table_reference}: {source}");
