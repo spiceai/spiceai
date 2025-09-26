@@ -90,6 +90,7 @@ pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
+mod sql_validator;
 pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";

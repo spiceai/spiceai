@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
     get_logical_plan_input_tables,
@@ -29,12 +29,8 @@ use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
-    common::ParamValues,
-    error::DataFusionError,
-    execution::{SendableRecordBatchStream, context::SQLOptions},
-    logical_expr::LogicalPlan,
-    physical_plan::stream::RecordBatchStreamAdapter,
-    prelude::DataFrame,
+    common::ParamValues, error::DataFusionError, execution::SendableRecordBatchStream,
+    logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter, prelude::DataFrame,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -54,7 +50,9 @@ use async_stream::stream;
 use futures::StreamExt;
 
 use crate::{
-    datafusion::{DataFusion, query::cache::RequestCacheManager},
+    datafusion::{
+        DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+    },
     request::{AsyncMarker, RequestContext},
 };
 
@@ -81,16 +79,6 @@ pub enum Error {
 
     #[snafu(display("Failed to set parameters in logical plan: {source}"))]
     BindingParameters { source: DataFusionError },
-}
-
-// There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
-thread_local! {
-    static RESTRICTED_SQL_OPTIONS: LazyCell<SQLOptions> = LazyCell::new(|| {
-        SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false)
-    });
 }
 
 pub enum QueryMethod {
@@ -182,9 +170,7 @@ impl Query {
                 }
             };
 
-            if let Err(e) =
-                RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
-            {
+            if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
                 let e = find_datafusion_root(e);
                 handle_error!(
                     tracker,
@@ -332,7 +318,7 @@ impl Query {
         };
 
         // Verify the plan against the restricted options
-        if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
+        if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
             let e = find_datafusion_root(e);
             self.handle_schema_error(&request_context, &e);
             return Err(e);
