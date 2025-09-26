@@ -22,7 +22,10 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
+    common::{
+        Column, Constraint, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType,
+        NullEquality,
+    },
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
@@ -42,13 +45,30 @@ use search::{generation::util::append_fields, index::VectorIndex};
 pub struct VectorScanTableProvider {
     pub table_provider: Arc<dyn TableProvider>,
     pub index: Arc<dyn VectorIndex>,
+    pub constraints: Constraints,
 }
 
 impl VectorScanTableProvider {
     pub fn new(table_provider: Arc<dyn TableProvider>, index: Arc<dyn VectorIndex>) -> Self {
+        let mut constraints = table_provider
+            .constraints()
+            .cloned()
+            .unwrap_or(Constraints::default());
+
+        let s = table_provider.schema();
+        let pk = index
+            .primary_fields()
+            .iter()
+            .filter_map(|f| Some(s.column_with_name(f.name().as_str())?.0))
+            .collect();
+        constraints.extend(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            pk,
+        )]));
+
         Self {
             table_provider,
             index,
+            constraints,
         }
     }
 
@@ -164,7 +184,7 @@ impl TableProvider for VectorScanTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        self.table_provider.constraints()
+        Some(&self.constraints)
     }
 
     fn table_type(&self) -> TableType {
@@ -356,8 +376,8 @@ mod tests {
             Field::new("another_column", DataType::Utf8, false),
         ]));
 
-        let p = VectorScanTableProvider {
-            table_provider: Arc::new(ExplainMemTable::new(
+        let p = VectorScanTableProvider::new(
+            Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
@@ -365,7 +385,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            index: Arc::new(PretendVectorIndex::new(
+            Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -377,7 +397,7 @@ mod tests {
                     ),
                 ]),
             )),
-        };
+        );
 
         let provider: Arc<dyn TableProvider> = Arc::new(p);
 
@@ -418,8 +438,8 @@ mod tests {
             Field::new("a_number", DataType::Int64, false),
             Field::new("not_where", DataType::Utf8, false),
         ]));
-        let p = VectorScanTableProvider {
-            table_provider: Arc::new(ExplainMemTable(
+        let p = VectorScanTableProvider::new(
+            Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
@@ -427,7 +447,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            index: Arc::new(PretendVectorIndex::new(
+            Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -445,7 +465,7 @@ mod tests {
                     ])),
                 ]),
             )),
-        };
+        );
         let provider: Arc<dyn TableProvider> = Arc::new(p);
 
         test_explain(
@@ -518,8 +538,8 @@ mod tests {
             Field::new("a_number", DataType::Int64, false),
             Field::new("not_where", DataType::Utf8, false),
         ]));
-        let p = VectorScanTableProvider {
-            table_provider: Arc::new(ExplainMemTable(
+        let p = VectorScanTableProvider::new(
+            Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
@@ -527,7 +547,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            index: Arc::new(PretendVectorIndex::new(
+            Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![
                     Field::new("pk1", DataType::Int64, false),
@@ -551,7 +571,7 @@ mod tests {
                     ])),
                 ]),
             )),
-        };
+        );
         let provider: Arc<dyn TableProvider> = Arc::new(p);
 
         test_explain(

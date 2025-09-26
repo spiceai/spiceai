@@ -20,18 +20,25 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Column, DFSchema, JoinConstraint, JoinType, NullEquality},
+    common::{
+        Column, DFSchema, FunctionalDependence, FunctionalDependencies, JoinConstraint, JoinType,
+        NullEquality,
+    },
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
-    logical_expr::{Filter, Join, LogicalPlan, Projection, TableProviderFilterPushDown, TableScan},
+    logical_expr::{
+        Extension, Filter, Join, LogicalPlan, Projection, SubqueryAlias,
+        TableProviderFilterPushDown, TableScan,
+    },
     physical_plan::ExecutionPlan,
     prelude::Expr,
     sql::TableReference,
 };
+use runtime_datafusion_analyzer::DistinctJoinColumns;
 
 use crate::index::SearchIndex;
 
@@ -39,7 +46,7 @@ use crate::index::SearchIndex;
 /// if required by filters or additional columns in the projection.
 #[derive(Debug, Clone)]
 pub struct SearchQueryProvider {
-    pub search_index_query: Arc<dyn TableProvider>,
+    pub search_index_query: Arc<LogicalPlan>,
     pub table_provider: Arc<dyn TableProvider>,
     pub primary_key: Vec<String>,
     pub pre_limit: Option<usize>,
@@ -47,7 +54,7 @@ pub struct SearchQueryProvider {
 
 impl SearchQueryProvider {
     pub fn new(
-        search_index_query: Arc<dyn TableProvider>,
+        search_index_query: Arc<LogicalPlan>,
         table_provider: Arc<dyn TableProvider>,
         primary_key: Vec<String>,
     ) -> Self {
@@ -76,6 +83,31 @@ impl SearchQueryProvider {
                 .collect(),
         ))
     }
+
+    // Returns the `self.primary_key` as a primary key like [`FunctionalDependence`] with respect
+    // to the base table.
+    fn base_table_dependency(&self) -> FunctionalDependence {
+        let source_indices: Vec<usize> = self
+            .primary_key
+            .iter()
+            .filter_map(|pk| {
+                Some(
+                    self.table_provider
+                        .schema()
+                        .column_with_name(pk.as_str())?
+                        .0,
+                )
+            })
+            .collect();
+        let target_indices = (0..self.table_provider.schema().fields().len()).collect::<Vec<_>>();
+
+        FunctionalDependence {
+            source_indices,
+            target_indices,
+            nullable: false,
+            mode: datafusion::common::Dependency::Single,
+        }
+    }
 }
 
 #[async_trait]
@@ -85,19 +117,23 @@ impl TableProvider for SearchQueryProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        let mut fields = self
+        let mut fields_map = self
             .search_index_query
             .schema()
             .fields()
             .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
+            .map(|f| (f.name().clone(), f.clone()))
+            .collect::<HashMap<String, FieldRef>>();
 
-        fields.extend(self.table_provider.schema().fields().into_iter().cloned());
+        // Only add if key not in search index (we chose search index columns in `scan` afterall).
+        for f in self.table_provider.schema().fields() {
+            if !fields_map.contains_key(f.name()) {
+                fields_map.insert(f.name().clone(), f.clone());
+            }
+        }
 
-        let mut fields = fields.into_iter().collect::<Vec<_>>();
+        let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
         fields.sort_unstable();
-
         Arc::new(Schema::new(fields))
     }
 
@@ -109,21 +145,8 @@ impl TableProvider for SearchQueryProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // If one of the two has a pushdown threshold, it can be used.
-        // TODO: anything we have columns for, should at least be inexact
-        Ok(self
-            .table_provider
-            .supports_filters_pushdown(filters)?
-            .iter()
-            .zip(self.search_index_query.supports_filters_pushdown(filters)?)
-            .map(|(a, b)| match (a, b) {
-                (TableProviderFilterPushDown::Exact, _)
-                | (_, TableProviderFilterPushDown::Exact) => TableProviderFilterPushDown::Exact,
-                (TableProviderFilterPushDown::Inexact, _)
-                | (_, TableProviderFilterPushDown::Inexact) => TableProviderFilterPushDown::Inexact,
-                _ => TableProviderFilterPushDown::Unsupported,
-            })
-            .collect())
+        // Like `ViewTable`, a filter is added on `scan` when needed
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
     async fn scan(
@@ -133,14 +156,9 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let search_index = LogicalPlan::TableScan(TableScan::try_new(
+        let search_index = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            Arc::clone(&self.search_index_query),
             TableReference::parse_str("search_index"),
-            Arc::new(DefaultTableSource::new(Arc::clone(
-                &self.search_index_query,
-            ))),
-            None,
-            vec![],
-            self.pre_limit,
         )?);
 
         let base_table = LogicalPlan::TableScan(TableScan::try_new(
@@ -173,15 +191,17 @@ impl TableProvider for SearchQueryProvider {
 
         let join_schema = Arc::new(search_index.schema().join(base_table.schema())?);
 
-        let join = LogicalPlan::Join(Join {
-            left: search_index.into(),
-            right: base_table.into(),
-            join_type: JoinType::Left,
-            join_constraint: JoinConstraint::On,
-            on,
-            filter: None,
-            schema: Arc::clone(&join_schema),
-            null_equality: NullEquality::NullEqualsNothing,
+        let join = LogicalPlan::Extension(Extension {
+            node: Arc::new(DistinctJoinColumns::from(Join {
+                left: search_index.into(),
+                right: base_table.into(),
+                join_type: JoinType::Left,
+                join_constraint: JoinConstraint::On,
+                on,
+                filter: None,
+                schema: Arc::clone(&join_schema),
+                null_equality: NullEquality::NullEqualsNothing,
+            })),
         });
 
         // Pick which columns we want.
@@ -203,8 +223,8 @@ impl TableProvider for SearchQueryProvider {
                     if self
                         .search_index_query
                         .schema()
-                        .column_with_name(c.name())
-                        .is_none()
+                        .columns_with_unqualified_name(c.name())
+                        .is_empty()
                     {
                         return Some(Expr::Column(c.clone()));
                     }

@@ -15,7 +15,6 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
-    catalog::TableProvider,
     common::Column,
     datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
@@ -301,7 +300,7 @@ impl SearchIndex for ChunkedSearchIndex {
         return Ok(record);
     }
 
-    fn query_table_provider(&self, query: &str) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let pk_names: Vec<_> = self
             .primary_fields()
             .iter()
@@ -312,16 +311,8 @@ impl SearchIndex for ChunkedSearchIndex {
             .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
             .collect();
 
-        let tbl_prov = self.inner.query_table_provider(query)?;
-        let schema = tbl_prov.schema();
-
-        let tbl = Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("tbl"),
-            Arc::new(DefaultTableSource::new(tbl_prov)),
-            None,
-            vec![],
-            None,
-        )?));
+        let tbl = self.inner.query_table_provider(query)?;
+        let schema = tbl.schema();
 
         let mut sort_order_by = vec![SortExpr::new(col(SEARCH_SCORE_COLUMN_NAME), false, false)];
 
@@ -353,7 +344,7 @@ impl SearchIndex for ChunkedSearchIndex {
             fetch: None,
         });
 
-        Ok(Arc::new(ViewTable::new(final_sort, None)))
+        Ok(Arc::new(final_sort))
     }
 }
 
@@ -527,7 +518,7 @@ impl SearchIndex for ChunkedVectorIndex {
     /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
     /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
     ///  search score between `query` and the [`SearchIndex::search_column`].
-    fn query_table_provider(&self, query: &str) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         ChunkedSearchIndex {
             inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
             chunker: Arc::clone(&self.chunker),

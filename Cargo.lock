@@ -12863,6 +12863,7 @@ dependencies = [
  "futures",
  "insta",
  "itertools 0.14.0",
+ "runtime-datafusion-analyzer",
  "runtime-datafusion-index",
  "serde_json",
  "snafu",

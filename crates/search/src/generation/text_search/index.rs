@@ -22,8 +22,9 @@ use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{LogicalPlan, TableScan};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::DocParsingError;
@@ -427,17 +428,22 @@ impl SearchIndex for FullTextDatabaseIndex {
         Ok(record)
     }
 
-    fn query_table_provider(&self, query: &str) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let field_index = self
             .full_text_search_field_index(&self.search_column())
             .boxed()
             .map_err(DataFusionError::External)?;
 
-        Ok(Arc::new(FullTextSearchQuery {
-            index: field_index,
-            query: query.to_string(),
-            pre_limit: None,
-        }))
+        Ok(Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+            self.name(),
+            Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery::new(
+                field_index,
+                query.to_string(),
+            )))),
+            None,
+            vec![],
+            None,
+        )?)))
     }
 }
 

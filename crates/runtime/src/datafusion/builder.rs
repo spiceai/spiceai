@@ -32,14 +32,21 @@ use datafusion::{
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
-        AnalyzerRule,
+        AnalyzerRule, Optimizer,
         analyzer::{
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
+        eliminate_nested_union::EliminateNestedUnion,
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::sql::federation_analyzer_rule;
+use datafusion_federation::{
+    FederationAnalyzerRule,
+    sql::{
+        federation_analyzer_rule,
+        optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation},
+    },
+};
 use runtime_datafusion_analyzer::RedundantJoinAnalyzerRule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;

@@ -51,7 +51,7 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
     /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
     ///  search score between `query` and the [`SearchIndex::search_column`].
-    fn query_table_provider(&self, query: &str) -> Result<Arc<dyn TableProvider>, DataFusionError>;
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError>;
 
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
         None
