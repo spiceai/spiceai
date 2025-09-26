@@ -23,7 +23,7 @@ use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::dataset::{Dataset, Mode, ReadyState};
+use crate::component::dataset::{AccessMode, Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
@@ -90,6 +90,7 @@ pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
+mod sql_validator;
 pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
@@ -439,7 +440,7 @@ impl DataFusion {
     ) -> Result<Option<Arc<Notify>>> {
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
-        let dataset_mode = dataset.mode();
+        let dataset_access_mode = dataset.access();
         let dataset_table_ref = dataset.name.clone();
 
         let is_ready = match table {
@@ -505,7 +506,7 @@ impl DataFusion {
             }
         };
 
-        if matches!(dataset_mode, Mode::ReadWrite) {
+        if matches!(dataset_access_mode, AccessMode::ReadWrite) {
             self.data_writers
                 .write()
                 .map_err(|_| Error::UnableToLockDataWriters {})?
@@ -850,9 +851,9 @@ impl DataFusion {
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<AcceleratedTable> {
         tracing::debug!("Creating accelerated table {dataset:?}");
-        let source_table_provider = match dataset.mode() {
-            Mode::Read => Arc::new(federated_read_table),
-            Mode::ReadWrite => {
+        let source_table_provider = match dataset.access() {
+            AccessMode::Read => Arc::new(federated_read_table),
+            AccessMode::ReadWrite => {
                 let read_write_provider = source
                     .read_write_provider(dataset)
                     .await
@@ -1271,9 +1272,9 @@ impl DataFusion {
 
         let federated_table_provider = federated_read_table.table_provider().await;
 
-        let source_table_provider = match dataset.mode() {
-            Mode::Read => federated_table_provider,
-            Mode::ReadWrite => source
+        let source_table_provider = match dataset.access() {
+            AccessMode::Read => federated_table_provider,
+            AccessMode::ReadWrite => source
                 .read_write_provider(dataset)
                 .await
                 .ok_or_else(|| {

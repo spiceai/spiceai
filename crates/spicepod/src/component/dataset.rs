@@ -31,7 +31,7 @@ use crate::vector::VectorStore;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum Mode {
+pub enum AccessMode {
     #[default]
     Read,
     ReadWrite,
@@ -111,8 +111,8 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<Column>,
 
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub mode: Mode,
+    #[serde(default, skip_serializing_if = "is_default", alias = "mode")]
+    pub access: AccessMode,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
@@ -178,7 +178,7 @@ impl Dataset {
             description: None,
             metadata: HashMap::default(),
             columns: Vec::default(),
-            mode: Mode::default(),
+            access: AccessMode::default(),
             params: None,
             has_metadata_table: None,
             replication: None,
@@ -246,7 +246,7 @@ impl WithDependsOn<Dataset> for Dataset {
             description: self.description.clone(),
             metadata: self.metadata.clone(),
             columns: self.columns.clone(),
-            mode: self.mode.clone(),
+            access: self.access.clone(),
             params: self.params.clone(),
             has_metadata_table: self.has_metadata_table,
             replication: self.replication.clone(),
@@ -303,8 +303,8 @@ struct DatasetDeserializer {
     metadata: HashMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     columns: Vec<Column>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    mode: Mode,
+    #[serde(default, skip_serializing_if = "is_default", alias = "mode")]
+    access: AccessMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     params: Option<Params>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,7 +374,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             description: deserializer.description,
             metadata: deserializer.metadata,
             columns: deserializer.columns,
-            mode: deserializer.mode,
+            access: deserializer.access,
             params: deserializer.params,
             has_metadata_table: deserializer.has_metadata_table,
             replication: deserializer.replication,

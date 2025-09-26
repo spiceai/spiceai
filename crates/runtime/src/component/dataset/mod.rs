@@ -116,17 +116,17 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum Mode {
+pub enum AccessMode {
     #[default]
     Read,
     ReadWrite,
 }
 
-impl From<spicepod_dataset::Mode> for Mode {
-    fn from(mode: spicepod_dataset::Mode) -> Self {
+impl From<spicepod_dataset::AccessMode> for AccessMode {
+    fn from(mode: spicepod_dataset::AccessMode) -> Self {
         match mode {
-            spicepod_dataset::Mode::Read => Mode::Read,
-            spicepod_dataset::Mode::ReadWrite => Mode::ReadWrite,
+            spicepod_dataset::AccessMode::Read => AccessMode::Read,
+            spicepod_dataset::AccessMode::ReadWrite => AccessMode::ReadWrite,
         }
     }
 }
@@ -257,7 +257,7 @@ impl Display for CheckAvailability {
 pub struct Dataset {
     pub from: String,
     pub name: TableReference,
-    pub mode: Mode,
+    pub access: AccessMode,
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
@@ -283,7 +283,7 @@ impl std::fmt::Debug for Dataset {
         f.debug_struct("Dataset")
             .field("from", &self.from)
             .field("name", &self.name)
-            .field("mode", &self.mode)
+            .field("access", &self.access)
             .field("params", &self.params)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
@@ -312,7 +312,7 @@ impl PartialEq for Dataset {
     fn eq(&self, other: &Self) -> bool {
         self.from == other.from
             && self.name == other.name
-            && self.mode == other.mode
+            && self.access == other.access
             && self.params == other.params
             && self.has_metadata_table == other.has_metadata_table
             && self.replication == other.replication
@@ -551,8 +551,8 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn mode(&self) -> Mode {
-        self.mode
+    pub fn access(&self) -> AccessMode {
+        self.access
     }
 
     #[must_use]
