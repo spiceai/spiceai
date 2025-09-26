@@ -126,28 +126,17 @@ impl FlightFactory {
     pub async fn table_provider(
         &self,
         table_reference: impl Into<MultiPartTableReference>,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider = match schema {
-            Some(schema) => Arc::new(FlightTable::create_with_schema(
+        let table_provider = Arc::new(
+            FlightTable::create(
                 self.name,
                 self.client.clone(),
                 table_reference,
-                schema,
                 Arc::clone(&self.dialect),
                 self.extra_compute_context.as_ref().map(Arc::clone),
-            )),
-            None => Arc::new(
-                FlightTable::create(
-                    self.name,
-                    self.client.clone(),
-                    table_reference,
-                    Arc::clone(&self.dialect),
-                    self.extra_compute_context.as_ref().map(Arc::clone),
-                )
-                .await?,
-            ),
-        };
+            )
+            .await?,
+        );
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
@@ -160,9 +149,8 @@ impl Read for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        FlightFactory::table_provider(self, table_reference, schema).await
+        FlightFactory::table_provider(self, table_reference).await
     }
 }
 
@@ -171,9 +159,8 @@ impl ReadWrite for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let read_provider = Read::table_provider(self, table_reference.clone(), schema).await?;
+        let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
         Ok(FlightTableWriter::create(
             read_provider,

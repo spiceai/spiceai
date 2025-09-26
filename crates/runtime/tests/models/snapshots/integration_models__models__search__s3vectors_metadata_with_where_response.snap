@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Choices create costs and benefits."
+      },
+      "primary_key": {
+        "id": 863
+      },
+      "score": 0.87
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+      },
+      "primary_key": {
+        "id": 6
+      },
+      "score": 0.82
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "The Cat does not need to drink, as it obtains sufficient water from its prey."
+      },
+      "primary_key": {
+        "id": 438
+      },
+      "score": 0.8
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "A common thermometer operates on the principle that matter usually expands when it absorbs heat energy."
+      },
+      "primary_key": {
+        "id": 1041
+      },
+      "score": 0.77
+    }
+  ]
+}
