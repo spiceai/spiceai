@@ -36,6 +36,25 @@ macro_rules! max_ts_macro {
     }};
 }
 
+/// Extracts the maximum timestamp from a stream of record batches.
+///
+/// The extraction uses `time_column` and `time_format` to interpret timestamps
+/// from various data types (timestamps, strings, integers, floats, dates).
+///
+/// # Parameters
+/// - `time_column`: Name of the column containing timestamp data
+/// - `time_format`: Format specification for interpreting the timestamp values
+/// - `source_name`: Used for logging warnings
+///
+/// # Returns
+/// - An updated data stream
+/// - An `Option<Arc<Mutex<Option<i64>>>>` with the following semantics:
+///     - `None`: Did not attempt to find a max timestamp (e.g., no `time_column`
+///       provided or column does not exist in schema)
+///     - `Some(Arc<Mutex<Option<i64>>>)`: Will be populated after the stream is consumed:
+///         - `Some(i64)`: The maximum timestamp found in the stream (in milliseconds)
+///         - `None`: Attempted extraction but no valid timestamps found
+///             - If batches were not empty, a warning is logged
 #[allow(clippy::too_many_lines)]
 pub async fn max_timestamp_in_stream(
     data_update: StreamingDataUpdate,
@@ -44,16 +63,21 @@ pub async fn max_timestamp_in_stream(
     time_format: Option<TimeFormat>,
     source_name: String,
 ) -> (StreamingDataUpdate, Option<Arc<Mutex<Option<i64>>>>) {
-    let Some(time_column_str) = time_column.as_ref() else {
+    let Some(time_column) = time_column else {
         return (data_update, None);
     };
 
     let time_format = time_format.unwrap_or_default();
     let Some(field) = schema
-        .column_with_name(time_column_str)
+        .column_with_name(&time_column)
         .map(|(_, f)| f)
         .cloned()
     else {
+        tracing::warn!(
+            "Failed to extract max_timestamp after refresh for {}: column {} not found in schema.",
+            source_name,
+            time_column,
+        );
         return (data_update, None);
     };
 
@@ -128,25 +152,26 @@ pub async fn max_timestamp_in_stream(
                         }
                     }
 
-                    if matched_supported_type {
-                        if batch.num_rows() > 0 && max_ts.is_none() {
+                    if batch.num_rows() > 0 && max_ts.is_none() {
+                        if matched_supported_type {
                             tracing::warn!(
-                                "Failed to extract max_timestamp_after_refresh for {}: batch_size={}, time_column={:?}, field_type={:?}",
+                                "Failed to extract max_timestamp after refresh for {}: batch_size={}, time_column={}, field_type={}",
                                 source_name,
                                 batch.num_rows(),
                                 time_column,
                                 field.data_type(),
                             );
+                        } else {
+                            tracing::warn!(
+                                "Failed to extract max_timestamp after refresh for {}: unsupported time column: time_column={}, field_type={}",
+                                source_name,
+                                time_column,
+                                field.data_type(),
+                            );
                         }
-                    } else {
-                        tracing::warn!(
-                            source_name,
-                            "Unsupported time column for {}: time_column={:?}, field_type={:?}",
-                            batch.num_rows(),
-                            time_column,
-                            field.data_type(),
-                        );
                     }
+
+
                 }
 
             yield batch_result;

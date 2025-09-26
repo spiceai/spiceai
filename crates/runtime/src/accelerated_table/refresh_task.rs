@@ -64,7 +64,7 @@ use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
 use super::refresh::Refresh;
-use crate::accelerated_table::time_utils::max_timestamp_in_stream;
+use crate::accelerated_table::timestamp_metrics_utils::max_timestamp_in_stream;
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::{

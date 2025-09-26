@@ -61,7 +61,7 @@ mod refresh_task_runner;
 mod retention;
 mod sink;
 mod synchronized_table;
-mod time_utils;
+mod timestamp_metrics_utils;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
