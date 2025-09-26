@@ -930,6 +930,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_with_dupes() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?;
+        let fruit_df = fruit_df.clone().union(fruit_df)?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
+        );
+
+        // There are only 3 unique rows for (id)
+        assert_eq!(results[0].num_rows(), 3);
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_score_computation() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
 
