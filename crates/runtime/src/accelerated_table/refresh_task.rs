@@ -64,7 +64,7 @@ use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
 use super::refresh::Refresh;
-use crate::accelerated_table::timestamp_metrics_utils::max_timestamp_in_stream;
+use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::{
@@ -296,14 +296,15 @@ impl RefreshTask {
             self.component_type(),
             include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref())
         );
-        let (streaming_data_update, max_timestamp_after_refresh_ms) = max_timestamp_in_stream(
-            streaming_data_update,
-            self.federated.schema(),
-            refresh.time_column.clone(),
-            refresh.time_format,
-            source_name,
-        )
-        .await;
+        let (streaming_data_update, max_timestamp_after_refresh_ms) =
+            with_find_max_timestamp_in_stream(
+                streaming_data_update,
+                self.federated.schema(),
+                refresh.time_column.clone(),
+                refresh.time_format,
+                source_name,
+            )
+            .await;
 
         self.write_streaming_data_update(
             Some(start_time),

@@ -1,3 +1,19 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::component::dataset::TimeFormat;
 use crate::dataupdate::StreamingDataUpdate;
 use arrow::array::{
@@ -7,7 +23,7 @@ use arrow::array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::TimeUnit;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, Field, SchemaRef};
 use async_stream::stream;
 use chrono::DateTime;
 use datafusion::execution::SendableRecordBatchStream;
@@ -56,7 +72,7 @@ macro_rules! max_ts_macro {
 ///         - `None`: Attempted extraction but no valid timestamps found
 ///             - If batches were not empty, a warning is logged
 #[allow(clippy::too_many_lines)]
-pub async fn max_timestamp_in_stream(
+pub async fn with_find_max_timestamp_in_stream(
     data_update: StreamingDataUpdate,
     schema: SchemaRef,
     time_column: Option<String>,
@@ -84,7 +100,36 @@ pub async fn max_timestamp_in_stream(
     let max_ts = Arc::new(Mutex::new(None::<i64>));
     let max_ts_clone = Arc::clone(&max_ts);
 
-    let out_stream = stream! {
+    let update_type = data_update.update_type.clone();
+
+    let out_stream = find_max_timestamp_in_stream_inner(
+        data_update,
+        time_column,
+        time_format,
+        field,
+        max_ts_clone,
+        Arc::clone(&schema),
+        source_name,
+    );
+
+    let new_data_update = StreamingDataUpdate {
+        data: out_stream,
+        update_type,
+    };
+
+    (new_data_update, Some(max_ts))
+}
+
+fn find_max_timestamp_in_stream_inner(
+    data_update: StreamingDataUpdate,
+    time_column: String,
+    time_format: TimeFormat,
+    field: Field,
+    max_ts_clone: Arc<Mutex<Option<i64>>>,
+    schema: SchemaRef,
+    source_name: String,
+) -> SendableRecordBatchStream {
+    let output_stream = stream! {
         let mut input_stream = data_update.data;
         let mut max_ts: Option<i64> = None;
 
@@ -179,16 +224,7 @@ pub async fn max_timestamp_in_stream(
         *max_ts_clone.lock().await = max_ts;
     };
 
-    let output_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        out_stream,
-    ));
-    let new_data_update = StreamingDataUpdate {
-        data: output_stream,
-        update_type: data_update.update_type,
-    };
-
-    (new_data_update, Some(max_ts))
+    Box::pin(RecordBatchStreamAdapter::new(schema, output_stream))
 }
 
 fn ts_to_ms(ts: i64, time_format: TimeFormat, time_unit: TimeUnit) -> Option<i64> {
@@ -261,7 +297,7 @@ mod tests {
         };
 
         // Run
-        let (new_data_update, max_ts_arc_opt) = max_timestamp_in_stream(
+        let (new_data_update, max_ts_arc_opt) = with_find_max_timestamp_in_stream(
             data_update,
             schema,
             Some("ts".to_string()),
