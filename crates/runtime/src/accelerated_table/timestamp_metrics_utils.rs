@@ -247,13 +247,11 @@ fn int_to_ms(ts: i64, time_format: TimeFormat) -> Option<i64> {
     }
 }
 
-#[allow(clippy::cast_possible_wrap)]
 fn uint64_to_ms(ts: u64, time_format: TimeFormat) -> Option<i64> {
-    if ts > i64::MAX as u64 {
-        None
-    } else {
-        int_to_ms(ts as i64, time_format)
-    }
+    i64::try_from(ts)
+        .map(|v| int_to_ms(v, time_format))
+        .ok()
+        .flatten()
 }
 
 #[allow(clippy::cast_possible_truncation)]

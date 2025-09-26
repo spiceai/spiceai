@@ -343,7 +343,7 @@ impl RefreshTask {
         if refresh.time_column.is_some() {
             match self.timestamp_nanos_for_append_query(refresh).await {
                 #[allow(clippy::cast_possible_truncation)]
-                Ok(Some(time_nanos)) => Some((time_nanos / NANOS_TO_MILLIS) as i64),
+                Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(
