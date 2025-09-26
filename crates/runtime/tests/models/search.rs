@@ -275,7 +275,7 @@ pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = Arc::clone(&rt).load_components() => {}

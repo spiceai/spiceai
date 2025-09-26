@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{any::Any, cmp::Ordering, collections::HashSet, fmt, hash::Hasher, sync::Arc};
 
+use async_trait::async_trait;
 use datafusion::{
     common::{
         Column, DFSchemaRef, Dependency, FunctionalDependence, JoinConstraint, JoinType,
@@ -23,10 +24,14 @@ use datafusion::{
     },
     config::ConfigOptions,
     error::DataFusionError,
+    execution::SessionState,
     logical_expr::{
         Extension, Filter, InvariantLevel, Join, LogicalPlan, Projection, UserDefinedLogicalNode,
+        UserDefinedLogicalNodeCore,
     },
     optimizer::AnalyzerRule,
+    physical_plan::ExecutionPlan,
+    physical_planner::{ExtensionPlanner, PhysicalPlanner},
     prelude::Expr,
 };
 
@@ -35,6 +40,7 @@ pub struct RedundantJoinAnalyzerRule {}
 
 impl RedundantJoinAnalyzerRule {
     fn prune_left_join(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        tracing::warn!("planning={plan:?}\n");
         // Look for a `Projection` wrapping `Join`
         let LogicalPlan::Projection(Projection {
             expr,
@@ -43,48 +49,45 @@ impl RedundantJoinAnalyzerRule {
             ..
         }) = &plan
         else {
+            tracing::warn!("out @Projection ");
             return Ok(Transformed::no(plan));
         };
 
         let LogicalPlan::Extension(Extension { node }) = Arc::unwrap_or_clone(Arc::clone(&input))
         else {
+            tracing::warn!("out @Extension ");
             return Ok(Transformed::no(plan));
         };
 
+        tracing::warn!("finding a DistinctJoinColumns?");
         let Some(DistinctJoinColumns {
             input: LogicalPlan::Join(join),
             left: distinct_left,
             right: distinct_right,
         }) = node.as_any().downcast_ref::<DistinctJoinColumns>().cloned()
         else {
+            tracing::warn!("out @ DistinctJoinColumns ");
             return Ok(Transformed::no(plan));
         };
 
+        tracing::warn!("Found meself a DistinctJoinColumns");
+
         let (left_on, right_on): (Vec<Expr>, Vec<Expr>) = join.on.clone().into_iter().unzip();
 
+        tracing::warn!("left_on={left_on:?}, right_on={right_on:?}");
         // Ensure `on` is distinct.
         let left_ok = Self::ensure_expr_are_column_superset(left_on, distinct_left);
         let right_ok = Self::ensure_expr_are_column_superset(right_on, distinct_right);
 
         if !(left_ok && right_ok) {
-            return Ok(Transformed::no(LogicalPlan::Projection(
-                Projection::try_new_with_schema(
-                    expr.clone(),
-                    LogicalPlan::Join(join).into(),
-                    proj_schema.clone(),
-                )?,
-            )));
+            tracing::warn!("left_ok={left_ok:?}, right_ok={right_ok:?}");
+            return Ok(Transformed::no(plan));
         };
 
         // Check if LHS of Join has all columns referenced in projection
         if !Self::child_is_sufficient(&join.left, expr.as_slice(), &join.filter) {
-            return Ok(Transformed::no(LogicalPlan::Projection(
-                Projection::try_new_with_schema(
-                    expr.clone(),
-                    LogicalPlan::Join(join).into(),
-                    Arc::clone(&proj_schema),
-                )?,
-            )));
+            tracing::warn!("child_is_sufficient");
+            return Ok(Transformed::no(plan));
         }
 
         // We can now prune JOIN and just return LHS
@@ -127,7 +130,17 @@ impl RedundantJoinAnalyzerRule {
             .collect::<HashSet<&Column>>();
 
         if !expr_cols.is_subset(&child_columns) {
+            tracing::warn!(
+                "child_is_sufficient expr_cols={expr_cols:?}. child_columns={child_columns:?}"
+            );
             return false;
+        }
+
+        if let Some(f) = &filters {
+            tracing::warn!(
+                "child_is_sufficient f.column_refs()={:?}. child_columns={child_columns:?}",
+                f.column_refs()
+            );
         }
 
         filters
@@ -153,7 +166,7 @@ impl AnalyzerRule for RedundantJoinAnalyzerRule {
 }
 
 /// For [`AnalyzerRule`]s, guarantees that the left and right side of a [`LogicalPlan::Join`] are distinct rows for a given set of columns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct DistinctJoinColumns {
     input: LogicalPlan,
     left: Vec<Column>,
@@ -180,24 +193,53 @@ impl From<Join> for DistinctJoinColumns {
     }
 }
 
-impl UserDefinedLogicalNode for DistinctJoinColumns {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Return the plan's name.
+impl UserDefinedLogicalNodeCore for DistinctJoinColumns {
     fn name(&self) -> &str {
         "DistinctJoinColumns"
     }
 
-    /// Return the logical plan's inputs.
     fn inputs(&self) -> Vec<&LogicalPlan> {
         vec![&self.input]
     }
 
-    /// Return the output schema of this logical plan node.
     fn schema(&self) -> &DFSchemaRef {
         self.input.schema()
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        Vec::new()
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "DistinctJoinColumns")
+    }
+
+    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        // Since the input & output schema is the same, output columns require their corresponding index in the input columns.
+        Some(vec![output_columns.to_vec()])
+    }
+
+    fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
+        // Allow filters for all columns to be pushed down
+        HashSet::new()
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> Result<Self, DataFusionError> {
+        assert_eq!(inputs.len(), 1, "should have one input");
+        assert_eq!(exprs.len(), 0, "should have no expressions");
+        let Some(input) = inputs.into_iter().next() else {
+            panic!("should have one input");
+        };
+
+        Ok(Self {
+            input,
+            left: self.left.clone(),
+            right: self.right.clone(),
+        })
     }
 
     fn check_invariants(
@@ -208,65 +250,40 @@ impl UserDefinedLogicalNode for DistinctJoinColumns {
         Ok(())
     }
 
-    fn expressions(&self) -> Vec<Expr> {
-        Vec::new()
-    }
-
-    /// Write a single line, human readable string to `f` for use in explain plan.
-    ///
-    /// For example: `TopK: k=10`
-    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "DistinctJoinColumns")
-    }
-
-    /// Create a new `UserDefinedLogicalNode` with the specified children
-    /// and expressions. This function is used during optimization
-    /// when the plan is being rewritten and a new instance of the
-    /// `UserDefinedLogicalNode` must be created.
-    ///
-    /// Note that exprs and inputs are in the same order as the result
-    /// of self.inputs and self.exprs.
-    ///
-    /// So, `self.with_exprs_and_inputs(exprs, ..).expressions() == exprs
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        inputs: Vec<LogicalPlan>,
-    ) -> Result<Arc<dyn UserDefinedLogicalNode>, DataFusionError> {
-        let Some(LogicalPlan::Join(j)) = inputs.first() else {
-            return Err(DataFusionError::Internal(format!(
-                "expect a single Join input to {}",
-                self.name()
-            )));
-        };
-
-        Ok(Arc::new(Self {
-            input: LogicalPlan::Join(j.clone()),
-            left: self.left.clone(),
-            right: self.right.clone(),
-        }))
-    }
-
-    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        None
-    }
-
-    fn dyn_hash(&self, state: &mut dyn Hasher) {}
-
-    fn dyn_eq(&self, other: &dyn UserDefinedLogicalNode) -> bool {
-        match other.as_any().downcast_ref::<Self>() {
-            Some(Self { input, .. }) => *input == self.input,
-            None => false,
-        }
-    }
-    fn dyn_ord(&self, other: &dyn UserDefinedLogicalNode) -> Option<Ordering> {
-        other
-            .as_any()
-            .downcast_ref::<Self>()
-            .and_then(|other| self.input.partial_cmp(&other.input))
-    }
-
     fn supports_limit_pushdown(&self) -> bool {
         true
+    }
+}
+
+#[derive(Default)]
+pub struct DistinctJoinColumnsExtensionPlanner {}
+
+impl DistinctJoinColumnsExtensionPlanner {
+    #[must_use]
+    pub fn new() -> Self {
+        DistinctJoinColumnsExtensionPlanner {}
+    }
+}
+
+#[async_trait]
+impl ExtensionPlanner for DistinctJoinColumnsExtensionPlanner {
+    async fn plan_extension(
+        &self,
+        _planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        _session_state: &SessionState,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        let distinct_join_columns = node.as_any().downcast_ref::<DistinctJoinColumns>();
+        if distinct_join_columns.is_some() {
+            assert_eq!(logical_inputs.len(), 1, "should have 1 input");
+            assert_eq!(physical_inputs.len(), 1, "should have 1 input");
+            let physical_input = &physical_inputs[0];
+
+            return Ok(Some(Arc::clone(&physical_input)));
+        }
+
+        Ok(None)
     }
 }

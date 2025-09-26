@@ -24,6 +24,7 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_federation::FederatedPlanner;
+use runtime_datafusion_analyzer::DistinctJoinColumnsExtensionPlanner;
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use std::sync::Arc;
 
@@ -50,6 +51,7 @@ impl QueryPlanner for SpiceQueryPlanner {
             Arc::new(FederatedPlanner::new()),
             Arc::new(SpiceExtensionPlanner::new()),
             Arc::new(IndexTableScanExtensionPlanner::new()),
+            Arc::new(DistinctJoinColumnsExtensionPlanner {}),
         ]);
         physical_planner
             .create_physical_plan(logical_plan, session_state)

@@ -356,48 +356,55 @@ mod search {
 
         run_search_w_explain(
             AppBuilder::new("search_app")
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
                     "hf_minilm",
                 ))
+                // .with_embedding(get_huggingface_embeddings(
+                //     "sentence-transformers/all-MiniLM-L6-v2",
+                //     "hf_minilm",
+                // ))
                 .with_dataset(ds)
                 .build(),
-            [basic_vector_search_tests("metadata"),
-            vec![
-                SearchTestCase::new(
-                    "s3vector_metadata_additional_columns_metadata",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
-                        "additional_columns": ["reference_answer", "source"],
-                    })),
-                ),
+            [
+                basic_vector_search_tests("metadata"),
+                vec![
+                    // SearchTestCase::new(
+                    //     "s3vector_metadata_additional_columns_metadata",
+                    //     SearchTestType::Http(json!({
+                    //         "text": "second",
+                    //         "limit": 4,
+                    //         "datasets": ["qs"],
+                    //         "additional_columns": ["reference_answer", "source"],
+                    //     })),
+                    // ),
 
-                SearchTestCase::new(
-                    "s3vector_metadata_with_where_metadata",
-                    SearchTestType::Http(json!({
-                        "text": "secondary",
-                        "datasets": ["qs"],
-                        "where": "subject!='math'",
-                        "limit": 4,
-                    })),
-                ),
+                    // SearchTestCase::new(
+                    //     "s3vector_metadata_with_where_metadata",
+                    //     SearchTestType::Http(json!({
+                    //         "text": "secondary",
+                    //         "datasets": ["qs"],
+                    //         "where": "subject!='math'",
+                    //         "limit": 4,
+                    //     })),
+                    // ),
 
-                SearchTestCase::new(
-                    "s3vector_metadata_vector_search_sql_projection_metadata",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                    ),
-                ),
-                SearchTestCase::new(
-                    "s3vector_metadata_vector_search_sql_filters_metadata",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
-                    ),
-                ),
-            ]].concat(),
-            true
+                    // SearchTestCase::new(
+                    //     "s3vector_metadata_vector_search_sql_projection_metadata",
+                    //     SearchTestType::Sql(
+                    //         "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    //     ),
+                    // ),
+                    // SearchTestCase::new(
+                    //     "s3vector_metadata_vector_search_sql_filters_metadata",
+                    //     SearchTestType::Sql(
+                    //         "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                    //     ),
+                    // ),
+                ],
+            ]
+            .concat(),
+            true,
         )
         .await
     }

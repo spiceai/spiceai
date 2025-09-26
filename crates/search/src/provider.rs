@@ -191,17 +191,18 @@ impl TableProvider for SearchQueryProvider {
 
         let join_schema = Arc::new(search_index.schema().join(base_table.schema())?);
 
-        let join = LogicalPlan::Extension(Extension {
-            node: Arc::new(DistinctJoinColumns::from(Join {
-                left: search_index.into(),
-                right: base_table.into(),
-                join_type: JoinType::Left,
-                join_constraint: JoinConstraint::On,
-                on,
-                filter: None,
-                schema: Arc::clone(&join_schema),
-                null_equality: NullEquality::NullEqualsNothing,
-            })),
+        // let join = LogicalPlan::Extension(Extension {
+        //     node: Arc::new(DistinctJoinColumns::from(Join {
+        let join = LogicalPlan::Join(Join {
+            left: search_index.into(),
+            right: base_table.into(),
+            join_type: JoinType::Left,
+            join_constraint: JoinConstraint::On,
+            on,
+            filter: None,
+            schema: Arc::clone(&join_schema),
+            null_equality: NullEquality::NullEqualsNothing,
+            // })),
         });
 
         // Pick which columns we want.
