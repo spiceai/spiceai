@@ -161,6 +161,8 @@ impl SnapshotBootstrapManager {
             .get("snapshots_location")
             .and_then(|s| s.parse().ok())?;
 
+        let s3_region = params.get("snapshots_aws_region").cloned();
+
         let snapshot_bootstrap_failure_behavior: SnapshotBootstrapFailureBehavior = params
             .get("snapshots_bootstrap_on_failure_behavior")
             .and_then(|s| s.parse().inspect_err(|e| tracing::error!("{e}")).ok())
@@ -171,9 +173,10 @@ impl SnapshotBootstrapManager {
             snapshots_location_url.path(),
         ) {
             ("s3", path) => {
-                let store = aws_sdk_credential_bridge::from_s3_url(&snapshots_location_url, None)
-                    .await
-                    .ok()?;
+                let store =
+                    aws_sdk_credential_bridge::from_s3_url(&snapshots_location_url, s3_region)
+                        .await
+                        .ok()?;
                 let path = object_store::path::Path::from(path);
                 (store, path)
             }
@@ -257,8 +260,19 @@ impl SnapshotBootstrapManager {
     async fn download_latest_once(&self) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
         let candidates = self.list_snapshot_candidates().await?;
         if let Some(candidate) = candidates.into_iter().next() {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                snapshot = %candidate.location.to_string(),
+                timestamp = %candidate.timestamp,
+                "Downloading latest snapshot."
+            );
             self.download_snapshot(&candidate.location).await.map(Some)
         } else {
+            tracing::debug!(
+                dataset = %self.dataset_name,
+                location = %self.snapshots_location.to_string(),
+                "No snapshots found; continuing without bootstrapping."
+            );
             Ok(None)
         }
     }
@@ -337,6 +351,12 @@ impl SnapshotBootstrapManager {
             }
         })?;
 
+        tracing::info!(
+            dataset = %self.dataset_name,
+            snapshot = %location.to_string(),
+            "Downloading snapshot."
+        );
+
         let bytes =
             reader
                 .bytes()
@@ -362,6 +382,12 @@ impl SnapshotBootstrapManager {
             }
         })?;
 
+        tracing::info!(
+            dataset = %self.dataset_name,
+            snapshot = %location.to_string(),
+            "Snapshot downloaded."
+        );
+
         let checkpointer = (self.checkpointer_factory)()
             .await
             .map_err(|source| SnapshotDownloadError::CheckpointerInit { source })?;
@@ -371,8 +397,22 @@ impl SnapshotBootstrapManager {
             .await
             .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?
         {
-            Some(schema) => Ok(schema),
-            None => Err(SnapshotDownloadError::MissingSchema { path: path_display }),
+            Some(schema) => {
+                tracing::info!(
+                    dataset = %self.dataset_name,
+                    snapshot = %location.to_string(),
+                    "Snapshot schema verified."
+                );
+                Ok(schema)
+            }
+            None => {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    snapshot = %location.to_string(),
+                    "Snapshot schema not found."
+                );
+                Err(SnapshotDownloadError::MissingSchema { path: path_display })
+            }
         }
     }
 
@@ -383,6 +423,13 @@ impl SnapshotBootstrapManager {
         let location = meta.location;
         let filename = location.filename()?;
         let timestamp = Self::parse_snapshot_timestamp(filename, dataset_name)?;
+
+        tracing::debug!(
+            dataset = %dataset_name,
+            snapshot = %location.to_string(),
+            timestamp = %timestamp,
+            "Found snapshot candidate."
+        );
 
         Some(SnapshotCandidate {
             location,

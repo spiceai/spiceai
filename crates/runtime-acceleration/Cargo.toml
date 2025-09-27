@@ -21,6 +21,7 @@ util = { path = "../util" }
 url.workspace = true
 
 [features]
+default = ["snapshots"]
 snapshots = []
 
 [dev-dependencies]
