@@ -367,6 +367,21 @@ impl TableProvider for SearchQueryProvider {
             }
         }
 
+        // Add `match` only if its a chunked search field.
+        if fields_map.contains_key(ChunkedSearchIndex::chunking_offset_col(
+            self.search_column.as_str(),
+        )) && fields_map.contains_key(self.search_column.as_str())
+        {
+            fields_map.insert(
+                SEARCH_MATCH_COLUMN_NAME.to_string(),
+                Arc::new(Field::new(
+                    SEARCH_MATCH_COLUMN_NAME.to_string(),
+                    arrow_schema::DataType::Utf8,
+                    false,
+                )),
+            )
+        }
+
         let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
         fields.sort_unstable();
         Arc::new(Schema::new(fields))
