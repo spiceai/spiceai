@@ -75,6 +75,9 @@ pub enum Error {
         "Failed to initiate catalog, app reference cannot be obtained from the runtime."
     ))]
     FailedToGetAppFromRuntime {},
+
+    #[snafu(transparent)]
+    IcebergSnafu { source: iceberg::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

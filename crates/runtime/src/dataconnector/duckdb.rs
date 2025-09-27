@@ -167,13 +167,11 @@ impl DataConnector for DuckDB {
             });
         }
 
-        Ok(
-            Read::table_provider(&self.duckdb_factory, path, dataset.schema())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "duckdb",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+        Ok(Read::table_provider(&self.duckdb_factory, path)
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "duckdb",
+                connector_component: ConnectorComponent::from(dataset),
+            })?)
     }
 }
