@@ -193,13 +193,11 @@ impl SearchQueryProvider {
 
         // Can pushdown all filters except those on PKs (since these PK Expr will be unqualified, DF will find them ambigious).
         let join_filters: Vec<Expr> = filters
-            .iter()
-            .cloned()
-            .filter(|f| {
+            .iter().filter(|&f| {
                 f.column_refs()
                     .iter()
                     .any(|col| !primary_key_column_names.contains(col.name()))
-            })
+            }).cloned()
             .collect();
 
         let join = LogicalPlan::Join(Join {
@@ -363,7 +361,7 @@ impl TableProvider for SearchQueryProvider {
             .schema()
             .fields()
             .iter()
-            .map(|f| (f.name().clone(), Arc::clone(&f)))
+            .map(|f| (f.name().clone(), Arc::clone(f)))
             .collect::<HashMap<String, FieldRef>>();
 
         // Only add if key not in search index (we chose search index columns in `scan` afterall).
