@@ -140,32 +140,6 @@ impl SearchQueryProvider {
         )?))
     }
 
-    // Returns the `self.primary_key` as a primary key like [`FunctionalDependence`] with respect
-    // to the base table.
-    fn base_table_dependency(&self) -> FunctionalDependence {
-        let source_indices: Vec<usize> = self
-            .primary_key
-            .iter()
-            .filter_map(|pk| {
-                Some(
-                    self.table_provider
-                        .schema()
-                        .column_with_name(pk.as_str())?
-                        .0,
-                )
-            })
-            .collect();
-        let target_indices = (0..self.table_provider.schema().fields().len()).collect::<Vec<_>>();
-
-        FunctionalDependence {
-            source_indices,
-            target_indices,
-            nullable: false,
-            mode: datafusion::common::Dependency::Single,
-        }
-    }
-
-    #[allow(clippy::too_many_lines)] // Removed in `https://github.com/spiceai/spiceai/issues/7242`.
     fn join_with_base(
         &self,
         projection: Option<&Vec<usize>>,

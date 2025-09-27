@@ -42,26 +42,9 @@ pub struct FullTextSearchQuery {
     ///  `< N` will be returned in the overall SQL query.
     /// If a `limit` is provided such that `limit` < `pre_limit`, `limit` will be used.
     pub pre_limit: Option<usize>,
-
-    pub constraints: Constraints,
 }
 
 impl FullTextSearchQuery {
-    pub fn new(index: FullTextSearchFieldIndex, query: String) -> Self {
-        let s = index.schema();
-        let pk_idx = index
-            .primary_key
-            .iter()
-            .filter_map(|pk| Some(s.column_with_name(&pk)?.0))
-            .collect();
-
-        Self {
-            index,
-            query,
-            pre_limit: None,
-            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(pk_idx)]),
-        }
-    }
     /// Determine whether and how to pick between
     ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
     ///   2. The pre-limit configured in [`FullTextSearchQuery::pre_limit`].
@@ -80,10 +63,6 @@ impl FullTextSearchQuery {
 impl TableProvider for FullTextSearchQuery {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        Some(&self.constraints)
     }
 
     fn schema(&self) -> Arc<Schema> {
