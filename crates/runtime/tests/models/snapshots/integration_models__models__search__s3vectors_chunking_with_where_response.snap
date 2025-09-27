@@ -8,6 +8,14 @@ snapshot_kind: text
   "results": [
     {
       "dataset": "qs",
+      "matches": {},
+      "primary_key": {
+        "id": 921
+      },
+      "score": 0.35
+    },
+    {
+      "dataset": "qs",
       "matches": {
         "answer": "The presence of fibrinolysin in the reagents can partially o"
       },
@@ -33,16 +41,6 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 551
-      },
-      "score": 0.29
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "answer": "stemic vascular resistance (SVR) by causing vasodilation."
-      },
-      "primary_key": {
-        "id": 1035
       },
       "score": 0.29
     }

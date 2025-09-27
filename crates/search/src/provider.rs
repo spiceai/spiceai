@@ -444,7 +444,18 @@ impl TableProvider for SearchQueryProvider {
                 search_index_table
             }
         } else {
-            self.join_with_base(inner_proj.as_ref(), search_index_table, filters)?
+            // Pushdown indexes to search index
+            let search_index = if let Some(filter) =
+                exprs_supported(filters, search_index_table.schema())
+                    .iter()
+                    .cloned()
+                    .reduce(Expr::and)
+            {
+                LogicalPlan::Filter(Filter::try_new(filter, search_index_table.into())?)
+            } else {
+                search_index_table
+            };
+            self.join_with_base(inner_proj.as_ref(), search_index, filters)?
         };
 
         // Add sorting by search score (descending)
@@ -511,5 +522,26 @@ fn columns_missing_from(expr: &[Expr], schema: &DFSchemaRef) -> Vec<String> {
                 .cloned()
                 .collect::<Vec<_>>()
         })
+        .collect::<Vec<_>>()
+}
+
+// Returns all expr in exprs that are supported by the `schema`.
+fn exprs_supported(exprs: &[Expr], schema: &DFSchemaRef) -> Vec<Expr> {
+    let schema_cols = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect::<HashSet<_>>();
+
+    exprs
+        .iter()
+        .filter(|e| {
+            e.column_refs()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect::<HashSet<_>>()
+                .is_subset(&schema_cols)
+        })
+        .cloned()
         .collect::<Vec<_>>()
 }
