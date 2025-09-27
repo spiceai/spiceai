@@ -193,11 +193,13 @@ impl SearchQueryProvider {
 
         // Can pushdown all filters except those on PKs (since these PK Expr will be unqualified, DF will find them ambigious).
         let join_filters: Vec<Expr> = filters
-            .iter().filter(|&f| {
+            .iter()
+            .filter(|&f| {
                 f.column_refs()
                     .iter()
                     .any(|col| !primary_key_column_names.contains(col.name()))
-            }).cloned()
+            })
+            .cloned()
             .collect();
 
         let join = LogicalPlan::Join(Join {
