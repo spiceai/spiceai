@@ -191,12 +191,16 @@ impl SearchQueryProvider {
         let primary_key_column_names: std::collections::HashSet<String> =
             self.primary_key.iter().cloned().collect();
 
-        let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
-            filters.iter().cloned().partition(|f| {
+        // Can pushdown all filters except those on PKs (since these PK Expr will be unqualified, DF will find them ambigious).
+        let join_filters: Vec<Expr> = filters
+            .iter()
+            .cloned()
+            .filter(|f| {
                 f.column_refs()
                     .iter()
-                    .any(|col| primary_key_column_names.contains(col.name()))
-            });
+                    .any(|col| !primary_key_column_names.contains(col.name()))
+            })
+            .collect();
 
         let join = LogicalPlan::Join(Join {
             left: Arc::new(search_index_proj),
@@ -204,7 +208,7 @@ impl SearchQueryProvider {
             join_type: JoinType::Left,
             join_constraint: JoinConstraint::On,
             on,
-            filter: pre_join_filters.into_iter().reduce(Expr::and),
+            filter: join_filters.into_iter().reduce(Expr::and),
             schema: join_schema.into(),
             null_equality: NullEquality::NullEqualsNothing,
         });
@@ -227,7 +231,9 @@ impl SearchQueryProvider {
         let proj =
             LogicalPlan::Projection(Projection::try_new(deduped_join_proj_exprs, join.into())?);
 
-        if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
+        // Apply all filters after JOIN. This is to ensure that if a filter is pushed onto RHS,
+        // LHS (i.e. from search index) doesn't return row violating filter.
+        if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
             Ok(LogicalPlan::Filter(Filter::try_new(filter, proj.into())?))
         } else {
             Ok(proj)
