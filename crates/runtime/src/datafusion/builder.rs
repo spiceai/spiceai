@@ -32,22 +32,15 @@ use datafusion::{
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
-        AnalyzerRule, Optimizer,
+        AnalyzerRule,
         analyzer::{
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
-        eliminate_nested_union::EliminateNestedUnion,
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::{
-    FederationAnalyzerRule,
-    sql::{
-        federation_analyzer_rule,
-        optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation},
-    },
-};
-use runtime_datafusion_analyzer::RedundantJoinAnalyzerRule;
+use datafusion_federation::sql::federation_analyzer_rule;
+
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -262,7 +255,6 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
-        Arc::new(RedundantJoinAnalyzerRule {}),
     ]
 }
 

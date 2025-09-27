@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -56,6 +56,7 @@ pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 /// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static S3_VECTOR_MAX_TOPK: i64 = 30;
 
+/// [`ComputeQueryVector`] allows [`S3VectorsQueryTable`] to be instantiated in a non-async setting.
 #[async_trait]
 pub trait ComputeQueryVector: std::fmt::Debug + Send + Sync {
     async fn compute_vector(
@@ -168,7 +169,7 @@ impl TableProvider for S3VectorsQueryTable {
             .compute_vector
             .compute_vector(self.query.as_str())
             .await
-            .map_err(|e| DataFusionError::External(e))?;
+            .map_err(DataFusionError::External)?;
 
         Ok(Arc::new(S3VectorsQueryExec::new(
             self,

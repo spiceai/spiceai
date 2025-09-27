@@ -24,7 +24,6 @@ use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraint, Constraints},
     datasource::TableType,
     error::DataFusionError,
     physical_plan::ExecutionPlan,

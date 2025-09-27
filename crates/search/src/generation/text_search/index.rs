@@ -436,10 +436,11 @@ impl SearchIndex for FullTextDatabaseIndex {
 
         Ok(Arc::new(LogicalPlan::TableScan(TableScan::try_new(
             self.name(),
-            Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery::new(
-                field_index,
-                query.to_string(),
-            )))),
+            Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
+                index: field_index,
+                query: query.to_string(),
+                pre_limit: None,
+            }))),
             None,
             vec![],
             None,

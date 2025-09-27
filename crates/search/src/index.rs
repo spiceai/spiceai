@@ -20,7 +20,7 @@ use crate::metadata::MetadataColumns;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{catalog::TableProvider, error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).

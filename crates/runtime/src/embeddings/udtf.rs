@@ -327,9 +327,9 @@ impl VectorSearchTableFunc {
         };
 
         Ok(Some(Arc::new(SearchQueryProvider::try_from_index(
-            vector_index,
+            &vector_index,
             Arc::clone(tbl),
-            args.query.clone(),
+            args.query.as_str(),
             args.limit,
         )?)))
     }

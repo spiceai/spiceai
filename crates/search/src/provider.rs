@@ -20,27 +20,22 @@ use std::{
     sync::Arc,
 };
 
-use arrow::compute::kernels::substring;
 use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{
-        Column, DFSchema, DFSchemaRef, FunctionalDependence, FunctionalDependencies,
-        JoinConstraint, JoinType, NullEquality,
-    },
+    common::{Column, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
-        BinaryExpr, Cast, Extension, Filter, Join, LogicalPlan, Operator, Projection, Sort,
-        SortExpr, SubqueryAlias, TableProviderFilterPushDown, TableScan, expr::Alias,
+        BinaryExpr, Cast, Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr,
+        SubqueryAlias, TableProviderFilterPushDown, TableScan, expr::Alias,
     },
     physical_plan::ExecutionPlan,
-    prelude::{Expr, array_element, col},
+    prelude::{Expr, array_element, col, substring},
     scalar::ScalarValue,
     sql::TableReference,
 };
-use runtime_datafusion_analyzer::DistinctJoinColumns;
 
 use crate::{
     SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, chunking::ChunkedSearchIndex,
@@ -53,6 +48,7 @@ use crate::{
 pub struct SearchQueryProvider {
     pub search_index_query: Arc<LogicalPlan>,
     pub table_provider: Arc<dyn TableProvider>,
+    pub search_column: String,
     pub primary_key: Vec<String>,
     pub pre_limit: Option<usize>,
 }
@@ -61,26 +57,29 @@ impl SearchQueryProvider {
     pub fn new(
         search_index_query: Arc<LogicalPlan>,
         table_provider: Arc<dyn TableProvider>,
+        search_column: String,
         primary_key: Vec<String>,
     ) -> Self {
         Self {
             search_index_query,
             primary_key,
             table_provider,
+            search_column,
             pre_limit: None,
         }
     }
 
     pub fn try_from_index(
-        search_index: Arc<dyn SearchIndex>,
+        search_index: &Arc<dyn SearchIndex>,
         table_provider: Arc<dyn TableProvider>,
-        query: String,
+        query: &str,
         limit: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let search_index_query = search_index.query_table_provider(query.as_str())?;
+        let search_index_query = search_index.query_table_provider(query)?;
         Ok(Self::new(
             search_index_query,
             table_provider,
+            search_index.search_column(),
             search_index
                 .primary_fields()
                 .iter()
@@ -156,7 +155,7 @@ impl SearchQueryProvider {
         let column_names: Vec<String> = match projection {
             None => schema.fields().iter().map(|f| f.name().clone()).collect(),
             Some(proj) => schema
-                .project(&proj)?
+                .project(proj)?
                 .fields()
                 .iter()
                 .map(|f| f.name().clone())
@@ -246,58 +245,62 @@ impl SearchQueryProvider {
         projection: Option<&Vec<usize>>,
         input: LogicalPlan,
     ) -> Result<LogicalPlan, DataFusionError> {
-        return Ok(input);
+        let search_col = self.search_column.as_str();
         // If projection doesn't include/need the 'match' column, early exit.
-        // if !is_chunked(&self.search_index)
-        //     || projection
-        //         .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)))
-        // {
-        //     return Ok(input);
-        // }
-        // let mut initial: Vec<_> = input
-        //     .schema()
-        //     .columns()
-        //     .into_iter()
-        //     .map(Expr::Column)
-        //     .collect();
+        // Or if its not a chunked search query (doesn't have offsets in schema).
+        let match_not_required = projection
+            .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)));
+        let chunked_search_field = self
+            .schema()
+            .column_with_name(ChunkedSearchIndex::chunking_offset_col(search_col).as_str())
+            .is_some();
+        if match_not_required || !chunked_search_field {
+            return Ok(input);
+        }
+        let mut initial: Vec<_> = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
 
-        // let first = array_element(
-        //     Expr::Column(Column::new_unqualified(
-        //         ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
-        //     )),
-        //     Expr::Literal(ScalarValue::Int64(Some(1)), None),
-        // );
-        // let second = array_element(
-        //     Expr::Column(Column::new_unqualified(
-        //         ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
-        //     )),
-        //     Expr::Literal(ScalarValue::Int64(Some(2)), None),
-        // );
+        let first = array_element(
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(search_col),
+            )),
+            Expr::Literal(ScalarValue::Int64(Some(1)), None),
+        );
+        let second = array_element(
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(search_col),
+            )),
+            Expr::Literal(ScalarValue::Int64(Some(2)), None),
+        );
 
-        // // substring(search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]) as 'match'
-        // let substr = Expr::Cast(Cast::new(
-        //     Box::new(substring(
-        //         Expr::Column(Column::new_unqualified(self.search_index.search_column())),
-        //         first.clone(),
-        //         Expr::BinaryExpr(BinaryExpr::new(
-        //             Box::new(second),
-        //             Operator::Minus,
-        //             Box::new(first),
-        //         )),
-        //     )),
-        //     DataType::Utf8,
-        // ));
+        // substring(search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]) as 'match'
+        let substr = Expr::Cast(Cast::new(
+            Box::new(substring(
+                col(search_col),
+                first.clone(),
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(second),
+                    Operator::Minus,
+                    Box::new(first),
+                )),
+            )),
+            DataType::Utf8,
+        ));
 
-        // initial.push(Expr::Alias(Alias::new(
-        //     substr,
-        //     None::<TableReference>,
-        //     "match",
-        // )));
+        initial.push(Expr::Alias(Alias::new(
+            substr,
+            None::<TableReference>,
+            "match",
+        )));
 
-        // Ok(LogicalPlan::Projection(Projection::try_new(
-        //     initial,
-        //     input.into(),
-        // )?))
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            initial,
+            input.into(),
+        )?))
     }
 
     fn search_index_table_is_sufficient(
@@ -354,7 +357,7 @@ impl TableProvider for SearchQueryProvider {
             .schema()
             .fields()
             .iter()
-            .map(|f| (f.name().clone(), f.clone()))
+            .map(|f| (f.name().clone(), Arc::clone(&f)))
             .collect::<HashMap<String, FieldRef>>();
 
         // Only add if key not in search index (we chose search index columns in `scan` afterall).
@@ -393,35 +396,25 @@ impl TableProvider for SearchQueryProvider {
             TableReference::parse_str("search_index"),
         )?);
 
-        let base_table = LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("base_table"),
-            Arc::new(DefaultTableSource::new(
-                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
-            )),
-            None,
-            vec![],
-            None,
-        )?);
-
-        let inner_proj: Option<Vec<_>> = projection.cloned();
-        //     .map(|proj| {
-        //     let Some(match_idx) = self.match_column_index() else {
-        //         return proj;
-        //     };
-        //     if !proj.contains(&match_idx) {
-        //         return proj;
-        //     }
-        //     let mut proj2 = proj.clone();
-        //     if let Some(search_idx) = self
-        //         .schema()
-        //         .column_with_name(self.search_index.search_column().as_str())
-        //         .map(|(i, _)| i)
-        //         && !proj2.contains(&search_idx)
-        //     {
-        //         proj2.push(search_idx);
-        //     }
-        //     proj2
-        // });
+        // Ensure that if we need `match`, we get underlying search column.
+        let inner_proj: Option<Vec<_>> = projection.cloned().map(|proj| {
+            let Some(match_idx) = self.match_column_index() else {
+                return proj;
+            };
+            if !proj.contains(&match_idx) {
+                return proj;
+            }
+            let mut proj2 = proj.clone();
+            if let Some(search_idx) = self
+                .schema()
+                .column_with_name(self.search_column.as_str())
+                .map(|(i, _)| i)
+                && !proj2.contains(&search_idx)
+            {
+                proj2.push(search_idx);
+            }
+            proj2
+        });
 
         // Check if search index alone is sufficient
         let base_logical_plan: LogicalPlan = if self.search_index_table_is_sufficient(
@@ -474,30 +467,6 @@ impl TableProvider for SearchQueryProvider {
 
         state.create_physical_plan(&final_proj).await
     }
-}
-
-/// Helper function to remove columns from a projection
-fn projection_without_columns(
-    table_fields: &arrow_schema::Fields,
-    columns: &[String],
-    projection: Option<&Vec<usize>>,
-) -> Vec<usize> {
-    let base_projection = projection
-        .cloned()
-        .unwrap_or_else(|| (0..table_fields.len()).collect());
-
-    let columns_to_remove: std::collections::HashSet<_> = columns.iter().collect();
-
-    base_projection
-        .into_iter()
-        .filter(|&idx| {
-            if let Some(field) = table_fields.get(idx) {
-                !columns_to_remove.contains(&field.name().to_string())
-            } else {
-                true
-            }
-        })
-        .collect()
 }
 
 // Covnert to index projection for all unqualified column names. If c in `cols` is not in schema, it is ignored.

@@ -16,12 +16,10 @@ use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
     common::Column,
-    datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
     functions_aggregate::expr_fn::{array_agg, first_value},
-    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, TableScan},
+    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr},
     prelude::{Expr, ExprFunctionExt, col},
-    sql::TableReference,
 };
 use futures::future::try_join_all;
 use itertools::Itertools;

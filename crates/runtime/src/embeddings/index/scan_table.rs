@@ -22,10 +22,7 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{
-        Column, Constraint, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType,
-        NullEquality,
-    },
+    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
@@ -353,7 +350,7 @@ mod tests {
         ]));
 
         let p = VectorScanTableProvider {
-            table_provider: indexArc::new(ExplainMemTable::new(
+            table_provider: Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
