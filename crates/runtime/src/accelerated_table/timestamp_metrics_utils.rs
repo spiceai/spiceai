@@ -71,7 +71,6 @@ macro_rules! max_ts_macro {
 ///         - `Some(i64)`: The maximum timestamp found in the stream (in milliseconds)
 ///         - `None`: Attempted extraction but no valid timestamps found
 ///             - If batches were not empty, a warning is logged
-#[allow(clippy::too_many_lines)]
 pub async fn with_find_max_timestamp_in_stream(
     data_update: StreamingDataUpdate,
     schema: SchemaRef,
@@ -100,10 +99,8 @@ pub async fn with_find_max_timestamp_in_stream(
     let max_ts = Arc::new(Mutex::new(None::<i64>));
     let max_ts_clone = Arc::clone(&max_ts);
 
-    let update_type = data_update.update_type.clone();
-
     let out_stream = find_max_timestamp_in_stream_inner(
-        data_update,
+        data_update.data,
         time_column,
         time_format,
         field,
@@ -114,14 +111,14 @@ pub async fn with_find_max_timestamp_in_stream(
 
     let new_data_update = StreamingDataUpdate {
         data: out_stream,
-        update_type,
+        update_type: data_update.update_type,
     };
 
     (new_data_update, Some(max_ts))
 }
 
 fn find_max_timestamp_in_stream_inner(
-    data_update: StreamingDataUpdate,
+    mut input_stream: SendableRecordBatchStream,
     time_column: String,
     time_format: TimeFormat,
     field: Field,
@@ -130,7 +127,6 @@ fn find_max_timestamp_in_stream_inner(
     source_name: String,
 ) -> SendableRecordBatchStream {
     let output_stream = stream! {
-        let mut input_stream = data_update.data;
         let mut max_ts: Option<i64> = None;
 
         while let Some(batch_result) = input_stream.next().await {
