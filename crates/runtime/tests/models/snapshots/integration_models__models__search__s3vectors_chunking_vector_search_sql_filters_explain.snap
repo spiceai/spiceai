@@ -15,18 +15,18 @@ snapshot_kind: text
 |               |     ProjectionExec: expr=[id@1 as id, answer@0 as answer, trunc(score@2, 3) as score]                                                                                    |
 |               |       BytesProcessedExec                                                                                                                                                 |
 |               |         ProjectionExec: expr=[answer@2 as answer, id@0 as id, score@1 as score]                                                                                          |
-|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3]                                                        |
-|               |             CoalescePartitionsExec                                                                                                                                       |
-|               |               AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[score]                                                                                       |
-|               |                 RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                        |
-|               |                   AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[score]                                                                                            |
-|               |                     ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, 1 - distance@1 as score]                                                        |
-|               |                       BytesProcessedExec                                                                                                                                 |
-|               |                         CooperativeExec                                                                                                                                  |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                           |
-|               |                             CooperativeExec                                                                                                                              |
-|               |                               S3VectorsQueryExec: limit=30                                                                                                               |
-|               |             ProjectionExec: expr=[id@0 as id, answer@1 as answer]                                                                                                        |
+|               |           FilterExec: subject@3 != math, projection=[id@0, score@1, answer@2]                                                                                            |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3, subject@4]                                           |
+|               |               CoalescePartitionsExec                                                                                                                                     |
+|               |                 AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[score]                                                                                     |
+|               |                   RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                      |
+|               |                     AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[score]                                                                                          |
+|               |                       ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, 1 - distance@1 as score]                                                      |
+|               |                         BytesProcessedExec                                                                                                                               |
+|               |                           CooperativeExec                                                                                                                                |
+|               |                             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                         |
+|               |                               CooperativeExec                                                                                                                            |
+|               |                                 S3VectorsQueryExec: limit=30                                                                                                             |
 |               |               BytesProcessedExec                                                                                                                                         |
 |               |                 FilterExec: subject@2 != math                                                                                                                            |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                   |
