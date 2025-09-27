@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -98,10 +98,10 @@ impl SearchQueryProvider {
         let mut base_table_cols: HashSet<String> = columns.into_iter().clone().collect();
         base_table_cols.remove(SEARCH_MATCH_COLUMN_NAME);
         for f in search_index_schema.fields() {
-            if !self.primary_key.contains(f.name()) {
-                base_table_cols.remove(f.name());
-            }
+            base_table_cols.remove(f.name());
         }
+        base_table_cols.extend(self.primary_key.clone());
+
         // Also include any columns needed for filters on base table.
         base_table_cols.extend(columns_missing_from(filters, search_index_schema));
         let base_table_cols: Vec<_> = base_table_cols.into_iter().collect();
@@ -368,9 +368,9 @@ impl TableProvider for SearchQueryProvider {
         }
 
         // Add `match` only if its a chunked search field.
-        if fields_map.contains_key(ChunkedSearchIndex::chunking_offset_col(
+        if fields_map.contains_key(&ChunkedSearchIndex::chunking_offset_col(
             self.search_column.as_str(),
-        )) && fields_map.contains_key(self.search_column.as_str())
+        )) && fields_map.contains_key(&self.search_column)
         {
             fields_map.insert(
                 SEARCH_MATCH_COLUMN_NAME.to_string(),
@@ -379,7 +379,7 @@ impl TableProvider for SearchQueryProvider {
                     arrow_schema::DataType::Utf8,
                     false,
                 )),
-            )
+            );
         }
 
         let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
