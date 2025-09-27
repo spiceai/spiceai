@@ -15,18 +15,19 @@ snapshot_kind: text
 |               |     ProjectionExec: expr=[id@1 as id, answer@0 as answer, trunc(score@2, 3) as score]                                                                                    |
 |               |       BytesProcessedExec                                                                                                                                                 |
 |               |         ProjectionExec: expr=[answer@2 as answer, id@0 as id, score@1 as score]                                                                                          |
-|               |           FilterExec: subject@3 != math, projection=[id@0, score@1, answer@2]                                                                                            |
-|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3, subject@4]                                           |
-|               |               CoalescePartitionsExec                                                                                                                                     |
-|               |                 ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                                                               |
-|               |                   BytesProcessedExec                                                                                                                                     |
-|               |                     CooperativeExec                                                                                                                                      |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                               |
-|               |                         CooperativeExec                                                                                                                                  |
-|               |                           S3VectorsQueryExec: limit=30                                                                                                                   |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                       |
+|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3]                                                        |
+|               |             CoalescePartitionsExec                                                                                                                                       |
+|               |               ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                                                                 |
 |               |                 BytesProcessedExec                                                                                                                                       |
-|               |                   SchemaCastScanExec                                                                                                                                     |
-|               |                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                    |
+|               |                   CooperativeExec                                                                                                                                        |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                 |
+|               |                       CooperativeExec                                                                                                                                    |
+|               |                         S3VectorsQueryExec: limit=30                                                                                                                     |
+|               |             ProjectionExec: expr=[id@0 as id, answer@1 as answer]                                                                                                        |
+|               |               BytesProcessedExec                                                                                                                                         |
+|               |                 FilterExec: subject@2 != math                                                                                                                            |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                   |
+|               |                     SchemaCastScanExec                                                                                                                                   |
+|               |                       DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                  |
 |               |                                                                                                                                                                          |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

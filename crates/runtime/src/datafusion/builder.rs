@@ -40,7 +40,6 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::sql::federation_analyzer_rule;
-
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};

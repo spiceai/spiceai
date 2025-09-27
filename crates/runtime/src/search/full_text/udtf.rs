@@ -282,7 +282,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
 
         Ok(Arc::new(TextSearchIndexProviderWrapper {
             inner: Arc::new(SearchQueryProvider::try_from_index(
-                &Arc::new(fts_index) as Arc<dyn SearchIndex>,
+                &(Arc::new(fts_index) as Arc<dyn SearchIndex>),
                 table_provider,
                 args.query.as_str(),
                 args.limit,
