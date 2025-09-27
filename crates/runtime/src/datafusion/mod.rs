@@ -853,7 +853,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<AcceleratedTable> {
-        tracing::debug!("Creating accelerated table {dataset:?}");
+        tracing::trace!("Creating accelerated table {dataset:?}");
         let source_table_provider = match dataset.access() {
             AccessMode::Read => Arc::new(federated_read_table),
             AccessMode::ReadWrite => {

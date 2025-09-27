@@ -323,11 +323,12 @@ impl SnapshotBootstrapManager {
         let listing_path = self.snapshots_location.to_string();
 
         while let Some(meta_result) = stream.next().await {
-            let meta: ObjectMeta =
-                meta_result.map_err(|source| SnapshotDownloadError::ListSnapshots {
+            let meta: ObjectMeta = meta_result
+                .map_err(|source| SnapshotDownloadError::ListSnapshots {
                     path: listing_path.clone(),
                     source,
-                })?;
+                })
+                .inspect_err(|e| tracing::error!(error = %e))?;
 
             if let Some(candidate) = Self::snapshot_candidate_from_meta(meta, &self.dataset_name) {
                 snapshots.push(candidate);
@@ -335,6 +336,13 @@ impl SnapshotBootstrapManager {
         }
 
         snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        tracing::info!(
+            dataset = %self.dataset_name,
+            location = %self.snapshots_location.to_string(),
+            count = snapshots.len(),
+            "Found {} snapshot candidates.",
+            snapshots.len()
+        );
         Ok(snapshots)
     }
 
@@ -375,6 +383,7 @@ impl SnapshotBootstrapManager {
             })?;
         }
 
+        let bytes_len = bytes.len();
         fs::write(&self.local_path, bytes).await.map_err(|source| {
             SnapshotDownloadError::WriteLocal {
                 path: self.local_path.clone(),
@@ -385,6 +394,7 @@ impl SnapshotBootstrapManager {
         tracing::info!(
             dataset = %self.dataset_name,
             snapshot = %location.to_string(),
+            size = bytes_len,
             "Snapshot downloaded."
         );
 
