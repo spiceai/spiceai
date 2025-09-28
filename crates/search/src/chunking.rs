@@ -353,7 +353,7 @@ impl SearchIndex for ChunkedSearchIndex {
             };
         };
 
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()?
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()
     }
 
     async fn query_table_provider(
