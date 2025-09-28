@@ -138,66 +138,48 @@ impl AsyncScalarUDFImpl for Ai {
         args: ScalarFunctionArgs,
         _config: &datafusion::config::ConfigOptions,
     ) -> DataFusionResult<ArrayRef> {
-        // Capture the current tracing context to ensure proper parent-child relationships
-        let current_span = tracing::Span::current();
-        let current_span_clone = current_span.clone();
+        // Capture the current tracing context (sql_query span) for direct parent-child relationships
+        let parent_span = tracing::Span::current();
 
-        async move {
-            if args.args.is_empty() || args.args.len() > 2 {
-                return exec_err!(
-                    "{AI_UDF_NAME} expects one or two arguments: message and optional model_name"
-                );
-            }
-
-            let model_name = if args.args.len() == 2 {
-                let model_arg = &args.args[1];
-                match model_arg {
-                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
-                        model_name.clone()
-                    }
-                    _ => {
-                        return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
-                    }
-                }
-            } else {
-                self.get_default_model_name().await?
-            };
-
-            let model_store = self.model_store.read().await;
-            let Some(model) = model_store.get(&model_name) else {
-                return exec_err!("{AI_UDF_NAME} cannot find model '{model_name}'");
-            };
-
-            // Convert arguments to arrays for consistency
-            let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
-
-            match args_arrays.len() {
-                1 => {
-                    let [message_array] = take_function_args(self.name(), args_arrays)?;
-                    self.process_messages(
-                        Arc::clone(model),
-                        message_array,
-                        &model_name,
-                        &current_span_clone,
-                    )
-                    .await
-                }
-                2 => {
-                    let [message_array, _model_array] =
-                        take_function_args(self.name(), args_arrays)?;
-                    self.process_messages(
-                        Arc::clone(model),
-                        message_array,
-                        &model_name,
-                        &current_span_clone,
-                    )
-                    .await
-                }
-                _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
-            }
+        if args.args.is_empty() || args.args.len() > 2 {
+            return exec_err!(
+                "{AI_UDF_NAME} expects one or two arguments: message and optional model_name"
+            );
         }
-        .instrument(current_span)
-        .await
+
+        let model_name = if args.args.len() == 2 {
+            let model_arg = &args.args[1];
+            match model_arg {
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => model_name.clone(),
+                _ => {
+                    return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
+                }
+            }
+        } else {
+            self.get_default_model_name().await?
+        };
+
+        let model_store = self.model_store.read().await;
+        let Some(model) = model_store.get(&model_name) else {
+            return exec_err!("{AI_UDF_NAME} cannot find model '{model_name}'");
+        };
+
+        // Convert arguments to arrays for consistency
+        let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
+
+        match args_arrays.len() {
+            1 => {
+                let [message_array] = take_function_args(self.name(), args_arrays)?;
+                self.process_messages(Arc::clone(model), message_array, &model_name, &parent_span)
+                    .await
+            }
+            2 => {
+                let [message_array, _model_array] = take_function_args(self.name(), args_arrays)?;
+                self.process_messages(Arc::clone(model), message_array, &model_name, &parent_span)
+                    .await
+            }
+            _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
+        }
     }
 }
 
