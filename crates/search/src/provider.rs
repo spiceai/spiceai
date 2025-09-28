@@ -28,7 +28,7 @@ use datafusion::{
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
-        BinaryExpr, Cast, Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr,
+        BinaryExpr, Cast, Filter, Join, Limit, LogicalPlan, Operator, Projection, Sort, SortExpr,
         SubqueryAlias, TableProviderFilterPushDown, TableScan, expr::Alias,
     },
     physical_plan::ExecutionPlan,
@@ -59,13 +59,14 @@ impl SearchQueryProvider {
         table_provider: Arc<dyn TableProvider>,
         search_column: String,
         primary_key: Vec<String>,
+        pre_limit: Option<usize>,
     ) -> Self {
         Self {
             search_index_query,
             primary_key,
             table_provider,
             search_column,
-            pre_limit: None,
+            pre_limit,
         }
     }
 
@@ -85,6 +86,7 @@ impl SearchQueryProvider {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect(),
+            limit,
         ))
     }
 
@@ -95,7 +97,7 @@ impl SearchQueryProvider {
         filters: &[Expr],
         search_index_schema: &DFSchemaRef,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let mut base_table_cols: HashSet<String> = columns.into_iter().clone().collect();
+        let mut base_table_cols: HashSet<String> = columns.into_iter().collect();
         base_table_cols.remove(SEARCH_MATCH_COLUMN_NAME);
         for f in search_index_schema.fields() {
             base_table_cols.remove(f.name());
@@ -369,7 +371,7 @@ impl TableProvider for SearchQueryProvider {
         // Only add if key not in search index (we chose search index columns in `scan` afterall).
         for f in self.table_provider.schema().fields() {
             if !fields_map.contains_key(f.name()) {
-                fields_map.insert(f.name().clone(), f.clone());
+                fields_map.insert(f.name().clone(), Arc::clone(&f));
             }
         }
 
@@ -412,10 +414,15 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let search_index_table = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-            Arc::clone(&self.search_index_query),
-            TableReference::parse_str("search_index"),
-        )?);
+        let mut search_index_table = LogicalPlan::Limit(Limit {
+            skip: None,
+            fetch: self.pre_limit,
+            input: LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                Arc::clone(&self.search_index_query),
+                TableReference::parse_str("search_index"),
+            )?)
+            .into(),
+        });
 
         // Ensure that if we need `match`, we get underlying search column.
         let inner_proj: Option<Vec<_>> = projection.cloned().map(|proj| {
