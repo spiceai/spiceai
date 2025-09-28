@@ -77,7 +77,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
                 ChatCompletionRequestUserMessage {
                     name: None,
                     content: ChatCompletionRequestUserMessageContent::Text(
-                        "Respond with the single letter 'A'".to_string(),
+                        "Respond with 'ok'".to_string(),
                     ),
                 },
             )],
