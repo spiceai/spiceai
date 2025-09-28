@@ -153,39 +153,63 @@ impl AsyncScalarUDFImpl for Ai {
             );
         }
 
-        let model_name = if args.args.len() == 2 {
-            let model_arg = &args.args[1];
-            match model_arg {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => model_name.clone(),
-                _ => {
-                    return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
+        // Execute the UDF within the current span context to maintain parent-child relationships
+        async move {
+            if args.args.is_empty() || args.args.len() > 2 {
+                return exec_err!(
+                    "{AI_UDF_NAME} expects one or two arguments: message and optional model_name"
+                );
+            }
+
+            let model_name = if args.args.len() == 2 {
+                let model_arg = &args.args[1];
+                match model_arg {
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
+                        model_name.clone()
+                    }
+                    _ => {
+                        return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
+                    }
                 }
-            }
-        } else {
-            self.get_default_model_name().await?
-        };
+            } else {
+                self.get_default_model_name().await?
+            };
 
-        let model_store = self.model_store.read().await;
-        let Some(model) = model_store.get(&model_name) else {
-            return exec_err!("{AI_UDF_NAME} cannot find model '{model_name}'");
-        };
+            let model_store = self.model_store.read().await;
+            let Some(model) = model_store.get(&model_name) else {
+                return exec_err!("{AI_UDF_NAME} cannot find model '{model_name}'");
+            };
 
-        // Convert arguments to arrays for consistency
-        let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
+            // Convert arguments to arrays for consistency
+            let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
 
-        match args_arrays.len() {
-            1 => {
-                let [message_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array, &model_name)
+            match args_arrays.len() {
+                1 => {
+                    let [message_array] = take_function_args(self.name(), args_arrays)?;
+                    self.process_messages(
+                        Arc::clone(model),
+                        message_array,
+                        &model_name,
+                        parent_span.clone(),
+                    )
                     .await
-            }
-            2 => {
-                let [message_array, _model_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array, &model_name)
+                }
+                2 => {
+                    let [message_array, _model_array] =
+                        take_function_args(self.name(), args_arrays)?;
+                    self.process_messages(
+                        Arc::clone(model),
+                        message_array,
+                        &model_name,
+                        parent_span.clone(),
+                    )
                     .await
+                }
+                _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
             }
-            _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
         }
+        .instrument(parent_span_for_instrument)
+        .await
     }
 }
 
@@ -195,6 +219,7 @@ impl Ai {
         model: Arc<dyn Chat>,
         message_array: ArrayRef,
         model_name: &str,
+        parent_span: tracing::Span,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
         let mut results = Vec::with_capacity(message_array.len());
@@ -202,14 +227,17 @@ impl Ai {
         for message_opt in message_array.iter() {
             let result = match message_opt {
                 Some(message) => {
-                    // Create span - the tracing framework automatically makes it a child of the current span (sql_query)
-                    let span = tracing::span!(
-                        target: "task_history",
-                        tracing::Level::INFO,
-                        "ai",
-                        model = %model_name,
-                        input = %message
-                    );
+                    // Create span as a child of the parent span (sql_query)
+                    let span = {
+                        let _enter = parent_span.enter();
+                        tracing::span!(
+                            target: "task_history",
+                            tracing::Level::INFO,
+                            "ai",
+                            model = %model_name,
+                            input = %message
+                        )
+                    };
 
                     // Create a proper chat completion request to get usage information
                     let chat_request = CreateChatCompletionRequestArgs::default()
@@ -607,8 +635,9 @@ mod tests {
         let model = model_store_guard.get("test-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
+        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
+            .process_messages(Arc::clone(model), messages, "test-model", test_span)
             .await
             .unwrap();
 
@@ -633,8 +662,9 @@ mod tests {
             Some("How are you?"),
             Some("Goodbye"),
         ]));
+        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
+            .process_messages(Arc::clone(model), messages, "test-model", test_span)
             .await
             .unwrap();
 
@@ -664,8 +694,9 @@ mod tests {
             None,
             Some("Goodbye"),
         ]));
+        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
+            .process_messages(Arc::clone(model), messages, "test-model", test_span)
             .await
             .unwrap();
 
@@ -688,8 +719,9 @@ mod tests {
         let model = model_store_guard.get("error-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
+        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "error-model")
+            .process_messages(Arc::clone(model), messages, "error-model", test_span)
             .await;
 
         assert!(result.is_err());
@@ -710,8 +742,9 @@ mod tests {
         let model = model_store_guard.get("null-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
+        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "null-model")
+            .process_messages(Arc::clone(model), messages, "null-model", test_span)
             .await
             .unwrap();
 
