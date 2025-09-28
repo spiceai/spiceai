@@ -56,7 +56,13 @@ async fn iceberg_insert_into_existing_table() -> Result<(), anyhow::Error> {
 
             // Generate a new UUID for this batch so we can query appended data
             let batch_uuid = uuid::Uuid::new_v4().to_string();
-            let append_sql = include_str!("append.sql").replace("<table-name>", "test_table").replace("<batch-uuid>", &batch_uuid);
+            let append_sql = format!(
+                "INSERT INTO test_table \
+                  (batch_id, boolean_col, int_col, long_col, float_col, double_col, decimal_col, date_col, timestamp_col, binary_col) \
+                VALUES \
+                  ('{batch_uuid}', TRUE,  1,  10000000001, REAL '1.5',  2.25, DECIMAL '12345.6789', DATE '2024-01-01', TIMESTAMP '2024-01-01 02:03:04', X'00FFAB'), \
+                  ('{batch_uuid}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
+            );
 
             execute_query_and_validate_result(
                 &rt,
