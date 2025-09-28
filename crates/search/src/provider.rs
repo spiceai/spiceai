@@ -63,9 +63,9 @@ impl SearchQueryProvider {
     ) -> Self {
         Self {
             search_index_query,
-            primary_key,
             table_provider,
             search_column,
+            primary_key,
             pre_limit,
         }
     }
@@ -371,7 +371,7 @@ impl TableProvider for SearchQueryProvider {
         // Only add if key not in search index (we chose search index columns in `scan` afterall).
         for f in self.table_provider.schema().fields() {
             if !fields_map.contains_key(f.name()) {
-                fields_map.insert(f.name().clone(), Arc::clone(&f));
+                fields_map.insert(f.name().clone(), Arc::clone(f));
             }
         }
 
@@ -407,6 +407,8 @@ impl TableProvider for SearchQueryProvider {
         Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
+
+    #[allow(clippy::cast_possible_truncation)]
     async fn scan(
         &self,
         state: &dyn Session,
