@@ -390,7 +390,7 @@ impl std::fmt::Debug for ChunkedVectorIndex {
 
 #[async_trait]
 impl VectorIndex for ChunkedVectorIndex {
-    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
+    fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         let base_index_table = self.inner.list_table_provider()?;
 
         let group_by_pks: Vec<_> = self

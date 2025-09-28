@@ -264,10 +264,16 @@ impl EmbeddingConnector {
 
                         // augment the previous underlying table provider with the vector index
                         // this will result in recursive augmentation of the underlying table for N embedding columns
-                        provider.underlying = Arc::new(VectorScanTableProvider::new(
-                            provider.underlying,
-                            vector_index,
-                        )) as Arc<dyn TableProvider>;
+                        provider.underlying = Arc::new(
+                            VectorScanTableProvider::try_new(provider.underlying, vector_index)
+                                .await
+                                .boxed()
+                                .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                                    dataconnector: dataset.source().to_string(),
+                                    connector_component: dataset.into(),
+                                    source: e,
+                                })?,
+                        ) as Arc<dyn TableProvider>;
                         provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
                     }
                 }

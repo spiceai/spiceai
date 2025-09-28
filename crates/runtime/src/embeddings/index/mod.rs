@@ -285,31 +285,25 @@ pub mod tests {
                 })
                 .unwrap_or_default()
         }
-        fn list_table_provider(
-            &self,
-        ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
+        fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
             let mem_table = MemTable::try_new(
                 Arc::new(self.schema.clone()),
                 vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
                     self.schema.clone(),
                 ))]],
-            )
-            .boxed()?;
+            )?;
 
-            Ok(LogicalPlan::TableScan(
-                TableScan::try_new(
-                    "tbl",
-                    Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
-                        mem_table,
-                        "PretendVectorIndex",
-                    ))
-                        as Arc<dyn TableProvider>)),
-                    None,
-                    vec![],
-                    None,
-                )
-                .boxed()?,
-            ))
+            Ok(LogicalPlan::TableScan(TableScan::try_new(
+                "tbl",
+                Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                    mem_table,
+                    "PretendVectorIndex",
+                ))
+                    as Arc<dyn TableProvider>)),
+                None,
+                vec![],
+                None,
+            )?))
         }
     }
 
