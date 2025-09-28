@@ -98,7 +98,7 @@ pub enum Error {
 
 /// Main struct for interacting with Databricks SQL Warehouse
 pub struct DatabricksSqlWarehouse {
-    pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static (dyn Sync)> + Send + Sync>,
+    pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> + Send + Sync>,
 }
 
 impl DatabricksSqlWarehouse {
