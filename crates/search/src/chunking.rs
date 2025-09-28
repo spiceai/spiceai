@@ -352,7 +352,7 @@ impl SearchIndex for ChunkedSearchIndex {
                 arrs.push(arr);
                 fields.push(f);
             }
-        };
+        }
 
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()
     }

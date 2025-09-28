@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-description: "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id> 10 order by score desc LIMIT 4"
+description: "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id > 10 order by score desc LIMIT 4"
 snapshot_kind: text
 ---
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
@@ -10,14 +10,14 @@ snapshot_kind: text
 |               |   Projection: vector_search(qs, Utf8("secondary")).question, vector_search(qs, Utf8("secondary")).answer, trunc(vector_search(qs, Utf8("secondary")).score, Int64(3)) AS score |
 |               |     BytesProcessedNode                                                                                                                                                         |
 |               |       Filter: vector_search(qs, Utf8("secondary")).id > Int64(10)                                                                                                              |
-|               |         TableScan: vector_search(qs, Utf8("secondary")) projection=[id, question, answer, score]                                                                               |
+|               |         TableScan: vector_search(qs, Utf8("secondary")) projection=[answer, id, question, score]                                                                               |
 | physical_plan | SortPreservingMergeExec: [score@2 DESC], fetch=4                                                                                                                               |
 |               |   SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]                                                                                                   |
-|               |     ProjectionExec: expr=[question@1 as question, answer@2 as answer, trunc(score@3, 3) as score]                                                                              |
+|               |     ProjectionExec: expr=[question@2 as question, answer@0 as answer, trunc(score@3, 3) as score]                                                                              |
 |               |       BytesProcessedExec                                                                                                                                                       |
-|               |         FilterExec: id@0 > 10                                                                                                                                                  |
-|               |           ProjectionExec: expr=[id@0 as id, question@1 as question, answer@3 as answer, score@2 as score]                                                                      |
-|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0), (question@1, question@1)], projection=[id@0, question@1, score@2, answer@5]                      |
+|               |         FilterExec: id@1 > 10                                                                                                                                                  |
+|               |           ProjectionExec: expr=[answer@3 as answer, id@0 as id, question@1 as question, score@2 as score]                                                                      |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@1), (question@1, question@2)], projection=[id@0, question@1, score@2, answer@3]                      |
 |               |               CoalescePartitionsExec                                                                                                                                           |
 |               |                 BytesProcessedExec                                                                                                                                             |
 |               |                   ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, union_extract(json_get(key@0, question), str) as question, 1 - distance@1 as score]     |
