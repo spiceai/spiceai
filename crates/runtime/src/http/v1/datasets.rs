@@ -81,6 +81,9 @@ pub struct DatasetResponseItem {
     pub properties: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+
 /// List Datasets
 ///
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
