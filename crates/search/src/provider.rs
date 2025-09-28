@@ -414,9 +414,11 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let mut search_index_table = LogicalPlan::Limit(Limit {
+        let search_index_table = LogicalPlan::Limit(Limit {
             skip: None,
-            fetch: self.pre_limit,
+            fetch: self
+                .pre_limit
+                .map(|l| Box::new(Expr::Literal(ScalarValue::UInt32(Some(l as u32)), None))),
             input: LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
                 Arc::clone(&self.search_index_query),
                 TableReference::parse_str("search_index"),
