@@ -407,7 +407,6 @@ impl TableProvider for SearchQueryProvider {
         Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
-
     #[allow(clippy::cast_possible_truncation)]
     async fn scan(
         &self,
