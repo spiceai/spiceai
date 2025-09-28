@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod ai;
 pub mod alias;
 pub mod bucket;
 pub mod cosine_distance;

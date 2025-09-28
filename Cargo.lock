@@ -12199,6 +12199,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-openai",
+ "async-trait",
  "datafusion",
  "insta",
  "llms",
