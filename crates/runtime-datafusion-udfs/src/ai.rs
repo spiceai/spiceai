@@ -203,7 +203,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tokio::sync::RwLock;
-    use datafusion::logical_expr::ScalarUDFImpl;
+    use datafusion::logical_expr::{ScalarUDFImpl, Volatility};
     use arrow_schema::DataType;
     use std::sync::Arc;
 
@@ -245,7 +245,13 @@ mod tests {
         let udf = Ai::new(model_store);
         
         let sig = udf.signature();
-        assert_eq!(sig.type_signature.len(), 2);
+        // Check that we have a OneOf signature with multiple options
+        match &sig.type_signature {
+            datafusion::logical_expr::TypeSignature::OneOf(sigs) => {
+                assert_eq!(sigs.len(), 2);
+            }
+            _ => panic!("Expected OneOf signature"),
+        }
         
         let return_type = udf.return_type(&[DataType::Utf8]).unwrap();
         assert_eq!(return_type, DataType::Utf8);
@@ -280,5 +286,280 @@ mod tests {
         let result = udf.get_default_model_name().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Multiple chat models configured"));
+    }
+
+    #[tokio::test]
+    async fn test_no_models_error() {
+        let store = HashMap::new();
+        let model_store = Arc::new(RwLock::new(store));
+        let udf = Ai::new(model_store);
+        
+        let result = udf.get_default_model_name().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No chat models configured"));
+    }
+
+    #[test]
+    fn test_udf_name() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+        
+        assert_eq!(udf.name(), "ai");
+    }
+
+    #[test]
+    fn test_documentation() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+        
+        let docs = udf.documentation().unwrap();
+        assert_eq!(docs.description, "Generates AI responses for text using a specified chat model");
+        assert_eq!(docs.syntax_example, "ai(message, model_name)");
+    }
+
+    #[test]
+    fn test_return_type_variations() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+        
+        // Test with single Utf8 argument
+        let return_type1 = udf.return_type(&[DataType::Utf8]).unwrap();
+        assert_eq!(return_type1, DataType::Utf8);
+        
+        // Test with two Utf8 arguments
+        let return_type2 = udf.return_type(&[DataType::Utf8, DataType::Utf8]).unwrap();
+        assert_eq!(return_type2, DataType::Utf8);
+        
+        // Test with LargeUtf8
+        let return_type3 = udf.return_type(&[DataType::LargeUtf8]).unwrap();
+        assert_eq!(return_type3, DataType::Utf8);
+    }
+
+    #[test]
+    fn test_non_async_invoke_with_args_error() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+        
+        use datafusion::logical_expr::ScalarFunctionArgs;
+        use arrow_schema::Field;
+        
+        let args = ScalarFunctionArgs {
+            args: vec![],
+            arg_fields: vec![],
+            number_rows: 0,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+        
+        let result = udf.invoke_with_args(args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("can only be called from async contexts"));
+    }
+
+    // Additional Mock Chat implementation that can return errors
+    struct ErrorMockChat;
+
+    #[async_trait]
+    impl Chat for ErrorMockChat {
+        fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
+            None
+        }
+
+        async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
+            Err(llms::chat::Error::FailedToRunModel { 
+                source: "Mock error for testing".into() 
+            })
+        }
+
+        async fn chat_request(
+            &self,
+            _req: async_openai::types::CreateChatCompletionRequest,
+        ) -> Result<async_openai::types::CreateChatCompletionResponse, async_openai::error::OpenAIError> {
+            unimplemented!()
+        }
+    }
+
+    // Mock Chat that returns None responses
+    struct NullMockChat;
+
+    #[async_trait]
+    impl Chat for NullMockChat {
+        fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
+            None
+        }
+
+        async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn chat_request(
+            &self,
+            _req: async_openai::types::CreateChatCompletionRequest,
+        ) -> Result<async_openai::types::CreateChatCompletionResponse, async_openai::error::OpenAIError> {
+            unimplemented!()
+        }
+    }
+
+    fn create_multi_model_store() -> Arc<RwLock<ChatModelStore>> {
+        let mut store = HashMap::new();
+        
+        store.insert("gpt-4".to_string(), Arc::new(MockChat { name: "gpt-4".to_string() }) as Arc<dyn Chat>);
+        store.insert("claude".to_string(), Arc::new(MockChat { name: "claude".to_string() }) as Arc<dyn Chat>);
+        store.insert("error-model".to_string(), Arc::new(ErrorMockChat) as Arc<dyn Chat>);
+        store.insert("null-model".to_string(), Arc::new(NullMockChat) as Arc<dyn Chat>);
+        
+        Arc::new(RwLock::new(store))
+    }
+
+    #[tokio::test]
+    async fn test_process_single_message() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+        
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("test-model").unwrap();
+        
+        let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
+        let result = udf.process_messages(Arc::clone(model), messages).await.unwrap();
+        
+        let string_array = result.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!(string_array.len(), 1);
+        assert_eq!(string_array.value(0), "Response from test-model: Hello");
+    }
+
+    #[tokio::test]
+    async fn test_process_multiple_messages() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+        
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("test-model").unwrap();
+        
+        let messages = Arc::new(arrow::array::StringArray::from(vec![
+            Some("Hello"),
+            Some("How are you?"),
+            Some("Goodbye")
+        ]));
+        let result = udf.process_messages(Arc::clone(model), messages).await.unwrap();
+        
+        let string_array = result.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "Response from test-model: Hello");
+        assert_eq!(string_array.value(1), "Response from test-model: How are you?");
+        assert_eq!(string_array.value(2), "Response from test-model: Goodbye");
+    }
+
+    #[tokio::test]
+    async fn test_process_messages_with_nulls() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+        
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("test-model").unwrap();
+        
+        let messages = Arc::new(arrow::array::StringArray::from(vec![
+            Some("Hello"),
+            None,
+            Some("Goodbye")
+        ]));
+        let result = udf.process_messages(Arc::clone(model), messages).await.unwrap();
+        
+        let string_array = result.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "Response from test-model: Hello");
+        assert!(string_array.is_null(1));
+        assert_eq!(string_array.value(2), "Response from test-model: Goodbye");
+    }
+
+    #[tokio::test]
+    async fn test_process_messages_with_model_error() {
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+        
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("error-model").unwrap();
+        
+        let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
+        let result = udf.process_messages(Arc::clone(model), messages).await;
+        
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Mock error for testing"));
+    }
+
+    #[tokio::test]
+    async fn test_process_messages_with_null_response() {
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+        
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("null-model").unwrap();
+        
+        let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
+        let result = udf.process_messages(Arc::clone(model), messages).await.unwrap();
+        
+        let string_array = result.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!(string_array.len(), 1);
+        assert!(string_array.is_null(0));
+    }
+
+    #[test]
+    fn test_debug_implementation() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+        
+        let debug_str = format!("{:?}", udf);
+        assert!(debug_str.contains("Ai"));
+        assert!(debug_str.contains("ChatModelStore"));
+    }
+
+    #[test]
+    fn test_into_async_udf() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+        
+        let async_udf = udf.into_async_udf();
+        let scalar_udf = async_udf.into_scalar_udf();
+        
+        assert_eq!(scalar_udf.name(), "ai");
+    }
+
+    #[test]
+    fn test_signature_volatility() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+        
+        let sig = udf.signature();
+        assert_eq!(sig.volatility, Volatility::Volatile);
+    }
+
+    #[test]
+    fn test_signature_type_signatures() {
+        let sig = &*SIGNATURE;
+        
+        // Check that we have the expected number of type signatures
+        match &sig.type_signature {
+            datafusion::logical_expr::TypeSignature::OneOf(sigs) => {
+                assert_eq!(sigs.len(), 2);
+                
+                // Check single argument signature
+                match &sigs[0] {
+                    datafusion::logical_expr::TypeSignature::Exact(types) => {
+                        assert_eq!(types.len(), 1);
+                        assert_eq!(types[0], DataType::Utf8);
+                    }
+                    _ => panic!("Expected Exact signature"),
+                }
+                
+                // Check two argument signature
+                match &sigs[1] {
+                    datafusion::logical_expr::TypeSignature::Exact(types) => {
+                        assert_eq!(types.len(), 2);
+                        assert_eq!(types[0], DataType::Utf8);
+                        assert_eq!(types[1], DataType::Utf8);
+                    }
+                    _ => panic!("Expected Exact signature"),
+                }
+            }
+            _ => panic!("Expected OneOf signature"),
+        }
     }
 }
