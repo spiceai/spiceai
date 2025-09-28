@@ -21,7 +21,7 @@ use spicepod::{component::catalog as spicepod_catalog, param::Params};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::Runtime;
+use crate::{Runtime, component::dataset::AccessMode};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -42,6 +42,7 @@ pub struct Catalog {
     pub catalog_id: Option<String>,
     pub from: String,
     pub name: String,
+    pub access: AccessMode,
     pub(crate) orig_include: Vec<String>,
     pub include: Option<GlobSet>,
     pub params: HashMap<String, String>,
@@ -57,6 +58,7 @@ impl std::fmt::Debug for Catalog {
             .field("catalog_id", &self.catalog_id)
             .field("from", &self.from)
             .field("name", &self.name)
+            .field("access", &self.access)
             .field("orig_include", &self.orig_include)
             .field("include", &self.include)
             .field("params", &self.params)
@@ -70,6 +72,7 @@ impl PartialEq for Catalog {
     fn eq(&self, other: &Self) -> bool {
         self.from == other.from
             && self.name == other.name
+            && self.access == other.access
             && self.orig_include == other.orig_include
             && self.params == other.params
             && self.dataset_params == other.dataset_params
@@ -148,6 +151,7 @@ pub struct CatalogBuilder {
     pub catalog_id: Option<String>,
     pub from: String,
     pub name: String,
+    pub access: AccessMode,
     orig_include: Vec<String>,
     pub include: Option<GlobSet>,
     pub params: HashMap<String, String>,
@@ -187,6 +191,7 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
             catalog_id,
             from: catalog.from.clone(),
             name: catalog.name,
+            access: AccessMode::from(catalog.access),
             orig_include: catalog.include.clone(),
             include: globset_opt,
             params: catalog
@@ -218,6 +223,7 @@ impl CatalogBuilder {
             catalog_id,
             from,
             name: name.to_string(),
+            access: AccessMode::default(),
             orig_include: Vec::default(),
             include: None,
             params: HashMap::default(),
@@ -254,6 +260,7 @@ impl CatalogBuilder {
             catalog_id: self.catalog_id,
             from: self.from,
             name: self.name,
+            access: self.access,
             orig_include: self.orig_include,
             include: self.include,
             params: self.params,

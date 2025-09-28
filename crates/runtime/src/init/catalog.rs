@@ -181,7 +181,7 @@ impl Runtime {
             });
 
         self.df
-            .register_catalog(&catalog.name, catalog_provider)
+            .register_catalog(&catalog.name, &catalog.access, catalog_provider)
             .await
             .boxed()
             .context(UnableToLoadCatalogConnectorSnafu {
