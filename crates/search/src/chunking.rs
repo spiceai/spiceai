@@ -213,6 +213,7 @@ impl SearchIndex for ChunkedSearchIndex {
     /// | 116 | Do planning and scheduling mean the                  | 0        | [0, 35]   | textbook_reasoning |
     /// | 116 | same thing? (Yes | No)                               | 0        | [35, 57]  | textbook_reasoning |
     /// +-----+------------------------------------------------------+----------|-----------|--------------------+
+    #[allow(clippy::too_many_lines)]
     async fn write(
         &self,
         record: RecordBatch,
@@ -319,8 +320,8 @@ impl SearchIndex for ChunkedSearchIndex {
             let arr = Arc::new(
                 ListArray::try_new(
                     Arc::clone(&f),
-                    OffsetBuffer::from_lengths(repeats.iter().map(|s| *s)),
-                    Arc::clone(&arr),
+                    OffsetBuffer::from_lengths(repeats.iter().copied()),
+                    Arc::clone(arr),
                     None,
                 )
                 .boxed()?,
@@ -330,8 +331,8 @@ impl SearchIndex for ChunkedSearchIndex {
             } else {
                 arrs.push(arr);
                 fields.push(f);
-            };
-        };
+            }
+        }
 
         let embeddings = Self::embedding_col(self.search_column().as_str());
         if let Some(arr) = inner_rb.column_by_name(&embeddings) {
@@ -339,8 +340,8 @@ impl SearchIndex for ChunkedSearchIndex {
             let arr = Arc::new(
                 ListArray::try_new(
                     Arc::clone(&f),
-                    OffsetBuffer::from_lengths(repeats.iter().map(|s| *s)),
-                    Arc::clone(&arr),
+                    OffsetBuffer::from_lengths(repeats.iter().copied()),
+                    Arc::clone(arr),
                     None,
                 )
                 .boxed()?,
@@ -350,7 +351,7 @@ impl SearchIndex for ChunkedSearchIndex {
             } else {
                 arrs.push(arr);
                 fields.push(f);
-            };
+            }
         };
 
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()
@@ -415,6 +416,11 @@ impl SearchIndex for ChunkedSearchIndex {
     }
 }
 
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn to_offset_array(x: &[Vec<(usize, usize)>], nullable: bool) -> FixedSizeListArray {
     let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 2)
         .with_field(Field::new_list_field(DataType::Int32, nullable));
