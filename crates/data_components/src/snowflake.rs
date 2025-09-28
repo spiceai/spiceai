@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::Read;
 
 pub type SnowflakeConnectionPool =
-    dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync;
+    dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
