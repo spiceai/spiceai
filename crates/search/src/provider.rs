@@ -511,7 +511,7 @@ impl TableProvider for SearchQueryProvider {
     }
 }
 
-// Covnert to index projection for all unqualified column names. If c in `cols` is not in schema, it is ignored.
+// Convert to index projection for all unqualified column names. If c in `cols` is not in schema, it is ignored.
 fn projection_from_columns(schema: &SchemaRef, cols: &[String]) -> Vec<usize> {
     cols.iter()
         .filter_map(|c| Some(schema.column_with_name(c.as_str())?.0))
