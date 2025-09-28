@@ -6,9 +6,12 @@ use crate::{
     metadata::{MetadataColumn, MetadataColumns},
 };
 
-use arrow::array::{
-    ArrayRef, FixedSizeListArray, FixedSizeListBuilder, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, UInt64Array, UInt64Builder,
+use arrow::{
+    array::{
+        ArrayRef, FixedSizeListArray, FixedSizeListBuilder, Int32Builder, LargeStringArray,
+        ListArray, RecordBatch, StringArray, StringViewArray, UInt64Array,
+    },
+    buffer::OffsetBuffer,
 };
 
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
@@ -20,7 +23,7 @@ use datafusion::{
     datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
     functions_aggregate::expr_fn::{array_agg, first_value},
-    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, TableScan},
+    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, TableScan, expr::Alias},
     prelude::{Expr, ExprFunctionExt, col},
     sql::TableReference,
 };
@@ -276,6 +279,10 @@ impl SearchIndex for ChunkedSearchIndex {
             })
             .collect::<Result<Vec<_>, ArrowError>>()?
             .into_iter()
+            .filter(|(f, _)| {
+                *f.name() != Self::embedding_col(self.search_column().as_str())
+                    && *f.name() != Self::chunking_offset_col(self.search_column().as_str())
+            })
             .unzip();
 
         fields.push(Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false));
@@ -283,7 +290,7 @@ impl SearchIndex for ChunkedSearchIndex {
 
         fields.push(Field::new(
             Self::chunking_offset_col(self.search_column().as_str()),
-            DataType::new_fixed_size_list(DataType::UInt64, 2, false),
+            DataType::new_fixed_size_list(DataType::Int32, 2, false),
             false,
         ));
         arrays.push(Arc::new(to_offset_array(&offsets, false)) as ArrayRef);
@@ -292,13 +299,61 @@ impl SearchIndex for ChunkedSearchIndex {
             .context(WriteFailedConstructRecordBatchSnafu)
             .boxed()?;
 
-        self.inner
+        let inner_rb = self
+            .inner
             .write(rb)
             .await
             .context(InnerIndexWriteSnafu)
             .boxed()?;
 
-        return Ok(record);
+        // From `inner_rb` we need to get {}_embedding, and {}_offset
+        //   then convert them from FixedSizeList() -> List(FixedSizeList())
+        //   so they can be added back to original `record`.
+        // This is so any acceleration has them in the expected format on the write path.
+        let (schema, mut arrs, _) = record.into_parts();
+        let mut fields: Vec<_> = schema.fields().iter().cloned().collect();
+
+        let offsets = Self::chunking_offset_col(self.search_column().as_str());
+        if let Some(arr) = inner_rb.column_by_name(&offsets) {
+            let f = Arc::new(Field::new("item", arr.data_type().clone(), true));
+            let arr = Arc::new(
+                ListArray::try_new(
+                    Arc::clone(&f),
+                    OffsetBuffer::from_lengths(repeats.iter().map(|s| *s)),
+                    Arc::clone(&arr),
+                    None,
+                )
+                .boxed()?,
+            );
+            if let Some((i, _)) = schema.column_with_name(&offsets) {
+                arrs[i] = arr;
+            } else {
+                arrs.push(arr);
+                fields.push(f);
+            };
+        };
+
+        let embeddings = Self::embedding_col(self.search_column().as_str());
+        if let Some(arr) = inner_rb.column_by_name(&embeddings) {
+            let f = Arc::new(Field::new("item", arr.data_type().clone(), true));
+            let arr = Arc::new(
+                ListArray::try_new(
+                    Arc::clone(&f),
+                    OffsetBuffer::from_lengths(repeats.iter().map(|s| *s)),
+                    Arc::clone(&arr),
+                    None,
+                )
+                .boxed()?,
+            );
+            if let Some((i, _)) = schema.column_with_name(&embeddings) {
+                arrs[i] = arr;
+            } else {
+                arrs.push(arr);
+                fields.push(f);
+            };
+        };
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()?
     }
 
     async fn query_table_provider(
@@ -361,13 +416,13 @@ impl SearchIndex for ChunkedSearchIndex {
 }
 
 fn to_offset_array(x: &[Vec<(usize, usize)>], nullable: bool) -> FixedSizeListArray {
-    let mut builder = FixedSizeListBuilder::new(UInt64Builder::new(), 2)
-        .with_field(Field::new_list_field(DataType::UInt64, nullable));
+    let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 2)
+        .with_field(Field::new_list_field(DataType::Int32, nullable));
 
     for row in x {
         for (start, end) in row {
-            builder.values().append_value(*start as u64);
-            builder.values().append_value(*end as u64);
+            builder.values().append_value(*start as i32);
+            builder.values().append_value(*end as i32);
             builder.append(true);
         }
     }
@@ -392,39 +447,44 @@ impl std::fmt::Debug for ChunkedVectorIndex {
 impl VectorIndex for ChunkedVectorIndex {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         let base_index_table = self.inner.list_table_provider()?;
-
         let group_by_pks: Vec<_> = self
             .inner
             .primary_fields()
             .iter()
+            .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
             .map(|f| Expr::Column(Column::new_unqualified(f.name())))
             .collect();
 
         // Primary key, offsets and embeddings.
-        let mut aggr_expr = group_by_pks.clone();
         //// Need to `order by _spice.chunk_id`.
-        aggr_expr.push(
-            array_agg(Expr::Column(Column::new_unqualified(
+        let mut aggr_expr = vec![
+            Expr::Alias(Alias::new(
+                array_agg(Expr::Column(Column::new_unqualified(
+                    ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
+                )))
+                .order_by(vec![SortExpr::new(
+                    Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
+                    true,
+                    false,
+                )])
+                .build()?,
+                None::<TableReference>,
                 ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
-            )))
-            .order_by(vec![SortExpr::new(
-                Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
-                true,
-                false,
-            )])
-            .build()?,
-        );
-        aggr_expr.push(
-            array_agg(Expr::Column(Column::new_unqualified(
+            )),
+            Expr::Alias(Alias::new(
+                array_agg(Expr::Column(Column::new_unqualified(
+                    ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
+                )))
+                .order_by(vec![SortExpr::new(
+                    Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
+                    true,
+                    false,
+                )])
+                .build()?,
+                None::<TableReference>,
                 ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
-            )))
-            .order_by(vec![SortExpr::new(
-                Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
-                true,
-                false,
-            )])
-            .build()?,
-        );
+            )),
+        ];
         aggr_expr.extend(
             self.inner
                 .metadata_columns()
@@ -434,24 +494,24 @@ impl VectorIndex for ChunkedVectorIndex {
                     if [
                         ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
                         ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
+                        CHUNKED_INDEX_CHUNK_KEY.to_string(),
                     ]
                     .contains(c)
                     {
                         return None;
                     }
-                    Some(first_value(
-                        Expr::Column(Column::new_unqualified(c)),
-                        vec![],
-                    ))
+                    Some(Expr::Alias(Alias::new(
+                        first_value(Expr::Column(Column::new_unqualified(c)), vec![]),
+                        None::<TableReference>,
+                        c.clone(),
+                    )))
                 })
                 .collect::<Vec<_>>(),
         );
 
-        let agg = LogicalPlan::Aggregate(
+        Ok(LogicalPlan::Aggregate(
             Aggregate::try_new(base_index_table.into(), group_by_pks, aggr_expr).boxed()?,
-        );
-
-        Ok(agg)
+        ))
     }
 
     fn dimension(&self) -> i32 {

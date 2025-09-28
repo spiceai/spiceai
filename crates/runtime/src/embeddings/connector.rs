@@ -254,16 +254,29 @@ impl EmbeddingConnector {
                             ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
 
                         let idx = Arc::new(vector_index);
-                        let chunked_idx =
-                            ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);
+                        let chunked_idx = Arc::new(ChunkedSearchIndex::new(
+                            idx as Arc<dyn SearchIndex>,
+                            chunker,
+                        ));
 
-                        provider = provider.add_index(Arc::new(chunked_idx) as Arc<dyn Index>);
+                        if let Some(vector_index) = Arc::clone(&chunked_idx).as_vector_index() {
+                            provider.underlying = Arc::new(
+                                VectorScanTableProvider::try_new(provider.underlying, vector_index)
+                                    .await
+                                    .boxed()
+                                    .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                                        dataconnector: dataset.source().to_string(),
+                                        connector_component: dataset.into(),
+                                        source: e,
+                                    })?,
+                            )
+                                as Arc<dyn TableProvider>;
+                        };
+                        provider = provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn Index>);
                     } else {
                         let idx = Arc::new(vector_index);
                         let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
 
-                        // augment the previous underlying table provider with the vector index
-                        // this will result in recursive augmentation of the underlying table for N embedding columns
                         provider.underlying = Arc::new(
                             VectorScanTableProvider::try_new(provider.underlying, vector_index)
                                 .await
