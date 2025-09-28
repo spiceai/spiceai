@@ -20,8 +20,6 @@ use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::query_provider::ComputeQueryVector;
 
-use llms::embeddings::Embed;
-
 use snafu::ResultExt;
 
 use crate::model::EmbeddingModelStore;
