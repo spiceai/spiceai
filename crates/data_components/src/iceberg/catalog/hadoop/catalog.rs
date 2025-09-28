@@ -206,6 +206,18 @@ pub struct HadoopCatalog {
 
 #[async_trait]
 impl Catalog for HadoopCatalog {
+    /// Register an existing table to the catalog.
+    async fn register_table(
+        &self,
+        _table: &TableIdent,
+        _metadata_location: String,
+    ) -> Result<Table> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Registering tables is not supported in hadoop catalog",
+        ))
+    }
+
     // Unsupported operations in Hadoop Catalog
     async fn create_namespace(
         &self,

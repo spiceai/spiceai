@@ -104,12 +104,10 @@ impl Read for SparkConnect {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         let provider = get_table_provider(
             Arc::clone(&self.session),
             table_reference,
-            schema,
             self.join_push_down_context.clone(),
         )
         .await?;
@@ -121,7 +119,6 @@ impl Read for SparkConnect {
 async fn get_table_provider(
     spark_session: Arc<RwLock<SparkSession>>,
     table_reference: TableReference,
-    schema: Option<SchemaRef>,
     join_push_down_context: String,
 ) -> Result<Arc<SparkConnectTableProvider>, Box<dyn Error + Send + Sync>> {
     let spark_table_reference = match table_reference {
@@ -143,10 +140,8 @@ async fn get_table_provider(
     let session = Arc::new(session_guard.clone());
     let dataframe = session.table(spark_table_reference.as_str())?;
 
-    let arrow_schema = match schema {
-        Some(schema) => schema,
-        None => dataframe.clone().limit(0).collect().await?.schema(),
-    };
+    let arrow_schema = dataframe.clone().limit(0).collect().await?.schema();
+
     Ok(Arc::new(SparkConnectTableProvider {
         dataframe,
         table_reference: spark_table_reference.into(),

@@ -59,7 +59,7 @@ itertools.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
-opendal = "0.53.0"
+opendal = "0.54"
 oracle = { version = "0.6", optional = true }
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex = "1.11.2"
@@ -83,6 +83,7 @@ tokio-postgres = { workspace = true, features = [
 ], optional = true }
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
+twox-hash = { workspace = true, optional = true }
 tracing.workspace = true
 url = "2.5.4"
 util = { path = "../util" }
@@ -116,7 +117,7 @@ postgres = [
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]
-s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
+s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter", "dep:twox-hash"]
 sharepoint = ["dep:graph-rs-sdk"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
@@ -132,6 +133,6 @@ test_hadoop_catalog_docker = []
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
 ctor = "0.5.0"
-iceberg_test_utils = { version = "0.5.1", features = ["tests"] }
+iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
 insta = { version = "1.43" }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

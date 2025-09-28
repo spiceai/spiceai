@@ -456,13 +456,13 @@ impl VectorSearchUDTFProvider {
     /// Determine whether and how to pick between
     ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
     ///   2. The limit provided in `vector_search` args
-    fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
+    fn limit_to_use(&self, limit: Option<usize>) -> usize {
         match (self.args.limit, limit) {
-            (Some(l), None) | (None, Some(l)) => Some(l),
-            (None, None) => None,
+            (Some(l), None) | (None, Some(l)) => l,
+            (None, None) => 1000, // Default limit when none specified
 
             // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
-            (Some(a), Some(b)) => Some(min(a, b)),
+            (Some(a), Some(b)) => min(a, b),
         }
     }
 }
@@ -581,7 +581,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 false,
             )],
             input: Arc::new(proj),
-            fetch: self.limit_to_use(limit),
+            fetch: Some(self.limit_to_use(limit)),
         });
 
         // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.

@@ -156,7 +156,7 @@ impl DataConnector for Spark {
         let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
-            .table_provider(table_reference, dataset.schema())
+            .table_provider(table_reference)
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "spark",

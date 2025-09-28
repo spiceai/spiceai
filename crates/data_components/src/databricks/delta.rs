@@ -17,7 +17,6 @@ limitations under the License.
 use crate::Read;
 use crate::unity_catalog::UnityCatalog;
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -111,7 +110,6 @@ impl Read for DatabricksDelta {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_delta_table(table_reference).await
     }

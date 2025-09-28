@@ -48,7 +48,7 @@ use util::{
 
 use crate::{
     Runtime,
-    component::dataset::{Mode, builder::DatasetBuilder},
+    component::dataset::{AccessMode, builder::DatasetBuilder},
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     datafusion::{
         DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,
@@ -286,7 +286,7 @@ async fn get_spiceai_table_provider(
         .context(UnableToCreateDataConnectorSnafu)?
         .with_params(params);
 
-    dataset.mode = Mode::ReadWrite;
+    dataset.access = AccessMode::ReadWrite;
 
     let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
         .build(secrets)
