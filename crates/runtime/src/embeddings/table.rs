@@ -33,10 +33,10 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
-use llms::embeddings::Error as EmbedError;
 use snafu::prelude::*;
 
 use crate::embeddings::common::base_col;
+use crate::embeddings::construct_chunker;
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
@@ -163,8 +163,7 @@ impl EmbeddingTable {
 
                 let mut chunker = None;
                 if let Some(chunking_config) = chunking_config_opt {
-                    match Self::construct_chunker(&model, chunking_config, &embedding_models).await
-                    {
+                    match construct_chunker(&model, chunking_config, &embedding_models).await {
                         Ok(c) => chunker = Some(c),
                         Err(e) => {
                             tracing::warn!(
@@ -327,22 +326,6 @@ impl EmbeddingTable {
     #[must_use]
     pub fn get_underlying_ref(&self) -> &Arc<dyn TableProvider> {
         &self.base_table
-    }
-
-    /// Makes a [`Chunker`] from [`ChunkingConfig`] and a column's embedding model in [`EmbeddingModelStore`].
-    async fn construct_chunker(
-        model_name: &str,
-        chunk_config: &ChunkingConfig<'_>,
-        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-    ) -> Result<Arc<dyn Chunker>, EmbedError> {
-        let embedding_models_guard = embedding_models.read().await;
-        let Some(embed_model) = embedding_models_guard.get(model_name) else {
-            // Don't need warn, as we should have already checked/logged this.
-            return Err(EmbedError::ModelDoesNotExist {
-                model_name: model_name.to_string(),
-            });
-        };
-        embed_model.chunker(chunk_config)
     }
 
     fn embedding_size_from_base_table(column: &str, base_schema: &SchemaRef) -> Option<i32> {

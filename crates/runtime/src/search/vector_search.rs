@@ -20,12 +20,16 @@ use std::{collections::HashMap, sync::Arc};
 use super::request::SearchRequest;
 use super::util::user_tables_that_can_search;
 use super::{Error, Result};
+#[cfg(feature = "s3_vectors")]
+use crate::embeddings::index::s3::S3Vector;
 use crate::embeddings::table::EmbeddingTable;
 use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 use crate::search::FormattingSnafu;
+use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
+
 use crate::search::{
     SearchPipelineSnafu,
-    candidate::vector::VectorGeneration,
+    candidate::vector::ChunkedNonIndexVectorGeneration,
     util::{
         embedding_columns_from_table, find_concrete_table_provider, full_text_search_candidates,
         get_primary_keys_with_overrides,
@@ -44,7 +48,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
-use llms::embeddings::Embed;
+use runtime_datafusion_index::IndexedTableProvider;
+use search::chunking::ChunkedSearchIndex;
+use search::index::SearchIndex;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -80,28 +86,25 @@ impl VectorSearch {
         }
     }
 
-    /// Checks if a  [`TableProvider`] has an associated vector index, and if so, returns the associated [`Embed`].
-    #[allow(clippy::unused_async)] // async is not used when the feature is disabled
-    #[allow(unused_variables)]
-    async fn model_from_vector_index(
-        &self,
+    fn get_vector_index(
         tbl: &Arc<dyn TableProvider>,
         embedding_column: &str,
-    ) -> Option<Arc<dyn Embed>> {
-        #[cfg(feature = "s3_vectors")]
-        {
-            use crate::{
-                embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider,
-            };
-            for s3v in find_index_in_table_provider::<S3Vector>(tbl)?.0 {
-                if s3v.embedded_column == embedding_column {
-                    return s3v.embedding_model().await;
-                }
+    ) -> Option<Arc<dyn SearchIndex>> {
+        let tbl = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
+        tbl.get_all_indexes().into_iter().find_map(|idx| {
+            if let Some(chunked) = idx.as_any().downcast_ref::<ChunkedSearchIndex>()
+                && chunked.search_column() == embedding_column
+            {
+                return Some(Arc::new(chunked.clone()) as Arc<dyn SearchIndex>);
+            }
+            #[cfg(feature = "s3_vectors")]
+            if let Some(s3v) = idx.as_any().downcast_ref::<S3Vector>()
+                && s3v.search_column() == embedding_column
+            {
+                return Some(Arc::new(s3v.clone()) as Arc<dyn SearchIndex>);
             }
             None
-        }
-        #[cfg(not(feature = "s3_vectors"))]
-        None
+        })
     }
 
     // Prepare an individual [`impl search::CandidateGeneration`] (specifically a [`VectorGeneration`]) based on the [`TableReference`].
@@ -110,7 +113,7 @@ impl VectorSearch {
         tbl: &TableReference,
         embedding_column: &str,
         primary_keys: &[String],
-    ) -> Result<VectorGeneration> {
+    ) -> Result<Arc<dyn CandidateGeneration>> {
         let table_provider = self
             .df
             .get_table(tbl)
@@ -119,11 +122,19 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let (model, is_chunked) = if let Some(model) = self
-            .model_from_vector_index(&table_provider, embedding_column)
-            .await
-        {
-            (model, false)
+        if let Some(vector_index) = Self::get_vector_index(&table_provider, embedding_column) {
+            let is_chunked = vector_index
+                .as_any()
+                .downcast_ref::<ChunkedSearchIndex>()
+                .is_some();
+
+            Ok(Arc::new(VectorUDTFGeneration::new(
+                &self.df,
+                tbl,
+                primary_keys,
+                embedding_column,
+                is_chunked,
+            )))
         } else {
             let Some(embedding_table) =
                 find_concrete_table_provider::<EmbeddingTable>(&table_provider)
@@ -132,6 +143,17 @@ impl VectorSearch {
                     data_source: tbl.clone(),
                 });
             };
+
+            // Use UDTF for non-chunked `EmbeddingTable`.
+            if !embedding_table.is_chunked(embedding_column) {
+                return Ok(Arc::new(VectorUDTFGeneration::new(
+                    &self.df,
+                    tbl,
+                    primary_keys,
+                    embedding_column,
+                    false,
+                )));
+            }
 
             let Some(model_name) = embedding_table.get_embedding_model_used_by(embedding_column)
             else {
@@ -156,17 +178,14 @@ impl VectorSearch {
                     data_source: tbl.clone(),
                 });
             };
-            (embed, embedding_table.is_chunked(embedding_column))
-        };
-
-        Ok(VectorGeneration::new(
-            &self.df,
-            tbl,
-            &model,
-            primary_keys,
-            embedding_column,
-            is_chunked,
-        ))
+            Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
+                &self.df,
+                tbl,
+                &embed,
+                primary_keys,
+                embedding_column,
+            )))
+        }
     }
 
     pub async fn search_with_cache(
@@ -283,11 +302,11 @@ impl VectorSearch {
                     let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
                     for (i, col) in embedding_columns.iter().enumerate() {
-                        generators.insert(i, Arc::new(self.vector_search_generator(
+                        generators.insert(i, self.vector_search_generator(
                                 &tbl,
                                 col.as_str(),
                                 primary_keys,
-                            ).await?)
+                            ).await?
                         );
                     };
 

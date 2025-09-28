@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 use arrow::error::ArrowError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
@@ -20,8 +21,10 @@ use s3_vectors::{
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
+use std::fmt::{Display, Formatter};
 
 pub mod list_provider;
+pub mod partition;
 pub mod put_vectors_sink;
 pub mod query_provider;
 mod vector_table;
@@ -111,6 +114,18 @@ pub enum S3VectorIdentifier {
         bucket_name: String,
         index_name: String,
     },
+}
+
+impl Display for S3VectorIdentifier {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexArn(arn) => write!(f, "{arn}"),
+            Self::Index {
+                bucket_name,
+                index_name,
+            } => write!(f, "{bucket_name}/{index_name}"),
+        }
+    }
 }
 
 impl S3VectorIdentifier {

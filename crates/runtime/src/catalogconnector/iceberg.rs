@@ -33,8 +33,10 @@ use data_components::{
         provider::IcebergCatalogProvider,
     },
 };
-use iceberg::{Namespace, NamespaceIdent, io::CustomAwsCredentialLoader};
-use iceberg_catalog_rest::RestCatalogConfig;
+use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::CustomAwsCredentialLoader};
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
+};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -81,6 +83,10 @@ pub enum Error {
 
     #[snafu(display("Unexpected table segment in catalog path: {segment}"))]
     UnexpectedTableSegment { segment: String },
+
+    #[snafu(display("Failed to build catalog: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalog { source: iceberg::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -340,7 +346,7 @@ impl CatalogConnector for IcebergCatalog {
         };
 
         props.extend(new_props);
-        let catalog_config = get_rest_catalog_config(base_uri, props);
+        let catalog_config = get_rest_catalog(base_uri, props).await?;
         let mut catalog_client = RestCatalog::new(catalog_config);
         if let Some(loader) = custom_credential_loader {
             catalog_client = catalog_client.with_file_io_extension(loader);
@@ -576,28 +582,16 @@ pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Na
     }
 }
 
-/// Builds a `RestCatalogConfig` from a base URI and properties.
-///
-/// This function takes a base URI and a map of properties, and builds a `RestCatalogConfig`
-/// with the given properties. If a "warehouse" property is present, it will be used to set the
-/// warehouse for the catalog.
-#[must_use]
-pub fn get_rest_catalog_config(
+/// Builds an `IcebergRestCatalog` from a base URI and properties.
+pub async fn get_rest_catalog(
     base_uri: String,
     mut props: HashMap<String, String, std::hash::RandomState>,
-) -> RestCatalogConfig {
-    if let Some(warehouse) = props.remove("warehouse") {
-        RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .warehouse(warehouse)
-            .build()
-    } else {
-        RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .build()
-    }
+) -> Result<IcebergRestCatalog> {
+    props.insert(REST_CATALOG_PROP_URI.to_string(), base_uri);
+    RestCatalogBuilder::default()
+        .load("rest", props)
+        .await
+        .context(UnableToBuildCatalogSnafu)
 }
 
 // Parse out the catalog id from the Glue URL if it exists, i.e.

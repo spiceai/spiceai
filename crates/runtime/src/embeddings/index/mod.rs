@@ -20,23 +20,10 @@ use arrow_schema::FieldRef;
 
 use datafusion::{logical_expr::LogicalPlan, prelude::Expr};
 
-mod retry_client;
+#[cfg(feature = "s3_vectors")]
 pub mod s3;
 pub(crate) mod scan_table;
 pub use scan_table::VectorScanTableProvider;
-use search::index::SearchIndex;
-
-pub trait VectorIndex: SearchIndex {
-    /// A [`LogicalPlan`] representation of the data within the index. The [`LogicalPlan::schema`] must contain
-    ///  - The [`SearchIndex::primary_fields`]
-    ///  - All columns in [`SearchIndex::metadata_columns`]
-    ///  - The associated embedding vectors of the [`SearchIndex::search_column`].
-    ///
-    /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
-    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn dimension(&self) -> i32;
-}
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(
@@ -115,14 +102,15 @@ pub mod tests {
         sql::TableReference,
     };
     use datafusion_expr::{LogicalPlan, TableScan};
-    use search::generation::util::append_fields;
-    use search::metadata::{MetadataColumn, MetadataColumns};
+    use runtime_datafusion_index::Index;
+    use search::{generation::util::append_fields, index::SearchIndex};
+    use search::{
+        index::VectorIndex,
+        metadata::{MetadataColumn, MetadataColumns},
+    };
     use snafu::ResultExt;
 
-    use crate::{
-        embedding_col,
-        embeddings::index::{SearchIndex, VectorIndex},
-    };
+    use crate::embedding_col;
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -322,6 +310,26 @@ pub mod tests {
                 )
                 .boxed()?,
             ))
+        }
+    }
+
+    #[async_trait]
+    impl Index for PretendVectorIndex {
+        fn name(&self) -> &'static str {
+            "PretendVectorIndex"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            self.schema
+                .fields
+                .iter()
+                .filter(|c| *c.name() != embedding_col!(self.search_column()))
+                .map(|f| f.name().clone())
+                .collect()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 
