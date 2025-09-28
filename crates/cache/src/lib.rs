@@ -434,6 +434,9 @@ impl QueryResultsCacheProvider {
                 LogicalPlan::Explain { .. }
                 | LogicalPlan::Analyze { .. }
                 | LogicalPlan::DescribeTable { .. }
+                | LogicalPlan::Ddl(..)
+                | LogicalPlan::Dml(..)
+                | LogicalPlan::Copy { .. }
                 | LogicalPlan::Statement(..) => return false,
                 _ => {}
             }
@@ -497,5 +500,65 @@ mod tests {
                 .expect("valid cache provider");
 
         assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_insert_into() {
+        let sql = "INSERT INTO customer (id, first_name, last_name, state) VALUES (1, 'John', 'Doe', 'NY')";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_update() {
+        let sql = "UPDATE customer SET first_name = 'Jane' WHERE id = 1";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_delete() {
+        let sql = "DELETE FROM customer WHERE id = 1";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_create_table() {
+        let sql = "CREATE TABLE test_table (id INT, name VARCHAR(50))";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_copy() {
+        let sql = "COPY customer TO 'output.csv'";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
     }
 }
