@@ -18,6 +18,12 @@ limitations under the License.
 
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow_schema::DataType;
+use async_openai::error::ApiError;
+use async_openai::types::{
+    ChatChoice, ChatCompletionRequestSystemMessageArgs, ChatCompletionResponseMessage,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+    CreateChatCompletionResponse, FinishReason, Role,
+};
 use async_trait::async_trait;
 use datafusion::common::cast::as_string_array;
 use datafusion::common::utils::take_function_args;
@@ -170,12 +176,12 @@ impl AsyncScalarUDFImpl for Ai {
         match args_arrays.len() {
             1 => {
                 let [message_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array, &model_name, &parent_span)
+                self.process_messages(Arc::clone(model), message_array, &model_name)
                     .await
             }
             2 => {
                 let [message_array, _model_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array, &model_name, &parent_span)
+                self.process_messages(Arc::clone(model), message_array, &model_name)
                     .await
             }
             _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
@@ -189,7 +195,6 @@ impl Ai {
         model: Arc<dyn Chat>,
         message_array: ArrayRef,
         model_name: &str,
-        parent_span: &tracing::Span,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
         let mut results = Vec::with_capacity(message_array.len());
@@ -197,30 +202,64 @@ impl Ai {
         for message_opt in message_array.iter() {
             let result = match message_opt {
                 Some(message) => {
-                    // Create span as child of the parent span (sql_query)
-                    let span = parent_span.in_scope(|| {
-                        tracing::span!(
-                            target: "task_history",
-                            tracing::Level::INFO,
-                            "ai_completion",
-                            model = %model_name,
-                            input = %message
-                        )
-                    });
+                    // Create span - the tracing framework automatically makes it a child of the current span (sql_query)
+                    let span = tracing::span!(
+                        target: "task_history",
+                        tracing::Level::INFO,
+                        "ai",
+                        model = %model_name,
+                        input = %message
+                    );
 
-                    // Execute the AI call within the span context
-                    let ai_result = async { model.run(message.to_string()).await }
+                    // Create a proper chat completion request to get usage information
+                    let chat_request = CreateChatCompletionRequestArgs::default()
+                        .model(model_name.to_string())
+                        .messages(vec![
+                            ChatCompletionRequestSystemMessageArgs::default()
+                                .content(message.to_string())
+                                .build()
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                                .into(),
+                        ])
+                        .build()
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    // Execute the AI call within the span context using .instrument()
+                    let ai_result = model
+                        .chat_request(chat_request)
                         .instrument(span.clone())
                         .await;
 
                     match ai_result {
-                        Ok(Some(response)) => {
-                            tracing::info!(target: "task_history", parent: &span, captured_output = %response);
-                            Some(response)
-                        }
-                        Ok(None) => {
-                            tracing::info!(target: "task_history", parent: &span, captured_output = "");
-                            None
+                        Ok(response) => {
+                            // Log token usage information if available
+                            if let Some(usage) = &response.usage {
+                                tracing::info!(
+                                    target: "task_history",
+                                    parent: &span,
+                                    input_tokens = %usage.prompt_tokens,
+                                    output_tokens = %usage.completion_tokens,
+                                    total_tokens = %usage.total_tokens,
+                                    "labels"
+                                );
+                            }
+
+                            // Extract the response text
+                            let response_text = response
+                                .choices
+                                .first()
+                                .and_then(|choice| choice.message.content.clone());
+
+                            match response_text {
+                                Some(text) => {
+                                    tracing::info!(target: "task_history", parent: &span, captured_output = %text, "labels");
+                                    Some(text)
+                                }
+                                None => {
+                                    tracing::info!(target: "task_history", parent: &span, captured_output = "", "labels");
+                                    None
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -263,12 +302,53 @@ mod tests {
 
         async fn chat_request(
             &self,
-            _req: async_openai::types::CreateChatCompletionRequest,
-        ) -> Result<
-            async_openai::types::CreateChatCompletionResponse,
-            async_openai::error::OpenAIError,
-        > {
-            unimplemented!()
+            req: CreateChatCompletionRequest,
+        ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError> {
+            // Extract the prompt from the request
+            let prompt = req
+                .messages
+                .first()
+                .and_then(|msg| match msg {
+                    async_openai::types::ChatCompletionRequestMessage::System(sys_msg) => {
+                        match &sys_msg.content {
+                            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
+                            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "".to_string());
+
+            let response_text = format!("Response from {}: {}", self.name, prompt);
+
+            Ok(CreateChatCompletionResponse {
+                id: "test-chat-id".to_string(),
+                model: self.name.clone(),
+                object: "chat.completion".to_string(),
+                created: 0,
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: ChatCompletionResponseMessage {
+                        content: Some(response_text),
+                        role: Role::Assistant,
+                        function_call: None,
+                        tool_calls: None,
+                        refusal: None,
+                        audio: None,
+                    },
+                    finish_reason: Some(FinishReason::Stop),
+                    logprobs: None,
+                }],
+                usage: Some(CompletionUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    total_tokens: 30,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                }),
+                system_fingerprint: None,
+                service_tier: None,
+            })
         }
     }
 
@@ -432,12 +512,14 @@ mod tests {
 
         async fn chat_request(
             &self,
-            _req: async_openai::types::CreateChatCompletionRequest,
-        ) -> Result<
-            async_openai::types::CreateChatCompletionResponse,
-            async_openai::error::OpenAIError,
-        > {
-            unimplemented!()
+            _req: CreateChatCompletionRequest,
+        ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError> {
+            Err(async_openai::error::OpenAIError::ApiError(ApiError {
+                message: "Mock error for testing".to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            }))
         }
     }
 
@@ -456,12 +538,36 @@ mod tests {
 
         async fn chat_request(
             &self,
-            _req: async_openai::types::CreateChatCompletionRequest,
-        ) -> Result<
-            async_openai::types::CreateChatCompletionResponse,
-            async_openai::error::OpenAIError,
-        > {
-            unimplemented!()
+            _req: CreateChatCompletionRequest,
+        ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError> {
+            Ok(CreateChatCompletionResponse {
+                id: "null-chat-id".to_string(),
+                model: "null-model".to_string(),
+                object: "chat.completion".to_string(),
+                created: 0,
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: ChatCompletionResponseMessage {
+                        content: None, // This represents a null/empty response
+                        role: Role::Assistant,
+                        function_call: None,
+                        tool_calls: None,
+                        refusal: None,
+                        audio: None,
+                    },
+                    finish_reason: Some(FinishReason::Stop),
+                    logprobs: None,
+                }],
+                usage: Some(CompletionUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 0, // No completion tokens for null response
+                    total_tokens: 5,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                }),
+                system_fingerprint: None,
+                service_tier: None,
+            })
         }
     }
 
@@ -500,10 +606,9 @@ mod tests {
         let model_store_guard = model_store.read().await;
         let model = model_store_guard.get("test-model").unwrap();
 
-        let parent_span = tracing::span!(tracing::Level::INFO, "test_parent");
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model", &parent_span)
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await
             .unwrap();
 
@@ -523,14 +628,13 @@ mod tests {
         let model_store_guard = model_store.read().await;
         let model = model_store_guard.get("test-model").unwrap();
 
-        let parent_span = tracing::span!(tracing::Level::INFO, "test_parent");
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("Hello"),
             Some("How are you?"),
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model", &parent_span)
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await
             .unwrap();
 
@@ -555,14 +659,13 @@ mod tests {
         let model_store_guard = model_store.read().await;
         let model = model_store_guard.get("test-model").unwrap();
 
-        let parent_span = tracing::span!(tracing::Level::INFO, "test_parent");
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("Hello"),
             None,
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model", &parent_span)
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await
             .unwrap();
 
@@ -584,10 +687,9 @@ mod tests {
         let model_store_guard = model_store.read().await;
         let model = model_store_guard.get("error-model").unwrap();
 
-        let parent_span = tracing::span!(tracing::Level::INFO, "test_parent");
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "error-model", &parent_span)
+            .process_messages(Arc::clone(model), messages, "error-model")
             .await;
 
         assert!(result.is_err());
@@ -607,10 +709,9 @@ mod tests {
         let model_store_guard = model_store.read().await;
         let model = model_store_guard.get("null-model").unwrap();
 
-        let parent_span = tracing::span!(tracing::Level::INFO, "test_parent");
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "null-model", &parent_span)
+            .process_messages(Arc::clone(model), messages, "null-model")
             .await
             .unwrap();
 
