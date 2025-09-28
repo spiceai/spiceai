@@ -138,7 +138,7 @@ impl AsyncScalarUDFImpl for Ai {
         args: ScalarFunctionArgs,
         _config: &datafusion::config::ConfigOptions,
     ) -> DataFusionResult<ArrayRef> {
-        // Capture the current tracing context (sql_query span) for direct parent-child relationships
+        // Capture the current tracing context for direct parent-child relationships
         let parent_span = tracing::Span::current();
 
         if args.args.is_empty() || args.args.len() > 2 {
