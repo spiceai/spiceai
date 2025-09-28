@@ -96,14 +96,11 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
 
         let result = self.chat_request(req).instrument(span.clone()).await;
         tracing::debug!("{} model health check response: {:?}", self.model, result);
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{e}");
-                return Err(crate::chat::Error::HealthCheckError {
-                    source: Box::new(e),
-                });
-            }
+        if let Err(e) = result {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(crate::chat::Error::HealthCheckError {
+                source: Box::new(e),
+            });
         }
         Ok(())
     }
