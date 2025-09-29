@@ -571,7 +571,7 @@ mod search {
                 let rt = start_app(app).await?;
 
                 // Ensure all messages are processed/including embeddings calculation
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 
                 run_and_snapshot_query(
                     &rt,
