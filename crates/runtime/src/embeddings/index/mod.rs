@@ -20,23 +20,10 @@ use arrow_schema::FieldRef;
 
 use datafusion::{logical_expr::LogicalPlan, prelude::Expr};
 
-mod retry_client;
+#[cfg(feature = "s3_vectors")]
 pub mod s3;
 pub(crate) mod scan_table;
 pub use scan_table::VectorScanTableProvider;
-use search::index::SearchIndex;
-
-pub trait VectorIndex: SearchIndex {
-    /// A [`LogicalPlan`] representation of the data within the index. The [`LogicalPlan::schema`] must contain
-    ///  - The [`SearchIndex::primary_fields`]
-    ///  - All columns in [`SearchIndex::metadata_columns`]
-    ///  - The associated embedding vectors of the [`SearchIndex::search_column`].
-    ///
-    /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
-    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn dimension(&self) -> i32;
-}
 
 // Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
 pub(super) fn search_index_table_is_sufficient(
@@ -115,14 +102,15 @@ pub mod tests {
         sql::TableReference,
     };
     use datafusion_expr::{LogicalPlan, TableScan};
-    use search::generation::util::append_fields;
-    use search::metadata::{MetadataColumn, MetadataColumns};
+    use runtime_datafusion_index::Index;
+    use search::{generation::util::append_fields, index::SearchIndex};
+    use search::{
+        index::VectorIndex,
+        metadata::{MetadataColumn, MetadataColumns},
+    };
     use snafu::ResultExt;
 
-    use crate::{
-        embedding_col,
-        embeddings::index::{SearchIndex, VectorIndex},
-    };
+    use crate::embedding_col;
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -326,6 +314,26 @@ pub mod tests {
     }
 
     #[async_trait]
+    impl Index for PretendVectorIndex {
+        fn name(&self) -> &'static str {
+            "PretendVectorIndex"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            self.schema
+                .fields
+                .iter()
+                .filter(|c| *c.name() != embedding_col!(self.search_column()))
+                .map(|f| f.name().clone())
+                .collect()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[async_trait]
     impl SearchIndex for PretendVectorIndex {
         fn search_column(&self) -> String {
             self.embedded_column.clone()
@@ -346,23 +354,27 @@ pub mod tests {
             Ok(record)
         }
 
-        async fn query_table_provider(
-            &self,
-            _query: &str,
-        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        fn query_table_provider(&self, _query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
                 vec![Arc::new(Field::new("score", DataType::Float64, false))],
             );
-
-            Ok(Arc::new(ExplainMemTable::new(
-                MemTable::try_new(
-                    Arc::clone(&schema),
-                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
-                )
-                .boxed()?,
-                "PretendVectorIndex",
-            )) as Arc<dyn TableProvider>)
+            Ok(LogicalPlan::TableScan(TableScan::try_new(
+                "explain",
+                Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                    MemTable::try_new(
+                        Arc::clone(&schema),
+                        vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                    )
+                    .boxed()?,
+                    "PretendVectorIndex",
+                ))
+                    as Arc<dyn TableProvider>)),
+                None,
+                vec![],
+                None,
+            )?)
+            .into())
         }
     }
 

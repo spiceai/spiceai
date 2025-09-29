@@ -44,7 +44,12 @@ use super::{
     TextSearchSnafu as GenerationTextSearchSnafu,
 };
 
+/// Maximum number of results in a single full-text search request, before any pagination.
+/// This size is designated for latency performance on the underlying index.
 pub static DEFAULT_BATCH_SIZE: usize = 100;
+
+/// Maximum number of results to return for a given full-text search.
+pub static DEFAULT_LIMIT_MAXIMUM: usize = 1000;
 
 pub mod exec;
 pub mod index;
@@ -56,6 +61,9 @@ mod util;
 pub enum Error {
     #[snafu(display("Error occurred during text search: {source}"))]
     TextSearchError { source: TantivyError },
+
+    #[snafu(display("Error occurred during indexing text search index: {source}"))]
+    TextSearchIndexingError { source: TantivyError },
 
     #[snafu(display("User provided query '{query}' is invalid: {source}"))]
     InvalidTextSearchQueryError {
@@ -128,6 +136,9 @@ pub enum Error {
 
     #[snafu(display("Failed to retrieve primary key from the table: {source}."))]
     FailedToRetrievePrimaryKey { source: ArrowError },
+
+    #[snafu(display("Temporarily failed to access full text search index"))]
+    TemporarilyFailedToAccessSearchIndex {},
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

@@ -39,8 +39,16 @@ use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::{Snafu, prelude::*};
-use std::{io::Cursor, pin::Pin, sync::Arc};
+use std::{
+    fmt::{Display, Formatter},
+    io::Cursor,
+    pin::Pin,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 use token_provider::TokenProvider;
+use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 mod datatypes;
 
@@ -57,6 +65,20 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve schema: {reason}"))]
     UnableToRetrieveSchema { reason: String },
+
+    #[snafu(display(
+        "Warehouse is not ready (state: '{state}'). Verify the warehouse state and try again later."
+    ))]
+    InvalidWarehouseState { state: String },
+
+    #[snafu(display("Unexpected Statement execution state: '{state}'."))]
+    UnexpectedStatementState { state: String },
+
+    #[snafu(display("Query canceled or timed out (state: 'CANCELED')."))]
+    QueryCanceled,
+
+    #[snafu(display("Long-running operations are not supported (state: 'RUNNING')."))]
+    QueryStillRunning,
 
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequestFailed { source: reqwest::Error },
@@ -140,6 +162,49 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
     }
 }
 
+// https://docs.databricks.com/api/workspace/statementexecution/executestatement#status-error
+// states: Enum: PENDING | RUNNING | SUCCEEDED | FAILED | CANCELED | CLOSED
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ResponseStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Canceled,
+    Closed,
+}
+
+impl Display for ResponseStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResponseStatus::Pending => write!(f, "PENDING"),
+            ResponseStatus::Running => write!(f, "RUNNING"),
+            ResponseStatus::Succeeded => write!(f, "SUCCEEDED"),
+            ResponseStatus::Failed => write!(f, "FAILED"),
+            ResponseStatus::Canceled => write!(f, "CANCELED"),
+            ResponseStatus::Closed => write!(f, "CLOSED"),
+        }
+    }
+}
+
+impl FromStr for ResponseStatus {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SUCCEEDED" => Ok(Self::Succeeded),
+            "FAILED" => Ok(Self::Failed),
+            // waiting for warehouse or async query
+            "PENDING" => Ok(Self::Pending),
+            "RUNNING" => Ok(Self::Running),
+            "CANCELED" => Ok(Self::Canceled),
+            "CLOSED" => Ok(Self::Closed),
+            other => Err(Error::UnexpectedStatementState {
+                state: other.to_string(),
+            }),
+        }
+    }
+}
+
 struct SqlWarehouseApi {
     client: Client,
     host: String,
@@ -169,7 +234,7 @@ impl SqlWarehouseApi {
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
         let payload = self.create_schema_payload(table)?;
-        let response = self.execute_request(&token, &payload).await?;
+        let response = self.execute_sql_statement(&token, &payload).await?;
         schema_from_json(&response)
     }
 
@@ -194,12 +259,34 @@ impl SqlWarehouseApi {
         }))
     }
 
-    async fn execute_request(&self, token: &str, payload: &Value) -> Result<Value, Error> {
+    async fn execute_sql_statement(&self, token: &str, payload: &Value) -> Result<Value, Error> {
         let url = format!("https://{}/api/2.0/sql/statements/", self.host);
         self.client
             .post(&url)
             .bearer_auth(token)
             .json(payload)
+            .send()
+            .await
+            .context(HttpRequestFailedSnafu)?
+            .error_for_status()
+            .context(HttpRequestFailedSnafu)?
+            .json()
+            .await
+            .context(JsonParsingFailedSnafu)
+    }
+
+    async fn get_sql_statement_status(
+        &self,
+        token: &str,
+        statement_id: &str,
+    ) -> Result<Value, Error> {
+        let url = format!(
+            "https://{}/api/2.0/sql/statements/{statement_id}",
+            self.host
+        );
+        self.client
+            .get(&url)
+            .bearer_auth(token)
             .send()
             .await
             .context(HttpRequestFailedSnafu)?
@@ -359,6 +446,66 @@ impl SqlWarehouseApi {
             .filter(|batch| batch.num_rows() > 0)
             .collect())
     }
+
+    fn extract_response_status(response: &Value) -> Result<ResponseStatus, Error> {
+        let state = response
+            .get("status")
+            .and_then(|s| s.get("state"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::MissingJsonField {
+                field: "status.state".to_string(),
+            })?;
+        ResponseStatus::from_str(state)
+    }
+
+    fn extract_statement_id(response: &Value) -> Result<String, Error> {
+        response
+            .get("statement_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .ok_or_else(|| Error::MissingJsonField {
+                field: "statement_id".to_string(),
+            })
+    }
+
+    /// This is an async query running on the Databricks SQL Warehouse
+    fn is_async_query(state: ResponseStatus) -> bool {
+        matches!(state, ResponseStatus::Pending | ResponseStatus::Running)
+    }
+
+    fn verify_response_status(response: &Value) -> Result<(), Error> {
+        let state = Self::extract_response_status(response)?;
+
+        match state {
+            ResponseStatus::Succeeded => Ok(()),
+            ResponseStatus::Failed => {
+                let message = Self::extract_error_message(response)
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                Err(Error::QueryFailure {
+                    message: format!("Query failed with state FAILED: {message}"),
+                })
+            }
+            // waiting for warehouse
+            ResponseStatus::Pending => Err(Error::InvalidWarehouseState {
+                state: state.to_string(),
+            }),
+            // long-running queries are not currently supported
+            ResponseStatus::Running => Err(Error::QueryStillRunning),
+            ResponseStatus::Canceled => Err(Error::QueryCanceled),
+            ResponseStatus::Closed => Err(Error::QueryFailure {
+                message: "Query failed with state CLOSED".to_string(),
+            }),
+        }
+    }
+
+    fn extract_error_message(response: &Value) -> Option<String> {
+        response
+            .get("status")
+            .and_then(|s| s.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .map(ToString::to_string)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -370,6 +517,10 @@ struct ExternalLink {
 }
 
 fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
+    tracing::trace!("Parsing schema definition from Databricks JSON response: {json_value}");
+
+    SqlWarehouseApi::verify_response_status(json_value)?;
+
     let data_array = json_value
         .get("result")
         .and_then(|r| r.get("data_array"))
@@ -479,31 +630,36 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "warehouse_id": self.api.sql_warehouse_id,
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
+            "wait_timeout": "30s",
+            "on_wait_timeout": "CONTINUE",
             "statement": sql,
         });
 
-        let mut response = self.api.execute_request(&token, &payload).await?;
+        let mut response = self.api.execute_sql_statement(&token, &payload).await?;
 
-        // Check if the response indicates a query failure
-        if let Some(status) = response.get("status").and_then(|s| s.get("state"))
-            && status == "FAILED"
-        {
-            let message = response
-                .get("status")
-                .and_then(|s| s.get("error"))
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .map(ToString::to_string)
-                .ok_or_else(|| {
-                    MissingJsonFieldSnafu {
-                        field: "status.error.message".to_string(),
-                    }
-                    .build()
-                })?;
-            return Err(Error::QueryFailure { message }.into());
+        tracing::trace!("Parsing Databricks JSON response: {response}");
+
+        let mut state = SqlWarehouseApi::extract_response_status(&response)?;
+        let statement_id = SqlWarehouseApi::extract_statement_id(&response)?;
+
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_duration(Some(Duration::from_secs(5)))
+            .build();
+        while SqlWarehouseApi::is_async_query(state) {
+            tracing::trace!("Query is still running (state: '{state}')");
+            let Some(backoff_duration) = backoff.next_backoff() else {
+                break;
+            };
+            tokio::time::sleep(backoff_duration).await;
+            response = self
+                .api
+                .get_sql_statement_status(&token, &statement_id)
+                .await?;
+            state = SqlWarehouseApi::extract_response_status(&response)?;
         }
 
-        // Get the result object if no error
+        SqlWarehouseApi::verify_response_status(&response)?;
+
         let result_object = response.get_mut("result").map(Value::take).ok_or_else(|| {
             MissingJsonFieldSnafu {
                 field: "result".to_string(),

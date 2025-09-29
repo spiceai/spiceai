@@ -34,11 +34,8 @@ use datafusion::{
 };
 use datafusion_expr::SubqueryAlias;
 
-use crate::{
-    embedding_col,
-    embeddings::index::{VectorIndex, search_index_table_is_sufficient},
-};
-use search::generation::util::append_fields;
+use crate::{embedding_col, embeddings::index::search_index_table_is_sufficient};
+use search::{generation::util::append_fields, index::VectorIndex};
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
@@ -48,13 +45,6 @@ pub struct VectorScanTableProvider {
 }
 
 impl VectorScanTableProvider {
-    pub fn new(table_provider: Arc<dyn TableProvider>, index: Arc<dyn VectorIndex>) -> Self {
-        Self {
-            table_provider,
-            index,
-        }
-    }
-
     /// Construct [`TableScan`] for underlying table for `projection` & `filters` relative to [`VectorScanTableProvider`].
     fn underlying_table_scan(
         &self,
@@ -116,6 +106,7 @@ impl VectorScanTableProvider {
             .iter()
             .map(|f| (Some(TableReference::parse_str("base_table")), Arc::clone(f)))
             .collect();
+
         qualified_fields.push((
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(

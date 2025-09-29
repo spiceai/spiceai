@@ -52,3 +52,31 @@ pub(crate) static READY_STATE_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|
         .with_description("Number of times the federated table was queried due to the accelerated table loading the initial data.")
         .build()
 });
+
+pub(crate) static MAX_TIMESTAMP_BEFORE_REFRESH_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge("dataset_acceleration_max_timestamp_before_refresh_ms")
+        .with_description("Maximum value of the dataset's time_column before the refresh operation, in milliseconds.")
+        .build()
+});
+
+pub(crate) static MAX_TIMESTAMP_AFTER_REFRESH_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge("dataset_acceleration_max_timestamp_after_refresh_ms")
+        .with_description("Maximum value of the dataset's time_column after the refresh operation, in milliseconds.")
+        .build()
+});
+
+pub(crate) static REFRESH_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge("dataset_acceleration_refresh_lag_ms")
+        .with_description("Difference between the maximum time_column value after and before the refresh operation, in milliseconds.")
+        .build()
+});
+
+pub(crate) static INGESTION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge("dataset_acceleration_ingestion_lag_ms")
+        .with_description("Lag between the current wall-clock time and the maximum time_column value after the refresh operation, in milliseconds.")
+        .build()
+});

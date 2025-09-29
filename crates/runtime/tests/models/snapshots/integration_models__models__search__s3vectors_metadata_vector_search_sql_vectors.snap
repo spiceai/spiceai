@@ -1,0 +1,31 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 863,
+    "answer": "Choices create costs and benefits.",
+    "array_length(vector_search(qs, Utf8(\"second\")).answer_embedding)": 384,
+    "round(vector_search(qs, Utf8(\"second\")).score,Int64(1))": 0.9
+  },
+  {
+    "id": 1316,
+    "answer": "\\(\\boxed{2a + 4b}\\)",
+    "array_length(vector_search(qs, Utf8(\"second\")).answer_embedding)": 384,
+    "round(vector_search(qs, Utf8(\"second\")).score,Int64(1))": 0.8
+  },
+  {
+    "id": 590,
+    "answer": "\\(\\boxed{x = A + E}\\)",
+    "array_length(vector_search(qs, Utf8(\"second\")).answer_embedding)": 384,
+    "round(vector_search(qs, Utf8(\"second\")).score,Int64(1))": 0.8
+  },
+  {
+    "id": 6,
+    "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)",
+    "array_length(vector_search(qs, Utf8(\"second\")).answer_embedding)": 384,
+    "round(vector_search(qs, Utf8(\"second\")).score,Int64(1))": 0.8
+  }
+]

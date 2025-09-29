@@ -16,14 +16,15 @@ limitations under the License.
 
 use std::cmp::min;
 use std::slice;
-use std::{any::Any, collections::HashSet, sync::Arc};
+use std::{any::Any, collections::HashSet, path::PathBuf, sync::Arc};
 
 use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{LogicalPlan, TableScan};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::DocParsingError;
@@ -35,7 +36,7 @@ use crate::generation::text_search::query::FullTextSearchQuery;
 use crate::generation::text_search::util::{array_to_terms, with_json_subset_column};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
-    InvalidIndexingSnafu,
+    InvalidIndexingSnafu, TextSearchIndexingSnafu,
 };
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
@@ -99,9 +100,40 @@ impl FullTextDatabaseIndex {
         inner: Arc<dyn TableProvider>,
         search_fields: Vec<String>,
         primary_key_override: Option<Vec<String>>,
+        directory: Option<PathBuf>,
     ) -> Result<Self, super::Error> {
+        let pks = Self::validate_primary_key(&inner, primary_key_override).await?;
+        let tantivy_schema =
+            Self::create_tantivy_schema(&inner, search_fields.as_slice(), pks.as_slice())?;
+
+        let index = if let Some(path) = &directory {
+            match tantivy::Index::create_in_dir(path, tantivy_schema) {
+                Ok(idx) => idx,
+                Err(TantivyError::IndexAlreadyExists) => {
+                    tantivy::index::Index::open_in_dir(path).context(TextSearchIndexingSnafu)?
+                }
+                Err(e) => return Err(e).context(TextSearchIndexingSnafu),
+            }
+        } else {
+            tantivy::Index::create_in_ram(tantivy_schema)
+        };
+
+        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks);
+        Ok(Self {
+            base_table: inner,
+            search_fields,
+            index: Arc::new(RwLock::new(index)),
+            primary_key: pks,
+            metadata_columns,
+        })
+    }
+
+    async fn validate_primary_key(
+        inner: &Arc<dyn TableProvider>,
+        primary_key_override: Option<Vec<String>>,
+    ) -> Result<Vec<String>, super::Error> {
         // Use 'primary_key_override', fallback to underlying in table.
-        let pks = match (primary_key_override, get_primary_keys(&inner).await) {
+        let pks = match (primary_key_override, get_primary_keys(inner).await) {
             (Some(pks), _) => pks,
             (None, Ok(pks)) => {
                 if pks.is_empty() {
@@ -121,27 +153,17 @@ impl FullTextDatabaseIndex {
                 column: INDEX_UNIQUE_FIELD_NAME.to_string(),
             });
         }
-
-        let index = Self::create_index(&inner, search_fields.as_slice(), pks.as_slice())?;
-        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks).await;
-        Ok(Self {
-            base_table: inner,
-            search_fields,
-            index,
-            primary_key: pks,
-            metadata_columns,
-        })
+        Ok(pks)
     }
 
     /// Get all [`Field`]s in Tantivy [`tantivy::Index`] that are in base table, and not primary keys.
     /// These are non-filterable [`MetadataColumn`]s, since we can retrieve the data
     /// from the [`tantivy::Index`] without access to the base [`TableProvider`].
-    async fn derive_metadata_columns(
+    fn derive_metadata_columns(
         base_table: &Arc<dyn TableProvider>,
-        index: &Arc<RwLock<tantivy::Index>>,
+        index: &tantivy::Index,
         primary_key: &[String],
     ) -> MetadataColumns {
-        let index = &*index.read().await;
         let base_schema = base_table.schema();
 
         index
@@ -160,16 +182,20 @@ impl FullTextDatabaseIndex {
             .into()
     }
 
-    pub async fn full_text_search_field_index(
+    pub fn full_text_search_field_index(
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self.index.read().await;
+        let index_read = self
+            .index
+            .try_read()
+            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
+
         let mut search_index = FullTextSearchFieldIndex::try_new(
             &index_read,
             search_field.to_string(),
             self.primary_key.clone(),
-            Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
+            Some(self.metadata_columns.all_names()),
         )?;
         search_index.add_type_hints(&self.underlying_table().schema());
         Ok(search_index)
@@ -254,7 +280,6 @@ impl FullTextDatabaseIndex {
         })?;
         let docs = parse_json_array(&index_writable.schema(), doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
-
         for doc in docs {
             index_writer.add_document(doc).context(IndexCreationSnafu)?;
         }
@@ -288,11 +313,11 @@ impl FullTextDatabaseIndex {
         }
     }
 
-    fn create_index(
+    fn create_tantivy_schema(
         base_table: &Arc<dyn TableProvider>,
         search_fields: &[String],
         primary_key: &[String],
-    ) -> Result<Arc<RwLock<tantivy::Index>>, super::Error> {
+    ) -> Result<tantivy::schema::Schema, super::Error> {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
         for p in primary_key {
@@ -359,9 +384,7 @@ impl FullTextDatabaseIndex {
         for s in search_fields {
             schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
         }
-        let schema = schema_builder.build();
-
-        Ok(Arc::new(RwLock::new(tantivy::Index::create_in_ram(schema))))
+        Ok(schema_builder.build())
     }
 
     #[must_use]
@@ -405,19 +428,23 @@ impl SearchIndex for FullTextDatabaseIndex {
         Ok(record)
     }
 
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let field_index = self
             .full_text_search_field_index(&self.search_column())
-            .await?;
+            .boxed()
+            .map_err(DataFusionError::External)?;
 
-        Ok(Arc::new(FullTextSearchQuery {
-            index: field_index,
-            query: query.to_string(),
-            pre_limit: None,
-        }))
+        Ok(Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+            self.name(),
+            Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
+                index: field_index,
+                query: query.to_string(),
+                pre_limit: None,
+            }))),
+            None,
+            vec![],
+            None,
+        )?)))
     }
 }
 
@@ -478,7 +505,7 @@ mod tests {
         let search_fields = vec!["content".to_string()];
         let primary_key = Some(vec!["id".to_string()]);
 
-        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key)
+        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key, None)
             .await
             .expect("Failed to create index");
 

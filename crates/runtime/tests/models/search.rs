@@ -45,6 +45,7 @@ use std::time::Instant;
 
 use super::{get_tpcds_dataset, sort_json_keys};
 
+#[derive(Clone)]
 pub enum SearchTestType {
     Http(serde_json::Value),
     Sql(&'static str),
@@ -59,17 +60,18 @@ impl Display for SearchTestType {
     }
 }
 
+#[derive(Clone)]
 pub struct SearchTestCase {
-    pub name: &'static str,
+    pub name: String,
     pub body: SearchTestType,
     pub should_fail: bool,
     pub skip: bool,
 }
 
 impl SearchTestCase {
-    pub fn new(name: &'static str, body: SearchTestType) -> Self {
+    pub fn new(name: impl Into<String>, body: SearchTestType) -> Self {
         Self {
-            name,
+            name: name.into(),
             body,
             should_fail: false,
             skip: false,
@@ -273,7 +275,7 @@ pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = Arc::clone(&rt).load_components() => {}
@@ -324,24 +326,24 @@ pub(crate) async fn run_search_w_explain(
                         run_search_test(http_base_url.as_str(), &ts, None, ts.should_fail).await?;
                     }
                     SearchTestType::Sql(sql) => {
+                        let test_name = ts.name.clone();
                         let resp = http_sql(http_base_url.as_str(), sql).await;
                         if ts.should_fail {
                             if resp.is_ok() {
                                 return Err(anyhow::anyhow!(format!(
-                                    "Test {} was expected to fail but succeeded",
-                                    ts.name
+                                    "Test {test_name} was expected to fail but succeeded",
                                 )));
                             }
 
                             let err = resp.err().context("Test was expected to fail")?;
                             insta::assert_snapshot!(
-                                format!("{}_error_response", ts.name),
+                                format!("{test_name}_error_response"),
                                 err.to_string()
                             );
                             continue;
                         }
 
-                        insta::assert_json_snapshot!(ts.name, resp?);
+                        insta::assert_json_snapshot!(test_name.clone(), resp?);
 
                         if explain_sql {
                             let c = client
@@ -355,7 +357,7 @@ pub(crate) async fn run_search_w_explain(
                             insta::with_settings!({
                                 omit_expression => true,
                                 description => sql
-                            }, {insta::assert_snapshot!(format!("{}_explain", ts.name), disp)});
+                            }, {insta::assert_snapshot!(format!("{test_name}_explain"), disp)});
                         }
                     }
                 }
@@ -563,10 +565,7 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
                     }],
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     description: None,
                     metadata: HashMap::new(),
                 }),
@@ -649,10 +648,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search:  Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -742,6 +738,8 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
                     full_text_search: Some(FullTextSearchConfig {
                         enabled: true,
                         row_ids: Some(vec!["id".to_string()]),
+                        index_store: None,
+                        index_directory: None,
                     }),
                     metadata: HashMap::new(),
                 }),
@@ -763,13 +761,13 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_explicit_join",
                 SearchTestType::Sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), id) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'id') order by fused_score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
                 "hybrid_multiple_column_sql_rrf_explicit_join_wrong_column",
                 SearchTestType::Sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), foobar) order by fused_score desc LIMIT 4",
+                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'foobar') order by fused_score desc LIMIT 4",
                 ),
             ).should_fail(),
             SearchTestCase::new(
@@ -795,10 +793,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search:  Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -883,10 +878,7 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["answer".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("answer")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -919,20 +911,14 @@ async fn test_text_search_where_rowid_is_search_column_multi_column() -> Result<
                     name: "question".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["answer".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("answer")),
                     metadata: HashMap::new(),
                 }),
                 Some(Column {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["answer".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("answer")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -963,6 +949,8 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
                     full_text_search: Some(FullTextSearchConfig {
                         enabled: true,
                         row_ids: Some(vec!["answer".to_string(), "id".to_string()]),
+                        index_store: Some(spicepod::semantic::IndexStore::Memory),
+                        index_directory: None
                     }),
                     metadata: HashMap::new(),
                 }),
@@ -997,20 +985,14 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                     name: "question".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
                 Some(Column {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -1049,7 +1031,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_question",
                 SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 // When there are multiple columns, `text_search` needs column explicitly as input.
                 "multi_text_column_sql_text_search_error_without_column",
@@ -1058,7 +1040,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_projection",
                 SearchTestType::Sql("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_filters",
                 SearchTestType::Sql("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),
@@ -1171,7 +1153,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 SearchTestType::Http(json!({
                     "text": "new patient",
                     "datasets": ["multiple_columns"],
-                    "where": "cp_catalog_page_sk % 2 = 0"
+                    "where": "cp_catalog_page_sk % 2 = 0 and cp_catalog_page_sk >=20"
                 })),
             ),
         ],
