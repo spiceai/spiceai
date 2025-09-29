@@ -18,12 +18,10 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
-    catalog::TableProvider,
     common::Column,
-    datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
     functions_aggregate::expr_fn::{array_agg, first_value},
-    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, TableScan, expr::Alias},
+    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, expr::Alias},
     prelude::{Expr, ExprFunctionExt, col},
     sql::TableReference,
 };
@@ -357,10 +355,7 @@ impl SearchIndex for ChunkedSearchIndex {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()
     }
 
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let pk_names: Vec<_> = self
             .primary_fields()
             .iter()
@@ -371,16 +366,8 @@ impl SearchIndex for ChunkedSearchIndex {
             .map(|c| Expr::Column(Column::new_unqualified(c.clone())))
             .collect();
 
-        let tbl_prov = self.inner.query_table_provider(query).await?;
-        let schema = tbl_prov.schema();
-
-        let tbl = Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("tbl"),
-            Arc::new(DefaultTableSource::new(tbl_prov)),
-            None,
-            vec![],
-            None,
-        )?));
+        let tbl = self.inner.query_table_provider(query)?;
+        let schema = tbl.schema();
 
         let mut sort_order_by = vec![SortExpr::new(col(SEARCH_SCORE_COLUMN_NAME), false, false)];
 
@@ -412,7 +399,7 @@ impl SearchIndex for ChunkedSearchIndex {
             fetch: None,
         });
 
-        Ok(Arc::new(ViewTable::new(final_sort, None)))
+        Ok(Arc::new(final_sort))
     }
 }
 
@@ -596,16 +583,12 @@ impl SearchIndex for ChunkedVectorIndex {
     /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
     /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
     ///  search score between `query` and the [`SearchIndex::search_column`].
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         ChunkedSearchIndex {
             inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
             chunker: Arc::clone(&self.chunker),
         }
         .query_table_provider(query)
-        .await
     }
 
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {

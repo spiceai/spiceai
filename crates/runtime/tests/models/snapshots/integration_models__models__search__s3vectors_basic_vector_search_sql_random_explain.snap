@@ -8,23 +8,22 @@ snapshot_kind: text
 +---------------+--------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Projection: vector_search(qs, Utf8("second")).subject                                                        |
 |               |   Sort: vector_search(qs, Utf8("second")).score DESC NULLS FIRST, fetch=4                                    |
-|               |     BytesProcessedNode                                                                                       |
-|               |       TableScan: vector_search(qs, Utf8("second")) projection=[subject, score]                               |
+|               |     Projection: vector_search(qs, Utf8("second")).subject, vector_search(qs, Utf8("second")).score           |
+|               |       BytesProcessedNode                                                                                     |
+|               |         TableScan: vector_search(qs, Utf8("second")) projection=[score, subject]                             |
 | physical_plan | ProjectionExec: expr=[subject@0 as subject]                                                                  |
 |               |   SortPreservingMergeExec: [score@1 DESC], fetch=4                                                           |
 |               |     SortExec: TopK(fetch=4), expr=[score@1 DESC], preserve_partitioning=[true]                               |
-|               |       BytesProcessedExec                                                                                     |
-|               |         ProjectionExec: expr=[subject@1 as subject, score@0 as score]                                        |
+|               |       ProjectionExec: expr=[subject@1 as subject, score@0 as score]                                          |
+|               |         BytesProcessedExec                                                                                   |
 |               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[score@1, subject@3] |
 |               |             CoalescePartitionsExec                                                                           |
-|               |               BytesProcessedExec                                                                             |
-|               |                 ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                   |
-|               |                   BytesProcessedExec                                                                         |
-|               |                     CooperativeExec                                                                          |
+|               |               ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                     |
+|               |                 BytesProcessedExec                                                                           |
+|               |                   CooperativeExec                                                                            |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                     |
 |               |                       CooperativeExec                                                                        |
-|               |                         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                 |
-|               |                           CooperativeExec                                                                    |
-|               |                             S3VectorsQueryExec: limit=30                                                     |
+|               |                         S3VectorsQueryExec: limit=30                                                         |
 |               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                             |
 |               |               BytesProcessedExec                                                                             |
 |               |                 SchemaCastScanExec                                                                           |

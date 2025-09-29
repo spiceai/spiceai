@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::Read;
 
 pub type ClickhouseConnectionPool =
-    dyn DbConnectionPool<ClientHandle, &'static (dyn Sync)> + Send + Sync;
+    dyn DbConnectionPool<ClientHandle, &'static dyn Sync> + Send + Sync;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

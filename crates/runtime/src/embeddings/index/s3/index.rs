@@ -18,7 +18,6 @@ use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
@@ -32,11 +31,12 @@ use search::index::{SearchIndex, VectorIndex};
 use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
+use crate::embeddings::index::s3::compute_vector::ComputeQuery;
 use crate::{embedding_col, embeddings::index::s3::write, model::EmbeddingModelStore};
 use datafusion::{
     catalog::TableProvider,
     common::Column,
-    datasource::{DefaultTableSource, ViewTable},
+    datasource::DefaultTableSource,
     error::DataFusionError,
     functions::core::{arrow_cast::ArrowCastFunc, union_extract::UnionExtractFun},
     logical_expr::{
@@ -112,31 +112,6 @@ impl S3Vector {
         let model = model_lock.get(&self.model_name)?;
         Some(Arc::clone(model))
     }
-
-    pub async fn query_vector(
-        &self,
-        query: &str,
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        let models = self.embedding_models.read().await;
-        let Some(embedding_model) = models.get(&self.model_name) else {
-            return Err(Box::from(format!(
-                "Vector index requires '{}' embedding model, but is not available.",
-                self.model_name
-            )));
-        };
-        let mut resp = embedding_model
-            .embed(EmbeddingInput::String(query.to_string()))
-            .await
-            .boxed()?;
-        let Some(query_vector) = resp.pop() else {
-            return Err(Box::from(format!(
-                "Embedding model '{}' produced no embedding for the query '{query}'.",
-                self.model_name,
-            )));
-        };
-
-        Ok(query_vector)
-    }
 }
 
 #[async_trait]
@@ -164,10 +139,7 @@ impl SearchIndex for S3Vector {
         Some(Arc::clone(&self) as Arc<dyn VectorIndex>)
     }
 
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let mut projection = s3_vectors_primary_key_cast(&self.primary_fields());
         projection.extend(vec![
             Expr::Alias(Alias::new(
@@ -187,13 +159,18 @@ impl SearchIndex for S3Vector {
         ]);
         projection.extend(metadata_columns_to_exprs(&self.metadata_columns));
 
-        // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
-        // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
-        let vector = self.query_vector(query).await?;
-        let tp = Arc::new(S3VectorsQueryTable::new(self.table.clone(), vector));
-
-        let lp = table_with_projection(tp, projection).boxed()?;
-        Ok(Arc::new(ViewTable::new(lp, None)) as Arc<dyn TableProvider>)
+        table_with_projection(
+            Arc::new(S3VectorsQueryTable::new(
+                self.table.clone(),
+                Arc::new(ComputeQuery {
+                    model_name: self.model_name.clone(),
+                    embedding_models: Arc::clone(&self.embedding_models),
+                }),
+                query.to_string(),
+            )),
+            projection,
+        )
+        .map(Arc::new)
     }
 }
 

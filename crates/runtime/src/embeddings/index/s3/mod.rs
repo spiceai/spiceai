@@ -43,6 +43,7 @@ use crate::{
     secrets::Secrets,
 };
 use retry_client::S3VectorRetryClientBuilder;
+mod compute_vector;
 mod retry_client;
 mod write;
 pub use index::S3Vector;
