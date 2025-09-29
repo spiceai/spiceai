@@ -105,14 +105,6 @@ pub enum ResponseContentBlock {
     ToolUse(ToolUseBlockParam),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BetaRawContentBlockStartEvent {
-    pub content_block: ContentBlock,
-    pub index: i32,
-    #[serde(rename = "type")]
-    pub event_type: String, // Always "content_block_start"
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TextBlockParam {
     pub text: String,
@@ -274,20 +266,6 @@ impl From<&ChatCompletionTool> for ToolParam {
             )),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ToolChoiceAutoParam {
-    #[serde(rename = "type")]
-    pub choice_type: String, // Always "auto"
-    pub disable_parallel_tool_use: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ToolChoiceAnyParam {
-    #[serde(rename = "type")]
-    pub choice_type: String, // Always "any"
-    pub disable_parallel_tool_use: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

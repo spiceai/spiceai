@@ -76,7 +76,7 @@ pub struct SnowflakeConnection {
     pub api: Arc<SnowflakeApi>,
 }
 
-impl<'a> DbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConnection {
+impl<'a> DbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -85,13 +85,13 @@ impl<'a> DbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConnection
         self
     }
 
-    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync>> {
         Some(self)
     }
 }
 
 #[async_trait]
-impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConnection {
+impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
     fn new(api: Arc<SnowflakeApi>) -> Self {
         SnowflakeConnection { api }
     }
@@ -131,7 +131,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
     async fn query_arrow(
         &self,
         sql: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let sql = sql.to_string();
@@ -177,7 +177,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
     async fn execute(
         &self,
         _query: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         return NotImplementedSnafu.fail()?;
     }
