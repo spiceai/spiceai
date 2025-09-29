@@ -40,6 +40,7 @@ use datafusion::{
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
+use moka::future::FutureExt;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
     provider::SearchQueryProvider,
@@ -281,10 +282,13 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 args.query.as_str(),
                 args.limit,
             )?
-            .call_on_scan(|| async {
-                let request_context = RequestContext::current(AsyncMarker::new().await);
-                telemetry::track_text_search(request_context);
-            }),
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_text_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
         ))
     }
 }

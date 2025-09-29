@@ -48,6 +48,7 @@ use datafusion::{
 };
 
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, SubqueryAlias};
+use futures::FutureExt;
 use itertools::Itertools;
 use std::{
     any::Any,
@@ -333,10 +334,13 @@ impl VectorSearchTableFunc {
                 args.query.as_str(),
                 args.limit,
             )?
-            .call_on_scan(|| async {
-                let request_context = RequestContext::current(AsyncMarker::new().await);
-                telemetry::track_vector_search(request_context);
-            }),
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_vector_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
         )))
     }
 }
@@ -503,7 +507,7 @@ impl TableProvider for VectorSearchUDTFProvider {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        telemetry::track_vector_search(request_context);
+        telemetry::track_vector_search(&request_context.to_dimensions());
         let (col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
 
         let query_vector = self

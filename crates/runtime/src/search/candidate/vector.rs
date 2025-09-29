@@ -275,7 +275,7 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
         limit: usize,
     ) -> search::generation::Result<SendableRecordBatchStream> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        telemetry::track_vector_search(request_context);
+        telemetry::track_vector_search(&request_context.to_dimensions());
         let embedding = self
             .embed_query(query.as_str())
             .await
