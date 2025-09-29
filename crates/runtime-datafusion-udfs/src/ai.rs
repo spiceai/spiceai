@@ -74,7 +74,7 @@ pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
             // ai(message, model_name)
             TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
         ],
-        Volatility::Volatile, // Changed to Volatile for async operations
+        Volatility::Volatile, // Volatile because AI model responses are non-deterministic for the same input
     )
 });
 
@@ -169,7 +169,11 @@ impl AsyncScalarUDFImpl for Ai {
 
         let model_store = self.model_store.read().await;
         let Some(model) = model_store.get(&model_name) else {
-            return exec_err!("{AI_UDF_NAME} cannot find model '{model_name}'");
+            return exec_err!(
+                "{AI_UDF_NAME} cannot find model '{}'. Available models: {}",
+                model_name,
+                model_store.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
         };
 
         // Convert arguments to arrays for consistency
