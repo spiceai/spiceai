@@ -77,7 +77,7 @@ impl BuiltinToolCatalog {
             (_, Some(desc)) => desc, // Use provided description if available
             ("websearch", None) => "Search the web for information",
             ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
-            ("search", None) => "Search datasets available & searchable in Spice.ai runtime",
+            ("search", None) => "Search across available, searchable datasets in Spice.ai runtime",
             ("table_schema", None) => "Get the schema of the Spice.ai dataset",
             ("sql", None) => "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
             ("sample_distinct_columns", None) => {

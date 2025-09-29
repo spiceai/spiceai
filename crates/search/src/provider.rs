@@ -52,6 +52,11 @@ pub struct SearchQueryProvider {
     pub search_column: String,
     pub primary_key: Vec<String>,
     pub pre_limit: Option<usize>,
+    /// Optional callback invoked before a table scan is performed.
+    ///
+    /// This callback can be used to perform custom actions (such as logging, metrics, or side effects)
+    /// immediately before the provider executes a scan operation. The callback is asynchronous and
+    /// will be awaited before the scan proceeds. If `None`, no callback is invoked.
     pub scan_callback: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
 }
 
@@ -86,6 +91,7 @@ impl SearchQueryProvider {
     }
 
     /// `func` will be called at the beginning of any [`Self::scan`].
+    #[must_use]
     pub fn call_on_scan(
         mut self,
         func: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
@@ -440,8 +446,8 @@ impl TableProvider for SearchQueryProvider {
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         if let Some(ref callback) = self.scan_callback {
-            callback().await
-        };
+            callback().await;
+        }
         let search_index_table = LogicalPlan::Limit(Limit {
             skip: None,
             fetch: self

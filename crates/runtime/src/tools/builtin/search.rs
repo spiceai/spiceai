@@ -42,7 +42,7 @@ impl SearchTool {
         Self {
             name: name.unwrap_or("search").to_string(),
             description: description
-                .unwrap_or("Search and retrieve documents from available datasets")
+                .unwrap_or("Search across available, searchable datasets")
                 .to_string(),
             rt,
         }
