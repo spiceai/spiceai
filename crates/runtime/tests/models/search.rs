@@ -1153,7 +1153,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 SearchTestType::Http(json!({
                     "text": "new patient",
                     "datasets": ["multiple_columns"],
-                    "where": "cp_catalog_page_sk % 2 = 0"
+                    "where": "cp_catalog_page_sk % 2 = 0 and cp_catalog_page_sk >=20"
                 })),
             ),
         ],
