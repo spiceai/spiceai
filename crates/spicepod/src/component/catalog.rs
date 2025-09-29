@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::WithDependsOn;
+use super::{WithDependsOn, dataset::AccessMode, is_default};
 use crate::{metric::Metrics, param::Params};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,6 +36,9 @@ pub struct Catalog {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
+
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub access: AccessMode,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
@@ -62,6 +65,7 @@ impl Catalog {
             name,
             description: None,
             metadata: HashMap::default(),
+            access: AccessMode::default(),
             include: Vec::default(),
             params: None,
             dataset_params: None,
@@ -78,6 +82,7 @@ impl WithDependsOn<Catalog> for Catalog {
             name: self.name.clone(),
             description: self.description.clone(),
             metadata: self.metadata.clone(),
+            access: self.access.clone(),
             include: self.include.clone(),
             params: self.params.clone(),
             dataset_params: self.dataset_params.clone(),

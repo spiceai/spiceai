@@ -205,4 +205,14 @@ impl<C: Config + Clone> Openai<C> {
     fn supports_max_completion_tokens(&self) -> bool {
         self.client.config().api_base() == OPENAI_API_BASE
     }
+
+    /// Returns true if the `OpenAI` compatible model supports reasoning.
+    /// This is only supported for GPT-5 models from `OpenAI` (i.e not any other compatible servers).
+    /// <https://platform.openai.com/docs/api-reference/chat/create#chat-create-reasoning_effort>
+    fn supports_reasoning_effort(&self) -> bool {
+        self.client.config().api_base() == OPENAI_API_BASE
+            && (self.model.starts_with("gpt-5")
+                || self.model.starts_with("o3")
+                || self.model.starts_with("o4"))
+    }
 }

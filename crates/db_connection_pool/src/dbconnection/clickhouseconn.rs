@@ -68,7 +68,7 @@ impl ClickhouseConnection {
     }
 }
 
-impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
+impl<'a> DbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -77,7 +77,7 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
         self
     }
 
-    fn as_async(&self) -> Option<&dyn AsyncDbConnection<ClientHandle, &'a (dyn Sync)>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<ClientHandle, &'a dyn Sync>> {
         Some(self)
     }
 }
@@ -86,7 +86,7 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
 // Looks like we don't actually pass any params to query_arrow.
 // But keep it in mind.
 #[async_trait::async_trait]
-impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
+impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection {
     // Required by trait, but not used.
     fn new(_: ClientHandle) -> Self {
         unreachable!()
@@ -134,7 +134,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
     async fn query_arrow(
         &self,
         sql: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.get_handle().await.context(ConnectionPoolSnafu)?;
@@ -161,7 +161,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
     async fn execute(
         &self,
         query: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;

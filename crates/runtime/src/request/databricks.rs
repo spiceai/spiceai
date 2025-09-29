@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::datafusion::DataFusion;
+use crate::{component::dataset::AccessMode, datafusion::DataFusion};
 
 const SPICE_DATABRICKS_HEADER: &str = "spice-databricks-auth";
 
@@ -147,8 +147,9 @@ impl DatabricksAuthExtension {
             let catalog_futures = databricks_u2m_catalogs.into_iter().map(|catalog| {
                 let df = Arc::clone(&df);
                 let name = catalog.name.clone();
+                let access = AccessMode::from(catalog.access);
                 Box::pin(async move {
-                    if let Err(err) = df.load_deferred_catalog(name.as_str()).await {
+                    if let Err(err) = df.load_deferred_catalog(name.as_str(), &access).await {
                         tracing::warn!("Failed to load catalog {}: {}", name, err);
                     }
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
