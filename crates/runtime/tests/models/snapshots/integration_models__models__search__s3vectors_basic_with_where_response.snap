@@ -25,6 +25,26 @@ snapshot_kind: text
         "id": 6
       },
       "score": 0.82
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "The Cat does not need to drink, as it obtains sufficient water from its prey."
+      },
+      "primary_key": {
+        "id": 438
+      },
+      "score": 0.8
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "A common thermometer operates on the principle that matter usually expands when it absorbs heat energy."
+      },
+      "primary_key": {
+        "id": 1041
+      },
+      "score": 0.77
     }
   ]
 }

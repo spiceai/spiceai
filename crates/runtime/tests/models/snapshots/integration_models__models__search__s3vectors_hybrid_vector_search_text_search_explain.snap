@@ -10,13 +10,13 @@ snapshot_kind: text
 |               |   Sort: text_search(qs, Utf8("second")).score DESC NULLS FIRST, fetch=4                                                                                                                   |
 |               |     Projection: text_search(qs, Utf8("second")).id, text_search(qs, Utf8("second")).answer, trunc(text_search(qs, Utf8("second")).score, Int64(3)), text_search(qs, Utf8("second")).score |
 |               |       BytesProcessedNode                                                                                                                                                                  |
-|               |         TableScan: text_search(qs, Utf8("second")) projection=[id, answer, score]                                                                                                         |
+|               |         TableScan: text_search(qs, Utf8("second")) projection=[answer, id, score]                                                                                                         |
 | physical_plan | ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(text_search(qs, Utf8("second")).score,Int64(3))@2 as trunc(text_search(qs, Utf8("second")).score,Int64(3))]                   |
 |               |   SortPreservingMergeExec: [score@3 DESC], fetch=4                                                                                                                                        |
 |               |     SortExec: TopK(fetch=4), expr=[score@3 DESC], preserve_partitioning=[true]                                                                                                            |
-|               |       ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as trunc(text_search(qs, Utf8("second")).score,Int64(3)), score@2 as score]                                 |
+|               |       ProjectionExec: expr=[id@1 as id, answer@0 as answer, trunc(score@2, 3) as trunc(text_search(qs, Utf8("second")).score,Int64(3)), score@2 as score]                                 |
 |               |         BytesProcessedExec                                                                                                                                                                |
-|               |           ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                                                                                         |
+|               |           ProjectionExec: expr=[answer@2 as answer, id@0 as id, score@1 as score]                                                                                                         |
 |               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3]                                                                       |
 |               |               CoalescePartitionsExec                                                                                                                                                      |
 |               |                 BytesProcessedExec                                                                                                                                                        |
