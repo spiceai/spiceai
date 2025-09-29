@@ -16,7 +16,6 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::utils::quote_identifier;
 use datafusion::common::{
     Column, DataFusionError, JoinType, Result, ScalarValue, TableReference, exec_err, not_impl_err,
 };
@@ -28,12 +27,11 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{
-    DataFrame, SessionContext, coalesce, exp, greatest, make_array, md5, now, to_unixtime,
-};
+use datafusion::prelude::{DataFrame, SessionContext, coalesce, exp, greatest, now, to_unixtime};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, ident, lit};
 use itertools::Itertools;
+use runtime_datafusion_udfs::digest_many::digest_many;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -536,12 +534,11 @@ impl ReciprocalRankFusion {
             .filter_map(|c| match c.name() {
                 "score" => None,
                 name if name.ends_with("_embedding") => None,
-                name => Some(ident(name).cast_to(&DataType::Utf8, df.schema())),
+                name => Some(ident(name)),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        let rrf_row_id = md5(make_array(bin_columns).cast_to(&DataType::Utf8, df.schema())?);
-        df.with_column("__spice_rrf_row_id", rrf_row_id)
+        df.with_column("__spice_rrf_row_id", digest_many(bin_columns, "md5"))
     }
 }
 
@@ -652,7 +649,7 @@ mod tests {
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
-    use datafusion::prelude::{DataFrame, now, to_unixtime};
+    use datafusion::prelude::{DataFrame, named_struct, now, to_unixtime};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{ExprFunctionExt, lit};
@@ -941,6 +938,34 @@ mod tests {
         let results = test_query!(
             runtime,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
+        );
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_queries_auto_hash_and_special_idents() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime)
+            .await?
+            .with_column("meta_a", named_struct(vec![lit("k1"), lit("v1")]))?
+            .with_column("meta_b.special", named_struct(vec![lit("k2"), lit(133.7)]))?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), k => 600.0)"
         );
 
         assert_eq!(
