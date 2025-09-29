@@ -202,6 +202,78 @@
         "width": 5,
         "height": 3
       }
+    },
+    {
+      "id": 5713842188321988,
+      "definition": {
+        "title": "Ingestion/Refresh Lag",
+        "title_size": "16",
+        "title_align": "left",
+        "show_legend": true,
+        "legend_layout": "auto",
+        "legend_columns": [
+          "avg",
+          "min",
+          "max",
+          "value",
+          "sum"
+        ],
+        "time": {},
+        "type": "timeseries",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "name": "query1",
+                "data_source": "metrics",
+                "query": "avg:spice.dataset_acceleration_ingestion_lag_ms{*}"
+              },
+              {
+                "name": "query4",
+                "data_source": "metrics",
+                "query": "avg:spice.dataset_acceleration_refresh_lag_ms{*}"
+              }
+            ],
+            "formulas": [
+              {
+                "number_format": {
+                  "unit": {
+                    "type": "canonical_unit",
+                    "unit_name": "second"
+                  }
+                },
+                "formula": "query1 / 1000"
+              },
+              {
+                "number_format": {
+                  "unit": {
+                    "type": "canonical_unit",
+                    "unit_name": "second"
+                  }
+                },
+                "formula": "query4 / 1000"
+              }
+            ],
+            "style": {
+              "palette": "dog_classic",
+              "order_by": "values",
+              "line_type": "solid",
+              "line_width": "normal"
+            },
+            "display_type": "line"
+          }
+        ],
+        "anomaly_detection": {
+          "detection_sensitivity": "never_detect"
+        }
+      },
+      "layout": {
+        "x": 0,
+        "y": 6,
+        "width": 5,
+        "height": 3
+      }
     }
   ],
   "template_variables": [
