@@ -34,10 +34,10 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use datafusion_expr::{SubqueryAlias, col, ident};
+use datafusion_expr::{SubqueryAlias, ident};
 
+use itertools::Itertools;
 use search::index::VectorIndex;
-use tract_core::tract_data::itertools::Itertools;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
@@ -84,27 +84,24 @@ impl VectorScanTableProvider {
 
     async fn apply_proj_and_filter(
         &self,
-        state: &dyn Session,
-        lp: Arc<LogicalPlan>,
+        input: Arc<LogicalPlan>,
         projection: &HashSet<String>,
         filters: &[Expr],
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    ) -> Result<LogicalPlan, DataFusionError> {
         let filtered = if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-            Arc::new(LogicalPlan::Filter(Filter::try_new(filter, lp.into())?))
+            Arc::new(LogicalPlan::Filter(Filter::try_new(filter, input.into())?))
         } else {
-            lp
+            input
         };
 
-        let lp = LogicalPlan::Projection(Projection::try_new(
+        Ok(LogicalPlan::Projection(Projection::try_new(
             projection
                 .iter()
                 .sorted_unstable()
                 .map(|p| Expr::Column(Column::new_unqualified(p.clone())))
                 .collect(),
             filtered,
-        )?);
-
-        state.create_physical_plan(&lp).await
+        )?))
     }
 
     fn columns_projected(
@@ -181,7 +178,6 @@ impl TableProvider for VectorScanTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        // TODO use self.primary_key
         self.table_provider.constraints()
     }
 
@@ -204,9 +200,8 @@ impl TableProvider for VectorScanTableProvider {
             &columns_requested,
             filters,
         ) {
-            return self
+            let lp = self
                 .apply_proj_and_filter(
-                    state,
                     Arc::new(LogicalPlan::TableScan(TableScan::try_new(
                         "base_table",
                         Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
@@ -217,21 +212,24 @@ impl TableProvider for VectorScanTableProvider {
                     &columns_requested,
                     filters,
                 )
-                .await;
+                .await?;
+
+            return state.create_physical_plan(&lp).await;
         }
         if self.schema_is_sufficient(
             self.vector_index_list.schema().fields(),
             &columns_requested,
             filters,
         ) {
-            return self
+            let lp = self
                 .apply_proj_and_filter(
-                    state,
                     Arc::clone(&self.vector_index_list),
                     &columns_requested,
                     filters,
                 )
-                .await;
+                .await?;
+
+            return state.create_physical_plan(&lp).await;
         }
 
         let base_ts = LogicalPlan::TableScan(TableScan::try_new(
