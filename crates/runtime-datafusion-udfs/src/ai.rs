@@ -18,10 +18,14 @@ limitations under the License.
 
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow_schema::DataType;
+#[cfg(test)]
+use async_openai::error::ApiError;
+#[cfg(test)]
 use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs, CompletionUsage,
-    CreateChatCompletionRequestArgs,
+    ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, Role,
 };
+use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
 use async_trait::async_trait;
 use datafusion::common::cast::as_string_array;
 use datafusion::common::utils::take_function_args;
@@ -33,14 +37,15 @@ use datafusion::{
     common::{Result as DataFusionResult, exec_err, not_impl_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
-use futures::{StreamExt, TryStreamExt};
+use tracing::{Instrument, Level};
+
 use llms::chat::Chat;
 use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
-use tracing::{Instrument, Span};
+use tracing::Span;
 
 pub static AI_UDF_NAME: &str = "ai";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
@@ -191,27 +196,32 @@ impl Ai {
         model: &Arc<dyn Chat>,
         message: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
-        let resp = model
-            .chat_request(
-                CreateChatCompletionRequestArgs::default()
-                    .messages(vec![
-                        ChatCompletionRequestUserMessageArgs::default()
-                            .content(message)
-                            .build()
-                            .boxed()
-                            .map_err(DataFusionError::External)?
-                            .into(),
-                    ])
-                    .build()
-                    .boxed()?,
-            )
-            .await
-            .boxed()?
-            .choices
-            .pop()
-            .and_then(|c| c.message.content);
+        async {
+            let resp = model
+                .chat_request(
+                    CreateChatCompletionRequestArgs::default()
+                        .messages(vec![
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(message)
+                                .build()
+                                .boxed()
+                                .map_err(DataFusionError::External)?
+                                .into(),
+                        ])
+                        .build()
+                        .boxed()?,
+                )
+                .await
+                .boxed()?
+                .choices
+                .pop()
+                .and_then(|c| c.message.content);
 
-        Ok(resp)
+            Ok(resp)
+        }
+        // Instrument the async block with an AI span as a child of the current (sql_query) span
+        .instrument(tracing::span!(Level::INFO, "ai", model = "test-model"))
+        .await
     }
 
     async fn process_messages(
@@ -224,10 +234,7 @@ impl Ai {
         let parent_span = Span::current();
         for message_opt in message_array.iter() {
             let result = if let Some(message) = message_opt {
-                match Self::call_model(&model, message)
-                    .instrument(parent_span.clone())
-                    .await
-                {
+                match Self::call_model(&model, message).await {
                     Ok(Some(result)) => {
                         tracing::info!(target: "task_history", captured_output = %result.clone(), "labels");
                         Some(result)
@@ -277,8 +284,6 @@ mod tests {
             &self,
             req: CreateChatCompletionRequest,
         ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
-            use async_stream::stream;
-
             // Extract the prompt from the request
             let prompt = req
                 .messages
@@ -290,58 +295,31 @@ mod tests {
                             async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
                         }
                     }
+                    async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
+                        match &user_msg.content {
+                            async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                            async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => Some("Array content".to_string()),
+                        }
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| "".to_string());
 
             let response_text = format!("Response from {}: {}", self.name, prompt);
-            let model_name = self.name.clone(); // Clone for the stream
+            let usage = Some(CompletionUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            });
 
-            // Create a simple stream that yields the response
-            let stream = stream! {
-                // Yield content chunk
-                yield Ok(CreateChatCompletionStreamResponse {
-                    id: "test-stream-id".to_string(),
-                    model: model_name.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: 0,
-                    choices: vec![async_openai::types::ChatChoiceStream {
-                        index: 0,
-                        delta: async_openai::types::ChatCompletionStreamResponseDelta {
-                            content: Some(response_text),
-                            role: Some(Role::Assistant),
-                            function_call: None,
-                            tool_calls: None,
-                            refusal: None,
-                        },
-                        finish_reason: None,
-                        logprobs: None,
-                    }],
-                    usage: None,
-                    system_fingerprint: None,
-                    service_tier: None,
-                });
-
-                // Yield final chunk with usage
-                yield Ok(CreateChatCompletionStreamResponse {
-                    id: "test-stream-id".to_string(),
-                    model: model_name,
-                    object: "chat.completion.chunk".to_string(),
-                    created: 0,
-                    choices: vec![],
-                    usage: Some(CompletionUsage {
-                        prompt_tokens: 10,
-                        completion_tokens: 20,
-                        total_tokens: 30,
-                        prompt_tokens_details: None,
-                        completion_tokens_details: None,
-                    }),
-                    system_fingerprint: None,
-                    service_tier: None,
-                });
-            };
-
-            Ok(Box::pin(stream))
+            // Use shared streaming utilities - return the complete response as a single chunk
+            Ok(llms::chat::streaming_utils::create_mock_streaming_response(
+                self.name.clone(),
+                vec![response_text],
+                usage,
+            ))
         }
 
         async fn chat_request(
@@ -357,6 +335,12 @@ mod tests {
                         match &sys_msg.content {
                             async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
                             async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
+                        }
+                    }
+                    async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
+                        match &user_msg.content {
+                            async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                            async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => Some("Array content".to_string()),
                         }
                     }
                     _ => None,
@@ -375,6 +359,7 @@ mod tests {
                     message: ChatCompletionResponseMessage {
                         content: Some(response_text),
                         role: Role::Assistant,
+                        #[allow(deprecated)]
                         function_call: None,
                         tool_calls: None,
                         refusal: None,
@@ -611,9 +596,10 @@ mod tests {
                         delta: async_openai::types::ChatCompletionStreamResponseDelta {
                             content: None, // Empty content
                             role: Some(Role::Assistant),
-                            function_call: None,
                             tool_calls: None,
                             refusal: None,
+                            #[allow(deprecated)]
+                            function_call: None,
                         },
                         finish_reason: None,
                         logprobs: None,
@@ -659,6 +645,7 @@ mod tests {
                     message: ChatCompletionResponseMessage {
                         content: None, // This represents a null/empty response
                         role: Role::Assistant,
+                        #[allow(deprecated)]
                         function_call: None,
                         tool_calls: None,
                         refusal: None,
@@ -717,7 +704,7 @@ mod tests {
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
+            .process_messages(Arc::clone(model), messages)
             .await
             .unwrap();
 
@@ -743,7 +730,7 @@ mod tests {
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
+            .process_messages(Arc::clone(model), messages)
             .await
             .unwrap();
 
@@ -774,7 +761,7 @@ mod tests {
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
+            .process_messages(Arc::clone(model), messages)
             .await
             .unwrap();
 
@@ -797,9 +784,7 @@ mod tests {
         let model = model_store_guard.get("error-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
-        let result = udf
-            .process_messages(Arc::clone(model), messages, "error-model")
-            .await;
+        let result = udf.process_messages(Arc::clone(model), messages).await;
 
         assert!(result.is_err());
         assert!(
@@ -820,7 +805,7 @@ mod tests {
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), messages, "null-model")
+            .process_messages(Arc::clone(model), messages)
             .await
             .unwrap();
 
@@ -906,13 +891,11 @@ mod tests {
         let model = model_store_guard.get("test-model").unwrap();
 
         // Create a parent span to simulate sql_query span
-        let sql_query_span = tracing::span!(Level::INFO, "sql_query", query = "SELECT ai('test')");
+        let _sql_query_span = tracing::span!(Level::INFO, "sql_query", query = "SELECT ai('test')");
 
         // Test that process_messages can accept and use a parent span without errors
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
-        let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
-            .await;
+        let result = udf.process_messages(Arc::clone(model), messages).await;
 
         // The test passes if process_messages executes without error using the parent span
         assert!(
@@ -1030,9 +1013,7 @@ mod tests {
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
 
         tracing::info!("About to call process_messages");
-        let _result = udf
-            .process_messages(Arc::clone(model), messages, "test-model")
-            .await;
+        let _result = udf.process_messages(Arc::clone(model), messages).await;
         tracing::info!("process_messages completed");
 
         logs_assert(|lines: &[&str]| {

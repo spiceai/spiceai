@@ -12,12 +12,12 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_openai::types::{
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequestArgs,
 };
 use async_stream::stream;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::Stream;
 use nsql::SqlGeneration;
 use rand::distr::Alphanumeric;
 use rand::{Rng, rng};
@@ -35,19 +35,21 @@ use tracing_futures::Instrument;
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoice, ChatChoiceStream, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
-        ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        ChatCompletionResponseMessage, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, Role,
+        ChatChoice, ChatCompletionRequestAssistantMessage, ChatCompletionRequestDeveloperMessage,
+        ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+        Role,
     },
 };
 
 pub mod mistral;
 pub mod nsql;
+#[cfg(test)]
+pub mod streaming_tests;
+pub mod streaming_utils;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
 
@@ -608,7 +610,7 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
-        let mut stream = self.stream(prompt).await.map_err(|e| {
+        let stream = self.stream(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -617,48 +619,9 @@ pub trait Chat: Sync + Send {
             })
         })?;
 
-        let strm_id: String = rng()
-            .sample_iter(&Alphanumeric)
-            .take(10)
-            .map(char::from)
-            .collect();
-        let strm = stream! {
-            let mut i  = 0;
-            while let Some(msg) = stream.next().await {
-                let choice = ChatChoiceStream {
-                    delta: ChatCompletionStreamResponseDelta {
-                        content: Some(msg?.unwrap_or_default()),
-                        tool_calls: None,
-                        role: Some(Role::System),
-                        function_call: None,
-                        refusal: None,
-                    },
-                    index: i,
-                    finish_reason: None,
-                    logprobs: None,
-                };
-
-            yield Ok(CreateChatCompletionStreamResponse {
-                id: format!("{}-{}-{i}", model_id.clone(), strm_id),
-                choices: vec![choice],
-                model: model_id.clone(),
-                created: 0,
-                system_fingerprint: None,
-                object: "list".to_string(),
-                usage: None,
-                service_tier: None,
-            });
-            i+=1;
-        }};
-
-        Ok(Box::pin(strm.map_err(|e: Error| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })))
+        Ok(streaming_utils::string_stream_to_chat_stream(
+            model_id, stream,
+        ))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
