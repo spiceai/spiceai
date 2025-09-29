@@ -77,6 +77,7 @@ default = [
     "oracle",
     "runtime/s3_vectors",
     "mongodb",
+    "iceberg-write",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -85,6 +86,7 @@ duckdb = ["runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
+iceberg-write = ["runtime/iceberg-write"]
 imap = ["runtime/imap"]
 kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]

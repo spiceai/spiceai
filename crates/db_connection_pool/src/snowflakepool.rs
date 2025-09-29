@@ -255,11 +255,11 @@ fn init_snowflake_api_with_keypair_auth(
 }
 
 #[async_trait]
-impl DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> for SnowflakeConnectionPool {
+impl DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> for SnowflakeConnectionPool {
     async fn connect(
         &self,
     ) -> Result<
-        Box<dyn DbConnection<Arc<SnowflakeApi>, &'static (dyn Sync)>>,
+        Box<dyn DbConnection<Arc<SnowflakeApi>, &'static dyn Sync>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let api = Arc::clone(&self.api);
