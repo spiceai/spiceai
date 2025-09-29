@@ -395,7 +395,8 @@ impl SnapshotBootstrapManager {
             dataset = %self.dataset_name,
             snapshot = %location.to_string(),
             size = bytes_len,
-            "Snapshot downloaded."
+            "Snapshot downloaded to {}.",
+            self.local_path.to_string_lossy()
         );
 
         let checkpointer = (self.checkpointer_factory)()

@@ -60,6 +60,12 @@ enum AccelerationConnection {
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum OpenOption {
+    CreateIfNotExists,
+    OpenExisting,
+}
+
 pub async fn acceleration_file_path(source: &dyn AccelerationSource) -> Option<PathBuf> {
     let runtime = source.runtime();
     let acceleration_settings = source.acceleration()?;
@@ -94,7 +100,7 @@ pub async fn acceleration_file_path(source: &dyn AccelerationSource) -> Option<P
 
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
-    create_table_if_not_exists: bool,
+    open_option: OpenOption,
 ) -> Result<AccelerationConnection> {
     let runtime = source.runtime();
 
@@ -114,7 +120,7 @@ async fn acceleration_connection(
                 .ok_or("Accelerator is not a DuckDBAccelerator")?;
 
             let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
-            if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
+            if open_option == OpenOption::OpenExisting && !Path::new(&duckdb_file).exists() {
                 return Err("DuckDB file does not exist.".into());
             }
 
@@ -161,7 +167,7 @@ async fn acceleration_connection(
                 .ok_or("Accelerator is not a SqliteAccelerator")?;
 
             let sqlite_file = sqlite_accelerator.sqlite_file_path(source)?;
-            if !create_table_if_not_exists && !Path::new(&sqlite_file).exists() {
+            if open_option == OpenOption::OpenExisting && !Path::new(&sqlite_file).exists() {
                 return Err("Sqlite file does not exist.".into());
             }
 

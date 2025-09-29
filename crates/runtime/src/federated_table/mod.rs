@@ -38,7 +38,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
     component::dataset::Dataset,
-    dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     dataconnector::{DataConnector, DataConnectorError},
     tracers::OnceTracer,
     warn_once,
@@ -329,7 +329,9 @@ impl FederatedTable {
             return None;
         }
 
-        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref()).await.ok()?;
+        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref(), OpenOption::OpenExisting)
+            .await
+            .ok()?;
         Some(checkpoint)
     }
 }

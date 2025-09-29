@@ -26,8 +26,8 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{AccessMode, Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
-use crate::dataaccelerator::spice_sys::acceleration_file_path;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::dataaccelerator::spice_sys::{OpenOption, acceleration_file_path};
 use crate::dataaccelerator::{self};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -883,16 +883,19 @@ impl DataFusion {
             && let Some(file_path) = acceleration_file_path(dataset).await
         {
             let dataset = dataset.clone();
-            let manager = SnapshotBootstrapManager::from_params(
-                dataset.name.to_string(),
-                &acceleration_settings.params,
-                make_checkpointer_factory(move || {
-                    let dataset = dataset.clone();
-                    async move { DatasetCheckpoint::try_new(&dataset).await }
-                }),
-                file_path,
-            )
-            .await;
+            let manager =
+                SnapshotBootstrapManager::from_params(
+                    dataset.name.to_string(),
+                    &acceleration_settings.params,
+                    make_checkpointer_factory(move || {
+                        let dataset = dataset.clone();
+                        async move {
+                            DatasetCheckpoint::try_new(&dataset, OpenOption::OpenExisting).await
+                        }
+                    }),
+                    file_path,
+                )
+                .await;
             if let Some(manager) = manager {
                 let schema = manager.download_latest_snapshot().await.ok().flatten();
                 if let Some(schema) = schema {
@@ -938,7 +941,7 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             self.runtime_status
@@ -1029,7 +1032,11 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
-        accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
+        accelerated_table_builder.checkpointer_opt(
+            DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
+                .await
+                .ok(),
+        );
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
@@ -1514,7 +1521,7 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view).await
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             initial_load_complete = true;
@@ -1542,7 +1549,11 @@ impl DataFusion {
         );
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
-        builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
+        builder.checkpointer_opt(
+            DatasetCheckpoint::try_new(view, OpenOption::CreateIfNotExists)
+                .await
+                .ok(),
+        );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
         if acceleration.disable_federation {
