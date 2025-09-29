@@ -29,7 +29,7 @@ use datafusion::logical_expr::{
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext, coalesce, exp, greatest, now, to_unixtime};
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, ident, lit};
+use datafusion_expr::{ExprFunctionExt, col, ident, lit};
 use itertools::Itertools;
 use runtime_datafusion_udfs::digest_many::digest_many;
 use std::any::Any;

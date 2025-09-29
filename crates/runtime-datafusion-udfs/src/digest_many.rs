@@ -100,6 +100,7 @@ impl ScalarUDFImpl for DigestMany {
         exec_err!("{DIGEST_UDF_NAME}: return type is input-dependent. This is a bug in Spice AI.")
     }
 
+    // Delegate this to the underlying hash function, as it may want to return {Binary, Utf8, Utf8View}
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> DataFusionResult<FieldRef> {
         if let Some(Some(scalar_value)) = args.scalar_arguments.last() {
             let hash_fn =
@@ -120,6 +121,7 @@ impl ScalarUDFImpl for DigestMany {
         let mut args = scalar_args.args;
         let hash_fn = Self::concrete_hash_function(args.pop())?;
 
+        // Collect variadic args into one string for hashing
         let hash_me: String = args
             .into_iter()
             .map(|c| match c {
