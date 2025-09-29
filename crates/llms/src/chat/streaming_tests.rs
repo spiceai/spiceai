@@ -194,7 +194,6 @@ async fn test_streaming_error_handling() {
     let result = model.chat_stream(request).await;
     assert!(result.is_err());
 
-    assert!(result.is_err());
     // We can't use unwrap_err() directly because the stream doesn't implement Debug
     // Instead, we'll check that we get an error which is what we expect
 }
