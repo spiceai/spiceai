@@ -34,7 +34,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use datafusion_expr::{SubqueryAlias, col};
+use datafusion_expr::{SubqueryAlias, col, ident};
 
 use search::index::VectorIndex;
 use tract_core::tract_data::itertools::Itertools;
@@ -336,7 +336,7 @@ impl TableProvider for VectorScanTableProvider {
             columns_requested
                 .into_iter()
                 .sorted_unstable()
-                .map(col)
+                .map(ident)
                 .collect(),
             Arc::new(filtered),
         )?);
