@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::utils::quote_identifier;
 use datafusion::common::{
-    Column, DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err,
+    Column, DataFusionError, JoinType, Result, ScalarValue, TableReference, exec_err, not_impl_err,
 };
 use datafusion::datasource::TableType;
 use datafusion::functions_aggregate::expr_fn::{first_value, max};
@@ -105,6 +105,9 @@ macro_rules! extract_string {
 macro_rules! col_qualified {
     ($column:expr) => {
         Expr::Column(Column::from_qualified_name_ignore_case($column))
+    };
+    ($table:expr, $column:expr) => {
+        Expr::Column(Column::new(Some($table), $column))
     };
 }
 
@@ -313,7 +316,11 @@ impl ReciprocalRankFusion {
             let (_, qname) = recency_col.qualified_name();
             let cols = subquery_dfs
                 .iter()
-                .map(|df| Self::first_qualified_field(df, &qname).map(|q| col_qualified!(q)))
+                .enumerate()
+                .map(|(i, df)| {
+                    Self::first_qualified_field(df, &qname)
+                        .map(|(_, q)| col_qualified!(format!("search_{i}"), q))
+                })
                 .collect::<Result<Vec<_>>>()?;
             coalesce(cols)
         } else {
@@ -367,9 +374,7 @@ impl ReciprocalRankFusion {
                 other => Some(
                     coalesce(
                         (0..subquery_dfs.len())
-                            .map(|i| {
-                                col_qualified!(format!("search_{i}.{}", quote_identifier(other)))
-                            })
+                            .map(|i| col_qualified!(format!("search_{i}"), other))
                             .collect(),
                     )
                     .alias(other),
@@ -421,11 +426,8 @@ impl ReciprocalRankFusion {
                     None
                 } else {
                     Some(
-                        first_value(
-                            col_qualified!(&cname),
-                            vec![col("fused_score").sort(false, false)],
-                        )
-                        .alias(&cname),
+                        first_value(ident(&cname), vec![col("fused_score").sort(false, false)])
+                            .alias(&cname),
                     )
                 }
             }));
@@ -489,13 +491,12 @@ impl ReciprocalRankFusion {
 
     // Given a DF with overlapping unqualified names (as produced by JOIN), where column values
     // are equivalent, return the first (arbitrary) qualified name.
-    fn first_qualified_field(df: &DataFrame, name: &str) -> Result<String> {
+    fn first_qualified_field(df: &DataFrame, name: &str) -> Result<(TableReference, String)> {
         df.schema()
             .qualified_fields_with_unqualified_name(name)
             .first()
             .and_then(|(maybe_table_reference, f)| {
-                maybe_table_reference
-                    .map(|tr| format!("{}.{}", tr.table(), quote_identifier(f.name())))
+                maybe_table_reference.map(|tr| (tr.clone(), f.name().clone()))
             })
             .ok_or(DataFusionError::Execution(format!(
                 "{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"
@@ -504,10 +505,14 @@ impl ReciprocalRankFusion {
 
     // Reduces 2 or more search subquery DFs into a single one
     fn fold_join(a: DataFrame, b: DataFrame, join_key: &str) -> Result<DataFrame> {
-        let id_a = Self::first_qualified_field(&a, join_key)?;
-        let id_b = Self::first_qualified_field(&b, join_key)?;
+        let (tbl_a, id_a) = Self::first_qualified_field(&a, join_key)?;
+        let (tbl_b, id_b) = Self::first_qualified_field(&b, join_key)?;
 
-        a.join(b, JoinType::Full, &[&id_a], &[&id_b], None)
+        a.join_on(
+            b,
+            JoinType::Full,
+            vec![col_qualified!(tbl_a, id_a).eq(col_qualified!(tbl_b, id_b))],
+        )
     }
 
     // Window and rank a search subquery by its `score` field, exposing a `rank` column
