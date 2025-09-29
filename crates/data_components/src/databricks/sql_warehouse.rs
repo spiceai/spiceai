@@ -63,6 +63,15 @@ pub enum Error {
     ))]
     InvalidWarehouseState { state: String },
 
+    #[snafu(display("Unexpected Statement execution state: '{state}'."))]
+    UnexpectedStatementState { state: String },
+
+    #[snafu(display("Query canceled or timed out (state: 'CANCELED')."))]
+    QueryCanceled,
+
+    #[snafu(display("Long-running operations are not supported (state: 'RUNNING')."))]
+    QueryStillRunning,
+
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequestFailed { source: reqwest::Error },
 
@@ -374,6 +383,8 @@ impl SqlWarehouseApi {
                 field: "status.state".to_string(),
             })?;
 
+        // https://docs.databricks.com/api/workspace/statementexecution/executestatement#status-error
+        // states: Enum: PENDING | RUNNING | SUCCEEDED | FAILED | CANCELED | CLOSED
         match state.to_uppercase().as_str() {
             "SUCCEEDED" => Ok(()),
             "FAILED" => {
@@ -383,8 +394,15 @@ impl SqlWarehouseApi {
                     message: format!("Query failed with state FAILED: {message}"),
                 })
             }
-            _ => Err(Error::InvalidWarehouseState {
+            // waiting for warehouse
+            "PENDING" => Err(Error::InvalidWarehouseState {
                 state: state.to_string(),
+            }),
+            // long-running queries are not currently supported
+            "RUNNING" => Err(Error::QueryStillRunning),
+            "CANCELED" => Err(Error::QueryCanceled),
+            other => Err(Error::UnexpectedStatementState {
+                state: other.to_string(),
             }),
         }
     }
