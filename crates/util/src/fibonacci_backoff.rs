@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::time::Duration;
 
-use backoff::backoff::Backoff;
+pub use backoff::backoff::Backoff;
 
 // Fibonacci-based backoff delay intervals capped at 5 mins
 const BACKOFF_INTERVALS_MS: [u64; 14] = [
