@@ -493,7 +493,7 @@ impl SqlWarehouseApi {
             ResponseStatus::Running => Err(Error::QueryStillRunning),
             ResponseStatus::Canceled => Err(Error::QueryCanceled),
             ResponseStatus::Closed => Err(Error::QueryFailure {
-                message: format!("Query failed with state CLOSED"),
+                message: "Query failed with state CLOSED".to_string(),
             }),
         }
     }
