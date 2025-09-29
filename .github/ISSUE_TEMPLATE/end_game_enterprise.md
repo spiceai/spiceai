@@ -100,7 +100,13 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
 
 - [ ] Ensure the [docker image build](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) is completed and the image [was promoted](https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml) to all stamps and environments
 - [ ] Deploy the new docker image to several apps in dev [SCP](https://dev.spice.ai/). Confirm upgrade and functionality.
-- [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality.
+  - [ ] SQL Query
+  - [ ] AI Chat
+  - [ ] Search
+- [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality:
+  - [ ] SQL Query
+  - [ ] AI Chat
+  - [ ] Search
   - spicehq:
     - https://spice.ai/spicehq/s3-vectors-demo
     - https://spice.ai/spicehq/s3-ai-database
