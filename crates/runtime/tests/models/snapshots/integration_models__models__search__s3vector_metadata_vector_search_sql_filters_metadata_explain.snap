@@ -9,19 +9,16 @@ snapshot_kind: text
 | logical_plan  | Sort: score DESC NULLS FIRST, fetch=4                                                                                                                                    |
 |               |   Projection: vector_search(qs, Utf8("secondary")).id, vector_search(qs, Utf8("secondary")).answer, trunc(vector_search(qs, Utf8("secondary")).score, Int64(3)) AS score |
 |               |     BytesProcessedNode                                                                                                                                                   |
-|               |       TableScan: vector_search(qs, Utf8("secondary")) projection=[id, answer, score], full_filters=[vector_search(qs, Utf8("secondary")).subject != Utf8("math")]        |
+|               |       TableScan: vector_search(qs, Utf8("secondary")) projection=[answer, id, score], full_filters=[vector_search(qs, Utf8("secondary")).subject != Utf8("math")]        |
 | physical_plan | SortPreservingMergeExec: [score@2 DESC], fetch=4                                                                                                                         |
 |               |   SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]                                                                                             |
-|               |     ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as score]                                                                                    |
+|               |     ProjectionExec: expr=[id@1 as id, answer@0 as answer, trunc(score@2, 3) as score]                                                                                    |
 |               |       BytesProcessedExec                                                                                                                                                 |
-|               |         ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                                                                          |
+|               |         ProjectionExec: expr=[answer@0 as answer, CAST(key@1 AS Int64) as id, 1 - distance@2 as score]                                                                   |
 |               |           BytesProcessedExec                                                                                                                                             |
-|               |             ProjectionExec: expr=[CAST(key@1 AS Int64) as id, 1 - distance@2 as score, answer@0 as answer]                                                               |
-|               |               BytesProcessedExec                                                                                                                                         |
+|               |             CooperativeExec                                                                                                                                              |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                       |
 |               |                 CooperativeExec                                                                                                                                          |
-|               |                   CooperativeExec                                                                                                                                        |
-|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                 |
-|               |                       CooperativeExec                                                                                                                                    |
-|               |                         S3VectorsQueryExec: filter={subject:{$ne:"math"}} limit=30                                                                                       |
+|               |                   S3VectorsQueryExec: filter={subject:{$ne:"math"}} limit=30                                                                                             |
 |               |                                                                                                                                                                          |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -92,7 +92,7 @@ impl Embed for TaskEmbed {
     }
 
     fn model_name(&self) -> Option<&str> {
-        self.inner.model_name()
+        Some(self.name.as_str())
     }
 
     fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {

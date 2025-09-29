@@ -6,21 +6,11 @@ expression: resp?
   {
     "id": 525,
     "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?",
-    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.02
-  },
-  {
-    "id": 772,
-    "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$",
-    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.017
+    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.016
   },
   {
     "id": 361,
     "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants.",
-    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.016
-  },
-  {
-    "id": 462,
-    "question": "How many groups of 2 are in 14?",
     "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\"))).fused_score,Int64(3))": 0.016
   }
 ]

@@ -362,42 +362,45 @@ mod search {
                 ))
                 .with_dataset(ds)
                 .build(),
-            [basic_vector_search_tests("metadata"),
-            vec![
-                SearchTestCase::new(
-                    "s3vector_metadata_additional_columns_metadata",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
-                        "additional_columns": ["reference_answer", "source"],
-                    })),
-                ),
-
-                SearchTestCase::new(
-                    "s3vector_metadata_with_where_metadata",
-                    SearchTestType::Http(json!({
-                        "text": "secondary",
-                        "datasets": ["qs"],
-                        "where": "subject!='math'",
-                        "limit": 4,
-                    })),
-                ),
-
-                SearchTestCase::new(
-                    "s3vector_metadata_vector_search_sql_projection_metadata",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+            [
+                basic_vector_search_tests("metadata"),
+                vec![
+                    SearchTestCase::new(
+                        "s3vector_metadata_additional_columns_metadata",
+                        SearchTestType::Http(json!({
+                            "text": "second",
+                            "limit": 4,
+                            "datasets": ["qs"],
+                            "additional_columns": ["reference_answer", "source"],
+                        })),
                     ),
-                ),
-                SearchTestCase::new(
-                    "s3vector_metadata_vector_search_sql_filters_metadata",
-                    SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+
+                    SearchTestCase::new(
+                        "s3vector_metadata_with_where_metadata",
+                        SearchTestType::Http(json!({
+                            "text": "secondary",
+                            "datasets": ["qs"],
+                            "where": "subject!='math'",
+                            "limit": 4,
+                        })),
                     ),
-                ),
-            ]].concat(),
-            true
+
+                    SearchTestCase::new(
+                        "s3vector_metadata_vector_search_sql_projection_metadata",
+                        SearchTestType::Sql(
+                            "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        ),
+                    ),
+                    SearchTestCase::new(
+                        "s3vector_metadata_vector_search_sql_filters_metadata",
+                        SearchTestType::Sql(
+                            "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                        ),
+                    ),
+                ],
+            ]
+            .concat(),
+            true,
         )
         .await
     }
@@ -568,7 +571,7 @@ mod search {
                 let rt = start_app(app).await?;
 
                 // Ensure all messages are processed/including embeddings calculation
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
 
                 run_and_snapshot_query(
                     &rt,

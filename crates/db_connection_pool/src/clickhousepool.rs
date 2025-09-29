@@ -78,11 +78,11 @@ impl ClickhouseConnectionPool {
 }
 
 #[async_trait]
-impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectionPool {
+impl DbConnectionPool<ClientHandle, &'static dyn Sync> for ClickhouseConnectionPool {
     async fn connect(
         &self,
     ) -> std::result::Result<
-        Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>,
+        Box<dyn DbConnection<ClientHandle, &'static dyn Sync>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let pool = Arc::clone(&self.pool);
