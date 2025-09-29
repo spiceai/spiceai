@@ -19,20 +19,30 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Which compound is not an intermediate of the TCA cycle?"
+        "question": "How is microsporidia infection typically acquired?"
       },
       "primary_key": {
-        "id": 1279
+        "id": 446
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+        "question": "Which of the following is an intensive property of a system?"
       },
       "primary_key": {
-        "id": 938
+        "id": 1289
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "Which compound is not an intermediate of the TCA cycle?"
+      },
+      "primary_key": {
+        "id": 1279
       },
       "score": 0.01
     }

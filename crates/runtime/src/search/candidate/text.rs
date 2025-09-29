@@ -58,11 +58,16 @@ impl TextSearchCandidate {
         addition_projection: &[&Expr],
         limit: usize,
     ) -> Result<DataFrame, DataFusionError> {
+        let pre_limit = if opt_filters.is_empty() {
+            Some(limit)
+        } else {
+            None
+        };
         let udtf_args = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
             tbl: self.tbl.clone(),
             query,
             column: Some(self.inner.field.clone()),
-            limit: Some(limit),
+            limit: pre_limit,
             include_score: Some(true),
         });
 

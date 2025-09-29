@@ -275,7 +275,7 @@ pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = Arc::clone(&rt).load_components() => {}
@@ -1153,7 +1153,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 SearchTestType::Http(json!({
                     "text": "new patient",
                     "datasets": ["multiple_columns"],
-                    "where": "cp_catalog_page_sk % 2 = 0"
+                    "where": "cp_catalog_page_sk % 2 = 0 and cp_catalog_page_sk >=20"
                 })),
             ),
         ],

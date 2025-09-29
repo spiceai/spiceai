@@ -45,13 +45,6 @@ pub struct VectorScanTableProvider {
 }
 
 impl VectorScanTableProvider {
-    pub fn new(table_provider: Arc<dyn TableProvider>, index: Arc<dyn VectorIndex>) -> Self {
-        Self {
-            table_provider,
-            index,
-        }
-    }
-
     /// Construct [`TableScan`] for underlying table for `projection` & `filters` relative to [`VectorScanTableProvider`].
     fn underlying_table_scan(
         &self,

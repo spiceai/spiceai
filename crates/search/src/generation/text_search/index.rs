@@ -22,8 +22,9 @@ use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{LogicalPlan, TableScan};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::DocParsingError;
@@ -181,11 +182,15 @@ impl FullTextDatabaseIndex {
             .into()
     }
 
-    pub async fn full_text_search_field_index(
+    pub fn full_text_search_field_index(
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self.index.read().await;
+        let index_read = self
+            .index
+            .try_read()
+            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
+
         let mut search_index = FullTextSearchFieldIndex::try_new(
             &index_read,
             search_field.to_string(),
@@ -423,19 +428,23 @@ impl SearchIndex for FullTextDatabaseIndex {
         Ok(record)
     }
 
-    async fn query_table_provider(
-        &self,
-        query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let field_index = self
             .full_text_search_field_index(&self.search_column())
-            .await?;
+            .boxed()
+            .map_err(DataFusionError::External)?;
 
-        Ok(Arc::new(FullTextSearchQuery {
-            index: field_index,
-            query: query.to_string(),
-            pre_limit: None,
-        }))
+        Ok(Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+            self.name(),
+            Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
+                index: field_index,
+                query: query.to_string(),
+                pre_limit: None,
+            }))),
+            None,
+            vec![],
+            None,
+        )?)))
     }
 }
 

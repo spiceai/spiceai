@@ -58,6 +58,20 @@ pub enum Error {
     #[snafu(display("Unable to retrieve schema: {reason}"))]
     UnableToRetrieveSchema { reason: String },
 
+    #[snafu(display(
+        "Warehouse is not ready (state: '{state}'). Verify the warehouse state and try again later."
+    ))]
+    InvalidWarehouseState { state: String },
+
+    #[snafu(display("Unexpected Statement execution state: '{state}'."))]
+    UnexpectedStatementState { state: String },
+
+    #[snafu(display("Query canceled or timed out (state: 'CANCELED')."))]
+    QueryCanceled,
+
+    #[snafu(display("Long-running operations are not supported (state: 'RUNNING')."))]
+    QueryStillRunning,
+
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequestFailed { source: reqwest::Error },
 
@@ -359,6 +373,48 @@ impl SqlWarehouseApi {
             .filter(|batch| batch.num_rows() > 0)
             .collect())
     }
+
+    fn verify_response_status(response: &Value) -> Result<(), Error> {
+        let state = response
+            .get("status")
+            .and_then(|s| s.get("state"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::MissingJsonField {
+                field: "status.state".to_string(),
+            })?;
+
+        // https://docs.databricks.com/api/workspace/statementexecution/executestatement#status-error
+        // states: Enum: PENDING | RUNNING | SUCCEEDED | FAILED | CANCELED | CLOSED
+        match state.to_uppercase().as_str() {
+            "SUCCEEDED" => Ok(()),
+            "FAILED" => {
+                let message = Self::extract_error_message(response)
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                Err(Error::QueryFailure {
+                    message: format!("Query failed with state FAILED: {message}"),
+                })
+            }
+            // waiting for warehouse
+            "PENDING" => Err(Error::InvalidWarehouseState {
+                state: state.to_string(),
+            }),
+            // long-running queries are not currently supported
+            "RUNNING" => Err(Error::QueryStillRunning),
+            "CANCELED" => Err(Error::QueryCanceled),
+            other => Err(Error::UnexpectedStatementState {
+                state: other.to_string(),
+            }),
+        }
+    }
+
+    fn extract_error_message(response: &Value) -> Option<String> {
+        response
+            .get("status")
+            .and_then(|s| s.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .map(ToString::to_string)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -370,6 +426,10 @@ struct ExternalLink {
 }
 
 fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
+    tracing::trace!("Parsing schema definition from Databricks JSON response: {json_value}");
+
+    SqlWarehouseApi::verify_response_status(json_value)?;
+
     let data_array = json_value
         .get("result")
         .and_then(|r| r.get("data_array"))
@@ -484,26 +544,8 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
 
         let mut response = self.api.execute_request(&token, &payload).await?;
 
-        // Check if the response indicates a query failure
-        if let Some(status) = response.get("status").and_then(|s| s.get("state"))
-            && status == "FAILED"
-        {
-            let message = response
-                .get("status")
-                .and_then(|s| s.get("error"))
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .map(ToString::to_string)
-                .ok_or_else(|| {
-                    MissingJsonFieldSnafu {
-                        field: "status.error.message".to_string(),
-                    }
-                    .build()
-                })?;
-            return Err(Error::QueryFailure { message }.into());
-        }
+        SqlWarehouseApi::verify_response_status(&response)?;
 
-        // Get the result object if no error
         let result_object = response.get_mut("result").map(Value::take).ok_or_else(|| {
             MissingJsonFieldSnafu {
                 field: "result".to_string(),

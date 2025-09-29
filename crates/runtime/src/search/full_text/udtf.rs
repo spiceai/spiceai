@@ -274,14 +274,14 @@ impl TableFunctionImpl for TextSearchTableFunc {
         let mut fts_index = fts_index.clone();
         fts_index.search_fields = vec![column];
 
-        Ok(Arc::new(DimensionTrackedTableProvider {
-            inner: Arc::new(SearchQueryProvider::new(
-                Arc::new(fts_index) as Arc<dyn SearchIndex>,
+
+        Ok(Arc::new(TextSearchIndexProviderWrapper {
+            inner: Arc::new(SearchQueryProvider::try_from_index(
+                &(Arc::new(fts_index) as Arc<dyn SearchIndex>),
                 table_provider,
-                args.query.clone(),
+                args.query.as_str(),
                 args.limit,
-            )),
-            track: telemetry::track_text_search,
+            )?),
         }))
     }
 }
