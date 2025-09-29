@@ -97,7 +97,7 @@ impl DataConnectorFactory for SnowflakeFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
-                dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync,
+                dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync,
             > = Arc::new(
                 SnowflakeConnectionPool::new(&params.parameters.to_secret_map())
                     .await
@@ -145,13 +145,11 @@ impl DataConnector for Snowflake {
             })
             .join(".");
 
-        Ok(
-            Read::table_provider(&self.table_factory, path.into(), dataset.schema())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "snowflake",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+        Ok(Read::table_provider(&self.table_factory, path.into())
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "snowflake",
+                connector_component: ConnectorComponent::from(dataset),
+            })?)
     }
 }

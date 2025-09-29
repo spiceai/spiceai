@@ -15,57 +15,54 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v1.7 (September 2025)](https://github.com/spiceai/spiceai/milestone/75)
+### [v1.8 (October 2025)](https://github.com/spiceai/spiceai/milestone/77)
 
-**Focus:** Real-Time Write-Through Caching - Streamlined data and embedding caching with real-time ingestion.
+**Focus:** Hybrid Search.
 
-- **Query**:
-  - Regex support for DuckDB accelerator/connector.
+- **Hybrid Search**:
+  - Boosting and re-ranking for fine-tuned search results.
 - **Search**:
   - Amazon S3 Vectors cross-index query.
   - Amazon S3 Vectors chunking support.
-  - Reciprocal Rank Fusion (RRF) UDTF
-- **Caching**:
-  - Real-time write-through caching/acceleration for data and embeddings.
-  - xxHash (XXH3) results-caching algorithm support.
-- **Ingestion**:
-  - Real-time data consumption via Apache Kafka.
-  - Improved Debezium/Change Data Capture (CDC) mechanisms.
-- **DataFusion**: Upgrade to v49.
-
-### [v1.8 (October 2025)](https://github.com/spiceai/spiceai/milestone/77)
-
-**Focus:** Resource Management & Expanded Write Support - Fine-grained resource control and broader database compatibility.
-
-- **Resource Management**: Finer-grained runtime-wide control for optimized performance.
 - **Hash Partitioning**: Improved query distribution and performance.
 - **Write Support**:
-  - Write-through support to Apache Iceberg.
-  - MySQL write support.
-  - PostgreSQL write support (expanded).
-  - Spice Cloud write support (expanded).
-- **DuckDB**: Upgrade to v1.4.
+  - Write-through caching support for Apache Iceberg.
 - **DataFusion**: Upgrade to v50.
 
-### v1.9 (November 2025)
+### [v1.9 (November 2025)](https://github.com/spiceai/spiceai/milestone/78)
 
-**Focus:** Hybrid Search Enhancements - Advanced search capabilities for improved relevance and performance.
+**Focus:** Ingestion, Write, and Security.
 
-- **Hybrid Search**:
-  - Boosting and re-ranking for enhanced search results.
-- **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
+- **Write Support**:
+  - Apache Iceberg write support (expanded).
+- **Search**:
+  - Amazon S3 Vectors index spilling.
+- **DuckDB**: Upgrade to v1.4.
 - **DataFusion**: Upgrade to v51.
+- **Security**:
+  - Authentication improvements.
+  - Security hardening.
 
 ### v1.10 (December 2025)
 
-**Focus:** Extensibility - Flexible middleware for custom integrations.
+**Focus:** Lakehouse Architecture.
 
+- **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
+- **Write Support**:
+  - PostgreSQL write support (expanded).
+  - Spice Cloud write support (expanded).
+
+### v1.1x (H1 2026)
+
+**Focus:** Extensibility.
+
+- **Resource Management**: Finer-grained runtime-wide control for optimized performance.
 - **Extensible Middleware**:
   - Pluggable extensions for dynamic customization.
 
-### v2.0 (H1 2026)
+### v2.0 (H2 2026)
 
-**Focus:** Enterprise Policy & Governance - Robust security and compliance features.
+**Focus:** Governance.
 
 - **Policy Engine**:
   - Role-based security for fine-grained access control.

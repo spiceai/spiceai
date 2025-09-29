@@ -17,9 +17,7 @@ use async_openai::types::{
     EmbeddingVector, EncodingFormat,
 };
 use async_trait::async_trait;
-use cache::CacheProvider;
-use cache::key::CacheKey;
-use cache::result::embeddings::CachedEmbeddingResult;
+use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
@@ -146,6 +144,22 @@ pub trait Embed: Debug + Sync + Send {
 
     fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         None
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {
+        if let Some(model_name) = self.model_name() {
+            Some((model_name, input).into())
+        } else {
+            tracing::trace!(
+                "dyn Embed does not implement model_name, therefore cannot generate cache key solely against embedding input: {:?} ",
+                self
+            );
+            None
+        }
     }
 
     async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {

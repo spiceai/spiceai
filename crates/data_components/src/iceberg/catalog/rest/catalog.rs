@@ -20,10 +20,10 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use iceberg::{
-    Catalog, Error as IcebergError, ErrorKind, Namespace, NamespaceIdent, Result as IcebergResult,
-    TableCommit, TableCreation, TableIdent, io::CustomAwsCredentialLoader, table::Table,
+    Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation,
+    TableIdent, io::CustomAwsCredentialLoader, table::Table,
 };
-use iceberg_catalog_rest::{RestCatalog as IcebergRestCatalog, RestCatalogConfig};
+use iceberg_catalog_rest::RestCatalog as IcebergRestCatalog;
 
 #[derive(Debug)]
 pub struct RestCatalog {
@@ -32,11 +32,8 @@ pub struct RestCatalog {
 
 impl RestCatalog {
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
-    pub fn new(catalog_config: RestCatalogConfig) -> Self {
-        Self {
-            inner: IcebergRestCatalog::new(catalog_config),
-        }
+    pub fn new(inner: IcebergRestCatalog) -> Self {
+        Self { inner }
     }
 
     #[must_use]
@@ -52,6 +49,15 @@ impl RestCatalog {
 
 #[async_trait]
 impl Catalog for RestCatalog {
+    /// Register an existing table to the catalog.
+    async fn register_table(
+        &self,
+        table: &TableIdent,
+        metadata_location: String,
+    ) -> IcebergResult<Table> {
+        self.inner.register_table(table, metadata_location).await
+    }
+
     /// List namespaces inside the catalog.
     async fn list_namespaces(
         &self,
@@ -63,13 +69,10 @@ impl Catalog for RestCatalog {
     /// Create a new namespace inside the catalog.
     async fn create_namespace(
         &self,
-        _namespace: &NamespaceIdent,
-        _properties: HashMap<String, String>,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
     ) -> IcebergResult<Namespace> {
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Create namespace is not implemented",
-        ));
+        self.inner.create_namespace(namespace, properties).await
     }
 
     /// Get a namespace information from the catalog.
@@ -89,21 +92,15 @@ impl Catalog for RestCatalog {
     /// The properties must be the full set of namespace.
     async fn update_namespace(
         &self,
-        _namespace: &NamespaceIdent,
-        _properties: HashMap<String, String>,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
     ) -> IcebergResult<()> {
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Update namespace is not implemented",
-        ));
+        self.inner.update_namespace(namespace, properties).await
     }
 
     /// Drop a namespace from the catalog.
-    async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> IcebergResult<()> {
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Drop namespace is not implemented",
-        ));
+    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<()> {
+        self.inner.drop_namespace(namespace).await
     }
 
     /// List tables from namespace.
@@ -114,13 +111,10 @@ impl Catalog for RestCatalog {
     /// Create a new table inside the namespace.
     async fn create_table(
         &self,
-        _namespace: &NamespaceIdent,
-        _creation: TableCreation,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
     ) -> IcebergResult<Table> {
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Create table is not implemented",
-        ));
+        self.inner.create_table(namespace, creation).await
     }
 
     /// Load table from the catalog.
@@ -129,11 +123,8 @@ impl Catalog for RestCatalog {
     }
 
     /// Drop a table from the catalog.
-    async fn drop_table(&self, _table: &TableIdent) -> IcebergResult<()> {
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Drop table is not implemented",
-        ));
+    async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        self.inner.drop_table(table).await
     }
 
     /// Check if a table exists in the catalog.
@@ -142,25 +133,21 @@ impl Catalog for RestCatalog {
     }
 
     /// Rename a table in the catalog.
-    async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> IcebergResult<()> {
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Rename table is not implemented",
-        ));
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> IcebergResult<()> {
+        self.inner.rename_table(src, dest).await
     }
 
     /// Update a table to the catalog.
-    async fn update_table(&self, _commit: TableCommit) -> IcebergResult<Table> {
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Update table is not implemented",
-        ));
+    async fn update_table(&self, commit: TableCommit) -> IcebergResult<Table> {
+        self.inner.update_table(commit).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use datafusion::prelude::SessionContext;
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_rest::RestCatalogBuilder;
     use iceberg_datafusion::IcebergTableProvider;
     use std::sync::Arc;
 
@@ -176,18 +163,22 @@ mod tests {
     #[ignore = "requires local minio and spark cluster"]
     async fn test_rest_catalog() {
         let catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri("http://localhost:8181".to_string())
-                .props(HashMap::from([
-                    (
-                        "s3.endpoint".to_string(),
-                        "http://localhost:9000".to_string(),
-                    ),
-                    ("s3.access-key-id".to_string(), "admin".to_string()),
-                    ("s3.secret-access-key".to_string(), "password".to_string()),
-                    ("s3.region".to_string(), "us-east-1".to_string()),
-                ]))
-                .build(),
+            RestCatalogBuilder::default()
+                .load(
+                    "rest",
+                    HashMap::from([
+                        ("uri".to_string(), "http://localhost:8181".to_string()),
+                        (
+                            "s3.endpoint".to_string(),
+                            "http://localhost:9000".to_string(),
+                        ),
+                        ("s3.access-key-id".to_string(), "admin".to_string()),
+                        ("s3.secret-access-key".to_string(), "password".to_string()),
+                        ("s3.region".to_string(), "us-east-1".to_string()),
+                    ]),
+                )
+                .await
+                .expect("valid catalog"),
         );
 
         let namespaces = catalog.list_namespaces(None).await;

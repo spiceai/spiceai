@@ -248,7 +248,7 @@ impl SpiceCloudPlatformSchemaProvider {
                 .map(|name| {
                     let connector = Arc::clone(&connector);
                     async move {
-                        match connector.table_provider(name.clone(), None).await {
+                        match connector.table_provider(name.clone()).await {
                             Ok(provider) => Ok(provider),
                             Err(e) => Err(Error::TableProviderCreation {
                                 table: name.to_string(),

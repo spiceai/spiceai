@@ -22,6 +22,7 @@ use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
@@ -1077,6 +1078,14 @@ pub fn spice_data_base_path() -> String {
 
 #[allow(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
-    let base_folder = spice_data_base_path();
-    std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
+    make_spice_data_sub_directory(&[])?;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
+    let mut base_folder = PathBuf::from(spice_data_base_path());
+    base_folder.extend(directory);
+    std::fs::create_dir_all(base_folder.clone()).context(UnableToCreateDirectorySnafu)?;
+    Ok(base_folder)
 }

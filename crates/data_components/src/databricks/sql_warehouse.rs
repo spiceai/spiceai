@@ -98,7 +98,7 @@ pub enum Error {
 
 /// Main struct for interacting with Databricks SQL Warehouse
 pub struct DatabricksSqlWarehouse {
-    pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static (dyn Sync)> + Send + Sync>,
+    pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> + Send + Sync>,
 }
 
 impl DatabricksSqlWarehouse {
@@ -535,22 +535,15 @@ impl crate::Read for DatabricksSqlWarehouse {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let dialect = Arc::new(databricks_dialect());
 
-        let table_provider = match schema {
-            Some(schema) => Arc::new(
-                SqlTable::new_with_schema("databricks", &self.pool, schema, table_reference, None)
-                    .with_dialect(dialect),
-            ),
-            None => Arc::new(
-                SqlTable::new("databricks", &self.pool, table_reference, None)
-                    .await
-                    .context(SqlTableInitializationFailedSnafu)?
-                    .with_dialect(dialect),
-            ),
-        };
+        let table_provider = Arc::new(
+            SqlTable::new("databricks", &self.pool, table_reference, None)
+                .await
+                .context(SqlTableInitializationFailedSnafu)?
+                .with_dialect(dialect),
+        );
 
         Ok(Arc::new(
             table_provider

@@ -69,7 +69,7 @@ pub enum CacheKey<'a> {
     // Embedding keys could either be the full request (for distinguising between dimension count, encoding format, etc)
     // or just the individual input for less complex requests (e.g. via `.embed()` for some models instead of `.embed_request()`)
     EmbeddingRequest(&'a CreateEmbeddingRequest),
-    EmbeddingInput(&'a EmbeddingInput),
+    EmbeddingInput(&'a str, &'a EmbeddingInput),
 }
 
 impl<'a> From<&'a CreateEmbeddingRequest> for CacheKey<'a> {
@@ -78,9 +78,10 @@ impl<'a> From<&'a CreateEmbeddingRequest> for CacheKey<'a> {
     }
 }
 
-impl<'a> From<&'a EmbeddingInput> for CacheKey<'a> {
-    fn from(embedding_input: &'a EmbeddingInput) -> Self {
-        Self::EmbeddingInput(embedding_input)
+impl<'a> From<(&'a str, &'a EmbeddingInput)> for CacheKey<'a> {
+    fn from(input: (&'a str, &'a EmbeddingInput)) -> Self {
+        let (model_name, input) = input;
+        Self::EmbeddingInput(model_name, input)
     }
 }
 
@@ -91,7 +92,10 @@ impl CacheKey<'_> {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
             Self::Search(search_key) => search_key.hash(&mut hasher),
             Self::EmbeddingRequest(embedding_request) => embedding_request.hash(&mut hasher),
-            Self::EmbeddingInput(embedding_input) => embedding_input.hash(&mut hasher),
+            Self::EmbeddingInput(model_name, embedding_input) => {
+                model_name.hash(&mut hasher);
+                embedding_input.hash(&mut hasher);
+            }
             Self::Query(sql, param_values) => {
                 sql.hash(&mut hasher);
                 if let Some(params) = param_values {

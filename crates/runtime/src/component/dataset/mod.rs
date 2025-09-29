@@ -18,7 +18,6 @@ use super::{find_first_delimiter, validate_identifier};
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
 use app::App;
-use arrow::datatypes::SchemaRef;
 use datafusion::sql::{
     TableReference,
     sqlparser::{
@@ -31,10 +30,16 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::Column,
+    semantic::{Column, FullTextSearchConfig, IndexStore},
     vector::VectorStore,
 };
-use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 pub mod acceleration;
 pub mod builder;
@@ -111,17 +116,17 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum Mode {
+pub enum AccessMode {
     #[default]
     Read,
     ReadWrite,
 }
 
-impl From<spicepod_dataset::Mode> for Mode {
-    fn from(mode: spicepod_dataset::Mode) -> Self {
+impl From<spicepod_dataset::AccessMode> for AccessMode {
+    fn from(mode: spicepod_dataset::AccessMode) -> Self {
         match mode {
-            spicepod_dataset::Mode::Read => Mode::Read,
-            spicepod_dataset::Mode::ReadWrite => Mode::ReadWrite,
+            spicepod_dataset::AccessMode::Read => AccessMode::Read,
+            spicepod_dataset::AccessMode::ReadWrite => AccessMode::ReadWrite,
         }
     }
 }
@@ -252,7 +257,7 @@ impl Display for CheckAvailability {
 pub struct Dataset {
     pub from: String,
     pub name: TableReference,
-    pub mode: Mode,
+    pub access: AccessMode,
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
@@ -265,7 +270,6 @@ pub struct Dataset {
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Arc<App>,
-    schema: Option<SchemaRef>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
@@ -279,7 +283,7 @@ impl std::fmt::Debug for Dataset {
         f.debug_struct("Dataset")
             .field("from", &self.from)
             .field("name", &self.name)
-            .field("mode", &self.mode)
+            .field("access", &self.access)
             .field("params", &self.params)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
@@ -292,7 +296,6 @@ impl std::fmt::Debug for Dataset {
             .field("acceleration", &self.acceleration)
             .field("embeddings", &self.embeddings)
             .field("app", &self.app)
-            .field("schema", &self.schema)
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
@@ -309,7 +312,7 @@ impl PartialEq for Dataset {
     fn eq(&self, other: &Self) -> bool {
         self.from == other.from
             && self.name == other.name
-            && self.mode == other.mode
+            && self.access == other.access
             && self.params == other.params
             && self.has_metadata_table == other.has_metadata_table
             && self.replication == other.replication
@@ -319,7 +322,6 @@ impl PartialEq for Dataset {
             && self.time_partition_format == other.time_partition_format
             && self.acceleration == other.acceleration
             && self.embeddings == other.embeddings
-            && self.schema == other.schema
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
@@ -339,20 +341,9 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
-        self
-    }
-
-    #[must_use]
     pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
         self.params = params;
         self
-    }
-
-    #[must_use]
-    pub fn schema(&self) -> Option<SchemaRef> {
-        self.schema.clone()
     }
 
     #[allow(clippy::result_large_err)]
@@ -560,8 +551,8 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn mode(&self) -> Mode {
-        self.mode
+    pub fn access(&self) -> AccessMode {
+        self.access
     }
 
     #[must_use]
@@ -641,6 +632,99 @@ impl Dataset {
             .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
     }
 
+    #[allow(clippy::type_complexity)] // From a two-part `.unzip()`.
+    #[must_use]
+    pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
+        let (search_fields_and_primary_key_overrides, indexes): (
+            Vec<(String, Option<Vec<String>>)>,
+            Vec<(IndexStore, Option<String>)>,
+        ) = self
+            .columns
+            .iter()
+            .filter_map(|c| {
+                let Some(FullTextSearchConfig {
+                    enabled: true,
+                    row_ids,
+                    index_store,
+                    index_directory,
+                }) = &c.full_text_search
+                else {
+                    return None;
+                };
+
+                if index_store.is_some_and(|is| is == IndexStore::Memory) && index_directory.is_some() {
+                    tracing::warn!("Dataset '{}' column '{}' has `index_store: memory` but also sets `index_directory`. These options are mutually exclusive. Defaulting to `index_store: memory`.", self.name, c.name);
+                }
+                Some(((c.name.clone(), row_ids.clone()), (index_store.unwrap_or_default(), index_directory.clone())))
+            })
+            .unzip();
+        let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
+            search_fields_and_primary_key_overrides.into_iter().unzip();
+
+        // No columns have full text search fields defined.
+        if search_fields.is_empty() {
+            return None;
+        }
+
+        // For all full text search columns, find the first with a non-null primary key override and
+        // if there are multiple, warn if they are different.
+        let mut first_pks: Option<Vec<String>> = None;
+        let mut first_search_field: Option<String> = None;
+        for (search_field, pk_overrides) in search_fields.iter().zip(primary_key_overrides.iter()) {
+            let Some(mut pks) = pk_overrides.clone() else {
+                continue;
+            };
+            pks.sort();
+
+            // If this is not the first FTS column that defined row ids, check if they match the previous.
+            // Otherwise set to be used for next comparison.
+            if let (Some(f), Some(s)) = (&first_pks, &first_search_field) {
+                if *pks != *f {
+                    tracing::warn!(
+                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
+                        self.name(),
+                        s,
+                        f.join(", "),
+                        search_field,
+                        pks.join(", "),
+                    );
+                }
+            } else {
+                first_pks = Some(pks.clone());
+                first_search_field = Some(search_field.clone());
+            }
+        }
+
+        let index_paths: HashSet<String> = indexes
+            .iter()
+            .filter_map(|(_, directory)| directory.clone())
+            .collect();
+        let index_path_len = index_paths.len();
+        let index_path: Option<String> = index_paths.into_iter().next();
+
+        if let Some(ref path) = index_path
+            && index_path_len > 1
+        {
+            tracing::warn!(
+                "Dataset '{}' has several full text search index directories provided. Using '{path}'.",
+                self.name
+            );
+        }
+
+        let index_store = if indexes.iter().any(|(store, _)| *store == IndexStore::File) {
+            IndexStore::File
+        } else {
+            IndexStore::Memory
+        };
+
+        Some(FullTextSearchDatasetConfig {
+            index_store,
+            index_path,
+            search_fields,
+            primary_key: first_pks.unwrap_or_default(),
+        })
+    }
+
     /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
     ///  1. Primary key defined in `.columns[].embeddings[].row_id`
     ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
@@ -675,6 +759,14 @@ impl Dataset {
 
         Some(primary_keys)
     }
+}
+
+/// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
+pub struct FullTextSearchDatasetConfig {
+    pub index_store: IndexStore,
+    pub index_path: Option<String>,
+    pub search_fields: Vec<String>,
+    pub primary_key: Vec<String>,
 }
 
 impl AccelerationSource for Dataset {

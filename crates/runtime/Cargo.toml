@@ -186,7 +186,7 @@ azure_core = "0.27.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
-dirs = "5.0.1"
+dirs = "6.0.0"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
@@ -252,6 +252,7 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-write = []
+iceberg-write = []
 s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snowflake = [

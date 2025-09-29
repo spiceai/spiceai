@@ -16,3 +16,5 @@ rand.workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true

@@ -28,7 +28,7 @@ use runtime::{
         AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
     },
     component::dataset::{
-        Mode, TimeFormat,
+        AccessMode, TimeFormat,
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
         replication::Replication,
@@ -308,7 +308,7 @@ async fn get_spiceai_table_provider(
         .boxed()
         .context(UnableToCreateDataConnectorSnafu)?;
 
-    dataset.mode = Mode::ReadWrite;
+    dataset.access = AccessMode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
     let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())

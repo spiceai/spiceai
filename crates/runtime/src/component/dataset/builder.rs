@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    CheckAvailability, Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
-    acceleration, replication, validate_identifier,
+    AccessMode, CheckAvailability, Dataset, Error, ReadyState, Result, TimeFormat,
+    UnsupportedTypeAction, acceleration, replication, validate_identifier,
 };
 use crate::Runtime;
 use app::App;
@@ -39,7 +39,7 @@ use spicepod::{
 pub struct DatasetBuilder {
     pub from: String,
     pub name: TableReference,
-    pub mode: Mode,
+    pub access: AccessMode,
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
@@ -88,33 +88,18 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
             // We have a vector engine configured with no explicit acceleration - no indexing will happen.
-            if vector_engine.enabled {
-                if acceleration.is_none() {
-                    tracing::debug!(
-                        "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
-                        dataset.name
-                    );
-                }
-
-                // Chunking with vector engines is not supported (yet).
-                for column in &dataset.columns {
-                    for embedding in &column.embeddings {
-                        if embedding.chunking.is_some() {
-                            return Err(crate::Error::InvalidSpicepodDataset {
-                                source: Error::ChunkingNotSupportedForVectorEngine {
-                                    column: column.name.clone(),
-                                },
-                            });
-                        }
-                    }
-                }
+            if vector_engine.enabled && acceleration.is_none() {
+                tracing::debug!(
+                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
+                    dataset.name
+                );
             }
         }
 
         Ok(DatasetBuilder {
             from: dataset.from,
             name: table_reference,
-            mode: Mode::from(dataset.mode),
+            access: AccessMode::from(dataset.access),
             params: dataset
                 .params
                 .as_ref()
@@ -155,7 +140,7 @@ impl DatasetBuilder {
         Ok(DatasetBuilder {
             from,
             name: Self::parse_table_reference(name)?,
-            mode: Mode::default(),
+            access: AccessMode::default(),
             params: HashMap::default(),
             metadata: HashMap::default(),
             columns: Vec::default(),
@@ -242,7 +227,7 @@ impl DatasetBuilder {
         let dataset = Dataset {
             from: self.from,
             name: self.name,
-            mode: self.mode,
+            access: self.access,
             params: self.params,
             metadata: self.metadata,
             columns: self.columns,
@@ -255,7 +240,6 @@ impl DatasetBuilder {
             acceleration: self.acceleration,
             embeddings: self.embeddings,
             app,
-            schema: None,
             unsupported_type_action: self.unsupported_type_action,
             ready_state: self.ready_state,
             metrics: self.metrics,
