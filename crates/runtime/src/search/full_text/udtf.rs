@@ -48,7 +48,7 @@ use std::any::Any;
 use std::sync::LazyLock;
 use std::sync::{Arc, Weak};
 
-use crate::request::DimensionTrackedTableProvider;
+use crate::request::{AsyncMarker, RequestContext};
 use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
@@ -274,15 +274,18 @@ impl TableFunctionImpl for TextSearchTableFunc {
         let mut fts_index = fts_index.clone();
         fts_index.search_fields = vec![column];
 
-
-        Ok(Arc::new(TextSearchIndexProviderWrapper {
-            inner: Arc::new(SearchQueryProvider::try_from_index(
+        Ok(Arc::new(
+            SearchQueryProvider::try_from_index(
                 &(Arc::new(fts_index) as Arc<dyn SearchIndex>),
                 table_provider,
                 args.query.as_str(),
                 args.limit,
-            )?),
-        }))
+            )?
+            .call_on_scan(|| async {
+                let request_context = RequestContext::current(AsyncMarker::new().await);
+                telemetry::track_text_search(request_context);
+            }),
+        ))
     }
 }
 

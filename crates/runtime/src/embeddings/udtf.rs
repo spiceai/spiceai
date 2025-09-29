@@ -66,12 +66,12 @@ use snafu::ResultExt;
 #[cfg(feature = "s3_vectors")]
 use crate::embeddings::index::s3::S3Vector;
 
-use crate::request::DimensionTrackedTableProvider;
 use crate::{
     datafusion::DataFusion,
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
+    request::{AsyncMarker, RequestContext},
     search::util::{
         find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
         to_column_expr,
@@ -326,12 +326,18 @@ impl VectorSearchTableFunc {
             return Ok(None);
         };
 
-        Ok(Some(Arc::new(SearchQueryProvider::try_from_index(
-            &vector_index,
-            Arc::clone(tbl),
-            args.query.as_str(),
-            args.limit,
-        )?)))
+        Ok(Some(Arc::new(
+            SearchQueryProvider::try_from_index(
+                &vector_index,
+                Arc::clone(tbl),
+                args.query.as_str(),
+                args.limit,
+            )?
+            .call_on_scan(|| async {
+                let request_context = RequestContext::current(AsyncMarker::new().await);
+                telemetry::track_vector_search(request_context);
+            }),
+        )))
     }
 }
 
@@ -353,10 +359,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         // For table with a vector engine, use it.
         #[cfg(feature = "s3_vectors")]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
-            return Ok(Arc::new(DimensionTrackedTableProvider {
-                inner: table_provider,
-                track: telemetry::track_vector_search,
-            }));
+            return Ok(table_provider);
         }
 
         // If an embedding column is defined, fallback to JIT or.
@@ -376,14 +379,11 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             )));
         }
 
-        Ok(Arc::new(DimensionTrackedTableProvider {
-            inner: Arc::new(VectorSearchUDTFProvider {
-                args,
-                underlying: Arc::clone(&table_provider),
-                embedded_columns: embedding_table_provider.embedded_columns.clone(),
-                embedding_models: Arc::clone(&embedding_table_provider.embedding_models),
-            }),
-            track: telemetry::track_vector_search,
+        Ok(Arc::new(VectorSearchUDTFProvider {
+            args,
+            underlying: Arc::clone(&table_provider),
+            embedded_columns: embedding_table_provider.embedded_columns.clone(),
+            embedding_models: Arc::clone(&embedding_table_provider.embedding_models),
         }))
     }
 }
@@ -502,6 +502,8 @@ impl TableProvider for VectorSearchUDTFProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_vector_search(request_context);
         let (col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
 
         let query_vector = self

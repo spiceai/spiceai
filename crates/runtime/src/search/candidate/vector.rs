@@ -1,3 +1,4 @@
+use crate::request::{AsyncMarker, RequestContext};
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -273,6 +274,8 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
         addition_projection: &[&Expr],
         limit: usize,
     ) -> search::generation::Result<SendableRecordBatchStream> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_vector_search(request_context);
         let embedding = self
             .embed_query(query.as_str())
             .await
