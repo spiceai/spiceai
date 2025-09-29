@@ -1046,6 +1046,22 @@
         "enabled": {
           "type": "boolean"
         },
+        "index_directory": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "index_store": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IndexStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "row_id": {
           "type": [
             "array",
@@ -1069,6 +1085,13 @@
         "xxh32",
         "xxh64",
         "xxh128"
+      ]
+    },
+    "IndexStore": {
+      "type": "string",
+      "enum": [
+        "memory",
+        "file"
       ]
     },
     "IndexType": {
