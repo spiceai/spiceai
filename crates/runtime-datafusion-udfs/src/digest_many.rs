@@ -26,6 +26,7 @@ use datafusion::{
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
 use std::any::Any;
+use std::fmt::{Debug, Write};
 use std::sync::{Arc, LazyLock};
 
 pub static DIGEST_UDF_NAME: &str = "digest_many";
@@ -122,18 +123,20 @@ impl ScalarUDFImpl for DigestMany {
         let hash_fn = Self::concrete_hash_function(args.pop())?;
 
         // Collect variadic args into one string for hashing
-        let hash_me: String = args
-            .into_iter()
-            .map(|c| match c {
-                ColumnarValue::Array(array) => array
-                    .to_data()
-                    .buffers()
-                    .iter()
-                    .flat_map(|b| b.iter().map(|b| format!("{b:02X}")))
-                    .collect::<String>(),
-                ColumnarValue::Scalar(scalar) => format!("{scalar}"),
-            })
-            .collect::<String>();
+        let mut hash_me = String::with_capacity(32 * args.len());
+        for arg in args {
+            match arg {
+                ColumnarValue::Array(array) => {
+                    for buf in array.to_data().buffers() {
+                        for b in buf.as_slice() {
+                            write!(&mut hash_me, "{b:02X}")?;
+                        }
+                    }
+                }
+
+                ColumnarValue::Scalar(scalar) => write!(&mut hash_me, "{scalar}")?,
+            }
+        }
 
         hash_fn.invoke_with_args(Self::make_scalar_function_args(vec![
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me))),
