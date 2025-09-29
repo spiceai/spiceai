@@ -111,6 +111,7 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
     - https://spice.ai/spicehq/iceberg-ai-demo
     - https://spice.ai/spicehq/ai-platform
     - https://spice.ai/spicehq/embedding-server
+    - https://spice.ai/spicehq/scp-synthetics-test-app
   - spiceai:
     - https://spice.ai/spiceai/react
     - https://spice.ai/spiceai/tpch
