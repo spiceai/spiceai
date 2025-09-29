@@ -98,7 +98,9 @@ impl ScalarUDFImpl for DigestMany {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
-        exec_err!("{DIGEST_UDF_NAME}: return type is input-dependent. Use return_field_from_args instead.")
+        exec_err!(
+            "{DIGEST_UDF_NAME}: return type is input-dependent. Use return_field_from_args instead."
+        )
     }
 
     // Delegate this to the underlying hash function, as it may want to return {Binary, Utf8, Utf8View}
