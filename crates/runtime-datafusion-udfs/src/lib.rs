@@ -18,5 +18,6 @@ pub mod ai;
 pub mod alias;
 pub mod bucket;
 pub mod cosine_distance;
+pub mod digest_many;
 pub mod embed;
 pub mod truncate;

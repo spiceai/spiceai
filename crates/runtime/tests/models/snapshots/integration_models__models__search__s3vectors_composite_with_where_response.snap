@@ -27,6 +27,28 @@ snapshot_kind: text
         "question": "<refined question>"
       },
       "score": 0.82
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "The Cat does not need to drink, as it obtains sufficient water from its prey."
+      },
+      "primary_key": {
+        "id": 438,
+        "question": "How does the Cat obtain water?"
+      },
+      "score": 0.8
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "A common thermometer operates on the principle that matter usually expands when it absorbs heat energy."
+      },
+      "primary_key": {
+        "id": 1041,
+        "question": "What is the principle behind the operation of a common thermometer?"
+      },
+      "score": 0.77
     }
   ]
 }

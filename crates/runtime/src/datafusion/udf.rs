@@ -21,7 +21,7 @@ use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc}
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use datafusion::functions::math::random::RandomFunc;
-use runtime_datafusion_udfs::{ai, alias, bucket, cosine_distance, embed, truncate};
+use runtime_datafusion_udfs::{ai, alias, bucket, cosine_distance, digest_many, embed, truncate};
 
 pub fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
@@ -49,4 +49,5 @@ pub fn register_udfs(runtime: &crate::Runtime) {
     );
     ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
     ctx.register_udf(ai::Ai::new(runtime.completion_llms()).into_async_udf().into_scalar_udf());
+    ctx.register_udf(digest_many::INSTANCE.clone());
 }

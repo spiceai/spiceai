@@ -22,3 +22,4 @@ version,qa_start_time,qa_end_time,human_count,human_hours,recipes_total,recipes_
 1.5.2,2025-08-11T14:43:00Z,2025-08-11T21:29:00Z,6,7,74,74,8,AI QA engineer runs recipes post-release.
 1.6.0,2025-08-25T17:00:00Z,2025-08-26T21:00:00Z,8,18,77,77,0,AI QA engineer testing skipped.
 1.6.1,2025-09-01T19:00:00Z,2025-09-01T23:00:00Z,2,3,77,6,0,Only selected recipes were tested; AI QA engineer testing skipped
+1.7.0,2025-09-22T17:00:00Z,2025-09-22T22:00:00Z,7,12,78,78,0,AI QA engineer testing skipped.

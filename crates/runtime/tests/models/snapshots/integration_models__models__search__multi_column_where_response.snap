@@ -8,12 +8,13 @@ expression: normalize_search_response(resp)
     {
       "dataset": "multi_column_search",
       "matches": {
+        "cp_department": "DEPARTMENT",
         "cp_description": "Years must understand. Well fat thousands take. Good police "
       },
       "primary_key": {
         "cp_catalog_page_sk": 7
       },
-      "score": 0.01
+      "score": 0.03
     },
     {
       "dataset": "multi_column_search",
@@ -28,10 +29,10 @@ expression: normalize_search_response(resp)
     {
       "dataset": "multi_column_search",
       "matches": {
-        "cp_description": "Good questions borrow only base children. Remarkably present "
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 19
+        "cp_catalog_page_sk": 5
       },
       "score": 0.01
     }
