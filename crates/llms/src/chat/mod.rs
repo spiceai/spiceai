@@ -12,7 +12,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_openai::types::{
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs,
 };
 use async_stream::stream;
