@@ -13,7 +13,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use async_openai::types::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestSystemMessageArgs,
-    CreateChatCompletionRequestArgs,
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
 };
 use async_stream::stream;
 use async_trait::async_trait;
@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{path::Path, pin::Pin};
+use tracing::Span;
 use tracing_futures::Instrument;
 
 use async_openai::{
@@ -533,36 +534,29 @@ pub fn message_to_mistral(
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        let span = tracing::Span::current();
-
         async move {
-            let req = CreateChatCompletionRequestArgs::default()
-                .messages(vec![
-                    ChatCompletionRequestSystemMessageArgs::default()
-                        .content(prompt)
-                        .build()
-                        .boxed()
-                        .context(FailedToLoadTokenizerSnafu)?
-                        .into(),
-                ])
-                .build()
-                .boxed()
-                .context(FailedToLoadModelSnafu)?;
-
-            let resp = self
-                .chat_request(req)
-                .await
-                .boxed()
-                .context(FailedToRunModelSnafu)?;
-
-            Ok(resp
+            Ok::<Option<String>, OpenAIError>(
+                self.chat_request(
+                    CreateChatCompletionRequestArgs::default()
+                        .messages(vec![
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(prompt)
+                                .build()?
+                                .into(),
+                        ])
+                        .build()?,
+                )
+                .instrument(Span::current())
+                .await?
                 .choices
-                .into_iter()
-                .next()
-                .and_then(|c| c.message.content))
+                .pop()
+                .and_then(|c| c.message.content),
+            )
         }
-        .instrument(span)
+        .instrument(Span::current())
         .await
+        .boxed()
+        .context(FailedToLoadModelSnafu)
     }
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.

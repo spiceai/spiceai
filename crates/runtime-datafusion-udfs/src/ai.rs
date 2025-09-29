@@ -19,7 +19,8 @@ limitations under the License.
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow_schema::DataType;
 use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, CompletionUsage, CreateChatCompletionRequestArgs,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs, CompletionUsage,
+    CreateChatCompletionRequestArgs,
 };
 use async_trait::async_trait;
 use datafusion::common::cast::as_string_array;
@@ -32,13 +33,14 @@ use datafusion::{
     common::{Result as DataFusionResult, exec_err, not_impl_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
+use futures::{StreamExt, TryStreamExt};
 use llms::chat::Chat;
+use snafu::ResultExt;
 use std::any::Any;
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 
 pub static AI_UDF_NAME: &str = "ai";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
@@ -151,9 +153,7 @@ impl AsyncScalarUDFImpl for Ai {
         let model_name = if args.args.len() == 2 {
             let model_arg = &args.args[1];
             match model_arg {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
-                    model_name.clone()
-                }
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => model_name.clone(),
                 _ => {
                     return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
                 }
@@ -173,13 +173,12 @@ impl AsyncScalarUDFImpl for Ai {
         match args_arrays.len() {
             1 => {
                 let [message_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array, &model_name)
+                self.process_messages(Arc::clone(model), message_array)
                     .await
             }
             2 => {
-                let [message_array, _model_array] =
-                    take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array, &model_name)
+                let [message_array, _model_array] = take_function_args(self.name(), args_arrays)?;
+                self.process_messages(Arc::clone(model), message_array)
                     .await
             }
             _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
@@ -188,119 +187,59 @@ impl AsyncScalarUDFImpl for Ai {
 }
 
 impl Ai {
+    async fn call_model(
+        model: &Arc<dyn Chat>,
+        message: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
+        let resp = model
+            .chat_request(
+                CreateChatCompletionRequestArgs::default()
+                    .messages(vec![
+                        ChatCompletionRequestUserMessageArgs::default()
+                            .content(message)
+                            .build()
+                            .boxed()
+                            .map_err(DataFusionError::External)?
+                            .into(),
+                    ])
+                    .build()
+                    .boxed()?,
+            )
+            .await
+            .boxed()?
+            .choices
+            .pop()
+            .and_then(|c| c.message.content);
+
+        Ok(resp)
+    }
+
     async fn process_messages(
         &self,
         model: Arc<dyn Chat>,
         message_array: ArrayRef,
-        model_name: &str,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
         let mut results = Vec::with_capacity(message_array.len());
-
-        // Capture the current parent span for parent-child relationships
-        let parent_span = tracing::Span::current();
-
+        let parent_span = Span::current();
         for message_opt in message_array.iter() {
-            let result = match message_opt {
-                Some(message) => {
-                    // Create span as a child of the parent span (sql_query)
-                    let span = tracing::span!(
-                        target: "task_history",
-                        parent: &parent_span,
-                        tracing::Level::INFO,
-                        "ai",
-                        model = %model_name,
-                        input = %message
-                    );
-
-                    // Execute AI operation within the child span
-                    let ai_result = async {
-                        // Create a proper chat completion request with streaming enabled
-                        let chat_request = CreateChatCompletionRequestArgs::default()
-                            .model(model_name.to_string())
-                            .messages(vec![
-                                ChatCompletionRequestSystemMessageArgs::default()
-                                    .content(message.to_string())
-                                    .build()
-                                    .map_err(|e| async_openai::error::OpenAIError::from(e))
-                                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-                                    .into(),
-                            ])
-                            .stream(true) // Enable streaming
-                            .build()
-                            .map_err(|e| async_openai::error::OpenAIError::from(e))
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                        // Execute the AI call using streaming
-                        let mut stream = model.chat_stream(chat_request).await
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        
-                        // Collect streaming response
-                        let mut content_parts = Vec::new();
-                        let mut usage: Option<CompletionUsage> = None;
-                        
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(chunk_response) => {
-                                    // Collect content from each chunk
-                                    if let Some(choice) = chunk_response.choices.first() {
-                                        if let Some(content) = &choice.delta.content {
-                                            content_parts.push(content.clone());
-                                        }
-                                    }
-                                    
-                                    // Capture usage information from the final chunk
-                                    if chunk_response.usage.is_some() {
-                                        usage = chunk_response.usage;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(target: "task_history", "{e}");
-                                    return Err(DataFusionError::External(Box::new(e)));
-                                }
-                            }
-                        }
-                        
-                        // Combine all content parts into final response
-                        let final_content = content_parts.join("");
-                        
-                        // Log token usage information if available
-                        if let Some(ref usage) = usage {
-                            tracing::info!(
-                                target: "task_history",
-                                input_tokens = %usage.prompt_tokens,
-                                output_tokens = %usage.completion_tokens,
-                                total_tokens = %usage.total_tokens,
-                                "labels"
-                            );
-                        }
-
-                        let response_text = if final_content.is_empty() { None } else { Some(final_content) };
-
-                        // Log the response
-                        match &response_text {
-                            Some(text) => {
-                                tracing::info!(target: "task_history", captured_output = %text, "labels");
-                            }
-                            None => {
-                                tracing::info!(target: "task_history", captured_output = "", "labels");
-                            }
-                        }
-
-                        Ok(response_text)
+            let result = if let Some(message) = message_opt {
+                match Self::call_model(&model, message)
+                    .instrument(parent_span.clone())
+                    .await
+                {
+                    Ok(Some(result)) => {
+                        tracing::info!(target: "task_history", captured_output = %result.clone(), "labels");
+                        Some(result)
                     }
-                    .instrument(span.clone())
-                    .await;
-
-                    match ai_result {
-                        Ok(response_text) => response_text,
-                        Err(e) => {
-                            tracing::error!(target: "task_history", "{e}");
-                            return Err(e);
-                        }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::error!(target: "task_history", parent: &parent_span, "{e}");
+                        return Err(DataFusionError::External(e));
                     }
                 }
-                None => None,
+            } else {
+                None
             };
             results.push(result);
         }
@@ -313,6 +252,7 @@ impl Ai {
 mod tests {
     use super::*;
     use arrow_schema::DataType;
+    use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
     use datafusion::logical_expr::{ScalarUDFImpl, Volatility};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -338,7 +278,7 @@ mod tests {
             req: CreateChatCompletionRequest,
         ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
             use async_stream::stream;
-            
+
             // Extract the prompt from the request
             let prompt = req
                 .messages
@@ -356,7 +296,7 @@ mod tests {
 
             let response_text = format!("Response from {}: {}", self.name, prompt);
             let model_name = self.name.clone(); // Clone for the stream
-            
+
             // Create a simple stream that yields the response
             let stream = stream! {
                 // Yield content chunk
@@ -381,7 +321,7 @@ mod tests {
                     system_fingerprint: None,
                     service_tier: None,
                 });
-                
+
                 // Yield final chunk with usage
                 yield Ok(CreateChatCompletionStreamResponse {
                     id: "test-stream-id".to_string(),
@@ -400,7 +340,7 @@ mod tests {
                     service_tier: None,
                 });
             };
-            
+
             Ok(Box::pin(stream))
         }
 
@@ -657,10 +597,10 @@ mod tests {
             _req: CreateChatCompletionRequest,
         ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
             use async_stream::stream;
-            
+
             // Create a stream that yields empty content
             let stream = stream! {
-                // Yield empty content chunk  
+                // Yield empty content chunk
                 yield Ok(CreateChatCompletionStreamResponse {
                     id: "null-stream-id".to_string(),
                     model: "null-model".to_string(),
@@ -682,7 +622,7 @@ mod tests {
                     system_fingerprint: None,
                     service_tier: None,
                 });
-                
+
                 // Yield final chunk with usage
                 yield Ok(CreateChatCompletionStreamResponse {
                     id: "null-stream-id".to_string(),
@@ -701,7 +641,7 @@ mod tests {
                     service_tier: None,
                 });
             };
-            
+
             Ok(Box::pin(stream))
         }
 
