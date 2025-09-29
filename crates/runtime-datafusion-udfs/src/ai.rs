@@ -18,12 +18,8 @@ limitations under the License.
 
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow_schema::DataType;
-use async_openai::error::ApiError;
 use async_openai::types::{
-    ChatChoice, ChatCompletionRequestSystemMessageArgs, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason, Role,
+    ChatCompletionRequestSystemMessageArgs, CompletionUsage, CreateChatCompletionRequestArgs,
 };
 use async_trait::async_trait;
 use datafusion::common::cast::as_string_array;
@@ -146,72 +142,48 @@ impl AsyncScalarUDFImpl for Ai {
         args: ScalarFunctionArgs,
         _config: &datafusion::config::ConfigOptions,
     ) -> DataFusionResult<ArrayRef> {
-        // Capture the current tracing context for direct parent-child relationships
-        let parent_span = tracing::Span::current();
-
         if args.args.is_empty() || args.args.len() > 2 {
             return exec_err!(
                 "{AI_UDF_NAME} expects one or two arguments: message and optional model_name"
             );
         }
 
-        // Execute the UDF within the current span context to maintain parent-child relationships
-        async move {
-            if args.args.is_empty() || args.args.len() > 2 {
-                return exec_err!(
-                    "{AI_UDF_NAME} expects one or two arguments: message and optional model_name"
-                );
+        let model_name = if args.args.len() == 2 {
+            let model_arg = &args.args[1];
+            match model_arg {
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
+                    model_name.clone()
+                }
+                _ => {
+                    return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
+                }
             }
+        } else {
+            self.get_default_model_name().await?
+        };
 
-            let model_name = if args.args.len() == 2 {
-                let model_arg = &args.args[1];
-                match model_arg {
-                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
-                        model_name.clone()
-                    }
-                    _ => {
-                        return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
-                    }
-                }
-            } else {
-                self.get_default_model_name().await?
-            };
+        let model_store = self.model_store.read().await;
+        let Some(model) = model_store.get(&model_name) else {
+            return exec_err!("{AI_UDF_NAME} cannot find model '{model_name}'");
+        };
 
-            let model_store = self.model_store.read().await;
-            let Some(model) = model_store.get(&model_name) else {
-                return exec_err!("{AI_UDF_NAME} cannot find model '{model_name}'");
-            };
+        // Convert arguments to arrays for consistency
+        let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
 
-            // Convert arguments to arrays for consistency
-            let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
-
-            match args_arrays.len() {
-                1 => {
-                    let [message_array] = take_function_args(self.name(), args_arrays)?;
-                    self.process_messages(
-                        Arc::clone(model),
-                        message_array,
-                        &model_name,
-                        parent_span.clone(),
-                    )
+        match args_arrays.len() {
+            1 => {
+                let [message_array] = take_function_args(self.name(), args_arrays)?;
+                self.process_messages(Arc::clone(model), message_array, &model_name)
                     .await
-                }
-                2 => {
-                    let [message_array, _model_array] =
-                        take_function_args(self.name(), args_arrays)?;
-                    self.process_messages(
-                        Arc::clone(model),
-                        message_array,
-                        &model_name,
-                        parent_span.clone(),
-                    )
-                    .await
-                }
-                _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
             }
+            2 => {
+                let [message_array, _model_array] =
+                    take_function_args(self.name(), args_arrays)?;
+                self.process_messages(Arc::clone(model), message_array, &model_name)
+                    .await
+            }
+            _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
         }
-        .instrument(parent_span_for_instrument)
-        .await
     }
 }
 
@@ -221,10 +193,12 @@ impl Ai {
         model: Arc<dyn Chat>,
         message_array: ArrayRef,
         model_name: &str,
-        parent_span: tracing::Span,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
         let mut results = Vec::with_capacity(message_array.len());
+
+        // Capture the current parent span for parent-child relationships
+        let parent_span = tracing::Span::current();
 
         for message_opt in message_array.iter() {
             let result = match message_opt {
@@ -232,17 +206,15 @@ impl Ai {
                     // Create span as a child of the parent span (sql_query)
                     let span = tracing::span!(
                         target: "task_history",
+                        parent: &parent_span,
                         tracing::Level::INFO,
                         "ai",
                         model = %model_name,
                         input = %message
                     );
 
-                    // Execute AI operation within the child span instrumented with parent context
-                    let _parent_guard = parent_span.enter();
+                    // Execute AI operation within the child span
                     let ai_result = async {
-                        tracing::info!("AI span created and entered");
-
                         // Create a proper chat completion request with streaming enabled
                         let chat_request = CreateChatCompletionRequestArgs::default()
                             .model(model_name.to_string())
@@ -283,7 +255,7 @@ impl Ai {
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!(target: "task_history", parent: &span, "{e}");
+                                    tracing::error!(target: "task_history", "{e}");
                                     return Err(DataFusionError::External(Box::new(e)));
                                 }
                             }
@@ -296,7 +268,6 @@ impl Ai {
                         if let Some(ref usage) = usage {
                             tracing::info!(
                                 target: "task_history",
-                                parent: &span,
                                 input_tokens = %usage.prompt_tokens,
                                 output_tokens = %usage.completion_tokens,
                                 total_tokens = %usage.total_tokens,
@@ -309,10 +280,10 @@ impl Ai {
                         // Log the response
                         match &response_text {
                             Some(text) => {
-                                tracing::info!(target: "task_history", parent: &span, captured_output = %text, "labels");
+                                tracing::info!(target: "task_history", captured_output = %text, "labels");
                             }
                             None => {
-                                tracing::info!(target: "task_history", parent: &span, captured_output = "", "labels");
+                                tracing::info!(target: "task_history", captured_output = "", "labels");
                             }
                         }
 
@@ -324,8 +295,8 @@ impl Ai {
                     match ai_result {
                         Ok(response_text) => response_text,
                         Err(e) => {
-                            tracing::error!(target: "task_history", parent: &span, "{e}");
-                            return Err(DataFusionError::External(Box::new(e)));
+                            tracing::error!(target: "task_history", "{e}");
+                            return Err(e);
                         }
                     }
                 }
@@ -805,9 +776,8 @@ mod tests {
         let model = model_store_guard.get("test-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
-        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model", test_span)
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await
             .unwrap();
 
@@ -832,9 +802,8 @@ mod tests {
             Some("How are you?"),
             Some("Goodbye"),
         ]));
-        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model", test_span)
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await
             .unwrap();
 
@@ -864,9 +833,8 @@ mod tests {
             None,
             Some("Goodbye"),
         ]));
-        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "test-model", test_span)
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await
             .unwrap();
 
@@ -889,9 +857,8 @@ mod tests {
         let model = model_store_guard.get("error-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
-        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "error-model", test_span)
+            .process_messages(Arc::clone(model), messages, "error-model")
             .await;
 
         assert!(result.is_err());
@@ -912,9 +879,8 @@ mod tests {
         let model = model_store_guard.get("null-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
-        let test_span = tracing::span!(tracing::Level::INFO, "test");
         let result = udf
-            .process_messages(Arc::clone(model), messages, "null-model", test_span)
+            .process_messages(Arc::clone(model), messages, "null-model")
             .await
             .unwrap();
 
@@ -1005,12 +971,7 @@ mod tests {
         // Test that process_messages can accept and use a parent span without errors
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
         let result = udf
-            .process_messages(
-                Arc::clone(model),
-                messages,
-                "test-model",
-                sql_query_span.clone(),
-            )
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await;
 
         // The test passes if process_messages executes without error using the parent span
@@ -1127,11 +1088,10 @@ mod tests {
         let model_store_guard = model_store.read().await;
         let model = model_store_guard.get("test-model").unwrap();
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
-        let test_span = tracing::Span::current();
 
         tracing::info!("About to call process_messages");
         let _result = udf
-            .process_messages(Arc::clone(model), messages, "test-model", test_span)
+            .process_messages(Arc::clone(model), messages, "test-model")
             .await;
         tracing::info!("process_messages completed");
 
