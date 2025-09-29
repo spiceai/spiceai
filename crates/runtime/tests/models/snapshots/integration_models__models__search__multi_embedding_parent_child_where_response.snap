@@ -12,7 +12,7 @@ snapshot_kind: text
         "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 4
+        "cp_catalog_page_sk": 2
       },
       "score": 0.01
     },
@@ -29,10 +29,10 @@ snapshot_kind: text
     {
       "dataset": "multiple_columns",
       "matches": {
-        "cp_department": "DEPARTMENT"
+        "cp_description": "Members comfort major horses. All good vehicles must perform ago wrong new conditions. Pl"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 6
+        "cp_catalog_page_sk": 20
       },
       "score": 0.01
     }
