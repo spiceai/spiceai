@@ -16,10 +16,7 @@ use std::{any::Any, cmp::min, sync::Arc};
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
     generation::{
-        text_search::{
-            DEFAULT_BATCH_SIZE, DEFAULT_LIMIT_MAXIMUM, FullTextSearchFieldIndex,
-            exec::FullTextSearchExec,
-        },
+        text_search::{DEFAULT_LIMIT_MAXIMUM, FullTextSearchFieldIndex, exec::FullTextSearchExec},
         util::append_fields,
     },
 };
