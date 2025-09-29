@@ -3,31 +3,31 @@ source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4"
 snapshot_kind: text
 ---
-+---------------+-------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                              |
-+---------------+-------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: vector_search(qs, Utf8("second")).id, vector_search(qs, Utf8("second")).answer                        |
-|               |   Sort: vector_search(qs, Utf8("second")).score DESC NULLS FIRST, fetch=4                                         |
-|               |     BytesProcessedNode                                                                                            |
-|               |       TableScan: vector_search(qs, Utf8("second")) projection=[id, answer, score]                                 |
-| physical_plan | ProjectionExec: expr=[id@0 as id, answer@1 as answer]                                                             |
-|               |   SortPreservingMergeExec: [score@2 DESC], fetch=4                                                                |
-|               |     SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]                                    |
-|               |       BytesProcessedExec                                                                                          |
-|               |         ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                   |
-|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3] |
-|               |             CoalescePartitionsExec                                                                                |
-|               |               BytesProcessedExec                                                                                  |
-|               |                 ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                        |
-|               |                   BytesProcessedExec                                                                              |
-|               |                     CooperativeExec                                                                               |
-|               |                       CooperativeExec                                                                             |
-|               |                         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                      |
-|               |                           CooperativeExec                                                                         |
-|               |                             S3VectorsQueryExec: limit=30                                                          |
-|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                  |
-|               |               BytesProcessedExec                                                                                  |
-|               |                 SchemaCastScanExec                                                                                |
-|               |                   DataSourceExec: partitions=1, partition_sizes=[1]                                               |
-|               |                                                                                                                   |
-+---------------+-------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                    |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: vector_search(qs, Utf8("second")).id, vector_search(qs, Utf8("second")).answer                                              |
+|               |   Sort: vector_search(qs, Utf8("second")).score DESC NULLS FIRST, fetch=4                                                               |
+|               |     Projection: vector_search(qs, Utf8("second")).id, vector_search(qs, Utf8("second")).answer, vector_search(qs, Utf8("second")).score |
+|               |       BytesProcessedNode                                                                                                                |
+|               |         TableScan: vector_search(qs, Utf8("second")) projection=[answer, id, score]                                                     |
+| physical_plan | ProjectionExec: expr=[id@0 as id, answer@1 as answer]                                                                                   |
+|               |   SortPreservingMergeExec: [score@2 DESC], fetch=4                                                                                      |
+|               |     SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]                                                          |
+|               |       ProjectionExec: expr=[id@1 as id, answer@0 as answer, score@2 as score]                                                           |
+|               |         BytesProcessedExec                                                                                                              |
+|               |           ProjectionExec: expr=[answer@2 as answer, id@0 as id, score@1 as score]                                                       |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3]                     |
+|               |               CoalescePartitionsExec                                                                                                    |
+|               |                 ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                              |
+|               |                   BytesProcessedExec                                                                                                    |
+|               |                     CooperativeExec                                                                                                     |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                              |
+|               |                         CooperativeExec                                                                                                 |
+|               |                           S3VectorsQueryExec: limit=30                                                                                  |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                      |
+|               |                 BytesProcessedExec                                                                                                      |
+|               |                   SchemaCastScanExec                                                                                                    |
+|               |                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                   |
+|               |                                                                                                                                         |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+

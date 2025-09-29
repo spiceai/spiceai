@@ -354,23 +354,27 @@ pub mod tests {
             Ok(record)
         }
 
-        async fn query_table_provider(
-            &self,
-            _query: &str,
-        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        fn query_table_provider(&self, _query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
                 vec![Arc::new(Field::new("score", DataType::Float64, false))],
             );
-
-            Ok(Arc::new(ExplainMemTable::new(
-                MemTable::try_new(
-                    Arc::clone(&schema),
-                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
-                )
-                .boxed()?,
-                "PretendVectorIndex",
-            )) as Arc<dyn TableProvider>)
+            Ok(LogicalPlan::TableScan(TableScan::try_new(
+                "explain",
+                Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                    MemTable::try_new(
+                        Arc::clone(&schema),
+                        vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                    )
+                    .boxed()?,
+                    "PretendVectorIndex",
+                ))
+                    as Arc<dyn TableProvider>)),
+                None,
+                vec![],
+                None,
+            )?)
+            .into())
         }
     }
 
