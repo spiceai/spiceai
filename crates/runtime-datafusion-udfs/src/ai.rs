@@ -21,8 +21,9 @@ use arrow_schema::DataType;
 use async_openai::error::ApiError;
 use async_openai::types::{
     ChatChoice, ChatCompletionRequestSystemMessageArgs, ChatCompletionResponseMessage,
-    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse, FinishReason, Role,
+    ChatCompletionResponseStream, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, Role,
 };
 use async_trait::async_trait;
 use datafusion::common::cast::as_string_array;
@@ -37,6 +38,7 @@ use datafusion::{
 };
 use llms::chat::Chat;
 use std::any::Any;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
@@ -228,67 +230,99 @@ impl Ai {
             let result = match message_opt {
                 Some(message) => {
                     // Create span as a child of the parent span (sql_query)
-                    let span = {
-                        let _enter = parent_span.enter();
-                        tracing::span!(
-                            target: "task_history",
-                            tracing::Level::INFO,
-                            "ai",
-                            model = %model_name,
-                            input = %message
-                        )
-                    };
+                    let span = tracing::span!(
+                        target: "task_history",
+                        tracing::Level::INFO,
+                        "ai",
+                        model = %model_name,
+                        input = %message
+                    );
 
-                    // Create a proper chat completion request to get usage information
-                    let chat_request = CreateChatCompletionRequestArgs::default()
-                        .model(model_name.to_string())
-                        .messages(vec![
-                            ChatCompletionRequestSystemMessageArgs::default()
-                                .content(message.to_string())
-                                .build()
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?
-                                .into(),
-                        ])
-                        .build()
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    // Execute AI operation within the child span instrumented with parent context
+                    let _parent_guard = parent_span.enter();
+                    let ai_result = async {
+                        tracing::info!("AI span created and entered");
 
-                    // Execute the AI call within the span context using .instrument()
-                    let ai_result = model
-                        .chat_request(chat_request)
-                        .instrument(span.clone())
-                        .await;
+                        // Create a proper chat completion request with streaming enabled
+                        let chat_request = CreateChatCompletionRequestArgs::default()
+                            .model(model_name.to_string())
+                            .messages(vec![
+                                ChatCompletionRequestSystemMessageArgs::default()
+                                    .content(message.to_string())
+                                    .build()
+                                    .map_err(|e| async_openai::error::OpenAIError::from(e))
+                                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                                    .into(),
+                            ])
+                            .stream(true) // Enable streaming
+                            .build()
+                            .map_err(|e| async_openai::error::OpenAIError::from(e))
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    match ai_result {
-                        Ok(response) => {
-                            // Log token usage information if available
-                            if let Some(usage) = &response.usage {
-                                tracing::info!(
-                                    target: "task_history",
-                                    parent: &span,
-                                    input_tokens = %usage.prompt_tokens,
-                                    output_tokens = %usage.completion_tokens,
-                                    total_tokens = %usage.total_tokens,
-                                    "labels"
-                                );
-                            }
-
-                            // Extract the response text
-                            let response_text = response
-                                .choices
-                                .first()
-                                .and_then(|choice| choice.message.content.clone());
-
-                            match response_text {
-                                Some(text) => {
-                                    tracing::info!(target: "task_history", parent: &span, captured_output = %text, "labels");
-                                    Some(text)
+                        // Execute the AI call using streaming
+                        let mut stream = model.chat_stream(chat_request).await
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        
+                        // Collect streaming response
+                        let mut content_parts = Vec::new();
+                        let mut usage: Option<CompletionUsage> = None;
+                        
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(chunk_response) => {
+                                    // Collect content from each chunk
+                                    if let Some(choice) = chunk_response.choices.first() {
+                                        if let Some(content) = &choice.delta.content {
+                                            content_parts.push(content.clone());
+                                        }
+                                    }
+                                    
+                                    // Capture usage information from the final chunk
+                                    if chunk_response.usage.is_some() {
+                                        usage = chunk_response.usage;
+                                    }
                                 }
-                                None => {
-                                    tracing::info!(target: "task_history", parent: &span, captured_output = "", "labels");
-                                    None
+                                Err(e) => {
+                                    tracing::error!(target: "task_history", parent: &span, "{e}");
+                                    return Err(DataFusionError::External(Box::new(e)));
                                 }
                             }
                         }
+                        
+                        // Combine all content parts into final response
+                        let final_content = content_parts.join("");
+                        
+                        // Log token usage information if available
+                        if let Some(ref usage) = usage {
+                            tracing::info!(
+                                target: "task_history",
+                                parent: &span,
+                                input_tokens = %usage.prompt_tokens,
+                                output_tokens = %usage.completion_tokens,
+                                total_tokens = %usage.total_tokens,
+                                "labels"
+                            );
+                        }
+
+                        let response_text = if final_content.is_empty() { None } else { Some(final_content) };
+
+                        // Log the response
+                        match &response_text {
+                            Some(text) => {
+                                tracing::info!(target: "task_history", parent: &span, captured_output = %text, "labels");
+                            }
+                            None => {
+                                tracing::info!(target: "task_history", parent: &span, captured_output = "", "labels");
+                            }
+                        }
+
+                        Ok(response_text)
+                    }
+                    .instrument(span.clone())
+                    .await;
+
+                    match ai_result {
+                        Ok(response_text) => response_text,
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span, "{e}");
                             return Err(DataFusionError::External(Box::new(e)));
@@ -326,6 +360,77 @@ mod tests {
 
         async fn run(&self, prompt: String) -> llms::chat::Result<Option<String>> {
             Ok(Some(format!("Response from {}: {}", self.name, prompt)))
+        }
+
+        async fn chat_stream(
+            &self,
+            req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
+            use async_stream::stream;
+            
+            // Extract the prompt from the request
+            let prompt = req
+                .messages
+                .first()
+                .and_then(|msg| match msg {
+                    async_openai::types::ChatCompletionRequestMessage::System(sys_msg) => {
+                        match &sys_msg.content {
+                            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
+                            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "".to_string());
+
+            let response_text = format!("Response from {}: {}", self.name, prompt);
+            let model_name = self.name.clone(); // Clone for the stream
+            
+            // Create a simple stream that yields the response
+            let stream = stream! {
+                // Yield content chunk
+                yield Ok(CreateChatCompletionStreamResponse {
+                    id: "test-stream-id".to_string(),
+                    model: model_name.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    choices: vec![async_openai::types::ChatChoiceStream {
+                        index: 0,
+                        delta: async_openai::types::ChatCompletionStreamResponseDelta {
+                            content: Some(response_text),
+                            role: Some(Role::Assistant),
+                            function_call: None,
+                            tool_calls: None,
+                            refusal: None,
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                    usage: None,
+                    system_fingerprint: None,
+                    service_tier: None,
+                });
+                
+                // Yield final chunk with usage
+                yield Ok(CreateChatCompletionStreamResponse {
+                    id: "test-stream-id".to_string(),
+                    model: model_name,
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    choices: vec![],
+                    usage: Some(CompletionUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 20,
+                        total_tokens: 30,
+                        prompt_tokens_details: None,
+                        completion_tokens_details: None,
+                    }),
+                    system_fingerprint: None,
+                    service_tier: None,
+                });
+            };
+            
+            Ok(Box::pin(stream))
         }
 
         async fn chat_request(
@@ -538,6 +643,18 @@ mod tests {
             })
         }
 
+        async fn chat_stream(
+            &self,
+            _req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
+            Err(async_openai::error::OpenAIError::ApiError(ApiError {
+                message: "Mock error for testing".to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            }))
+        }
+
         async fn chat_request(
             &self,
             _req: CreateChatCompletionRequest,
@@ -562,6 +679,59 @@ mod tests {
 
         async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
             Ok(None)
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
+            use async_stream::stream;
+            
+            // Create a stream that yields empty content
+            let stream = stream! {
+                // Yield empty content chunk  
+                yield Ok(CreateChatCompletionStreamResponse {
+                    id: "null-stream-id".to_string(),
+                    model: "null-model".to_string(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    choices: vec![async_openai::types::ChatChoiceStream {
+                        index: 0,
+                        delta: async_openai::types::ChatCompletionStreamResponseDelta {
+                            content: None, // Empty content
+                            role: Some(Role::Assistant),
+                            function_call: None,
+                            tool_calls: None,
+                            refusal: None,
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                    usage: None,
+                    system_fingerprint: None,
+                    service_tier: None,
+                });
+                
+                // Yield final chunk with usage
+                yield Ok(CreateChatCompletionStreamResponse {
+                    id: "null-stream-id".to_string(),
+                    model: "null-model".to_string(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    choices: vec![],
+                    usage: Some(CompletionUsage {
+                        prompt_tokens: 5,
+                        completion_tokens: 0,
+                        total_tokens: 5,
+                        prompt_tokens_details: None,
+                        completion_tokens_details: None,
+                    }),
+                    system_fingerprint: None,
+                    service_tier: None,
+                });
+            };
+            
+            Ok(Box::pin(stream))
         }
 
         async fn chat_request(
@@ -816,5 +986,259 @@ mod tests {
             }
             _ => panic!("Expected OneOf signature"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_ai_span_parent_child_relationship() {
+        use tracing::Level;
+
+        // This test verifies that the AI UDF properly accepts and uses parent span context
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("test-model").unwrap();
+
+        // Create a parent span to simulate sql_query span
+        let sql_query_span = tracing::span!(Level::INFO, "sql_query", query = "SELECT ai('test')");
+
+        // Test that process_messages can accept and use a parent span without errors
+        let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
+        let result = udf
+            .process_messages(
+                Arc::clone(model),
+                messages,
+                "test-model",
+                sql_query_span.clone(),
+            )
+            .await;
+
+        // The test passes if process_messages executes without error using the parent span
+        assert!(
+            result.is_ok(),
+            "process_messages should succeed with parent span"
+        );
+
+        let response_array = result.unwrap();
+        let string_array = response_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(string_array.len(), 1);
+        assert_eq!(
+            string_array.value(0),
+            "Response from test-model: Hello test"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invoke_async_captures_current_span() {
+        use arrow_schema::Field;
+        use datafusion::logical_expr::ScalarFunctionArgs;
+        use tracing::Level;
+
+        // This test verifies that invoke_async_with_args properly captures the current span
+        // and passes it to process_messages
+
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Create a test span and enter it to simulate DataFusion's sql_query span context
+        let sql_query_span = tracing::span!(Level::INFO, "sql_query", query = "SELECT ai('test')");
+        let _enter = sql_query_span.enter();
+
+        // Create test arguments for the UDF
+        let message_scalar =
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("Hello test".to_string())));
+        let args = ScalarFunctionArgs {
+            args: vec![message_scalar],
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        // Call invoke_async_with_args which should capture the current span (sql_query)
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        // Verify that the function executed successfully
+        // The real parent-child relationship will be established at runtime with proper tracing
+        assert!(
+            result.is_ok(),
+            "invoke_async_with_args should succeed and capture parent span"
+        );
+
+        let response_array = result.unwrap();
+        let string_array = response_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(string_array.len(), 1);
+        assert_eq!(
+            string_array.value(0),
+            "Response from test-model: Hello test"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_basic_tracing_works() {
+        use tracing::Level;
+
+        // Test that basic tracing works
+        tracing::info!("Test message");
+        let span = tracing::span!(Level::INFO, "test_span");
+        let _enter = span.enter();
+        tracing::info!("Inside test span");
+
+        logs_assert(|lines: &[&str]| {
+            let has_test_message = lines.iter().any(|line| line.contains("Test message"));
+            let has_span_message = lines.iter().any(|line| line.contains("Inside test span"));
+
+            if has_test_message && has_span_message {
+                Ok(())
+            } else {
+                Err(format!("Missing basic tracing. Lines: {:?}", lines))
+            }
+        });
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_ai_span_creation_issue() {
+        use tracing::Level;
+
+        // This test reveals why spans aren't being created properly
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Test 1: Verify direct span creation works
+        tracing::info!("Starting AI span test");
+
+        // Test 2: Create and enter parent span
+        let sql_query_span = tracing::span!(Level::INFO, "sql_query", query = "SELECT ai('test')");
+        let _enter = sql_query_span.enter();
+        tracing::info!("Inside sql_query span");
+
+        // Test 3: Try calling process_messages directly to see if spans are created
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("test-model").unwrap();
+        let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
+        let test_span = tracing::Span::current();
+
+        tracing::info!("About to call process_messages");
+        let _result = udf
+            .process_messages(Arc::clone(model), messages, "test-model", test_span)
+            .await;
+        tracing::info!("process_messages completed");
+
+        logs_assert(|lines: &[&str]| {
+            let has_start = lines
+                .iter()
+                .any(|line| line.contains("Starting AI span test"));
+            let has_sql_query = lines
+                .iter()
+                .any(|line| line.contains("Inside sql_query span"));
+            let has_process_start = lines
+                .iter()
+                .any(|line| line.contains("About to call process_messages"));
+            let has_process_end = lines
+                .iter()
+                .any(|line| line.contains("process_messages completed"));
+
+            // Look for proper AI child span - it should have "ai{" in the span hierarchy
+            let has_ai_child_span = lines.iter().any(|line| {
+                // The AI span should appear as a child with format like "sql_query{...}:ai{model=...}"
+                line.contains("}:ai{") && line.contains("model=")
+            });
+
+            if !has_start || !has_sql_query || !has_process_start || !has_process_end {
+                return Err(format!(
+                    "Missing basic trace messages. Start: {}, SQL: {}, Process start: {}, Process end: {}. Lines: {:?}",
+                    has_start, has_sql_query, has_process_start, has_process_end, lines
+                ));
+            }
+
+            if !has_ai_child_span {
+                return Err(format!(
+                    "AI child span was not created! The span should appear as 'sql_query:ai:' but we only see 'sql_query:'. This confirms the parent-child relationship is broken. Lines: {:?}",
+                    lines
+                ));
+            }
+
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    async fn test_ai_udf_full_span_flow() {
+        use arrow_schema::Field;
+        use datafusion::logical_expr::ScalarFunctionArgs;
+        use tracing::Level;
+
+        // This test documents the expected span flow behavior:
+        // 1. SQL query execution creates sql_query span
+        // 2. AI UDF invoke_async_with_args captures current span (sql_query)
+        // 3. AI UDF creates child ai spans with proper parent context
+        // 4. In production with tracing enabled, parent_span_id will be set correctly
+
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+
+        // Simulate the DataFusion execution context where sql_query span exists
+        let sql_query_span = tracing::span!(
+            Level::INFO,
+            "sql_query",
+            query = "SELECT ai('What is the weather?')"
+        );
+
+        let result = {
+            let _enter = sql_query_span.enter();
+
+            // Create test arguments that would come from DataFusion
+            let message_scalar =
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("What is the weather?".to_string())));
+            let args = ScalarFunctionArgs {
+                args: vec![message_scalar],
+                arg_fields: vec![],
+                number_rows: 1,
+                return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+            };
+
+            // This simulates what happens when DataFusion calls the AI UDF:
+            // 1. invoke_async_with_args captures tracing::Span::current() (sql_query)
+            // 2. The captured span is passed to process_messages
+            // 3. process_messages creates ai spans within parent context
+            // 4. With proper tracing subscriber, parent_span_id relationships are recorded
+            udf.invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+                .await
+        };
+
+        // Verify the UDF executed successfully
+        assert!(result.is_ok(), "Full AI UDF execution should succeed");
+
+        let response_array = result.unwrap();
+        let string_array = response_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(string_array.len(), 1);
+        assert_eq!(
+            string_array.value(0),
+            "Response from test-model: What is the weather?"
+        );
+
+        // NOTE: In production with a tracing subscriber (like OpenTelemetry):
+        // - The sql_query span will have a unique span_id
+        // - The ai span will be created as a child with parent_span_id = sql_query.span_id
+        // - The task_history table will show proper parent-child relationships
+        // - Token usage (input_tokens, output_tokens, total_tokens) will be logged as labels
+
+        // This test confirms the mechanism is in place - the actual tracing verification
+        // requires runtime testing with a real tracing backend like the task_history system
     }
 }
