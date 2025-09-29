@@ -11,10 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::{
-    ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs,
-};
+use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
@@ -35,7 +32,8 @@ use tracing_futures::Instrument;
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoice, ChatCompletionRequestAssistantMessage, ChatCompletionRequestDeveloperMessage,
+        ChatChoice, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
         ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
         ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,

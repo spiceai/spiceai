@@ -182,12 +182,12 @@ impl AsyncScalarUDFImpl for Ai {
         match args_arrays.len() {
             1 => {
                 let [message_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array)
+                self.process_messages(Arc::clone(model), &model_name, message_array)
                     .await
             }
             2 => {
                 let [message_array, _model_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), message_array)
+                self.process_messages(Arc::clone(model), &model_name, message_array)
                     .await
             }
             _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
@@ -198,6 +198,7 @@ impl AsyncScalarUDFImpl for Ai {
 impl Ai {
     async fn call_model(
         model: &Arc<dyn Chat>,
+        model_name: &str,
         message: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
         async {
@@ -224,13 +225,14 @@ impl Ai {
             Ok(resp)
         }
         // Instrument the async block with an AI span as a child of the current (sql_query) span
-        .instrument(tracing::span!(Level::INFO, "ai", model = %model.model_name()))
+        .instrument(tracing::span!(Level::INFO, "ai", model = %model_name))
         .await
     }
 
     async fn process_messages(
         &self,
         model: Arc<dyn Chat>,
+        model_name: &str,
         message_array: ArrayRef,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
@@ -238,9 +240,9 @@ impl Ai {
         let parent_span = Span::current();
         for message_opt in message_array.iter() {
             let result = if let Some(message) = message_opt {
-                match Self::call_model(&model, message).await {
+                match Self::call_model(&model, model_name, message).await {
                     Ok(Some(result)) => {
-                        tracing::info!(target: "task_history", captured_output = %result.clone(), "labels");
+                        tracing::info!(target: "task_history", captured_output = %result.clone());
                         Some(result)
                     }
                     Ok(None) => None,
@@ -708,7 +710,7 @@ mod tests {
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), messages)
+            .process_messages(Arc::clone(model), "test-model", messages)
             .await
             .unwrap();
 
@@ -734,7 +736,7 @@ mod tests {
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), messages)
+            .process_messages(Arc::clone(model), "test-model", messages)
             .await
             .unwrap();
 
@@ -765,7 +767,7 @@ mod tests {
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), messages)
+            .process_messages(Arc::clone(model), "test-model", messages)
             .await
             .unwrap();
 
@@ -788,7 +790,9 @@ mod tests {
         let model = model_store_guard.get("error-model").unwrap();
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
-        let result = udf.process_messages(Arc::clone(model), messages).await;
+        let result = udf
+            .process_messages(Arc::clone(model), "error-model", messages)
+            .await;
 
         assert!(result.is_err());
         assert!(
@@ -809,7 +813,7 @@ mod tests {
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), messages)
+            .process_messages(Arc::clone(model), "null-model", messages)
             .await
             .unwrap();
 
@@ -899,7 +903,9 @@ mod tests {
 
         // Test that process_messages can accept and use a parent span without errors
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
-        let result = udf.process_messages(Arc::clone(model), messages).await;
+        let result = udf
+            .process_messages(Arc::clone(model), "test-model", messages)
+            .await;
 
         // The test passes if process_messages executes without error using the parent span
         assert!(
@@ -1017,7 +1023,9 @@ mod tests {
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
 
         tracing::info!("About to call process_messages");
-        let _result = udf.process_messages(Arc::clone(model), messages).await;
+        let _result = udf
+            .process_messages(Arc::clone(model), "test-model", messages)
+            .await;
         tracing::info!("process_messages completed");
 
         logs_assert(|lines: &[&str]| {
