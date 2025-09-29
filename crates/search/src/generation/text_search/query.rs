@@ -96,7 +96,7 @@ impl TableProvider for FullTextSearchQuery {
                 self.schema(),
                 projection,
                 filters.to_vec(),
-                self.limit_to_use(limit).unwrap_or(DEFAULT_BATCH_SIZE),
+                self.limit_to_use(limit).unwrap_or(DEFAULT_LIMIT_MAXIMUM),
             )
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
         ))

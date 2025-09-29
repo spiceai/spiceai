@@ -44,7 +44,12 @@ use super::{
     TextSearchSnafu as GenerationTextSearchSnafu,
 };
 
+/// Maximum number of results in a single full-text search request, before any pagination.
+/// This size is designated for latency performance on the underlying index.
 pub static DEFAULT_BATCH_SIZE: usize = 100;
+
+/// Maximum number of results to return for a given full-text search.
+pub static DEFAULT_LIMIT_MAXIMUM: usize = 1000;
 
 pub mod exec;
 pub mod index;
