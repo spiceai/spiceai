@@ -83,6 +83,11 @@ pub struct DatasetResponseItem {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct Property {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
+}
 
 /// List Datasets
 ///
