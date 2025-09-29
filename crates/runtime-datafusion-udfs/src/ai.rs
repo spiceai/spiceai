@@ -220,7 +220,7 @@ impl Ai {
             Ok(resp)
         }
         // Instrument the async block with an AI span as a child of the current (sql_query) span
-        .instrument(tracing::span!(Level::INFO, "ai", model = "test-model"))
+        .instrument(tracing::span!(Level::INFO, "ai", model = %model.model_name()))
         .await
     }
 
