@@ -206,7 +206,7 @@
     {
       "id": 5713842188321988,
       "definition": {
-        "title": "Ingestion/Refresh Lag",
+        "title": "Ingestion + Refresh Lag",
         "title_size": "16",
         "title_align": "left",
         "show_legend": true,
@@ -243,6 +243,7 @@
                     "unit_name": "second"
                   }
                 },
+                "alias": "Ingestion Lag",
                 "formula": "query1 / 1000"
               },
               {
@@ -252,6 +253,7 @@
                     "unit_name": "second"
                   }
                 },
+                "alias": "Refresh Lag",
                 "formula": "query4 / 1000"
               }
             ],
