@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::models::hf::get_model_to_vec_embeddings;
 use crate::models::openai::get_openai_embeddings;
+use crate::models::s3_vectors::basic_vector_search_tests;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
@@ -369,29 +370,25 @@ pub(crate) async fn run_search_w_explain(
 
 #[tokio::test]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
-    let mut ds = catalog_page_tpcds_dataset_w_embeddings(
-        "multi_column_search",
-        "hf_minilm",
-        Some(vec!["cp_catalog_page_sk".to_string()]),
-        Some(EmbeddingChunkConfig {
-            enabled: true,
-            target_chunk_size: 512,
-            overlap_size: 128,
-            trim_whitespace: false,
-        }),
+    let ds = get_mega_science_dataset(
+        Some("qs"),
+        Some(
+            Column::new("question").with_embeddings(vec![ColumnLevelEmbeddingConfig {
+                model: "hf_minilm".to_string(),
+                row_ids: Some(vec!["id".to_string()]),
+                chunking: None,
+                vector_size: None,
+            }]),
+        ),
+        Some(
+            Column::new("answer").with_embeddings(vec![ColumnLevelEmbeddingConfig {
+                model: "hf_minilm".to_string(),
+                row_ids: Some(vec!["id".to_string()]),
+                chunking: Some(EmbeddingChunkConfig::enabled().target_chunk_size(64)),
+                vector_size: None,
+            }]),
+        ),
     );
-    ds.columns.push(Column {
-        name: "cp_department".to_string(),
-        embeddings: vec![ColumnLevelEmbeddingConfig {
-            model: "hf_minilm".to_string(),
-            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-            chunking: None,
-            vector_size: None,
-        }],
-        description: None,
-        full_text_search: None,
-        metadata: HashMap::new(),
-    });
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds)
@@ -402,33 +399,32 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
         .build();
     run_search(
         app,
-        vec![
+        vec![basic_vector_search_tests("multi_column"), vec![
             SearchTestCase::new(
-                "multi_column_basic",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_search"]
-                })),
+                format!("multi_column_question_vector_search_sql_filters"),
+                SearchTestType::Sql(
+                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
+                ),
             ),
             SearchTestCase::new(
-                "multi_column_additional",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_search"],
-                    "additional_columns": ["cp_catalog_number"],
-                })),
+                format!("multi_column_question_vector_search_sql_no_score"),
+                SearchTestType::Sql(
+                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                ),
             ),
             SearchTestCase::new(
-                "multi_column_where",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "datasets": ["multi_column_search"],
-                    "where": "cp_catalog_page_sk % 2 = 1"
-                })),
+                format!("multi_column_question_vector_search_sql_random"),
+                SearchTestType::Sql(
+                    "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                ),
             ),
-        ],
+            SearchTestCase::new(
+                format!("multi_column_question_vector_search_sql_vectors"),
+                SearchTestType::Sql(
+                    "SELECT id, answer, array_length(question_embedding), array_length(question_offsets), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+                ),
+            ),
+        ]].concat(),
     )
     .await
 }

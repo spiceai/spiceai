@@ -209,7 +209,7 @@ impl Display for EmbeddingPrefix {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct EmbeddingChunkConfig {
     #[serde(default)]
@@ -223,6 +223,20 @@ pub struct EmbeddingChunkConfig {
 
     #[serde(default)]
     pub trim_whitespace: bool,
+}
+
+impl EmbeddingChunkConfig {
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn target_chunk_size(mut self, size: usize) -> Self {
+        self.target_chunk_size = size;
+        self
+    }
 }
 
 /// Configuration for if and how a dataset's column should be embedded.
