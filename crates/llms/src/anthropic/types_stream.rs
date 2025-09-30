@@ -429,5 +429,5 @@ fn create_anthropic_stream_response(
         None => vec![],
     };
 
-    crate::chat::streaming_utils::create_stream_response(id, model, choices, usage)
+    crate::streaming_utils::create_stream_response(id, model, choices, usage)
 }

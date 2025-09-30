@@ -15,7 +15,7 @@ limitations under the License.
 #![allow(clippy::needless_pass_by_value)]
 
 use crate::chat::message_to_mistral;
-use crate::chat::streaming_utils::create_stream_response_with_timestamp;
+use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{

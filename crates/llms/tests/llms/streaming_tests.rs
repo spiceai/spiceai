@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use llms::chat::{Chat, streaming_utils};
+use llms::{chat::Chat, streaming_utils};
 
 /// Mock streaming Chat implementation for testing
 struct StreamingMockChat {

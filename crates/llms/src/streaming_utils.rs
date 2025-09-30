@@ -29,7 +29,7 @@ use rand::distr::Alphanumeric;
 use rand::{Rng, rng};
 use std::{pin::Pin, time::SystemTime};
 
-use super::Result;
+use crate::chat::Result;
 
 /// Creates a standardized `CreateChatCompletionStreamResponse` with consistent formatting
 #[allow(clippy::cast_possible_truncation)]

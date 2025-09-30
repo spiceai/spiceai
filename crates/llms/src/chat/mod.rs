@@ -43,10 +43,9 @@ use async_openai::{
 
 pub mod mistral;
 pub mod nsql;
-pub mod streaming_utils;
+use crate::streaming_utils::generate_stream_id;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
-use streaming_utils::generate_stream_id;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".safetensors",
@@ -614,7 +613,7 @@ pub trait Chat: Sync + Send {
             })
         })?;
 
-        Ok(streaming_utils::string_stream_to_chat_stream(
+        Ok(crate::streaming_utils::string_stream_to_chat_stream(
             model_id, stream,
         ))
     }

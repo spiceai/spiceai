@@ -25,7 +25,7 @@ use crate::bedrock::chat::util::{
 };
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
-use crate::chat::streaming_utils::{create_stream_response, generate_stream_id};
+use crate::streaming_utils::{create_stream_response, generate_stream_id};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
