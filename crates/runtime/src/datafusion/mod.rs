@@ -22,8 +22,9 @@ use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
+use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::dataset::{AccessMode, Dataset, ReadyState};
+use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
@@ -228,6 +229,9 @@ pub enum Error {
     #[snafu(display("Unable to get the lock of data writers"))]
     UnableToLockDataWriters {},
 
+    #[snafu(display("Unable to acquire lock for writable catalogs"))]
+    UnableToLockWritableCatalogs {},
+
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
     ))]
@@ -305,6 +309,7 @@ pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
+    writable_catalogs: RwLock<HashSet<String>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
@@ -322,6 +327,7 @@ impl std::fmt::Debug for DataFusion {
         f.debug_struct("DataFusion")
             .field("runtime_status", &self.runtime_status)
             .field("data_writers", &self.data_writers)
+            .field("writable_catalogs", &self.writable_catalogs)
             .field("accelerated_tables", &self.accelerated_tables)
             .field("caching", &self.caching)
             .finish_non_exhaustive()
@@ -421,6 +427,7 @@ impl DataFusion {
     pub async fn register_catalog(
         &self,
         name: &str,
+        access: &AccessMode,
         catalog: Arc<dyn CatalogProvider>,
     ) -> Result<()> {
         if let Some(deferred_catalog) = catalog.as_any().downcast_ref::<DeferredCatalogProvider>() {
@@ -430,6 +437,10 @@ impl DataFusion {
                 .insert(name.to_string(), Arc::new(deferred_catalog.clone()));
         } else {
             self.ctx.register_catalog(name, catalog);
+
+            if matches!(access, AccessMode::ReadWrite) {
+                self.mark_catalog_writable(name)?;
+            }
         }
 
         Ok(())
@@ -529,6 +540,23 @@ impl DataFusion {
     }
 
     #[must_use]
+    pub fn is_catalog_writable(&self, catalog_name: &str) -> bool {
+        if let Ok(writable_catalogs) = self.writable_catalogs.read() {
+            writable_catalogs.contains(catalog_name)
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
+        self.writable_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+            .insert(catalog_name.to_string());
+        Ok(())
+    }
+
+    #[must_use]
     pub async fn is_accelerated(&self, table_reference: &TableReference) -> bool {
         self.accelerated_tables
             .read()
@@ -599,11 +627,14 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn load_deferred_catalog(&self, name: &str) -> Result<()> {
+    pub async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
         let deferred_catalogs = self.deferred_catalogs.read().await;
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
                 self.ctx.register_catalog(name, Arc::clone(&provider));
+                if matches!(access, AccessMode::ReadWrite) {
+                    self.mark_catalog_writable(name)?;
+                }
             }
 
             drop(deferred_catalogs);

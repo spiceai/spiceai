@@ -56,16 +56,35 @@ pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 /// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static S3_VECTOR_MAX_TOPK: i64 = 30;
 
+/// [`ComputeQueryVector`] allows [`S3VectorsQueryTable`] to be instantiated in a non-async setting.
+#[async_trait]
+pub trait ComputeQueryVector: std::fmt::Debug + Send + Sync {
+    async fn compute_vector(
+        &self,
+        query: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
 pub struct S3VectorsQueryTable {
     table: S3VectorsTable,
-    query: Vec<f32>,
+    compute_vector: Arc<dyn ComputeQueryVector>,
+    query: String,
 }
+
 impl S3VectorsQueryTable {
     #[must_use]
-    pub fn new(table: S3VectorsTable, query: Vec<f32>) -> Self {
-        Self { table, query }
+    pub fn new(
+        table: S3VectorsTable,
+        compute_vector: Arc<dyn ComputeQueryVector>,
+        query: String,
+    ) -> Self {
+        Self {
+            table,
+            compute_vector,
+            query,
+        }
     }
 }
 
@@ -145,11 +164,18 @@ impl TableProvider for S3VectorsQueryTable {
             None => S3_VECTOR_MAX_TOPK,
             Some(l) => l as i64,
         };
+
+        let query_vector = self
+            .compute_vector
+            .compute_vector(self.query.as_str())
+            .await
+            .map_err(DataFusionError::External)?;
+
         Ok(Arc::new(S3VectorsQueryExec::new(
             self,
             projection,
             limit,
-            self.query.clone(),
+            query_vector,
             filters.to_vec(),
         )) as Arc<dyn ExecutionPlan>)
     }

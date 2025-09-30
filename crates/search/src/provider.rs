@@ -20,26 +20,25 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Column, DFSchema, JoinConstraint, JoinType, NullEquality},
+    common::{Column, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
-        BinaryExpr, Cast, Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr,
+        BinaryExpr, Cast, Filter, Join, Limit, LogicalPlan, Operator, Projection, Sort, SortExpr,
         SubqueryAlias, TableProviderFilterPushDown, TableScan, expr::Alias,
     },
     physical_plan::ExecutionPlan,
-    prelude::{Expr, array_element, substring},
+    prelude::{Expr, array_element, col, substring},
     scalar::ScalarValue,
     sql::TableReference,
 };
 
 use crate::{
-    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
-    chunking::{ChunkedSearchIndex, is_chunked},
+    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, chunking::ChunkedSearchIndex,
     index::SearchIndex,
 };
 
@@ -47,28 +46,271 @@ use crate::{
 /// if required by filters or additional columns in the projection.
 #[derive(Debug, Clone)]
 pub struct SearchQueryProvider {
-    pub search_index: Arc<dyn SearchIndex>,
+    pub search_index_query: Arc<LogicalPlan>,
     pub table_provider: Arc<dyn TableProvider>,
-    pub query: String,
+    pub search_column: String,
+    pub primary_key: Vec<String>,
     pub pre_limit: Option<usize>,
 }
 
 impl SearchQueryProvider {
     pub fn new(
-        search_index: Arc<dyn SearchIndex>,
+        search_index_query: Arc<LogicalPlan>,
         table_provider: Arc<dyn TableProvider>,
-        query: String,
-        limit: Option<usize>,
+        search_column: String,
+        primary_key: Vec<String>,
+        pre_limit: Option<usize>,
     ) -> Self {
         Self {
-            search_index,
+            search_index_query,
             table_provider,
-            query,
-            pre_limit: limit,
+            search_column,
+            primary_key,
+            pre_limit,
         }
     }
 
-    /// Check if the search index alone can satisfy the query (no join with base table needed)
+    pub fn try_from_index(
+        search_index: &Arc<dyn SearchIndex>,
+        table_provider: Arc<dyn TableProvider>,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let search_index_query = search_index.query_table_provider(query)?;
+        Ok(Self::new(
+            search_index_query,
+            table_provider,
+            search_index.search_column(),
+            search_index
+                .primary_fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
+            limit,
+        ))
+    }
+
+    /// Build the underlying table scan, removing search index metadata columns from projection
+    fn underlying_table_scan(
+        &self,
+        columns: Vec<String>,
+        filters: &[Expr],
+        search_index_schema: &DFSchemaRef,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let mut base_table_cols: HashSet<String> = columns.into_iter().collect();
+        base_table_cols.remove(SEARCH_MATCH_COLUMN_NAME);
+        for f in search_index_schema.fields() {
+            base_table_cols.remove(f.name());
+        }
+        base_table_cols.extend(self.primary_key.clone());
+
+        // Also include any columns needed for filters on base table.
+        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
+        let base_table_cols: Vec<_> = base_table_cols.into_iter().collect();
+        let mut base_proj =
+            projection_from_columns(&self.table_provider.schema(), &base_table_cols);
+        base_proj.sort_unstable(); // Deterministic LogicalPlans
+
+        // Get filters that can be pushed down to the base table
+        let filter_refs: Vec<_> = filters.iter().collect();
+        let supported_filters = self
+            .table_provider
+            .supports_filters_pushdown(filter_refs.as_slice())?;
+
+        let underlying_filters: Vec<Expr> = filters
+            .iter()
+            .zip(supported_filters.iter())
+            .filter_map(|(f, supp)| {
+                use datafusion::logical_expr::TableProviderFilterPushDown;
+                if matches!(supp, TableProviderFilterPushDown::Unsupported) {
+                    None
+                } else {
+                    Some(f.clone())
+                }
+            })
+            .collect();
+
+        Ok(LogicalPlan::TableScan(TableScan::try_new(
+            TableReference::parse_str("base_table"),
+            Arc::new(DefaultTableSource::new(
+                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
+            )),
+            Some(base_proj),
+            underlying_filters,
+            None,
+        )?))
+    }
+
+    fn join_with_base(
+        &self,
+        projection: Option<&Vec<usize>>,
+        search_index_table: LogicalPlan,
+        filters: &[Expr],
+    ) -> Result<LogicalPlan, DataFusionError> {
+        // Add subquery so that we can uniquely identify columns between search index and underlying table scan.
+        let search_index_proj = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            search_index_table.into(),
+            TableReference::parse_str("search_index"),
+        )?);
+
+        let schema = self.schema();
+        let column_names: Vec<String> = match projection {
+            None => schema.fields().iter().map(|f| f.name().clone()).collect(),
+            Some(proj) => schema
+                .project(proj)?
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
+        };
+
+        let underlying_table_scan =
+            self.underlying_table_scan(column_names, filters, search_index_proj.schema())?;
+
+        // Build join conditions based on primary keys
+        let on: Vec<(Expr, Expr)> = self
+            .primary_key
+            .iter()
+            .map(|pk| {
+                (
+                    Expr::Column(Column::new(
+                        Some(TableReference::parse_str("search_index")),
+                        pk,
+                    )),
+                    Expr::Column(Column::new(
+                        Some(TableReference::parse_str("base_table")),
+                        pk,
+                    )),
+                )
+            })
+            .collect();
+
+        // Build join schema
+        let join_schema = search_index_proj
+            .schema()
+            .join(underlying_table_scan.schema())?;
+
+        let primary_key_column_names: std::collections::HashSet<String> =
+            self.primary_key.iter().cloned().collect();
+
+        // Can pushdown all filters except those on PKs (since these PK Expr will be unqualified, DF will find them ambigious).
+        let join_filters: Vec<Expr> = filters
+            .iter()
+            .filter(|&f| {
+                f.column_refs()
+                    .iter()
+                    .any(|col| !primary_key_column_names.contains(col.name()))
+            })
+            .cloned()
+            .collect();
+
+        let join = LogicalPlan::Join(Join {
+            left: Arc::new(search_index_proj),
+            right: Arc::new(underlying_table_scan),
+            join_type: JoinType::Left,
+            join_constraint: JoinConstraint::On,
+            on,
+            filter: join_filters.into_iter().reduce(Expr::and),
+            schema: join_schema.into(),
+            null_equality: NullEquality::NullEqualsNothing,
+        });
+
+        let deduped_join_proj_exprs: Vec<_> = join
+            .schema()
+            .iter()
+            .filter(|(tbl, f)| {
+                !(primary_key_column_names.contains(f.name())
+                    && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
+            })
+            .map(|(tbl, field_ref)| match tbl {
+                Some(table_ref) => {
+                    Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
+                }
+                None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
+            })
+            .collect();
+
+        let proj =
+            LogicalPlan::Projection(Projection::try_new(deduped_join_proj_exprs, join.into())?);
+
+        // Apply all filters after JOIN. This is to ensure that if a filter is pushed onto RHS,
+        // LHS (i.e. from search index) doesn't return row violating filter.
+        if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+            Ok(LogicalPlan::Filter(Filter::try_new(filter, proj.into())?))
+        } else {
+            Ok(proj)
+        }
+    }
+
+    fn match_column_index(&self) -> Option<usize> {
+        self.schema()
+            .column_with_name(SEARCH_MATCH_COLUMN_NAME)
+            .map(|(i, _)| i)
+    }
+
+    pub fn add_match_column(
+        &self,
+        projection: Option<&Vec<usize>>,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let search_col = self.search_column.as_str();
+        // If projection doesn't include/need the 'match' column, early exit.
+        // Or if its not a chunked search query (doesn't have offsets in schema).
+        let match_not_required = projection
+            .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)));
+        let chunked_search_field = self
+            .schema()
+            .column_with_name(ChunkedSearchIndex::chunking_offset_col(search_col).as_str())
+            .is_some();
+        if match_not_required || !chunked_search_field {
+            return Ok(input);
+        }
+        let mut initial: Vec<_> = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
+
+        let first = array_element(
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(search_col),
+            )),
+            Expr::Literal(ScalarValue::Int64(Some(1)), None),
+        );
+        let second = array_element(
+            Expr::Column(Column::new_unqualified(
+                ChunkedSearchIndex::chunking_offset_col(search_col),
+            )),
+            Expr::Literal(ScalarValue::Int64(Some(2)), None),
+        );
+
+        // substring(search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]) as 'match'
+        let substr = Expr::Cast(Cast::new(
+            Box::new(substring(
+                col(search_col),
+                first.clone(),
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(second),
+                    Operator::Minus,
+                    Box::new(first),
+                )),
+            )),
+            DataType::Utf8,
+        ));
+
+        initial.push(Expr::Alias(Alias::new(
+            substr,
+            None::<TableReference>,
+            "match",
+        )));
+
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            initial,
+            input.into(),
+        )?))
+    }
+
     fn search_index_table_is_sufficient(
         &self,
         search_index_table: &LogicalPlan,
@@ -106,334 +348,8 @@ impl SearchQueryProvider {
             return Ok(false);
         }
 
-        // Check if all filters can be handled by search index
-        let all_filters_can_be_done = filters.iter().all(|f| {
-            let filter_columns = f
-                .column_refs()
-                .iter()
-                .map(|c| c.name().to_string())
-                .collect::<HashSet<_>>();
-            search_index_columns.is_superset(&filter_columns)
-        });
-
-        Ok(all_filters_can_be_done)
-    }
-
-    /// Build the underlying table scan, removing search index metadata columns from projection
-    fn underlying_table_scan(
-        &self,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        all_metadata_columns: &[String],
-    ) -> Result<LogicalPlan, DataFusionError> {
-        let mut base_proj = projection_without_columns(
-            &self.schema().fields,
-            &[
-                all_metadata_columns,
-                &[
-                    SEARCH_SCORE_COLUMN_NAME.to_string(),
-                    SEARCH_MATCH_COLUMN_NAME.to_string(),
-                    ChunkedSearchIndex::chunking_offset_col(
-                        self.search_index.search_column().as_str(),
-                    ),
-                ],
-            ]
-            .concat(),
-            projection,
-        );
-        base_proj.sort_unstable(); // Deterministic LogicalPlans
-
-        // Get filters that can be pushed down to the base table
-        let filter_refs: Vec<_> = filters.iter().collect();
-        let supported_filters = self
-            .table_provider
-            .supports_filters_pushdown(filter_refs.as_slice())?;
-
-        let underlying_filters: Vec<Expr> = filters
-            .iter()
-            .zip(supported_filters.iter())
-            .filter_map(|(f, supp)| {
-                use datafusion::logical_expr::TableProviderFilterPushDown;
-                if matches!(supp, TableProviderFilterPushDown::Unsupported) {
-                    None
-                } else {
-                    Some(f.clone())
-                }
-            })
-            .collect();
-
-        Ok(LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("base_table"),
-            Arc::new(DefaultTableSource::new(
-                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
-            )),
-            Some(base_proj),
-            underlying_filters,
-            None,
-        )?))
-    }
-
-    /// Get filters that can be handled by the search index
-    fn search_index_filters(
-        search_index_columns: &std::collections::HashSet<String>,
-        filters: &[Expr],
-    ) -> Vec<Expr> {
-        filters
-            .iter()
-            .filter(|f| {
-                let filter_columns = f
-                    .column_refs()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect::<std::collections::HashSet<_>>();
-                search_index_columns.is_superset(&filter_columns)
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Create the search index table scan
-    async fn search_index_table(&self, filters: &[Expr]) -> Result<LogicalPlan, DataFusionError> {
-        // Get the query table provider from the search index
-        let query_table = self
-            .search_index
-            .query_table_provider(&self.query)
-            .await
-            .map_err(DataFusionError::External)?;
-
-        // Create table scan with filters that can be handled by the search index
-        let search_index_columns: std::collections::HashSet<String> = query_table
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect();
-
-        let search_filters = Self::search_index_filters(&search_index_columns, filters);
-
-        Ok(LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("search_index"),
-            Arc::new(DefaultTableSource::new(query_table)),
-            None,
-            search_filters,
-            self.pre_limit,
-        )?))
-    }
-
-    #[allow(clippy::too_many_lines)] // Removed in `https://github.com/spiceai/spiceai/issues/7242`.
-    fn join_with_base(
-        &self,
-        projection: Option<&Vec<usize>>,
-        search_index_table: LogicalPlan,
-        filters: &[Expr],
-    ) -> Result<LogicalPlan, DataFusionError> {
-        // Add subquery so that we can uniquely identify columns between search index and underlying table scan.
-        let search_index_proj = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-            search_index_table.into(),
-            TableReference::parse_str("search_index"),
-        )?);
-
-        let primary_key_fields = self.search_index.primary_fields();
-        let primary_key_projection: Vec<usize> = primary_key_fields
-            .iter()
-            .filter_map(|f| self.schema().index_of(f.name()).ok())
-            .collect();
-
-        let table_proj: Option<Vec<_>> = projection.map(|proj| {
-            let mut p = proj.clone().into_iter().collect::<HashSet<_>>();
-            // Ensure primary keys are retrieved from underlying table.
-            for pp in primary_key_projection {
-                p.insert(pp);
-            }
-
-            // Remove 'match'. Not in base table, calculated from offsets and search column.
-            if let Some((idx, _)) = self.schema().column_with_name(SEARCH_MATCH_COLUMN_NAME) {
-                let _ = p.remove(&idx);
-            }
-
-            let search_index_cols = search_index_proj
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect::<HashSet<_>>();
-            // These columns may be needed to handle filters in the JOIN.
-            // Don't add any that will be in search index.
-            let filter_cols = filters
-                .iter()
-                .flat_map(|f| {
-                    let filter_cols = f
-                        .column_refs()
-                        .iter()
-                        .map(|c| c.name())
-                        .collect::<HashSet<_>>();
-                    filter_cols
-                        .difference(&search_index_cols)
-                        .copied()
-                        .collect::<Vec<_>>()
-                })
-                .filter_map(|c| self.schema().index_of(c).ok())
-                .collect::<Vec<_>>();
-            p.extend(filter_cols);
-
-            // If base and index has embedding column, use index.
-            let embedding_col = format!("{}_embedding", self.search_index.search_column());
-            let index_has_embedding = !search_index_proj
-                .schema()
-                .columns_with_unqualified_name(embedding_col.as_str())
-                .is_empty();
-            if let Some((idx, _)) = self.schema().column_with_name(embedding_col.as_str())
-                && index_has_embedding
-            {
-                let _ = p.remove(&idx);
-            }
-
-            p.into_iter().collect()
-        });
-
-        // Need to join with base table
-        let underlying_table_scan = self.underlying_table_scan(
-            table_proj.as_ref(),
-            filters,
-            &self.search_index.metadata_columns().all_names(),
-        )?;
-
-        // Build join conditions based on primary keys
-        let join_conditions: Vec<(Column, Column)> = self
-            .search_index
-            .primary_fields()
-            .iter()
-            .map(|field| {
-                (
-                    Column::new(
-                        Some(TableReference::parse_str("search_index")),
-                        field.name(),
-                    ),
-                    Column::new(Some(TableReference::parse_str("base_table")), field.name()),
-                )
-            })
-            .collect();
-
-        let on: Vec<(Expr, Expr)> = join_conditions
-            .into_iter()
-            .map(|(left, right)| (Expr::Column(left), Expr::Column(right)))
-            .collect();
-
-        // Build join schema
-        let join_schema = search_index_proj
-            .schema()
-            .join(underlying_table_scan.schema())?;
-
-        let primary_key_column_names: std::collections::HashSet<String> = primary_key_fields
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-
-        let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
-            filters.iter().cloned().partition(|f| {
-                f.column_refs()
-                    .iter()
-                    .any(|col| primary_key_column_names.contains(col.name()))
-            });
-
-        let join = LogicalPlan::Join(Join {
-            left: Arc::new(search_index_proj),
-            right: Arc::new(underlying_table_scan),
-            join_type: JoinType::Left,
-            join_constraint: JoinConstraint::On,
-            on,
-            filter: pre_join_filters.into_iter().reduce(Expr::and),
-            schema: join_schema.into(),
-            null_equality: NullEquality::NullEqualsNothing,
-        });
-
-        let deduped_join_proj_exprs: Vec<_> = join
-            .schema()
-            .iter()
-            .filter(|(tbl, f)| {
-                !(primary_key_column_names.contains(f.name())
-                    && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
-            })
-            .map(|(tbl, field_ref)| match tbl {
-                Some(table_ref) => {
-                    Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
-                }
-                None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
-            })
-            .collect();
-
-        let proj =
-            LogicalPlan::Projection(Projection::try_new(deduped_join_proj_exprs, join.into())?);
-
-        if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
-            Ok(LogicalPlan::Filter(Filter::try_new(filter, proj.into())?))
-        } else {
-            Ok(proj)
-        }
-    }
-
-    fn match_column_index(&self) -> Option<usize> {
-        self.schema()
-            .column_with_name(SEARCH_MATCH_COLUMN_NAME)
-            .map(|(i, _)| i)
-    }
-
-    pub fn add_match_column(
-        &self,
-        projection: Option<&Vec<usize>>,
-        input: LogicalPlan,
-    ) -> Result<LogicalPlan, DataFusionError> {
-        // If projection doesn't include/need the 'match' column, early exit.
-        if !is_chunked(&self.search_index)
-            || projection
-                .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)))
-        {
-            return Ok(input);
-        }
-        let mut initial: Vec<_> = input
-            .schema()
-            .columns()
-            .into_iter()
-            .map(Expr::Column)
-            .collect();
-
-        let first = array_element(
-            Expr::Column(Column::new_unqualified(
-                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
-            )),
-            Expr::Literal(ScalarValue::Int64(Some(1)), None),
-        );
-        let second = array_element(
-            Expr::Column(Column::new_unqualified(
-                ChunkedSearchIndex::chunking_offset_col(self.search_index.search_column().as_str()),
-            )),
-            Expr::Literal(ScalarValue::Int64(Some(2)), None),
-        );
-
-        // substring(search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]) as 'match'
-        let substr = Expr::Cast(Cast::new(
-            Box::new(substring(
-                Expr::Column(Column::new_unqualified(self.search_index.search_column())),
-                first.clone(),
-                Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(second),
-                    Operator::Minus,
-                    Box::new(first),
-                )),
-            )),
-            DataType::Utf8,
-        ));
-
-        initial.push(Expr::Alias(Alias::new(
-            substr,
-            None::<TableReference>,
-            "match",
-        )));
-
-        Ok(LogicalPlan::Projection(Projection::try_new(
-            initial,
-            input.into(),
-        )?))
+        // Ensure filters do not reference column not in search index.
+        Ok(columns_missing_from(filters, search_index_table.schema()).is_empty())
     }
 }
 
@@ -444,51 +360,38 @@ impl TableProvider for SearchQueryProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        // Build schema by combining base table schema with search score column
-        let mut fields: Vec<_> = self
-            .table_provider
+        let mut fields_map = self
+            .search_index_query
             .schema()
             .fields()
             .iter()
-            .cloned()
-            .collect();
+            .map(|f| (f.name().clone(), Arc::clone(f)))
+            .collect::<HashMap<String, FieldRef>>();
 
-        // Add search score column
-        fields.push(Arc::new(Field::new(
-            SEARCH_SCORE_COLUMN_NAME.to_string(),
-            arrow_schema::DataType::Float64,
-            false,
-        )));
+        // Only add if key not in search index (we chose search index columns in `scan` afterall).
+        for f in self.table_provider.schema().fields() {
+            if !fields_map.contains_key(f.name()) {
+                fields_map.insert(f.name().clone(), Arc::clone(f));
+            }
+        }
 
-        if is_chunked(&self.search_index) {
-            fields.extend([
-                Arc::new(Field::new(
-                    ChunkedSearchIndex::chunking_offset_col(
-                        self.search_index.search_column().as_str(),
-                    ),
-                    DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
-                    false,
-                )),
+        // Add `match` only if its a chunked search field.
+        if fields_map.contains_key(&ChunkedSearchIndex::chunking_offset_col(
+            self.search_column.as_str(),
+        )) && fields_map.contains_key(&self.search_column)
+        {
+            fields_map.insert(
+                SEARCH_MATCH_COLUMN_NAME.to_string(),
                 Arc::new(Field::new(
                     SEARCH_MATCH_COLUMN_NAME.to_string(),
                     arrow_schema::DataType::Utf8,
                     false,
                 )),
-            ]);
-
-            if let Some(vector_index) = Arc::clone(&self.search_index).as_vector_index() {
-                fields.push(Arc::new(Field::new(
-                    ChunkedSearchIndex::embedding_col(self.search_index.search_column().as_str()),
-                    DataType::new_fixed_size_list(
-                        DataType::Float32,
-                        vector_index.dimension(),
-                        false,
-                    ),
-                    true,
-                )));
-            }
+            );
         }
 
+        let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
+        fields.sort_unstable();
         Arc::new(Schema::new(fields))
     }
 
@@ -500,46 +403,11 @@ impl TableProvider for SearchQueryProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        let base_table = self.table_provider.supports_filters_pushdown(filters)?;
-
-        // For vector index, any filter that is only on vector index will be marked as support (if not supported by engine, we will manually apply thereafter).
-        let search_index_columns: HashSet<String> = self
-            .search_index
-            .metadata_columns()
-            .filterable()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        let search_index: Vec<_> = filters
-            .iter()
-            .map(|f| {
-                let filter_columns = f
-                    .column_refs()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
-                if search_index_columns.is_superset(&filter_columns) {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect();
-
-        // If one of the two has a pushdown threshold, it can be used.
-        Ok(base_table
-            .iter()
-            .zip(search_index.iter())
-            .map(|(a, b)| match (a, b) {
-                (TableProviderFilterPushDown::Exact, _)
-                | (_, TableProviderFilterPushDown::Exact) => TableProviderFilterPushDown::Exact,
-                (TableProviderFilterPushDown::Inexact, _)
-                | (_, TableProviderFilterPushDown::Inexact) => TableProviderFilterPushDown::Inexact,
-                _ => TableProviderFilterPushDown::Unsupported,
-            })
-            .collect())
+        // Like `ViewTable`, a filter is added on `scan` when needed
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -547,15 +415,19 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if self.search_index.primary_fields().is_empty() {
-            return Err(DataFusionError::Execution(
-                "The search index was created without a primary key.\n\
-                Ensure a primary key is available in the dataset source, or specified in the column configuration."
-                .to_string(),
-            ));
-        }
-        let search_index_table = self.search_index_table(filters).await?;
+        let search_index_table = LogicalPlan::Limit(Limit {
+            skip: None,
+            fetch: self
+                .pre_limit
+                .map(|l| Box::new(Expr::Literal(ScalarValue::UInt32(Some(l as u32)), None))),
+            input: LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                Arc::clone(&self.search_index_query),
+                TableReference::parse_str("search_index"),
+            )?)
+            .into(),
+        });
 
+        // Ensure that if we need `match`, we get underlying search column.
         let inner_proj: Option<Vec<_>> = projection.cloned().map(|proj| {
             let Some(match_idx) = self.match_column_index() else {
                 return proj;
@@ -566,7 +438,7 @@ impl TableProvider for SearchQueryProvider {
             let mut proj2 = proj.clone();
             if let Some(search_idx) = self
                 .schema()
-                .column_with_name(self.search_index.search_column().as_str())
+                .column_with_name(self.search_column.as_str())
                 .map(|(i, _)| i)
                 && !proj2.contains(&search_idx)
             {
@@ -588,7 +460,18 @@ impl TableProvider for SearchQueryProvider {
                 search_index_table
             }
         } else {
-            self.join_with_base(inner_proj.as_ref(), search_index_table, filters)?
+            // Pushdown indexes to search index
+            let search_index = if let Some(filter) =
+                exprs_supported(filters, search_index_table.schema())
+                    .iter()
+                    .cloned()
+                    .reduce(Expr::and)
+            {
+                LogicalPlan::Filter(Filter::try_new(filter, search_index_table.into())?)
+            } else {
+                search_index_table
+            };
+            self.join_with_base(inner_proj.as_ref(), search_index, filters)?
         };
 
         // Add sorting by search score (descending)
@@ -628,26 +511,53 @@ impl TableProvider for SearchQueryProvider {
     }
 }
 
-/// Helper function to remove columns from a projection
-fn projection_without_columns(
-    table_fields: &arrow_schema::Fields,
-    columns: &[String],
-    projection: Option<&Vec<usize>>,
-) -> Vec<usize> {
-    let base_projection = projection
-        .cloned()
-        .unwrap_or_else(|| (0..table_fields.len()).collect());
-
-    let columns_to_remove: std::collections::HashSet<_> = columns.iter().collect();
-
-    base_projection
-        .into_iter()
-        .filter(|&idx| {
-            if let Some(field) = table_fields.get(idx) {
-                !columns_to_remove.contains(&field.name().to_string())
-            } else {
-                true
-            }
-        })
+// Convert to index projection for all unqualified column names. If c in `cols` is not in schema, it is ignored.
+fn projection_from_columns(schema: &SchemaRef, cols: &[String]) -> Vec<usize> {
+    cols.iter()
+        .filter_map(|c| Some(schema.column_with_name(c.as_str())?.0))
         .collect()
+}
+
+// Return the unqualified names of columns missing from those referenced by in `expr`.
+fn columns_missing_from(expr: &[Expr], schema: &DFSchemaRef) -> Vec<String> {
+    let schema_cols = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect::<HashSet<_>>();
+
+    expr.iter()
+        .flat_map(|e| {
+            let filter_cols = e
+                .column_refs()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect::<HashSet<_>>();
+            filter_cols
+                .difference(&schema_cols)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+}
+
+// Returns all expr in exprs that are supported by the `schema`.
+fn exprs_supported(exprs: &[Expr], schema: &DFSchemaRef) -> Vec<Expr> {
+    let schema_cols = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect::<HashSet<_>>();
+
+    exprs
+        .iter()
+        .filter(|e| {
+            e.column_refs()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect::<HashSet<_>>()
+                .is_subset(&schema_cols)
+        })
+        .cloned()
+        .collect::<Vec<_>>()
 }

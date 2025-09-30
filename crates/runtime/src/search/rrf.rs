@@ -16,20 +16,22 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err};
+use datafusion::common::{
+    Column, DataFusionError, JoinType, Result, ScalarValue, TableReference, exec_err, not_impl_err,
+};
 use datafusion::datasource::TableType;
+use datafusion::functions_aggregate::expr_fn::{first_value, max};
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
     ColumnarValue, DocSection, Documentation, Expr, ScalarFunctionArgs, ScalarUDFImpl, Signature,
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{
-    DataFrame, SessionContext, coalesce, exp, greatest, make_array, md5, now, to_unixtime,
-};
+use datafusion::prelude::{DataFrame, SessionContext, coalesce, exp, greatest, now, to_unixtime};
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, lit};
+use datafusion_expr::{ExprFunctionExt, col, ident, lit};
 use itertools::Itertools;
+use runtime_datafusion_udfs::digest_many::digest_many;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -97,6 +99,15 @@ macro_rules! extract_string {
           )
       };
   }
+
+macro_rules! col_qualified {
+    ($column:expr) => {
+        Expr::Column(Column::from_qualified_name_ignore_case($column))
+    };
+    ($table:expr, $column:expr) => {
+        Expr::Column(Column::new(Some($table), $column))
+    };
+}
 
 #[derive(Debug, Clone)]
 enum RecencyDecay {
@@ -220,8 +231,8 @@ impl ReciprocalRankFusionArgs {
             search_udtf_exprs: search_udtfs,
             rrf_subquery_arguments: subquery_args,
             k: extract_f64!(rrf_args, "k").unwrap_or(60.0),
-            join_key: extract_string!(rrf_args, "join_key").map(col),
-            time_column: extract_string!(rrf_args, "time_column").map(col),
+            join_key: extract_string!(rrf_args, "join_key").map(ident),
+            time_column: extract_string!(rrf_args, "time_column").map(ident),
             recency_decay: extract_string!(rrf_args, "recency_decay")
                 .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
             decay_constant: extract_f64!(rrf_args, "decay_constant"),
@@ -285,7 +296,10 @@ impl ReciprocalRankFusion {
 
                 lit(dividend)
                     / (lit(args.k)
-                        + coalesce(vec![col(format!("search_{i}.rank")), lit(f64::INFINITY)]))
+                        + coalesce(vec![
+                            col_qualified!(format!("search_{i}.rank")),
+                            lit(f64::INFINITY),
+                        ]))
             })
             .reduce(|a, b| a + b);
 
@@ -298,7 +312,15 @@ impl ReciprocalRankFusion {
         // If user specifies a recency column, we enable recency boosting
         let qualified_recency_col = if let Some(recency_col) = args.time_column.clone() {
             let (_, qname) = recency_col.qualified_name();
-            Self::first_qualified_field(&subquery_dfs[0], &qname)?
+            let cols = subquery_dfs
+                .iter()
+                .enumerate()
+                .map(|(i, df)| {
+                    Self::first_qualified_field(df, &qname)
+                        .map(|(_, q)| col_qualified!(format!("search_{i}"), q))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            coalesce(cols)
         } else {
             return Ok(score_expr);
         };
@@ -312,7 +334,7 @@ impl ReciprocalRankFusion {
 
         // Lots of casting annoyances are avoided by treating everything as `long`
         let today_epoch = to_unixtime(vec![now()]);
-        let recency_col_epoch = to_unixtime(vec![col(qualified_recency_col)]);
+        let recency_col_epoch = to_unixtime(vec![qualified_recency_col]);
         let age_in_units = (today_epoch - recency_col_epoch) / lit(decay_scale_secs);
 
         let recency_expr = match recency_decay {
@@ -344,13 +366,13 @@ impl ReciprocalRankFusion {
         let mut columns: Vec<Expr> = vec![score_expr];
         columns.extend(subquery_dfs[0].schema().columns().iter().filter_map(|c| {
             match c.name.as_str() {
-                "__spice_rrf_row_id" | "rank" | "score" => None,
+                "rank" | "score" => None,
                 // TODO: do we want the embedding in the final projection?
                 other if other.ends_with("_embedding") => None,
                 other => Some(
                     coalesce(
                         (0..subquery_dfs.len())
-                            .map(|i| col(format!("search_{i}.{other}")))
+                            .map(|i| col_qualified!(format!("search_{i}"), other))
                             .collect(),
                     )
                     .alias(other),
@@ -359,12 +381,17 @@ impl ReciprocalRankFusion {
         }));
 
         // Join DFs together, apply final projection, and sort by the new fused score
+        let join_key = args
+            .join_key
+            .clone()
+            .map_or("__spice_rrf_row_id".to_string(), |k| {
+                let (_, qname) = k.qualified_name();
+                qname
+            });
+
         let mut join_err: Option<DataFusionError> = None;
         let maybe_joined = subquery_dfs.into_iter().reduce(|a, b| {
-            let joined = match args.join_key.clone().map(|e| e.qualified_name()) {
-                Some((_, join_key)) => Self::fold_join(a, b, &join_key),
-                None => Self::fold_join(a, b, "__spice_rrf_row_id"),
-            };
+            let joined = Self::fold_join(a, b, &join_key);
 
             // No way to short circuit reduce, so we will surface the error at the end
             match joined {
@@ -384,10 +411,29 @@ impl ReciprocalRankFusion {
 
         if let Some(joined) = maybe_joined {
             tracing::trace!("{RRF_UDF_NAME} made reranked & fused DF for: {args:?}");
+            // Take the highest scores from multiple matches
+            let mut agg_cols = vec![max(col("fused_score")).alias("fused_score")];
+
+            // The first column is the score_expr, which gets special treatment above.
+            // These are unaliased, because they get flattened by coalesce() in the first select
+            agg_cols.extend(columns.iter().skip(1).filter_map(|c| {
+                let (_, cname) = c.qualified_name();
+
+                // Do not aggregate the join key
+                if cname == join_key {
+                    None
+                } else {
+                    Some(
+                        first_value(ident(&cname), vec![col("fused_score").sort(false, false)])
+                            .alias(&cname),
+                    )
+                }
+            }));
 
             joined
                 .select(columns)?
-                .distinct()?
+                .aggregate(vec![ident(&join_key)], agg_cols)?
+                .drop_columns(&["__spice_rrf_row_id"])?
                 .sort(vec![col("fused_score").sort(false, false)])
         } else {
             exec_err!("{RRF_UDF_NAME}: Unable to join result sets")
@@ -443,12 +489,12 @@ impl ReciprocalRankFusion {
 
     // Given a DF with overlapping unqualified names (as produced by JOIN), where column values
     // are equivalent, return the first (arbitrary) qualified name.
-    fn first_qualified_field(df: &DataFrame, name: &str) -> Result<String> {
+    fn first_qualified_field(df: &DataFrame, name: &str) -> Result<(TableReference, String)> {
         df.schema()
             .qualified_fields_with_unqualified_name(name)
             .first()
             .and_then(|(maybe_table_reference, f)| {
-                maybe_table_reference.map(|tr| format!("{}.{}", tr.table(), &f.name()))
+                maybe_table_reference.map(|tr| (tr.clone(), f.name().clone()))
             })
             .ok_or(DataFusionError::Execution(format!(
                 "{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"
@@ -457,10 +503,14 @@ impl ReciprocalRankFusion {
 
     // Reduces 2 or more search subquery DFs into a single one
     fn fold_join(a: DataFrame, b: DataFrame, join_key: &str) -> Result<DataFrame> {
-        let id_a = Self::first_qualified_field(&a, join_key)?;
-        let id_b = Self::first_qualified_field(&b, join_key)?;
+        let (tbl_a, id_a) = Self::first_qualified_field(&a, join_key)?;
+        let (tbl_b, id_b) = Self::first_qualified_field(&b, join_key)?;
 
-        a.join(b, JoinType::Full, &[&id_a], &[&id_b], None)
+        a.join_on(
+            b,
+            JoinType::Full,
+            vec![col_qualified!(tbl_a, id_a).eq(col_qualified!(tbl_b, id_b))],
+        )
     }
 
     // Window and rank a search subquery by its `score` field, exposing a `rank` column
@@ -484,12 +534,11 @@ impl ReciprocalRankFusion {
             .filter_map(|c| match c.name() {
                 "score" => None,
                 name if name.ends_with("_embedding") => None,
-                name => Some(col(name).cast_to(&DataType::Utf8, df.schema())),
+                name => Some(ident(name)),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        let rrf_row_id = md5(make_array(bin_columns).cast_to(&DataType::Utf8, df.schema())?);
-        df.with_column("__spice_rrf_row_id", rrf_row_id)
+        df.with_column("__spice_rrf_row_id", digest_many(bin_columns, "md5"))
     }
 }
 
@@ -567,7 +616,7 @@ impl TableProvider for ReciprocalRankFusion {
                         .project(projection)?
                         .fields
                         .iter()
-                        .map(|f| col(f.name())),
+                        .map(|f| ident(f.name())),
                 )?;
             }
 
@@ -594,13 +643,13 @@ mod tests {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::catalog::TableProvider;
     use datafusion::common::Result;
-    use datafusion::common::cast::as_float64_array;
+    use datafusion::common::cast::{as_float64_array, as_uint64_array};
     use datafusion::functions_window::expr_fn::row_number;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
-    use datafusion::prelude::{DataFrame, now, to_unixtime};
+    use datafusion::prelude::{DataFrame, named_struct, now, to_unixtime};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{ExprFunctionExt, lit};
@@ -621,6 +670,33 @@ mod tests {
                 $name.to_string(),
             )]));
             Expr::Literal(scalar_value, Some(spice_metadata))
+        }};
+    }
+
+    macro_rules! extract_column {
+        ($batches:expr, $column_name:expr, $array_cast_fn:ident, $nth:expr) => {
+            $array_cast_fn(
+                $batches[$nth]
+                    .column_by_name($column_name)
+                    .expect(format!("Must have {}", $column_name).as_str()),
+            )
+        };
+
+        ($batches:expr, $column_name:expr, $array_cast_fn:ident) => {
+            extract_column!($batches, $column_name, $array_cast_fn, 0)
+        };
+    }
+
+    macro_rules! test_query {
+        ($runtime:ident, $query:expr) => {{
+            let query = QueryBuilder::new($query, $runtime.datafusion()).build();
+            query
+                .run()
+                .await
+                .expect("Must run query")
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await?
         }};
     }
 
@@ -741,31 +817,83 @@ mod tests {
 
         // decay_constant is made more aggressive in this query to further deprioritize
         // old results. The test will/should fail if you use the default of 0.01.
-        let query = "select * from rrf(vector_search(foo, 'red crispy'), vector_search(foo, 'fruit'), time_column => 'picked_at', decay_constant => 0.1)";
-        let query = QueryBuilder::new(query, runtime.datafusion()).build();
-        let results = query
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let content = as_string_array(
-            results[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'red crispy'), vector_search(foo, 'fruit'), time_column => 'picked_at', decay_constant => 0.1)"
         );
+
+        let content = extract_column!(results, "content", as_string_array);
 
         let fruit_df_batches = fruit_df.collect().await?;
-        let fruit_df_recent = as_string_array(
-            fruit_df_batches[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
-        );
+        let fruit_df_recent = extract_column!(fruit_df_batches, "content", as_string_array);
 
         // fruit_df.show() to debug me
         assert_eq!(content.value(0), fruit_df_recent.value(0));
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_recency_unboosting_disjoint() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime)
+            .await?
+            .with_column("picked_at", now())?
+            .with_column(
+                "picked_at",
+                to_unixtime(vec![col("picked_at")]) - (lit(86400) * col("id")),
+            )?;
+
+        let picked_at_expr = fruit_df.parse_sql_expr("to_timestamp(cast(picked_at as bigint))")?;
+
+        // Rows ordered picked_at DESC
+        let fruit_df = fruit_df
+            .with_column("picked_at", picked_at_expr)?
+            .sort(vec![col("picked_at").sort(false, false)])?;
+
+        // left_fruit: id (2, 3) with (now() - 1 day, now() - 2 day) respectively
+        let left_fruit = df_as_embedding_table(&runtime, fruit_df.clone().limit(1, Some(2))?);
+        // right_fruit: id (1) with timestamp 1970-01-01
+        let right_fruit = df_as_embedding_table(
+            &runtime,
+            fruit_df.clone().limit(0, Some(1))?.with_column(
+                "picked_at",
+                fruit_df.parse_sql_expr("to_timestamp(cast(0 as timestamp))")?,
+            )?,
+        );
+
+        runtime.df.ctx.register_table("left_fruit", left_fruit)?;
+
+        runtime.df.ctx.register_table("right_fruit", right_fruit)?;
+
+        // Baseline: query against self to obtain fused score with recency decay
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(left_fruit, 'red crispy'), vector_search(right_fruit, 'red crispy'), k => 0, time_column => 'picked_at', decay_constant => 0.25)"
+        );
+
+        /*
+        Prior to fix:
+
+        Base RRF score for id=1, k=0 = 1/(k + rank) = 1/(0+1) = 1/1
+        But should be unboosted!
+        | fused_score        | content                      | id | picked_at           |
+        +--------------------+------------------------------+----+---------------------+
+        | 1.0                | orange citrus round juicy    | 1  | 1970-01-01T00:00:00 |
+        | 0.4723665527410147 | apple fruit sweet red crispy | 3  | 2025-09-23T14:26:15 |
+        | 0.3032653298563167 | banana yellow curved fruit   | 2  | 2025-09-24T14:26:15 |
+        +--------------------+------------------------------+----+---------------------+
+
+        After:
+        | fused_score        | content                      | id | picked_at           |
+        +--------------------+------------------------------+----+---------------------+
+        | 0.4723665527410147 | apple fruit sweet red crispy | 3  | 2025-09-23T14:32:53 |
+        | 0.3032653298563167 | banana yellow curved fruit   | 2  | 2025-09-24T14:32:53 |
+        | 0.0                | orange citrus round juicy    | 1  | 1970-01-01T00:00:00 |
+        +--------------------+------------------------------+----+---------------------+
+         */
+        assert_ne!(extract_column!(results, "id", as_uint64_array)?.value(0), 1);
 
         Ok(ExitCode::SUCCESS)
     }
@@ -782,22 +910,15 @@ mod tests {
             .ctx
             .register_table("foo", fruit_embedding_table)?;
 
-        let query = "select * from rrf(vector_search(foo, 'yellow', rank_weight => 100), vector_search(foo, 'red', rank_weight => 10))";
-        let query = QueryBuilder::new(query, runtime.datafusion()).build();
-        let results = query
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let content = as_string_array(
-            results[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'yellow', rank_weight => 100), vector_search(foo, 'red', rank_weight => 10))"
         );
-        assert_eq!(content.value(0), "banana yellow curved fruit");
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "banana yellow curved fruit"
+        );
 
         Ok(ExitCode::SUCCESS)
     }
@@ -814,22 +935,98 @@ mod tests {
             .ctx
             .register_table("foo", fruit_embedding_table)?;
 
-        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)";
-        let query = QueryBuilder::new(query, runtime.datafusion()).build();
-        let results = query
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let content = as_string_array(
-            results[0]
-                .column_by_name("content")
-                .expect("Must have content column"),
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
         );
-        assert_eq!(content.value(0), "apple fruit sweet red crispy");
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_queries_auto_hash_and_special_idents() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime)
+            .await?
+            .with_column("meta_a", named_struct(vec![lit("k1"), lit("v1")]))?
+            .with_column("meta_b.special", named_struct(vec![lit("k2"), lit(133.7)]))?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), k => 600.0)"
+        );
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_with_case_sensitive_columns() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?.select(vec![
+            col("id").alias("Id"),
+            col("content"),
+            col("content_embedding"),
+            now().alias("pIckEd_AT"),
+        ])?;
+
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'Id', k => 600.0, time_column => 'pIckEd_AT')"
+        );
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_with_dupes() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime).await?;
+        let fruit_df = fruit_df.clone().union(fruit_df)?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
+        );
+
+        // There are only 3 unique rows for (id)
+        assert_eq!(results[0].num_rows(), 3);
 
         Ok(ExitCode::SUCCESS)
     }
@@ -850,46 +1047,22 @@ mod tests {
         let no_fruit_table = df_as_embedding_table(&runtime, no_fruit_df);
 
         runtime.df.ctx.register_table("foo", fruit_table)?;
-
         runtime.df.ctx.register_table("bar", no_fruit_table)?;
 
-        let query_empty_red = "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by fused_score desc";
-        let query_empty_red = QueryBuilder::new(query_empty_red, runtime.datafusion()).build();
-        let query_empty_red_results = query_empty_red
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let query_empty_red_content = as_float64_array(
-            query_empty_red_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
-        )
-        .expect("Must be f64[]");
-
+        let query_empty_red_results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by fused_score desc"
+        );
+        let query_empty_red_content =
+            extract_column!(query_empty_red_results, "fused_score", as_float64_array)?;
         let query_empty_red_score = query_empty_red_content.value(0);
 
-        let query_red_empty =
-            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))";
-        let query_red_empty = QueryBuilder::new(query_red_empty, runtime.datafusion()).build();
-        let query_red_empty_results = query_red_empty
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let query_red_empty_content = as_float64_array(
-            query_red_empty_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
-        )
-        .expect("Must be f64[]");
-
+        let query_red_empty_results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))"
+        );
+        let query_red_empty_content =
+            extract_column!(query_red_empty_results, "fused_score", as_float64_array)?;
         let query_red_empty_score = query_red_empty_content.value(0);
 
         // Compare permutation of RRF invocations to ensure score is consistent regardless of order
@@ -897,23 +1070,15 @@ mod tests {
         assert!(score_diff < 0.0001f64);
 
         // If timestamp column is missing due to FULL OUTER JOIN, ensure a score is still output
-        let query_empty_red_recency = "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), time_column => 'timestamp')";
-        let query_empty_red_recency =
-            QueryBuilder::new(query_empty_red_recency, runtime.datafusion()).build();
-        let query_empty_red_recency_results = query_empty_red_recency
-            .run()
-            .await
-            .expect("Must run query")
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await?;
-
-        let query_empty_red_recency_scores = as_float64_array(
-            query_empty_red_recency_results[0]
-                .column_by_name("fused_score")
-                .expect("Must have score column"),
-        )
-        .expect("Must be f64[]");
+        let query_empty_red_recency_results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), time_column => 'timestamp')"
+        );
+        let query_empty_red_recency_scores = extract_column!(
+            query_empty_red_recency_results,
+            "fused_score",
+            as_float64_array
+        )?;
 
         assert!(
             query_empty_red_recency_scores

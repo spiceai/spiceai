@@ -77,19 +77,26 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
                 ChatCompletionRequestUserMessage {
                     name: None,
                     content: ChatCompletionRequestUserMessageContent::Text(
-                        "Respond with the single letter 'A'. This is a healthcheck.".to_string(),
+                        "Respond with 'ok'".to_string(),
                     ),
                 },
             )],
             ..Default::default()
         };
-        if self.supports_max_completion_tokens() {
-            req.max_completion_tokens = Some(150);
-        } else {
-            req.max_tokens = Some(150);
+
+        if self.supports_reasoning_effort() {
+            req.reasoning_effort = Some(async_openai::types::ReasoningEffort::Low);
         }
 
-        if let Err(e) = self.chat_request(req).instrument(span.clone()).await {
+        if self.supports_max_completion_tokens() {
+            req.max_completion_tokens = Some(300);
+        } else {
+            req.max_tokens = Some(300);
+        }
+
+        let result = self.chat_request(req).instrument(span.clone()).await;
+        tracing::debug!("{} model health check response: {:?}", self.model, result);
+        if let Err(e) = result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
             return Err(crate::chat::Error::HealthCheckError {
                 source: Box::new(e),

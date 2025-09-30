@@ -55,15 +55,15 @@ impl Drop for TimeMeasurement {
 
 /// Measures the time in milliseconds it takes to execute a block of code and records it in a histogram metric
 /// with multiple independent sets of labels.
-pub struct MultiTimeMeasurement {
+pub struct MultiTimeMeasurement<'a> {
     start: Instant,
     metric: &'static Histogram<f64>,
-    label_sets: Vec<Vec<KeyValue>>,
+    label_sets: &'a Vec<Vec<KeyValue>>,
 }
 
-impl MultiTimeMeasurement {
+impl<'a> MultiTimeMeasurement<'a> {
     #[must_use]
-    pub fn new(metric: &'static Histogram<f64>, label_sets: Vec<Vec<KeyValue>>) -> Self {
+    pub fn new(metric: &'static Histogram<f64>, label_sets: &'a Vec<Vec<KeyValue>>) -> Self {
         Self {
             start: Instant::now(),
             metric,
@@ -72,10 +72,10 @@ impl MultiTimeMeasurement {
     }
 }
 
-impl Drop for MultiTimeMeasurement {
+impl Drop for MultiTimeMeasurement<'_> {
     fn drop(&mut self) {
         let elapsed = 1000_f64 * self.start.elapsed().as_secs_f64();
-        for label_set in &self.label_sets {
+        for label_set in self.label_sets {
             self.metric.record(elapsed, label_set);
         }
     }

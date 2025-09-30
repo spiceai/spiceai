@@ -108,72 +108,8 @@ impl GlueDataConnector {
     pub fn new(params: Parameters) -> Self {
         Self { params }
     }
-}
 
-impl GlueDataConnector {
-    async fn config(&self) -> Result<SdkConfig, aws::Error> {
-        let config = load_config(
-            "GlueCatalogConnector",
-            "region",
-            "key",
-            "secret",
-            "session_token",
-            &self.params,
-        )
-        .await?;
-
-        Ok(config)
-    }
-}
-
-#[derive(Default, Debug, Copy, Clone)]
-pub struct GlueDataConnectorFactory {}
-
-impl GlueDataConnectorFactory {
-    #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
-    }
-}
-
-pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
-    let mut all_parameters = Vec::new();
-    all_parameters.extend_from_slice(&[ParameterSpec::component("catalog_id").secret()]);
-    all_parameters.extend_from_slice(crate::dataconnector::s3::PARAMETERS.as_ref());
-    all_parameters
-});
-
-impl DataConnectorFactory for GlueDataConnectorFactory {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn create(
-        &self,
-        params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move {
-            let glue = GlueDataConnector::new(params.parameters);
-            Ok(Arc::new(glue) as Arc<dyn DataConnector>)
-        })
-    }
-
-    fn prefix(&self) -> &'static str {
-        PREFIX
-    }
-
-    fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS.as_ref()
-    }
-}
-
-#[async_trait]
-impl DataConnector for GlueDataConnector {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn read_provider(
+    async fn create_table_provider(
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
@@ -257,6 +193,86 @@ impl DataConnector for GlueDataConnector {
                 create_iceberg_provider(dataset, &config, database.to_string(), &table).await
             }
         }
+    }
+}
+
+impl GlueDataConnector {
+    async fn config(&self) -> Result<SdkConfig, aws::Error> {
+        let config = load_config(
+            "GlueCatalogConnector",
+            "region",
+            "key",
+            "secret",
+            "session_token",
+            &self.params,
+        )
+        .await?;
+
+        Ok(config)
+    }
+}
+
+#[derive(Default, Debug, Copy, Clone)]
+pub struct GlueDataConnectorFactory {}
+
+impl GlueDataConnectorFactory {
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[ParameterSpec::component("catalog_id").secret()]);
+    all_parameters.extend_from_slice(crate::dataconnector::s3::PARAMETERS.as_ref());
+    all_parameters
+});
+
+impl DataConnectorFactory for GlueDataConnectorFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn create(
+        &self,
+        params: ConnectorParams,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move {
+            let glue = GlueDataConnector::new(params.parameters);
+            Ok(Arc::new(glue) as Arc<dyn DataConnector>)
+        })
+    }
+
+    fn prefix(&self) -> &'static str {
+        PREFIX
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS.as_ref()
+    }
+}
+
+#[async_trait]
+impl DataConnector for GlueDataConnector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        self.create_table_provider(dataset).await
+    }
+
+    #[cfg(feature = "iceberg-write")]
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        // Iceberg supports read and write operations through the same TableProvider interface.
+        Some(self.create_table_provider(dataset).await)
     }
 }
 

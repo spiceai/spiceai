@@ -33,7 +33,6 @@ pub async fn as_candidate_generations(
     for search_field in database_index.search_fields.as_slice() {
         let base = database_index
             .full_text_search_field_index(search_field.as_str())
-            .await
             .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
         let candidate: TextSearchCandidate =
