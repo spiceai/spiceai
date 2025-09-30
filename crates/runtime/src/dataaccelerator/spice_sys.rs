@@ -121,11 +121,6 @@ pub enum Error {
     #[snafu(display("Failed to downcast to {target}"))]
     DowncastFailed { target: &'static str },
 
-    #[snafu(transparent)]
-    FileModeUnsupported {
-        source: crate::dataaccelerator::FilePathError,
-    },
-
     #[snafu(display("{source}"))]
     External {
         source: Box<dyn std::error::Error + Send + Sync>,
