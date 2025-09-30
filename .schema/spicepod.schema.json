@@ -1276,6 +1276,12 @@
             "null"
           ]
         },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "from": {
           "type": "string"
         },
