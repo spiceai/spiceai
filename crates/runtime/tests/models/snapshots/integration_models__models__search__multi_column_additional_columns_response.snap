@@ -7,6 +7,9 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "data": {
+        "question": "What is the fifth root of 32?"
+      },
       "dataset": "qs",
       "matches": {
         "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
@@ -17,6 +20,9 @@ snapshot_kind: text
       "score": 0.01
     },
     {
+      "data": {
+        "question": "How many groups of 3 are in 18?"
+      },
       "dataset": "qs",
       "matches": {
         "question": "How many groups of 3 are in 18?"
@@ -27,6 +33,9 @@ snapshot_kind: text
       "score": 0.01
     },
     {
+      "data": {
+        "question": "How many groups of 5 are in 25?"
+      },
       "dataset": "qs",
       "matches": {
         "question": "How many groups of 5 are in 25?"
@@ -37,6 +46,9 @@ snapshot_kind: text
       "score": 0.01
     },
     {
+      "data": {
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
+      },
       "dataset": "qs",
       "matches": {
         "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"

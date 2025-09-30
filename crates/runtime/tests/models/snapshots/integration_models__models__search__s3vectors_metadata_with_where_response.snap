@@ -9,42 +9,42 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Choices create costs and benefits."
+        "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
       },
       "primary_key": {
-        "id": 863
+        "id": 1015
       },
-      "score": 0.87
+      "score": 0.28
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
       },
       "primary_key": {
-        "id": 6
+        "id": 821
       },
-      "score": 0.82
+      "score": 0.24
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "The Cat does not need to drink, as it obtains sufficient water from its prey."
+        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
       },
       "primary_key": {
-        "id": 438
+        "id": 449
       },
-      "score": 0.8
+      "score": 0.23
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "A common thermometer operates on the principle that matter usually expands when it absorbs heat energy."
+        "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
       },
       "primary_key": {
-        "id": 1041
+        "id": 1193
       },
-      "score": 0.77
+      "score": 0.2
     }
   ]
 }
