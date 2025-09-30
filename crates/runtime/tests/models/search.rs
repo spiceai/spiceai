@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::models::hf::get_model_to_vec_embeddings;
 use crate::models::openai::get_openai_embeddings;
-use crate::models::s3_vectors::basic_vector_search_tests;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
@@ -401,7 +400,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
         app,
         vec![
             SearchTestCase::new(
-                format!("multi_column_basic"),
+                "multi_column_basic".to_string(),
                 SearchTestType::Http(json!({
                     "text": "second",
                     "limit": 4,
@@ -409,7 +408,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
                 })),
             ),
             SearchTestCase::new(
-                format!("multi_column_additional_columns"),
+                "multi_column_additional_columns".to_string(),
                 SearchTestType::Http(json!({
                     "text": "second",
                     "limit": 4,
@@ -418,7 +417,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
                 })),
             ),
             SearchTestCase::new(
-                format!("multi_column_with_where"),
+                "multi_column_with_where".to_string(),
                 SearchTestType::Http(json!({
                     "text": "secondary",
                     "datasets": ["qs"],
