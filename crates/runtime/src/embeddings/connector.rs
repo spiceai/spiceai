@@ -25,6 +25,7 @@ use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
 use crate::embeddings::index::VectorScanTableProvider;
+#[cfg(feature = "s3_vectors")]
 use crate::embeddings::index::s3::S3Vector;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
