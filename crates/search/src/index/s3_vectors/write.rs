@@ -22,16 +22,14 @@ use arrow::array::{
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field};
-use async_openai::types::EmbeddingInput;
 use itertools::Itertools;
+use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
-use search::index::SearchIndex;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
-use tokio::sync::RwLock;
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
-use crate::{embedding_col, embeddings::index::s3::S3Vector, model::EmbeddingModelStore};
+use crate::index::{SearchIndex, embedding_col, s3_vectors::S3Vector};
 
 #[derive(Snafu, Debug)]
 pub enum Error {
@@ -40,15 +38,6 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     FailedToEmbed { source: llms::embeddings::Error },
-
-    #[snafu(display(
-        "Failed to update '{index}' index. An error occurred embedding the underlying dataset column '{column}'. Error: '{source}'."
-    ))]
-    FailedToEmbedColumn {
-        index: String,
-        column: String,
-        source: Box<Error>,
-    },
 
     #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
     ColumnNotFound { index: String, column: String },
@@ -127,8 +116,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     let embedding_vectors = embed_column(
         &record,
         embedded_column_idx,
-        index.model_name.as_str(),
-        Arc::clone(&index.embedding_models),
+        Arc::clone(&index.compute_query),
     )
     .await?;
 
@@ -138,7 +126,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
             .metadata_columns()
             .all_names()
             .into_iter()
-            .filter(|c| *c != embedding_col!(index.search_column()))
+            .filter(|c| *c != embedding_col(&index.search_column()))
             .collect::<Vec<_>>(),
         &record,
     )
@@ -345,19 +333,10 @@ where
 async fn embed_column(
     rb: &RecordBatch,
     column_idx: usize,
-    model_name: &str,
-    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+    model: Arc<dyn Embed>,
 ) -> Result<Vec<Option<Vec<f32>>>, Error> {
     let Some(data) = convert_string_arrow_to_iterator!(rb.column(column_idx)) else {
         return Ok(vec![]);
-    };
-
-    let embedding_guard = embedding_models.read().await;
-    let Some(model) = embedding_guard.get(model_name) else {
-        return EmbeddingModelNotFoundSnafu {
-            model_name: model_name.to_string(),
-        }
-        .fail();
     };
 
     let mut nulls = vec![];
@@ -372,7 +351,7 @@ async fn embed_column(
     }
 
     let embedded_data = model
-        .embed(EmbeddingInput::StringArray(column))
+        .embed_strings(column)
         .await
         .context(FailedToEmbedSnafu)?;
 
@@ -385,7 +364,7 @@ fn update_embedding_column_in_batch(
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
 ) -> Result<RecordBatch, Box<Error>> {
-    let embedding_column_name = embedding_col!(embedded_column_name);
+    let embedding_column_name = embedding_col(&embedded_column_name);
 
     let schema = record.schema();
     let mut columns = record.columns().to_vec();
@@ -640,7 +619,7 @@ mod tests {
             .expect("Failed to handle missing embedding column");
 
         // Should append the embedding column with the correct name
-        let expected_embedding_col = embedding_col!("text");
+        let expected_embedding_col = embedding_col("text");
         assert_eq!(result.num_columns(), record.num_columns() + 1);
         assert_eq!(result.num_rows(), record.num_rows());
 

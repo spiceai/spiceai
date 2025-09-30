@@ -2,7 +2,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    index::{SearchIndex, VectorIndex},
+    index::{SearchIndex, VectorIndex, embedding_col},
     metadata::{MetadataColumn, MetadataColumns},
 };
 
@@ -120,11 +120,6 @@ impl ChunkedSearchIndex {
     #[must_use]
     pub fn chunking_offset_col(search_column: &str) -> String {
         format!("{search_column}_offset")
-    }
-
-    #[must_use]
-    pub fn embedding_col(search_column: &str) -> String {
-        format!("{search_column}_embedding")
     }
 
     #[must_use]
@@ -401,9 +396,9 @@ impl VectorIndex for ChunkedVectorIndex {
             .build()?,
         );
         aggr_expr.push(
-            array_agg(Expr::Column(Column::new_unqualified(
-                ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
-            )))
+            array_agg(Expr::Column(Column::new_unqualified(embedding_col(
+                self.search_column().as_str(),
+            ))))
             .order_by(vec![SortExpr::new(
                 Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
                 true,
@@ -419,7 +414,7 @@ impl VectorIndex for ChunkedVectorIndex {
                 .filter_map(|c| {
                     if [
                         ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
-                        ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
+                        embedding_col(self.search_column().as_str()),
                     ]
                     .contains(c)
                     {

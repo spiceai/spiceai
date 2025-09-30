@@ -20,12 +20,12 @@ use std::{collections::HashMap, sync::Arc};
 use super::request::SearchRequest;
 use super::util::user_tables_that_can_search;
 use super::{Error, Result};
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::s3::S3Vector;
 use crate::embeddings::table::EmbeddingTable;
 use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 use crate::search::FormattingSnafu;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
+#[cfg(feature = "s3_vectors")]
+use search::index::s3_vectors::S3Vector;
 
 use crate::search::{
     SearchPipelineSnafu,
@@ -49,8 +49,8 @@ use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
-use search::chunking::ChunkedSearchIndex;
 use search::index::SearchIndex;
+use search::index::chunking::ChunkedSearchIndex;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,

@@ -64,7 +64,7 @@ use search::{
 use snafu::ResultExt;
 
 #[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::s3::S3Vector;
+use search::index::s3_vectors::S3Vector;
 
 use crate::{
     datafusion::DataFusion,
@@ -78,7 +78,7 @@ use crate::{
     },
 };
 
-use search::chunking::ChunkedSearchIndex;
+use search::index::chunking::ChunkedSearchIndex;
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";

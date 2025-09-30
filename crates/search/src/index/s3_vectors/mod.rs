@@ -19,6 +19,7 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use data_components::s3_vectors::query_provider::ComputeQueryVector;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
@@ -26,13 +27,12 @@ use data_components::s3_vectors::{
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
-use search::SEARCH_SCORE_COLUMN_NAME;
-use search::index::{SearchIndex, VectorIndex};
-use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
-use crate::embeddings::index::s3::compute_vector::ComputeQuery;
-use crate::{embedding_col, embeddings::index::s3::write, model::EmbeddingModelStore};
+use crate::SEARCH_SCORE_COLUMN_NAME;
+use crate::index::s3_vectors::compute_query::EmbedQuery;
+use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::metadata::{MetadataColumn, MetadataColumns};
 use datafusion::{
     catalog::TableProvider,
     common::Column,
@@ -47,7 +47,9 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use tokio::sync::RwLock;
+
+mod compute_query;
+mod write;
 
 #[derive(Debug, Clone)]
 pub struct S3Vector {
@@ -62,9 +64,7 @@ pub struct S3Vector {
     /// Additional columns to add as metadata to the S3 vector index from the original dataset columns.
     pub metadata_columns: MetadataColumns,
 
-    pub model_name: String,
-
-    pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+    pub compute_query: Arc<dyn Embed>,
 }
 
 impl S3Vector {
@@ -75,16 +75,14 @@ impl S3Vector {
         embedded_column: String,
         primary_key: Vec<Field>,
         metadata_columns: MetadataColumns,
-        model_name: String,
-        embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+        compute_query: Arc<dyn Embed>,
     ) -> Self {
         Self {
             table,
             embedded_column,
             primary_key,
             metadata_columns,
-            model_name,
-            embedding_models,
+            compute_query,
         }
     }
 
@@ -105,12 +103,6 @@ impl S3Vector {
         self.metadata_columns = new.into();
 
         self
-    }
-
-    pub async fn embedding_model(&self) -> Option<Arc<dyn Embed>> {
-        let model_lock = self.embedding_models.read().await;
-        let model = model_lock.get(&self.model_name)?;
-        Some(Arc::clone(model))
     }
 }
 
@@ -145,7 +137,7 @@ impl SearchIndex for S3Vector {
             Expr::Alias(Alias::new(
                 Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
                 None::<TableReference>,
-                embedding_col!(self.search_column()),
+                embedding_col(&self.search_column()),
             )),
             Expr::Alias(Alias::new(
                 Expr::BinaryExpr(BinaryExpr::new(
@@ -162,10 +154,8 @@ impl SearchIndex for S3Vector {
         table_with_projection(
             Arc::new(S3VectorsQueryTable::new(
                 self.table.clone(),
-                Arc::new(ComputeQuery {
-                    model_name: self.model_name.clone(),
-                    embedding_models: Arc::clone(&self.embedding_models),
-                }),
+                Arc::new(EmbedQuery(Arc::clone(&self.compute_query)))
+                    as Arc<dyn ComputeQueryVector>,
                 query.to_string(),
             )),
             projection,
@@ -199,7 +189,7 @@ impl VectorIndex for S3Vector {
                 S3_VECTOR_EMBEDDING_NAME,
             )),
             None::<TableReference>,
-            embedding_col!(self.search_column()),
+            embedding_col(&self.search_column()),
         )));
 
         table_with_projection(
@@ -240,7 +230,7 @@ impl Index for S3Vector {
         pks.extend(
             self.metadata_columns
                 .iter()
-                .filter(|c| *c.name() != embedding_col!(self.embedded_column))
+                .filter(|c| *c.name() != embedding_col(&self.embedded_column))
                 .map(|c| c.name().to_string()),
         );
 

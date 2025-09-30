@@ -142,6 +142,25 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
+    /// Implementation so that upstream do not need [`async_openai`] types.
+    async fn embed_str(&self, input: &str) -> Result<Vec<f32>> {
+        let Some(vec) = self
+            .embed(EmbeddingInput::String(input.to_string()))
+            .await?
+            .pop()
+        else {
+            return Err(Error::FailedToCreateEmbedding {
+                source: Box::from("no embedding vector created for query".to_string()),
+            });
+        };
+        Ok(vec)
+    }
+
+    /// Implementation so that upstream do not need [`async_openai`] types.
+    async fn embed_strings(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.embed(EmbeddingInput::StringArray(inputs)).await
+    }
+
     fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         None
     }

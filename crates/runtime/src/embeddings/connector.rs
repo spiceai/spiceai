@@ -37,10 +37,7 @@ use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
-use search::{
-    chunking::ChunkedSearchIndex,
-    index::{SearchIndex, VectorIndex},
-};
+use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::vector::VectorStore;

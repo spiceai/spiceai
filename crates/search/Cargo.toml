@@ -17,10 +17,13 @@ async-stream.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
+datafusion-functions-json = { workspace = true }
+data_components  = { path = "../data_components" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 chunking = { path = "../chunking" }
 serde_json.workspace = true
 itertools.workspace = true
+llms = {path = "../llms"}
 snafu.workspace = true
 tantivy = { workspace = true, optional = true }
 tokio.workspace = true

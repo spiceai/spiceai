@@ -25,6 +25,7 @@ use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
 use search::{
     generation::util::get_primary_keys,
+    index::s3_vectors::S3Vector,
     metadata::{MetadataColumn, MetadataColumns},
 };
 use snafu::ResultExt;
@@ -43,12 +44,7 @@ use crate::{
     secrets::Secrets,
 };
 use retry_client::S3VectorRetryClientBuilder;
-mod compute_vector;
 mod retry_client;
-mod write;
-pub use index::S3Vector;
-mod index;
-pub use write::write;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
@@ -123,13 +119,20 @@ pub async fn try_from_dataset(
     )
     .await?;
 
+    let model_read = embedding_models.read().await;
+    let Some(model) = model_read.get(&config.model) else {
+        return Err(Box::from(format!(
+            "Cannot make S3 vector index for table '{}'. No embedding model named: '{}'.",
+            ds_name, config.model
+        )));
+    };
+
     Ok(S3Vector::new(
         table,
         column.clone(),
         primary_key,
         metadata_columns,
-        config.model.clone(),
-        embedding_models,
+        Arc::clone(&model),
     ))
 }
 
