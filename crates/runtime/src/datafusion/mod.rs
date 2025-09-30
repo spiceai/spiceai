@@ -27,6 +27,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self};
 use crate::dataconnector::deferred::DeferredConnector;
@@ -944,7 +945,7 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             self.runtime_status
@@ -1035,7 +1036,11 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
-        accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
+        accelerated_table_builder.checkpointer_opt(
+            DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
+                .await
+                .ok(),
+        );
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
@@ -1520,7 +1525,7 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view).await
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             initial_load_complete = true;
@@ -1548,7 +1553,11 @@ impl DataFusion {
         );
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
-        builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
+        builder.checkpointer_opt(
+            DatasetCheckpoint::try_new(view, OpenOption::CreateIfNotExists)
+                .await
+                .ok(),
+        );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
         if acceleration.disable_federation {

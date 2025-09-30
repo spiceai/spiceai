@@ -135,9 +135,15 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum OpenOption {
+    CreateIfNotExists,
+    OpenExisting,
+}
+
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
-    create_table_if_not_exists: bool,
+    open_option: OpenOption,
 ) -> Result<AccelerationConnection> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
     match acceleration_settings.engine {
@@ -159,7 +165,7 @@ async fn acceleration_connection(
             let duckdb_file = duckdb_accelerator
                 .duckdb_file_path(source)
                 .context(DuckDbFilePathSnafu)?;
-            if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
+            if open_option == OpenOption::OpenExisting && !Path::new(&duckdb_file).exists() {
                 return DuckDbFileMissingSnafu { path: duckdb_file }.fail();
             }
 
@@ -210,7 +216,7 @@ async fn acceleration_connection(
             let sqlite_file = sqlite_accelerator
                 .sqlite_file_path(source)
                 .context(SqliteFilePathSnafu)?;
-            if !create_table_if_not_exists && !Path::new(&sqlite_file).exists() {
+            if open_option == OpenOption::OpenExisting && !Path::new(&sqlite_file).exists() {
                 return SqliteFileMissingSnafu { path: sqlite_file }.fail();
             }
 

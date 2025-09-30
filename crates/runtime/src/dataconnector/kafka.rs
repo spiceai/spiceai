@@ -35,7 +35,7 @@ use crate::{
         dataset::{Dataset, acceleration::RefreshMode},
         metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
     },
-    dataaccelerator::spice_sys::{self, kafka::KafkaSys},
+    dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
     },
@@ -405,7 +405,9 @@ pub(crate) struct KafkaMetadata {
 }
 
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadata> {
-    let kafka_sys = KafkaSys::try_new(dataset).await.ok()?;
+    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::OpenExisting)
+        .await
+        .ok()?;
     kafka_sys.get().await
 }
 
@@ -413,8 +415,8 @@ async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &KafkaMetadata,
 ) -> Result<(), spice_sys::Error> {
-    let debezium_kafka_sys = KafkaSys::try_new_create_if_not_exists(dataset).await?;
-    debezium_kafka_sys.upsert(metadata).await
+    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
+    kafka_sys.upsert(metadata).await
 }
 
 async fn bootstrap_new_kafka_consumer(
