@@ -50,7 +50,7 @@ mod search {
         semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig},
         vector::VectorStore,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use app::App;
     use futures::StreamExt;
@@ -211,8 +211,7 @@ mod search {
                 ))
                 .with_dataset(ds)
                 .build(),
-            vec![
-                basic_vector_search_tests("s3vectors_multiple_embeddings"),
+            [basic_vector_search_tests("s3vectors_multiple_embeddings"),
                 vec![
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_additional_columns2",
@@ -235,8 +234,7 @@ mod search {
                         "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
                     ),
                 ),
-                ]
-            ].concat(),
+                ]].concat(),
             true
         )
         .await

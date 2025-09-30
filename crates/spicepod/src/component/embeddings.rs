@@ -226,6 +226,7 @@ pub struct EmbeddingChunkConfig {
 }
 
 impl EmbeddingChunkConfig {
+    #[must_use]
     pub fn enabled() -> Self {
         Self {
             enabled: true,
@@ -233,10 +234,12 @@ impl EmbeddingChunkConfig {
         }
     }
 
+    #[must_use]
     pub fn target_chunk_size(mut self, size: usize) -> Self {
         self.target_chunk_size = size;
         self
     }
+    #[must_use]
     pub fn trim_whitespace(mut self, trim_whitespace: bool) -> Self {
         self.trim_whitespace = trim_whitespace;
         self

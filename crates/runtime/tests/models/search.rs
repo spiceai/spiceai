@@ -399,32 +399,58 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
         .build();
     run_search(
         app,
-        vec![basic_vector_search_tests("multi_column"), vec![
+        vec![
             SearchTestCase::new(
-                format!("multi_column_question_vector_search_sql_filters"),
+                format!("multi_column_basic"),
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                format!("multi_column_additional_columns"),
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                })),
+            ),
+            SearchTestCase::new(
+                format!("multi_column_with_where"),
+                SearchTestType::Http(json!({
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
+                })),
+            ),
+            SearchTestCase::new(
+                "multi_column_question_vector_search_sql_filters".to_string(),
                 SearchTestType::Sql(
                     "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
-                format!("multi_column_question_vector_search_sql_no_score"),
+                "multi_column_question_vector_search_sql_no_score".to_string(),
                 SearchTestType::Sql(
                     "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
-                format!("multi_column_question_vector_search_sql_random"),
+                "multi_column_question_vector_search_sql_random".to_string(),
                 SearchTestType::Sql(
                     "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
                 ),
             ),
             SearchTestCase::new(
-                format!("multi_column_question_vector_search_sql_vectors"),
+                "multi_column_question_vector_search_sql_vectors".to_string(),
                 SearchTestType::Sql(
-                    "SELECT id, answer, array_length(question_embedding), array_length(question_offsets), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+                    "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
                 ),
             ),
-        ]].concat(),
+        ],
     )
     .await
 }
