@@ -32,6 +32,11 @@ use std::{pin::Pin, time::SystemTime};
 use crate::chat::Result;
 
 /// Creates a standardized `CreateChatCompletionStreamResponse` with consistent formatting
+///
+/// # Errors
+///
+/// Returns an error if the system time cannot be determined or if the timestamp
+/// conversion fails.
 #[allow(clippy::cast_possible_truncation)]
 pub fn create_stream_response(
     id: &str,
@@ -57,6 +62,11 @@ pub fn create_stream_response(
 }
 
 /// Creates a standardized `CreateChatCompletionStreamResponse` with custom timestamp
+///
+/// # Errors
+///
+/// This function is currently infallible and wrapped in `Ok()`, but returns a `Result`
+/// for API consistency with other streaming utility functions.
 #[allow(clippy::cast_possible_truncation)]
 pub fn create_stream_response_with_timestamp(
     id: &str,
@@ -78,6 +88,7 @@ pub fn create_stream_response_with_timestamp(
 }
 
 /// Creates a chat choice for streaming with optional content
+#[must_use]
 pub fn create_stream_choice(
     index: u32,
     content: Option<String>,
@@ -109,7 +120,8 @@ pub fn generate_stream_id(model_id: &str) -> String {
     format!("{model_id}-{random_suffix}")
 }
 
-/// Converts a basic string stream to an OpenAI compatible chat completion stream
+/// Converts a basic string stream to an `OpenAI` compatible chat completion stream
+#[must_use]
 pub fn string_stream_to_chat_stream(
     model_id: String,
     mut stream: Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>,
@@ -153,6 +165,7 @@ pub fn string_stream_to_chat_stream(
 }
 
 /// Creates a stream that yields multiple content chunks for testing streaming behavior
+#[must_use]
 pub fn create_mock_streaming_response(
     model_name: String,
     content_chunks: Vec<String>,
@@ -163,6 +176,7 @@ pub fn create_mock_streaming_response(
     Box::pin(stream! {
         let num_chunks = content_chunks.len();
         for (index, chunk) in content_chunks.into_iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
             let choice = create_stream_choice(
                 index as u32,
                 Some(chunk),
@@ -182,6 +196,7 @@ pub fn create_mock_streaming_response(
         }
 
         // Final chunk with finish reason and optional usage
+        #[allow(clippy::cast_possible_truncation)]
         let final_choice = create_stream_choice(
             num_chunks as u32,
             Some(String::new()),
@@ -233,7 +248,8 @@ mod tests {
     #[test]
     fn test_create_stream_response() {
         let choice = create_stream_choice(0, Some("test".to_string()), Some(Role::Assistant), None);
-        let response = create_stream_response("test-id", "test-model", vec![choice], None).unwrap();
+        let response = create_stream_response("test-id", "test-model", vec![choice], None)
+            .expect("Failed to create stream response");
 
         assert_eq!(response.id, "test-id");
         assert_eq!(response.model, "test-model");
@@ -257,7 +273,7 @@ mod tests {
 
         let mut collected = Vec::new();
         while let Some(item) = stream.next().await {
-            collected.push(item.unwrap());
+            collected.push(item.expect("Stream item should be Ok"));
         }
 
         // Should have 3 content chunks + 1 final chunk
