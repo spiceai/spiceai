@@ -134,7 +134,7 @@ impl ColumnLevelEmbeddingConfig {
     }
 
     #[must_use]
-    pub fn chunking(self, chunking: EmbeddingChunkConfig) -> Self {
+    pub fn chunking(mut self, chunking: EmbeddingChunkConfig) -> Self {
         self.chunking = Some(chunking);
         self
     }
