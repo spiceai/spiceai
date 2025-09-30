@@ -22,21 +22,25 @@ use std::{
 };
 
 use super::{AccelerationSource, DataAccelerator};
+use snafu::{OptionExt, ResultExt, Snafu};
 
 #[cfg(feature = "postgres")]
 use {
-    datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool,
+    datafusion_table_providers::sql::db_connection_pool::postgrespool::{
+        self, PostgresConnectionPool,
+    },
     datafusion_table_providers::util::secrets::to_secret_map,
 };
 
 #[cfg(feature = "duckdb")]
 use {
-    super::duckdb::DuckDBAccelerator, super::partitioned_duckdb::PartitionedDuckDBAccelerator,
+    super::duckdb::{DuckDBAccelerator, Error as DuckDbError},
+    super::partitioned_duckdb::{Error as PartitionedDuckDbError, PartitionedDuckDBAccelerator},
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
 #[cfg(feature = "sqlite")]
 use {
-    super::sqlite::SqliteAccelerator,
+    super::sqlite::{Error as SqliteError, SqliteAccelerator},
     datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
 };
 
@@ -58,7 +62,88 @@ enum AccelerationConnection {
     SQLite(SqliteConnectionPool),
 }
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Acceleration is not enabled"))]
+    AccelerationNotEnabled,
+
+    #[snafu(display("{engine:?} accelerator engine not available"))]
+    AcceleratorEngineUnavailable { engine: Engine },
+
+    #[snafu(display("Accelerator is not a {expected}"))]
+    InvalidAcceleratorType { expected: &'static str },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("Failed to resolve DuckDB file path: {source}"))]
+    DuckDbFilePath { source: DuckDbError },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("DuckDB file does not exist at {path}"))]
+    DuckDbFileMissing { path: String },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("DuckDB pool acquisition failed: {source}"))]
+    DuckDbPool { source: DuckDbError },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("Partitioned DuckDB pool acquisition failed: {source}"))]
+    PartitionedDuckDbPool { source: PartitionedDuckDbError },
+
+    #[cfg(feature = "sqlite")]
+    #[snafu(display("Failed to resolve SQLite file path: {source}"))]
+    SqliteFilePath { source: SqliteError },
+
+    #[cfg(feature = "sqlite")]
+    #[snafu(display("SQLite file does not exist at {path}"))]
+    SqliteFileMissing { path: String },
+
+    #[cfg(feature = "sqlite")]
+    #[snafu(display("SQLite pool acquisition failed: {source}"))]
+    SqlitePool { source: SqliteError },
+
+    #[cfg(feature = "postgres")]
+    #[snafu(display("PostgreSQL pool creation failed: {source}"))]
+    PostgresPool { source: postgrespool::Error },
+
+    #[cfg(not(feature = "duckdb"))]
+    #[snafu(display("Spice wasn't built with DuckDB support enabled"))]
+    DuckDbFeatureNotEnabled,
+
+    #[cfg(not(feature = "sqlite"))]
+    #[snafu(display("Spice wasn't built with SQLite support enabled"))]
+    SqliteFeatureNotEnabled,
+
+    #[cfg(not(feature = "postgres"))]
+    #[snafu(display("Spice wasn't built with PostgreSQL support enabled"))]
+    PostgresFeatureNotEnabled,
+
+    #[snafu(display("{engine:?} acceleration not supported for metadata"))]
+    UnsupportedEngine { engine: Engine },
+
+    #[snafu(display("No acceleration connection available"))]
+    NoAccelerationConnection,
+
+    #[snafu(display("Failed to downcast to {target}"))]
+    DowncastFailed { target: &'static str },
+
+    #[snafu(display("{source}"))]
+    External {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl Error {
+    fn external<E>(err: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::External {
+            source: Box::new(err),
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum OpenOption {
@@ -66,49 +151,39 @@ pub enum OpenOption {
     OpenExisting,
 }
 
-pub async fn acceleration_file_path(source: &dyn AccelerationSource) -> Option<PathBuf> {
-    let acceleration_settings = source.acceleration()?;
+pub async fn acceleration_file_path(source: &dyn AccelerationSource) -> Result<Option<PathBuf>> {
+    let Some(acceleration_settings) = source.acceleration() else {
+        return Ok(None);
+    };
 
     match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = get_registered_accelerator(
-                source,
-                acceleration_settings.engine,
-                "DuckDB accelerator engine not available",
-            )
-            .await
-            .ok()?;
+            let accelerator =
+                get_registered_accelerator(source, acceleration_settings.engine).await?;
 
-            let duckdb_accelerator = downcast_accelerator::<DuckDBAccelerator>(
-                &accelerator,
-                "Accelerator is not a DuckDBAccelerator",
-            )
-            .ok()?;
+            let duckdb_accelerator =
+                downcast_accelerator::<DuckDBAccelerator>(&accelerator, "DuckDBAccelerator")?;
 
-            let duckdb_file = duckdb_accelerator.duckdb_file_path(source).ok()?;
-            Some(PathBuf::from(duckdb_file))
+            let duckdb_file = duckdb_accelerator
+                .duckdb_file_path(source)
+                .context(DuckDbFilePathSnafu)?;
+            Ok(Some(PathBuf::from(duckdb_file)))
         }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = get_registered_accelerator(
-                source,
-                acceleration_settings.engine,
-                "Sqlite accelerator engine not available",
-            )
-            .await
-            .ok()?;
+            let accelerator =
+                get_registered_accelerator(source, acceleration_settings.engine).await?;
 
-            let sqlite_accelerator = downcast_accelerator::<SqliteAccelerator>(
-                &accelerator,
-                "Accelerator is not a SqliteAccelerator",
-            )
-            .ok()?;
+            let sqlite_accelerator =
+                downcast_accelerator::<SqliteAccelerator>(&accelerator, "SqliteAccelerator")?;
 
-            let sqlite_file = sqlite_accelerator.sqlite_file_path(source).ok()?;
-            Some(PathBuf::from(sqlite_file))
+            let sqlite_file = sqlite_accelerator
+                .sqlite_file_path(source)
+                .context(SqliteFilePathSnafu)?;
+            Ok(Some(PathBuf::from(sqlite_file)))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -116,117 +191,108 @@ async fn acceleration_connection(
     source: &dyn AccelerationSource,
     create_table_if_not_exists: bool,
 ) -> Result<AccelerationConnection> {
-    let acceleration_settings = source.acceleration().ok_or("Acceleration is not enabled")?;
+    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
     match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = get_registered_accelerator(
-                source,
-                acceleration_settings.engine,
-                "DuckDB accelerator engine not available",
-            )
-            .await?;
+            let accelerator =
+                get_registered_accelerator(source, acceleration_settings.engine).await?;
 
-            let duckdb_accelerator = downcast_accelerator::<DuckDBAccelerator>(
-                &accelerator,
-                "Accelerator is not a DuckDBAccelerator",
-            )?;
+            let duckdb_accelerator =
+                downcast_accelerator::<DuckDBAccelerator>(&accelerator, "DuckDBAccelerator")?;
 
-            let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
+            let duckdb_file = duckdb_accelerator
+                .duckdb_file_path(source)
+                .context(DuckDbFilePathSnafu)?;
             if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
-                return Err("DuckDB file does not exist.".into());
+                return DuckDbFileMissingSnafu { path: duckdb_file }.fail();
             }
 
             let pool = duckdb_accelerator
                 .get_shared_pool(source)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context(DuckDbPoolSnafu)?;
 
             Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
         }
         #[cfg(feature = "duckdb")]
         Engine::PartitionedDuckDB => {
-            let accelerator = get_registered_accelerator(
-                source,
-                acceleration_settings.engine,
-                "DuckDB accelerator engine not available",
-            )
-            .await?;
+            let accelerator =
+                get_registered_accelerator(source, acceleration_settings.engine).await?;
             let duckdb_accelerator = downcast_accelerator::<PartitionedDuckDBAccelerator>(
                 &accelerator,
-                "Accelerator is not a PartitionedDuckDBAccelerator",
+                "PartitionedDuckDBAccelerator",
             )?;
 
             let pool = duckdb_accelerator
                 .get_shared_pool(source)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context(PartitionedDuckDbPoolSnafu)?;
 
             Ok(AccelerationConnection::DuckDB(pool))
         }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB | Engine::PartitionedDuckDB => {
-            Err("Spice wasn't built with DuckDB support enabled".into())
-        }
+        Engine::DuckDB | Engine::PartitionedDuckDB => DuckDbFeatureNotEnabledSnafu.fail(),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = get_registered_accelerator(
-                source,
-                acceleration_settings.engine,
-                "Sqlite accelerator engine not available",
-            )
-            .await?;
-            let sqlite_accelerator = downcast_accelerator::<SqliteAccelerator>(
-                &accelerator,
-                "Accelerator is not a SqliteAccelerator",
-            )?;
+            let accelerator =
+                get_registered_accelerator(source, acceleration_settings.engine).await?;
+            let sqlite_accelerator =
+                downcast_accelerator::<SqliteAccelerator>(&accelerator, "SqliteAccelerator")?;
 
-            let sqlite_file = sqlite_accelerator.sqlite_file_path(source)?;
+            let sqlite_file = sqlite_accelerator
+                .sqlite_file_path(source)
+                .context(SqliteFilePathSnafu)?;
             if !create_table_if_not_exists && !Path::new(&sqlite_file).exists() {
-                return Err("Sqlite file does not exist.".into());
+                return SqliteFileMissingSnafu { path: sqlite_file }.fail();
             }
 
-            let conn = sqlite_accelerator.get_shared_pool(source).await?;
+            let conn = sqlite_accelerator
+                .get_shared_pool(source)
+                .await
+                .context(SqlitePoolSnafu)?;
 
             Ok(AccelerationConnection::SQLite(conn))
         }
         #[cfg(not(feature = "sqlite"))]
-        Engine::Sqlite => Err("Spice wasn't built with Sqlite support enabled".into()),
+        Engine::Sqlite => SqliteFeatureNotEnabledSnafu.fail(),
         #[cfg(feature = "postgres")]
         Engine::PostgreSQL => {
             let secret_map = to_secret_map(acceleration_settings.params.clone());
 
             let pool = PostgresConnectionPool::new(secret_map)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context(PostgresPoolSnafu)?;
 
             Ok(AccelerationConnection::Postgres(pool))
         }
         #[cfg(not(feature = "postgres"))]
-        Engine::PostgreSQL => Err("Spice wasn't built with PostgreSQL support enabled".into()),
-        Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
+        Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
+        Engine::Arrow => UnsupportedEngineSnafu {
+            engine: acceleration_settings.engine,
+        }
+        .fail(),
     }
 }
 
 async fn get_registered_accelerator(
     source: &dyn AccelerationSource,
     engine: Engine,
-    missing_err: &'static str,
-) -> std::result::Result<Arc<dyn DataAccelerator>, &'static str> {
+) -> Result<Arc<dyn DataAccelerator>> {
     source
         .runtime()
         .accelerator_engine_registry()
         .get_accelerator_engine(engine)
         .await
-        .ok_or(missing_err)
+        .context(AcceleratorEngineUnavailableSnafu { engine })
 }
 
-fn downcast_accelerator<T: 'static>(
-    accelerator: &Arc<dyn DataAccelerator>,
-    wrong_type_err: &'static str,
-) -> std::result::Result<&T, &'static str> {
+fn downcast_accelerator<'a, T: 'static>(
+    accelerator: &'a Arc<dyn DataAccelerator>,
+    expected: &'static str,
+) -> Result<&'a T> {
     accelerator
         .as_any()
         .downcast_ref::<T>()
-        .ok_or(wrong_type_err)
+        .context(InvalidAcceleratorTypeSnafu { expected })
 }
