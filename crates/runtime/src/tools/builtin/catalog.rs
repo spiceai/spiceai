@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use globset::{Glob, GlobSet};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
@@ -113,11 +114,33 @@ impl BuiltinToolCatalog {
                 Some(name),
                 Some(description),
             ))),
-            "sql" => Ok(Arc::new(SqlTool::new(
-                self.rt.datafusion(),
-                Some(name),
-                Some(description),
-            ))),
+            "sql" => {
+                let table_allowlist: Option<GlobSet> = params
+                    .get("table_allowlist")
+                    .map(|t| {
+                        t.expose_secret()
+                            .split(',')
+                            .map(str::trim)
+                            .collect::<Vec<_>>()
+                    })
+                    .map(|tbls| {
+                        let mut bldr = GlobSet::builder();
+                        for t in tbls {
+                            bldr.add(Glob::new(t)?);
+                        }
+                        bldr.build()
+                    })
+                    .transpose()
+                    .boxed()
+                    .context(FailedToConstructToolSnafu { id })?;
+
+                Ok(Arc::new(SqlTool::new(
+                    self.rt.datafusion(),
+                    Some(name),
+                    Some(description),
+                    table_allowlist,
+                )))
+            }
             "sample_distinct_columns" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
                     .with_overrides(Some(name), Some(description)),

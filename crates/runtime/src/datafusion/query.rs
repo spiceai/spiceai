@@ -17,7 +17,7 @@ limitations under the License.
 use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
-    get_logical_plan_input_tables,
+    AsTableRefs, get_logical_plan_input_tables,
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
@@ -31,8 +31,10 @@ use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues, error::DataFusionError, execution::SendableRecordBatchStream,
     logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter, prelude::DataFrame,
+    sql::TableReference,
 };
 use error_code::ErrorCode;
+use globset::GlobSet;
 use snafu::{ResultExt, Snafu};
 use tokio::time::Instant;
 use tracing::Span;
@@ -79,6 +81,9 @@ pub enum Error {
 
     #[snafu(display("Failed to set parameters in logical plan: {source}"))]
     BindingParameters { source: DataFusionError },
+
+    #[snafu(display("Forbidden to access tables {tables:?}"))]
+    TableAccessDisallowed { tables: Vec<TableReference> },
 }
 
 pub enum QueryMethod {
@@ -86,6 +91,7 @@ pub enum QueryMethod {
     Text {
         sql: Arc<str>,
         parameters: Option<ParamValues>,
+        table_allowlist: Option<GlobSet>,
     },
 }
 
@@ -144,7 +150,11 @@ impl Query {
 
             // Get the `LogicalPlan` or cached results
             let (plan, mut tracker, cache_manager) = match &ctx.sql {
-                QueryMethod::Text { sql, parameters } => {
+                QueryMethod::Text {
+                    sql,
+                    parameters,
+                    table_allowlist,
+                } => {
                     match Self::get_plan_or_cached(
                         &ctx.df,
                         &session,
@@ -156,8 +166,22 @@ impl Query {
                     .await?
                     {
                         PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                            if let Some(allow_list) = table_allowlist {
+                                let tables_referenced = plan.as_table_refs();
+                                let disallowed_tables = tables_referenced
+                                    .iter()
+                                    .filter(|t| allow_list.is_match(t.to_string()))
+                                    .collect::<Vec<_>>();
+
+                                if !disallowed_tables.is_empty() {
+                                    return Err(Error::TableAccessDisallowed {
+                                        tables: disallowed_tables.into_iter().cloned().collect(),
+                                    });
+                                }
+                            }
                             (plan, tracker, cache_manager)
                         }
+                        // TODO: need to use `table_allowlist` here, or LLM retry will bypass allowlist.
                         PlanOrCached::Cached(query_result) => return Ok(query_result),
                     }
                 }

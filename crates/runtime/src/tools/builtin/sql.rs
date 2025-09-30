@@ -15,6 +15,7 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use globset::GlobSet;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
@@ -38,15 +39,24 @@ pub struct SqlTool {
     name: String,
     description: String,
     df: Arc<DataFusion>,
+
+    /// If [`Option::is_some`], then only allow the SQL tool to access tables that match the [`GlobSet`] pattern(s).
+    allowed_tables: Option<GlobSet>,
 }
 
 impl SqlTool {
     #[must_use]
-    pub fn new(df: Arc<DataFusion>, name: Option<&str>, description: Option<&str>) -> Self {
+    pub fn new(
+        df: Arc<DataFusion>,
+        name: Option<&str>,
+        description: Option<&str>,
+        allowed_tables: Option<GlobSet>,
+    ) -> Self {
         Self {
             df,
             name: name.unwrap_or("sql").to_string(),
             description: description.unwrap_or("Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix.").to_string(),
+            allowed_tables
         }
     }
 }
@@ -70,15 +80,16 @@ impl SpiceModelTool for SqlTool {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let req: SqlToolParams = serde_json::from_str(arg)?;
 
-            let query_result = self
-                .df
-                .query_builder(&req.query)
+            let mut query_builder = self.df.query_builder(&req.query);
+            if let Some(ref allowlist) = self.allowed_tables {
+                query_builder = query_builder.allow_tables(allowlist.clone());
+            }
+
+            let batches = query_builder
                 .build()
                 .run()
                 .await
-                .boxed()?;
-
-            let batches = query_result
+                .boxed()?
                 .data
                 .try_collect::<Vec<RecordBatch>>()
                 .await
