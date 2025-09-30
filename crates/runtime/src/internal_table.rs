@@ -24,7 +24,9 @@ use tokio::sync::RwLock;
 
 use crate::Runtime;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
-use crate::component::dataset::{AccessMode, acceleration::Acceleration, builder::DatasetBuilder};
+use crate::component::access::AccessMode;
+use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::builder::DatasetBuilder;
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;

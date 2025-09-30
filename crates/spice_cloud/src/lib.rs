@@ -27,11 +27,14 @@ use runtime::{
     accelerated_table::{
         AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
     },
-    component::dataset::{
-        AccessMode, TimeFormat,
-        acceleration::{Acceleration, RefreshMode},
-        builder::DatasetBuilder,
-        replication::Replication,
+    component::{
+        access::AccessMode,
+        dataset::{
+            TimeFormat,
+            acceleration::{Acceleration, RefreshMode},
+            builder::DatasetBuilder,
+            replication::Replication,
+        },
     },
     dataaccelerator::{self, AcceleratorEngineRegistry},
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},

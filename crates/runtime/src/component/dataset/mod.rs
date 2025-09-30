@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::{Runtime, dataaccelerator::AccelerationSource};
+use crate::{Runtime, component::access::AccessMode, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
 use app::App;
 use datafusion::sql::{
@@ -114,22 +114,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum AccessMode {
-    #[default]
-    Read,
-    ReadWrite,
-}
-
-impl From<spicepod_dataset::AccessMode> for AccessMode {
-    fn from(mode: spicepod_dataset::AccessMode) -> Self {
-        match mode {
-            spicepod_dataset::AccessMode::Read => AccessMode::Read,
-            spicepod_dataset::AccessMode::ReadWrite => AccessMode::ReadWrite,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TimeFormat {

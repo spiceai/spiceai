@@ -192,7 +192,7 @@ fn make_iceberg_dataset(
     );
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(get_iceberg_params());
-    dataset.access = spicepod::component::dataset::AccessMode::ReadWrite;
+    dataset.access = spicepod::component::access::AccessMode::ReadWrite;
     Ok(dataset)
 }
 
@@ -205,7 +205,7 @@ fn make_iceberg_catalog(name: &str, include: &str) -> Result<Catalog, anyhow::Er
     );
     let mut catalog = Catalog::new(from, name.to_string());
     catalog.params = Some(get_iceberg_params());
-    catalog.access = spicepod::component::dataset::AccessMode::ReadWrite;
+    catalog.access = spicepod::component::access::AccessMode::ReadWrite;
     catalog.include = vec![include.to_string()];
     Ok(catalog)
 }
@@ -232,14 +232,14 @@ fn make_glue_dataset(schema: &str, table: &str, name: &str) -> Dataset {
     let from = format!("glue:{schema}.{table}");
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(get_glue_params());
-    dataset.access = spicepod::component::dataset::AccessMode::ReadWrite;
+    dataset.access = spicepod::component::access::AccessMode::ReadWrite;
     dataset
 }
 
 fn make_glue_catalog(name: &str, include: &str) -> Catalog {
     let mut catalog = Catalog::new("glue".to_string(), name.to_string());
     catalog.params = Some(get_glue_params());
-    catalog.access = spicepod::component::dataset::AccessMode::ReadWrite;
+    catalog.access = spicepod::component::access::AccessMode::ReadWrite;
     catalog.include = vec![include.to_string()];
     catalog
 }
