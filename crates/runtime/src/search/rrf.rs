@@ -16,9 +16,8 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::utils::quote_identifier;
 use datafusion::common::{
-    Column, DataFusionError, JoinType, Result, ScalarValue, exec_err, not_impl_err,
+    Column, DataFusionError, JoinType, Result, ScalarValue, TableReference, exec_err, not_impl_err,
 };
 use datafusion::datasource::TableType;
 use datafusion::functions_aggregate::expr_fn::{first_value, max};
@@ -28,12 +27,11 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{
-    DataFrame, SessionContext, coalesce, exp, greatest, make_array, md5, now, to_unixtime,
-};
+use datafusion::prelude::{DataFrame, SessionContext, coalesce, exp, greatest, now, to_unixtime};
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, ident, lit};
+use datafusion_expr::{ExprFunctionExt, col, ident, lit};
 use itertools::Itertools;
+use runtime_datafusion_udfs::digest_many::digest_many;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -105,6 +103,9 @@ macro_rules! extract_string {
 macro_rules! col_qualified {
     ($column:expr) => {
         Expr::Column(Column::from_qualified_name_ignore_case($column))
+    };
+    ($table:expr, $column:expr) => {
+        Expr::Column(Column::new(Some($table), $column))
     };
 }
 
@@ -313,7 +314,11 @@ impl ReciprocalRankFusion {
             let (_, qname) = recency_col.qualified_name();
             let cols = subquery_dfs
                 .iter()
-                .map(|df| Self::first_qualified_field(df, &qname).map(|q| col_qualified!(q)))
+                .enumerate()
+                .map(|(i, df)| {
+                    Self::first_qualified_field(df, &qname)
+                        .map(|(_, q)| col_qualified!(format!("search_{i}"), q))
+                })
                 .collect::<Result<Vec<_>>>()?;
             coalesce(cols)
         } else {
@@ -367,9 +372,7 @@ impl ReciprocalRankFusion {
                 other => Some(
                     coalesce(
                         (0..subquery_dfs.len())
-                            .map(|i| {
-                                col_qualified!(format!("search_{i}.{}", quote_identifier(other)))
-                            })
+                            .map(|i| col_qualified!(format!("search_{i}"), other))
                             .collect(),
                     )
                     .alias(other),
@@ -421,11 +424,8 @@ impl ReciprocalRankFusion {
                     None
                 } else {
                     Some(
-                        first_value(
-                            col_qualified!(&cname),
-                            vec![col("fused_score").sort(false, false)],
-                        )
-                        .alias(&cname),
+                        first_value(ident(&cname), vec![col("fused_score").sort(false, false)])
+                            .alias(&cname),
                     )
                 }
             }));
@@ -489,13 +489,12 @@ impl ReciprocalRankFusion {
 
     // Given a DF with overlapping unqualified names (as produced by JOIN), where column values
     // are equivalent, return the first (arbitrary) qualified name.
-    fn first_qualified_field(df: &DataFrame, name: &str) -> Result<String> {
+    fn first_qualified_field(df: &DataFrame, name: &str) -> Result<(TableReference, String)> {
         df.schema()
             .qualified_fields_with_unqualified_name(name)
             .first()
             .and_then(|(maybe_table_reference, f)| {
-                maybe_table_reference
-                    .map(|tr| format!("{}.{}", tr.table(), quote_identifier(f.name())))
+                maybe_table_reference.map(|tr| (tr.clone(), f.name().clone()))
             })
             .ok_or(DataFusionError::Execution(format!(
                 "{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"
@@ -504,10 +503,14 @@ impl ReciprocalRankFusion {
 
     // Reduces 2 or more search subquery DFs into a single one
     fn fold_join(a: DataFrame, b: DataFrame, join_key: &str) -> Result<DataFrame> {
-        let id_a = Self::first_qualified_field(&a, join_key)?;
-        let id_b = Self::first_qualified_field(&b, join_key)?;
+        let (tbl_a, id_a) = Self::first_qualified_field(&a, join_key)?;
+        let (tbl_b, id_b) = Self::first_qualified_field(&b, join_key)?;
 
-        a.join(b, JoinType::Full, &[&id_a], &[&id_b], None)
+        a.join_on(
+            b,
+            JoinType::Full,
+            vec![col_qualified!(tbl_a, id_a).eq(col_qualified!(tbl_b, id_b))],
+        )
     }
 
     // Window and rank a search subquery by its `score` field, exposing a `rank` column
@@ -531,12 +534,11 @@ impl ReciprocalRankFusion {
             .filter_map(|c| match c.name() {
                 "score" => None,
                 name if name.ends_with("_embedding") => None,
-                name => Some(ident(name).cast_to(&DataType::Utf8, df.schema())),
+                name => Some(ident(name)),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
-        let rrf_row_id = md5(make_array(bin_columns).cast_to(&DataType::Utf8, df.schema())?);
-        df.with_column("__spice_rrf_row_id", rrf_row_id)
+        df.with_column("__spice_rrf_row_id", digest_many(bin_columns, "md5"))
     }
 }
 
@@ -647,7 +649,7 @@ mod tests {
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
-    use datafusion::prelude::{DataFrame, now, to_unixtime};
+    use datafusion::prelude::{DataFrame, named_struct, now, to_unixtime};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{ExprFunctionExt, lit};
@@ -936,6 +938,34 @@ mod tests {
         let results = test_query!(
             runtime,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
+        );
+
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fuse_queries_auto_hash_and_special_idents() -> Result<ExitCode> {
+        let runtime = make_test_runtime().await?;
+
+        let fruit_df = make_fruit_dataframe(&runtime)
+            .await?
+            .with_column("meta_a", named_struct(vec![lit("k1"), lit("v1")]))?
+            .with_column("meta_b.special", named_struct(vec![lit("k2"), lit(133.7)]))?;
+        let fruit_embedding_table = df_as_embedding_table(&runtime, fruit_df);
+
+        runtime
+            .df
+            .ctx
+            .register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            runtime,
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), k => 600.0)"
         );
 
         assert_eq!(

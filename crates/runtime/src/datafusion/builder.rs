@@ -231,6 +231,7 @@ impl DataFusionBuilder {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
+            writable_catalogs: RwLock::new(HashSet::new()),
             caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
