@@ -48,9 +48,9 @@ pub struct VectorScanTableProvider {
 }
 
 impl VectorScanTableProvider {
-    pub async fn try_new(
+    pub fn try_new(
         table_provider: Arc<dyn TableProvider>,
-        index: Arc<dyn VectorIndex>,
+        index: &Arc<dyn VectorIndex>,
     ) -> Result<Self, DataFusionError> {
         Ok(Self {
             table_provider,
@@ -64,7 +64,6 @@ impl VectorScanTableProvider {
     }
 
     fn schema_is_sufficient(
-        &self,
         schema: &Fields,
         projection: &HashSet<String>,
         filters: &[Expr],
@@ -82,14 +81,13 @@ impl VectorScanTableProvider {
         columns_missing_from(filters, schema).is_empty()
     }
 
-    async fn apply_proj_and_filter(
-        &self,
+    fn apply_proj_and_filter(
         input: Arc<LogicalPlan>,
         projection: &HashSet<String>,
         filters: &[Expr],
     ) -> Result<LogicalPlan, DataFusionError> {
         let filtered = if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-            Arc::new(LogicalPlan::Filter(Filter::try_new(filter, input.into())?))
+            Arc::new(LogicalPlan::Filter(Filter::try_new(filter, input)?))
         } else {
             input
         };
@@ -168,7 +166,7 @@ impl TableProvider for VectorScanTableProvider {
         // Only add if key not in base table (we chose base table over index columns in `scan` afterall).
         for f in self.vector_index_list.schema().fields() {
             if !fields_map.contains_key(f.name()) {
-                fields_map.insert(f.name().clone(), f.clone());
+                fields_map.insert(f.name().clone(), Arc::clone(f));
             }
         }
 
@@ -195,39 +193,35 @@ impl TableProvider for VectorScanTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let columns_requested = self.columns_projected(projection)?;
 
-        if self.schema_is_sufficient(
+        if Self::schema_is_sufficient(
             self.table_provider.schema().fields(),
             &columns_requested,
             filters,
         ) {
-            let lp = self
-                .apply_proj_and_filter(
-                    Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-                        "base_table",
-                        Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
-                        None,
-                        vec![],
-                        None,
-                    )?)),
-                    &columns_requested,
-                    filters,
-                )
-                .await?;
+            let lp = Self::apply_proj_and_filter(
+                Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+                    "base_table",
+                    Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
+                    None,
+                    vec![],
+                    None,
+                )?)),
+                &columns_requested,
+                filters,
+            )?;
 
             return state.create_physical_plan(&lp).await;
         }
-        if self.schema_is_sufficient(
+        if Self::schema_is_sufficient(
             self.vector_index_list.schema().fields(),
             &columns_requested,
             filters,
         ) {
-            let lp = self
-                .apply_proj_and_filter(
-                    Arc::clone(&self.vector_index_list),
-                    &columns_requested,
-                    filters,
-                )
-                .await?;
+            let lp = Self::apply_proj_and_filter(
+                Arc::clone(&self.vector_index_list),
+                &columns_requested,
+                filters,
+            )?;
 
             return state.create_physical_plan(&lp).await;
         }
@@ -361,6 +355,7 @@ mod tests {
         catalog::{MemTable, TableProvider},
         sql::TableReference,
     };
+    use search::index::VectorIndex;
 
     use crate::embeddings::index::tests::{
         PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
@@ -384,7 +379,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            Arc::new(PretendVectorIndex::new(
+            &(Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -395,9 +390,8 @@ mod tests {
                         false,
                     ),
                 ]),
-            )),
+            )) as Arc<dyn VectorIndex>),
         )
-        .await
         .expect("could not make 'VectorScanTableProvider'");
 
         let provider: Arc<dyn TableProvider> = Arc::new(p);
@@ -448,7 +442,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            Arc::new(PretendVectorIndex::new(
+            &(Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -465,9 +459,8 @@ mod tests {
                         ("filterable".to_string(), "false".to_string()),
                     ])),
                 ]),
-            )),
+            )) as Arc<dyn VectorIndex>),
         )
-        .await
         .expect("could not make 'VectorScanTableProvider'");
 
         let provider: Arc<dyn TableProvider> = Arc::new(p);
@@ -551,7 +544,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            Arc::new(PretendVectorIndex::new(
+            &(Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![
                     Field::new("pk1", DataType::Int64, false),
@@ -574,9 +567,8 @@ mod tests {
                         ("filterable".to_string(), "false".to_string()),
                     ])),
                 ]),
-            )),
+            )) as Arc<dyn VectorIndex>),
         )
-        .await
         .expect("could not make 'VectorScanTableProvider'");
 
         let provider: Arc<dyn TableProvider> = Arc::new(p);
