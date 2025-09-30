@@ -16,8 +16,6 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use nsql::SqlGeneration;
-use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -50,6 +48,7 @@ pub mod streaming_tests;
 pub mod streaming_utils;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
+use streaming_utils::generate_stream_id;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".safetensors",
@@ -661,15 +660,7 @@ pub trait Chat: Sync + Send {
         };
 
         Ok(CreateChatCompletionResponse {
-            id: format!(
-                "{}-{}",
-                model_id.clone(),
-                rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(10)
-                    .map(char::from)
-                    .collect::<String>()
-            ),
+            id: generate_stream_id(&model_id),
             choices,
             model: model_id,
             created: 0,

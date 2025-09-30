@@ -26,7 +26,7 @@ use async_openai::types::{
     CreateChatCompletionStreamResponse, FinishReason, Role,
 };
 use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
-use async_trait::async_trait;
+
 use datafusion::common::cast::as_string_array;
 use datafusion::common::utils::take_function_args;
 use datafusion::error::DataFusionError;
@@ -34,17 +34,20 @@ use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
-    common::{Result as DataFusionResult, exec_err, not_impl_err},
+    common::{Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
+use futures::StreamExt;
 use tracing::{Instrument, Level};
 
+use async_trait::async_trait;
 use llms::chat::Chat;
 use snafu::ResultExt;
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::Span;
 
 pub static AI_UDF_NAME: &str = "ai";
@@ -134,7 +137,7 @@ impl ScalarUDFImpl for Ai {
     }
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
-        not_impl_err!("AI UDF can only be called from async contexts")
+        exec_err!("AI UDF can only be called from async contexts. Use the async interface instead.")
     }
 
     fn documentation(&self) -> Option<&Documentation> {
@@ -200,10 +203,11 @@ impl Ai {
         model: &Arc<dyn Chat>,
         model_name: &str,
         message: &str,
+        _row_index: usize,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
         async {
-            let resp = model
-                .chat_request(
+            let mut stream = model
+                .chat_stream(
                     CreateChatCompletionRequestArgs::default()
                         .messages(vec![
                             ChatCompletionRequestUserMessageArgs::default()
@@ -217,12 +221,26 @@ impl Ai {
                         .boxed()?,
                 )
                 .await
-                .boxed()?
-                .choices
-                .pop()
-                .and_then(|c| c.message.content);
+                .boxed()?;
 
-            Ok(resp)
+            let mut complete_response = String::new();
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.boxed()?;
+
+                // Extract content from the streaming response
+                for choice in chunk.choices {
+                    if let Some(content) = &choice.delta.content {
+                        complete_response.push_str(content);
+                    }
+                }
+            }
+
+            Ok(if complete_response.is_empty() {
+                None
+            } else {
+                Some(complete_response)
+            })
         }
         // Instrument the async block with an AI span as a child of the current (sql_query) span
         .instrument(tracing::span!(Level::INFO, "ai", model = %model_name))
@@ -236,26 +254,76 @@ impl Ai {
         message_array: ArrayRef,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
-        let mut results = Vec::with_capacity(message_array.len());
+        let array_len = message_array.len();
         let parent_span = Span::current();
-        for message_opt in message_array.iter() {
-            let result = if let Some(message) = message_opt {
-                match Self::call_model(&model, model_name, message).await {
-                    Ok(Some(result)) => {
-                        tracing::info!(target: "task_history", captured_output = %result.clone());
-                        Some(result)
+
+        // Determine the degree of parallelism based on CPU cores
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4); // fallback to 4 if detection fails
+
+        // Create a semaphore to limit concurrent model calls
+        let semaphore = Arc::new(Semaphore::new(parallelism));
+
+        // Create tasks for all messages
+        let mut tasks = Vec::with_capacity(array_len);
+
+        for (row_index, message_opt) in message_array.iter().enumerate() {
+            let model = Arc::clone(&model);
+            let model_name = model_name.to_string();
+            let semaphore = Arc::clone(&semaphore);
+            let parent_span = parent_span.clone();
+
+            let task = if let Some(message) = message_opt {
+                let message = message.to_string();
+                tokio::spawn(async move {
+                    // Acquire permit to limit concurrent calls
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                    match Self::call_model(&model, &model_name, &message, row_index).await {
+                        Ok(Some(result)) => {
+                            tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
+                            Ok(Some(result))
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "AI model returned empty response for row {}",
+                                row_index
+                            );
+                            Ok(None)
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "task_history", parent: &parent_span, "AI model error for row {}: {}", row_index, e);
+                            Err(DataFusionError::External(e))
+                        }
                     }
-                    Ok(None) => None,
-                    Err(e) => {
-                        tracing::error!(target: "task_history", parent: &parent_span, "{e}");
-                        return Err(DataFusionError::External(e));
-                    }
-                }
+                })
             } else {
-                None
+                // Handle null input - return null result
+                tokio::spawn(async move { Ok::<Option<String>, DataFusionError>(None) })
             };
+
+            tasks.push(task);
+        }
+
+        // Wait for all tasks to complete and collect results in order
+        let mut results = Vec::with_capacity(array_len);
+        for task in tasks {
+            let result = task
+                .await
+                .map_err(|e| DataFusionError::Internal(format!("Task join error: {}", e)))??;
             results.push(result);
         }
+
+        // Ensure the result array has the same length as the input array
+        assert_eq!(
+            results.len(),
+            array_len,
+            "Result array length must match input array length"
+        );
 
         Ok(Arc::new(StringArray::from(results)) as ArrayRef)
     }
@@ -1044,7 +1112,7 @@ mod tests {
 
             // Look for proper AI child span - it should have "ai{" in the span hierarchy
             let has_ai_child_span = lines.iter().any(|line| {
-                // The AI span should appear as a child with format like "sql_query{...}:ai{model=...}"
+                // The AI span should appear as a child with format like "sql_query:ai:" but we only see "sql_query:"
                 line.contains("}:ai{") && line.contains("model=")
             });
 
@@ -1133,5 +1201,149 @@ mod tests {
 
         // This test confirms the mechanism is in place - the actual tracing verification
         // requires runtime testing with a real tracing backend like the task_history system
+    }
+
+    #[tokio::test]
+    async fn test_parallel_processing_with_multiple_messages() {
+        use std::time::{Duration, Instant};
+
+        // Mock Chat that simulates processing time
+        struct SlowMockChat {
+            name: String,
+            delay: Duration,
+        }
+
+        #[async_trait]
+        impl Chat for SlowMockChat {
+            fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
+                None
+            }
+
+            async fn run(&self, prompt: String) -> llms::chat::Result<Option<String>> {
+                tokio::time::sleep(self.delay).await;
+                Ok(Some(format!("Response from {}: {}", self.name, prompt)))
+            }
+
+            async fn chat_stream(
+                &self,
+                req: CreateChatCompletionRequest,
+            ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError>
+            {
+                // Simulate processing time
+                tokio::time::sleep(self.delay).await;
+
+                // Extract the prompt from the request
+                let prompt = req
+                    .messages
+                    .first()
+                    .and_then(|msg| match msg {
+                        async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
+                            match &user_msg.content {
+                                async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                                _ => Some("Array content".to_string()),
+                            }
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "".to_string());
+
+                let response_text = format!("Response from {}: {}", self.name, prompt);
+                let usage = Some(CompletionUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    total_tokens: 30,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                });
+
+                Ok(llms::chat::streaming_utils::create_mock_streaming_response(
+                    self.name.clone(),
+                    vec![response_text],
+                    usage,
+                ))
+            }
+
+            async fn chat_request(
+                &self,
+                _req: CreateChatCompletionRequest,
+            ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError>
+            {
+                tokio::time::sleep(self.delay).await;
+                Ok(CreateChatCompletionResponse {
+                    id: "slow-chat-id".to_string(),
+                    model: self.name.clone(),
+                    object: "chat.completion".to_string(),
+                    created: 0,
+                    choices: vec![],
+                    usage: None,
+                    system_fingerprint: None,
+                    service_tier: None,
+                })
+            }
+        }
+
+        let mut store = HashMap::new();
+        let slow_model = SlowMockChat {
+            name: "slow-model".to_string(),
+            delay: Duration::from_millis(100), // 100ms delay per call
+        };
+        store.insert(
+            "slow-model".to_string(),
+            Arc::new(slow_model) as Arc<dyn Chat>,
+        );
+        let model_store = Arc::new(RwLock::new(store));
+        let udf = Ai::new(model_store.clone());
+
+        let model_store_guard = model_store.read().await;
+        let model = model_store_guard.get("slow-model").unwrap();
+
+        // Test with 8 messages - if processed sequentially would take ~800ms,
+        // but with parallelism should be much faster
+        let messages = Arc::new(arrow::array::StringArray::from(vec![
+            Some("Message 1"),
+            Some("Message 2"),
+            Some("Message 3"),
+            Some("Message 4"),
+            Some("Message 5"),
+            Some("Message 6"),
+            Some("Message 7"),
+            Some("Message 8"),
+        ]));
+
+        let start = Instant::now();
+        let result = udf
+            .process_messages(Arc::clone(model), "slow-model", messages)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Verify all results are correct
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(string_array.len(), 8);
+
+        for i in 0..8 {
+            assert_eq!(
+                string_array.value(i),
+                format!("Response from slow-model: Message {}", i + 1)
+            );
+        }
+
+        // With parallelism, should take roughly 100ms * ceil(8 / num_cores)
+        // rather than 800ms sequentially. Allow generous margin for test stability.
+        let max_expected_time = Duration::from_millis(500);
+        assert!(
+            elapsed < max_expected_time,
+            "Parallel processing took {}ms, expected less than {}ms",
+            elapsed.as_millis(),
+            max_expected_time.as_millis()
+        );
+
+        println!(
+            "Parallel processing of 8 messages took: {}ms",
+            elapsed.as_millis()
+        );
     }
 }
