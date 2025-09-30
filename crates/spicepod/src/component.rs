@@ -26,6 +26,7 @@ use serde_value::Value;
 use snafu::prelude::*;
 
 use crate::reader;
+pub mod access;
 pub mod caching;
 pub mod catalog;
 pub mod dataset;

@@ -19,9 +19,8 @@ use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionNamedToolChoice, ChatCompletionStreamResponseDelta, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionName, FunctionObject,
-    PromptTokensDetails, Role,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage, FinishReason,
+    FunctionCall, FunctionName, FunctionObject, PromptTokensDetails, Role,
 };
 use aws_sdk_bedrockruntime::error::SdkError;
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
@@ -37,7 +36,6 @@ use aws_smithy_types::{Document, Number};
 use futures::Stream;
 use futures::stream::unfold;
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 pub(super) fn try_convert_role(role: &ConversationRole) -> Result<Role, OpenAIError> {
     match role {
@@ -120,28 +118,6 @@ pub(super) fn extract_from_content_block(
         }
         unsupported_block => Err(to_api_error(format!("{unsupported_block:?}"))),
     }
-}
-
-#[allow(clippy::cast_possible_truncation)]
-pub(super) fn chat_completion_stream(
-    id: &str,
-    model: String,
-    choices: Vec<ChatChoiceStream>,
-    usage: Option<CompletionUsage>,
-) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
-    Ok(CreateChatCompletionStreamResponse {
-        choices,
-        id: id.to_owned(),
-        created: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
-            .as_secs() as u32,
-        model,
-        service_tier: None,
-        system_fingerprint: None,
-        object: "chat.completion.chunk".to_string(),
-        usage,
-    })
 }
 
 pub(super) fn tool_config(
