@@ -84,7 +84,7 @@ impl KafkaSys {
     }
 
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
-        Ok(serde_json::to_string(schema).map_err(Error::external)?)
+        serde_json::to_string(schema).map_err(Error::external)
     }
 
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
