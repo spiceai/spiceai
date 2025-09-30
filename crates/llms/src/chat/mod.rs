@@ -11,16 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::{
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestSystemMessageArgs,
-    CreateChatCompletionRequestArgs,
-};
+use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
 use async_stream::stream;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::Stream;
 use nsql::SqlGeneration;
-use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -29,24 +24,26 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{path::Path, pin::Pin};
+use tracing::Span;
 use tracing_futures::Instrument;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoice, ChatChoiceStream, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
-        ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        ChatCompletionResponseMessage, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, Role,
+        ChatChoice, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
+        ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+        Role,
     },
 };
 
 pub mod mistral;
 pub mod nsql;
+use crate::streaming_utils::generate_stream_id;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
 
@@ -533,36 +530,29 @@ pub fn message_to_mistral(
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        let span = tracing::Span::current();
-
         async move {
-            let req = CreateChatCompletionRequestArgs::default()
-                .messages(vec![
-                    ChatCompletionRequestSystemMessageArgs::default()
-                        .content(prompt)
-                        .build()
-                        .boxed()
-                        .context(FailedToLoadTokenizerSnafu)?
-                        .into(),
-                ])
-                .build()
-                .boxed()
-                .context(FailedToLoadModelSnafu)?;
-
-            let resp = self
-                .chat_request(req)
-                .await
-                .boxed()
-                .context(FailedToRunModelSnafu)?;
-
-            Ok(resp
+            Ok::<Option<String>, OpenAIError>(
+                self.chat_request(
+                    CreateChatCompletionRequestArgs::default()
+                        .messages(vec![
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(prompt)
+                                .build()?
+                                .into(),
+                        ])
+                        .build()?,
+                )
+                .instrument(Span::current())
+                .await?
                 .choices
-                .into_iter()
-                .next()
-                .and_then(|c| c.message.content))
+                .pop()
+                .and_then(|c| c.message.content),
+            )
         }
-        .instrument(span)
+        .instrument(Span::current())
         .await
+        .boxed()
+        .context(FailedToLoadModelSnafu)
     }
 
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
@@ -614,7 +604,7 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
-        let mut stream = self.stream(prompt).await.map_err(|e| {
+        let stream = self.stream(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -623,48 +613,9 @@ pub trait Chat: Sync + Send {
             })
         })?;
 
-        let strm_id: String = rng()
-            .sample_iter(&Alphanumeric)
-            .take(10)
-            .map(char::from)
-            .collect();
-        let strm = stream! {
-            let mut i  = 0;
-            while let Some(msg) = stream.next().await {
-                let choice = ChatChoiceStream {
-                    delta: ChatCompletionStreamResponseDelta {
-                        content: Some(msg?.unwrap_or_default()),
-                        tool_calls: None,
-                        role: Some(Role::System),
-                        function_call: None,
-                        refusal: None,
-                    },
-                    index: i,
-                    finish_reason: None,
-                    logprobs: None,
-                };
-
-            yield Ok(CreateChatCompletionStreamResponse {
-                id: format!("{}-{}-{i}", model_id.clone(), strm_id),
-                choices: vec![choice],
-                model: model_id.clone(),
-                created: 0,
-                system_fingerprint: None,
-                object: "list".to_string(),
-                usage: None,
-                service_tier: None,
-            });
-            i+=1;
-        }};
-
-        Ok(Box::pin(strm.map_err(|e: Error| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })))
+        Ok(crate::streaming_utils::string_stream_to_chat_stream(
+            model_id, stream,
+        ))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
@@ -706,15 +657,7 @@ pub trait Chat: Sync + Send {
         };
 
         Ok(CreateChatCompletionResponse {
-            id: format!(
-                "{}-{}",
-                model_id.clone(),
-                rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(10)
-                    .map(char::from)
-                    .collect::<String>()
-            ),
+            id: generate_stream_id(&model_id),
             choices,
             model: model_id,
             created: 0,

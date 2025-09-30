@@ -20,12 +20,12 @@ pub(super) mod util;
 use crate::bedrock::BedrockClient;
 use crate::bedrock::chat::guardrail::GuardRail;
 use crate::bedrock::chat::util::{
-    chat_choice_stream, chat_completion_stream, convert_usage, extract_from_content_block,
-    into_fallible_stream, to_api_error, tool_config, try_convert_finish_reason, try_convert_role,
-    value_to_document,
+    chat_choice_stream, convert_usage, extract_from_content_block, into_fallible_stream,
+    to_api_error, tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
 };
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
+use crate::streaming_utils::{create_stream_response, generate_stream_id};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
@@ -67,7 +67,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
-use tracing::Span;
 
 /// [`BedrockConverse`] provides an `OpenAI` compatible interface (i.e. `impl Chat` ), for models on AWS bedrock that are compatible with the [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html).
 pub struct BedrockConverse {
@@ -470,10 +469,7 @@ impl BedrockConverse {
 
         Ok(CreateChatCompletionResponse {
             usage,
-            id: Span::current()
-                .id()
-                .map(|id| id.into_u64().to_string())
-                .unwrap_or_default(),
+            id: generate_stream_id(&self.model_id),
             choices: vec![choices],
             created: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -502,11 +498,7 @@ impl BedrockConverse {
         }
 
         let state = Arc::new(RwLock::new(StreamState {
-            id: Span::current()
-                .id()
-                .map(|id| id.into_u64().to_string())
-                .unwrap_or_default(),
-            // input_stream,
+            id: generate_stream_id(model),
             model: model.to_string(),
 
             ..StreamState::default()
@@ -566,9 +558,9 @@ impl BedrockConverse {
                                         delta: Some(ContentBlockDeltaType::Text(text)),
                                         ..
                                     },
-                                ) => Some(chat_completion_stream(
+                                ) => Some(create_stream_response(
                                     state_.id.as_str(),
-                                    state_.model.clone(),
+                                    &state_.model,
                                     vec![chat_choice_stream(
                                         Some(text),
                                         None,
@@ -600,9 +592,9 @@ impl BedrockConverse {
                                         .content_block_index_to_tool_details
                                         .get(&content_block_index)
                                     {
-                                        let z = chat_completion_stream(
+                                        let z = create_stream_response(
                                             state_.id.as_str(),
-                                            state_.model.clone(),
+                                            &state_.model,
                                             vec![chat_choice_stream(
                                                 None,
                                                 Some(vec![ChatCompletionMessageToolCallChunk {
@@ -632,9 +624,9 @@ impl BedrockConverse {
                                     stop_reason,
                                     ..
                                 }) => match try_convert_finish_reason(&stop_reason) {
-                                    Ok(finish_reason) => Some(chat_completion_stream(
+                                    Ok(finish_reason) => Some(create_stream_response(
                                         state_.id.as_str(),
-                                        state_.model.clone(),
+                                        &state_.model,
                                         vec![chat_choice_stream(
                                             None,
                                             None,
@@ -650,9 +642,9 @@ impl BedrockConverse {
                                     ConverseStreamMetadataEvent {
                                         usage: Some(usage), ..
                                     },
-                                ) => Some(chat_completion_stream(
+                                ) => Some(create_stream_response(
                                     state_.id.as_str(),
-                                    state_.model.clone(),
+                                    &state_.model,
                                     vec![],
                                     Some(convert_usage(&usage)),
                                 )),

@@ -5,31 +5,31 @@ snapshot_kind: text
 ---
 [
   {
-    "id": 863,
-    "answer": "Choices create costs and benefits.",
-    "question": "What is created by making a choice?",
-    "subject": "economics",
-    "score": 0.891
-  },
-  {
-    "id": 1316,
-    "answer": "\\(\\boxed{2a + 4b}\\)",
-    "question": "Write down in simplest form \\( 5a - 2b - 3a + 6b \\).",
+    "id": 468,
+    "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
+    "question": "How many multiples of 4 are there between 1 and 30? List them and count the total.",
     "subject": "math",
-    "score": 0.843
+    "score": 0.54
   },
   {
-    "id": 590,
-    "answer": "\\(\\boxed{x = A + E}\\)",
-    "question": "Make \\( x \\) the subject of the formula \\( x - A = E \\).",
+    "id": 1277,
+    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
-    "score": 0.836
+    "score": 0.539
   },
   {
-    "id": 6,
-    "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)",
-    "question": "<refined question>",
-    "subject": "medicine",
-    "score": 0.833
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
+    "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
+    "subject": "math",
+    "score": 0.539
+  },
+  {
+    "id": 948,
+    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "question": "What is the fifth root of 32?",
+    "subject": "math",
+    "score": 0.528
   }
 ]

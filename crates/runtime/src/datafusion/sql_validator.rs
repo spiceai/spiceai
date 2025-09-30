@@ -55,6 +55,17 @@ pub fn validate_sql_query_operations(
                     );
                 }
 
+                // Check if attempting to write into a catalog. The default catalog name indicates writing to a table registered as a dataset, not via a catalog.
+                if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
+                    if !df.is_catalog_writable(catalog) {
+                        return plan_err!(
+                            "INSERT operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                            dml.table_name
+                        );
+                    }
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+
                 if df.is_writable(&dml.table_name) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
@@ -80,14 +91,16 @@ pub fn validate_sql_query_operations(
 mod tests {
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
-        datafusion::{SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder},
+        datafusion::{
+            SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder, schema::SpiceSchemaProvider,
+        },
         status::RuntimeStatus,
     };
 
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use datafusion::sql::TableReference;
+    use datafusion::{catalog::MemoryCatalogProvider, sql::TableReference};
     use std::sync::Arc;
 
     fn create_test_schema() -> Arc<Schema> {
@@ -132,13 +145,56 @@ mod tests {
 
         let internal_table = TableReference::partial(SPICE_RUNTIME_SCHEMA, "spice_table");
         df.ctx
-            .register_table(internal_table.clone(), mem_table)
+            .register_table(
+                internal_table.clone(),
+                Arc::<data_components::arrow::write::MemTable>::clone(&mem_table),
+            )
             .expect("table should be registered");
 
         df.data_writers
             .write()
             .expect("data writers should be acquired")
             .insert(internal_table);
+
+        df.ctx.register_catalog(
+            "readonly_catalog".to_string(),
+            Arc::new(MemoryCatalogProvider::new()),
+        );
+
+        df.ctx
+            .catalog("readonly_catalog")
+            .expect("catalog should be found")
+            .register_schema("public", Arc::new(SpiceSchemaProvider::new()))
+            .expect("schema should be registered");
+
+        df.ctx
+            .register_table(
+                TableReference::full("readonly_catalog", "public", "test_table"),
+                Arc::<data_components::arrow::write::MemTable>::clone(&mem_table),
+            )
+            .expect("table should be registered");
+
+        df.ctx.register_catalog(
+            "writable_catalog".to_string(),
+            Arc::new(MemoryCatalogProvider::new()),
+        );
+
+        df.ctx
+            .catalog("writable_catalog")
+            .expect("catalog should be found")
+            .register_schema("public", Arc::new(SpiceSchemaProvider::new()))
+            .expect("schema should be registered");
+
+        df.ctx
+            .register_table(
+                TableReference::full("writable_catalog", "public", "test_table"),
+                mem_table,
+            )
+            .expect("table should be registered");
+
+        // Mark writable_catalog as writable
+        df.mark_catalog_writable("writable_catalog")
+            .expect("catalog should be marked as writable");
 
         df
     }
@@ -178,6 +234,27 @@ mod tests {
             "INSERT should be allowed on writable dataset"
         );
     }
+
+    #[tokio::test]
+    async fn test_validate_insert_on_writable_dataset_full_reference() {
+        let df = create_test_datafusion();
+
+        let sql = "INSERT INTO spice.public.tbl_writable VALUES (1, 'foo', 42.0)";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        // INSERT should be allowed on writable dataset
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "INSERT should be allowed on writable dataset with full reference"
+        );
+    }
+
     #[tokio::test]
     async fn test_validate_insert_on_readonly_dataset_blocked() {
         let df = create_test_datafusion();
@@ -341,5 +418,82 @@ mod tests {
 
         let result = validate_sql_query_operations(&plan, &df);
         assert!(result.is_ok(), "Read-only subqueries should be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_validate_insert_on_writable_catalog() {
+        let df = create_test_datafusion();
+
+        let sql = "INSERT INTO writable_catalog.public.test_table VALUES (1, 'foo', 42.0)";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "INSERT should be allowed on writable catalog table"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_insert_on_readonly_catalog_blocked() {
+        let df = create_test_datafusion();
+
+        let sql = "INSERT INTO readonly_catalog.public.test_table VALUES (1, 'foo', 42.0)";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(result.is_err(), "INSERT should fail on read-only catalog");
+    }
+
+    #[tokio::test]
+    async fn test_validate_default_catalog_table_uses_dataset_rules() {
+        let df = create_test_datafusion();
+
+        // Default catalog should follow dataset writable rules, not catalog rules
+        let sql = "INSERT INTO spice.public.tbl_writable VALUES (1, 'foo', 42.0)";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "INSERT should be allowed on writable dataset in default catalog"
+        );
+
+        // Test read-only dataset in default catalog
+        let sql = "INSERT INTO spice.public.tbl_read_only VALUES (1, 'foo', 42.0)";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_err(),
+            "INSERT should fail on read-only dataset in default catalog"
+        );
+
+        if let Err(e) = result {
+            assert!(
+                e.to_string()
+                    .contains("INSERT operations are not allowed on read-only dataset")
+            );
+        }
     }
 }

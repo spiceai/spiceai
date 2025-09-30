@@ -17,10 +17,11 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    AccessMode, CheckAvailability, Dataset, Error, ReadyState, Result, TimeFormat,
-    UnsupportedTypeAction, acceleration, replication, validate_identifier,
+    CheckAvailability, Dataset, Error, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
+    acceleration, replication, validate_identifier,
 };
 use crate::Runtime;
+use crate::component::access::AccessMode;
 use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;

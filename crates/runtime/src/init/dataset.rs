@@ -24,10 +24,13 @@ use crate::{
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
     UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::dataset::{
-        self, Dataset,
-        acceleration::{Acceleration, RefreshMode},
-        builder::DatasetBuilder,
+    component::{
+        access::AccessMode,
+        dataset::{
+            Dataset,
+            acceleration::{Acceleration, RefreshMode},
+            builder::DatasetBuilder,
+        },
     },
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
@@ -680,7 +683,7 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        if ds.access() == dataset::AccessMode::ReadWrite && !replicate {
+        if ds.access() == AccessMode::ReadWrite && !replicate {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 

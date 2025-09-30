@@ -61,9 +61,10 @@ use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 use crate::component::dataset::TimeFormat;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
-use tokio::sync::{RwLock, Semaphore, oneshot};
+use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
 use super::refresh::Refresh;
+use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::{
@@ -79,6 +80,8 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 
 mod changes;
 mod streaming_append;
+
+const NANOS_TO_MILLIS: u128 = 1_000_000;
 
 #[derive(Debug, Clone, Default)]
 struct RefreshStat {
@@ -250,6 +253,10 @@ impl RefreshTask {
         self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
+        let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
+
+        let max_timestamp_before_refresh_ms = self.get_max_timestamp_before_refresh(refresh).await;
+
         let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
                 RefreshMode::Disabled => {
@@ -258,7 +265,7 @@ impl RefreshTask {
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            self.get_dataset_label_sets(&refresh.mode).await,
+            &dataset_metrics_label_sets,
         );
 
         let start_time = SystemTime::now();
@@ -284,6 +291,21 @@ impl RefreshTask {
             }
         };
 
+        let source_name = format!(
+            "{} {}",
+            self.component_type(),
+            include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref())
+        );
+        let (streaming_data_update, max_timestamp_after_refresh_ms) =
+            with_find_max_timestamp_in_stream(
+                streaming_data_update,
+                self.federated.schema(),
+                refresh.time_column.clone(),
+                refresh.time_format,
+                source_name,
+            )
+            .await;
+
         self.write_streaming_data_update(
             Some(start_time),
             streaming_data_update,
@@ -304,7 +326,78 @@ impl RefreshTask {
                     inner_err_from_retry_ref(e)
                 );
             }
-        })
+        })?;
+
+        // Only record metrics if a refresh was successful
+        self.handle_metrics(
+            &dataset_metrics_label_sets,
+            max_timestamp_before_refresh_ms,
+            max_timestamp_after_refresh_ms,
+        )
+        .await;
+
+        Ok(())
+    }
+
+    async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<i64> {
+        if refresh.time_column.is_some() {
+            match self.timestamp_nanos_for_append_query(refresh).await {
+                Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
+                        self.component_type(),
+                        include_source_to_table_name(
+                            &self.dataset_name,
+                            self.federated_source.as_deref()
+                        ),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    async fn handle_metrics(
+        &self,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
+        max_timestamp_before_refresh_ms: Option<i64>,
+        max_timestamp_after_refresh_ms: Option<Arc<Mutex<Option<i64>>>>,
+    ) {
+        if let (Some(max_timestamp_before_refresh_ms), Some(max_timestamp_after_refresh_ms)) = (
+            max_timestamp_before_refresh_ms,
+            max_timestamp_after_refresh_ms,
+        ) {
+            let max_timestamp_after_refresh_ms = {
+                let guard = max_timestamp_after_refresh_ms.lock().await;
+                *guard
+            };
+
+            if let Some(max_timestamp_after_refresh_ms) = max_timestamp_after_refresh_ms {
+                #[allow(clippy::cast_possible_truncation)]
+                let current_time_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                let refresh_lag_ms =
+                    max_timestamp_after_refresh_ms - max_timestamp_before_refresh_ms;
+                let ingestion_lag_ms = current_time_ms - max_timestamp_after_refresh_ms;
+
+                for label_set in dataset_metrics_label_sets {
+                    metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS
+                        .record(max_timestamp_before_refresh_ms, label_set);
+                    metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS
+                        .record(max_timestamp_after_refresh_ms, label_set);
+                    metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
+                    metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
+                }
+            }
+        }
     }
 
     async fn write_streaming_data_update(
