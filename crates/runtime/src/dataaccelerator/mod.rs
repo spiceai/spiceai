@@ -81,6 +81,9 @@ pub enum FilePathError {
     #[snafu(display("Could not resolve file path. Acceleration is not enabled."))]
     AccelerationNotEnabled,
 
+    #[snafu(display("{engine:?} accelerator engine not available."))]
+    AcceleratorEngineUnavailable { engine: Engine },
+
     #[snafu(display("File mode is not supported for this accelerator engine."))]
     FileModeUnsupported {},
 
@@ -509,7 +512,9 @@ pub async fn acceleration_file_path(
 
     let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
         .await
-        .context(AccelerationNotEnabledSnafu)?;
+        .context(AcceleratorEngineUnavailableSnafu {
+            engine: acceleration_settings.engine,
+        })?;
 
     let file = accelerator.file_path(source)?;
 
