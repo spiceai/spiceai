@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{component::dataset::AccessMode, datafusion::DataFusion};
+use crate::{component::access::AccessMode, datafusion::DataFusion};
 
 const SPICE_DATABRICKS_HEADER: &str = "spice-databricks-auth";
 

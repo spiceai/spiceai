@@ -24,6 +24,7 @@ use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
+use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use std::sync::Arc;
@@ -37,8 +38,9 @@ async fn iceberg_insert_into_existing_table() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let dataset = make_iceberg_dataset("spice_write", "test_table", "test_table")?;
+            let catalog = make_iceberg_catalog("ice", "spice_write.*")?;
 
-            let app = AppBuilder::new("iceberg-write").with_dataset(dataset).build();
+            let app = AppBuilder::new("iceberg-write").with_dataset(dataset).with_catalog(catalog).build();
 
             configure_test_datafusion();
 
@@ -54,30 +56,97 @@ async fn iceberg_insert_into_existing_table() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Generate a new UUID for this batch so we can query appended data
-            let batch_uuid = uuid::Uuid::new_v4().to_string();
-            let append_sql = format!(
-                "INSERT INTO test_table \
-                  (batch_id, boolean_col, int_col, long_col, float_col, double_col, decimal_col, date_col, timestamp_col, binary_col) \
-                VALUES \
-                  ('{batch_uuid}', TRUE,  1,  10000000001, REAL '1.5',  2.25, DECIMAL '12345.6789', DATE '2024-01-01', TIMESTAMP '2024-01-01 02:03:04', X'00FFAB'), \
-                  ('{batch_uuid}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
-            );
+            for (tbl_name, snapshot_prefix) in [
+                ("test_table", "table"),
+                ("ice.spice_write.test_table", "catalog"),
+            ] {
+                // Generate a new UUID for this batch so we can query appended data
+                let batch_uuid = uuid::Uuid::new_v4().to_string();
+                let append_sql = format!(
+                    "INSERT INTO {tbl_name} \
+                    (batch_id, boolean_col, int_col, long_col, float_col, double_col, decimal_col, date_col, timestamp_col, binary_col) \
+                    VALUES \
+                    ('{batch_uuid}', TRUE,  1,  10000000001, REAL '1.5',  2.25, DECIMAL '12345.6789', DATE '2024-01-01', TIMESTAMP '2024-01-01 02:03:04', X'00FFAB'), \
+                    ('{batch_uuid}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
+                );
 
-            execute_query_and_validate_result(
-                &rt,
-                &append_sql,
-                "iceberg_insert_into_table_result",
-            ).await?;
+                execute_query_and_validate_result(
+                    &rt,
+                    &append_sql,
+                    &format!("{snapshot_prefix}_result"),
+                ).await?;
 
-            // Select to validate appended rows. The batch_id is unique per test run, so we exclude it from snapshot validation.
-            execute_query_and_validate_result(
-                &rt,
-                &format!(
-                    "SELECT boolean_col, int_col, long_col, float_col, double_col, decimal_col, date_col, timestamp_col, binary_col FROM test_table WHERE batch_id = '{batch_uuid}'",
-                ),
-                "iceberg_insert_into_table_appended_rows",
-            ).await?;
+                // Select to validate appended rows. The batch_id is unique per test run, so we exclude it from snapshot validation.
+                execute_query_and_validate_result(
+                    &rt,
+                    &format!(
+                        "SELECT boolean_col, int_col, long_col, float_col, double_col, decimal_col, date_col, timestamp_col, binary_col FROM {tbl_name} WHERE batch_id = '{batch_uuid}'",
+                    ),
+                    &format!("{snapshot_prefix}_appended_rows"),
+                ).await?;
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn glue_insert_into_existing_table() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let dataset = make_glue_dataset("spice_write", "test_table", "test_table");
+            let catalog = make_glue_catalog("glue", "spice_write.*");
+
+            let app = AppBuilder::new("glue-write").with_dataset(dataset).with_catalog(catalog).build();
+
+            configure_test_datafusion();
+
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            for (tbl_name, snapshot_prefix) in [
+                ("test_table", "glue_table"),
+                ("glue.spice_write.test_table", "glue_catalog"),
+            ] {
+                // Generate a new UUID for this batch so we can query appended data
+                let batch_uuid = uuid::Uuid::new_v4().to_string();
+                let append_sql = format!(
+                    "INSERT INTO {tbl_name} \
+                    (batch_id, boolean_col, int_col, long_col, float_col, double_col, decimal_col, date_col, timestamp_col, binary_col) \
+                    VALUES \
+                    ('{batch_uuid}', TRUE,  1,  10000000001, REAL '1.5',  2.25, DECIMAL '12345.6789', DATE '2024-01-01', TIMESTAMP '2024-01-01 02:03:04', X'00FFAB'), \
+                    ('{batch_uuid}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
+                );
+
+                execute_query_and_validate_result(
+                    &rt,
+                    &append_sql,
+                    &format!("{snapshot_prefix}_result"),
+                ).await?;
+
+                // Select to validate appended rows. The batch_id is unique per test run, so we exclude it from snapshot validation.
+                execute_query_and_validate_result(
+                    &rt,
+                    &format!(
+                        "SELECT boolean_col, int_col, long_col, float_col, double_col, decimal_col, date_col, timestamp_col, binary_col FROM {tbl_name} WHERE batch_id = '{batch_uuid}'",
+                    ),
+                    &format!("{snapshot_prefix}_appended_rows"),
+                ).await?;
+            }
 
             Ok(())
         })
@@ -122,12 +191,26 @@ fn make_iceberg_dataset(
         "iceberg:https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/{namespace}/tables/{table}"
     );
     let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(get_params());
-    dataset.access = spicepod::component::dataset::AccessMode::ReadWrite;
+    dataset.params = Some(get_iceberg_params());
+    dataset.access = spicepod::component::access::AccessMode::ReadWrite;
     Ok(dataset)
 }
 
-fn get_params() -> Params {
+fn make_iceberg_catalog(name: &str, include: &str) -> Result<Catalog, anyhow::Error> {
+    let account_id =
+        std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
+
+    let from = format!(
+        "iceberg:https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"
+    );
+    let mut catalog = Catalog::new(from, name.to_string());
+    catalog.params = Some(get_iceberg_params());
+    catalog.access = spicepod::component::access::AccessMode::ReadWrite;
+    catalog.include = vec![include.to_string()];
+    Ok(catalog)
+}
+
+fn get_iceberg_params() -> Params {
     Params::from_string_map(
         vec![
             ("iceberg_s3_region".to_string(), "us-east-1".to_string()),
@@ -139,6 +222,41 @@ fn get_params() -> Params {
                 "iceberg_s3_secret_access_key".to_string(),
                 "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
             ),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn make_glue_dataset(schema: &str, table: &str, name: &str) -> Dataset {
+    let from = format!("glue:{schema}.{table}");
+    let mut dataset = Dataset::new(from, name);
+    dataset.params = Some(get_glue_params());
+    dataset.access = spicepod::component::access::AccessMode::ReadWrite;
+    dataset
+}
+
+fn make_glue_catalog(name: &str, include: &str) -> Catalog {
+    let mut catalog = Catalog::new("glue".to_string(), name.to_string());
+    catalog.params = Some(get_glue_params());
+    catalog.access = spicepod::component::access::AccessMode::ReadWrite;
+    catalog.include = vec![include.to_string()];
+    catalog
+}
+
+fn get_glue_params() -> Params {
+    Params::from_string_map(
+        vec![
+            ("glue_region".to_string(), "us-east-1".to_string()),
+            (
+                "glue_key".to_string(),
+                "${ env:AWS_ICEBERG_ACCESS_KEY_ID }".to_string(),
+            ),
+            (
+                "glue_secret".to_string(),
+                "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
+            ),
+            ("glue_auth".to_string(), "key".to_string()),
         ]
         .into_iter()
         .collect(),
