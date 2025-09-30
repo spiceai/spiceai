@@ -56,6 +56,27 @@ pub fn create_stream_response(
     })
 }
 
+/// Creates a standardized `CreateChatCompletionStreamResponse` with custom timestamp
+#[allow(clippy::cast_possible_truncation)]
+pub fn create_stream_response_with_timestamp(
+    id: &str,
+    model: &str,
+    choices: Vec<ChatChoiceStream>,
+    usage: Option<CompletionUsage>,
+    created: u32,
+) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
+    Ok(CreateChatCompletionStreamResponse {
+        id: id.to_string(),
+        created,
+        model: model.to_string(),
+        service_tier: None,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".to_string(),
+        usage,
+        choices,
+    })
+}
+
 /// Creates a chat choice for streaming with optional content
 pub fn create_stream_choice(
     index: u32,
