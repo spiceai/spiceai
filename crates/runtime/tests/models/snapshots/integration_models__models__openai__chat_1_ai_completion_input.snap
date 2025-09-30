@@ -120,7 +120,7 @@ snapshot_kind: text
     },
     {
       "function": {
-        "description": "Search datasets available & searchable in Spice.ai runtime",
+        "description": "Search across available, searchable datasets in Spice.ai runtime",
         "name": "search",
         "parameters": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
