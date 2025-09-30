@@ -25,7 +25,10 @@ use async_openai::types::{
     ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
     CreateChatCompletionStreamResponse, FinishReason, Role,
 };
-use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
+use async_openai::types::{
+    ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions,
+    CreateChatCompletionRequestArgs,
+};
 
 use datafusion::common::cast::as_string_array;
 use datafusion::common::utils::take_function_args;
@@ -217,6 +220,10 @@ impl Ai {
                                 .map_err(DataFusionError::External)?
                                 .into(),
                         ])
+                        .stream(true)
+                        .stream_options(ChatCompletionStreamOptions {
+                            include_usage: true,
+                        })
                         .build()
                         .boxed()?,
                 )
@@ -389,7 +396,7 @@ mod tests {
             });
 
             // Use shared streaming utilities - return the complete response as a single chunk
-            Ok(llms::chat::streaming_utils::create_mock_streaming_response(
+            Ok(llms::streaming_utils::create_mock_streaming_response(
                 self.name.clone(),
                 vec![response_text],
                 usage,
@@ -1256,7 +1263,7 @@ mod tests {
                     completion_tokens_details: None,
                 });
 
-                Ok(llms::chat::streaming_utils::create_mock_streaming_response(
+                Ok(llms::streaming_utils::create_mock_streaming_response(
                     self.name.clone(),
                     vec![response_text],
                     usage,
