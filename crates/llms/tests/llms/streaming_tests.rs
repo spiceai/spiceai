@@ -51,10 +51,15 @@ impl Chat for StreamingMockChat {
         &self,
         _req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError> {
+        let completion_tokens: u32 = self
+            .chunks
+            .iter()
+            .map(|c| u32::try_from(c.len()).unwrap_or(0))
+            .sum();
         let usage = Some(CompletionUsage {
             prompt_tokens: 10,
-            completion_tokens: self.chunks.iter().map(|c| c.len() as u32).sum(),
-            total_tokens: 10 + self.chunks.iter().map(|c| c.len() as u32).sum::<u32>(),
+            completion_tokens,
+            total_tokens: 10 + completion_tokens,
             prompt_tokens_details: None,
             completion_tokens_details: None,
         });
@@ -122,21 +127,22 @@ async fn test_streaming_chat_completion() {
     let model = StreamingMockChat::new("test-streaming".to_string(), chunks.clone());
 
     // Create a test request
+    let system_message = ChatCompletionRequestSystemMessageArgs::default()
+        .content("Hello, test streaming!".to_string())
+        .build()
+        .expect("Failed to build system message");
     let request = CreateChatCompletionRequestArgs::default()
         .model("test-streaming".to_string())
-        .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("Hello, test streaming!".to_string())
-                .build()
-                .unwrap()
-                .into(),
-        ])
+        .messages(vec![system_message.into()])
         .stream(true)
         .build()
-        .unwrap();
+        .expect("Failed to build chat completion request");
 
     // Get the stream
-    let mut stream = model.chat_stream(request).await.unwrap();
+    let mut stream = model
+        .chat_stream(request)
+        .await
+        .expect("Failed to create chat stream");
 
     let mut content_parts = Vec::new();
     let mut usage = None;
@@ -144,28 +150,25 @@ async fn test_streaming_chat_completion() {
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(response) => {
-                if let Some(choice) = response.choices.first() {
-                    if let Some(content) = &choice.delta.content {
-                        if !content.is_empty() {
-                            content_parts.push(content.clone());
-                        }
-                    }
+                if let Some(choice) = response.choices.first()
+                    && let Some(content) = &choice.delta.content
+                    && !content.is_empty()
+                {
+                    content_parts.push(content.clone());
                 }
                 if response.usage.is_some() {
                     usage = response.usage;
                 }
             }
             Err(e) => {
-                panic!("Stream error: {:?}", e);
+                panic!("Stream error: {e:?}");
             }
         }
     }
 
     let final_content = content_parts.join("");
     assert_eq!(final_content, "Hello streaming works!");
-    assert!(usage.is_some());
-
-    let usage = usage.unwrap();
+    let usage = usage.expect("Usage should be present in final chunk");
     assert_eq!(usage.prompt_tokens, 10);
     assert!(usage.completion_tokens > 0);
     assert_eq!(
@@ -178,18 +181,16 @@ async fn test_streaming_chat_completion() {
 async fn test_streaming_error_handling() {
     let model = ErrorMockChat;
 
+    let system_message = ChatCompletionRequestSystemMessageArgs::default()
+        .content("This should fail".to_string())
+        .build()
+        .expect("Failed to build system message");
     let request = CreateChatCompletionRequestArgs::default()
         .model("error-model".to_string())
-        .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("This should fail".to_string())
-                .build()
-                .unwrap()
-                .into(),
-        ])
+        .messages(vec![system_message.into()])
         .stream(true)
         .build()
-        .unwrap();
+        .expect("Failed to build chat completion request");
 
     let result = model.chat_stream(request).await;
     assert!(result.is_err());
@@ -202,20 +203,21 @@ async fn test_streaming_error_handling() {
 async fn test_empty_streaming_response() {
     let model = StreamingMockChat::new("test-empty".to_string(), vec![]);
 
+    let system_message = ChatCompletionRequestSystemMessageArgs::default()
+        .content("Empty response test".to_string())
+        .build()
+        .expect("Failed to build system message");
     let request = CreateChatCompletionRequestArgs::default()
         .model("test-empty".to_string())
-        .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("Empty response test".to_string())
-                .build()
-                .unwrap()
-                .into(),
-        ])
+        .messages(vec![system_message.into()])
         .stream(true)
         .build()
-        .unwrap();
+        .expect("Failed to build chat completion request");
 
-    let mut stream = model.chat_stream(request).await.unwrap();
+    let mut stream = model
+        .chat_stream(request)
+        .await
+        .expect("Failed to create chat stream");
 
     let mut chunk_count = 0;
     while let Some(chunk) = stream.next().await {
@@ -224,7 +226,7 @@ async fn test_empty_streaming_response() {
                 chunk_count += 1;
             }
             Err(e) => {
-                panic!("Stream error: {:?}", e);
+                panic!("Stream error: {e:?}");
             }
         }
     }
@@ -251,37 +253,39 @@ async fn test_model_store_integration() {
 
     let model_store = Arc::new(RwLock::new(store));
     let model_store_guard = model_store.read().await;
-    let model = model_store_guard.get("test-streaming").unwrap();
+    let model = model_store_guard
+        .get("test-streaming")
+        .expect("Model should exist in store");
 
+    let system_message = ChatCompletionRequestSystemMessageArgs::default()
+        .content("Hello from model store!".to_string())
+        .build()
+        .expect("Failed to build system message");
     let request = CreateChatCompletionRequestArgs::default()
         .model("test-streaming".to_string())
-        .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("Hello from model store!".to_string())
-                .build()
-                .unwrap()
-                .into(),
-        ])
+        .messages(vec![system_message.into()])
         .stream(true)
         .build()
-        .unwrap();
+        .expect("Failed to build chat completion request");
 
-    let mut stream = model.chat_stream(request).await.unwrap();
+    let mut stream = model
+        .chat_stream(request)
+        .await
+        .expect("Failed to create chat stream");
 
     let mut content_parts = Vec::new();
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(response) => {
-                if let Some(choice) = response.choices.first() {
-                    if let Some(content) = &choice.delta.content {
-                        if !content.is_empty() {
-                            content_parts.push(content.clone());
-                        }
-                    }
+                if let Some(choice) = response.choices.first()
+                    && let Some(content) = &choice.delta.content
+                    && !content.is_empty()
+                {
+                    content_parts.push(content.clone());
                 }
             }
             Err(e) => {
-                panic!("Stream error: {:?}", e);
+                panic!("Stream error: {e:?}");
             }
         }
     }
@@ -295,24 +299,25 @@ async fn test_streaming_response_structure() {
     let chunks = vec!["Test".to_string(), " response".to_string()];
     let model = StreamingMockChat::new("test-structure".to_string(), chunks);
 
+    let system_message = ChatCompletionRequestSystemMessageArgs::default()
+        .content("Structure test".to_string())
+        .build()
+        .expect("Failed to build system message");
     let request = CreateChatCompletionRequestArgs::default()
         .model("test-structure".to_string())
-        .messages(vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("Structure test".to_string())
-                .build()
-                .unwrap()
-                .into(),
-        ])
+        .messages(vec![system_message.into()])
         .stream(true)
         .build()
-        .unwrap();
+        .expect("Failed to build chat completion request");
 
-    let mut stream = model.chat_stream(request).await.unwrap();
+    let mut stream = model
+        .chat_stream(request)
+        .await
+        .expect("Failed to create chat stream");
 
     let mut responses = Vec::new();
     while let Some(chunk) = stream.next().await {
-        responses.push(chunk.unwrap());
+        responses.push(chunk.expect("Stream chunk should be valid"));
     }
 
     // Check that all responses have consistent structure
@@ -324,7 +329,7 @@ async fn test_streaming_response_structure() {
     }
 
     // Check that the final response has usage information
-    let final_response = responses.last().unwrap();
+    let final_response = responses.last().expect("Should have at least one response");
     assert!(final_response.usage.is_some());
 
     // Check that the final response has a finish reason

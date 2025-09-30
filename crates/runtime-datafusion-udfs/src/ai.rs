@@ -103,6 +103,7 @@ impl Ai {
         Self { model_store }
     }
 
+    #[must_use]
     pub fn into_async_udf(self) -> AsyncScalarUDF {
         AsyncScalarUDF::new(Arc::new(self))
     }
@@ -263,7 +264,7 @@ impl Ai {
 
         // Determine the degree of parallelism based on CPU cores
         let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(4); // fallback to 4 if detection fails
 
         // Create a semaphore to limit concurrent model calls
@@ -318,7 +319,7 @@ impl Ai {
         for task in tasks {
             let result = task
                 .await
-                .map_err(|e| DataFusionError::Internal(format!("Task join error: {}", e)))??;
+                .map_err(|e| DataFusionError::Internal(format!("Task join error: {e}")))??;
             results.push(result);
         }
 
@@ -334,13 +335,22 @@ impl Ai {
 }
 
 #[cfg(test)]
+// Allow various lints in test code for simplicity and readability.
+// Test code prioritizes clarity over strict lint compliance.
+#[allow(
+    clippy::unwrap_used,
+    clippy::clone_on_ref_ptr,
+    clippy::uninlined_format_args,
+    clippy::too_many_lines
+)]
 mod tests {
     use super::*;
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, Field};
     use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
-    use datafusion::logical_expr::{ScalarUDFImpl, Volatility};
+    use datafusion::logical_expr::{ScalarFunctionArgs, ScalarUDFImpl, Volatility};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tokio::sync::RwLock;
 
     // Mock Chat implementation for testing
@@ -381,7 +391,7 @@ mod tests {
                     }
                     _ => None,
                 })
-                .unwrap_or_else(|| "".to_string());
+                .unwrap_or_default();
 
             let response_text = format!("Response from {}: {}", self.name, prompt);
             let usage = Some(CompletionUsage {
@@ -423,7 +433,7 @@ mod tests {
                     }
                     _ => None,
                 })
-                .unwrap_or_else(|| "".to_string());
+                .unwrap_or_default();
 
             let response_text = format!("Response from {}: {}", self.name, prompt);
 
@@ -581,9 +591,6 @@ mod tests {
     fn test_non_async_invoke_with_args_error() {
         let model_store = create_test_model_store();
         let udf = Ai::new(model_store);
-
-        use arrow_schema::Field;
-        use datafusion::logical_expr::ScalarFunctionArgs;
 
         let args = ScalarFunctionArgs {
             args: vec![],
@@ -1000,8 +1007,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_invoke_async_captures_current_span() {
-        use arrow_schema::Field;
-        use datafusion::logical_expr::ScalarFunctionArgs;
         use tracing::Level;
 
         // This test verifies that invoke_async_with_args properly captures the current span
@@ -1140,8 +1145,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ai_udf_full_span_flow() {
-        use arrow_schema::Field;
-        use datafusion::logical_expr::ScalarFunctionArgs;
         use tracing::Level;
 
         // This test documents the expected span flow behavior:
@@ -1209,8 +1212,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_processing_with_multiple_messages() {
-        use std::time::{Duration, Instant};
-
         // Mock Chat that simulates processing time
         struct SlowMockChat {
             name: String,
@@ -1244,12 +1245,12 @@ mod tests {
                         async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
                             match &user_msg.content {
                                 async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
-                                _ => Some("Array content".to_string()),
+                                async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => Some("Array content".to_string()),
                             }
                         }
                         _ => None,
                     })
-                    .unwrap_or_else(|| "".to_string());
+                    .unwrap_or_default();
 
                 let response_text = format!("Response from {}: {}", self.name, prompt);
                 let usage = Some(CompletionUsage {
