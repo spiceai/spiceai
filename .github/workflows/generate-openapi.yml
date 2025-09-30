@@ -10,7 +10,7 @@ on:
 
 jobs:
   generate_openapi:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Check out repository
