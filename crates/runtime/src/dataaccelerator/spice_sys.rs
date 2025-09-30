@@ -133,13 +133,8 @@ pub enum Error {
 }
 
 impl Error {
-    fn external<E>(err: E) -> Self
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        Self::External {
-            source: Box::new(err),
-        }
+    fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::External { source: err.into() }
     }
 }
 
