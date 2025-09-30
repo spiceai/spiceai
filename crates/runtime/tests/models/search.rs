@@ -369,29 +369,25 @@ pub(crate) async fn run_search_w_explain(
 
 #[tokio::test]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
-    let mut ds = catalog_page_tpcds_dataset_w_embeddings(
-        "multi_column_search",
-        "hf_minilm",
-        Some(vec!["cp_catalog_page_sk".to_string()]),
-        Some(EmbeddingChunkConfig {
-            enabled: true,
-            target_chunk_size: 512,
-            overlap_size: 128,
-            trim_whitespace: false,
-        }),
+    let ds = get_mega_science_dataset(
+        Some("qs"),
+        Some(
+            Column::new("question").with_embeddings(vec![ColumnLevelEmbeddingConfig {
+                model: "hf_minilm".to_string(),
+                row_ids: Some(vec!["id".to_string()]),
+                chunking: None,
+                vector_size: None,
+            }]),
+        ),
+        Some(
+            Column::new("answer").with_embeddings(vec![ColumnLevelEmbeddingConfig {
+                model: "hf_minilm".to_string(),
+                row_ids: Some(vec!["id".to_string()]),
+                chunking: Some(EmbeddingChunkConfig::enabled().target_chunk_size(64)),
+                vector_size: None,
+            }]),
+        ),
     );
-    ds.columns.push(Column {
-        name: "cp_department".to_string(),
-        embeddings: vec![ColumnLevelEmbeddingConfig {
-            model: "hf_minilm".to_string(),
-            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-            chunking: None,
-            vector_size: None,
-        }],
-        description: None,
-        full_text_search: None,
-        metadata: HashMap::new(),
-    });
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds)
@@ -404,29 +400,54 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
         app,
         vec![
             SearchTestCase::new(
-                "multi_column_basic",
+                "multi_column_basic".to_string(),
                 SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_search"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 })),
             ),
             SearchTestCase::new(
-                "multi_column_additional",
+                "multi_column_additional_columns".to_string(),
                 SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_search"],
-                    "additional_columns": ["cp_catalog_number"],
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
                 })),
             ),
             SearchTestCase::new(
-                "multi_column_where",
+                "multi_column_with_where".to_string(),
                 SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "datasets": ["multi_column_search"],
-                    "where": "cp_catalog_page_sk % 2 = 1"
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 })),
+            ),
+            SearchTestCase::new(
+                "multi_column_question_vector_search_sql_filters".to_string(),
+                SearchTestType::Sql(
+                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "multi_column_question_vector_search_sql_no_score".to_string(),
+                SearchTestType::Sql(
+                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "multi_column_question_vector_search_sql_random".to_string(),
+                SearchTestType::Sql(
+                    "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "multi_column_question_vector_search_sql_vectors".to_string(),
+                SearchTestType::Sql(
+                    "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+                ),
             ),
         ],
     )
@@ -449,24 +470,10 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 None,
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".into(),
-                        chunking: None,
-                        row_ids: Some(vec!["id".to_string()]),
-                        vector_size: None,
-                    }, ColumnLevelEmbeddingConfig {
-                        model: "openai_embeddings".into(),
-                        chunking: None,
-                        row_ids: Some(vec!["id".to_string()]),
-                        vector_size: None,
-                    }],
-                    description: None,
-                    full_text_search: None,
-                    metadata: HashMap::new(),
-                }),
-            ))
+                Some(Column::new("answer").with_embeddings(vec![
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                    ColumnLevelEmbeddingConfig::model("openai_embeddings").with_row_id("id")
+                ]))))
             .build(),
         vec![
             SearchTestCase::new(
@@ -511,18 +518,9 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
 async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
         catalog_page_tpcds_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
-    chunked.columns.push(Column {
-        name: "cp_department".to_string(),
-        embeddings: vec![ColumnLevelEmbeddingConfig {
-            model: "hf_minilm".to_string(),
-            row_ids: None,
-            chunking: None,
-            vector_size: None,
-        }],
-        description: None,
-        full_text_search: None,
-        metadata: HashMap::new(),
-    });
+    chunked.columns.push(
+        Column::new("cp_department").with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm")),
+    );
     let app = AppBuilder::new("search_app")
         .with_dataset(chunked)
         .with_embedding(get_model_to_vec_embeddings(
@@ -557,18 +555,10 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
             ))
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
-                Some(Column {
-                    name: "question".to_string(),
-                    embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".into(),
-                        chunking: None,
-                        row_ids: Some(vec!["id".to_string()]),
-                        vector_size: None,
-                    }],
-                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
-                    description: None,
-                    metadata: HashMap::new(),
-                }),
+                Some(Column::new("question")
+                    .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))
+                    .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
+                ),
                 None,
             ))
             .build(),
@@ -632,25 +622,8 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
             ))
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
-                Some(Column {
-                    name: "question".to_string(),
-                    embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".into(),
-                        chunking: None,
-                        row_ids: Some(vec!["id".to_string()]),
-                        vector_size: None,
-                    }],
-                    description: None,
-                    full_text_search: None,
-                    metadata: HashMap::new(),
-                }),
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search:  Some(FullTextSearchConfig::enabled().with_row_id("id")),
-                    metadata: HashMap::new(),
-                }),
+                Some(Column::new("question").with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))),
+                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
             ))
             .build(),
         vec![
@@ -719,30 +692,8 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
             ))
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
-                Some(Column {
-                    name: "question".to_string(),
-                    embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".into(),
-                        chunking: None,
-                        row_ids: Some(vec!["id".to_string()]),
-                        vector_size: None,
-                    }],
-                    description: None,
-                    full_text_search: None,
-                    metadata: HashMap::new(),
-                }),
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                        index_store: None,
-                        index_directory: None,
-                    }),
-                    metadata: HashMap::new(),
-                }),
+                Some(Column::new("question").with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))),
+                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
             ))
             .build(),
         vec![
@@ -789,13 +740,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 None,
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search:  Some(FullTextSearchConfig::enabled().with_row_id("id")),
-                    metadata: HashMap::new(),
-                }),
+                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
             ))
             .build(),
         vec![
@@ -874,13 +819,7 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 None,
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("answer")),
-                    metadata: HashMap::new(),
-                }),
+                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("answer"))),
             ))
             .build(),
         vec![
@@ -907,20 +846,16 @@ async fn test_text_search_where_rowid_is_search_column_multi_column() -> Result<
         AppBuilder::new("search_app")
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
-                Some(Column {
-                    name: "question".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("answer")),
-                    metadata: HashMap::new(),
-                }),
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("answer")),
-                    metadata: HashMap::new(),
-                }),
+                Some(
+                    Column::new("question").with_full_text_search(
+                        FullTextSearchConfig::enabled().with_row_id("answer"),
+                    ),
+                ),
+                Some(
+                    Column::new("answer").with_full_text_search(
+                        FullTextSearchConfig::enabled().with_row_id("answer"),
+                    ),
+                ),
             ))
             .build(),
         vec![SearchTestCase::new(
@@ -942,18 +877,11 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 None,
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["answer".to_string(), "id".to_string()]),
-                        index_store: Some(spicepod::semantic::IndexStore::Memory),
-                        index_directory: None
-                    }),
-                    metadata: HashMap::new(),
-                }),
+                Some(
+                    Column::new("answer").with_full_text_search(
+                        FullTextSearchConfig::enabled().with_row_id("answer").with_row_id("id"),
+                    ),
+                ),
             ))
             .build(),
         vec![
@@ -981,20 +909,9 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
         AppBuilder::new("search_app")
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
-                Some(Column {
-                    name: "question".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
-                    metadata: HashMap::new(),
-                }),
-                Some(Column {
-                    name: "answer".to_string(),
-                    embeddings: vec![],
-                    description: None,
-                    full_text_search: Some(FullTextSearchConfig::enabled().with_row_id("id")),
-                    metadata: HashMap::new(),
-                }),
+                Some(Column::new("question").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
+                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
+
             ))
             .build(),
         vec![
@@ -1099,24 +1016,18 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 "This column has an embedding in the underlying spice instance".to_string(),
             ),
             full_text_search: None,
-            embeddings: vec![ColumnLevelEmbeddingConfig {
-                model: "hf_minilm".to_string(),
-                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-                chunking: None,
-                vector_size: None,
-            }],
+            embeddings: vec![
+                ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("cp_catalog_page_sk"),
+            ],
             metadata: HashMap::new(),
         },
         Column {
             name: "cp_department".to_string(),
             description: Some("This column is newly embedded in this spice app".to_string()),
             full_text_search: None,
-            embeddings: vec![ColumnLevelEmbeddingConfig {
-                model: "hf_minilm".to_string(),
-                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-                chunking: None,
-                vector_size: None,
-            }],
+            embeddings: vec![
+                ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("cp_catalog_page_sk"),
+            ],
             metadata: HashMap::new(),
         },
     ];

@@ -14,7 +14,7 @@ clap = { workspace = true, features = ["derive"] }
 event_stream = { path = "../../crates/event_stream" }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
-mimalloc = { version = "0.1.47", optional = true }
+mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
 opentelemetry-prometheus.workspace = true
