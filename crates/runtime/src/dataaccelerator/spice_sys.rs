@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::{path::Path, sync::Arc};
 
-use super::{AccelerationSource, DataAccelerator};
+use super::AccelerationSource;
 use snafu::{OptionExt, ResultExt, Snafu};
 
 #[cfg(feature = "postgres")]
