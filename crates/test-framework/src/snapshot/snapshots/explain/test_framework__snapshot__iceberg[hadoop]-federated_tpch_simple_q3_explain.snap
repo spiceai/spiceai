@@ -15,6 +15,6 @@ description: "Query: tpch_simple_q3"
 |               |     ProjectionExec: expr=[l_comment@2 as l_comment, l_partkey@0 as l_partkey, l_linenumber@1 as l_linenumber] |
 |               |       BytesProcessedExec                                                                                      |
 |               |         CooperativeExec                                                                                       |
-|               |           IcebergTableScan projection:[l_partkey,l_linenumber,l_comment] predicate:[]                         |
+|               |           IcebergTableScan projection:[l_partkey,l_linenumber,l_comment] predicate:[] limit:[]                |
 |               |                                                                                                               |
 +---------------+---------------------------------------------------------------------------------------------------------------+
