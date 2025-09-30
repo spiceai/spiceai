@@ -21,7 +21,7 @@ use spicepod::{component::catalog as spicepod_catalog, param::Params};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::{Runtime, component::dataset::AccessMode};
+use crate::{Runtime, component::access::AccessMode};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

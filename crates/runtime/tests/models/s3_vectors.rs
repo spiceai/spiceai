@@ -50,7 +50,7 @@ mod search {
         semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig},
         vector::VectorStore,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use app::App;
     use futures::StreamExt;
@@ -62,35 +62,27 @@ mod search {
 
     #[tokio::test]
     async fn basic_functionality() -> Result<(), anyhow::Error> {
-        let mut ds = get_mega_science_dataset(
-            Some("qs"),
-            None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
-        );
+        let mut ds =
+            get_mega_science_dataset(
+                Some("qs"),
+                None,
+                Some(Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+            );
         let bucket_name = "spice-ci-tests-s3-vectors-basic";
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
 
         run_search_w_explain(
             AppBuilder::new("search_app")
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
                     "hf_minilm",
                 ))
                 .with_dataset(ds)
                 .build(),
-            basic_vector_search_tests("basic"),
+            basic_vector_search_tests("s3vectors_basic"),
             true,
         )
         .await
@@ -99,41 +91,25 @@ mod search {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
-        let mut ds = get_mega_science_dataset(
-            Some("qs"),
-            Some(Column {
-                name: "question".to_string(),
-                embeddings: vec![],
-                description: None,
-                full_text_search: Some(FullTextSearchConfig {
-                    enabled: true,
-                    row_ids: Some(vec!["id".to_string()]),
-                    index_store: None,
-                    index_directory: None,
-                }),
-                metadata: HashMap::new(),
-            }),
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
-        );
+        let mut ds =
+            get_mega_science_dataset(
+                Some("qs"),
+                Some(
+                    Column::new("question")
+                        .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+                ),
+                Some(Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+            );
         let bucket_name = "spice-ci-tests-s3-vectors-hybrid";
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
 
         run_search_w_explain(
             AppBuilder::new("search_app")
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
                     "hf_minilm",
                 ))
                 .with_dataset(ds)
@@ -211,22 +187,71 @@ mod search {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn multiple_embeddings() -> Result<(), anyhow::Error> {
+        let mut ds =
+            get_mega_science_dataset(
+                Some("qs"),
+                Some(Column::new("question").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+                Some(Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+            );
+        let bucket_name = "spice-ci-tests-s3-vectors-hybrid";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            [basic_vector_search_tests("s3vectors_multiple_embeddings"),
+                vec![
+                SearchTestCase::new(
+                    "s3vectors_multiple_embeddings_additional_columns2",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["answer"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_multiple_embeddings_vector_search_questions",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_multiple_embeddings_vector_search_w_embeddings",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    ),
+                ),
+                ]].concat(),
+            true
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn multi_column_primary_key() -> Result<(), anyhow::Error> {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string(), "question".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
+            Some(
+                Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                        .with_row_id("id")
+                        .with_row_id("question"),
+                ),
+            ),
         );
         let bucket_name = "spice-ci-tests-s3-vectors-compose-pk";
         let vector_store = init_vector_store(bucket_name, true).await?;
@@ -234,14 +259,14 @@ mod search {
 
         run_search_w_explain(
             AppBuilder::new("search_app")
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
                     "hf_minilm",
                 ))
                 .with_dataset(ds)
                 .build(),
 
-            [basic_vector_search_tests("composite"),
+            [basic_vector_search_tests("s3vectors_composite"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_composite_key",
@@ -265,23 +290,17 @@ mod search {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: Some(EmbeddingChunkConfig {
-                        enabled: true,
-                        target_chunk_size: 64,
-                        overlap_size: 0,
-                        trim_whitespace: true,
-                    }),
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
+            Some(
+                Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                        .with_row_id("id")
+                        .chunking(
+                            EmbeddingChunkConfig::enabled()
+                                .target_chunk_size(64)
+                                .trim_whitespace(true),
+                        ),
+                ),
+            ),
         );
         let bucket_name = "spice-ci-tests-s3-vectors-chunking";
         let vector_store = init_vector_store(bucket_name, true).await?;
@@ -295,7 +314,7 @@ mod search {
                 ))
                 .with_dataset(ds)
                 .build(),
-            [basic_vector_search_tests("chunking"),
+            [basic_vector_search_tests("s3vectors_chunking"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match",
@@ -328,22 +347,19 @@ mod search {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: [(
-                    "vectors".to_string(),
-                    serde_json::Value::String("non-filterable".to_string()),
-                )]
-                .into(),
-            }),
+            Some(
+                Column::new("answer")
+                    .with_embedding(
+                        ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                    )
+                    .with_metadata(
+                        [(
+                            "vectors".to_string(),
+                            serde_json::Value::String("non-filterable".to_string()),
+                        )]
+                        .into(),
+                    ),
+            ),
         );
         ds.columns.extend([
             vectors_nonfilterable_col("question"),
@@ -356,14 +372,14 @@ mod search {
 
         run_search_w_explain(
             AppBuilder::new("search_app")
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
                     "hf_minilm",
                 ))
                 .with_dataset(ds)
                 .build(),
             [
-                basic_vector_search_tests("metadata"),
+                basic_vector_search_tests("s3vectors_metadata"),
                 vec![
                     SearchTestCase::new(
                         "s3vector_metadata_additional_columns_metadata",
@@ -497,8 +513,8 @@ mod search {
 
             let app = AppBuilder::new("search_app")
                 .with_dataset(ds)
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
                     "hf_minilm",
                 ))
                 .build();
@@ -785,10 +801,10 @@ fn vectors_nonfilterable_col(name: &str) -> Column {
 /// Returns common test cases for vector search on the [`get_mega_science_dataset`] dataset
 ///
 /// Assumes datasets has name `qs` and embedding column is on `answer` column.
-fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
+pub(crate) fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
     vec![
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_basic"),
+            format!("{prefix}_basic"),
             SearchTestType::Http(json!({
                 "text": "second",
                 "limit": 4,
@@ -796,7 +812,7 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
             })),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_additional_columns"),
+            format!("{prefix}_additional_columns"),
             SearchTestType::Http(json!({
                 "text": "second",
                 "limit": 4,
@@ -805,7 +821,7 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
             })),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_with_where"),
+            format!("{prefix}_with_where"),
             SearchTestType::Http(json!({
                 "text": "secondary",
                 "datasets": ["qs"],
@@ -814,39 +830,39 @@ fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestCase> {
             })),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_basic"),
+            format!("{prefix}_vector_search_sql_basic"),
             SearchTestType::Sql(
-                "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_projection"),
+            format!("{prefix}_vector_search_sql_projection"),
             SearchTestType::Sql(
-                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_filters"),
+            format!("{prefix}_vector_search_sql_filters"),
             SearchTestType::Sql(
-                "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_no_score"),
+            format!("{prefix}_vector_search_sql_no_score"),
             SearchTestType::Sql(
-                "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                "SELECT id, answer FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_random"),
+            format!("{prefix}_vector_search_sql_random"),
             SearchTestType::Sql(
-                "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                "SELECT subject FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
             ),
         ),
         SearchTestCase::new(
-            format!("s3vectors_{prefix}_vector_search_sql_vectors"),
+            format!("{prefix}_vector_search_sql_vectors"),
             SearchTestType::Sql(
-                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
+                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4;",
             ),
         ),
     ]

@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{WithDependsOn, dataset::AccessMode, is_default};
+use super::{WithDependsOn, access::AccessMode, is_default};
 use crate::{metric::Metrics, param::Params};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
