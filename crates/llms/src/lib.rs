@@ -26,6 +26,7 @@ pub mod openai;
 pub mod perplexity;
 pub mod progress;
 pub mod responses;
+pub mod streaming_utils;
 pub mod xai;
 
 pub enum HealthCheck {
