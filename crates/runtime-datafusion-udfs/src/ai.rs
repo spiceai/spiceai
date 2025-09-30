@@ -45,7 +45,6 @@ use tracing::{Instrument, Level};
 
 use async_trait::async_trait;
 use llms::chat::Chat;
-use snafu::ResultExt;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -209,6 +208,7 @@ impl Ai {
         _row_index: usize,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
         async {
+            tracing::debug!("Starting AI model call for message: {}", message);
             let mut stream = model
                 .chat_stream(
                     CreateChatCompletionRequestArgs::default()
@@ -216,24 +216,21 @@ impl Ai {
                             ChatCompletionRequestUserMessageArgs::default()
                                 .content(message)
                                 .build()
-                                .boxed()
-                                .map_err(DataFusionError::External)?
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?
                                 .into(),
                         ])
                         .stream(true)
                         .stream_options(ChatCompletionStreamOptions {
                             include_usage: true,
                         })
-                        .build()
-                        .boxed()?,
+                        .build()?,
                 )
-                .await
-                .boxed()?;
+                .await?;
 
             let mut complete_response = String::new();
 
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.boxed()?;
+                let chunk = chunk?;
 
                 // Extract content from the streaming response
                 for choice in chunk.choices {
