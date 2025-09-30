@@ -62,22 +62,14 @@ mod search {
 
     #[tokio::test]
     async fn basic_functionality() -> Result<(), anyhow::Error> {
-        let mut ds = get_mega_science_dataset(
-            Some("qs"),
-            None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
-        );
+        let mut ds =
+            get_mega_science_dataset(
+                Some("qs"),
+                None,
+                Some(Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+            );
         let bucket_name = "spice-ci-tests-s3-vectors-basic";
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
@@ -99,33 +91,17 @@ mod search {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
-        let mut ds = get_mega_science_dataset(
-            Some("qs"),
-            Some(Column {
-                name: "question".to_string(),
-                embeddings: vec![],
-                description: None,
-                full_text_search: Some(FullTextSearchConfig {
-                    enabled: true,
-                    row_ids: Some(vec!["id".to_string()]),
-                    index_store: None,
-                    index_directory: None,
-                }),
-                metadata: HashMap::new(),
-            }),
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
-        );
+        let mut ds =
+            get_mega_science_dataset(
+                Some("qs"),
+                Some(
+                    Column::new("question")
+                        .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+                ),
+                Some(Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+            );
         let bucket_name = "spice-ci-tests-s3-vectors-hybrid";
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
@@ -211,22 +187,73 @@ mod search {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn multiple_embeddings() -> Result<(), anyhow::Error> {
+        let mut ds =
+            get_mega_science_dataset(
+                Some("qs"),
+                Some(Column::new("question").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+                Some(Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                )),
+            );
+        let bucket_name = "spice-ci-tests-s3-vectors-hybrid";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                basic_vector_search_tests("s3vectors_multiple_embeddings"),
+                vec![
+                SearchTestCase::new(
+                    "s3vectors_multiple_embeddings_additional_columns2",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["answer"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_multiple_embeddings_vector_search_questions",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_multiple_embeddings_vector_search_w_embeddings",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                    ),
+                ),
+                ]
+            ].concat(),
+            true
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn multi_column_primary_key() -> Result<(), anyhow::Error> {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string(), "question".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
+            Some(
+                Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                        .with_row_id("id")
+                        .with_row_id("question"),
+                ),
+            ),
         );
         let bucket_name = "spice-ci-tests-s3-vectors-compose-pk";
         let vector_store = init_vector_store(bucket_name, true).await?;
@@ -265,23 +292,17 @@ mod search {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: Some(EmbeddingChunkConfig {
-                        enabled: true,
-                        target_chunk_size: 64,
-                        overlap_size: 0,
-                        trim_whitespace: true,
-                    }),
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: HashMap::new(),
-            }),
+            Some(
+                Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                        .with_row_id("id")
+                        .chunking(
+                            EmbeddingChunkConfig::enabled()
+                                .target_chunk_size(64)
+                                .trim_whitespace(true),
+                        ),
+                ),
+            ),
         );
         let bucket_name = "spice-ci-tests-s3-vectors-chunking";
         let vector_store = init_vector_store(bucket_name, true).await?;
@@ -328,22 +349,19 @@ mod search {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
-            Some(Column {
-                name: "answer".to_string(),
-                embeddings: vec![ColumnLevelEmbeddingConfig {
-                    model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["id".to_string()]),
-                    chunking: None,
-                    vector_size: None,
-                }],
-                description: None,
-                full_text_search: None,
-                metadata: [(
-                    "vectors".to_string(),
-                    serde_json::Value::String("non-filterable".to_string()),
-                )]
-                .into(),
-            }),
+            Some(
+                Column::new("answer")
+                    .with_embedding(
+                        ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                    )
+                    .with_metadata(
+                        [(
+                            "vectors".to_string(),
+                            serde_json::Value::String("non-filterable".to_string()),
+                        )]
+                        .into(),
+                    ),
+            ),
         );
         ds.columns.extend([
             vectors_nonfilterable_col("question"),

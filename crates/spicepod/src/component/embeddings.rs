@@ -237,6 +237,10 @@ impl EmbeddingChunkConfig {
         self.target_chunk_size = size;
         self
     }
+    pub fn trim_whitespace(mut self, trim_whitespace: bool) -> Self {
+        self.trim_whitespace = trim_whitespace;
+        self
+    }
 }
 
 /// Configuration for if and how a dataset's column should be embedded.
