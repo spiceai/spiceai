@@ -43,8 +43,6 @@ use async_openai::{
 
 pub mod mistral;
 pub mod nsql;
-#[cfg(test)]
-pub mod streaming_tests;
 pub mod streaming_utils;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;

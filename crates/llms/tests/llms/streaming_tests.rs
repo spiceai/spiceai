@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::chat::{Chat, streaming_utils};
+use llms::chat::{Chat, streaming_utils};
 
 /// Mock streaming Chat implementation for testing
 struct StreamingMockChat {
@@ -39,11 +39,11 @@ impl StreamingMockChat {
 
 #[async_trait]
 impl Chat for StreamingMockChat {
-    fn as_sql(&self) -> Option<&dyn crate::chat::nsql::SqlGeneration> {
+    fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
         None
     }
 
-    async fn run(&self, prompt: String) -> crate::chat::Result<Option<String>> {
+    async fn run(&self, prompt: String) -> llms::chat::Result<Option<String>> {
         Ok(Some(format!("Response from {}: {}", self.name, prompt)))
     }
 
@@ -79,12 +79,12 @@ struct ErrorMockChat;
 
 #[async_trait]
 impl Chat for ErrorMockChat {
-    fn as_sql(&self) -> Option<&dyn crate::chat::nsql::SqlGeneration> {
+    fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
         None
     }
 
-    async fn run(&self, _prompt: String) -> crate::chat::Result<Option<String>> {
-        Err(crate::chat::Error::FailedToRunModel {
+    async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
+        Err(llms::chat::Error::FailedToRunModel {
             source: "Test error".into(),
         })
     }
