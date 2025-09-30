@@ -74,7 +74,9 @@ impl KafkaSys {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn get_sqlite(&self, pool: &SqliteConnectionPool) -> Option<KafkaMetadata> {
@@ -96,10 +98,11 @@ impl KafkaSys {
                     let topic: String = row.get(1)?;
                     let schema_json: String = row.get(2)?;
 
-                   Ok(KafkaMetadata {
+                    Ok(KafkaMetadata {
                         consumer_group_id,
                         topic,
-                        schema: KafkaSys::deserialize_schema(&schema_json).map_err(tokio_rusqlite::Error::Other)?,
+                        schema: KafkaSys::deserialize_schema(&schema_json)
+                            .map_err(|err| tokio_rusqlite::Error::Other(Box::new(err)))?,
                     })
                 } else {
                     Err(tokio_rusqlite::Error::Other("No row found".into()))

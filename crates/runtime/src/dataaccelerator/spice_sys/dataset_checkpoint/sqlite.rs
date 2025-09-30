@@ -46,7 +46,9 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn migrate_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
@@ -75,7 +77,9 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
@@ -86,7 +90,8 @@ impl DatasetCheckpoint {
             });
         };
         let dataset_name = self.dataset_name.clone();
-        conn.conn
+        let exists = conn
+            .conn
             .call(move |conn| {
                 let query =
                     format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
@@ -95,7 +100,9 @@ impl DatasetCheckpoint {
                 Ok(rows.next()?.is_some())
             })
             .await
-            .map_err(Error::external)?
+            .map_err(Error::external)?;
+
+        Ok(exists)
     }
 
     pub(super) async fn last_checkpoint_time_sqlite(
@@ -156,7 +163,9 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn get_schema_sqlite(

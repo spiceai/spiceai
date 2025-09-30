@@ -81,7 +81,9 @@ impl DebeziumKafkaSys {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn get_sqlite(

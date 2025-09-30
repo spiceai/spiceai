@@ -400,7 +400,10 @@ async fn set_metadata_to_accelerator(
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let debezium_kafka_sys = DebeziumKafkaSys::try_new_create_if_not_exists(dataset).await?;
-    debezium_kafka_sys.upsert(metadata).await
+    debezium_kafka_sys
+        .upsert(metadata)
+        .await
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 async fn get_metadata_from_kafka(
