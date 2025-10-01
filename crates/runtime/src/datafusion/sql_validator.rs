@@ -48,12 +48,12 @@ pub fn validate_sql_query_operations(
         LogicalPlan::Dml(dml) => {
             if let datafusion::logical_expr::WriteOp::Insert(_) = &dml.op {
 
-                // if super::is_spice_internal_dataset(&dml.table_name) {
-                //     return plan_err!(
-                //         "INSERT operations are not allowed on Spice system dataset '{}'.",
-                //         dml.table_name
-                //     );
-                // }
+                if super::is_spice_internal_dataset(&dml.table_name) {
+                    return plan_err!(
+                        "INSERT operations are not allowed on Spice system dataset '{}'.",
+                        dml.table_name
+                    );
+                }
 
                 // Check if attempting to write into a catalog. The default catalog name indicates writing to a table registered as a dataset, not via a catalog.
                 if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {

@@ -26,7 +26,7 @@ use datafusion::{
 use datafusion_federation::FederatedPlanner;
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 
-use self::cache_invalidation::{CacheInvalidationExtensionPlanner, CacheInvalidationNode};
+use self::cache_invalidation::CacheInvalidationExtensionPlanner;
 use std::sync::Arc;
 
 pub mod bytes_processed;
