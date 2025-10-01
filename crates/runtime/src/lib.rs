@@ -446,9 +446,11 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
-    // Maps model names to their Model definitions from the spicepod for AI UDF partitioning
+    // Maps model names to source strings for AI UDF partitioning
+    // Pre-computed during model initialization for fast O(1) query-time lookups
+    // Uses std::sync::RwLock following DataFusion's pattern for synchronous data
     #[cfg(feature = "models")]
-    model_registry: Arc<RwLock<HashMap<String, spicepod::component::model::Model>>>,
+    model_registry: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl Runtime {

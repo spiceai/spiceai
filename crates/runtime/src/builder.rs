@@ -180,8 +180,10 @@ impl RuntimeBuilder {
         let caching = Runtime::init_caching(Some(&caching_config));
 
         // Create the model registry that will be shared between Runtime and DataFusion
-        // This maps model names to their Model definitions from the spicepod
-        let model_registry = Arc::new(RwLock::new(HashMap::new()));
+        // Maps model names to source strings (e.g., "gpt-4o" -> "openai")
+        // Pre-computed during model initialization for fast O(1) query-time lookups
+        // Uses std::sync::RwLock following DataFusion's pattern for synchronous data
+        let model_registry = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         #[allow(unused_mut)]
         let mut df_builder = DataFusion::builder(

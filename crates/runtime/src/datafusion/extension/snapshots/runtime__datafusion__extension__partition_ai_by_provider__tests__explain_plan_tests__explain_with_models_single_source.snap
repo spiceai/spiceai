@@ -1,0 +1,16 @@
+---
+source: crates/runtime/src/datafusion/extension/partition_ai_by_provider.rs
+expression: plan
+---
++---------------+------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                           |
++---------------+------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: test_data.id, test_data.name, ai(test_data.description, Utf8("gpt-4o")) AS summary |
+|               |   BytesProcessedNode                                                                           |
+|               |     TableScan: test_data projection=[id, name, description]                                    |
+| physical_plan | ProjectionExec: expr=[id@0 as id, name@1 as name, ai(description@2, gpt-4o) as summary]        |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                        |
+|               |     BytesProcessedExec                                                                         |
+|               |       DataSourceExec: partitions=1, partition_sizes=[0]                                        |
+|               |                                                                                                |
++---------------+------------------------------------------------------------------------------------------------+

@@ -130,10 +130,12 @@ impl Runtime {
                     drop(responses_llm_map);
 
                     // Populate the model registry for AI UDF partitioning
+                    // Pre-compute the source string once during model loading
                     #[cfg(feature = "models")]
-                    {
-                        let mut registry = self.model_registry.write().await;
-                        registry.insert(m.name.clone(), m.clone());
+                    if let Some(source) = m.get_source() {
+                        if let Ok(mut registry) = self.model_registry.write() {
+                            registry.insert(m.name.clone(), source.to_string());
+                        }
                     }
                     Ok(())
                 }
@@ -143,10 +145,12 @@ impl Runtime {
                     drop(llm_map);
 
                     // Populate the model registry for AI UDF partitioning
+                    // Pre-compute the source string once during model loading
                     #[cfg(feature = "models")]
-                    {
-                        let mut registry = self.model_registry.write().await;
-                        registry.insert(m.name.clone(), m.clone());
+                    if let Some(source) = m.get_source() {
+                        if let Ok(mut registry) = self.model_registry.write() {
+                            registry.insert(m.name.clone(), source.to_string());
+                        }
                     }
                     Ok(())
                 }
