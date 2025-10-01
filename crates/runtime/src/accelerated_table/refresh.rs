@@ -22,7 +22,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
@@ -33,6 +32,7 @@ use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
@@ -845,7 +845,7 @@ mod tests {
     use prometheus::proto::MetricType;
     use tokio::{sync::mpsc, time::timeout};
 
-    use crate::dataaccelerator::spice_sys::{Result, dataset_checkpoint::DatasetCheckpointer};
+    use crate::dataaccelerator::spice_sys::Result;
     use crate::status;
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
@@ -876,17 +876,24 @@ mod tests {
             self.exists_value
         }
 
-        async fn checkpoint(&self, _schema: &SchemaRef) -> Result<()> {
+        async fn checkpoint(
+            &self,
+            _schema: &SchemaRef,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(())
         }
 
-        async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+        async fn get_schema(
+            &self,
+        ) -> Result<Option<SchemaRef>, Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(None)
         }
 
-        async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
+        async fn last_checkpoint_time(
+            &self,
+        ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.last_checkpoint_time)
         }
     }

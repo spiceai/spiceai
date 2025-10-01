@@ -27,7 +27,9 @@ use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::dataaccelerator::{AccelerationSource, spice_sys::OpenOption};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use serde_json;
+use snafu::ResultExt;
 
 const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
 const SCHEMA_MIGRATION_01_STMT: &str =
@@ -41,29 +43,28 @@ mod postgres;
 mod sqlite;
 
 #[async_trait]
-pub trait DatasetCheckpointer: Send + Sync {
-    async fn exists(&self) -> bool;
-    async fn checkpoint(&self, schema: &SchemaRef) -> Result<()>;
-    async fn get_schema(&self) -> Result<Option<SchemaRef>>;
-    async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>>;
-}
-
-#[async_trait]
 impl DatasetCheckpointer for DatasetCheckpoint {
     async fn exists(&self) -> bool {
         self.exists().await
     }
 
-    async fn checkpoint(&self, schema: &SchemaRef) -> Result<()> {
-        self.checkpoint(schema).await
+    async fn checkpoint(
+        &self,
+        schema: &SchemaRef,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.checkpoint(schema).await.boxed()
     }
 
-    async fn get_schema(&self) -> Result<Option<SchemaRef>> {
-        self.get_schema().await
+    async fn get_schema(
+        &self,
+    ) -> Result<Option<SchemaRef>, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_schema().await.boxed()
     }
 
-    async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
-        self.last_checkpoint_time().await
+    async fn last_checkpoint_time(
+        &self,
+    ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
+        self.last_checkpoint_time().await.boxed()
     }
 }
 

@@ -111,7 +111,7 @@ pub async fn try_to_embedding(
             .await
         }
         EmbeddingPrefix::HuggingFace => {
-            huggingface(model_id, &params, embeddings_cache.clone()).await
+            huggingface(&component.name, model_id, &params, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
             databricks(
@@ -274,6 +274,7 @@ async fn bedrock(
 }
 
 async fn huggingface(
+    name: &String,
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -285,7 +286,8 @@ async fn huggingface(
         Ok(Arc::new(
             TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len)
                 .await?
-                .set_cache(embeddings_cache),
+                .set_cache(embeddings_cache)
+                .set_cache_model_id(name),
         ))
     } else {
         Err(EmbedError::ModelNotProvided {
@@ -435,7 +437,8 @@ async fn file(
             max_seq_len,
         )
         .await?
-        .set_cache(embeddings_cache),
+        .set_cache(embeddings_cache)
+        .set_cache_model_id(&component.name),
     ))
 }
 

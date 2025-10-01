@@ -9,13 +9,13 @@ snapshot_kind: text
 | logical_plan  | Projection: my_vectored_table.pk1, my_vectored_table.pk2, my_vectored_table.pk3, my_vectored_table.body_embedding                     |
 |               |   Limit: skip=0, fetch=5                                                                                                              |
 |               |     Filter: my_vectored_table.a_number > Int64(0)                                                                                     |
-|               |       TableScan: my_vectored_table projection=[pk1, pk2, pk3, a_number, body_embedding]                                               |
+|               |       TableScan: my_vectored_table projection=[a_number, body_embedding, pk1, pk2, pk3]                                               |
 | physical_plan | CoalescePartitionsExec: fetch=5                                                                                                       |
-|               |   ProjectionExec: expr=[pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3, body_embedding@4 as body_embedding]                                 |
+|               |   ProjectionExec: expr=[pk1@2 as pk1, pk2@3 as pk2, pk3@4 as pk3, body_embedding@1 as body_embedding]                                 |
 |               |     CoalesceBatchesExec: target_batch_size=8192, fetch=5                                                                              |
-|               |       FilterExec: a_number@3 > 0                                                                                                      |
+|               |       FilterExec: a_number@0 > 0                                                                                                      |
 |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                          |
-|               |           ProjectionExec: expr=[pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3, a_number@4 as a_number, body_embedding@3 as body_embedding] |
+|               |           ProjectionExec: expr=[a_number@4 as a_number, body_embedding@3 as body_embedding, pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3] |
 |               |             PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding", "a_number"] filter=[] limit=None                   |
 |               |                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+

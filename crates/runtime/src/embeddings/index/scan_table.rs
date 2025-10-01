@@ -14,129 +14,138 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow::datatypes::SchemaRef;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{FieldRef, Fields, Schema};
 use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType, NullEquality},
+    common::{Column, Constraints, JoinConstraint, JoinType, NullEquality},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{
-        Expr, Filter, Join, Limit, LogicalPlan, Projection, TableProviderFilterPushDown, TableScan,
-    },
+    logical_expr::{Expr, Filter, Join, Limit, LogicalPlan, Projection, TableScan},
     physical_plan::ExecutionPlan,
     scalar::ScalarValue,
     sql::TableReference,
 };
-use datafusion_expr::SubqueryAlias;
+use datafusion_expr::{SubqueryAlias, ident};
 
-use crate::{embedding_col, embeddings::index::search_index_table_is_sufficient};
-use search::{generation::util::append_fields, index::VectorIndex};
+use itertools::Itertools;
+use search::index::VectorIndex;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
 pub struct VectorScanTableProvider {
     pub table_provider: Arc<dyn TableProvider>,
-    pub index: Arc<dyn VectorIndex>,
+    pub vector_index_list: Arc<LogicalPlan>,
+    pub primary_key: Vec<String>,
 }
 
 impl VectorScanTableProvider {
-    /// Construct [`TableScan`] for underlying table for `projection` & `filters` relative to [`VectorScanTableProvider`].
-    fn underlying_table_scan(
+    pub fn try_new(
+        table_provider: Arc<dyn TableProvider>,
+        index: &Arc<dyn VectorIndex>,
+    ) -> Result<Self, DataFusionError> {
+        Ok(Self {
+            table_provider,
+            primary_key: index
+                .primary_fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
+            vector_index_list: index.list_table_provider()?.into(),
+        })
+    }
+
+    fn schema_is_sufficient(
+        schema: &Fields,
+        projection: &HashSet<String>,
+        filters: &[Expr],
+    ) -> bool {
+        if !projection.is_subset(
+            &schema
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect::<HashSet<String>>(),
+        ) {
+            // schema does not have all columns.
+            return false;
+        }
+        // Ensure filters do not reference column not in the schema
+        columns_missing_from(filters, schema).is_empty()
+    }
+
+    fn apply_proj_and_filter(
+        input: Arc<LogicalPlan>,
+        projection: &HashSet<String>,
+        filters: &[Expr],
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let filtered = if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+            Arc::new(LogicalPlan::Filter(Filter::try_new(filter, input)?))
+        } else {
+            input
+        };
+
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            projection
+                .iter()
+                .sorted_unstable()
+                .map(|p| Expr::Column(Column::new_unqualified(p.clone())))
+                .collect(),
+            filtered,
+        )?))
+    }
+
+    fn columns_projected(
         &self,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-    ) -> DataFusionResult<TableScan> {
-        let num_underlying_columns = self.table_provider.schema().fields().len();
-        let underlying_projection = projection.map(|proj| {
-            proj.iter()
-                .filter(|&idx| *idx < num_underlying_columns)
-                .copied()
-                .collect()
-        });
-
-        let filter_refs: Vec<&Expr> = filters.iter().collect();
-        let underlying_filters = self
-            .table_provider
-            .supports_filters_pushdown(filter_refs.as_slice())?
-            .into_iter()
-            .zip(filters.iter())
-            .filter_map(|(supported, filter)| {
-                if matches!(supported, TableProviderFilterPushDown::Unsupported) {
-                    None
-                } else {
-                    Some(filter.clone())
-                }
-            })
-            .collect::<Vec<_>>();
-
-        TableScan::try_new(
-            TableReference::parse_str("base_table"),
-            Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
-            underlying_projection,
-            underlying_filters,
-            None,
-        )
-    }
-
-    /// For a projection relative to [`VectorScanTableProvider`], check if the embedding column is being requested.
-    fn need_vector_column(&self, projection: Option<&Vec<usize>>) -> bool {
-        let Some(proj) = projection else {
-            return true; // None projection -> "SELECT *".
+    ) -> Result<HashSet<String>, DataFusionError> {
+        let source_schema = match projection {
+            None => self.schema(),
+            Some(indices) => {
+                let projected = self
+                    .schema()
+                    .project(indices)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                Arc::new(projected)
+            }
         };
-
-        let Some(idx) = index_of_column(
-            &self.schema(),
-            embedding_col!(self.index.search_column()).as_str(),
-        ) else {
-            return false; // Technically unreachable, but by definition not needed.
-        };
-
-        proj.contains(&idx)
-    }
-
-    fn qualified_schema(&self, projection: Option<&Vec<usize>>) -> DFSchemaRef {
-        let base = self.table_provider.schema();
-        let mut qualified_fields: Vec<_> = base
+        let columns_requested: HashSet<String> = source_schema
             .fields()
             .iter()
-            .map(|f| (Some(TableReference::parse_str("base_table")), Arc::clone(f)))
+            .map(|f| f.name().clone())
             .collect();
 
-        qualified_fields.push((
-            Some(TableReference::parse_str("vector_index")),
-            Arc::new(Field::new(
-                embedding_col!(self.index.search_column()),
-                DataType::new_fixed_size_list(DataType::Float32, self.index.dimension(), false),
-                true,
-            )),
-        ));
-
-        let projected_qualified_fields = match projection {
-            None => qualified_fields,
-            Some(proj) => qualified_fields
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, f)| if proj.contains(&i) { Some(f) } else { None })
-                .collect(),
-        };
-
-        let Ok(df_schema) =
-            DFSchema::new_with_metadata(projected_qualified_fields, HashMap::default())
-        else {
-            unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
-        };
-
-        Arc::new(df_schema)
+        Ok(columns_requested)
     }
 }
 
-fn index_of_column(s: &SchemaRef, col: &str) -> Option<usize> {
-    Some(s.column_with_name(col)?.0)
+// Return the unqualified names of columns missing from those referenced by in `expr`.
+fn columns_missing_from(expr: &[Expr], schema: &Fields) -> Vec<String> {
+    let schema_cols = schema
+        .iter()
+        .map(|f| f.name().clone())
+        .collect::<HashSet<_>>();
+
+    expr.iter()
+        .flat_map(|e| {
+            let filter_cols = e
+                .column_refs()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect::<HashSet<_>>();
+            filter_cols
+                .difference(&schema_cols)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
 }
 
 #[async_trait]
@@ -146,14 +155,24 @@ impl TableProvider for VectorScanTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        append_fields(
-            &self.table_provider.schema(),
-            vec![Arc::new(Field::new(
-                embedding_col!(self.index.search_column()),
-                DataType::new_fixed_size_list(DataType::Float32, self.index.dimension(), false),
-                true,
-            ))],
-        )
+        let mut fields_map = self
+            .table_provider
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), Arc::clone(f)))
+            .collect::<HashMap<String, FieldRef>>();
+
+        // Only add if key not in base table (we chose base table over index columns in `scan` afterall).
+        for f in self.vector_index_list.schema().fields() {
+            if !fields_map.contains_key(f.name()) {
+                fields_map.insert(f.name().clone(), Arc::clone(f));
+            }
+        }
+
+        let mut fields = fields_map.values().cloned().collect::<Vec<_>>();
+        fields.sort_unstable();
+        Arc::new(Schema::new(fields))
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -172,145 +191,147 @@ impl TableProvider for VectorScanTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Filter pushdown not supported for S3 vector listVectors. If vector is not needed in projection, do not need to join on this table.
-        if !self.need_vector_column(projection) {
-            return self
-                .table_provider
-                .scan(state, projection, filters, limit)
-                .await;
+        let columns_requested = self.columns_projected(projection)?;
+
+        if Self::schema_is_sufficient(
+            self.table_provider.schema().fields(),
+            &columns_requested,
+            filters,
+        ) {
+            let lp = Self::apply_proj_and_filter(
+                Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+                    "base_table",
+                    Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
+                    None,
+                    vec![],
+                    None,
+                )?)),
+                &columns_requested,
+                filters,
+            )?;
+
+            return state.create_physical_plan(&lp).await;
+        }
+        if Self::schema_is_sufficient(
+            self.vector_index_list.schema().fields(),
+            &columns_requested,
+            filters,
+        ) {
+            let lp = Self::apply_proj_and_filter(
+                Arc::clone(&self.vector_index_list),
+                &columns_requested,
+                filters,
+            )?;
+
+            return state.create_physical_plan(&lp).await;
         }
 
-        let mut proj = self
-            .index
-            .primary_fields()
-            .iter()
-            .map(|f| {
-                Expr::Column(Column::new(
-                    Some(TableReference::parse_str("vector_index")),
-                    f.name().clone(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        proj.push(Expr::Column(Column::new(
-            Some(TableReference::parse_str("vector_index")),
-            embedding_col!(self.index.search_column()),
-        )));
+        let base_ts = LogicalPlan::TableScan(TableScan::try_new(
+            TableReference::parse_str("base_table"),
+            Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
+            None,
+            vec![],
+            None,
+        )?);
 
-        let index_logical_plan = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-            self.index.list_table_provider()?.into(),
+        // Only include fields from index that aren't in base table (including metadata), except primary key.
+        let index_lp = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+            Arc::new(LogicalPlan::Projection(Projection::try_new(
+                self.vector_index_list
+                    .schema()
+                    .columns()
+                    .iter()
+                    .filter(|c| {
+                        base_ts
+                            .schema()
+                            .columns_with_unqualified_name(&c.name)
+                            .is_empty()
+                            || self.primary_key.contains(&c.name)
+                    })
+                    .map(|c| Expr::Column(c.clone()))
+                    .collect(),
+                Arc::clone(&self.vector_index_list),
+            )?)),
             TableReference::parse_str("vector_index"),
         )?);
 
-        let primary_key_fields = self.index.primary_fields();
-        if primary_key_fields.is_empty() {
-            return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
-        }
+        let join_schema = base_ts.schema().join(index_lp.schema())?;
 
-        let projection_schema: SchemaRef = match projection {
-            None => self.schema(),
-            Some(indices) => self.schema().project(indices)?.into(),
-        };
+        // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+        let join_filters: Vec<Expr> = filters
+            .iter()
+            .filter(|f| {
+                f.column_refs()
+                    .iter()
+                    .any(|col| !self.primary_key.contains(&col.name))
+            })
+            .cloned()
+            .collect();
 
-        let output_plan = if search_index_table_is_sufficient(
-            projection_schema.fields().iter().as_slice(),
-            &index_logical_plan,
-            filters,
-        ) {
-            // Let DataFusion handle pushing filters.
-            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                LogicalPlan::Filter(Filter::try_new(filter, index_logical_plan.into())?)
-            } else {
-                index_logical_plan
-            }
+        let join_conditions: Vec<(Expr, Expr)> = self
+            .primary_key
+            .iter()
+            .map(|pk| {
+                (
+                    Expr::Column(Column::new(
+                        Some(TableReference::parse_str("base_table")),
+                        pk.clone(),
+                    )),
+                    Expr::Column(Column::new(
+                        Some(TableReference::parse_str("vector_index")),
+                        pk.clone(),
+                    )),
+                )
+            })
+            .collect();
+
+        // Left Join so that all rows in the underlying table are returned.
+        // Rows may not have associated vectors periodically due to indexing delays.
+        let join = LogicalPlan::Join(Join {
+            left: Arc::new(base_ts),
+            right: Arc::new(index_lp),
+            join_type: JoinType::Left,
+            join_constraint: JoinConstraint::On,
+            on: join_conditions,
+            filter: join_filters.into_iter().reduce(Expr::and),
+            schema: join_schema.into(),
+            null_equality: NullEquality::NullEqualsNothing,
+        });
+
+        // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
+        // case, we will remove duplicate primary key columns from the right table.
+        let deduped_join_proj_exprs: Vec<_> = join
+            .schema()
+            .iter()
+            .filter(|(tbl, f)| {
+                !(self.primary_key.contains(f.name())
+                    && tbl.is_some_and(|t| *t == TableReference::parse_str("vector_index")))
+            })
+            .map(|(tbl, field_ref)| match tbl {
+                Some(table_ref) => {
+                    Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
+                }
+                None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
+            })
+            .collect();
+
+        let proj =
+            LogicalPlan::Projection(Projection::try_new(deduped_join_proj_exprs, join.into())?);
+
+        let filtered = if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+            LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
         } else {
-            let underlying_table_scan =
-                LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
-
-            // Don't get metadata columns from index. Only vectors and primary key.
-            let index_logical_projection =
-                LogicalPlan::Projection(Projection::try_new(proj, index_logical_plan.into())?);
-            let join_schema = index_logical_projection
-                .schema()
-                .join(underlying_table_scan.schema())?;
-
-            // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
-            let primary_key_column_names: std::collections::HashSet<String> = primary_key_fields
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
-            let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
-                filters.iter().cloned().partition(|f| {
-                    f.column_refs()
-                        .iter()
-                        .any(|col| primary_key_column_names.contains(col.name()))
-                });
-
-            let join_conditions: Vec<(Expr, Expr)> = primary_key_fields
-                .iter()
-                .map(|field| {
-                    (
-                        Expr::Column(Column::new(
-                            Some(TableReference::parse_str("vector_index")),
-                            field.name(),
-                        )),
-                        Expr::Column(Column::new(
-                            Some(TableReference::parse_str("base_table")),
-                            field.name(),
-                        )),
-                    )
-                })
-                .collect();
-
-            // Right Join so that all rows in the underlying table are returned.
-            // Rows may not have associated vectors periodically due to indexing delays.
-            let join = LogicalPlan::Join(Join {
-                left: Arc::new(index_logical_projection),
-                right: Arc::new(underlying_table_scan),
-                join_type: JoinType::Right,
-                join_constraint: JoinConstraint::On,
-                on: join_conditions,
-                filter: pre_join_filters.into_iter().reduce(Expr::and),
-                schema: join_schema.into(),
-                null_equality: NullEquality::NullEqualsNothing,
-            });
-
-            // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
-            // case, we will remove duplicate primary key columns from the right table.
-            let deduped_join_proj_exprs: Vec<_> = join
-                .schema()
-                .iter()
-                .filter(|(tbl, f)| {
-                    !(primary_key_column_names.contains(f.name())
-                        && tbl.is_some_and(|t| *t == TableReference::parse_str("vector_index")))
-                })
-                .map(|(tbl, field_ref)| match tbl {
-                    Some(table_ref) => {
-                        Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
-                    }
-                    None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
-                })
-                .collect();
-
-            let proj =
-                LogicalPlan::Projection(Projection::try_new(deduped_join_proj_exprs, join.into())?);
-
-            if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
-                LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
-            } else {
-                proj
-            }
+            proj
         };
 
-        let output_proj = LogicalPlan::Projection(Projection::new_from_schema(
-            Arc::new(output_plan),
-            Arc::new(DFSchema::from_unqualified_fields(
-                self.qualified_schema(projection)
-                    .as_arrow()
-                    .fields()
-                    .clone(),
-                HashMap::default(),
-            )?),
-        ));
+        let output_proj = LogicalPlan::Projection(Projection::try_new(
+            columns_requested
+                .into_iter()
+                .sorted_unstable()
+                .map(ident)
+                .collect(),
+            Arc::new(filtered),
+        )?);
 
         let limit = LogicalPlan::Limit(Limit {
             input: Arc::new(output_proj),
@@ -320,7 +341,6 @@ impl TableProvider for VectorScanTableProvider {
             ))),
             skip: None,
         });
-
         state.create_physical_plan(&limit).await
     }
 }
@@ -335,6 +355,7 @@ mod tests {
         catalog::{MemTable, TableProvider},
         sql::TableReference,
     };
+    use search::index::VectorIndex;
 
     use crate::embeddings::index::tests::{
         PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
@@ -349,8 +370,8 @@ mod tests {
             Field::new("another_column", DataType::Utf8, false),
         ]));
 
-        let p = VectorScanTableProvider {
-            table_provider: Arc::new(ExplainMemTable::new(
+        let p = VectorScanTableProvider::try_new(
+            Arc::new(ExplainMemTable::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
@@ -358,7 +379,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            index: Arc::new(PretendVectorIndex::new(
+            &(Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -369,8 +390,9 @@ mod tests {
                         false,
                     ),
                 ]),
-            )),
-        };
+            )) as Arc<dyn VectorIndex>),
+        )
+        .expect("could not make 'VectorScanTableProvider'");
 
         let provider: Arc<dyn TableProvider> = Arc::new(p);
 
@@ -411,8 +433,8 @@ mod tests {
             Field::new("a_number", DataType::Int64, false),
             Field::new("not_where", DataType::Utf8, false),
         ]));
-        let p = VectorScanTableProvider {
-            table_provider: Arc::new(ExplainMemTable(
+        let p = VectorScanTableProvider::try_new(
+            Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
@@ -420,7 +442,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            index: Arc::new(PretendVectorIndex::new(
+            &(Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -437,8 +459,10 @@ mod tests {
                         ("filterable".to_string(), "false".to_string()),
                     ])),
                 ]),
-            )),
-        };
+            )) as Arc<dyn VectorIndex>),
+        )
+        .expect("could not make 'VectorScanTableProvider'");
+
         let provider: Arc<dyn TableProvider> = Arc::new(p);
 
         test_explain(
@@ -511,8 +535,8 @@ mod tests {
             Field::new("a_number", DataType::Int64, false),
             Field::new("not_where", DataType::Utf8, false),
         ]));
-        let p = VectorScanTableProvider {
-            table_provider: Arc::new(ExplainMemTable(
+        let p = VectorScanTableProvider::try_new(
+            Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
@@ -520,7 +544,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            index: Arc::new(PretendVectorIndex::new(
+            &(Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![
                     Field::new("pk1", DataType::Int64, false),
@@ -543,8 +567,10 @@ mod tests {
                         ("filterable".to_string(), "false".to_string()),
                     ])),
                 ]),
-            )),
-        };
+            )) as Arc<dyn VectorIndex>),
+        )
+        .expect("could not make 'VectorScanTableProvider'");
+
         let provider: Arc<dyn TableProvider> = Arc::new(p);
 
         test_explain(
