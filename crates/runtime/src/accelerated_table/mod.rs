@@ -42,6 +42,7 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
@@ -241,6 +242,7 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
+    snapshot_behavior: SnapshotBehavior,
 }
 
 impl Builder {
@@ -271,6 +273,7 @@ impl Builder {
             disable_federation: false,
             initial_load_complete: false,
             refresh_semaphore: None,
+            snapshot_behavior: SnapshotBehavior::default(),
         }
     }
 
@@ -384,6 +387,12 @@ impl Builder {
         self
     }
 
+    /// Configure whether snapshots are taken of the accelerated table after refreshes.
+    pub fn snapshot_behavior(&mut self, snapshot_behavior: SnapshotBehavior) -> &mut Self {
+        self.snapshot_behavior = snapshot_behavior;
+        self
+    }
+
     /// Build the accelerated table
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         let on_complete_notification = Arc::new(Notify::new());
@@ -450,6 +459,7 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
+        refresher.with_snapshot_behavior(self.snapshot_behavior);
 
         let refresh_handle = refresher.start(acceleration_refresh_mode).await;
         let refresher = Arc::new(refresher);

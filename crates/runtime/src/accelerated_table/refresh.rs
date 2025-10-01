@@ -33,6 +33,7 @@ use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
@@ -425,6 +426,7 @@ pub struct Refresher {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
     synchronize_with: Option<SynchronizedTable>,
+    snapshot_behavior: SnapshotBehavior,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -469,6 +471,7 @@ impl Refresher {
             disable_federation: false,
             semaphore: None,
             on_complete_notification: None,
+            snapshot_behavior: SnapshotBehavior::default(),
         }
     }
 
@@ -509,6 +512,11 @@ impl Refresher {
 
     pub fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
         self.on_complete_notification = Some(on_complete_notification);
+        self
+    }
+
+    pub fn with_snapshot_behavior(&mut self, snapshot_behavior: SnapshotBehavior) -> &mut Self {
+        self.snapshot_behavior = snapshot_behavior;
         self
     }
 
