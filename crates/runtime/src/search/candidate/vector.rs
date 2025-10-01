@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::request::{AsyncMarker, RequestContext};
 use crate::search::Error as VectorSearchError;
 use crate::{embedding_col, offset_col};
 use async_openai::types::EmbeddingInput;
@@ -273,6 +274,8 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
         addition_projection: &[&Expr],
         limit: usize,
     ) -> search::generation::Result<SendableRecordBatchStream> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_vector_search(&request_context.to_dimensions());
         let embedding = self
             .embed_query(query.as_str())
             .await

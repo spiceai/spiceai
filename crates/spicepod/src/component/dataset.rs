@@ -23,19 +23,11 @@ use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::acceleration::Acceleration;
+use crate::component::access::AccessMode;
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;
 use crate::vector::VectorStore;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum AccessMode {
-    #[default]
-    Read,
-    ReadWrite,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]

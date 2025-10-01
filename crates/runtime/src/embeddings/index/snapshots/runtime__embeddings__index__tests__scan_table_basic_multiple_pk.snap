@@ -3,12 +3,13 @@ source: crates/runtime/src/embeddings/index/mod.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
 snapshot_kind: text
 ---
-+---------------+--------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                             |
-+---------------+--------------------------------------------------------------------------------------------------+
-| logical_plan  | Limit: skip=0, fetch=5                                                                           |
-|               |   TableScan: my_vectored_table projection=[pk1, pk2, pk3, body_embedding], fetch=5               |
-| physical_plan | GlobalLimitExec: skip=0, fetch=5                                                                 |
-|               |   PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding"] filter=[] limit=Some(5) |
-|               |                                                                                                  |
-+---------------+--------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                              |
++---------------+-------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: my_vectored_table.pk1, my_vectored_table.pk2, my_vectored_table.pk3, my_vectored_table.body_embedding |
+|               |   Limit: skip=0, fetch=5                                                                                          |
+|               |     TableScan: my_vectored_table projection=[body_embedding, pk1, pk2, pk3], fetch=5                              |
+| physical_plan | GlobalLimitExec: skip=0, fetch=5                                                                                  |
+|               |   PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding"] filter=[] limit=None                     |
+|               |                                                                                                                   |
++---------------+-------------------------------------------------------------------------------------------------------------------+

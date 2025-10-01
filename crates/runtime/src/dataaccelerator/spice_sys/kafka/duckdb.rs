@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
+use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;
 
@@ -24,9 +24,9 @@ impl KafkaSys {
         pool: &Arc<DuckDbConnectionPool>,
         metadata: &KafkaMetadata,
     ) -> Result<()> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         let create_table = format!(
@@ -41,7 +41,7 @@ impl KafkaSys {
         );
         duckdb_conn
             .execute(&create_table, [])
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         let schema_json = Self::serialize_schema(&metadata.schema)?;
 
@@ -65,7 +65,7 @@ impl KafkaSys {
                     &schema_json,
                 ],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }
@@ -108,6 +108,7 @@ mod tests {
             acceleration::{Acceleration, Engine, Mode},
             builder::DatasetBuilder,
         },
+        dataaccelerator::spice_sys::OpenOption,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -154,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn test_duckdb_roundtrip() {
         let ds = create_test_dataset("test_duckdb_roundtrip").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
 
@@ -174,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn test_duckdb_metadata_overwrite() {
         let ds = create_test_dataset("test_duckdb_metadata_overwrite").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
         let mut test_metadata = create_test_metadata();
@@ -200,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn test_duckdb_get_nonexistent() {
         let ds = create_test_dataset("test_duckdb_get_nonexistent").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
 

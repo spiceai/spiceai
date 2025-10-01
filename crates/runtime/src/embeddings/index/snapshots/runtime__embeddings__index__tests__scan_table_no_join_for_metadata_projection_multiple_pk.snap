@@ -3,13 +3,14 @@ source: crates/runtime/src/embeddings/index/mod.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
 snapshot_kind: text
 ---
-+---------------+-------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                          |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Limit: skip=0, fetch=5                                                                                                        |
-|               |   TableScan: my_vectored_table projection=[pk1, pk2, pk3, not_where, body_embedding], fetch=5                                 |
-| physical_plan | ProjectionExec: expr=[pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3, not_where@4 as not_where, body_embedding@3 as body_embedding] |
-|               |   GlobalLimitExec: skip=0, fetch=5                                                                                            |
-|               |     PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding", "not_where"] filter=[] limit=Some(5)               |
-|               |                                                                                                                               |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                           |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: my_vectored_table.pk1, my_vectored_table.pk2, my_vectored_table.pk3, my_vectored_table.not_where, my_vectored_table.body_embedding |
+|               |   Limit: skip=0, fetch=5                                                                                                                       |
+|               |     TableScan: my_vectored_table projection=[body_embedding, not_where, pk1, pk2, pk3], fetch=5                                                |
+| physical_plan | ProjectionExec: expr=[pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3, not_where@4 as not_where, body_embedding@3 as body_embedding]                  |
+|               |   GlobalLimitExec: skip=0, fetch=5                                                                                                             |
+|               |     PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding", "not_where"] filter=[] limit=None                                   |
+|               |                                                                                                                                                |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------+

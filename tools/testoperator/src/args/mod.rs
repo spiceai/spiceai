@@ -31,7 +31,7 @@ mod evals;
 pub use evals::EvalsTestArgs;
 
 mod search;
-pub use search::VectorSearchTestArgs;
+pub use search::SearchTestArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -56,7 +56,7 @@ pub enum TestCommands {
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(DatasetTestArgs),
-    VectorSearch(VectorSearchTestArgs),
+    Search(SearchTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
@@ -65,6 +65,9 @@ pub struct CommonArgs {
     /// Path to the spicepod.yaml file
     #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,
+
+    #[arg(short('z'), long)]
+    pub(crate) spicepod_dependencies: Option<PathBuf>,
 
     /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
     #[arg(long, default_value = "1")]

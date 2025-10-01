@@ -118,6 +118,26 @@ pub enum OnConflictBehavior {
     UpsertDedupByRowId,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotBehavior {
+    /// Snapshots are disabled (default).
+    #[default]
+    Disabled,
+    /// Enable both creating and bootstrapping from snapshots.
+    Enabled,
+    /// Only bootstrap from existing snapshots, don't attempt to create new ones.
+    BootstrapOnly,
+    /// Only create new snapshots.
+    CreateOnly,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
+    *b == SnapshotBehavior::Disabled
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -201,6 +221,17 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_by: Vec<String>,
+
+    /// Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.
+    ///
+    /// Options: `enabled` / `disabled` / `bootstrap_only` / `create_only`.
+    ///
+    /// `disabled` (default) will turn off snapshots for this dataset.
+    /// `enabled` will enable both creating and bootstrapping from snapshots.
+    /// `bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.
+    /// `create_only` will only create snapshots, it won't attempt to bootstrap from one.
+    #[serde(default, skip_serializing_if = "is_default_snapshot_behavior")]
+    pub snapshots: SnapshotBehavior,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -242,6 +273,7 @@ impl Default for Acceleration {
             on_conflict: HashMap::default(),
             metrics: None,
             partition_by: vec![],
+            snapshots: SnapshotBehavior::Disabled,
         }
     }
 }
