@@ -184,7 +184,7 @@ impl AsyncScalarUDFImpl for Ai {
         // Only convert the message argument to array (not the model name)
         // The model name is always a scalar and shouldn't be part of the columnar data
         let message_array = match &args.args[0] {
-            ColumnarValue::Array(arr) => arr.clone(),
+            ColumnarValue::Array(arr) => Arc::clone(arr),
             ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
         };
 
@@ -330,7 +330,6 @@ impl Ai {
 // Allow various lints in test code for simplicity and readability.
 // Test code prioritizes clarity over strict lint compliance.
 #[allow(
-    clippy::unwrap_used,
     clippy::clone_on_ref_ptr,
     clippy::uninlined_format_args,
     clippy::too_many_lines
@@ -484,7 +483,9 @@ mod tests {
             _ => panic!("Expected OneOf signature"),
         }
 
-        let return_type = udf.return_type(&[DataType::Utf8]).unwrap();
+        let return_type = udf
+            .return_type(&[DataType::Utf8])
+            .expect("should return Utf8 type");
         assert_eq!(return_type, DataType::Utf8);
     }
 
@@ -493,7 +494,10 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(model_store);
 
-        let default_model = udf.get_default_model_name().await.unwrap();
+        let default_model = udf
+            .get_default_model_name()
+            .await
+            .expect("should get default model");
         assert_eq!(default_model, "test-model");
     }
 
@@ -518,7 +522,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error with multiple models")
                 .to_string()
                 .contains("Multiple chat models configured")
         );
@@ -534,7 +538,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error with no models")
                 .to_string()
                 .contains("No chat models configured")
         );
@@ -553,7 +557,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(model_store);
 
-        let docs = udf.documentation().unwrap();
+        let docs = udf.documentation().expect("should have documentation");
         assert_eq!(
             docs.description,
             "Generates AI responses for text using a specified chat model"
@@ -567,15 +571,21 @@ mod tests {
         let udf = Ai::new(model_store);
 
         // Test with single Utf8 argument
-        let return_type1 = udf.return_type(&[DataType::Utf8]).unwrap();
+        let return_type1 = udf
+            .return_type(&[DataType::Utf8])
+            .expect("should return Utf8 for single arg");
         assert_eq!(return_type1, DataType::Utf8);
 
         // Test with two Utf8 arguments
-        let return_type2 = udf.return_type(&[DataType::Utf8, DataType::Utf8]).unwrap();
+        let return_type2 = udf
+            .return_type(&[DataType::Utf8, DataType::Utf8])
+            .expect("should return Utf8 for two args");
         assert_eq!(return_type2, DataType::Utf8);
 
         // Test with LargeUtf8
-        let return_type3 = udf.return_type(&[DataType::LargeUtf8]).unwrap();
+        let return_type3 = udf
+            .return_type(&[DataType::LargeUtf8])
+            .expect("should return Utf8 for LargeUtf8");
         assert_eq!(return_type3, DataType::Utf8);
     }
 
@@ -595,7 +605,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error when called non-async")
                 .to_string()
                 .contains("can only be called from async contexts")
         );
@@ -777,18 +787,20 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
             .process_messages(Arc::clone(model), "test-model", messages)
             .await
-            .unwrap();
+            .expect("should process messages");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 1);
         assert_eq!(string_array.value(0), "Response from test-model: Hello");
     }
@@ -799,7 +811,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("Hello"),
@@ -809,12 +823,12 @@ mod tests {
         let result = udf
             .process_messages(Arc::clone(model), "test-model", messages)
             .await
-            .unwrap();
+            .expect("should invoke async");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 3);
         assert_eq!(string_array.value(0), "Response from test-model: Hello");
         assert_eq!(
@@ -830,7 +844,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("Hello"),
@@ -840,12 +856,12 @@ mod tests {
         let result = udf
             .process_messages(Arc::clone(model), "test-model", messages)
             .await
-            .unwrap();
+            .expect("should invoke async");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 3);
         assert_eq!(string_array.value(0), "Response from test-model: Hello");
         assert!(string_array.is_null(1));
@@ -858,7 +874,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("error-model").unwrap();
+        let model = model_store_guard
+            .get("error-model")
+            .expect("should get error-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
@@ -868,7 +886,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error with mock error")
                 .to_string()
                 .contains("Mock error for testing")
         );
@@ -880,18 +898,20 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("null-model").unwrap();
+        let model = model_store_guard
+            .get("null-model")
+            .expect("should get null-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
             .process_messages(Arc::clone(model), "null-model", messages)
             .await
-            .unwrap();
+            .expect("should invoke async");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 1);
         assert!(string_array.is_null(0));
     }
@@ -967,7 +987,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         // Create a parent span to simulate sql_query span
         let _sql_query_span = tracing::span!(Level::INFO, "sql_query", query = "SELECT ai('test')");
@@ -984,11 +1006,11 @@ mod tests {
             "process_messages should succeed with parent span"
         );
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         assert_eq!(string_array.len(), 1);
         assert_eq!(
@@ -1033,11 +1055,11 @@ mod tests {
             result.err()
         );
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         // Verify we got 3 responses (matching the input array length)
         assert_eq!(string_array.len(), 3);
@@ -1078,11 +1100,11 @@ mod tests {
             result.err()
         );
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         // Verify we got 5 responses (matching the number_rows)
         assert_eq!(string_array.len(), 5);
@@ -1122,7 +1144,7 @@ mod tests {
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 2);
         assert_eq!(string_array.value(0), "Response from gpt-4: Query 1");
         assert_eq!(string_array.value(1), "Response from gpt-4: Query 2");
@@ -1151,7 +1173,7 @@ mod tests {
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 3);
         assert_eq!(string_array.value(0), "Response from claude: Hello");
         assert!(string_array.is_null(1));
@@ -1177,7 +1199,7 @@ mod tests {
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 10);
         // All should have the same response
         for i in 0..10 {
@@ -1226,11 +1248,11 @@ mod tests {
             "invoke_async_with_args should succeed and capture parent span"
         );
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         assert_eq!(string_array.len(), 1);
         assert_eq!(
@@ -1281,7 +1303,9 @@ mod tests {
 
         // Test 3: Try calling process_messages directly to see if spans are created
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
 
         tracing::info!("About to call process_messages");
@@ -1373,11 +1397,11 @@ mod tests {
         // Verify the UDF executed successfully
         assert!(result.is_ok(), "Full AI UDF execution should succeed");
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         assert_eq!(string_array.len(), 1);
         assert_eq!(
@@ -1485,7 +1509,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("slow-model").unwrap();
+        let model = model_store_guard
+            .get("slow-model")
+            .expect("should get slow-model");
 
         // Test with 8 messages - if processed sequentially would take ~800ms,
         // but with parallelism should be much faster
@@ -1504,14 +1530,14 @@ mod tests {
         let result = udf
             .process_messages(Arc::clone(model), "slow-model", messages)
             .await
-            .unwrap();
+            .expect("should process messages in parallel");
         let elapsed = start.elapsed();
 
         // Verify all results are correct
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 8);
 
         for i in 0..8 {
