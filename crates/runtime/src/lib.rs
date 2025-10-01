@@ -446,9 +446,9 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
-    // Maps model names to their source strings (e.g., "openai", "anthropic") for AI UDF partitioning
+    // Maps model names to their Model definitions from the spicepod for AI UDF partitioning
     #[cfg(feature = "models")]
-    model_source_registry: Arc<RwLock<HashMap<String, String>>>,
+    model_registry: Arc<RwLock<HashMap<String, spicepod::component::model::Model>>>,
 }
 
 impl Runtime {

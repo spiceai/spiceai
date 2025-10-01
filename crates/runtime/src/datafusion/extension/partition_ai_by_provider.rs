@@ -20,6 +20,17 @@ limitations under the License.
 //! (from spicepod configuration) and creates a plan that executes each source
 //! group in parallel, then joins results back together.
 //!
+//! # Supported Patterns
+//!
+//! The optimizer supports AI UDF calls in various forms:
+//! - Direct calls: `ai('hi', 'gpt-4o')`
+//! - Aliased calls: `ai('hi', 'gpt-4o') AS "result"`
+//! - Nested in functions: `left(ai('hi', 'gpt-4o'), 10)`
+//! - Nested and aliased: `left(ai('hi', 'gpt-4o'), 10) AS "summary"`
+//!
+//! Note: Expressions with multiple AI UDF calls (e.g., `concat(ai(...), ai(...))`)
+//! are currently passed through without optimization.
+//!
 //! # Example Transformation
 //!
 //! Input query:
@@ -49,18 +60,16 @@ use datafusion::{
     common::{DFSchemaRef, Result, tree_node::Transformed},
     logical_expr::{Expr, Extension, LogicalPlan, Projection, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
-    physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
+    physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::RwLock;
 
-/// Type alias for the model source registry
-/// This maps model names to their source strings (e.g., "openai", "anthropic")
-/// This is a simple lookup table populated when models are loaded
-pub type ModelRegistry = Arc<RwLock<HashMap<String, String>>>;
+/// Type alias for the model registry
+/// This maps model names to their Model definitions from the spicepod
+pub type ModelRegistry = Arc<RwLock<HashMap<String, spicepod::component::model::Model>>>;
 
 /// A group of AI UDF calls that belong to the same model source
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -275,53 +284,107 @@ impl PartitionAiBySource {
         }
     }
 
-    /// Check if an expression is a top-level AI UDF call
-    /// Handles both direct calls and aliased calls (e.g., ai(...) AS "name")
-    fn is_top_level_ai_udf(expr: &Expr) -> bool {
-        matches!(
-            Self::unwrap_alias(expr),
-            Expr::ScalarFunction(func) if func.name() == "ai"
-        )
-    }
-
-    /// Extract the model name from an AI UDF expression
-    /// Handles both direct calls and aliased calls (e.g., ai(...) AS "name")
-    fn extract_model_name(expr: &Expr) -> Option<String> {
+    /// Recursively extract all model names from AI UDF calls within an expression
+    /// Returns a vector of (model_name, ai_expr) tuples found in the expression
+    fn extract_all_ai_udfs(expr: &Expr) -> Vec<(String, Expr)> {
         let inner_expr = Self::unwrap_alias(expr);
+        let mut results = Vec::new();
 
-        if let Expr::ScalarFunction(func) = inner_expr {
-            if func.name() == "ai" && func.args.len() >= 2 {
-                // Second argument is the model name
-                if let Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(model_name)), _) =
-                    &func.args[1]
-                {
-                    return Some(model_name.clone());
+        match inner_expr {
+            // Direct AI UDF call
+            Expr::ScalarFunction(func) if func.name() == "ai" => {
+                if func.args.len() >= 2 {
+                    if let Expr::Literal(
+                        datafusion::scalar::ScalarValue::Utf8(Some(model_name)),
+                        _,
+                    ) = &func.args[1]
+                    {
+                        results.push((model_name.clone(), Expr::ScalarFunction(func.clone())));
+                    }
                 }
             }
+            // Recursively search function arguments
+            Expr::ScalarFunction(func) => {
+                for arg in &func.args {
+                    results.extend(Self::extract_all_ai_udfs(arg));
+                }
+            }
+            // Check other expression types that can contain nested expressions
+            Expr::Cast(cast) => results.extend(Self::extract_all_ai_udfs(&cast.expr)),
+            Expr::TryCast(try_cast) => results.extend(Self::extract_all_ai_udfs(&try_cast.expr)),
+            Expr::Not(not_expr) => results.extend(Self::extract_all_ai_udfs(not_expr)),
+            Expr::IsNull(is_null) => results.extend(Self::extract_all_ai_udfs(is_null)),
+            Expr::IsNotNull(is_not_null) => results.extend(Self::extract_all_ai_udfs(is_not_null)),
+            Expr::IsTrue(is_true) => results.extend(Self::extract_all_ai_udfs(is_true)),
+            Expr::IsFalse(is_false) => results.extend(Self::extract_all_ai_udfs(is_false)),
+            Expr::IsUnknown(is_unknown) => results.extend(Self::extract_all_ai_udfs(is_unknown)),
+            Expr::IsNotTrue(is_not_true) => results.extend(Self::extract_all_ai_udfs(is_not_true)),
+            Expr::IsNotFalse(is_not_false) => {
+                results.extend(Self::extract_all_ai_udfs(is_not_false));
+            }
+            Expr::IsNotUnknown(is_not_unknown) => {
+                results.extend(Self::extract_all_ai_udfs(is_not_unknown));
+            }
+            Expr::Negative(neg) => results.extend(Self::extract_all_ai_udfs(neg)),
+            Expr::BinaryExpr(binary) => {
+                results.extend(Self::extract_all_ai_udfs(&binary.left));
+                results.extend(Self::extract_all_ai_udfs(&binary.right));
+            }
+            Expr::Between(between) => {
+                results.extend(Self::extract_all_ai_udfs(&between.expr));
+                results.extend(Self::extract_all_ai_udfs(&between.low));
+                results.extend(Self::extract_all_ai_udfs(&between.high));
+            }
+            Expr::Case(case) => {
+                if let Some(expr) = &case.expr {
+                    results.extend(Self::extract_all_ai_udfs(expr));
+                }
+                for (when, then) in &case.when_then_expr {
+                    results.extend(Self::extract_all_ai_udfs(when));
+                    results.extend(Self::extract_all_ai_udfs(then));
+                }
+                if let Some(else_expr) = &case.else_expr {
+                    results.extend(Self::extract_all_ai_udfs(else_expr));
+                }
+            }
+            Expr::InList(in_list) => {
+                results.extend(Self::extract_all_ai_udfs(&in_list.expr));
+                for item in &in_list.list {
+                    results.extend(Self::extract_all_ai_udfs(item));
+                }
+            }
+            _ => {}
         }
-        None
+
+        results
     }
 
     /// Get the model source for a model by looking it up in the registry (blocking)
     /// Returns the model source string (e.g., "openai", "anthropic") or None if not found
+    ///
+    /// Note: This uses blocking_read() which is designed for synchronous contexts like optimizers
     fn get_model_source_sync(&self, model_name: &str) -> Option<String> {
-        // Use block_in_place to safely block on the async RwLock
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let registry = self.llm_models.read().await;
-                registry.get(model_name).cloned()
-            })
-        })
+        let registry = self.llm_models.blocking_read();
+        registry
+            .get(model_name)
+            .and_then(|model| model.get_source().map(|s| s.to_string()))
     }
 
     /// Get the list of available model names from the registry (blocking)
-    fn get_available_models_sync(&self) -> Vec<String> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let registry = self.llm_models.read().await;
-                registry.keys().cloned().collect()
-            })
-        })
+    /// Returns a string slice iterator to avoid cloning keys
+    ///
+    /// Note: This uses blocking_read() which is designed for synchronous contexts like optimizers
+    fn get_available_models_list(&self) -> String {
+        let registry = self.llm_models.blocking_read();
+        if registry.is_empty() {
+            "none".to_string()
+        } else {
+            registry
+                .keys()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     }
 
     /// Transform a projection with multiple AI UDFs into an AiSourcePartitionNode
@@ -334,33 +397,43 @@ impl PartitionAiBySource {
         let mut passthrough_exprs: Vec<(Expr, String)> = Vec::new();
 
         for (expr, alias) in projection.expr.iter().zip(projection.schema.field_names()) {
-            if Self::is_top_level_ai_udf(expr) {
-                if let Some(model_name) = Self::extract_model_name(expr) {
-                    if let Some(source) = self.get_model_source_sync(&model_name) {
-                        // Group by source string
-                        source_map.entry(source).or_default().push((
-                            expr.clone(),
-                            model_name.clone(),
-                            alias.clone(),
-                        ));
-                        continue;
-                    } else {
-                        // Model not found in LLM registry - get available models and return helpful error
-                        let available_models = self.get_available_models_sync();
-                        let models_list = if available_models.is_empty() {
-                            "none".to_string()
-                        } else {
-                            available_models.join(", ")
-                        };
-                        return datafusion::common::plan_err!(
-                            "Model '{model_name}' not found. The model must be a completion LLM defined in the spicepod before it can be used in ai() calls. \
-                             Available models: {models_list}. \
-                             Add the model to your spicepod.yaml, verify the model name is correct, and ensure it's a completion LLM (not an ML/embedding model)."
-                        );
-                    }
-                }
+            // Extract all AI UDF calls from the expression (single traversal)
+            let ai_udfs = Self::extract_all_ai_udfs(expr);
+
+            if ai_udfs.is_empty() {
+                // No AI UDFs in this expression, pass through
+                passthrough_exprs.push((expr.clone(), alias.to_string()));
+                continue;
             }
-            passthrough_exprs.push((expr.clone(), alias.clone()));
+
+            // For now, we only handle expressions with a single AI UDF call
+            // Multiple AI UDFs in one expression (e.g., concat(ai(...), ai(...))) would be complex
+            if ai_udfs.len() > 1 {
+                // Pass through expressions with multiple AI UDFs without optimization
+                // They will still execute, just not in parallel
+                passthrough_exprs.push((expr.clone(), alias.to_string()));
+                continue;
+            }
+
+            let (model_name, _ai_expr) = &ai_udfs[0];
+
+            if let Some(source) = self.get_model_source_sync(model_name) {
+                // Group by source string
+                // The entire expression (including any nesting) goes into the source map
+                source_map.entry(source).or_default().push((
+                    expr.clone(),
+                    model_name.clone(),
+                    alias.to_string(),
+                ));
+            } else {
+                // Model not found in LLM registry - get available models and return helpful error
+                let models_list = self.get_available_models_list();
+                return datafusion::common::plan_err!(
+                    "Model '{model_name}' not found. The model must be a completion LLM defined in the spicepod before it can be used in ai() calls. \
+                     Available models: {models_list}. \
+                     Add the model to your spicepod.yaml, verify the model name is correct, and ensure it's a completion LLM (not an ML/embedding model)."
+                );
+            }
         }
 
         // If there are no AI UDFs or only one source, no need to partition
@@ -596,9 +669,23 @@ mod tests {
     use datafusion::logical_expr::col;
 
     #[test]
-    fn test_is_top_level_ai_udf() {
+    fn test_extract_ai_udfs_no_udfs() {
+        // Test that column expressions don't contain AI UDFs
         let col_expr = col("test");
-        assert!(!PartitionAiBySource::is_top_level_ai_udf(&col_expr));
+        assert!(PartitionAiBySource::extract_all_ai_udfs(&col_expr).is_empty());
+
+        // Test that literal expressions don't contain AI UDFs
+        use datafusion::logical_expr::lit;
+        let lit_expr = lit("hello");
+        assert!(PartitionAiBySource::extract_all_ai_udfs(&lit_expr).is_empty());
+
+        // Test that binary expressions without AI UDFs return empty
+        let binary = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(col("a")),
+            op: datafusion::logical_expr::Operator::Plus,
+            right: Box::new(lit(1)),
+        });
+        assert!(PartitionAiBySource::extract_all_ai_udfs(&binary).is_empty());
     }
 
     #[test]

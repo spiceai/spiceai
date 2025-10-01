@@ -129,11 +129,11 @@ impl Runtime {
                     responses_llm_map.insert(m.name.clone(), responses_model);
                     drop(responses_llm_map);
 
-                    // Populate the model source registry for AI UDF partitioning
+                    // Populate the model registry for AI UDF partitioning
                     #[cfg(feature = "models")]
-                    if let Some(source) = m.get_source() {
-                        let mut source_registry = self.model_source_registry.write().await;
-                        source_registry.insert(m.name.clone(), source.to_string());
+                    {
+                        let mut registry = self.model_registry.write().await;
+                        registry.insert(m.name.clone(), m.clone());
                     }
                     Ok(())
                 }
@@ -142,11 +142,11 @@ impl Runtime {
                     llm_map.insert(m.name.clone(), model);
                     drop(llm_map);
 
-                    // Populate the model source registry for AI UDF partitioning
+                    // Populate the model registry for AI UDF partitioning
                     #[cfg(feature = "models")]
-                    if let Some(source) = m.get_source() {
-                        let mut source_registry = self.model_source_registry.write().await;
-                        source_registry.insert(m.name.clone(), source.to_string());
+                    {
+                        let mut registry = self.model_registry.write().await;
+                        registry.insert(m.name.clone(), m.clone());
                     }
                     Ok(())
                 }

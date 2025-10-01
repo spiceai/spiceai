@@ -179,9 +179,9 @@ impl RuntimeBuilder {
 
         let caching = Runtime::init_caching(Some(&caching_config));
 
-        // Create the model source registry that will be shared between Runtime and DataFusion
-        // This maps model names to their source strings for AI UDF partitioning
-        let model_source_registry = Arc::new(RwLock::new(HashMap::new()));
+        // Create the model registry that will be shared between Runtime and DataFusion
+        // This maps model names to their Model definitions from the spicepod
+        let model_registry = Arc::new(RwLock::new(HashMap::new()));
 
         #[allow(unused_mut)]
         let mut df_builder = DataFusion::builder(
@@ -191,7 +191,7 @@ impl RuntimeBuilder {
 
         #[cfg(feature = "models")]
         {
-            df_builder = df_builder.with_model_registry(Arc::clone(&model_source_registry));
+            df_builder = df_builder.with_model_registry(Arc::clone(&model_registry));
         }
 
         let mut df_builder = df_builder
@@ -270,7 +270,7 @@ impl RuntimeBuilder {
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "models")]
-            model_source_registry,
+            model_registry,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
