@@ -247,50 +247,6 @@ impl Display for OnConflictBehavior {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum SnapshotBehavior {
-    /// Snapshots are disabled (default).
-    #[default]
-    Disabled,
-    /// Enable both creating and bootstrapping from snapshots.
-    Enabled,
-    /// Only bootstrap from existing snapshots, don't attempt to create new ones.
-    BootstrapOnly,
-    /// Only create new snapshots.
-    CreateOnly,
-}
-
-impl SnapshotBehavior {
-    #[must_use]
-    pub fn bootstrap_enabled(&self) -> bool {
-        matches!(
-            self,
-            SnapshotBehavior::Enabled | SnapshotBehavior::BootstrapOnly
-        )
-    }
-
-    #[must_use]
-    pub fn create_enabled(&self) -> bool {
-        matches!(
-            self,
-            SnapshotBehavior::Enabled | SnapshotBehavior::CreateOnly
-        )
-    }
-}
-
-impl From<spicepod_acceleration::SnapshotBehavior> for SnapshotBehavior {
-    fn from(snapshot_behavior: spicepod_acceleration::SnapshotBehavior) -> Self {
-        match snapshot_behavior {
-            spicepod_acceleration::SnapshotBehavior::Disabled => SnapshotBehavior::Disabled,
-            spicepod_acceleration::SnapshotBehavior::Enabled => SnapshotBehavior::Enabled,
-            spicepod_acceleration::SnapshotBehavior::BootstrapOnly => {
-                SnapshotBehavior::BootstrapOnly
-            }
-            spicepod_acceleration::SnapshotBehavior::CreateOnly => SnapshotBehavior::CreateOnly,
-        }
-    }
-}
-
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
