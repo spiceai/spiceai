@@ -266,9 +266,30 @@ impl PartitionAiBySource {
         Self { llm_models }
     }
 
+    /// Unwrap alias to get the inner expression
+    /// Handles both direct expressions and aliased expressions (e.g., expr AS "name")
+    fn unwrap_alias(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            other => other,
+        }
+    }
+
+    /// Check if an expression is a top-level AI UDF call
+    /// Handles both direct calls and aliased calls (e.g., ai(...) AS "name")
+    fn is_top_level_ai_udf(expr: &Expr) -> bool {
+        matches!(
+            Self::unwrap_alias(expr),
+            Expr::ScalarFunction(func) if func.name() == "ai"
+        )
+    }
+
     /// Extract the model name from an AI UDF expression
+    /// Handles both direct calls and aliased calls (e.g., ai(...) AS "name")
     fn extract_model_name(expr: &Expr) -> Option<String> {
-        if let Expr::ScalarFunction(func) = expr {
+        let inner_expr = Self::unwrap_alias(expr);
+
+        if let Expr::ScalarFunction(func) = inner_expr {
             if func.name() == "ai" && func.args.len() >= 2 {
                 // Second argument is the model name
                 if let Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(model_name)), _) =
@@ -281,11 +302,6 @@ impl PartitionAiBySource {
         None
     }
 
-    /// Check if an expression is a top-level AI UDF call
-    fn is_top_level_ai_udf(expr: &Expr) -> bool {
-        matches!(expr, Expr::ScalarFunction(func) if func.name() == "ai")
-    }
-
     /// Get the model source for a model by looking it up in the registry (blocking)
     /// Returns the model source string (e.g., "openai", "anthropic") or None if not found
     fn get_model_source_sync(&self, model_name: &str) -> Option<String> {
@@ -294,6 +310,16 @@ impl PartitionAiBySource {
             tokio::runtime::Handle::current().block_on(async {
                 let registry = self.llm_models.read().await;
                 registry.get(model_name).cloned()
+            })
+        })
+    }
+
+    /// Get the list of available model names from the registry (blocking)
+    fn get_available_models_sync(&self) -> Vec<String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let registry = self.llm_models.read().await;
+                registry.keys().cloned().collect()
             })
         })
     }
@@ -319,11 +345,17 @@ impl PartitionAiBySource {
                         ));
                         continue;
                     } else {
-                        // Model not found in LLM registry - return helpful error
+                        // Model not found in LLM registry - get available models and return helpful error
+                        let available_models = self.get_available_models_sync();
+                        let models_list = if available_models.is_empty() {
+                            "none".to_string()
+                        } else {
+                            available_models.join(", ")
+                        };
                         return datafusion::common::plan_err!(
-                            "Model '{}' not found. The model must be a completion LLM defined in the spicepod before it can be used in ai() calls. \
-                             Add the model to your spicepod.yaml, verify the model name is correct, and ensure it's a completion LLM (not an ML/embedding model).",
-                            model_name
+                            "Model '{model_name}' not found. The model must be a completion LLM defined in the spicepod before it can be used in ai() calls. \
+                             Available models: {models_list}. \
+                             Add the model to your spicepod.yaml, verify the model name is correct, and ensure it's a completion LLM (not an ML/embedding model)."
                         );
                     }
                 }

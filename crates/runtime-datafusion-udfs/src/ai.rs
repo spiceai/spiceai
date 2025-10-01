@@ -194,10 +194,16 @@ impl AsyncScalarUDFImpl for Ai {
 
         let model_store = self.model_store.read().await;
         let Some(model) = model_store.get(&model_name) else {
+            let available_models = model_store.keys().cloned().collect::<Vec<_>>();
+            let models_list = if available_models.is_empty() {
+                "none".to_string()
+            } else {
+                available_models.join(", ")
+            };
             return exec_err!(
-                "{AI_UDF_NAME} cannot find model '{}'. Available models: {}",
-                model_name,
-                model_store.keys().cloned().collect::<Vec<_>>().join(", ")
+                "Model '{model_name}' not found. The model must be a completion LLM defined in the spicepod before it can be used in ai() calls. \
+                 Available models: {models_list}. \
+                 Add the model to your spicepod.yaml, verify the model name is correct, and ensure it's a completion LLM (not an ML/embedding model)."
             );
         };
 
@@ -267,6 +273,10 @@ impl Ai {
             let mut complete_response = String::with_capacity(512);
             let max_response_size = MAX_MESSAGE_SIZE * 2;
 
+            // Track time to first token
+            let mut time_to_first_token_ms: Option<u64> = None;
+            let mut first_token_received = false;
+
             // Performance: Process stream chunks efficiently
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result?;
@@ -274,6 +284,12 @@ impl Ai {
                 // Performance: Use iterator directly to avoid intermediate allocations
                 for choice in chunk.choices {
                     if let Some(ref content) = choice.delta.content {
+                        // Record time to first token
+                        if !first_token_received && !content.is_empty() {
+                            time_to_first_token_ms = Some(ai_start.elapsed().as_millis() as u64);
+                            first_token_received = true;
+                        }
+
                         let new_len = complete_response.len() + content.len();
 
                         // Security: Check accumulated response size
@@ -303,6 +319,9 @@ impl Ai {
             // Record metrics in the current span
             tracing::Span::current().record("elapsed_ai_completion_ms", elapsed_ai_completion_ms);
             tracing::Span::current().record("elapsed_compute_us", elapsed_compute_ms);
+            if let Some(ttft) = time_to_first_token_ms {
+                tracing::Span::current().record("time_to_first_token_ms", ttft);
+            }
 
             Ok(result)
         }
@@ -312,7 +331,8 @@ impl Ai {
             "ai",
             model = %model_name,
             elapsed_ai_completion_ms = tracing::field::Empty,
-            elapsed_compute_us = tracing::field::Empty
+            elapsed_compute_us = tracing::field::Empty,
+            time_to_first_token_ms = tracing::field::Empty
         ))
         .await
     }
