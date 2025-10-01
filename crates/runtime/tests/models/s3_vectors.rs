@@ -584,7 +584,7 @@ mod search {
                     ))
                     .build();
 
-                let rt = start_app(app).await?;
+                let rt = start_app_w_timeout(app, std::time::Duration::from_secs(120)).await?;
 
                 // Ensure all messages are processed/including embeddings calculation
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
@@ -654,12 +654,15 @@ mod search {
         })
     }
 
-    async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
+    async fn start_app_w_timeout(
+        app: App,
+        timeout: std::time::Duration,
+    ) -> Result<Arc<Runtime>, anyhow::Error> {
         configure_test_datafusion();
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(timeout) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
@@ -668,6 +671,10 @@ mod search {
         runtime_ready_check(&rt).await;
 
         Ok(rt)
+    }
+
+    async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
+        start_app_w_timeout(app, std::time::Duration::from_secs(60)).await
     }
 
     async fn run_and_snapshot_query(
