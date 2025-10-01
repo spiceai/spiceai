@@ -17,6 +17,7 @@ limitations under the License.
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
 use spicepod::{acceleration as spicepod_acceleration, param::Params};
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
@@ -298,6 +299,8 @@ pub struct Acceleration {
     pub disable_federation: bool,
 
     pub partition_by: Vec<String>,
+
+    pub snapshots: SnapshotBehavior,
 }
 
 impl Acceleration {
@@ -440,6 +443,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             partition_by: acceleration.partition_by,
+            snapshots: SnapshotBehavior::disabled(),
         })
     }
 }
@@ -472,6 +476,7 @@ impl Default for Acceleration {
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
+            snapshots: SnapshotBehavior::Disabled,
         }
     }
 }

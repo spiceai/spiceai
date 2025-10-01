@@ -18,8 +18,8 @@ use crate::{
     search::{
         Error as VectorSearchError,
         request::{SearchRequest, SearchRequestHTTPJson},
+        search_engine::SearchEngine,
         types::{Match, to_matches_sorted},
-        vector_search::VectorSearch,
     },
 };
 use axum::{
@@ -30,6 +30,7 @@ use axum::{
 use http::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
+use tracing::Instrument;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -120,7 +121,7 @@ struct SearchResponse {
     )
 ))]
 pub(crate) async fn post(
-    Extension(vs): Extension<Arc<VectorSearch>>,
+    Extension(vs): Extension<Arc<SearchEngine>>,
     Json(payload): Json<SearchRequestHTTPJson>,
 ) -> Response {
     let start_time = Instant::now();
@@ -139,7 +140,7 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
     }
 
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.base.text);
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "search", input = %payload.base.text);
 
     let search_request = match SearchRequest::try_from(payload) {
         Ok(r) => r,
@@ -157,6 +158,7 @@ pub(crate) async fn post(
             cache_provider,
             Arc::clone(&request_context),
         )
+        .instrument(span.clone())
         .await
     {
         Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {

@@ -16,7 +16,7 @@ snapshot_kind: text
 |               |       BytesProcessedExec                                                                                                                                                                         |
 |               |         ProjectionExec: expr=[answer@2 as answer, id@0 as id, score@1 as score]                                                                                                                  |
 |               |           FilterExec: subject@3 != math, projection=[id@0, score@1, answer@2]                                                                                                                    |
-|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3, subject@4]                                                                   |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@1)], projection=[id@0, score@1, answer@2, subject@4]                                                                   |
 |               |               CoalescePartitionsExec                                                                                                                                                             |
 |               |                 AggregateExec: mode=FinalPartitioned, gby=[id@0 as id], aggr=[score]                                                                                                             |
 |               |                   RepartitionExec: partitioning=Hash([id@0], 3), input_partitions=3                                                                                                              |

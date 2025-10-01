@@ -213,7 +213,7 @@ impl SearchRequest {
                 let select_statement = format!("SELECT {c} FROM testing");
                 let parser = Parser::new(&GenericDialect);
                 let mut parser = parser.try_with_sql(&select_statement).map_err(|err| {
-                    tracing::trace!("vector_search additional column parsing failed. {err}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. {err}");
                     Error::InvalidAdditionalColumns {
                         additional_column: c.clone(),
                     }
@@ -221,14 +221,14 @@ impl SearchRequest {
 
                 // parse the SELECT
                 let expr = parser.parse_select().map_err(|err| {
-                    tracing::trace!("vector_search additional column parsing failed. {err}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. {err}");
                     Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     }
                 })?;
 
                 if expr.projection.len() > 1 || expr.from.len() > 1 {
-                    tracing::trace!("vector_search additional column parsing failed. expected 1 projection and 1 table, but got {expr:?}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected 1 projection and 1 table, but got {expr:?}");
                     return Err(Error::InvalidAdditionalColumns {
                         additional_column: c.clone(),
                     });
@@ -236,7 +236,7 @@ impl SearchRequest {
 
 
                 let Some(SelectItem::UnnamedExpr(select_expr)) = expr.projection.first() else {
-                    tracing::trace!("vector_search additional column parsing failed. expected an identifier, but got {expr:?}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected an identifier, but got {expr:?}");
                     return Err(Error::InvalidAdditionalColumns {
                         additional_column: c.clone(),
                     });
@@ -250,7 +250,7 @@ impl SearchRequest {
                     }) => value,
                     Expr::CompoundIdentifier(idents) => &idents.iter().map(|i| i.value.clone()).join("."),
                     _ => {
-                        tracing::trace!("vector_search additional column parsing failed. expected an identifier, but got {expr:?}");
+                        tracing::trace!("parsing 'additional_columns' for search failed. Expected an identifier, but got {expr:?}");
                         return Err(Error::InvalidAdditionalColumns {
                             additional_column: c.clone(),
                         });
@@ -259,28 +259,28 @@ impl SearchRequest {
 
                 // Check equality whilst ignoring quotation.
                 if proj_value != c.trim_matches('"') {
-                    tracing::trace!("vector_search additional column parsing failed. expected {c}, but got {proj_value}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected {c}, but got {proj_value}");
                     return Err(Error::InvalidAdditionalColumns {
                         additional_column: c.clone(),
                     });
                 }
 
                 let Some(TableWithJoins { relation, .. }) = expr.from.first() else {
-                    tracing::trace!("vector_search additional column parsing failed. expected a table, but got {expr:?}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected a table, but got {expr:?}");
                     return Err(super::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
                 };
 
                 let TableFactor::Table { name, .. } = relation else {
-                    tracing::trace!("vector_search additional column parsing failed. expected a table, but got {relation:?}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected a table, but got {relation:?}");
                     return Err(super::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
                 };
 
                 if name.to_string() != "testing" {
-                    tracing::trace!("vector_search additional column parsing failed. expected 'testing', but got {name}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected 'testing', but got {name}");
                     return Err(super::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
@@ -288,7 +288,7 @@ impl SearchRequest {
 
                 let next_token = parser.next_token();
                 if next_token != Token::EOF {
-                    tracing::trace!("vector_search additional column parsing failed. expected EOF, but got {next_token:?}");
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected EOF, but got {next_token:?}");
                     return Err(super::Error::InvalidAdditionalColumns{
                         additional_column: c.clone(),
                     });
@@ -304,7 +304,7 @@ impl SearchRequest {
         let expression = format!("{target_column} ILIKE '%{}%'", k.to_lowercase());
         let parser = Parser::new(&GenericDialect {});
         let mut parser = parser.try_with_sql(&expression).map_err(|err| {
-            tracing::trace!("vector_search keyword parsing failed. {err}");
+            tracing::trace!("failed to parse 'keywords' for search. {err}");
             Error::InvalidKeyword {
                 keyword: k.to_string(),
             }
@@ -312,7 +312,7 @@ impl SearchRequest {
 
         // The keyword will exist on its own if nothing else is present.
         let ilike_expr = parser.parse_expr().map_err(|err| {
-            tracing::trace!("vector_search keyword parsing failed. {err}");
+            tracing::trace!("failed to parse 'keywords' for search. {err}");
             Error::InvalidKeyword {
                 keyword: k.to_string(),
             }
@@ -320,7 +320,7 @@ impl SearchRequest {
 
         let Expr::ILike { expr, pattern, .. } = &ilike_expr else {
             tracing::trace!(
-                "vector_search keyword parsing failed. expected ILIKE, but got {ilike_expr:?}"
+                "failed to parse 'keywords' for search. Expected ILIKE, but got {ilike_expr:?}"
             );
             return Err(Error::InvalidKeyword {
                 keyword: k.to_string(),
@@ -337,7 +337,7 @@ impl SearchRequest {
         {
             if id.value.to_lowercase() != target_column {
                 tracing::trace!(
-                    "vector_search keyword parsing failed. expected 'target_column', but got {}",
+                    "failed to parse 'keywords' for search. Expected 'target_column', but got {}",
                     id.value
                 );
                 return Err(Error::InvalidKeyword {
@@ -347,7 +347,7 @@ impl SearchRequest {
 
             if v != format!("%{}%", k.to_lowercase()) {
                 tracing::trace!(
-                    "vector_search keyword parsing failed. expected '%{}%', but got {}",
+                    "failed to parse 'keywords' for search. Expected '%{}%', but got {}",
                     k.to_lowercase(),
                     v
                 );
@@ -357,7 +357,7 @@ impl SearchRequest {
             }
         } else {
             tracing::trace!(
-                "vector_search keyword parsing failed. expected identifiers, but got {expr:?} - {pattern:?}"
+                "failed to parse 'keywords' for search. Expected identifiers, but got {expr:?} - {pattern:?}"
             );
             return Err(Error::InvalidKeyword {
                 keyword: k.to_string(),
@@ -368,7 +368,7 @@ impl SearchRequest {
         let next_token = parser.next_token();
         if next_token != Token::EOF {
             tracing::trace!(
-                "vector_search keyword parsing failed. expected EOF, but got {next_token:?}"
+                "failed to parse 'keywords' for search. Expected EOF, but got {next_token:?}"
             );
             return Err(Error::InvalidKeyword {
                 keyword: k.to_string(),

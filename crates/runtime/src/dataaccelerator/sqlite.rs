@@ -31,12 +31,13 @@ use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
+    dataaccelerator::FilePathError,
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, DataAccelerator};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -186,10 +187,11 @@ impl DataAccelerator for SqliteAccelerator {
         vec!["sqlite", "db"]
     }
 
-    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
         self.sqlite_file_path(source)
-            .map_err(|err| DataAcceleratorError::InvalidConfiguration {
-                msg: err.to_string(),
+            .map_err(|err| FilePathError::External {
+                engine: Engine::Sqlite,
+                source: err.into(),
             })
     }
 

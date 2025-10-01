@@ -36,6 +36,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use futures::future::BoxFuture;
 
 use crate::{
     SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, chunking::ChunkedSearchIndex,
@@ -44,13 +45,31 @@ use crate::{
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]
 /// if required by filters or additional columns in the projection.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SearchQueryProvider {
     pub search_index_query: Arc<LogicalPlan>,
     pub table_provider: Arc<dyn TableProvider>,
     pub search_column: String,
     pub primary_key: Vec<String>,
     pub pre_limit: Option<usize>,
+    /// Optional callback invoked before a table scan is performed.
+    ///
+    /// This callback can be used to perform custom actions (such as logging, metrics, or side effects)
+    /// immediately before the provider executes a scan operation. The callback is asynchronous and
+    /// will be awaited before the scan proceeds. If `None`, no callback is invoked.
+    pub scan_callback: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SearchQueryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchQueryProvider")
+            .field("search_index_query", &self.search_index_query)
+            .field("table_provider", &self.table_provider)
+            .field("search_column", &self.search_column)
+            .field("primary_key", &self.primary_key)
+            .field("pre_limit", &self.pre_limit)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SearchQueryProvider {
@@ -67,7 +86,18 @@ impl SearchQueryProvider {
             search_column,
             primary_key,
             pre_limit,
+            scan_callback: None,
         }
+    }
+
+    /// `func` will be called at the beginning of any [`Self::scan`].
+    #[must_use]
+    pub fn call_on_scan(
+        mut self,
+        func: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+    ) -> Self {
+        self.scan_callback = Some(func);
+        self
     }
 
     pub fn try_from_index(
@@ -415,6 +445,9 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if let Some(ref callback) = self.scan_callback {
+            callback().await;
+        }
         let search_index_table = LogicalPlan::Limit(Limit {
             skip: None,
             fetch: self

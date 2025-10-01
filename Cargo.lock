@@ -12108,6 +12108,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rmcp",
+ "runtime-acceleration",
  "runtime-auth",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -12162,6 +12163,25 @@ dependencies = [
  "winver",
  "workers",
  "x509-certificate",
+]
+
+[[package]]
+name = "runtime-acceleration"
+version = "1.8.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "bytes",
+ "chrono",
+ "futures",
+ "object_store",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
 ]
 
 [[package]]

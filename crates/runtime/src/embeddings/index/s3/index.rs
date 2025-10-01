@@ -191,7 +191,7 @@ impl VectorIndex for S3Vector {
     /// Use a [`S3VectorsListTable`] and then:
     ///   1. Convert the primary key to its appropriate name and data type
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
-    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
+    fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         let mut projection: Vec<_> = metadata_columns_to_exprs(&self.metadata_columns);
         projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
         projection.push(Expr::Alias(Alias::new(
@@ -206,7 +206,6 @@ impl VectorIndex for S3Vector {
             Arc::new(S3VectorsListTable::from(self.table.clone())),
             projection,
         )
-        .boxed()
     }
 }
 

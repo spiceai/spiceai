@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Result};
+use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
@@ -28,15 +28,17 @@ impl DebeziumKafkaSys {
     ) -> Result<()> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
         let primary_keys =
-            serde_json::to_string(&metadata.primary_keys).map_err(|e| e.to_string())?;
+            serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
-            serde_json::to_string(&metadata.schema_fields).map_err(|e| e.to_string())?;
+            serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
 
         conn.conn
             .call(move |conn| {
@@ -79,7 +81,9 @@ impl DebeziumKafkaSys {
                 Ok(())
             })
             .await
-            .map_err(|e| e.to_string().into())
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn get_sqlite(

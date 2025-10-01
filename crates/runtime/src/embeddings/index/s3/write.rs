@@ -21,7 +21,7 @@ use arrow::array::{
     StringViewArray,
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use async_openai::types::EmbeddingInput;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
@@ -186,7 +186,22 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
             index: index.name().to_string(),
         })?;
 
-    Ok(updated_record)
+    // Because of limitations of `DFSchema::logically_equivalent_names_and_types` and its use in
+    // `MemTable`, this must be in the same order as outputted by `VectorScanTableProvider`.
+    let (schema, arr, _) = updated_record.into_parts();
+    let (arrs, fields): (Vec<_>, Vec<_>) = arr
+        .into_iter()
+        .zip(schema.fields().into_iter())
+        .sorted_by_key(|(_, f)| f.name())
+        .unzip();
+
+    RecordBatch::try_new(
+        Arc::new(Schema::new(fields.into_iter().cloned().collect::<Vec<_>>())),
+        arrs,
+    )
+    .context(IssueWithArrowProcessingSnafu {
+        index: index.name(),
+    })
 }
 
 /// Given a [`RecordBatch`] of data from a [`SearchIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.

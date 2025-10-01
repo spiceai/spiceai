@@ -147,7 +147,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
     let expression = format!("{target_column} ILIKE '%{}%'", k.to_lowercase());
     let parser = Parser::new(&GenericDialect {});
     let mut parser = parser.try_with_sql(&expression).map_err(|err| {
-        tracing::trace!("vector_search keyword parsing failed. {err}");
+        tracing::trace!("failed to parse 'keywords' for search. {err}");
         Error::InvalidKeyword {
             keyword: k.to_string(),
         }
@@ -155,7 +155,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
 
     // The keyword will exist on its own if nothing else is present.
     let ilike_expr = parser.parse_expr().map_err(|err| {
-        tracing::trace!("vector_search keyword parsing failed. {err}");
+        tracing::trace!("failed to parse 'keywords' for search. {err}");
         Error::InvalidKeyword {
             keyword: k.to_string(),
         }
@@ -163,7 +163,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
 
     let Expr::ILike { expr, pattern, .. } = &ilike_expr else {
         tracing::trace!(
-            "vector_search keyword parsing failed. expected ILIKE, but got {ilike_expr:?}"
+            "failed to parse 'keywords' for search. expected ILIKE, but got {ilike_expr:?}"
         );
         return Err(Error::InvalidKeyword {
             keyword: k.to_string(),
@@ -180,7 +180,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
     {
         if id.value.to_lowercase() != target_column {
             tracing::trace!(
-                "vector_search keyword parsing failed. expected {target_column}, but got {}",
+                "failed to parse 'keywords' for search. expected {target_column}, but got {}",
                 id.value
             );
             return Err(Error::InvalidKeyword {
@@ -190,7 +190,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
 
         if v != format!("%{}%", k.to_lowercase()) {
             tracing::trace!(
-                "vector_search keyword parsing failed. expected '%{}%', but got {}",
+                "failed to parse 'keywords' for search. expected '%{}%', but got {}",
                 k.to_lowercase(),
                 v
             );
@@ -200,7 +200,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         }
     } else {
         tracing::trace!(
-            "vector_search keyword parsing failed. expected identifiers, but got {expr:?} - {pattern:?}"
+            "failed to parse 'keywords' for search. expected identifiers, but got {expr:?} - {pattern:?}"
         );
         return Err(Error::InvalidKeyword {
             keyword: k.to_string(),
@@ -211,7 +211,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
     let next_token = parser.next_token();
     if next_token != Token::EOF {
         tracing::trace!(
-            "vector_search keyword parsing failed. expected EOF, but got {next_token:?}"
+            "failed to parse 'keywords' for search. expected EOF, but got {next_token:?}"
         );
         return Err(Error::InvalidKeyword {
             keyword: k.to_string(),

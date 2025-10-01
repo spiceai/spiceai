@@ -28,6 +28,7 @@ use crate::component::is_default;
 use crate::component::management::Management;
 use crate::component::runtime::Runtime;
 use crate::component::secret::Secret;
+use crate::component::snapshot::Snapshots;
 use crate::component::tool::Tool;
 use crate::component::{
     ComponentOrReference, dataset::Dataset, model::Model, view::View, worker::Worker,
@@ -71,6 +72,10 @@ pub struct SpicepodDefinition {
     /// Optional management configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub management: Option<Management>,
+
+    /// Optional acceleration snapshot configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<Snapshots>,
 
     /// Optional extensions configuration
     #[serde(skip_serializing_if = "HashMap::is_empty")]

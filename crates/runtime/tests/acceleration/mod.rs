@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use runtime::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    component::dataset::Dataset,
+    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
 };
 use spicepod::{acceleration::Mode, param::Params};
 
@@ -58,7 +59,7 @@ async fn wait_for_checkpoints(
 
     for dataset in datasets {
         let check_future = async move {
-            match DatasetCheckpoint::try_new(&dataset).await {
+            match DatasetCheckpoint::try_new(&dataset, OpenOption::OpenExisting).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

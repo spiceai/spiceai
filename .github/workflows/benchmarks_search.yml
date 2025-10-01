@@ -65,7 +65,7 @@ jobs:
 
             // include the spicepod path for each matrix item
             filtered = filtered.map((m) => {
-                m.spicepod = "./test/spicepods/vector_search/mteb/quora/" + m.name + ".yaml";
+                m.spicepod = "./test/spicepods/search/mteb/quora/" + m.name + ".yaml";
                 return m;
             });
 
