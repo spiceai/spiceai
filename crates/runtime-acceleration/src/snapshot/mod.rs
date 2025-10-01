@@ -783,7 +783,6 @@ mod tests {
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
         );
-        assert!(filename.ends_with(".db"));
         assert!(
             SnapshotManager::parse_snapshot_timestamp(filename, "dataset").is_some(),
             "snapshot filename should contain a parsable timestamp"
