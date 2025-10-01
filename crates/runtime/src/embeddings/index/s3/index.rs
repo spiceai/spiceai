@@ -158,7 +158,7 @@ impl SearchIndex for S3Vector {
                     // change the index name to a partition name
                     let id = match &self.table.idx {
                         S3VectorIdentifier::IndexArn(_) => {
-                            tracing::debug!(
+                            tracing::warn!(
                                 "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
                             );
                             return write::write(self, &self.table, record).await.boxed();
