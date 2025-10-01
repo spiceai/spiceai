@@ -26,6 +26,7 @@ use std::{
 use crate::{TEST_ARGS, init_tracing};
 
 mod create;
+mod streaming_tests;
 
 #[derive(Clone)]
 pub struct TestCase {

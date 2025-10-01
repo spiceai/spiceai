@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
+use crate::dataaccelerator::spice_sys;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
@@ -398,7 +399,7 @@ async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafk
 async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &DebeziumKafkaMetadata,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), spice_sys::Error> {
     let debezium_kafka_sys = DebeziumKafkaSys::try_new_create_if_not_exists(dataset).await?;
     debezium_kafka_sys.upsert(metadata).await
 }
@@ -491,6 +492,7 @@ async fn get_metadata_from_kafka(
     if dataset.is_file_accelerated() {
         set_metadata_to_accelerator(dataset, &metadata)
             .await
+            .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",
                 connector_component: ConnectorComponent::from(dataset),

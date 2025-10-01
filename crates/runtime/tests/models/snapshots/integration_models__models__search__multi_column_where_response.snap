@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -30,10 +29,10 @@ snapshot_kind: text
     {
       "dataset": "multi_column_search",
       "matches": {
-        "cp_description": "Good questions borrow only base children. Remarkably present "
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 19
+        "cp_catalog_page_sk": 5
       },
       "score": 0.01
     }

@@ -14,6 +14,6 @@ description: "Query: tpch_simple_q7"
 |               |   GlobalLimitExec: skip=0, fetch=10                                      |
 |               |     BytesProcessedExec                                                   |
 |               |       CooperativeExec                                                    |
-|               |         IcebergTableScan projection:[o_orderkey] predicate:[]            |
+|               |         IcebergTableScan projection:[o_orderkey] predicate:[] limit:[10] |
 |               |                                                                          |
 +---------------+--------------------------------------------------------------------------+

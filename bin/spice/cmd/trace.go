@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -48,19 +49,14 @@ var (
 )
 
 var supported_trace_tasks = []string{
-	"ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
+	"ai", "ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
 	"tool_use::search", "tool_use::list_datasets", "tool_use::load_memory",
 	"tool_use::sample_data", "tool_use::sql", "tool_use::store_memory",
 	"tool_use::table_schema", "search", "scheduled_worker", "text_embed",
 }
 
 func isValidTraceTask(task string) bool {
-	for _, supported_task := range supported_trace_tasks {
-		if task == supported_task {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(supported_trace_tasks, task)
 }
 
 var traceCmd = &cobra.Command{
