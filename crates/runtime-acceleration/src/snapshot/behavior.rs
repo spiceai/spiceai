@@ -77,7 +77,7 @@ impl SnapshotBehavior {
 
     #[must_use]
     pub fn create_only(snapshots: Arc<Snapshots>) -> Self {
-        // Snapshot support must be compiled in for bootstrapping to be possible.
+        // Snapshot support must be compiled in for snapshot creation to be possible.
         if !SNAPSHOTS_ENABLED {
             tracing::trace!(
                 "Snapshot bootstrapping is not enabled because snapshot support is not compiled in."
