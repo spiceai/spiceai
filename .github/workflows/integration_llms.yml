@@ -43,13 +43,13 @@ jobs:
               {
                 name: 'self-hosted',
                 needs_env: false,
-                runner: 'macOS',
+                runner: 'spiceai-macos',
                 model_allowlist: 'local_phi3,hf_phi3'
               },
               {
                 name: 'hosted',
                 needs_env: true,
-                runner: 'macOS',
+                runner: 'spiceai-macos',
                 model_allowlist: 'anthropic,bedrock,openai,xai,perplexity'
               }
             ];
@@ -67,7 +67,7 @@ jobs:
 
   build:
     name: Build Test Binary
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     steps:
       - uses: actions/checkout@v5
 
@@ -93,7 +93,7 @@ jobs:
           retention-days: 1
 
   test:
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     needs: [build, setup-matrix]
     strategy:
       matrix:

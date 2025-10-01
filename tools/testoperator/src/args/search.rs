@@ -18,7 +18,7 @@ use super::CommonArgs;
 use clap::Parser;
 
 #[derive(Parser)]
-pub struct VectorSearchTestArgs {
+pub struct SearchTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 

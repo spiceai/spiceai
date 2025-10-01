@@ -23,8 +23,8 @@ limitations under the License.
 
 use std::{sync::Arc, time::SystemTime};
 
-use super::{AccelerationConnection, Result, acceleration_connection};
-use crate::dataaccelerator::AccelerationSource;
+use super::{AccelerationConnection, Error, Result, acceleration_connection};
+use crate::dataaccelerator::{AccelerationSource, spice_sys::OpenOption};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use serde_json;
@@ -73,8 +73,11 @@ pub struct DatasetCheckpoint {
 }
 
 impl DatasetCheckpoint {
-    pub async fn try_new(source: &dyn AccelerationSource) -> Result<Arc<dyn DatasetCheckpointer>> {
-        let acceleration_connection = acceleration_connection(source, true).await?;
+    pub async fn try_new(
+        source: &dyn AccelerationSource,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn DatasetCheckpointer>> {
+        let acceleration_connection = acceleration_connection(source, open_option).await?;
         Self::init(&acceleration_connection).await?;
         Ok(Arc::new(Self {
             dataset_name: source.name().to_string(),
@@ -92,7 +95,7 @@ impl DatasetCheckpoint {
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await?,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => return Err("No acceleration connection available".into()),
+            _ => return Err(Error::NoAccelerationConnection),
         }
 
         // Then add the schema column if it doesn't exist
@@ -104,18 +107,18 @@ impl DatasetCheckpoint {
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => Self::migrate_sqlite(conn).await?,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => return Err("No acceleration connection available".into()),
+            _ => return Err(Error::NoAccelerationConnection),
         }
 
         Ok(())
     }
 
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
-        Ok(serde_json::to_string(schema).map_err(Box::new)?)
+        serde_json::to_string(schema).map_err(Error::external)
     }
 
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
-        let schema: Schema = serde_json::from_str(schema_json).map_err(Box::new)?;
+        let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
         Ok(std::sync::Arc::new(schema))
     }
 
@@ -147,7 +150,7 @@ impl DatasetCheckpoint {
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.last_checkpoint_time_sqlite(conn).await,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => Err("No acceleration connection available".into()),
+            _ => Err(Error::NoAccelerationConnection),
         }
     }
 
@@ -160,7 +163,7 @@ impl DatasetCheckpoint {
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn, schema).await,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => Err("No acceleration connection available".into()),
+            _ => Err(Error::NoAccelerationConnection),
         }
     }
 
@@ -173,7 +176,7 @@ impl DatasetCheckpoint {
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_schema_sqlite(conn).await,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => Err("No acceleration connection available".into()),
+            _ => Err(Error::NoAccelerationConnection),
         }
     }
 }

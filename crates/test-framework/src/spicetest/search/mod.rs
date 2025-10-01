@@ -24,7 +24,7 @@ use crate::{
         Builder, BuilderTarget, ExtendedMetrics, MetricCollector, QueryMetric, QueryStatus,
         StatisticsCollector, system_time_to_unix_epoch_ms,
     },
-    spicetest::vector_search::evaluate::calculate_ndcg,
+    spicetest::search::evaluate::calculate_ndcg,
 };
 use anyhow::{Context, Result};
 use arrow::{

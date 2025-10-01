@@ -31,7 +31,7 @@ mod evals;
 pub use evals::EvalsTestArgs;
 
 mod search;
-pub use search::VectorSearchTestArgs;
+pub use search::SearchTestArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -56,7 +56,7 @@ pub enum TestCommands {
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(DatasetTestArgs),
-    VectorSearch(VectorSearchTestArgs),
+    Search(SearchTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
