@@ -448,6 +448,15 @@ fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
             Value::String("unsupported".to_string())
         },
     );
+    #[cfg(feature = "models")]
+    properties.insert(
+        "search".to_string(),
+        if ds.has_embeddings() || ds.has_full_text_column() {
+            Value::String("supported".to_string())
+        } else {
+            Value::String("unsupported".to_string())
+        },
+    );
 
     properties
 }
