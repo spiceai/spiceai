@@ -132,7 +132,7 @@ pub async fn try_from_dataset(
         column.clone(),
         primary_key,
         metadata_columns,
-        Arc::clone(&model),
+        Arc::clone(model),
     ))
 }
 
