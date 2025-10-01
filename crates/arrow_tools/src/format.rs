@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
+static MARKDOWN_TABLE_SEPARATOR_ROW: [&str; 5] = ["---"; 5];
+
 /// Operations to apply to [`ArrayRef`] or [`RecordBatch`] data so as to prepare it for display.
 ///
 /// Note: Operations do not preserve all original data, and as such, should be used for human display purposes only.
@@ -332,7 +334,7 @@ fn hashmap_to_string(map: &HashMap<String, String>, separator: &str) -> String {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort(); // To make this function reproducible
     keys.iter()
-        .map(|k| format!("* {}: {}", k, map.get(*k).map_or("", String::as_str)))
+        .map(|k| format!("* {}: {}", k, map[*k]))
         .collect::<Vec<_>>()
         .join(separator)
 }
@@ -355,11 +357,11 @@ pub fn table_schemas_to_markdown_table(table_schemas: Vec<(String, Schema)>) -> 
     for (table_name, table_schema) in table_schemas {
         // Header row and separator for markdown
         let header = ["Column", "Sql Type", "Arrow Type", "Nullable", "Metadata"];
-        let separator = ["---"; 5];
 
-        let mut md_table = Vec::new();
-        md_table.push(format!("| {} |", header.join(" | ")));
-        md_table.push(format!("| {} |", separator.join(" | ")));
+        let mut md_table = vec![
+            format!("| {} |", header.join(" | ")),
+            format!("| {} |", MARKDOWN_TABLE_SEPARATOR_ROW.join(" | ")),
+        ];
 
         for field in table_schema.fields() {
             md_table.push(format!(
@@ -372,7 +374,7 @@ pub fn table_schemas_to_markdown_table(table_schemas: Vec<(String, Schema)>) -> 
             ));
         }
 
-        let mut sections = vec![format!("**Table: {}**", table_name)];
+        let mut sections = vec![format!("**Table: {table_name}**")];
         if !table_schema.metadata().is_empty() {
             sections.push(format!(
                 "Metadata:\n{}",
