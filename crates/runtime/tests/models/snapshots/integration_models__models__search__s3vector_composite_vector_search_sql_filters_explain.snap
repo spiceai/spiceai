@@ -15,7 +15,7 @@ snapshot_kind: text
 |               |     ProjectionExec: expr=[question@1 as question, answer@0 as answer, trunc(score@2, 3) as score]                                                                              |
 |               |       BytesProcessedExec                                                                                                                                                       |
 |               |         ProjectionExec: expr=[answer@2 as answer, question@0 as question, score@1 as score]                                                                                    |
-|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0), (question@1, question@1)], projection=[question@1, score@2, answer@5]                              |
+|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@1), (question@1, question@2)], projection=[question@1, score@2, answer@3]                              |
 |               |             CoalescePartitionsExec                                                                                                                                             |
 |               |               ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, union_extract(json_get(key@0, question), str) as question, 1 - distance@1 as score]         |
 |               |                 BytesProcessedExec                                                                                                                                             |

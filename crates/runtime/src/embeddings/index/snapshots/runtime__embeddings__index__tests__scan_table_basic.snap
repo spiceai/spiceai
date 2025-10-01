@@ -7,7 +7,8 @@ snapshot_kind: text
 | plan_type     | plan                                                                           |
 +---------------+--------------------------------------------------------------------------------+
 | logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                           |
-|               |   TableScan: my_vectored_table projection=[pk, body_embedding]                 |
+|               |   Projection: my_vectored_table.pk, my_vectored_table.body_embedding           |
+|               |     TableScan: my_vectored_table projection=[body_embedding, pk]               |
 | physical_plan | SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[false]       |
 |               |   PretendVectorIndex: projection=["pk", "body_embedding"] filter=[] limit=None |
 |               |                                                                                |

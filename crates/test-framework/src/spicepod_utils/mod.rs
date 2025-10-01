@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use app::App;
 use spicepod::{
@@ -41,7 +41,7 @@ pub fn from_app(app: App) -> SpicepodDefinition {
         runtime: app.runtime,
         extensions: app.extensions,
         management: app.management,
-        snapshots: app.snapshots,
+        snapshots: app.snapshots.map(Arc::unwrap_or_clone),
         secrets: app.secrets,
         views: app
             .views
