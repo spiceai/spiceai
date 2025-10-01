@@ -22,9 +22,8 @@ use arrow::array::{
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field, Schema};
-use async_openai::types::EmbeddingInput;
 use itertools::Itertools;
-use llms::embeddings::Embed;
+use llms::embeddings::{Embed, EmbeddingInput};
 use runtime_datafusion_index::Index;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
@@ -367,7 +366,7 @@ async fn embed_column(
     }
 
     let embedded_data = model
-        .embed_strings(column)
+        .embed(EmbeddingInput::StringArray(column))
         .await
         .context(FailedToEmbedSnafu)?;
 

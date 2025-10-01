@@ -274,7 +274,7 @@ impl SearchIndex for ChunkedSearchIndex {
             .collect::<Result<Vec<_>, ArrowError>>()?
             .into_iter()
             .filter(|(f, _)| {
-                *f.name() != Self::embedding_col(self.search_column().as_str())
+                *f.name() != embedding_col(self.search_column().as_str())
                     && *f.name() != Self::chunking_offset_col(self.search_column().as_str())
             })
             .unzip();
@@ -327,7 +327,7 @@ impl SearchIndex for ChunkedSearchIndex {
             }
         }
 
-        let embeddings = Self::embedding_col(self.search_column().as_str());
+        let embeddings = embedding_col(&self.search_column());
         if let Some(arr) = inner_rb.column_by_name(&embeddings) {
             let f = Arc::new(Field::new("item", arr.data_type().clone(), true));
             let arr = Arc::new(

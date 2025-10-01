@@ -25,8 +25,6 @@ use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
 use crate::embeddings::index::VectorScanTableProvider;
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::s3::S3Vector;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
@@ -39,6 +37,8 @@ use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
+#[cfg(feature = "s3_vectors")]
+use search::index::s3_vectors::S3Vector;
 use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
@@ -232,6 +232,7 @@ impl EmbeddingConnector {
                                 provider,
                                 chunking,
                                 vector_index,
+                                &config.model,
                                 dataset.params.get("file_format").map(String::as_str),
                             )
                             .await
@@ -282,10 +283,11 @@ impl EmbeddingConnector {
         mut provider: IndexedTableProvider,
         chunking: &EmbeddingChunkConfig,
         vector_index: S3Vector,
+        model_name: &String,
         file_format: Option<&str>,
     ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
         let chunker = construct_chunker(
-            &vector_index.model_name,
+            model_name.as_str(),
             &ChunkingConfig {
                 target_chunk_size: chunking.target_chunk_size,
                 overlap_size: chunking.overlap_size,
