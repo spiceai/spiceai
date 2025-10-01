@@ -25,6 +25,8 @@ use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
 use crate::embeddings::index::VectorScanTableProvider;
+#[cfg(feature = "s3_vectors")]
+use crate::embeddings::index::s3::S3Vector;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
@@ -43,6 +45,8 @@ use search::{
 };
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
+#[cfg(feature = "s3_vectors")]
+use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::collections::HashMap;
@@ -204,7 +208,7 @@ impl EmbeddingConnector {
                     .collect();
                 let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
                 for (column, config) in embedding_columns {
-                    let mut vector_index = super::index::s3::try_from_dataset(
+                    let vector_index = super::index::s3::try_from_dataset(
                         &dataset.name,
                         column,
                         config.clone(),
@@ -226,48 +230,32 @@ impl EmbeddingConnector {
                     if let Some(ref chunking) = config.chunking
                         && chunking.enabled
                     {
-                        let chunker = construct_chunker(
-                            config.model.as_str(),
-                            &ChunkingConfig {
-                                target_chunk_size: chunking.target_chunk_size,
-                                overlap_size: chunking.overlap_size,
-                                trim_whitespace: chunking.trim_whitespace,
-                                file_format: dataset.params.get("file_format").map(String::as_str),
-                            },
-                            &Arc::clone(&self.embedding_models),
-                        )
-                        .await
-                        .boxed()
-                        .map_err(|e| {
-                            DataConnectorError::UnableToConnectInternal {
+                        provider = self
+                            .construct_s3_chunked_vector_index(
+                                provider,
+                                chunking,
+                                vector_index,
+                                dataset.params.get("file_format").map(String::as_str),
+                            )
+                            .await
+                            .map_err(|e| DataConnectorError::UnableToConnectInternal {
                                 dataconnector: dataset.source().to_string(),
                                 connector_component: dataset.into(),
                                 source: e,
-                            }
-                        })?;
-
-                        let additional_meta = ChunkedSearchIndex::additional_metadata(
-                            vector_index.search_column().as_str(),
-                        );
-                        vector_index = vector_index.add_metadata(additional_meta);
-                        vector_index.primary_key =
-                            ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
-
-                        let idx = Arc::new(vector_index);
-                        let chunked_idx =
-                            ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);
-
-                        provider = provider.add_index(Arc::new(chunked_idx) as Arc<dyn Index>);
+                            })?;
                     } else {
                         let idx = Arc::new(vector_index);
                         let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
 
-                        // augment the previous underlying table provider with the vector index
-                        // this will result in recursive augmentation of the underlying table for N embedding columns
-                        provider.underlying = Arc::new(VectorScanTableProvider {
-                            table_provider: provider.underlying,
-                            index: vector_index,
-                        }) as Arc<dyn TableProvider>;
+                        provider.underlying = Arc::new(
+                            VectorScanTableProvider::try_new(provider.underlying, &vector_index)
+                                .boxed()
+                                .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                                    dataconnector: dataset.source().to_string(),
+                                    connector_component: dataset.into(),
+                                    source: e,
+                                })?,
+                        ) as Arc<dyn TableProvider>;
                         provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
                     }
                 }
@@ -289,6 +277,47 @@ impl EmbeddingConnector {
                 message: format!("Unknown vector engine '.vectors.engine: {unknown_engine}'"),
             }),
         }
+    }
+
+    #[cfg(feature = "s3_vectors")]
+    async fn construct_s3_chunked_vector_index(
+        &self,
+        mut provider: IndexedTableProvider,
+        chunking: &EmbeddingChunkConfig,
+        vector_index: S3Vector,
+        file_format: Option<&str>,
+    ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+        let chunker = construct_chunker(
+            &vector_index.model_name,
+            &ChunkingConfig {
+                target_chunk_size: chunking.target_chunk_size,
+                overlap_size: chunking.overlap_size,
+                trim_whitespace: chunking.trim_whitespace,
+                file_format,
+            },
+            &Arc::clone(&self.embedding_models),
+        )
+        .await
+        .boxed()?;
+
+        let additional_meta =
+            ChunkedSearchIndex::additional_metadata(vector_index.search_column().as_str());
+        let mut vector_index = vector_index.add_metadata(additional_meta);
+        vector_index.primary_key =
+            ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
+
+        let idx = Arc::new(vector_index);
+        let chunked_idx = Arc::new(ChunkedSearchIndex::new(
+            idx as Arc<dyn SearchIndex>,
+            chunker,
+        ));
+
+        if let Some(vector_index) = Arc::clone(&chunked_idx).as_vector_index() {
+            provider.underlying = Arc::new(
+                VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
+            ) as Arc<dyn TableProvider>;
+        }
+        Ok(provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn Index>))
     }
 
     async fn embed_change_envelope(

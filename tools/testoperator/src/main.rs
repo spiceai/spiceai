@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
             commands::env_export(&args.common).await?;
         }
         Commands::Run(TestCommands::Search(args)) => {
-            commands::search::run(&args).await?;
+            Box::pin(commands::search::run(&args)).await?;
         }
     }
 
