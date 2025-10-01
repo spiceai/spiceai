@@ -31,7 +31,6 @@ use async_openai::types::{
 };
 
 use datafusion::common::cast::as_string_array;
-use datafusion::common::utils::take_function_args;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
@@ -182,22 +181,15 @@ impl AsyncScalarUDFImpl for Ai {
             );
         };
 
-        // Convert arguments to arrays for consistency
-        let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        // Only convert the message argument to array (not the model name)
+        // The model name is always a scalar and shouldn't be part of the columnar data
+        let message_array = match &args.args[0] {
+            ColumnarValue::Array(arr) => arr.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+        };
 
-        match args_arrays.len() {
-            1 => {
-                let [message_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), &model_name, message_array)
-                    .await
-            }
-            2 => {
-                let [message_array, _model_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), &model_name, message_array)
-                    .await
-            }
-            _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
-        }
+        self.process_messages(Arc::clone(model), &model_name, message_array)
+            .await
     }
 }
 
@@ -1003,6 +995,199 @@ mod tests {
             string_array.value(0),
             "Response from test-model: Hello test"
         );
+    }
+
+    #[tokio::test]
+    async fn test_invoke_with_columnar_message_and_scalar_model() {
+        // This test verifies the fix for the "all columns in a record batch must have
+        // the same length" error. When calling ai(column, 'model'), the first argument
+        // is a columnar array and the second is a scalar model name.
+
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Simulate a query like: SELECT ai(title, 'gpt-4') FROM pulls LIMIT 3
+        // where title is a column (array) and 'gpt-4' is a scalar literal
+        let message_array = ColumnarValue::Array(Arc::new(arrow::array::StringArray::from(vec![
+            Some("First message"),
+            Some("Second message"),
+            Some("Third message"),
+        ])));
+        let model_name_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_array, model_name_scalar],
+            arg_fields: vec![],
+            number_rows: 3,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        // This should not fail with "all columns in a record batch must have the same length"
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "invoke_async_with_args should handle columnar message + scalar model: {:?}",
+            result.err()
+        );
+
+        let response_array = result.unwrap();
+        let string_array = response_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        // Verify we got 3 responses (matching the input array length)
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "Response from gpt-4: First message");
+        assert_eq!(string_array.value(1), "Response from gpt-4: Second message");
+        assert_eq!(string_array.value(2), "Response from gpt-4: Third message");
+    }
+
+    #[tokio::test]
+    async fn test_invoke_with_scalar_message_and_scalar_model_multiple_rows() {
+        // This test verifies the fix for queries like:
+        // SELECT LocationID, ai('hi', 'gpt-4o') FROM taxi_zones_direct LIMIT 5
+        // where both arguments are scalar literals but need to be applied to multiple rows
+
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Simulate: SELECT ai('hi', 'gpt-4') FROM table LIMIT 5
+        // Both arguments are scalars, but the function is called for 5 rows
+        let message_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("hi".to_string())));
+        let model_name_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_scalar, model_name_scalar],
+            arg_fields: vec![],
+            number_rows: 5,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        // This should not fail with "all columns in a record batch must have the same length"
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "invoke_async_with_args should handle scalar message + scalar model for multiple rows: {:?}",
+            result.err()
+        );
+
+        let response_array = result.unwrap();
+        let string_array = response_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        // Verify we got 5 responses (matching the number_rows)
+        assert_eq!(string_array.len(), 5);
+        // All responses should be the same since the input is the same
+        for i in 0..5 {
+            assert_eq!(string_array.value(i), "Response from gpt-4: hi");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invoke_with_mixed_array_and_scalars() {
+        // This test covers various combinations of array and scalar arguments
+        // to ensure proper handling in all cases
+
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Test 1: Array message with explicit model (as in: SELECT ai(column, 'model'))
+        let message_array = ColumnarValue::Array(Arc::new(arrow::array::StringArray::from(vec![
+            Some("Query 1"),
+            Some("Query 2"),
+        ])));
+        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_array, model_scalar],
+            arg_fields: vec![],
+            number_rows: 2,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await
+            .expect("Array message + scalar model should work");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(string_array.len(), 2);
+        assert_eq!(string_array.value(0), "Response from gpt-4: Query 1");
+        assert_eq!(string_array.value(1), "Response from gpt-4: Query 2");
+
+        // Test 2: Array message with nulls
+        let message_array_with_nulls =
+            ColumnarValue::Array(Arc::new(arrow::array::StringArray::from(vec![
+                Some("Hello"),
+                None,
+                Some("World"),
+            ])));
+        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("claude".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_array_with_nulls, model_scalar],
+            arg_fields: vec![],
+            number_rows: 3,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await
+            .expect("Array with nulls should work");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "Response from claude: Hello");
+        assert!(string_array.is_null(1));
+        assert_eq!(string_array.value(2), "Response from claude: World");
+
+        // Test 3: Single scalar message expanded to multiple rows (the original bug case)
+        let single_message =
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("Same message".to_string())));
+        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![single_message, model_scalar],
+            arg_fields: vec![],
+            number_rows: 10, // Expanded to 10 rows
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await
+            .expect("Scalar expanded to multiple rows should work");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(string_array.len(), 10);
+        // All should have the same response
+        for i in 0..10 {
+            assert_eq!(
+                string_array.value(i),
+                "Response from gpt-4: Same message",
+                "Row {} should have the same response",
+                i
+            );
+        }
     }
 
     #[tokio::test]
