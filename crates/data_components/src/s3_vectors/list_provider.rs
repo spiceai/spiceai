@@ -168,8 +168,19 @@ impl TableProvider for S3VectorsListTable {
             })
             .collect();
 
+        let projected_schema = match projection {
+            Some(proj) => {
+                let fields = proj
+                    .iter()
+                    .map(|&i| self.table.schema.field(i).clone())
+                    .collect::<Vec<_>>();
+                Arc::new(Schema::new(fields))
+            }
+            None => Arc::clone(&self.table.schema),
+        };
+
         if index_names.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema()))));
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -196,7 +207,9 @@ impl TableProvider for S3VectorsListTable {
         }
 
         let union_plan = match index_plans.len() {
-            0 => return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema())))),
+            0 => {
+                return Ok(Arc::new(EmptyExec::new(projected_schema)));
+            }
             1 => return Ok(index_plans.pop().unwrap()), // SAFETY: checked the length
             _ => Arc::new(UnionExec::new(index_plans)),
         };

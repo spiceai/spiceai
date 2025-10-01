@@ -241,7 +241,7 @@ impl TableProvider for S3VectorsQueryTable {
             .collect();
 
         if index_names.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema()))));
+            return Ok(Arc::new(EmptyExec::new(self.schema())));
         }
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -274,7 +274,9 @@ impl TableProvider for S3VectorsQueryTable {
         }
 
         let union_plan = match index_plans.len() {
-            0 => return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema())))),
+            0 => {
+                return Ok(Arc::new(EmptyExec::new(self.schema())));
+            }
             1 => return Ok(index_plans.pop().unwrap()), // SAFETY: checked the length
             _ => Arc::new(UnionExec::new(index_plans)),
         };
