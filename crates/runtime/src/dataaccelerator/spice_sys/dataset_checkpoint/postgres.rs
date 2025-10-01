@@ -19,11 +19,11 @@ use std::time::SystemTime;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 
-use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result, SCHEMA_MIGRATION_01_STMT};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Error, Result, SCHEMA_MIGRATION_01_STMT};
 
 impl DatasetCheckpoint {
     pub(super) async fn init_postgres(pool: &PostgresConnectionPool) -> Result<()> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
 
         let create_table = format!(
             "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
@@ -35,21 +35,21 @@ impl DatasetCheckpoint {
         conn.conn
             .execute(&create_table, &[])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }
 
     pub(super) async fn exists_postgres(&self, pool: &PostgresConnectionPool) -> Result<bool> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
         let query =
             format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = $1 LIMIT 1");
-        let stmt = conn.conn.prepare(&query).await.map_err(|e| e.to_string())?;
+        let stmt = conn.conn.prepare(&query).await.map_err(Error::external)?;
         let row = conn
             .conn
             .query_opt(&stmt, &[&self.dataset_name])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
         Ok(row.is_some())
     }
 
@@ -57,17 +57,17 @@ impl DatasetCheckpoint {
         &self,
         pool: &PostgresConnectionPool,
     ) -> Result<Option<SystemTime>> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
 
         let query = format!(
             "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
-        let stmt = conn.conn.prepare(&query).await.map_err(|e| e.to_string())?;
+        let stmt = conn.conn.prepare(&query).await.map_err(Error::external)?;
         let rows = conn
             .conn
             .query(&stmt, &[&self.dataset_name])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
@@ -81,7 +81,7 @@ impl DatasetCheckpoint {
         pool: &PostgresConnectionPool,
         schema: &SchemaRef,
     ) -> Result<()> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
         let schema_json = Self::serialize_schema(schema)?;
 
         let upsert = format!(
@@ -93,17 +93,17 @@ impl DatasetCheckpoint {
         conn.conn
             .execute(&upsert, &[&self.dataset_name, &schema_json])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }
 
     pub(super) async fn migrate_postgres(pool: &PostgresConnectionPool) -> Result<()> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
         conn.conn
             .execute(SCHEMA_MIGRATION_01_STMT, &[])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
         Ok(())
     }
 
@@ -111,14 +111,14 @@ impl DatasetCheckpoint {
         &self,
         pool: &PostgresConnectionPool,
     ) -> Result<Option<SchemaRef>> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
         let query =
             format!("SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = $1");
         let row = conn
             .conn
             .query_opt(&query, &[&self.dataset_name])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         match row {
             Some(row) => {
