@@ -35,7 +35,7 @@ description: "Query: tpch_q13"
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                         |
 |               |                             BytesProcessedExec                                                                                                                                          |
 |               |                               CooperativeExec                                                                                                                                           |
-|               |                                 IcebergTableScan projection:[c_custkey] predicate:[]                                                                                                    |
+|               |                                 IcebergTableScan projection:[c_custkey] predicate:[] limit:[]                                                                                           |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                       |
 |               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 16), input_partitions=16                                                                                      |
 |               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                                                                   |
@@ -44,6 +44,6 @@ description: "Query: tpch_q13"
 |               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                                                                     |
 |               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                 |
 |               |                                     CooperativeExec                                                                                                                                     |
-|               |                                       IcebergTableScan projection:[o_orderkey,o_custkey,o_comment] predicate:[]                                                                         |
+|               |                                       IcebergTableScan projection:[o_orderkey,o_custkey,o_comment] predicate:[] limit:[]                                                                |
 |               |                                                                                                                                                                                         |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

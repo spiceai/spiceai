@@ -20,14 +20,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result, SCHEMA_MIGRATION_01_STMT};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Error, Result, SCHEMA_MIGRATION_01_STMT};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 impl DatasetCheckpoint {
     pub(super) fn init_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         let create_table = format!(
@@ -39,49 +39,45 @@ impl DatasetCheckpoint {
         );
         duckdb_conn
             .execute(&create_table, [])
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }
 
     pub(super) fn exists_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<bool> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         let query = format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
-        let mut stmt = duckdb_conn.prepare(&query).map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query([&self.dataset_name])
-            .map_err(|e| e.to_string())?;
+        let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
+        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
-        Ok(rows.next().map_err(|e| e.to_string())?.is_some())
+        Ok(rows.next().map_err(Error::external)?.is_some())
     }
 
     pub(super) fn last_checkpoint_time_duckdb(
         &self,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<SystemTime>> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         let query = format!(
             "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
-        let mut stmt = duckdb_conn.prepare(&query).map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query([&self.dataset_name])
-            .map_err(|e| e.to_string())?;
+        let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
+        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
         let checkpoint_time_micros: Option<u64> = rows
             .next()
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .map(|row| row.get(0))
             .transpose()
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         if let Some(checkpoint_time_micros) = checkpoint_time_micros {
             let duration = Duration::from_micros(checkpoint_time_micros);
@@ -96,9 +92,9 @@ impl DatasetCheckpoint {
         pool: &Arc<DuckDbConnectionPool>,
         schema: &SchemaRef,
     ) -> Result<()> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         let schema_json = Self::serialize_schema(schema)?;
@@ -110,20 +106,20 @@ impl DatasetCheckpoint {
         );
         duckdb_conn
             .execute(&upsert, [&self.dataset_name, &schema_json])
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }
 
     pub(super) fn migrate_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         duckdb_conn
             .execute(SCHEMA_MIGRATION_01_STMT, [])
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }
@@ -132,21 +128,19 @@ impl DatasetCheckpoint {
         &self,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Result<Option<SchemaRef>> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         let query = format!(
             "SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
-        let mut stmt = duckdb_conn.prepare(&query).map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query([&self.dataset_name])
-            .map_err(|e| e.to_string())?;
+        let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
+        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let schema_json: Option<String> = row.get(0).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(Error::external)? {
+            let schema_json: Option<String> = row.get(0).map_err(Error::external)?;
             match schema_json {
                 Some(json) => Ok(Some(Self::deserialize_schema(&json)?)),
                 None => Ok(None),
