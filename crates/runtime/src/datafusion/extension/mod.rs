@@ -25,9 +25,12 @@ use datafusion::{
 };
 use datafusion_federation::FederatedPlanner;
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
+
+use self::cache_invalidation::{CacheInvalidationExtensionPlanner, CacheInvalidationNode};
 use std::sync::Arc;
 
 pub mod bytes_processed;
+pub mod cache_invalidation;
 
 #[derive(Debug, Default)]
 pub struct SpiceQueryPlanner {}
@@ -50,6 +53,7 @@ impl QueryPlanner for SpiceQueryPlanner {
             Arc::new(FederatedPlanner::new()),
             Arc::new(SpiceExtensionPlanner::new()),
             Arc::new(IndexTableScanExtensionPlanner::new()),
+            Arc::new(CacheInvalidationExtensionPlanner::new()),
         ]);
         physical_planner
             .create_physical_plan(logical_plan, session_state)

@@ -47,7 +47,10 @@ use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
-    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
+    extension::{
+        SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule,
+        cache_invalidation::CacheInvalidationOptimizerRule,
+    },
     schema::SpiceSchemaProvider,
 };
 
@@ -177,6 +180,13 @@ impl DataFusionBuilder {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
+
+        // Add cache invalidation optimizer rule if caching is enabled
+        if let Some(caching) = &self.caching {
+            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
+                Arc::downgrade(caching),
+            )));
+        };
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
