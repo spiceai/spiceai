@@ -12178,6 +12178,7 @@ dependencies = [
  "object_store",
  "snafu",
  "spicepod",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
