@@ -41,7 +41,6 @@ pub fn from_app(app: App) -> SpicepodDefinition {
         runtime: app.runtime,
         extensions: app.extensions,
         management: app.management,
-        snapshots: app.snapshots,
         secrets: app.secrets,
         views: app
             .views

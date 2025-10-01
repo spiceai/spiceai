@@ -32,7 +32,6 @@ use spicepod::{
         model::Model,
         runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
-        snapshot::Snapshots,
         tool::Tool,
         view::View,
         worker::Worker,
@@ -72,8 +71,6 @@ pub struct App {
     pub runtime: Runtime,
 
     pub management: Option<Management>,
-
-    pub snapshots: Option<Snapshots>,
 }
 
 impl App {
@@ -114,7 +111,6 @@ pub struct AppBuilder {
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
     management: Option<Management>,
-    snapshots: Option<Snapshots>,
 }
 
 impl AppBuilder {
@@ -134,7 +130,6 @@ impl AppBuilder {
             spicepods: vec![],
             runtime: Runtime::default(),
             management: None,
-            snapshots: None,
         }
     }
 
@@ -144,7 +139,6 @@ impl AppBuilder {
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
         self.management.clone_from(&spicepod.management);
-        self.snapshots.clone_from(&spicepod.snapshots);
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
@@ -288,7 +282,6 @@ impl AppBuilder {
             spicepods: self.spicepods,
             runtime: self.runtime,
             management: self.management,
-            snapshots: self.snapshots,
         }
     }
 
@@ -307,7 +300,6 @@ impl AppBuilder {
         let runtime = spicepod.runtime.clone();
         let extensions = spicepod.extensions.clone();
         let management = spicepod.management.clone();
-        let snapshots = spicepod.snapshots.clone();
         let mut catalogs: Vec<Catalog> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
@@ -404,14 +396,6 @@ impl AppBuilder {
                 });
             }
 
-            if dependent_spicepod.snapshots.is_some() {
-                in_tracing_context(|| {
-                    tracing::warn!(
-                        "Spicepod dependency '{dependency}' has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. '{dependency}' snapshots configuration will be ignored."
-                    );
-                });
-            }
-
             spicepods.push(dependent_spicepod);
         }
 
@@ -432,7 +416,6 @@ impl AppBuilder {
             spicepods,
             runtime,
             management,
-            snapshots,
         })
     }
 }
