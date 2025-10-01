@@ -19,7 +19,7 @@ use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path as ObjectPath};
 use snafu::prelude::*;
-use spicepod::component::snapshot::BootstrapOnFailureBehavior;
+use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::ParamValue};
 use tokio::fs;
 use url::Url;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
@@ -102,17 +102,14 @@ impl SnapshotManager {
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
 
-        let snapshot_location = match &snapshot_config.location {
-            Some(loc) => loc,
-            None => {
-                tracing::warn!(
-                    "Snapshots are enabled for dataset {dataset_name} but no location is configured"
-                );
-                return None;
-            }
+        let Some(snapshot_location) = &snapshot_config.location else {
+            tracing::warn!(
+                "Snapshots are enabled for dataset {dataset_name} but no location is configured"
+            );
+            return None;
         };
 
-        let snapshots_location_url = match Url::from_str(&snapshot_location) {
+        let snapshots_location_url = match Url::from_str(snapshot_location) {
             Ok(url) => url,
             Err(e) => {
                 tracing::error!(
@@ -126,7 +123,7 @@ impl SnapshotManager {
             .as_ref()
             .params
             .as_ref()
-            .and_then(|params| params.data.get("s3_region").map(|pv| pv.as_string()));
+            .and_then(|params| params.data.get("s3_region").map(ParamValue::as_string));
 
         let (store, path) = match (
             snapshots_location_url.scheme(),
@@ -361,27 +358,24 @@ impl SnapshotManager {
             .await
             .map_err(|source| SnapshotDownloadError::CheckpointerInit { source })?;
 
-        match checkpointer
+        if let Some(schema) = checkpointer
             .get_schema()
             .await
             .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?
         {
-            Some(schema) => {
-                tracing::info!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location.to_string(),
-                    "Snapshot schema verified."
-                );
-                Ok(schema)
-            }
-            None => {
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location.to_string(),
-                    "Snapshot schema not found."
-                );
-                Err(SnapshotDownloadError::MissingSchema { path: path_display })
-            }
+            tracing::info!(
+                dataset = %self.dataset_name,
+                snapshot = %location.to_string(),
+                "Snapshot schema verified."
+            );
+            Ok(schema)
+        } else {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                snapshot = %location.to_string(),
+                "Snapshot schema not found."
+            );
+            Err(SnapshotDownloadError::MissingSchema { path: path_display })
         }
     }
 

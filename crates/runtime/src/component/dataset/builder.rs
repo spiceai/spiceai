@@ -80,6 +80,13 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
+        let acceleration_snapshot = dataset
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
+                a.snapshots
+            });
+
         let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -125,12 +132,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
-            acceleration_snapshot: dataset
-                .acceleration
-                .as_ref()
-                .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
-                    a.snapshots
-                }),
+            acceleration_snapshot,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
