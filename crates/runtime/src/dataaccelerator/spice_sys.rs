@@ -141,12 +141,6 @@ pub enum OpenOption {
     OpenExisting,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub enum OpenOption {
-    CreateIfNotExists,
-    OpenExisting,
-}
-
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     open_option: OpenOption,
