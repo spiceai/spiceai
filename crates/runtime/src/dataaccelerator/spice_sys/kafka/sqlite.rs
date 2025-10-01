@@ -122,6 +122,7 @@ mod tests {
             acceleration::{Acceleration, Engine, Mode},
             builder::DatasetBuilder,
         },
+        dataaccelerator::spice_sys::OpenOption,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -168,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_roundtrip() {
         let ds = create_test_dataset("test_sqlite_roundtrip").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
 
@@ -188,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_metadata_overwrite() {
         let ds = create_test_dataset("test_sqlite_metadata_overwrite").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
         let mut test_metadata = create_test_metadata();
@@ -214,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_get_nonexistent() {
         let ds = create_test_dataset("test_sqlite_get_nonexistent").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
 

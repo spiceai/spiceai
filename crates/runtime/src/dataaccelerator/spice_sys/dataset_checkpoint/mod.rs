@@ -24,7 +24,7 @@ limitations under the License.
 use std::{sync::Arc, time::SystemTime};
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
-use crate::dataaccelerator::AccelerationSource;
+use crate::dataaccelerator::{AccelerationSource, spice_sys::OpenOption};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use serde_json;
@@ -73,8 +73,11 @@ pub struct DatasetCheckpoint {
 }
 
 impl DatasetCheckpoint {
-    pub async fn try_new(source: &dyn AccelerationSource) -> Result<Arc<dyn DatasetCheckpointer>> {
-        let acceleration_connection = acceleration_connection(source, true).await?;
+    pub async fn try_new(
+        source: &dyn AccelerationSource,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn DatasetCheckpointer>> {
+        let acceleration_connection = acceleration_connection(source, open_option).await?;
         Self::init(&acceleration_connection).await?;
         Ok(Arc::new(Self {
             dataset_name: source.name().to_string(),
