@@ -1007,6 +1007,34 @@ mod tests {
 
         #[tokio::test]
         #[ignore] // Memory issues on some systems - test logic is sound
+        async fn test_explain_with_models_two_sources() {
+            // Test with two different AI sources (OpenAI and Anthropic)
+            let registry = Arc::new(std::sync::RwLock::new(
+                vec![
+                    ("gpt-4o".to_string(), "openai".to_string()),
+                    ("claude-3-5-sonnet".to_string(), "anthropic".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+
+            let df = create_test_datafusion(Some(registry));
+
+            let plan = get_explain_plan(
+                &df,
+                "EXPLAIN SELECT \
+                    id, \
+                    ai(name, 'gpt-4o') as openai_result, \
+                    ai(description, 'claude-3-5-sonnet') as anthropic_result \
+                FROM test_data",
+            )
+            .await;
+
+            insta::assert_snapshot!("explain_with_models_two_sources", plan);
+        }
+
+        #[tokio::test]
+        #[ignore] // Memory issues on some systems - test logic is sound
         async fn test_explain_with_models_multiple_sources() {
             // Test with multiple AI sources (OpenAI, Anthropic, xAI)
             let registry = Arc::new(std::sync::RwLock::new(
