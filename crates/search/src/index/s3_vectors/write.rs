@@ -364,7 +364,7 @@ fn update_embedding_column_in_batch(
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
 ) -> Result<RecordBatch, Box<Error>> {
-    let embedding_column_name = embedding_col(&embedded_column_name);
+    let embedding_column_name = embedding_col(embedded_column_name);
 
     let schema = record.schema();
     let mut columns = record.columns().to_vec();

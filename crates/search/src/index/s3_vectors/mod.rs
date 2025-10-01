@@ -284,6 +284,7 @@ fn data_type_to_union_variant(dt: &DataType) -> &str {
     }
 }
 
+#[must_use]
 pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
     match primary_key {
         [f] => vec![Expr::Alias(Alias::new(

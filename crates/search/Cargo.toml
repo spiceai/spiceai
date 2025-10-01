@@ -18,7 +18,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 datafusion-functions-json = { workspace = true }
-data_components  = { path = "../data_components" }
+data_components  = { path = "../data_components", features = ["s3_vectors"] }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 chunking = { path = "../chunking" }
 serde_json.workspace = true
