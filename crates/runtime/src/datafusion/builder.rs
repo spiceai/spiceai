@@ -186,7 +186,7 @@ impl DataFusionBuilder {
             ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
                 Arc::downgrade(caching),
             )));
-        };
+        }
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();

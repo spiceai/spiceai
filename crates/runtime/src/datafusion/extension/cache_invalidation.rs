@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Cache invalidation optimizer rule for DataFusion
+//! Cache invalidation optimizer rule for `DataFusion`
 //!
 //! Automatically injects cache invalidation logic after successful write operations
 
@@ -46,7 +46,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 
-/// [`OptimizerRule`] that detects write operations in a DataFusion logical plan and injects a cache invalidation node [`CacheInvalidationNode`].
+/// [`OptimizerRule`] that detects write operations in a `DataFusion` logical plan and injects a cache invalidation node [`CacheInvalidationNode`].
 ///
 /// # See also
 ///
@@ -100,7 +100,7 @@ impl OptimizerRule for CacheInvalidationOptimizerRule {
                     node: Arc::new(CacheInvalidationNode::new(
                         LogicalPlan::Dml(dml),
                         table_name,
-                        self.caching.clone(),
+                        Weak::clone(&self.caching),
                     )),
                 };
 
@@ -173,12 +173,12 @@ impl UserDefinedLogicalNodeCore for CacheInvalidationNode {
         assert_eq!(inputs.len(), 1, "should have one input");
         assert_eq!(exprs.len(), 0, "should have no expressions");
         let Some(input) = inputs.into_iter().next() else {
-            panic!("should have one input");
+            unreachable!("should have one input");
         };
         Ok(Self {
             input,
             table: self.table.clone(),
-            caching: self.caching.clone(),
+            caching: Weak::clone(&self.caching),
         })
     }
 }
@@ -296,7 +296,7 @@ impl ExecutionPlan for CacheInvalidationExec {
         Ok(Arc::new(Self::new(
             input,
             self.table.clone(),
-            self.caching.clone(),
+            Weak::clone(&self.caching),
         )))
     }
 
@@ -309,7 +309,7 @@ impl ExecutionPlan for CacheInvalidationExec {
         let schema = self.input_exec.schema();
 
         let table = self.table.clone();
-        let caching = self.caching.clone();
+        let caching = Weak::clone(&self.caching);
 
         // Create an async stream that wraps the input and handles cache invalidation
         let stream = stream! {
@@ -377,12 +377,12 @@ impl ExtensionPlanner for CacheInvalidationExtensionPlanner {
         let physical_input = &physical_inputs[0];
 
         let exec = CacheInvalidationExec::new(
-            physical_input.clone(),
+            Arc::clone(physical_input),
             cache_node.table.clone(),
-            cache_node.caching.clone(),
+            Weak::clone(&cache_node.caching),
         );
 
-        return Ok(Some(Arc::new(exec)));
+        Ok(Some(Arc::new(exec)))
     }
 }
 
@@ -429,7 +429,7 @@ mod tests {
         df.ctx
             .register_table(
                 "test_table",
-                Arc::<data_components::arrow::write::MemTable>::clone(&mem_table),
+                Arc::clone(&mem_table) as Arc<dyn crate::datafusion::TableProvider>,
             )
             .expect("table should be registered");
 

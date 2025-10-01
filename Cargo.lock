@@ -6859,7 +6859,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2b23c10046b38a9d521c8328ffa49675d309ed24#2b23c10046b38a9d521c8328ffa49675d309ed24"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cdb23210224c2a3b2a8f0c82635d393df86ada6d#cdb23210224c2a3b2a8f0c82635d393df86ada6d"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6915,7 +6915,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2b23c10046b38a9d521c8328ffa49675d309ed24#2b23c10046b38a9d521c8328ffa49675d309ed24"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cdb23210224c2a3b2a8f0c82635d393df86ada6d#cdb23210224c2a3b2a8f0c82635d393df86ada6d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6930,7 +6930,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2b23c10046b38a9d521c8328ffa49675d309ed24#2b23c10046b38a9d521c8328ffa49675d309ed24"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cdb23210224c2a3b2a8f0c82635d393df86ada6d#cdb23210224c2a3b2a8f0c82635d393df86ada6d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6956,7 +6956,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2b23c10046b38a9d521c8328ffa49675d309ed24#2b23c10046b38a9d521c8328ffa49675d309ed24"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cdb23210224c2a3b2a8f0c82635d393df86ada6d#cdb23210224c2a3b2a8f0c82635d393df86ada6d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6971,7 +6971,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2b23c10046b38a9d521c8328ffa49675d309ed24#2b23c10046b38a9d521c8328ffa49675d309ed24"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cdb23210224c2a3b2a8f0c82635d393df86ada6d#cdb23210224c2a3b2a8f0c82635d393df86ada6d"
 dependencies = [
  "tracing",
  "tracing-subscriber",
