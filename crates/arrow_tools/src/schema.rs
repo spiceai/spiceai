@@ -206,6 +206,54 @@ pub fn schema_difference(expected: &Schema, actual: &Schema) -> Option<String> {
     }
 }
 
+/// Returns associated `DataFusion` SQL type name for provided Arrow `DataType`.
+/// `<https://datafusion.apache.org/user-guide/sql/data_types.html>`
+#[must_use]
+pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
+    // For non-complex types, `to_string()` can be used to return type information, but for consistency and control over naming,
+    // explicit matching and type names are used.
+    match data_type {
+        DataType::Null => "NULL",
+        DataType::Boolean => "BOOLEAN",
+        DataType::Int8 => "TINYINT",
+        DataType::Int16 => "SMALLINT",
+        DataType::Int32 => "INTEGER",
+        DataType::Int64 => "BIGINT",
+        DataType::UInt8 => "TINYINT UNSIGNED",
+        DataType::UInt16 => "SMALLINT UNSIGNED",
+        DataType::UInt32 => "INTEGER UNSIGNED",
+        DataType::UInt64 => "BIGINT UNSIGNED",
+        // There is no direct mapping for Float16 in DataFusion SQL, so we use REAL.
+        DataType::Float16 | DataType::Float32 => "REAL",
+        DataType::Float64 => "DOUBLE",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL",
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR",
+        DataType::Timestamp(_, _) => "TIMESTAMP",
+        DataType::Date32 | DataType::Date64 => "DATE",
+        DataType::Time32(_) | DataType::Time64(_) => "TIME",
+        DataType::Interval(_) => "INTERVAL",
+        DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView => "BYTEA",
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::LargeListView(_)
+        | DataType::ListView(_) => "ARRAY",
+
+        DataType::Struct(_) => "STRUCT",
+        // The following types are not durectly supported in SQL queries by DataFusion,
+        // Clients must treat them as text or use custom logic to handle them.
+        // `<https://github.com/apache/datafusion/blob/85eebcd25dfbe8e2d2d75d85b8683de8be4851e8/datafusion/sql/src/planner.rs#L720>`
+        DataType::Map(_, _) => "MAP",
+        DataType::Duration(_) => "DURATION",
+        DataType::Union(_, _) => "UNION",
+        DataType::Dictionary(_, _) => "DICTIONARY",
+        DataType::RunEndEncoded(_, _) => "RUNENDENCODED",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
