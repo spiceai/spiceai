@@ -27,8 +27,8 @@ use crate::component::eval::Eval;
 use crate::component::is_default;
 use crate::component::management::Management;
 use crate::component::runtime::Runtime;
-use crate::component::snapshot::Snapshots;
 use crate::component::secret::Secret;
+use crate::component::snapshot::Snapshots;
 use crate::component::tool::Tool;
 use crate::component::{
     ComponentOrReference, dataset::Dataset, model::Model, view::View, worker::Worker,
