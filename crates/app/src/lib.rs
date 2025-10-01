@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use snafu::prelude::*;
 pub use spicepod;
@@ -73,7 +73,7 @@ pub struct App {
 
     pub management: Option<Management>,
 
-    pub snapshots: Option<Snapshots>,
+    pub snapshots: Option<Arc<Snapshots>>,
 }
 
 impl App {
@@ -272,6 +272,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_snapshots(mut self, snapshots: Snapshots) -> AppBuilder {
+        self.snapshots = Some(snapshots);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
@@ -288,7 +294,7 @@ impl AppBuilder {
             spicepods: self.spicepods,
             runtime: self.runtime,
             management: self.management,
-            snapshots: self.snapshots,
+            snapshots: self.snapshots.map(Arc::new),
         }
     }
 
@@ -432,7 +438,7 @@ impl AppBuilder {
             spicepods,
             runtime,
             management,
-            snapshots,
+            snapshots: snapshots.map(Arc::new),
         })
     }
 }
