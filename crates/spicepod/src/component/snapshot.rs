@@ -31,7 +31,7 @@ pub enum BootstrapOnFailureBehavior {
 }
 
 /// Datasets accelerated using a file-mode acceleration
-/// engine (i.e. Sqlite or DuckDB) can bootstrap from a DB
+/// engine (i.e. `Sqlite` or `DuckDB`) can bootstrap from a DB
 /// file on object storage (i.e. S3) if the acceleration file
 /// does not exist on startup using this configuration.
 ///
@@ -46,7 +46,7 @@ pub struct Snapshots {
 
     /// The object store location pointing to a folder
     /// containing the dataset snapshots.
-    /// i.e. s3://my-bucket/spice/snapshots/
+    /// i.e. `s3://my-bucket/spice/snapshots/`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
 

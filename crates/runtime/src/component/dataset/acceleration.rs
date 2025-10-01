@@ -260,6 +260,7 @@ pub enum SnapshotBehavior {
 }
 
 impl SnapshotBehavior {
+    #[must_use]
     pub fn bootstrap_enabled(&self) -> bool {
         matches!(
             self,
@@ -267,6 +268,7 @@ impl SnapshotBehavior {
         )
     }
 
+    #[must_use]
     pub fn create_enabled(&self) -> bool {
         matches!(
             self,
