@@ -24,7 +24,7 @@ limitations under the License.
 use std::{sync::Arc, time::SystemTime};
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
-use crate::dataaccelerator::{AccelerationSource, spice_sys::OpenOption};
+use crate::dataaccelerator::{AccelerationSource, OpenOption};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use serde_json;

@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
+use crate::dataaccelerator::spice_sys;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataaccelerator::spice_sys::{self, OpenOption};
 use crate::dataconnector::ConnectorComponent;
