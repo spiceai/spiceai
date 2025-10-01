@@ -29,9 +29,9 @@ pub(crate) mod dispatch;
 pub(crate) mod evals;
 pub(crate) mod http;
 pub(crate) mod load;
+pub(crate) mod search;
 pub(crate) mod throughput;
 mod util;
-pub(crate) mod vector_search;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
 pub(crate) async fn get_app_and_start_request(

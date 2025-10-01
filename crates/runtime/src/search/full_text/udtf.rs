@@ -31,33 +31,28 @@ use arrow_schema::DataType;
 use datafusion::common::exec_err;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
-    common::{Column, Constraints, Statistics},
-    datasource::TableType,
+    catalog::{TableFunctionImpl, TableProvider},
+    common::Column,
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
     sql::TableReference,
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
+use moka::future::FutureExt;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
     provider::SearchQueryProvider,
 };
 use std::any::Any;
 use std::sync::LazyLock;
-use std::{
-    borrow::Cow,
-    sync::{Arc, Weak},
-};
+use std::sync::{Arc, Weak};
 
+use crate::request::{AsyncMarker, RequestContext};
 use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
-    request::{AsyncMarker, RequestContext},
     search::util::{find_index_in_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 
@@ -280,14 +275,21 @@ impl TableFunctionImpl for TextSearchTableFunc {
         let mut fts_index = fts_index.clone();
         fts_index.search_fields = vec![column];
 
-        Ok(Arc::new(TextSearchIndexProviderWrapper {
-            inner: Arc::new(SearchQueryProvider::try_from_index(
+        Ok(Arc::new(
+            SearchQueryProvider::try_from_index(
                 &(Arc::new(fts_index) as Arc<dyn SearchIndex>),
                 table_provider,
                 args.query.as_str(),
                 args.limit,
-            )?),
-        }))
+            )?
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_text_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
+        ))
     }
 }
 
@@ -310,74 +312,5 @@ impl ScalarUDFImpl for TextSearchTableFunc {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         Self::scalar_invocation_error()
-    }
-}
-
-#[derive(Debug)]
-struct TextSearchIndexProviderWrapper {
-    inner: Arc<SearchQueryProvider>,
-}
-
-#[async_trait::async_trait]
-impl TableProvider for TextSearchIndexProviderWrapper {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self.inner.as_any()
-    }
-
-    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, insert_op).await
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let request_context = RequestContext::current(AsyncMarker::new().await);
-        telemetry::track_text_search(&request_context.to_dimensions());
-
-        self.inner.scan(state, projection, filters, limit).await
     }
 }
