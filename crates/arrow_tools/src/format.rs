@@ -332,11 +332,12 @@ fn hashmap_to_string(map: &HashMap<String, String>, separator: &str) -> String {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort(); // To make this function reproducible
     keys.iter()
-        .map(|k| format!("* {}: {}", k, map.get(*k).unwrap()))
+        .map(|k| format!("* {}: {}", k, map.get(*k).map_or("", String::as_str)))
         .collect::<Vec<_>>()
         .join(separator)
 }
 
+#[allow(clippy::doc_lazy_continuation)]
 /// Creates a markdown representation of tables' schemas in the following format:
 ///
 /// **Table: users**
