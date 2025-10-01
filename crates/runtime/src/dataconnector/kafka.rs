@@ -35,10 +35,7 @@ use crate::{
         dataset::{Dataset, acceleration::RefreshMode},
         metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
     },
-    dataaccelerator::{
-        OpenOption,
-        spice_sys::{self, kafka::KafkaSys},
-    },
+    dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
     },

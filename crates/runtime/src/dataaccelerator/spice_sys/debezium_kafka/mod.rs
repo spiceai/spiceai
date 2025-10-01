@@ -26,7 +26,7 @@ limitations under the License.
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{
-    component::dataset::Dataset, dataaccelerator::OpenOption,
+    component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
     dataconnector::debezium::DebeziumKafkaMetadata,
 };
 

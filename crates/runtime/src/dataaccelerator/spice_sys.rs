@@ -135,6 +135,12 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum OpenOption {
+    CreateIfNotExists,
+    OpenExisting,
+}
+
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     open_option: OpenOption,

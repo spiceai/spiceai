@@ -27,7 +27,8 @@ use datafusion::arrow::datatypes::{Schema, SchemaRef};
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{
-    component::dataset::Dataset, dataaccelerator::OpenOption, dataconnector::kafka::KafkaMetadata,
+    component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
+    dataconnector::kafka::KafkaMetadata,
 };
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
