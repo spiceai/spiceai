@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::time::SystemTime;
 
-use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Error, Result};
 use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion_table_providers::sql::db_connection_pool::{
@@ -27,7 +27,9 @@ impl DatasetCheckpoint {
     pub(super) async fn init_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
         conn.conn
             .call(move |conn| {
@@ -44,13 +46,17 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(|e| e.to_string().into())
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn migrate_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
 
         conn.conn
@@ -71,16 +77,21 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(|e| e.to_string().into())
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
         let dataset_name = self.dataset_name.clone();
-        conn.conn
+        let exists = conn
+            .conn
             .call(move |conn| {
                 let query =
                     format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
@@ -89,7 +100,9 @@ impl DatasetCheckpoint {
                 Ok(rows.next()?.is_some())
             })
             .await
-            .map_err(|e| e.to_string().into())
+            .map_err(Error::external)?;
+
+        Ok(exists)
     }
 
     pub(super) async fn last_checkpoint_time_sqlite(
@@ -98,7 +111,9 @@ impl DatasetCheckpoint {
     ) -> Result<Option<SystemTime>> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
         let dataset_name = self.dataset_name.clone();
 
@@ -113,9 +128,9 @@ impl DatasetCheckpoint {
                 Ok(rows.next()?.map(|row| row.get(0)))
             })
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .transpose()
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         let checkpoint_time = checkpoint_time.map(Into::into);
         Ok(checkpoint_time)
@@ -128,7 +143,9 @@ impl DatasetCheckpoint {
     ) -> Result<()> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
         let dataset_name = self.dataset_name.clone();
         let schema_json = Self::serialize_schema(schema)?;
@@ -146,7 +163,9 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(|e| e.to_string().into())
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn get_schema_sqlite(
@@ -155,7 +174,9 @@ impl DatasetCheckpoint {
     ) -> Result<Option<SchemaRef>> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
         let dataset_name = self.dataset_name.clone();
 
@@ -175,7 +196,7 @@ impl DatasetCheckpoint {
                 }
             })
             .await
-            .map_err(Box::new)?;
+            .map_err(Error::external)?;
 
         match schema_json {
             Some(json) => Ok(Some(Self::deserialize_schema(&json)?)),
