@@ -232,7 +232,7 @@ impl EmbeddingConnector {
                                 provider,
                                 chunking,
                                 vector_index,
-                                &config.model,
+                                config.model.as_str(),
                                 dataset.params.get("file_format").map(String::as_str),
                             )
                             .await
@@ -283,7 +283,7 @@ impl EmbeddingConnector {
         mut provider: IndexedTableProvider,
         chunking: &EmbeddingChunkConfig,
         vector_index: S3Vector,
-        model_name: &String,
+        model_name: &str,
         file_format: Option<&str>,
     ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
         let chunker = construct_chunker(
