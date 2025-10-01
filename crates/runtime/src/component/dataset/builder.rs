@@ -237,10 +237,10 @@ impl DatasetBuilder {
             missing_component: "runtime".to_string(),
         })?;
 
-        self.acceleration.as_mut().map(|acceleration| {
+        if let Some(acceleration) = self.acceleration.as_mut() {
             acceleration.snapshots =
                 SnapshotBehavior::from(app.snapshots.clone(), self.acceleration_snapshot);
-        });
+        }
 
         let dataset = Dataset {
             from: self.from,
