@@ -198,6 +198,7 @@ impl SnapshotManager {
     ///
     /// - If the local acceleration file cannot be opened or read.
     /// - If communicating with the backing object store fails at any stage of the upload.
+    #[allow(clippy::too_many_lines)]
     pub async fn create_snapshot(&self) -> Result<ObjectPath, SnapshotUploadError> {
         let timestamp = Utc::now().format(SNAPSHOT_TIMESTAMP_FORMAT).to_string();
         let filename = format!("{}_{}.db", self.dataset_name, timestamp);
@@ -777,7 +778,11 @@ mod tests {
         let filename = uploaded_path
             .filename()
             .expect("snapshot path includes filename");
-        assert!(filename.starts_with("dataset_"));
+        assert!(
+            std::path::Path::new(filename)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+        );
         assert!(filename.ends_with(".db"));
         assert!(
             SnapshotManager::parse_snapshot_timestamp(filename, "dataset").is_some(),
