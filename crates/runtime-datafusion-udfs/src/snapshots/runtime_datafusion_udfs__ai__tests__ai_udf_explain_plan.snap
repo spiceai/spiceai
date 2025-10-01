@@ -1,0 +1,10 @@
+---
+source: crates/runtime-datafusion-udfs/src/ai.rs
+expression: plan_text
+---
+logical_plan: Projection: test_data.id, ai(test_data.message, Utf8("test-model")) AS ai_result
+  TableScan: test_data projection=[id, message]
+physical_plan: ProjectionExec: expr=[id@0 as id, __async_fn_0@2 as ai_result]
+  AsyncFuncExec: async_expr=[async_expr(name=__async_fn_0, expr=ai(message@1, test-model))]
+    CoalesceBatchesExec: target_batch_size=8192
+      DataSourceExec: partitions=1, partition_sizes=[1]

@@ -158,6 +158,9 @@ impl AsyncScalarUDFImpl for Ai {
         args: ScalarFunctionArgs,
         config: &datafusion::config::ConfigOptions,
     ) -> DataFusionResult<ArrayRef> {
+        // Track overall UDF execution time for EXPLAIN ANALYZE
+        let udf_start = std::time::Instant::now();
+
         // Security: Validate argument count
         if args.args.is_empty() || args.args.len() > 2 {
             return exec_err!(
@@ -217,13 +220,28 @@ impl AsyncScalarUDFImpl for Ai {
         // Use target_partitions from config for parallelism control
         let max_parallelism = config.execution.target_partitions;
 
-        self.process_messages(
-            Arc::clone(model),
-            &model_name,
-            message_array,
-            max_parallelism,
-        )
-        .await
+        let result = self
+            .process_messages(
+                Arc::clone(model),
+                &model_name,
+                message_array,
+                max_parallelism,
+            )
+            .await?;
+
+        // Record overall UDF metrics for EXPLAIN ANALYZE
+        let elapsed_ms = udf_start.elapsed().as_millis() as u64;
+        tracing::Span::current().record("total_execution_time_ms", elapsed_ms);
+        tracing::Span::current().record("output_rows", args.number_rows);
+        tracing::debug!(
+            target: "metrics",
+            total_execution_time_ms = elapsed_ms,
+            output_rows = args.number_rows,
+            model = %model_name,
+            "AI UDF completed"
+        );
+
+        Ok(result)
     }
 }
 
@@ -2120,5 +2138,77 @@ mod tests {
         assert_eq!(string_array.value(2), "Response from test-model: Message 3");
         assert!(string_array.is_null(3));
         assert_eq!(string_array.value(4), "Response from test-model: Message 5");
+    }
+
+    #[tokio::test]
+    async fn test_ai_udf_explain_plan_snapshot() {
+        use arrow::datatypes::Schema;
+        use datafusion::prelude::*;
+
+        // Snapshot test to verify AI UDF EXPLAIN plan output
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store).into_async_udf();
+
+        // Create a DataFusion context
+        let ctx = SessionContext::new();
+
+        // Register the AI UDF
+        ctx.register_udf(udf.into_scalar_udf());
+
+        // Create a test table with sample data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("message", DataType::Utf8, true),
+        ]));
+
+        let id_array = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let message_array = Arc::new(StringArray::from(vec![
+            Some("Hello world"),
+            Some("How are you?"),
+            Some("Test message"),
+        ])) as ArrayRef;
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![id_array, message_array],
+        )
+        .expect("should create record batch");
+
+        ctx.register_batch("test_data", batch)
+            .expect("should register batch");
+
+        // Execute EXPLAIN query with AI UDF
+        let df = ctx
+            .sql("EXPLAIN SELECT id, ai(message, 'test-model') as ai_result FROM test_data")
+            .await
+            .expect("should create explain plan");
+
+        let results = df.collect().await.expect("should execute explain");
+
+        // Extract the plan text from the results
+        // EXPLAIN returns a record batch with two columns: "plan_type" and "plan"
+        let mut plan_lines = Vec::new();
+
+        for batch in &results {
+            let plan_type = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("should be string array");
+            let plan = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("should be string array");
+
+            for i in 0..batch.num_rows() {
+                plan_lines.push(format!("{}: {}", plan_type.value(i), plan.value(i)));
+            }
+        }
+
+        let plan_text = plan_lines.join("\n");
+
+        // Use insta to create a snapshot of the explain plan
+        insta::assert_snapshot!("ai_udf_explain_plan", plan_text);
     }
 }
