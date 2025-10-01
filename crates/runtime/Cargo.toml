@@ -127,6 +127,7 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-child-process",
     "transport-streamable-http-server",
 ] }
+runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
