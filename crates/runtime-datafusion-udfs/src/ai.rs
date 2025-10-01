@@ -200,8 +200,14 @@ impl Ai {
         message: &str,
         _row_index: usize,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
+        use std::time::Instant;
+
         async {
             tracing::debug!("Starting AI model call for message: {}", message);
+
+            // Track time spent in AI completion (API call + streaming)
+            let ai_start = Instant::now();
+
             let mut stream = model
                 .chat_stream(
                     CreateChatCompletionRequestArgs::default()
@@ -233,14 +239,33 @@ impl Ai {
                 }
             }
 
-            Ok(if complete_response.is_empty() {
+            let elapsed_ai_completion_ms = ai_start.elapsed().as_millis() as u64;
+
+            // Track time spent in compute (processing the response)
+            let compute_start = Instant::now();
+
+            let result = if complete_response.is_empty() {
                 None
             } else {
                 Some(complete_response)
-            })
+            };
+
+            let elapsed_compute_ms = compute_start.elapsed().as_micros() as u64; // Use micros since compute is typically very fast
+
+            // Record metrics in the current span
+            tracing::Span::current().record("elapsed_ai_completion_ms", elapsed_ai_completion_ms);
+            tracing::Span::current().record("elapsed_compute_us", elapsed_compute_ms);
+
+            Ok(result)
         }
         // Instrument the async block with an AI span as a child of the current (sql_query) span
-        .instrument(tracing::span!(Level::INFO, "ai", model = %model_name))
+        .instrument(tracing::span!(
+            Level::INFO,
+            "ai",
+            model = %model_name,
+            elapsed_ai_completion_ms = tracing::field::Empty,
+            elapsed_compute_us = tracing::field::Empty
+        ))
         .await
     }
 

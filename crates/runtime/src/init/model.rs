@@ -127,11 +127,27 @@ impl Runtime {
                     drop(llm_map);
                     let mut responses_llm_map = self.responses_llms.write().await;
                     responses_llm_map.insert(m.name.clone(), responses_model);
+                    drop(responses_llm_map);
+
+                    // Populate the model source registry for AI UDF partitioning
+                    #[cfg(feature = "models")]
+                    if let Some(source) = m.get_source() {
+                        let mut source_registry = self.model_source_registry.write().await;
+                        source_registry.insert(m.name.clone(), source.to_string());
+                    }
                     Ok(())
                 }
                 Ok((model, None)) => {
                     let mut llm_map = self.completion_llms.write().await;
                     llm_map.insert(m.name.clone(), model);
+                    drop(llm_map);
+
+                    // Populate the model source registry for AI UDF partitioning
+                    #[cfg(feature = "models")]
+                    if let Some(source) = m.get_source() {
+                        let mut source_registry = self.model_source_registry.write().await;
+                        source_registry.insert(m.name.clone(), source.to_string());
+                    }
                     Ok(())
                 }
                 Err(e) => Err(Error::FailedToLoadLLM {

@@ -51,6 +51,9 @@ use super::{
     schema::SpiceSchemaProvider,
 };
 
+#[cfg(feature = "models")]
+use super::extension::partition_ai_by_provider::{ModelRegistry, PartitionAiBySource};
+
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
 
@@ -83,6 +86,8 @@ pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    #[cfg(feature = "models")]
+    model_registry: Option<ModelRegistry>,
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
@@ -114,12 +119,21 @@ impl DataFusionBuilder {
             config: df_config,
             status,
             accelerator_engine_registry,
+            #[cfg(feature = "models")]
+            model_registry: None,
             memory_limit: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
             caching: None,
         }
+    }
+
+    #[must_use]
+    #[cfg(feature = "models")]
+    pub fn with_model_registry(mut self, model_registry: ModelRegistry) -> Self {
+        self.model_registry = Some(model_registry);
+        self
     }
 
     #[must_use]
@@ -177,6 +191,12 @@ impl DataFusionBuilder {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
+
+        // Only add the AI partitioning optimizer if models feature is enabled and model registry is provided
+        #[cfg(feature = "models")]
+        if let Some(model_registry) = self.model_registry {
+            ctx.add_optimizer_rule(Arc::new(PartitionAiBySource::new(model_registry)));
+        }
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();

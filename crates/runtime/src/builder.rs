@@ -179,14 +179,26 @@ impl RuntimeBuilder {
 
         let caching = Runtime::init_caching(Some(&caching_config));
 
+        // Create the model source registry that will be shared between Runtime and DataFusion
+        // This maps model names to their source strings for AI UDF partitioning
+        let model_source_registry = Arc::new(RwLock::new(HashMap::new()));
+
+        #[allow(unused_mut)]
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
-        )
-        .memory_limit(memory_limit)
-        .temp_directory(temp_directory)
-        .with_task_history(task_history)
-        .with_caching(caching);
+        );
+
+        #[cfg(feature = "models")]
+        {
+            df_builder = df_builder.with_model_registry(Arc::clone(&model_source_registry));
+        }
+
+        let mut df_builder = df_builder
+            .memory_limit(memory_limit)
+            .temp_directory(temp_directory)
+            .with_task_history(task_history)
+            .with_caching(caching);
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
@@ -257,6 +269,8 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "models")]
+            model_source_registry,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

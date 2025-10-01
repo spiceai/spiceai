@@ -445,6 +445,10 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+
+    // Maps model names to their source strings (e.g., "openai", "anthropic") for AI UDF partitioning
+    #[cfg(feature = "models")]
+    model_source_registry: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Runtime {

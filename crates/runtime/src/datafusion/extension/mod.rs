@@ -17,6 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 use bytes_processed::{BytesProcessedExec, BytesProcessedNode};
 use datafusion::{
+    arrow::datatypes::Schema as ArrowSchema,
     error::Result,
     execution::context::{QueryPlanner, SessionState},
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
@@ -24,10 +25,12 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_federation::FederatedPlanner;
+use partition_ai_by_provider::{AiSourcePartitionExec, AiSourcePartitionNode};
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use std::sync::Arc;
 
 pub mod bytes_processed;
+pub mod partition_ai_by_provider;
 
 #[derive(Debug, Default)]
 pub struct SpiceQueryPlanner {}
@@ -85,6 +88,25 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
             let physical_input = &physical_inputs[0];
 
             let exec_plan = Arc::new(BytesProcessedExec::new(Arc::clone(physical_input)));
+            return Ok(Some(exec_plan));
+        }
+
+        // AI source partition extension
+        if let Some(ai_partition_node) = node.as_any().downcast_ref::<AiSourcePartitionNode>() {
+            assert_eq!(logical_inputs.len(), 1, "should have 1 input");
+            assert_eq!(physical_inputs.len(), 1, "should have 1 input");
+            let physical_input = &physical_inputs[0];
+
+            // Convert DFSchema to Arrow Schema for physical plan
+            let arrow_schema = ArrowSchema::from(ai_partition_node.schema.as_ref());
+
+            let exec_plan = Arc::new(AiSourcePartitionExec::new(
+                Arc::clone(physical_input),
+                ai_partition_node.source_groups.clone(),
+                ai_partition_node.passthrough_exprs.clone(),
+                Arc::new(arrow_schema),
+                ai_partition_node.field_order.clone(),
+            ));
             return Ok(Some(exec_plan));
         }
 
