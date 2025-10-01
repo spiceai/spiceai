@@ -29,10 +29,10 @@ use crate::{
 
 use super::{
     SpiceModelTool,
-    document_similarity::DocumentSimilarityTool,
     get_readiness::GetReadinessTool,
     list_datasets::ListDatasetsTool,
     sample::{SampleTableMethod, tool::SampleDataTool},
+    search::SearchTool,
     sql::SqlTool,
     table_schema::TableSchemaTool,
     web_search::WebSearchTool,
@@ -77,9 +77,7 @@ impl BuiltinToolCatalog {
             (_, Some(desc)) => desc, // Use provided description if available
             ("websearch", None) => "Search the web for information",
             ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
-            ("document_similarity", None) => {
-                "Search Spice.ai datasets using Vector Similarity Search (VSS)"
-            }
+            ("search", None) => "Search across available, searchable datasets in Spice.ai runtime",
             ("table_schema", None) => "Get the schema of the Spice.ai dataset",
             ("sql", None) => "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
             ("sample_distinct_columns", None) => {
@@ -103,7 +101,7 @@ impl BuiltinToolCatalog {
                 Some(name),
                 Some(description),
             ))),
-            "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(
+            "search" => Ok(Arc::new(SearchTool::new(
                 Arc::clone(&self.rt),
                 Some(name),
                 Some(description),

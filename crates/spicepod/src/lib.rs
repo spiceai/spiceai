@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, model::Model,
-    runtime::Runtime, secret::Secret, tool::Tool, view::View, worker::Worker,
+    runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
 };
 
 use crate::component::Nameable;
@@ -123,6 +123,8 @@ pub struct Spicepod {
     pub runtime: Runtime,
 
     pub management: Option<Management>,
+
+    pub snapshots: Option<Snapshots>,
 }
 
 fn detect_duplicate_component_names(
@@ -393,6 +395,7 @@ fn from_definition(
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
         management: spicepod_definition.management,
+        snapshots: spicepod_definition.snapshots,
     }
 }
 

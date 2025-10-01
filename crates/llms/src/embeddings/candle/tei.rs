@@ -54,6 +54,7 @@ pub struct TeiEmbed {
 
     // Shared embeddings cache
     cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    cache_model_id: Option<String>, // Used for unique key in `cache`.
 }
 
 impl TeiEmbed {
@@ -207,6 +208,7 @@ impl TeiEmbed {
             model_size: config.hidden_size,
             tok: Arc::new(tokenizer),
             cache: None,
+            cache_model_id: None,
         })
     }
 
@@ -216,6 +218,12 @@ impl TeiEmbed {
         cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
     ) -> Self {
         self.cache = cache;
+        self
+    }
+
+    #[must_use]
+    pub fn set_cache_model_id(mut self, id: impl Into<String>) -> Self {
+        self.cache_model_id = Some(id.into());
         self
     }
 
@@ -255,6 +263,10 @@ impl TeiEmbed {
 impl Embed for TeiEmbed {
     fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
         self.cache.as_ref().map(Arc::clone)
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        self.cache_model_id.as_deref()
     }
 
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {

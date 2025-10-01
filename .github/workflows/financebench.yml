@@ -188,6 +188,7 @@ jobs:
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
+            -z ./test/spicepods/financebench/core \
             -p ${{ matrix.target.spicepod }} \
             --model ${{ matrix.target.name }} \
             --ready-wait 180 \

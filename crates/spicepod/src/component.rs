@@ -36,6 +36,7 @@ pub mod management;
 pub mod model;
 pub mod runtime;
 pub mod secret;
+pub mod snapshot;
 pub mod tool;
 pub mod view;
 pub mod worker;

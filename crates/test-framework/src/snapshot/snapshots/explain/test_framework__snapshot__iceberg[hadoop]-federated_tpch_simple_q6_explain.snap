@@ -2,19 +2,19 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q6"
 ---
-+---------------+-------------------------------------------------------------------------+
-| plan_type     | plan                                                                    |
-+---------------+-------------------------------------------------------------------------+
-| logical_plan  | SubqueryAlias: c                                                        |
-|               |   Projection: CAST(orders.o_orderkey AS Int64) + Int64(1) AS key        |
-|               |     Limit: skip=0, fetch=10                                             |
-|               |       BytesProcessedNode                                                |
-|               |         TableScan: orders projection=[o_orderkey], fetch=10             |
-| physical_plan | ProjectionExec: expr=[CAST(o_orderkey@0 AS Int64) + 1 as key]           |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |     GlobalLimitExec: skip=0, fetch=10                                   |
-|               |       BytesProcessedExec                                                |
-|               |         CooperativeExec                                                 |
-|               |           IcebergTableScan projection:[o_orderkey] predicate:[]         |
-|               |                                                                         |
-+---------------+-------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------+
+| plan_type     | plan                                                                       |
++---------------+----------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                           |
+|               |   Projection: CAST(orders.o_orderkey AS Int64) + Int64(1) AS key           |
+|               |     Limit: skip=0, fetch=10                                                |
+|               |       BytesProcessedNode                                                   |
+|               |         TableScan: orders projection=[o_orderkey], fetch=10                |
+| physical_plan | ProjectionExec: expr=[CAST(o_orderkey@0 AS Int64) + 1 as key]              |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1    |
+|               |     GlobalLimitExec: skip=0, fetch=10                                      |
+|               |       BytesProcessedExec                                                   |
+|               |         CooperativeExec                                                    |
+|               |           IcebergTableScan projection:[o_orderkey] predicate:[] limit:[10] |
+|               |                                                                            |
++---------------+----------------------------------------------------------------------------+

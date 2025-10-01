@@ -24,9 +24,11 @@ use crate::Runtime;
 use crate::component::access::AccessMode;
 use app::App;
 use datafusion::sql::TableReference;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
+    acceleration as spicepod_acceleration,
     component::{
         dataset::{self as spicepod_dataset},
         embeddings::ColumnEmbeddingConfig,
@@ -51,6 +53,7 @@ pub struct DatasetBuilder {
     pub time_partition_column: Option<String>,
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub acceleration_snapshot: spicepod_acceleration::SnapshotBehavior,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
@@ -76,6 +79,13 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             }
             _ => ReadyState::from(dataset.ready_state),
         };
+
+        let acceleration_snapshot = dataset
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
+                a.snapshots
+            });
 
         let acceleration = dataset
             .acceleration
@@ -122,6 +132,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
+            acceleration_snapshot,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -152,6 +163,7 @@ impl DatasetBuilder {
             time_partition_column: None,
             time_partition_format: None,
             acceleration: None,
+            acceleration_snapshot: spicepod_acceleration::SnapshotBehavior::Disabled,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
@@ -215,7 +227,7 @@ impl DatasetBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Dataset> {
+    pub fn build(mut self) -> Result<Dataset> {
         let app = self.app.ok_or(Error::UnableToBuildDataset {
             dataset: self.name.to_string(),
             missing_component: "app".to_string(),
@@ -224,6 +236,11 @@ impl DatasetBuilder {
             dataset: self.name.to_string(),
             missing_component: "runtime".to_string(),
         })?;
+
+        if let Some(acceleration) = self.acceleration.as_mut() {
+            acceleration.snapshots =
+                SnapshotBehavior::from(app.snapshots.clone(), self.acceleration_snapshot);
+        }
 
         let dataset = Dataset {
             from: self.from,

@@ -35,6 +35,7 @@ use datafusion_table_providers::util::{
 use runtime_table_partition::expression::{PartitionBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
+use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -73,9 +74,24 @@ pub enum Error {
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+}
+
+#[derive(Debug, Snafu)]
+pub enum FilePathError {
+    #[snafu(display("Could not resolve file path. Acceleration is not enabled."))]
+    AccelerationNotEnabled,
+
+    #[snafu(display("{engine:?} accelerator engine not available."))]
+    AcceleratorEngineUnavailable { engine: Engine },
 
     #[snafu(display("File mode is not supported for this accelerator engine."))]
     FileModeUnsupported {},
+
+    #[snafu(display("Failed to get file path for {engine} acceleration: {source}"))]
+    External {
+        engine: Engine,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -309,8 +325,8 @@ pub trait DataAccelerator: Send + Sync {
 
     /// For file-based accelerators, return the file path
     /// For any other accelerator, return None
-    fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String> {
-        Err(Error::FileModeUnsupported {})
+    fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, FilePathError> {
+        Err(FilePathError::FileModeUnsupported {})
     }
 
     /// Check if the file path is valid
@@ -489,6 +505,22 @@ pub trait AccelerationSource: Sync {
     fn name(&self) -> &TableReference;
 }
 
+pub async fn acceleration_file_path(
+    source: &dyn AccelerationSource,
+) -> Result<PathBuf, FilePathError> {
+    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
+
+    let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+        .await
+        .context(AcceleratorEngineUnavailableSnafu {
+            engine: acceleration_settings.engine,
+        })?;
+
+    let file = accelerator.file_path(source)?;
+
+    Ok(PathBuf::from(file))
+}
+
 fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaRef) -> Vec<String> {
     constraints
         .iter()
@@ -505,6 +537,17 @@ fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaR
         })
         .flatten()
         .collect()
+}
+
+async fn get_registered_accelerator(
+    source: &dyn AccelerationSource,
+    engine: Engine,
+) -> Option<Arc<dyn DataAccelerator>> {
+    source
+        .runtime()
+        .accelerator_engine_registry()
+        .get_accelerator_engine(engine)
+        .await
 }
 
 #[cfg(test)]
