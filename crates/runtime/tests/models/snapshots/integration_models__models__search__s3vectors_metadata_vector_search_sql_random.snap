@@ -5,15 +5,15 @@ snapshot_kind: text
 ---
 [
   {
-    "subject": "economics"
-  },
-  {
     "subject": "math"
   },
   {
     "subject": "math"
   },
   {
-    "subject": "medicine"
+    "subject": "math"
+  },
+  {
+    "subject": "math"
   }
 ]

@@ -48,7 +48,8 @@ use util::{
 
 use crate::{
     Runtime,
-    component::dataset::{AccessMode, builder::DatasetBuilder},
+    component::access::AccessMode,
+    component::dataset::builder::DatasetBuilder,
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     datafusion::{
         DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,

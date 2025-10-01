@@ -25,7 +25,7 @@ limitations under the License.
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 
-use super::{AccelerationConnection, Result, acceleration_connection};
+use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataconnector::kafka::KafkaMetadata};
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
@@ -79,16 +79,16 @@ impl KafkaSys {
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(pool) => self.upsert_sqlite(pool, metadata).await,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => Err("No acceleration connection available".into()),
+            _ => Err(Error::NoAccelerationConnection),
         }
     }
 
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
-        Ok(serde_json::to_string(schema).map_err(Box::new)?)
+        serde_json::to_string(schema).map_err(Error::external)
     }
 
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
-        let schema: Schema = serde_json::from_str(schema_json).map_err(Box::new)?;
+        let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
         Ok(std::sync::Arc::new(schema))
     }
 }

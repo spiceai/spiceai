@@ -28,6 +28,7 @@ pub enum Error {
     InvalidIdentifier,
 }
 
+pub mod access;
 pub mod catalog;
 pub mod dataset;
 pub mod metrics;

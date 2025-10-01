@@ -39,7 +39,7 @@ env:
 jobs:
   license-check-rust:
     name: Check Rust Licenses
-    runs-on: spiceai-macos
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v5
 
@@ -57,7 +57,7 @@ jobs:
 
   license-check-go:
     name: Check Golang Licenses
-    runs-on: spiceai-dev-runners
+    runs-on: self-hosted
     env:
       GOVER: 1.24.2
 

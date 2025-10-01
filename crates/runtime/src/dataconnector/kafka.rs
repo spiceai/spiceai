@@ -35,7 +35,7 @@ use crate::{
         dataset::{Dataset, acceleration::RefreshMode},
         metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
     },
-    dataaccelerator::spice_sys::kafka::KafkaSys,
+    dataaccelerator::spice_sys::{self, kafka::KafkaSys},
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
     },
@@ -412,7 +412,7 @@ async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadat
 async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &KafkaMetadata,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), spice_sys::Error> {
     let debezium_kafka_sys = KafkaSys::try_new_create_if_not_exists(dataset).await?;
     debezium_kafka_sys.upsert(metadata).await
 }
@@ -501,6 +501,7 @@ async fn bootstrap_new_kafka_consumer(
     if dataset.is_file_accelerated() {
         set_metadata_to_accelerator(dataset, &metadata)
             .await
+            .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "kafka",
                 connector_component: ConnectorComponent::from(dataset),
