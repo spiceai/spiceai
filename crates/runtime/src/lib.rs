@@ -474,6 +474,11 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
+        Arc::clone(&self.completion_llms)
+    }
+
+    #[must_use]
     pub fn app(&self) -> Arc<RwLock<Option<Arc<App>>>> {
         Arc::clone(&self.app)
     }

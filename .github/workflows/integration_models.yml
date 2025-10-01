@@ -140,7 +140,7 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture openai_embeddings_beta_requirements
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes
@@ -152,7 +152,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
     permissions: read-all
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -190,7 +190,7 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture hf_embeddings_beta_requirements
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes
@@ -201,7 +201,7 @@ jobs:
     name: Test Local Models
     needs: build
     permissions: read-all
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -223,7 +223,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture local_embeddings_beta_requirements
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes
@@ -235,7 +235,7 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
     permissions: read-all
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -259,7 +259,7 @@ jobs:
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture bedrock_test
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes
@@ -270,7 +270,7 @@ jobs:
     name: Test Workers
     needs: build
     permissions: read-all
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -301,7 +301,7 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture workers
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes
@@ -312,7 +312,7 @@ jobs:
     name: Test Search
     needs: build
     permissions: read-all
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -345,7 +345,7 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture search
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes

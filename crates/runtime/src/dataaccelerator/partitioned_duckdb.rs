@@ -50,12 +50,12 @@ use snafu::{OptionExt, prelude::*};
 use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
-    AccelerationSource, DataAccelerator, Error as DataAcceleratorError,
+    AccelerationSource, DataAccelerator,
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{
-    component::dataset::acceleration::Mode, datafusion::dialect::new_duckdb_dialect,
-    parameters::ParameterSpec, spice_data_base_path,
+    component::dataset::acceleration::Mode, dataaccelerator::FilePathError,
+    datafusion::dialect::new_duckdb_dialect, parameters::ParameterSpec, spice_data_base_path,
 };
 
 #[derive(Debug, Snafu)]
@@ -215,12 +215,12 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         DuckDBPartitionCreator::valid_file_extensions()
     }
 
-    fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+    fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, FilePathError> {
         // There is no one file path but one for each partition
         // This function is only internally used (within this trait) in the
         // DuckDBAccelerator, for example, but is never used in this
         // implementation.
-        Ok(String::new())
+        Err(FilePathError::FileModeUnsupported {})
     }
 
     async fn init(

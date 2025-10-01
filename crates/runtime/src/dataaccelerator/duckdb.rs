@@ -23,6 +23,7 @@ use crate::{
         },
         view::View,
     },
+    dataaccelerator::FilePathError,
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -51,7 +52,7 @@ use std::{
     sync::{Arc, Once},
 };
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, DataAccelerator};
 
 pub(crate) mod settings;
 
@@ -265,9 +266,12 @@ impl DataAccelerator for DuckDBAccelerator {
         vec!["db", "ddb", "duckdb"]
     }
 
-    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
         self.duckdb_file_path(source)
-            .map_err(|e| DataAcceleratorError::InvalidConfiguration { msg: e.to_string() })
+            .map_err(|e| FilePathError::External {
+                engine: Engine::DuckDB,
+                source: e.into(),
+            })
     }
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {

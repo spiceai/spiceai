@@ -15,6 +15,7 @@ limitations under the License.
 #![allow(clippy::needless_pass_by_value)]
 
 use crate::chat::message_to_mistral;
+use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
@@ -692,23 +693,22 @@ fn chunk_to_openai_stream(
         .iter()
         .map(chunk_choices_to_openai)
         .collect::<Result<Vec<_>, OpenAIError>>()?;
-    Ok(CreateChatCompletionStreamResponse {
-        id: c.id,
-        model: c.model,
-        system_fingerprint: Some(c.system_fingerprint),
-        object: "chat.completion.chunk".to_string(),
-        // mistralrs uses milliseconds, OpenAI uses seconds
-        created: (c.created / 1000) as u32,
-        service_tier: None,
-        usage: c.usage.map(|u| CompletionUsage {
-            prompt_tokens: u.prompt_tokens as u32,
-            completion_tokens: u.completion_tokens as u32,
-            total_tokens: u.total_tokens as u32,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-        }),
-        choices,
-    })
+
+    let usage = c.usage.map(|u| CompletionUsage {
+        prompt_tokens: u.prompt_tokens as u32,
+        completion_tokens: u.completion_tokens as u32,
+        total_tokens: u.total_tokens as u32,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
+    });
+
+    // mistralrs uses milliseconds, OpenAI uses seconds
+    let created = (c.created / 1000) as u32;
+
+    let mut response =
+        create_stream_response_with_timestamp(&c.id, &c.model, choices, usage, created)?;
+    response.system_fingerprint = Some(c.system_fingerprint);
+    Ok(response)
 }
 
 #[allow(
