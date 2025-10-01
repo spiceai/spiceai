@@ -156,6 +156,7 @@ impl TableProvider for S3VectorsQueryTable {
             .collect())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -181,13 +182,15 @@ impl TableProvider for S3VectorsQueryTable {
                 None => S3_VECTOR_MAX_TOPK,
                 Some(l) => l as i64,
             };
-            return Ok(Arc::new(S3VectorsQueryExec::new(
+            let plan = Arc::new(S3VectorsQueryExec::new(
                 self,
                 projection,
                 limit,
                 query_vector,
                 filters.to_vec(),
-            )) as Arc<dyn ExecutionPlan>);
+            ));
+
+            return Ok(plan as Arc<dyn ExecutionPlan>);
         }
 
         let (_, Some(bucket_name), Some(index_name)) = self.table.idx.index_identifier_variables()
@@ -219,11 +222,11 @@ impl TableProvider for S3VectorsQueryTable {
             .indexes()
             .iter()
             .filter_map(|idx| {
-                let partitioned_index_name =
-                    match PartitionedIndexName::from_index_name(idx.index_name()) {
-                        Ok(name) => name,
-                        Err(_) => return None,
-                    };
+                let Ok(partitioned_index_name) =
+                    PartitionedIndexName::from_index_name(idx.index_name())
+                else {
+                    return None;
+                };
 
                 if matches!(
                     partitioned_index_name.belongs_with(
@@ -277,7 +280,7 @@ impl TableProvider for S3VectorsQueryTable {
             0 => {
                 return Ok(Arc::new(EmptyExec::new(self.schema())));
             }
-            1 => return Ok(index_plans.pop().unwrap()), // SAFETY: checked the length
+            1 => return Ok(Arc::clone(&index_plans[0])),
             _ => Arc::new(UnionExec::new(index_plans)),
         };
 

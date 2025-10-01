@@ -157,7 +157,7 @@ impl PartitionedIndexName {
 }
 
 fn sanitize_column(s: &str) -> String {
-    s.replace('_', "-").replace('.', "-")
+    s.replace(['_', '.'], "-")
 }
 
 fn validate_index(index: &str) -> Result<(), Error> {

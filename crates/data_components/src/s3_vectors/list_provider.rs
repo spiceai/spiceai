@@ -67,6 +67,7 @@ pub struct S3VectorsListTable {
 }
 
 impl S3VectorsListTable {
+    #[must_use]
     pub fn new(table: S3VectorsTable, column_name: String, partition_by: Vec<Expr>) -> Self {
         Self {
             table,
@@ -147,11 +148,11 @@ impl TableProvider for S3VectorsListTable {
             .indexes()
             .iter()
             .filter_map(|idx| {
-                let partitioned_index_name =
-                    match PartitionedIndexName::from_index_name(idx.index_name()) {
-                        Ok(name) => name,
-                        Err(_) => return None,
-                    };
+                let Ok(partitioned_index_name) =
+                    PartitionedIndexName::from_index_name(idx.index_name())
+                else {
+                    return None;
+                };
 
                 if matches!(
                     partitioned_index_name.belongs_with(
@@ -210,7 +211,7 @@ impl TableProvider for S3VectorsListTable {
             0 => {
                 return Ok(Arc::new(EmptyExec::new(projected_schema)));
             }
-            1 => return Ok(index_plans.pop().unwrap()), // SAFETY: checked the length
+            1 => return Ok(Arc::clone(&index_plans[0])),
             _ => Arc::new(UnionExec::new(index_plans)),
         };
 

@@ -181,6 +181,7 @@ impl EmbeddingConnector {
         Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn wrap_table_as_index(
         &self,
         dataset: &Dataset,

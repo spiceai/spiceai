@@ -148,11 +148,11 @@ impl SearchIndex for S3Vector {
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         match self.partition_by.first() {
             Some(partition_by) => {
-                let input_dfschema = DFSchema::try_from(record.schema()).unwrap();
+                let input_dfschema = DFSchema::try_from(record.schema())?;
                 let execution_props = ExecutionProps::new();
                 let physical_expr =
-                    create_physical_expr(partition_by, &input_dfschema, &execution_props).unwrap();
-                let partitions = partition_batch(&record, physical_expr.as_ref()).unwrap();
+                    create_physical_expr(partition_by, &input_dfschema, &execution_props)?;
+                let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
                 for (partition_value, partition_record) in partitions.into_values() {
                     // change the index name to a partition name
@@ -161,7 +161,7 @@ impl SearchIndex for S3Vector {
                             tracing::debug!(
                                 "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
                             );
-                            return Ok(write::write(self, &self.table, record).await.boxed()?);
+                            return write::write(self, &self.table, record).await.boxed();
                         }
                         S3VectorIdentifier::Index {
                             bucket_name,
@@ -203,9 +203,9 @@ impl SearchIndex for S3Vector {
                 }
             }
             None => {
-                return Ok(write::write(self, &self.table, record).await.boxed()?);
+                return write::write(self, &self.table, record).await.boxed();
             }
-        };
+        }
 
         Ok(record)
     }
