@@ -66,7 +66,7 @@ impl<T: InputParameter + Sync + Send + DynClone> ODBCSyncParameter for T {
 dyn_clone::clone_trait_object!(ODBCSyncParameter);
 
 pub type ODBCParameter = Box<dyn ODBCSyncParameter>;
-pub type ODBCDbConnection<'a> = (dyn DbConnection<Connection<'a>, ODBCParameter>);
+pub type ODBCDbConnection<'a> = dyn DbConnection<Connection<'a>, ODBCParameter>;
 pub type ODBCDbConnectionPool<'a> =
     dyn DbConnectionPool<Connection<'a>, ODBCParameter> + Sync + Send;
 

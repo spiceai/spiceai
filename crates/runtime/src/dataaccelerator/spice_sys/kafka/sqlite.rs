@@ -18,7 +18,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
 };
 
-use super::{KAFKA_TABLE_NAME, KafkaSys, Result};
+use super::{Error, KAFKA_TABLE_NAME, KafkaSys, Result};
 use crate::dataconnector::kafka::KafkaMetadata;
 
 impl KafkaSys {
@@ -29,7 +29,9 @@ impl KafkaSys {
     ) -> Result<()> {
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err("Failed to downcast to SqliteConnection".into());
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
         };
         let schema_json = Self::serialize_schema(&metadata.schema)?;
         let dataset_name = self.dataset_name.clone();
@@ -72,7 +74,9 @@ impl KafkaSys {
                 Ok(())
             })
             .await
-            .map_err(|e| e.to_string().into())
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 
     pub(super) async fn get_sqlite(&self, pool: &SqliteConnectionPool) -> Option<KafkaMetadata> {
@@ -94,10 +98,11 @@ impl KafkaSys {
                     let topic: String = row.get(1)?;
                     let schema_json: String = row.get(2)?;
 
-                   Ok(KafkaMetadata {
+                    Ok(KafkaMetadata {
                         consumer_group_id,
                         topic,
-                        schema: KafkaSys::deserialize_schema(&schema_json).map_err(tokio_rusqlite::Error::Other)?,
+                        schema: KafkaSys::deserialize_schema(&schema_json)
+                            .map_err(|err| tokio_rusqlite::Error::Other(Box::new(err)))?,
                     })
                 } else {
                     Err(tokio_rusqlite::Error::Other("No row found".into()))
@@ -117,6 +122,7 @@ mod tests {
             acceleration::{Acceleration, Engine, Mode},
             builder::DatasetBuilder,
         },
+        dataaccelerator::spice_sys::OpenOption,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -163,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_roundtrip() {
         let ds = create_test_dataset("test_sqlite_roundtrip").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
 
@@ -183,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_metadata_overwrite() {
         let ds = create_test_dataset("test_sqlite_metadata_overwrite").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
         let mut test_metadata = create_test_metadata();
@@ -209,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_get_nonexistent() {
         let ds = create_test_dataset("test_sqlite_get_nonexistent").await;
-        let kafka_sys = KafkaSys::try_new_create_if_not_exists(&ds)
+        let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
 

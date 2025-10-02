@@ -188,7 +188,7 @@ mod tests {
         let request = rx.recv().await.expect("Should receive a task request");
         let now = Local::now();
         assert!(
-            now.second() % 5 == 0,
+            now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);
@@ -207,7 +207,7 @@ mod tests {
             "The next request should be sent after 5 seconds"
         );
         assert!(
-            next_now.second() % 5 == 0,
+            next_now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);
@@ -252,7 +252,7 @@ mod tests {
         let request = rx.recv().await.expect("Should receive a task request");
         let last_now = Local::now();
         assert!(
-            last_now.second() % 5 == 0,
+            last_now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);
@@ -289,7 +289,7 @@ mod tests {
             "The next request should be sent after 5 seconds"
         );
         assert!(
-            next_now.second() % 5 == 0,
+            next_now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);

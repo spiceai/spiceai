@@ -65,7 +65,7 @@ pub trait VectorIndex: SearchIndex {
     ///  - The associated embedding vectors of the [`SearchIndex::search_column`].
     ///
     /// The associated embedding vector column will be [`SearchIndex::search_column`] with `_embedding` appended (e.g. `body_embedding`).
-    fn list_table_provider(&self) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>>;
+    fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError>;
 
     fn dimension(&self) -> i32;
 }

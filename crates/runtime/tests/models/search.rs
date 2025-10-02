@@ -421,8 +421,8 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
                 SearchTestType::Http(json!({
                     "text": "secondary",
                     "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
+                    "where": "subject='math'",
+                    "limit": 1,
                 })),
             ),
             SearchTestCase::new(

@@ -175,7 +175,7 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         sorted_durations.sort();
 
         let half = sorted_durations.len() / 2;
-        if sorted_durations.len() % 2 == 0 {
+        if sorted_durations.len().is_multiple_of(2) {
             Ok((sorted_durations[half - 1] + sorted_durations[half]) / 2)
         } else {
             Ok(sorted_durations[half])

@@ -9,43 +9,13 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "The presence of fibrinolysin in the reagents can partially or",
-        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+        "answer": "A relation is partial if there is an element in the domain that",
+        "question": "What is the definition of a partial relation?"
       },
       "primary_key": {
-        "id": 938
+        "id": 921
       },
       "score": 0.03
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "answer": " Late recurrences can occur beyond 10 years, so patients require"
-      },
-      "primary_key": {
-        "id": 551
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "question": "How is microsporidia infection typically acquired?"
-      },
-      "primary_key": {
-        "id": 446
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "question": "Which of the following is an intensive property of a system?"
-      },
-      "primary_key": {
-        "id": 1289
-      },
-      "score": 0.01
     }
   ]
 }

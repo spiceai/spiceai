@@ -32,12 +32,13 @@ use std::sync::{Arc, OnceLock};
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
 use datafusion::catalog::TableProvider;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use tokio::sync::{RwLock, oneshot};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
     component::dataset::Dataset,
-    dataaccelerator::spice_sys::dataset_checkpoint::{DatasetCheckpoint, DatasetCheckpointer},
+    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     dataconnector::{DataConnector, DataConnectorError},
     tracers::OnceTracer,
     warn_once,
@@ -264,7 +265,9 @@ impl FederatedTable {
             return None;
         }
 
-        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref()).await.ok()?;
+        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref(), OpenOption::OpenExisting)
+            .await
+            .ok()?;
         Some(checkpoint)
     }
 }

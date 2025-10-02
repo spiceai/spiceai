@@ -31,7 +31,6 @@ use async_openai::types::{
 };
 
 use datafusion::common::cast::as_string_array;
-use datafusion::common::utils::take_function_args;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
@@ -51,6 +50,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::Span;
+
+// Security and performance constants
+const MAX_MESSAGE_SIZE: usize = 1_000_000; // 1MB per message
+const MAX_BATCH_SIZE: usize = 100; // Maximum rows per batch (LLM calls are slow)
 
 pub static AI_UDF_NAME: &str = "ai";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
@@ -153,18 +156,34 @@ impl AsyncScalarUDFImpl for Ai {
     async fn invoke_async_with_args(
         &self,
         args: ScalarFunctionArgs,
-        _config: &datafusion::config::ConfigOptions,
+        config: &datafusion::config::ConfigOptions,
     ) -> DataFusionResult<ArrayRef> {
+        // Security: Validate argument count
         if args.args.is_empty() || args.args.len() > 2 {
             return exec_err!(
                 "{AI_UDF_NAME} expects one or two arguments: message and optional model_name"
             );
         }
 
+        // Security: Validate number of rows
+        if args.number_rows > MAX_BATCH_SIZE {
+            return exec_err!(
+                "{AI_UDF_NAME} batch size ({}) exceeds maximum allowed ({})",
+                args.number_rows,
+                MAX_BATCH_SIZE
+            );
+        }
+
         let model_name = if args.args.len() == 2 {
             let model_arg = &args.args[1];
             match model_arg {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => model_name.clone(),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
+                    // Security: Validate model name (prevent injection)
+                    if model_name.is_empty() || model_name.len() > 256 {
+                        return exec_err!("{AI_UDF_NAME} invalid model name length");
+                    }
+                    model_name.clone()
+                }
                 _ => {
                     return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
                 }
@@ -182,22 +201,23 @@ impl AsyncScalarUDFImpl for Ai {
             );
         };
 
-        // Convert arguments to arrays for consistency
-        let args_arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        // Only convert the message argument to array (not the model name)
+        // The model name is always a scalar and shouldn't be part of the columnar data
+        let message_array = match &args.args[0] {
+            ColumnarValue::Array(arr) => Arc::clone(arr),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+        };
 
-        match args_arrays.len() {
-            1 => {
-                let [message_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), &model_name, message_array)
-                    .await
-            }
-            2 => {
-                let [message_array, _model_array] = take_function_args(self.name(), args_arrays)?;
-                self.process_messages(Arc::clone(model), &model_name, message_array)
-                    .await
-            }
-            _ => exec_err!("{AI_UDF_NAME} unexpected number of arguments"),
-        }
+        // Use target_partitions from config for parallelism control
+        let max_parallelism = config.execution.target_partitions;
+
+        self.process_messages(
+            Arc::clone(model),
+            &model_name,
+            message_array,
+            max_parallelism,
+        )
+        .await
     }
 }
 
@@ -208,6 +228,16 @@ impl Ai {
         message: &str,
         _row_index: usize,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
+        // Security: Validate message size before processing
+        if message.len() > MAX_MESSAGE_SIZE {
+            return Err(format!(
+                "Message size ({} bytes) exceeds maximum allowed size ({} bytes)",
+                message.len(),
+                MAX_MESSAGE_SIZE
+            )
+            .into());
+        }
+
         async {
             tracing::debug!("Starting AI model call for message: {}", message);
             let mut stream = model
@@ -228,14 +258,25 @@ impl Ai {
                 )
                 .await?;
 
-            let mut complete_response = String::new();
+            // Performance: Pre-allocate with estimated size to reduce reallocations
+            let mut complete_response = String::with_capacity(512);
+            let max_response_size = MAX_MESSAGE_SIZE * 2;
 
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
+            // Performance: Process stream chunks efficiently
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result?;
 
-                // Extract content from the streaming response
+                // Performance: Use iterator directly to avoid intermediate allocations
                 for choice in chunk.choices {
-                    if let Some(content) = &choice.delta.content {
+                    if let Some(ref content) = choice.delta.content {
+                        let new_len = complete_response.len() + content.len();
+
+                        // Security: Check accumulated response size
+                        if new_len > max_response_size {
+                            return Err("Response size exceeds maximum allowed size".into());
+                        }
+
+                        // Performance: push_str is optimized for string concatenation
                         complete_response.push_str(content);
                     }
                 }
@@ -257,38 +298,68 @@ impl Ai {
         model: Arc<dyn Chat>,
         model_name: &str,
         message_array: ArrayRef,
+        max_parallelism: usize,
     ) -> DataFusionResult<ArrayRef> {
         let message_array = as_string_array(&message_array)?;
         let array_len = message_array.len();
+
+        // Security: Validate batch size
+        if array_len > MAX_BATCH_SIZE {
+            return exec_err!(
+                "Batch size ({}) exceeds maximum allowed size ({})",
+                array_len,
+                MAX_BATCH_SIZE
+            );
+        }
+
+        if array_len == 0 {
+            return Ok(Arc::new(StringArray::from(Vec::<Option<String>>::new())) as ArrayRef);
+        }
+
+        // Always use parallel processing - LLM calls are I/O heavy, not compute heavy
+        // Parallel processing benefits even small batches due to I/O wait times
+        self.process_messages_parallel(&model, model_name, message_array, max_parallelism)
+            .await
+    }
+
+    // Performance: Optimized parallel processing - always used since LLM calls are I/O heavy
+    async fn process_messages_parallel(
+        &self,
+        model: &Arc<dyn Chat>,
+        model_name: &str,
+        message_array: &StringArray,
+        max_parallelism: usize,
+    ) -> DataFusionResult<ArrayRef> {
+        let array_len = message_array.len();
         let parent_span = Span::current();
 
-        // Determine the degree of parallelism based on CPU cores
-        let parallelism = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(4); // fallback to 4 if detection fails
+        // Performance: Use configured parallelism from DataFusion config (target_partitions)
+        // Limit to batch size to avoid over-spawning
+        let parallelism = std::cmp::min(max_parallelism, array_len);
 
-        // Create a semaphore to limit concurrent model calls
         let semaphore = Arc::new(Semaphore::new(parallelism));
 
-        // Create tasks for all messages
+        // Performance: Pre-allocate task vector
         let mut tasks = Vec::with_capacity(array_len);
 
         for (row_index, message_opt) in message_array.iter().enumerate() {
-            let model = Arc::clone(&model);
-            let model_name = model_name.to_string();
+            // Performance: Share Arc reference, only clone when spawning
+            let model = Arc::clone(model);
+            let model_name_str = model_name.to_string();
             let semaphore = Arc::clone(&semaphore);
             let parent_span = parent_span.clone();
 
             let task = if let Some(message) = message_opt {
+                // Performance: Convert to owned string once before spawning
                 let message = message.to_string();
+
                 tokio::spawn(async move {
-                    // Acquire permit to limit concurrent calls
                     let _permit = semaphore
                         .acquire()
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    match Self::call_model(&model, &model_name, &message, row_index).await {
+                    match Self::call_model(&model, &model_name_str, &message, row_index).await {
                         Ok(Some(result)) => {
                             tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
                             Ok(Some(result))
@@ -301,20 +372,22 @@ impl Ai {
                             Ok(None)
                         }
                         Err(e) => {
-                            tracing::error!(target: "task_history", parent: &parent_span, "AI model error for row {}: {}", row_index, e);
+                            // Security: Don't leak detailed error messages to parent span
+                            tracing::error!(target: "task_history", parent: &parent_span, "AI model error for row {}", row_index);
+                            tracing::debug!(target: "task_history", parent: &parent_span, "AI model error details: {}", e);
                             Err(DataFusionError::External(e))
                         }
                     }
                 })
             } else {
-                // Handle null input - return null result
+                // Performance: Don't spawn task for null values, return immediately
                 tokio::spawn(async move { Ok::<Option<String>, DataFusionError>(None) })
             };
 
             tasks.push(task);
         }
 
-        // Wait for all tasks to complete and collect results in order
+        // Performance: Collect results maintaining order
         let mut results = Vec::with_capacity(array_len);
         for task in tasks {
             let result = task
@@ -323,8 +396,7 @@ impl Ai {
             results.push(result);
         }
 
-        // Ensure the result array has the same length as the input array
-        assert_eq!(
+        debug_assert_eq!(
             results.len(),
             array_len,
             "Result array length must match input array length"
@@ -338,7 +410,6 @@ impl Ai {
 // Allow various lints in test code for simplicity and readability.
 // Test code prioritizes clarity over strict lint compliance.
 #[allow(
-    clippy::unwrap_used,
     clippy::clone_on_ref_ptr,
     clippy::uninlined_format_args,
     clippy::too_many_lines
@@ -492,7 +563,9 @@ mod tests {
             _ => panic!("Expected OneOf signature"),
         }
 
-        let return_type = udf.return_type(&[DataType::Utf8]).unwrap();
+        let return_type = udf
+            .return_type(&[DataType::Utf8])
+            .expect("should return Utf8 type");
         assert_eq!(return_type, DataType::Utf8);
     }
 
@@ -501,7 +574,10 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(model_store);
 
-        let default_model = udf.get_default_model_name().await.unwrap();
+        let default_model = udf
+            .get_default_model_name()
+            .await
+            .expect("should get default model");
         assert_eq!(default_model, "test-model");
     }
 
@@ -526,7 +602,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error with multiple models")
                 .to_string()
                 .contains("Multiple chat models configured")
         );
@@ -542,7 +618,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error with no models")
                 .to_string()
                 .contains("No chat models configured")
         );
@@ -561,7 +637,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(model_store);
 
-        let docs = udf.documentation().unwrap();
+        let docs = udf.documentation().expect("should have documentation");
         assert_eq!(
             docs.description,
             "Generates AI responses for text using a specified chat model"
@@ -575,15 +651,21 @@ mod tests {
         let udf = Ai::new(model_store);
 
         // Test with single Utf8 argument
-        let return_type1 = udf.return_type(&[DataType::Utf8]).unwrap();
+        let return_type1 = udf
+            .return_type(&[DataType::Utf8])
+            .expect("should return Utf8 for single arg");
         assert_eq!(return_type1, DataType::Utf8);
 
         // Test with two Utf8 arguments
-        let return_type2 = udf.return_type(&[DataType::Utf8, DataType::Utf8]).unwrap();
+        let return_type2 = udf
+            .return_type(&[DataType::Utf8, DataType::Utf8])
+            .expect("should return Utf8 for two args");
         assert_eq!(return_type2, DataType::Utf8);
 
         // Test with LargeUtf8
-        let return_type3 = udf.return_type(&[DataType::LargeUtf8]).unwrap();
+        let return_type3 = udf
+            .return_type(&[DataType::LargeUtf8])
+            .expect("should return Utf8 for LargeUtf8");
         assert_eq!(return_type3, DataType::Utf8);
     }
 
@@ -603,7 +685,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error when called non-async")
                 .to_string()
                 .contains("can only be called from async contexts")
         );
@@ -785,18 +867,27 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), "test-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await
-            .unwrap();
+            .expect("should process messages");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 1);
         assert_eq!(string_array.value(0), "Response from test-model: Hello");
     }
@@ -807,7 +898,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("Hello"),
@@ -815,14 +908,21 @@ mod tests {
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), "test-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await
-            .unwrap();
+            .expect("should invoke async");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 3);
         assert_eq!(string_array.value(0), "Response from test-model: Hello");
         assert_eq!(
@@ -838,7 +938,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("Hello"),
@@ -846,14 +948,21 @@ mod tests {
             Some("Goodbye"),
         ]));
         let result = udf
-            .process_messages(Arc::clone(model), "test-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await
-            .unwrap();
+            .expect("should invoke async");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 3);
         assert_eq!(string_array.value(0), "Response from test-model: Hello");
         assert!(string_array.is_null(1));
@@ -866,17 +975,26 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("error-model").unwrap();
+        let model = model_store_guard
+            .get("error-model")
+            .expect("should get error-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), "error-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "error-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await;
 
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("should error with mock error")
                 .to_string()
                 .contains("Mock error for testing")
         );
@@ -888,18 +1006,27 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("null-model").unwrap();
+        let model = model_store_guard
+            .get("null-model")
+            .expect("should get null-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello")]));
         let result = udf
-            .process_messages(Arc::clone(model), "null-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "null-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await
-            .unwrap();
+            .expect("should invoke async");
 
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 1);
         assert!(string_array.is_null(0));
     }
@@ -975,7 +1102,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
 
         // Create a parent span to simulate sql_query span
         let _sql_query_span = tracing::span!(Level::INFO, "sql_query", query = "SELECT ai('test')");
@@ -983,7 +1112,14 @@ mod tests {
         // Test that process_messages can accept and use a parent span without errors
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
         let result = udf
-            .process_messages(Arc::clone(model), "test-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await;
 
         // The test passes if process_messages executes without error using the parent span
@@ -992,17 +1128,210 @@ mod tests {
             "process_messages should succeed with parent span"
         );
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         assert_eq!(string_array.len(), 1);
         assert_eq!(
             string_array.value(0),
             "Response from test-model: Hello test"
         );
+    }
+
+    #[tokio::test]
+    async fn test_invoke_with_columnar_message_and_scalar_model() {
+        // This test verifies the fix for the "all columns in a record batch must have
+        // the same length" error. When calling ai(column, 'model'), the first argument
+        // is a columnar array and the second is a scalar model name.
+
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Simulate a query like: SELECT ai(title, 'gpt-4') FROM pulls LIMIT 3
+        // where title is a column (array) and 'gpt-4' is a scalar literal
+        let message_array = ColumnarValue::Array(Arc::new(arrow::array::StringArray::from(vec![
+            Some("First message"),
+            Some("Second message"),
+            Some("Third message"),
+        ])));
+        let model_name_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_array, model_name_scalar],
+            arg_fields: vec![],
+            number_rows: 3,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        // This should not fail with "all columns in a record batch must have the same length"
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "invoke_async_with_args should handle columnar message + scalar model: {:?}",
+            result.err()
+        );
+
+        let response_array = result.expect("should get result");
+        let string_array = response_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+
+        // Verify we got 3 responses (matching the input array length)
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "Response from gpt-4: First message");
+        assert_eq!(string_array.value(1), "Response from gpt-4: Second message");
+        assert_eq!(string_array.value(2), "Response from gpt-4: Third message");
+    }
+
+    #[tokio::test]
+    async fn test_invoke_with_scalar_message_and_scalar_model_multiple_rows() {
+        // This test verifies the fix for queries like:
+        // SELECT LocationID, ai('hi', 'gpt-4o') FROM taxi_zones_direct LIMIT 5
+        // where both arguments are scalar literals but need to be applied to multiple rows
+
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Simulate: SELECT ai('hi', 'gpt-4') FROM table LIMIT 5
+        // Both arguments are scalars, but the function is called for 5 rows
+        let message_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("hi".to_string())));
+        let model_name_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_scalar, model_name_scalar],
+            arg_fields: vec![],
+            number_rows: 5,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        // This should not fail with "all columns in a record batch must have the same length"
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "invoke_async_with_args should handle scalar message + scalar model for multiple rows: {:?}",
+            result.err()
+        );
+
+        let response_array = result.expect("should get result");
+        let string_array = response_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+
+        // Verify we got 5 responses (matching the number_rows)
+        assert_eq!(string_array.len(), 5);
+        // All responses should be the same since the input is the same
+        for i in 0..5 {
+            assert_eq!(string_array.value(i), "Response from gpt-4: hi");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invoke_with_mixed_array_and_scalars() {
+        // This test covers various combinations of array and scalar arguments
+        // to ensure proper handling in all cases
+
+        let model_store = create_multi_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Test 1: Array message with explicit model (as in: SELECT ai(column, 'model'))
+        let message_array = ColumnarValue::Array(Arc::new(arrow::array::StringArray::from(vec![
+            Some("Query 1"),
+            Some("Query 2"),
+        ])));
+        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_array, model_scalar],
+            arg_fields: vec![],
+            number_rows: 2,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await
+            .expect("Array message + scalar model should work");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+        assert_eq!(string_array.len(), 2);
+        assert_eq!(string_array.value(0), "Response from gpt-4: Query 1");
+        assert_eq!(string_array.value(1), "Response from gpt-4: Query 2");
+
+        // Test 2: Array message with nulls
+        let message_array_with_nulls =
+            ColumnarValue::Array(Arc::new(arrow::array::StringArray::from(vec![
+                Some("Hello"),
+                None,
+                Some("World"),
+            ])));
+        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("claude".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_array_with_nulls, model_scalar],
+            arg_fields: vec![],
+            number_rows: 3,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await
+            .expect("Array with nulls should work");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "Response from claude: Hello");
+        assert!(string_array.is_null(1));
+        assert_eq!(string_array.value(2), "Response from claude: World");
+
+        // Test 3: Single scalar message expanded to multiple rows (the original bug case)
+        let single_message =
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("Same message".to_string())));
+        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("gpt-4".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![single_message, model_scalar],
+            arg_fields: vec![],
+            number_rows: 10, // Expanded to 10 rows
+            return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await
+            .expect("Scalar expanded to multiple rows should work");
+
+        let string_array = result
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+        assert_eq!(string_array.len(), 10);
+        // All should have the same response
+        for i in 0..10 {
+            assert_eq!(
+                string_array.value(i),
+                "Response from gpt-4: Same message",
+                "Row {} should have the same response",
+                i
+            );
+        }
     }
 
     #[tokio::test]
@@ -1041,11 +1370,11 @@ mod tests {
             "invoke_async_with_args should succeed and capture parent span"
         );
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         assert_eq!(string_array.len(), 1);
         assert_eq!(
@@ -1096,12 +1425,21 @@ mod tests {
 
         // Test 3: Try calling process_messages directly to see if spans are created
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("test-model").unwrap();
+        let model = model_store_guard
+            .get("test-model")
+            .expect("should get test-model");
         let messages = Arc::new(arrow::array::StringArray::from(vec![Some("Hello test")]));
 
         tracing::info!("About to call process_messages");
         let _result = udf
-            .process_messages(Arc::clone(model), "test-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await;
         tracing::info!("process_messages completed");
 
@@ -1188,11 +1526,11 @@ mod tests {
         // Verify the UDF executed successfully
         assert!(result.is_ok(), "Full AI UDF execution should succeed");
 
-        let response_array = result.unwrap();
+        let response_array = result.expect("should get result");
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
 
         assert_eq!(string_array.len(), 1);
         assert_eq!(
@@ -1300,7 +1638,9 @@ mod tests {
         let udf = Ai::new(model_store.clone());
 
         let model_store_guard = model_store.read().await;
-        let model = model_store_guard.get("slow-model").unwrap();
+        let model = model_store_guard
+            .get("slow-model")
+            .expect("should get slow-model");
 
         // Test with 8 messages - if processed sequentially would take ~800ms,
         // but with parallelism should be much faster
@@ -1317,16 +1657,23 @@ mod tests {
 
         let start = Instant::now();
         let result = udf
-            .process_messages(Arc::clone(model), "slow-model", messages)
+            .process_messages(
+                Arc::clone(model),
+                "slow-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
             .await
-            .unwrap();
+            .expect("should process messages in parallel");
         let elapsed = start.elapsed();
 
         // Verify all results are correct
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("should cast to StringArray");
         assert_eq!(string_array.len(), 8);
 
         for i in 0..8 {
@@ -1350,5 +1697,384 @@ mod tests {
             "Parallel processing of 8 messages took: {}ms",
             elapsed.as_millis()
         );
+    }
+
+    #[tokio::test]
+    async fn test_max_message_size_validation() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+
+        // Create a message that exceeds MAX_MESSAGE_SIZE
+        let large_message = "x".repeat(MAX_MESSAGE_SIZE + 1);
+        let messages = Arc::new(StringArray::from(vec![Some(large_message.as_str())]));
+
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(messages)],
+            arg_fields: vec![Arc::new(Field::new("message", DataType::Utf8, true))],
+            number_rows: 1,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, true)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result
+            .expect_err("should return error for oversized message")
+            .to_string();
+        assert!(
+            err_msg.contains("exceeds maximum allowed size"),
+            "Expected size validation error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_batch_size_validation() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                "test".to_string(),
+            )))],
+            arg_fields: vec![Arc::new(Field::new("message", DataType::Utf8, true))],
+            number_rows: MAX_BATCH_SIZE + 1,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, true)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result
+            .expect_err("should return error for oversized batch")
+            .to_string();
+        assert!(
+            err_msg.contains("batch size") && err_msg.contains("exceeds maximum"),
+            "Expected batch size validation error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_name_length_validation() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+
+        // Test empty model name
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("test".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(String::new()))),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("message", DataType::Utf8, true)),
+                Arc::new(Field::new("model", DataType::Utf8, true)),
+            ],
+            number_rows: 1,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, true)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result
+            .expect_err("should return error for empty model name")
+            .to_string();
+        assert!(
+            err_msg.contains("invalid model name length"),
+            "Expected model name validation error, got: {}",
+            err_msg
+        );
+
+        // Test model name too long
+        let long_model_name = "x".repeat(257);
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("test".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(long_model_name))),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("message", DataType::Utf8, true)),
+                Arc::new(Field::new("model", DataType::Utf8, true)),
+            ],
+            number_rows: 1,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, true)),
+        };
+
+        let result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result
+            .expect_err("should return error for long model name")
+            .to_string();
+        assert!(
+            err_msg.contains("invalid model name length"),
+            "Expected model name validation error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_processing_for_small_batches() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Create a small batch - should still use parallel processing since LLM calls are I/O heavy
+        let messages = Arc::new(StringArray::from(vec![
+            Some("Message 1"),
+            Some("Message 2"),
+            Some("Message 3"),
+        ]));
+
+        let model_store_read = model_store.read().await;
+        let model = model_store_read
+            .get("test-model")
+            .expect("should get test-model");
+
+        let start = Instant::now();
+        let result = udf
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        let result_array = result.expect("should process messages successfully");
+        let string_array = result_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "Response from test-model: Message 1");
+        assert_eq!(string_array.value(1), "Response from test-model: Message 2");
+        assert_eq!(string_array.value(2), "Response from test-model: Message 3");
+
+        // Parallel processing benefits even small batches due to I/O wait times
+        println!(
+            "Parallel processing of 3 messages took: {}ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_batch_handling() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        let messages = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+
+        let model_store_read = model_store.read().await;
+        let model = model_store_read
+            .get("test-model")
+            .expect("should get test-model");
+
+        let result = udf
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let result_array = result.expect("should process empty batch successfully");
+        let string_array = result_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+
+        assert_eq!(string_array.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_response_size_limit() {
+        // Mock Chat that returns very large responses
+        struct LargeResponseMockChat;
+
+        #[async_trait]
+        impl Chat for LargeResponseMockChat {
+            fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
+                None
+            }
+
+            async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
+                Ok(Some("x".repeat(MAX_MESSAGE_SIZE * 2 + 1)))
+            }
+
+            async fn chat_stream(
+                &self,
+                _req: CreateChatCompletionRequest,
+            ) -> Result<ChatCompletionResponseStream, async_openai::error::OpenAIError>
+            {
+                // Create a stream with multiple chunks that accumulate to exceed the limit
+                // First chunk is within limit, second chunk pushes it over
+                let chunk1 = "x".repeat(MAX_MESSAGE_SIZE + 1);
+                let chunk2 = "y".repeat(MAX_MESSAGE_SIZE + 1);
+
+                Ok(llms::streaming_utils::create_mock_streaming_response(
+                    "large-model".to_string(),
+                    vec![chunk1, chunk2],
+                    None,
+                ))
+            }
+
+            async fn chat_request(
+                &self,
+                _req: CreateChatCompletionRequest,
+            ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError>
+            {
+                Err(async_openai::error::OpenAIError::ApiError(ApiError {
+                    message: "Not implemented".to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                }))
+            }
+        }
+
+        let mut store = HashMap::new();
+        store.insert(
+            "large-model".to_string(),
+            Arc::new(LargeResponseMockChat) as Arc<dyn Chat>,
+        );
+        let model_store = Arc::new(RwLock::new(store));
+        let udf = Ai::new(model_store.clone());
+
+        let messages = Arc::new(StringArray::from(vec![Some("test")]));
+
+        let model_store_read = model_store.read().await;
+        let model = model_store_read
+            .get("large-model")
+            .expect("should get large-model");
+
+        let result = udf
+            .process_messages(
+                Arc::clone(model),
+                "large-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result
+            .expect_err("should return error for oversized response")
+            .to_string();
+        assert!(
+            err_msg.contains("Response size exceeds maximum"),
+            "Expected response size validation error, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallelism_calculation() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Test with batch size larger than MIN_PARALLEL_THRESHOLD
+        let messages = Arc::new(StringArray::from(vec![
+            Some("Message 1"),
+            Some("Message 2"),
+            Some("Message 3"),
+            Some("Message 4"),
+            Some("Message 5"),
+        ]));
+
+        let model_store_read = model_store.read().await;
+        let model = model_store_read
+            .get("test-model")
+            .expect("should get test-model");
+
+        let result = udf
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let result_array = result.expect("should process messages successfully");
+        let string_array = result_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+
+        assert_eq!(string_array.len(), 5);
+        for i in 0..5 {
+            assert_eq!(
+                string_array.value(i),
+                format!("Response from test-model: Message {}", i + 1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mixed_null_and_valid_messages() {
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store.clone());
+
+        // Mix of valid messages and nulls
+        let messages = Arc::new(StringArray::from(vec![
+            Some("Message 1"),
+            None,
+            Some("Message 3"),
+            None,
+            Some("Message 5"),
+        ]));
+
+        let model_store_read = model_store.read().await;
+        let model = model_store_read
+            .get("test-model")
+            .expect("should get test-model");
+
+        let result = udf
+            .process_messages(
+                Arc::clone(model),
+                "test-model",
+                messages,
+                std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(4),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let result_array = result.expect("should process mixed null and valid messages");
+        let string_array = result_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("should cast to StringArray");
+
+        assert_eq!(string_array.len(), 5);
+        assert_eq!(string_array.value(0), "Response from test-model: Message 1");
+        assert!(string_array.is_null(1));
+        assert_eq!(string_array.value(2), "Response from test-model: Message 3");
+        assert!(string_array.is_null(3));
+        assert_eq!(string_array.value(4), "Response from test-model: Message 5");
     }
 }
