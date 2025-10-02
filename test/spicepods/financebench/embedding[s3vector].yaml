@@ -35,7 +35,7 @@ datasets:
       primary_key: location
       refresh_mode: append
       params:
-        duckdb_file: ./financebench_data.db
+        duckdb_file: ./financebench_data_s3.db
     columns:
       - name: content
         embeddings:
