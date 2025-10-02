@@ -13,14 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+use crate::schema::to_source_native_type_name;
 use arrow::array::{Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::concat;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use arrow_schema::{ArrowError, DataType, Field};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+
+static MARKDOWN_TABLE_SEPARATOR_ROW: [&str; 5] = ["---"; 5];
 
 /// Operations to apply to [`ArrayRef`] or [`RecordBatch`] data so as to prepare it for display.
 ///
@@ -327,6 +330,64 @@ fn column_indices(batch: &RecordBatch, column_names: &[String]) -> Result<Vec<us
         .collect()
 }
 
+fn hashmap_to_string(map: &HashMap<String, String>, separator: &str) -> String {
+    let mut keys: Vec<_> = map.keys().collect();
+    keys.sort(); // To make this function reproducible
+    keys.iter()
+        .map(|k| format!("* {}: {}", k, map[*k]))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+#[allow(clippy::doc_lazy_continuation)]
+/// Creates a markdown representation of tables' schemas in the following format:
+///
+/// **Table: users**
+/// Metadata:
+/// * owner: admin
+/// * description: All the users of the world
+/// | Column | Sql Type | Arrow Type | Nullable | Metadata |
+/// | --- | --- | --- | --- | --- |
+/// | id | BIGINT | Int64 | false | * comment: autoincrement<br>* description: user id |
+/// | name | VARCHAR | Utf8 | true |  |
+#[must_use]
+pub fn table_schemas_to_markdown_table(table_schemas: Vec<(String, Schema)>) -> String {
+    let mut table_schemas_formatted = Vec::with_capacity(table_schemas.len());
+
+    for (table_name, table_schema) in table_schemas {
+        // Header row and separator for markdown
+        let header = ["Column", "Sql Type", "Arrow Type", "Nullable", "Metadata"];
+
+        let mut md_table = vec![
+            format!("| {} |", header.join(" | ")),
+            format!("| {} |", MARKDOWN_TABLE_SEPARATOR_ROW.join(" | ")),
+        ];
+
+        for field in table_schema.fields() {
+            md_table.push(format!(
+                "| {} | {} | {} | {} | {} |",
+                field.name(),
+                to_source_native_type_name(field.data_type()),
+                field.data_type(),
+                field.is_nullable(),
+                hashmap_to_string(field.metadata(), "<br>"),
+            ));
+        }
+
+        let mut sections = vec![format!("**Table: {table_name}**")];
+        if !table_schema.metadata().is_empty() {
+            sections.push(format!(
+                "Metadata:\n{}",
+                hashmap_to_string(table_schema.metadata(), "\n")
+            ));
+        }
+        sections.push(md_table.join("\n"));
+        table_schemas_formatted.push(sections.join("\n"));
+    }
+
+    table_schemas_formatted.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::{
@@ -335,11 +396,10 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use snafu::ResultExt;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::format::{
-        to_markdown_documents, truncate_fixed_size_list_array, truncate_list_array,
-    };
+    use super::*;
 
     #[test]
     fn test_pretty_format_markdown() -> Result<(), Box<dyn std::error::Error>> {
@@ -500,5 +560,29 @@ Cras venenatis euismod malesuada.",
         writer.write_batches([rb].iter().collect::<Vec<&RecordBatch>>().as_slice())?;
         writer.finish()?;
         serde_json::from_reader::<_, serde_json::Value>(writer.into_inner().as_slice()).boxed()
+    }
+
+    #[test]
+    fn test_table_schemas_to_markdown_table() {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("comment".to_string(), "autoincrement".to_string());
+        field_metadata.insert("description".to_string(), "user id".to_string());
+
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("owner".to_string(), "admin".to_string());
+        schema_metadata.insert(
+            "description".to_string(),
+            "All the users of the world".to_string(),
+        );
+
+        let fields = vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_metadata.clone()),
+            Field::new("name", DataType::Utf8, true),
+        ];
+
+        let schema = Schema::new(fields).with_metadata(schema_metadata.clone());
+        let output = table_schemas_to_markdown_table(vec![("users".to_string(), schema)]);
+
+        insta::assert_snapshot!(output);
     }
 }
