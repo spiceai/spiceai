@@ -12,6 +12,8 @@ version.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+bytes.workspace = true
+chrono.workspace = true
 futures.workspace = true
 object_store.workspace = true
 spicepod = { path = "../spicepod" }
@@ -26,5 +28,4 @@ default = ["snapshots"]
 snapshots = []
 
 [dev-dependencies]
-bytes.workspace = true
-chrono.workspace = true
+tempfile.workspace = true

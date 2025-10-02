@@ -16,11 +16,16 @@ limitations under the License.
 use std::{path::PathBuf, str::FromStr};
 
 use arrow::datatypes::SchemaRef;
+use bytes::BytesMut;
+use chrono::Utc;
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path as ObjectPath};
 use snafu::prelude::*;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::ParamValue};
-use tokio::fs;
+use tokio::{
+    fs,
+    io::{AsyncReadExt, BufReader},
+};
 use url::Url;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 
@@ -28,6 +33,9 @@ use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
 pub use behavior::SnapshotBehavior;
+
+const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
+const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Snafu)]
 pub enum SnapshotDownloadError {
@@ -66,6 +74,40 @@ pub enum SnapshotDownloadError {
     },
     #[snafu(display("Snapshot {path} is missing a schema in its checkpoint"))]
     MissingSchema { path: String },
+}
+
+#[derive(Debug, Snafu)]
+pub enum SnapshotUploadError {
+    #[snafu(display("Failed to open local snapshot file {}: {source}", path.display()))]
+    OpenLocal {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("Failed to read local snapshot file {}: {source}", path.display()))]
+    ReadLocal {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("Failed to start snapshot upload to {path}: {source}"))]
+    StartUpload {
+        path: String,
+        source: object_store::Error,
+    },
+    #[snafu(display("Failed to upload snapshot part to {path}: {source}"))]
+    UploadPart {
+        path: String,
+        source: object_store::Error,
+    },
+    #[snafu(display("Failed to complete snapshot upload to {path}: {source}"))]
+    CompleteUpload {
+        path: String,
+        source: object_store::Error,
+    },
+    #[snafu(display("Failed to abort snapshot upload to {path}: {source}"))]
+    AbortUpload {
+        path: String,
+        source: object_store::Error,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +190,150 @@ impl SnapshotManager {
             checkpointer_factory,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
         })
+    }
+
+    /// Creates a new snapshot by streaming the local acceleration file to object storage.
+    ///
+    /// # Errors
+    ///
+    /// - If the local acceleration file cannot be opened or read.
+    /// - If communicating with the backing object store fails at any stage of the upload.
+    #[allow(clippy::too_many_lines)]
+    pub async fn create_snapshot(&self) -> Result<ObjectPath, SnapshotUploadError> {
+        let timestamp = Utc::now().format(SNAPSHOT_TIMESTAMP_FORMAT).to_string();
+        let filename = format!("{}_{}.db", self.dataset_name, timestamp);
+        let location = self.snapshots_location.child(filename);
+        let location_path = location.to_string();
+        let local_path = self.local_path.clone();
+
+        tracing::info!(
+            dataset = %self.dataset_name,
+            snapshot = %location,
+            "Uploading snapshot."
+        );
+
+        let file = fs::File::open(&local_path).await.context(OpenLocalSnafu {
+            path: local_path.clone(),
+        })?;
+
+        let mut reader = BufReader::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE, file);
+
+        let mut upload =
+            self.object_store
+                .put_multipart(&location)
+                .await
+                .context(StartUploadSnafu {
+                    path: location_path.clone(),
+                })?;
+
+        let mut buffer = BytesMut::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE);
+        let mut eof = false;
+        let mut total_bytes: u64 = 0;
+
+        while !eof || !buffer.is_empty() {
+            while buffer.len() < SNAPSHOT_MULTIPART_CHUNK_SIZE && !eof {
+                match reader.read_buf(&mut buffer).await {
+                    Ok(0) => {
+                        eof = true;
+                    }
+                    Ok(read) => {
+                        total_bytes += read as u64;
+                    }
+                    Err(source) => {
+                        tracing::error!(
+                            dataset = %self.dataset_name,
+                            snapshot = %location,
+                            error = %source,
+                            "Failed to read local snapshot file while uploading."
+                        );
+                        if let Err(abort_source) = upload.abort().await {
+                            tracing::warn!(
+                                dataset = %self.dataset_name,
+                                snapshot = %location,
+                                error = %abort_source,
+                                "Failed to abort snapshot upload after read failure."
+                            );
+                            return Err(SnapshotUploadError::AbortUpload {
+                                path: location_path.clone(),
+                                source: abort_source,
+                            });
+                        }
+                        return Err(SnapshotUploadError::ReadLocal {
+                            path: local_path,
+                            source,
+                        });
+                    }
+                }
+            }
+
+            if buffer.is_empty() {
+                break;
+            }
+
+            let chunk_len = buffer.len().min(SNAPSHOT_MULTIPART_CHUNK_SIZE);
+            let chunk = buffer.split_to(chunk_len).freeze();
+
+            if let Err(source) = upload.put_part(chunk.into()).await {
+                tracing::error!(
+                    dataset = %self.dataset_name,
+                    snapshot = %location,
+                    error = %source,
+                    "Snapshot upload part failed."
+                );
+                if let Err(abort_source) = upload.abort().await {
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        snapshot = %location,
+                        error = %abort_source,
+                        "Failed to abort snapshot upload after part failure."
+                    );
+                    return Err(SnapshotUploadError::AbortUpload {
+                        path: location_path.clone(),
+                        source: abort_source,
+                    });
+                }
+                return Err(SnapshotUploadError::UploadPart {
+                    path: location_path.clone(),
+                    source,
+                });
+            }
+        }
+
+        match upload.complete().await {
+            Ok(_) => {
+                tracing::info!(
+                    dataset = %self.dataset_name,
+                    snapshot = %location,
+                    size = total_bytes,
+                    "Snapshot uploaded."
+                );
+                Ok(location)
+            }
+            Err(source) => {
+                tracing::error!(
+                    dataset = %self.dataset_name,
+                    snapshot = %location,
+                    error = %source,
+                    "Failed to finalize snapshot upload."
+                );
+                if let Err(abort_source) = upload.abort().await {
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        snapshot = %location,
+                        error = %abort_source,
+                        "Failed to abort snapshot upload after completion failure."
+                    );
+                    return Err(SnapshotUploadError::AbortUpload {
+                        path: location_path,
+                        source: abort_source,
+                    });
+                }
+                Err(SnapshotUploadError::CompleteUpload {
+                    path: location_path,
+                    source,
+                })
+            }
+        }
     }
 
     /// Attempts to download the latest snapshot, returning the schema if successful.
@@ -425,7 +611,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use futures::executor::block_on;
     use object_store::{memory::InMemory, path::Path};
-    use std::{path::PathBuf, sync::Arc, time::SystemTime};
+    use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
+    use tempfile::NamedTempFile;
 
     struct NoopCheckpointer;
 
@@ -562,5 +749,57 @@ mod tests {
                 "dataset_20250101T000000Z.db".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_streams_file_to_store() {
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        let contents = b"snapshot-bytes".to_vec();
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let manager = SnapshotManager {
+            dataset_name: "dataset".to_string(),
+            snapshots_location: Path::from("snapshots"),
+            local_path: local_path.clone(),
+            object_store: Box::new(InMemory::new()),
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
+            checkpointer_factory: Arc::new(|| {
+                Box::pin(async {
+                    Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(NoopCheckpointer))
+                })
+            }),
+        };
+
+        let uploaded_path = manager.create_snapshot().await.expect("upload snapshot");
+
+        let filename = uploaded_path
+            .filename()
+            .expect("snapshot path includes filename");
+        assert!(
+            std::path::Path::new(filename)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+        );
+        assert!(
+            SnapshotManager::parse_snapshot_timestamp(filename, "dataset").is_some(),
+            "snapshot filename should contain a parsable timestamp"
+        );
+
+        let stored_bytes = manager
+            .object_store
+            .get(&uploaded_path)
+            .await
+            .expect("snapshot should exist")
+            .bytes()
+            .await
+            .expect("read snapshot bytes");
+
+        assert_eq!(stored_bytes.as_ref(), contents.as_slice());
+
+        // Ensure the temp file path isn't dropped until the end of the test.
+        drop(temp_path);
     }
 }

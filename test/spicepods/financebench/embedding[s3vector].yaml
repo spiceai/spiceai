@@ -1,0 +1,53 @@
+version: v1
+kind: Spicepod
+name: financebench
+
+runtime:
+  flight:
+    max_message_size: 1G
+
+dependencies:
+  - models
+  - evals
+
+snapshots:
+  enabled: false
+  location: s3://spiceai-public-datasets/financebench/indexes
+  bootstrap_on_failure_behavior: warn
+
+datasets:
+  - from: s3://spiceai-public-datasets/financebench/txt/
+    name: data
+    description: Financial information
+    # We use `refresh_mode: append` based on `last_modified` so that if we have `duckdb_file` present, we don't reindex (or rewrite into S3vectors).
+    # With snapshotting soon™, we will be able to automatically load this `duckdb_file` whereever we run this spicepod.
+    time_column: last_modified
+    time_format: timestamptz
+    metadata:
+      last_modified: enabled
+    params:
+      file_format: txt
+    acceleration:
+      enabled: true
+      engine: duckdb
+      snapshots: disabled
+      mode: file
+      primary_key: location
+      refresh_mode: append
+      params:
+        duckdb_file: ./financebench_data_s3.db
+    columns:
+      - name: content
+        embeddings:
+          - from: openai_embed
+            row_id: location
+            chunking:
+              enabled: true
+              target_chunk_size: 1000
+              overlap_size: 200
+    vectors:
+      enabled: true
+      engine: s3_vectors
+      params:
+        s3_vectors_bucket: spiceai-financebench-s3-data
+        s3_vectors_aws_region: us-east-1

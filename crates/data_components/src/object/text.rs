@@ -19,6 +19,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
+use arrow_array::{TimestampMicrosecondArray, UInt64Array};
 use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -36,6 +37,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
+use datafusion_datasource::metadata::MetadataColumn;
 use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
@@ -51,6 +53,8 @@ pub struct ObjectStoreTextTable {
 
     /// For document tables, provide an optional formatter
     document_formatter: Option<Arc<dyn DocumentParser>>,
+
+    metadata_columns: Vec<MetadataColumn>,
 }
 
 impl std::fmt::Debug for ObjectStoreTextTable {
@@ -66,28 +70,22 @@ impl ObjectStoreTextTable {
         store: Arc<dyn ObjectStore>,
         url: &Url,
         extension: Option<String>,
-        formatter: Option<Arc<dyn DocumentParser>>,
-    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Arc::new(Self {
+        document_formatter: Option<Arc<dyn DocumentParser>>,
+        metadata_columns: Option<Vec<MetadataColumn>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
             ctx: ObjectStoreContext::try_new(store, url, extension)?,
-            document_formatter: formatter,
-        }))
+            document_formatter,
+            metadata_columns: metadata_columns.unwrap_or_default(),
+        })
     }
 
-    fn table_schema() -> Schema {
+    #[must_use]
+    pub fn base_table_schema() -> Schema {
         Schema::new(vec![
             Field::new("location", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
         ])
-    }
-
-    fn get_location_value(meta_list: &[ObjectMeta]) -> ArrayRef {
-        Arc::new(StringArray::from(
-            meta_list
-                .iter()
-                .map(|meta| meta.location.to_string())
-                .collect::<Vec<_>>(),
-        ))
     }
 
     fn get_content_value(
@@ -129,8 +127,25 @@ impl ObjectStoreTextTable {
         formatter: Option<&Arc<dyn DocumentParser>>,
     ) -> Result<ArrayRef, ArrowError> {
         match field_name {
-            "location" => Ok(Self::get_location_value(meta_list)),
+            "location" => Ok(Arc::new(StringArray::from(
+                meta_list
+                    .iter()
+                    .map(|meta| meta.location.to_string())
+                    .collect::<Vec<_>>(),
+            ))),
             "content" => Self::get_content_value(raw, formatter, meta_list),
+            "last_modified" => Ok(Arc::new(
+                TimestampMicrosecondArray::from(
+                    meta_list
+                        .iter()
+                        .map(|meta| meta.last_modified.timestamp_micros())
+                        .collect::<Vec<_>>(),
+                )
+                .with_timezone("UTC"),
+            )),
+            "size" => Ok(Arc::new(UInt64Array::from(
+                meta_list.iter().map(|meta| meta.size).collect::<Vec<_>>(),
+            ))),
             _ => Err(ArrowError::SchemaError(format!(
                 "Unsupported field name: {field_name}",
             ))),
@@ -169,7 +184,15 @@ impl TableProvider for ObjectStoreTextTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(Self::table_schema())
+        let mut base_field = Self::base_table_schema()
+            .fields()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        base_field.extend(self.metadata_columns.iter().map(|c| Arc::new(c.field())));
+
+        Arc::new(Schema::new(base_field))
     }
 
     fn constraints(&self) -> Option<&Constraints> {

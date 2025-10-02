@@ -121,7 +121,7 @@ pub fn median_observed_memory(readings: &[MemoryReading]) -> anyhow::Result<f64>
     memory_usages.sort_by(f64::total_cmp);
 
     let len = memory_usages.len();
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         Ok(f64::midpoint(
             memory_usages[len / 2],
             memory_usages[len / 2 - 1],

@@ -228,6 +228,18 @@ impl Dataset {
 
         Some(primary_keys)
     }
+
+    #[must_use]
+    pub fn metadata(&self) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        if let Some(d) = self.description.as_ref() {
+            metadata.insert("description".to_string(), d.to_string());
+        }
+        for (k, v) in &self.metadata {
+            metadata.insert(k.to_string(), v.to_string());
+        }
+        metadata
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {

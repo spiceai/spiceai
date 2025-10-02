@@ -473,20 +473,28 @@ pub trait ListingTableConnector: DataConnector {
                     factory.default()
                 });
 
-        Ok(ObjectStoreTextTable::try_new(
-            self.get_object_store(dataset)?,
-            &url.clone(),
-            Some(extension.to_string()),
-            content_formatter,
-        )
-        .context(crate::dataconnector::InvalidConfigurationSnafu {
-            dataconnector: format!("{self}"),
-            connector_component: ConnectorComponent::from(dataset),
-            message: format!(
-                "Invalid file extension ({extension}) for source ({})",
-                dataset.name
-            ),
-        })?)
+        let metadata_columns = dataset.listing_table_metadata_columns(
+            get_url_prefix(url),
+            &ObjectStoreTextTable::base_table_schema(),
+        );
+
+        Ok(Arc::new(
+            ObjectStoreTextTable::try_new(
+                self.get_object_store(dataset)?,
+                &url.clone(),
+                Some(extension.to_string()),
+                content_formatter,
+                metadata_columns,
+            )
+            .context(crate::dataconnector::InvalidConfigurationSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "Invalid file extension ({extension}) for source ({})",
+                    dataset.name
+                ),
+            })?,
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
