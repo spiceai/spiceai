@@ -1779,9 +1779,9 @@ dependencies = [
 
 [[package]]
 name = "azure_core"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd9e026f749ac67e6d736ebcfa1ba36ab60ce3d6c446c67624a538f4e0667fa"
+checksum = "06d2b4c218c9edaddb625c5d287958eb4defb0addf54e6aad9c17bda320269ae"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -1799,9 +1799,9 @@ dependencies = [
 
 [[package]]
 name = "azure_core_macros"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06bce1a683e1a27013e64a1ff760700c7241275fe38787e578c3526f4ac569e0"
+checksum = "4a2df13e12ead1bb9f3b45cebec7e2b36eb6c2e88305745adc34828c1e457f92"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10753,9 +10753,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.95"
+version = "1.0.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
+checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
 ]
@@ -12026,7 +12026,7 @@ dependencies = [
  "aws-sdk-sts",
  "axum 0.8.4",
  "axum-extra",
- "azure_core 0.27.0",
+ "azure_core 0.28.0",
  "azure_storage",
  "azure_storage_blobs",
  "base64 0.22.1",
@@ -15758,11 +15758,13 @@ checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
 
 [[package]]
 name = "typespec"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2fffbed46125e0931e8f45618c3f6f0ffa2e0dc6d8b10a8de9f100b03138f33"
+checksum = "dd7ebbd28a587eb1c2208dc6f48304eb8b7dea2100d4a83aecb27951a878987a"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
+ "futures",
  "serde",
  "serde_json",
  "url",
@@ -15770,13 +15772,12 @@ dependencies = [
 
 [[package]]
 name = "typespec_client_core"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e96d81a432a1d2eb5cb3e9f813ff3811928e35f549bb5fa0a16abeffc66dec4c"
+checksum = "c722bbf92825952d4f7ab56393e5d200b5c702ef9fb92fd8b4c7a5447107ae6c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "bytes",
  "dyn-clone",
  "futures",
  "getrandom 0.3.3",
@@ -15796,9 +15797,9 @@ dependencies = [
 
 [[package]]
 name = "typespec_macros"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b032d7c2352fd8c2af91f942b914c52e315d3ea2b1bcad21a16cb94f72816bd"
+checksum = "71ada600035ee156b8898d98dcd58d68f93e685b0d564c4be15a160ccfcb7480"
 dependencies = [
  "proc-macro2",
  "quote",
