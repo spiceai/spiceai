@@ -1,0 +1,12 @@
+---
+source: crates/arrow_tools/src/format.rs
+expression: output
+---
+**Table: users**
+Metadata:
+* description: All the users of the world
+* owner: admin
+| Column | Sql Type | Arrow Type | Nullable | Metadata |
+| --- | --- | --- | --- | --- |
+| id | BIGINT | Int64 | false | * comment: autoincrement<br>* description: user id |
+| name | VARCHAR | Utf8 | true |  |
