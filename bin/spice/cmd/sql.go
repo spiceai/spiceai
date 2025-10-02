@@ -292,8 +292,6 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 		fmt.Println("Connected to Spice Cloud")
 	} else if healthOk && checkDuration > 0 {
 		fmt.Printf("Connected to %s (%dms).\n", endpoint, checkDuration.Milliseconds())
-	} else {
-		fmt.Println("Connected to remote Spice instance at:", endpoint)
 	}
 	fmt.Println()
 
