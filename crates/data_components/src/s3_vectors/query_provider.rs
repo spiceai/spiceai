@@ -96,6 +96,33 @@ impl S3VectorsQueryTable {
             partition_by,
         }
     }
+
+    fn no_partitioning_exec(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        query_vector: Vec<f32>,
+    ) -> Arc<dyn ExecutionPlan> {
+        #[allow(clippy::cast_possible_wrap)]
+        let limit: i64 = match limit {
+            Some(l) if (l as i64) > S3_VECTOR_MAX_TOPK => {
+                tracing::warn!(
+                    "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
+                );
+                S3_VECTOR_MAX_TOPK
+            }
+            None => S3_VECTOR_MAX_TOPK,
+            Some(l) => l as i64,
+        };
+        Arc::new(S3VectorsQueryExec::new(
+            self,
+            projection,
+            limit,
+            query_vector,
+            filters.to_vec(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -156,7 +183,6 @@ impl TableProvider for S3VectorsQueryTable {
             .collect())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -171,26 +197,7 @@ impl TableProvider for S3VectorsQueryTable {
             .map_err(DataFusionError::External)?;
 
         if self.partition_by.is_empty() {
-            #[allow(clippy::cast_possible_wrap)]
-            let limit: i64 = match limit {
-                Some(l) if (l as i64) > S3_VECTOR_MAX_TOPK => {
-                    tracing::warn!(
-                        "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                    );
-                    S3_VECTOR_MAX_TOPK
-                }
-                None => S3_VECTOR_MAX_TOPK,
-                Some(l) => l as i64,
-            };
-            let plan = Arc::new(S3VectorsQueryExec::new(
-                self,
-                projection,
-                limit,
-                query_vector,
-                filters.to_vec(),
-            ));
-
-            return Ok(plan as Arc<dyn ExecutionPlan>);
+            return Ok(self.no_partitioning_exec(projection, filters, limit, query_vector));
         }
 
         let (_, Some(bucket_name), Some(index_name)) = self.table.idx.index_identifier_variables()
