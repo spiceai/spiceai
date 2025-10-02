@@ -505,3 +505,13 @@ fn to_flat_value(output: ListOutputVector) -> serde_json::Value {
 
     serde_json::Value::Object(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use s3_vectors::mock::MockClient;
+
+    #[tokio::test]
+    async fn test() {}
+}
