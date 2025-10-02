@@ -56,7 +56,7 @@ use super::{AccelerationSource, DataAccelerator};
 
 pub(crate) mod settings;
 
-const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 1;
+const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
