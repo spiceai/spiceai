@@ -19,8 +19,8 @@ datasets:
   - from: s3://spiceai-public-datasets/financebench/txt/
     name: data
     description: Financial information
-    # Use `last_modified` with append refresh and snapshots enabled will mean we will load DuckDB file and only add in new data.
-    # This also means we won't reindex into S3 vectors either.
+    # We use `refresh_mode: append` based on `last_modified` so that if we have `duckdb_file` present, we don't reindex (or rewrite into S3vectors).
+    # With snapshotting soon™, we will be able to automatically load this `duckdb_file` whether we run this spicepod.
     time_column: last_modified
     time_format: timestamptz
     metadata:
