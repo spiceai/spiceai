@@ -20,7 +20,7 @@ datasets:
     name: data
     description: Financial information
     # We use `refresh_mode: append` based on `last_modified` so that if we have `duckdb_file` present, we don't reindex (or rewrite into S3vectors).
-    # With snapshotting soon™, we will be able to automatically load this `duckdb_file` whether we run this spicepod.
+    # With snapshotting soon™, we will be able to automatically load this `duckdb_file` whereever we run this spicepod.
     time_column: last_modified
     time_format: timestamptz
     metadata:
