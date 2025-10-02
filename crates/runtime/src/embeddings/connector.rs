@@ -181,7 +181,6 @@ impl EmbeddingConnector {
         Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn wrap_table_as_index(
         &self,
         dataset: &Dataset,
@@ -191,119 +190,8 @@ impl EmbeddingConnector {
         match vector_store.engine.as_deref() {
             #[cfg(feature = "s3_vectors")]
             Some("s3" | "s3_vectors") => {
-                use datafusion::common::ToDFSchema as _;
-                use runtime_table_partition::expression::partition_by_expressions;
-
-                tracing::info!("S3 Vectors for dataset {} initializing...", dataset.name);
-                let start = std::time::Instant::now();
-
-                let df_schema = &inner_table_provider.schema().to_dfschema().map_err(|e| {
-                    DataConnectorError::InvalidConfigurationSourceOnly {
-                        dataconnector: dataset.source().to_string(),
-                        connector_component: dataset.into(),
-                        source: e.into(),
-                    }
-                })?;
-
-                let partition_by = partition_by_expressions(
-                    &vector_store.partition_by,
-                    &dataset.runtime().df.ctx,
-                    df_schema,
-                )
-                .map(|p| p.expressions)
-                .map_err(|e| {
-                    DataConnectorError::InvalidConfigurationSourceOnly {
-                        dataconnector: dataset.source().to_string(),
-                        connector_component: dataset.into(),
-                        source: e.into(),
-                    }
-                })?;
-
-                let embedding_columns: Vec<_> = dataset
-                    .columns
-                    .iter()
-                    .filter_map(|c| {
-                        c.embeddings
-                            .first()
-                            .map(|embed| (c.name.clone(), embed.clone()))
-                    })
-                    .collect();
-                let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
-                for (column, config) in embedding_columns {
-                    let mut vector_index = super::index::s3::try_from_dataset(
-                        &dataset.name,
-                        column,
-                        config.clone(),
-                        vector_store,
-                        Arc::clone(&inner_table_provider),
-                        Arc::clone(&self.embedding_models),
-                        dataset.columns.clone(),
-                        Arc::clone(&self.secrets),
-                        partition_by.clone(),
-                    )
+                self.wrap_table_as_index_s3(dataset, inner_table_provider, vector_store)
                     .await
-                    .map_err(|e| {
-                        DataConnectorError::UnableToConnectInternal {
-                            dataconnector: dataset.source().to_string(),
-                            connector_component: dataset.into(),
-                            source: e,
-                        }
-                    })?;
-
-                    if let Some(ref chunking) = config.chunking
-                        && chunking.enabled
-                    {
-                        let chunker = construct_chunker(
-                            config.model.as_str(),
-                            &ChunkingConfig {
-                                target_chunk_size: chunking.target_chunk_size,
-                                overlap_size: chunking.overlap_size,
-                                trim_whitespace: chunking.trim_whitespace,
-                                file_format: dataset.params.get("file_format").map(String::as_str),
-                            },
-                            &Arc::clone(&self.embedding_models),
-                        )
-                        .await
-                        .boxed()
-                        .map_err(|e| {
-                            DataConnectorError::UnableToConnectInternal {
-                                dataconnector: dataset.source().to_string(),
-                                connector_component: dataset.into(),
-                                source: e,
-                            }
-                        })?;
-
-                        let additional_meta = ChunkedSearchIndex::additional_metadata(
-                            vector_index.search_column().as_str(),
-                        );
-                        vector_index = vector_index.add_metadata(additional_meta);
-                        vector_index.primary_key =
-                            ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
-
-                        let idx = Arc::new(vector_index);
-                        let chunked_idx =
-                            ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);
-
-                        provider = provider.add_index(Arc::new(chunked_idx) as Arc<dyn Index>);
-                    } else {
-                        let idx = Arc::new(vector_index);
-                        let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
-
-                        // augment the previous underlying table provider with the vector index
-                        // this will result in recursive augmentation of the underlying table for N embedding columns
-                        provider.underlying = Arc::new(VectorScanTableProvider {
-                            table_provider: provider.underlying,
-                            index: vector_index,
-                        }) as Arc<dyn TableProvider>;
-                        provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
-                    }
-                }
-                tracing::info!(
-                    "S3 Vectors for dataset {} initialized in {:?}",
-                    dataset.name,
-                    start.elapsed()
-                );
-                Ok(Arc::new(provider))
             }
             None => Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: dataset.source().to_string(),
@@ -316,6 +204,100 @@ impl EmbeddingConnector {
                 message: format!("Unknown vector engine '.vectors.engine: {unknown_engine}'"),
             }),
         }
+    }
+
+    #[cfg(feature = "s3_vectors")]
+    async fn wrap_table_as_index_s3(
+        &self,
+        dataset: &Dataset,
+        inner_table_provider: Arc<dyn TableProvider + 'static>,
+        vector_store: &VectorStore,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        tracing::info!("S3 Vectors for dataset {} initializing...", dataset.name);
+        let start = std::time::Instant::now();
+
+        let partition_by =
+            get_dataset_partition_expressions(dataset, &inner_table_provider, vector_store)?;
+
+        let embedding_columns: Vec<_> = dataset
+            .columns
+            .iter()
+            .filter_map(|c| {
+                c.embeddings
+                    .first()
+                    .map(|embed| (c.name.clone(), embed.clone()))
+            })
+            .collect();
+        let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
+        for (column, config) in embedding_columns {
+            let mut vector_index = super::index::s3::try_from_dataset(
+                &dataset.name,
+                column,
+                config.clone(),
+                vector_store,
+                Arc::clone(&inner_table_provider),
+                Arc::clone(&self.embedding_models),
+                dataset.columns.clone(),
+                Arc::clone(&self.secrets),
+                partition_by.clone(),
+            )
+            .await
+            .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                dataconnector: dataset.source().to_string(),
+                connector_component: dataset.into(),
+                source: e,
+            })?;
+
+            if let Some(ref chunking) = config.chunking
+                && chunking.enabled
+            {
+                let chunker = construct_chunker(
+                    config.model.as_str(),
+                    &ChunkingConfig {
+                        target_chunk_size: chunking.target_chunk_size,
+                        overlap_size: chunking.overlap_size,
+                        trim_whitespace: chunking.trim_whitespace,
+                        file_format: dataset.params.get("file_format").map(String::as_str),
+                    },
+                    &Arc::clone(&self.embedding_models),
+                )
+                .await
+                .boxed()
+                .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: dataset.source().to_string(),
+                    connector_component: dataset.into(),
+                    source: e,
+                })?;
+
+                let additional_meta =
+                    ChunkedSearchIndex::additional_metadata(vector_index.search_column().as_str());
+                vector_index = vector_index.add_metadata(additional_meta);
+                vector_index.primary_key =
+                    ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
+
+                let idx = Arc::new(vector_index);
+                let chunked_idx = ChunkedSearchIndex::new(idx as Arc<dyn SearchIndex>, chunker);
+
+                provider = provider.add_index(Arc::new(chunked_idx) as Arc<dyn Index>);
+            } else {
+                let idx = Arc::new(vector_index);
+                let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
+
+                // augment the previous underlying table provider with the vector index
+                // this will result in recursive augmentation of the underlying table for N embedding columns
+                provider.underlying = Arc::new(VectorScanTableProvider {
+                    table_provider: provider.underlying,
+                    index: vector_index,
+                }) as Arc<dyn TableProvider>;
+                provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
+            }
+        }
+        tracing::info!(
+            "S3 Vectors for dataset {} initialized in {:?}",
+            dataset.name,
+            start.elapsed()
+        );
+        Ok(Arc::new(provider))
     }
 
     async fn embed_change_envelope(
@@ -357,6 +339,38 @@ impl EmbeddingConnector {
 
         Ok(ChangeEnvelope::new(change_committer, new_change_batch))
     }
+}
+
+#[cfg(feature = "s3_vectors")]
+fn get_dataset_partition_expressions(
+    dataset: &Dataset,
+    inner_table_provider: &Arc<dyn TableProvider + 'static>,
+    vector_store: &VectorStore,
+) -> Result<Vec<datafusion_expr::Expr>, DataConnectorError> {
+    use datafusion::common::ToDFSchema as _;
+    use runtime_table_partition::expression::partition_by_expressions;
+
+    let df_schema = &inner_table_provider.schema().to_dfschema().map_err(|e| {
+        DataConnectorError::InvalidConfigurationSourceOnly {
+            dataconnector: dataset.source().to_string(),
+            connector_component: dataset.into(),
+            source: e.into(),
+        }
+    })?;
+
+    let partition_by = partition_by_expressions(
+        &vector_store.partition_by,
+        &dataset.runtime().df.ctx,
+        df_schema,
+    )
+    .map(|p| p.expressions)
+    .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+        dataconnector: dataset.source().to_string(),
+        connector_component: dataset.into(),
+        source: e.into(),
+    })?;
+
+    Ok(partition_by)
 }
 
 #[async_trait]
