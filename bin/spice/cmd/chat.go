@@ -813,6 +813,17 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		os.Exit(1)
 	}
 
+	// Parse custom headers
+	customHeaders := make(map[string]string)
+	if headers, err := cmd.Flags().GetStringSlice("headers"); err == nil {
+		for _, header := range headers {
+			parts := strings.SplitN(header, ":", 2)
+			if len(parts) == 2 {
+				customHeaders[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
 	// Create HTTP client
 	httpClient := &http.Client{
 		Timeout: 0, // No timeout for long-running queries
@@ -869,6 +880,11 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		req.Header.Set("Content-Type", "application/json")
 		if apiKey != "" {
 			req.Header.Set("X-API-Key", apiKey)
+		}
+
+		// Add custom headers
+		for key, value := range customHeaders {
+			req.Header.Set(key, value)
 		}
 
 		resp, err := httpClient.Do(req)
@@ -1008,6 +1024,7 @@ func init() {
 	chatCmd.Flags().Float32("temperature", 1, "Model temperature for chat request")
 	chatCmd.Flags().Bool("responses", false, "Whether to use the responses API for all completions")
 	chatCmd.Flags().String("endpoint", "", "Specifies the remote Spice instance HTTP endpoint (e.g., http://localhost:8090)")
+	chatCmd.Flags().StringSlice("headers", []string{}, "Custom HTTP headers to pass to remote endpoint in the format 'Key:Value'. Can be specified multiple times.")
 
 	RootCmd.AddCommand(chatCmd)
 }

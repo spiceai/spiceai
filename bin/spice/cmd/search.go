@@ -384,6 +384,17 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 		os.Exit(1)
 	}
 
+	// Parse custom headers
+	customHeaders := make(map[string]string)
+	if headers, err := cmd.Flags().GetStringSlice("headers"); err == nil {
+		for _, header := range headers {
+			parts := strings.SplitN(header, ":", 2)
+			if len(parts) == 2 {
+				customHeaders[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
 	// Create HTTP client
 	httpClient := &http.Client{
 		Timeout: 0, // No timeout for long-running queries
@@ -449,6 +460,11 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 			req.Header.Set("X-API-Key", apiKey)
 		}
 
+		// Add custom headers
+		for key, value := range customHeaders {
+			req.Header.Set(key, value)
+		}
+
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			slog.Error("sending request", "error", err)
@@ -511,6 +527,7 @@ func init() {
 	searchCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for search")
 	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
 	searchCmd.Flags().String("endpoint", "", "Specifies the remote Spice instance HTTP endpoint (e.g., http://localhost:8090)")
+	searchCmd.Flags().StringSlice("headers", []string{}, "Custom HTTP headers to pass to remote endpoint in the format 'Key:Value'. Can be specified multiple times.")
 
 	RootCmd.AddCommand(searchCmd)
 }
