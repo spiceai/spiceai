@@ -3729,6 +3729,7 @@ dependencies = [
  "ctor",
  "dataformat-json",
  "datafusion",
+ "datafusion-datasource",
  "datafusion-federation",
  "datafusion-table-providers",
  "db_connection_pool",
