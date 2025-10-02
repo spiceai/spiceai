@@ -102,7 +102,8 @@ impl DataConnectorFactory for PostgresFactory {
 
             match PostgresConnectionPool::new(param_map).await {
                 Ok(pool) => {
-                    let unsupported_type_action = params.unsupported_type_action
+                    let unsupported_type_action = params
+                        .unsupported_type_action
                         .unwrap_or(datafusion_table_providers::UnsupportedTypeAction::String);
                     let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
