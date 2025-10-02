@@ -11,12 +11,12 @@ dependencies:
   - evals
 
 snapshots:
-  enabled: disabled
+  enabled: false
   location: s3://spiceai-public-datasets/financebench/indexes
   bootstrap_on_failure_behavior: warn
 
 datasets:
-  - from: s3://spiceai-public-datasets/financebench/txt_small/
+  - from: s3://spiceai-public-datasets/financebench/txt/
     name: data
     description: Financial information
     # Use `last_modified` with append refresh and snapshots enabled will mean we will load DuckDB file and only add in new data.
@@ -51,11 +51,3 @@ datasets:
       params:
         s3_vectors_bucket: spiceai-financebench-s3-data
         s3_vectors_aws_region: us-east-1
-        s3_vectors_index: jeadie-test
-
-embeddings:
-  - from: model2vec:minishlab/potion-retrieval-32M
-    # - from: openai:text-embedding-3-small
-    name: openai_embed
-    params:
-      openai_api_key: ${secrets:OPENAI_API_KEY}
