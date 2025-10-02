@@ -508,10 +508,124 @@ fn to_flat_value(output: ListOutputVector) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::s3_vectors::MetadataColumns;
+
     use super::*;
 
-    use s3_vectors::mock::MockClient;
+    use arrow::datatypes::{DataType, Field};
+    use datafusion::{logical_expr::col, prelude::SessionContext, scalar::ScalarValue};
+    use s3_vectors::{
+        DistanceMetric, IndexSummary,
+        mock::{DateTime, MockClient},
+    };
 
     #[tokio::test]
-    async fn test() {}
+    async fn scan_plan_with_partitions() -> Result<(), Box<dyn std::error::Error>> {
+        let mock_client = Arc::new(MockClient::new());
+        let bucket_name = "test_bucket";
+        let index_name_prefix = "test_index";
+        let column_name = "my_col";
+
+        let partition_by = &[col(column_name)];
+
+        let mut indexes = vec![];
+        let mut vectors_map = HashMap::new();
+
+        // Create 2 partitions
+        for i in 0..2 {
+            let partition_value = ScalarValue::Int32(Some(i));
+            let index_name = PartitionedIndexName::new(
+                index_name_prefix,
+                column_name,
+                &partition_value,
+                partition_by,
+            )?
+            .to_index_name();
+            indexes.push(
+                IndexSummary::builder()
+                    .vector_bucket_name(bucket_name)
+                    .set_index_arn(Some("arn".to_string()))
+                    .creation_time(DateTime::from_secs(1))
+                    .index_name(index_name.clone())
+                    .build()?,
+            );
+            vectors_map.insert(index_name, vec![]);
+        }
+
+        // Add an index that shouldn't be included
+        indexes.push(
+            IndexSummary::builder()
+                .vector_bucket_name(bucket_name)
+                .set_index_arn(Some("arn".to_string()))
+                .creation_time(DateTime::from_secs(1))
+                .index_name("another_index")
+                .build()?,
+        );
+
+        mock_client
+            .data
+            .lock()
+            .expect("lock")
+            .indexes
+            .insert(bucket_name.to_string(), indexes);
+
+        for (index, vectors) in vectors_map {
+            mock_client
+                .data
+                .lock()
+                .expect("lock")
+                .vectors
+                .insert(index, vectors);
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new(
+                S3_VECTOR_EMBEDDING_NAME,
+                DataType::new_list(DataType::Float32, true),
+                false,
+            ),
+            Field::new(column_name, DataType::Utf8, true),
+        ]));
+
+        let s3_table = S3VectorsTable {
+            client: mock_client,
+            schema,
+            constraints: Constraints::default(),
+            idx: S3VectorIdentifier::Index {
+                bucket_name: bucket_name.to_string(),
+                index_name: index_name_prefix.to_string(),
+            },
+            dimension: 0,
+            columns: MetadataColumns::none(),
+            distance_metric: DistanceMetric::Cosine,
+        };
+
+        let list_table =
+            S3VectorsListTable::new(s3_table, column_name.to_string(), vec![col(column_name)]);
+
+        let session_state = SessionContext::new().state();
+        let plan = list_table
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan");
+
+        // The plan should be a GlobalLimitExec -> UnionExec
+        let limit_plan = plan
+            .as_any()
+            .downcast_ref::<GlobalLimitExec>()
+            .expect("downcast");
+        let union_plan = limit_plan
+            .input()
+            .as_any()
+            .downcast_ref::<UnionExec>()
+            .expect("downcast");
+
+        // There should be 2 partitions, so 2 input plans to the UnionExec
+        assert_eq!(union_plan.children().len(), 2);
+
+        Ok(())
+    }
 }

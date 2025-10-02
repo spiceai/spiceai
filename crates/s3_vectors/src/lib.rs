@@ -52,8 +52,8 @@ pub use aws_sdk_s3vectors::{
         query_vectors::{QueryVectorsError, QueryVectorsInput, QueryVectorsOutput},
     },
     types::{
-        DataType, DistanceMetric, ListOutputVector, MetadataConfiguration, PutInputVector,
-        QueryOutputVector, VectorData,
+        DataType, DistanceMetric, IndexSummary, ListOutputVector, MetadataConfiguration,
+        PutInputVector, QueryOutputVector, VectorData,
     },
 };
 pub use aws_smithy_types::{Document, Number, error::operation::BuildError};

@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
 use async_trait::async_trait;
 use aws_sdk_s3vectors::{
     config::http::HttpResponse,
@@ -49,12 +54,29 @@ use aws_sdk_s3vectors::{
         put_vectors::{PutVectorsError, PutVectorsInput, PutVectorsOutput},
         query_vectors::{QueryVectorsError, QueryVectorsInput, QueryVectorsOutput},
     },
+    types::ListOutputVector,
 };
-pub use aws_smithy_types::{Document, Number, error::operation::BuildError};
+pub use aws_smithy_types::{DateTime, Document, Number, error::operation::BuildError};
 
 use crate::S3Vectors;
 
-pub struct MockClient;
+#[derive(Default, Debug)]
+pub struct MockData {
+    pub indexes: HashMap<String, Vec<aws_sdk_s3vectors::types::IndexSummary>>,
+    pub vectors: HashMap<String, Vec<ListOutputVector>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MockClient {
+    pub data: Arc<Mutex<MockData>>,
+}
+
+impl MockClient {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 #[async_trait]
 impl S3Vectors for MockClient {
@@ -132,9 +154,15 @@ impl S3Vectors for MockClient {
 
     async fn list_indexes(
         &self,
-        _input: ListIndexesInput,
+        input: ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
-        unimplemented!()
+        let bucket_name = input.vector_bucket_name().unwrap_or_default();
+        let data = self.data.lock().unwrap();
+        let bucket_indexes = data.indexes.get(bucket_name).cloned().unwrap_or_default();
+
+        Ok(ListIndexesOutput::builder()
+            .set_indexes(Some(bucket_indexes))
+            .build()?)
     }
 
     async fn list_vector_buckets(
@@ -146,9 +174,15 @@ impl S3Vectors for MockClient {
 
     async fn list_vectors(
         &self,
-        _input: ListVectorsInput,
+        input: ListVectorsInput,
     ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
-        unimplemented!()
+        let index_name = input.index_name().unwrap_or_default();
+        let data = self.data.lock().unwrap();
+        let index_vectors = data.vectors.get(index_name).cloned().unwrap_or_default();
+
+        Ok(ListVectorsOutput::builder()
+            .set_vectors(Some(index_vectors))
+            .build()?)
     }
 
     async fn put_vector_bucket_policy(
