@@ -157,7 +157,10 @@ impl S3Vectors for MockClient {
         input: ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
         let bucket_name = input.vector_bucket_name().unwrap_or_default();
-        let data = self.data.lock().unwrap();
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
         let bucket_indexes = data.indexes.get(bucket_name).cloned().unwrap_or_default();
 
         Ok(ListIndexesOutput::builder()
@@ -177,7 +180,10 @@ impl S3Vectors for MockClient {
         input: ListVectorsInput,
     ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
         let index_name = input.index_name().unwrap_or_default();
-        let data = self.data.lock().unwrap();
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
         let index_vectors = data.vectors.get(index_name).cloned().unwrap_or_default();
 
         Ok(ListVectorsOutput::builder()
