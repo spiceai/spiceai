@@ -281,10 +281,17 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 
 // runREPL provides a common REPL experience for all SQL execution modes
 func runREPL(endpoint string, executor QueryExecutor) error {
+	return runREPLWithHealth(endpoint, executor, 0, false)
+}
+
+// runREPLWithHealth provides a common REPL experience with optional health check info
+func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration time.Duration, healthOk bool) error {
 	fmt.Println("Welcome to the Spice.ai SQL REPL! Type 'help' for help.")
 	fmt.Println()
 	if endpoint == "spice-cloud" {
 		fmt.Println("Connected to Spice Cloud")
+	} else if healthOk && checkDuration > 0 {
+		fmt.Printf("Connected to %s (%dms).\n", endpoint, checkDuration.Milliseconds())
 	} else {
 		fmt.Println("Connected to remote Spice instance at:", endpoint)
 	}
@@ -395,6 +402,9 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		Timeout: 0, // No timeout for long-running queries
 	}
 
+	// Check server health and readiness
+	checkDuration, healthOk := util.CheckRemoteServerHealth(httpEndpoint, httpClient, apiKey)
+
 	// Create HTTP query executor
 	httpExecutor := func(ctx context.Context, query string) error {
 		req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/v1/sql", httpEndpoint), strings.NewReader(query))
@@ -403,7 +413,7 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		}
 
 		req.Header.Set("Content-Type", "text/plain")
-		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Accept", "application/vnd.spiceai.sql.v1+json")
 		if apiKey != "" {
 			req.Header.Set("X-API-Key", apiKey)
 		}
@@ -450,23 +460,30 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		return nil
 	}
 
-	// Use the consolidated REPL
-	return runREPL(httpEndpoint, httpExecutor)
+	// Use the consolidated REPL with health check info
+	return runREPLWithHealth(httpEndpoint, httpExecutor, checkDuration, healthOk)
 }
 
 // displayJSONResults parses JSON response and displays it as a table
 func displayJSONResults(jsonData []byte) (int, uint64, error) {
-	// Parse JSON response - expected format is an object with rows array and schema
+	// Parse JSON response - expected format from application/vnd.spiceai.sql.v1+json
 	var response struct {
-		RowCount int                      `json:"rowCount"`
-		Schema   []map[string]interface{} `json:"schema"`
-		Rows     []map[string]interface{} `json:"rows"`
+		RowCount int `json:"row_count"`
+		Schema   struct {
+			Fields []struct {
+				Name string `json:"name"`
+				Type struct {
+					Name string `json:"name"`
+				} `json:"type"`
+			} `json:"fields"`
+		} `json:"schema"`
+		Data []map[string]interface{} `json:"data"`
 	}
 	if err := json.Unmarshal(jsonData, &response); err != nil {
 		return 0, 0, fmt.Errorf("parsing JSON response: %w", err)
 	}
 
-	records := response.Rows
+	records := response.Data
 	if len(records) == 0 {
 		fmt.Println("No results.")
 		return 0, 0, nil
@@ -475,19 +492,12 @@ func displayJSONResults(jsonData []byte) (int, uint64, error) {
 	// Extract column names and types from schema if available, otherwise from first record
 	var colNames []string
 	var colTypes []string
-	if len(response.Schema) > 0 {
-		for _, field := range response.Schema {
-			if name, ok := field["name"].(string); ok {
-				colNames = append(colNames, name)
-				// Extract type if available
-				typeName := ""
-				if typeObj, ok := field["type"].(map[string]interface{}); ok {
-					if name, ok := typeObj["name"].(string); ok {
-						typeName = name
-					}
-				}
-				colTypes = append(colTypes, typeName)
-			}
+	if len(response.Schema.Fields) > 0 {
+		for _, field := range response.Schema.Fields {
+			colNames = append(colNames, field.Name)
+			// Extract type if available
+			typeName := field.Type.Name
+			colTypes = append(colTypes, typeName)
 		}
 	} else {
 		// Fallback: extract from first record

@@ -391,7 +391,12 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 
 	cmd.Println("Welcome to the Spice.ai search REPL! Enter your search queries.")
 	cmd.Println()
-	cmd.Printf("Connected to remote Spice instance at: %s\n", httpEndpoint)
+
+	// Check server health and readiness
+	checkDuration, healthOk := util.CheckRemoteServerHealth(httpEndpoint, httpClient, apiKey)
+	if healthOk {
+		cmd.Printf("Connected to %s (%dms).\n", httpEndpoint, checkDuration.Milliseconds())
+	}
 	cmd.Println()
 
 	line := liner.NewLiner()

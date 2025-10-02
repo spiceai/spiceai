@@ -818,6 +818,13 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		Timeout: 0, // No timeout for long-running queries
 	}
 
+	// Check server health and readiness
+	checkDuration, healthOk := util.CheckRemoteServerHealth(httpEndpoint, httpClient, apiKey)
+	if healthOk {
+		cmd.Printf("Connected to %s (%dms).\n", httpEndpoint, checkDuration.Milliseconds())
+	}
+	cmd.Println()
+
 	// Function to send chat request
 	sendChatRequest := func(messages []Message, useSpinner bool) ([]Message, error) {
 		var done chan bool
@@ -964,10 +971,7 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 	}
 
 	// Interactive mode
-	cmd.Println("Welcome to the Spice.ai chat REPL! Type your message to chat with the model.")
-	cmd.Println()
-	cmd.Printf("Connected to remote Spice instance at: %s\n", httpEndpoint)
-	cmd.Printf("Using model: %s\n", model)
+	cmd.Printf("Welcome to the Spice.ai chat REPL! Type your message to chat with '%s'.\n", model)
 	cmd.Println()
 
 	var messages []Message
