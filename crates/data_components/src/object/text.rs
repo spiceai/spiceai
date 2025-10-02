@@ -80,6 +80,7 @@ impl ObjectStoreTextTable {
         })
     }
 
+    #[must_use]
     pub fn base_table_schema() -> Schema {
         Schema::new(vec![
             Field::new("location", DataType::Utf8, false),
