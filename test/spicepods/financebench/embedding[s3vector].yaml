@@ -1,0 +1,61 @@
+version: v1
+kind: Spicepod
+name: financebench
+
+runtime:
+  flight:
+    max_message_size: 1G
+
+dependencies:
+  - models
+  - evals
+
+snapshots:
+  enabled: disabled
+  location: s3://spiceai-public-datasets/financebench/indexes
+  bootstrap_on_failure_behavior: warn
+
+datasets:
+  - from: s3://spiceai-public-datasets/financebench/txt_small/
+    name: data
+    description: Financial information
+    # Use `last_modified` with append refresh and snapshots enabled will mean we will load DuckDB file and only add in new data.
+    # This also means we won't reindex into S3 vectors either.
+    time_column: last_modified
+    time_format: timestamptz
+    metadata:
+      last_modified: enabled
+    params:
+      file_format: txt
+    acceleration:
+      enabled: true
+      engine: duckdb
+      snapshots: disabled
+      mode: file
+      primary_key: location
+      refresh_mode: append
+      params:
+        duckdb_file: ./financebench_data.db
+    columns:
+      - name: content
+        embeddings:
+          - from: openai_embed
+            row_id: location
+            chunking:
+              enabled: true
+              target_chunk_size: 1000
+              overlap_size: 200
+    vectors:
+      enabled: true
+      engine: s3_vectors
+      params:
+        s3_vectors_bucket: spiceai-financebench-s3-data
+        s3_vectors_aws_region: us-east-1
+        s3_vectors_index: jeadie-test
+
+embeddings:
+  - from: model2vec:minishlab/potion-retrieval-32M
+    # - from: openai:text-embedding-3-small
+    name: openai_embed
+    params:
+      openai_api_key: ${secrets:OPENAI_API_KEY}
