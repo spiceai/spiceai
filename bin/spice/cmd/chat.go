@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -454,6 +455,44 @@ spice chat --model <model> "What is Spice.ai?"
 			os.Exit(1)
 		}
 
+		// Check for --endpoint flag for remote HTTP mode
+		endpoint, err := cmd.Flags().GetString("endpoint")
+		if err != nil {
+			slog.Error("getting endpoint flag", "error", err)
+			os.Exit(1)
+		}
+
+		// Check for --cloud flag
+		if rtcontext.IsCloud() {
+			if endpoint != "" {
+				slog.Error("cannot use both --cloud and --endpoint flags")
+				os.Exit(1)
+			}
+
+			// Get API key from context or environment variable
+			apiKey := os.Getenv("SPICE_API_KEY")
+			if apiKey == "" {
+				if cmdApiKey, err := rtcontext.GetApiKey(); err == nil && cmdApiKey != "" {
+					apiKey = cmdApiKey
+				}
+			}
+
+			if apiKey == "" {
+				slog.Error("API key is required when using --cloud. Set SPICE_API_KEY environment variable or use --api-key flag.")
+				os.Exit(1)
+			}
+
+			// Use cloud connection - cloud uses HTTPS
+			runRemoteChatREPL(cmd, rtcontext, "https://data.spiceai.io", args)
+			return
+		}
+
+		if endpoint != "" {
+			// Remote HTTP mode
+			runRemoteChatREPL(cmd, rtcontext, endpoint, args)
+			return
+		}
+
 		temperature, err := cmd.Flags().GetFloat32("temperature")
 		if err != nil {
 			slog.Error("could not get temperature flag", "error", err)
@@ -588,6 +627,9 @@ spice chat --model <model> "What is Spice.ai?"
 		}
 
 		var messages = []Message{}
+
+		cmd.Println("Welcome to the Spice.ai chat REPL! Type your message to chat with the model.")
+		cmd.Println()
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
@@ -745,10 +787,223 @@ func isEndOfStream(chunk string) bool {
 	return false
 }
 
+func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, httpEndpoint string, args []string) {
+	// Get API key from context or environment variable
+	apiKey := os.Getenv("SPICE_API_KEY")
+	if apiKey == "" {
+		if cmdApiKey, err := rtcontext.GetApiKey(); err == nil && cmdApiKey != "" {
+			apiKey = cmdApiKey
+		}
+	}
+
+	model, err := cmd.Flags().GetString("model")
+	if err != nil {
+		slog.Error("could not get model flag", "error", err)
+		os.Exit(1)
+	}
+
+	if model == "" {
+		slog.Error("--model flag is required for remote chat")
+		os.Exit(1)
+	}
+
+	useResponsesAPI, err := cmd.Flags().GetBool("responses")
+	if err != nil {
+		slog.Error("could not get responses flag", "error", err)
+		os.Exit(1)
+	}
+
+	// Create HTTP client
+	httpClient := &http.Client{
+		Timeout: 0, // No timeout for long-running queries
+	}
+
+	// Function to send chat request
+	sendChatRequest := func(messages []Message, useSpinner bool) ([]Message, error) {
+		var done chan bool
+		var doneLoading bool
+		if useSpinner {
+			done = make(chan bool)
+			doneLoading = false
+			go func() {
+				util.ShowSpinner(done)
+			}()
+		}
+
+		var endpoint string
+		var body interface{}
+
+		if useResponsesAPI {
+			endpoint = fmt.Sprintf("%s/v1/responses", httpEndpoint)
+			input := messagesToInput(messages)
+			body = NewResponsesRequestBody(model, input, true)
+		} else {
+			endpoint = fmt.Sprintf("%s/v1/chat/completions", httpEndpoint)
+			body = NewChatRequestBody(messages, model, true, &StreamOptions{IncludeUsage: true})
+			body, _ = ApplyChatOptions(body.(*ChatRequestBody), cmd)
+		}
+
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			if useSpinner {
+				done <- true
+			}
+			return messages, fmt.Errorf("marshaling request: %w", err)
+		}
+
+		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(jsonBody))
+		if err != nil {
+			if useSpinner {
+				done <- true
+			}
+			return messages, fmt.Errorf("creating request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		if apiKey != "" {
+			req.Header.Set("X-API-Key", apiKey)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if useSpinner {
+				done <- true
+			}
+			return messages, fmt.Errorf("sending request: %w", err)
+		}
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				slog.Error("closing response body", "error", err)
+			}
+		}()
+
+		if resp.StatusCode != http.StatusOK {
+			if useSpinner {
+				done <- true
+			}
+			body, _ := io.ReadAll(resp.Body)
+			return messages, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+
+		// Handle streaming response
+		scanner := bufio.NewScanner(resp.Body)
+		var responseMessage string
+
+		for scanner.Scan() {
+			chunk := scanner.Text()
+
+			if !strings.HasPrefix(chunk, "data: ") {
+				continue
+			}
+			chunk = strings.TrimPrefix(chunk, "data: ")
+
+			if chunk == "[DONE]" {
+				break
+			}
+
+			if useResponsesAPI {
+				var streamEvent ResponseStreamEvent
+				if err := json.Unmarshal([]byte(chunk), &streamEvent); err != nil {
+					continue
+				}
+
+				if streamEvent.Type == "response.output_text.delta" {
+					token := streamEvent.Delta
+					if useSpinner && !doneLoading && token != "" {
+						done <- true
+						doneLoading = true
+					}
+					cmd.Printf("%s", token)
+					responseMessage += token
+				}
+
+				if streamEvent.Type == "response.done" {
+					break
+				}
+			} else {
+				var chatResponse ChatCompletion
+				if err := json.Unmarshal([]byte(chunk), &chatResponse); err != nil {
+					continue
+				}
+
+				if useSpinner && !doneLoading {
+					done <- true
+					doneLoading = true
+				}
+
+				if len(chatResponse.Choices) > 0 {
+					token := chatResponse.Choices[0].Delta.Content
+					cmd.Printf("%s", token)
+					responseMessage += token
+				}
+			}
+		}
+
+		if useSpinner && !doneLoading {
+			done <- true
+		}
+
+		if responseMessage != "" {
+			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+		}
+		cmd.Print("\n\n")
+
+		return messages, nil
+	}
+
+	// Single message mode
+	if len(args) > 0 {
+		userMessage := args[0]
+		messages := []Message{{Role: "user", Content: userMessage}}
+		_, err := sendChatRequest(messages, false)
+		if err != nil {
+			slog.Error("chat request failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Interactive mode
+	cmd.Println("Welcome to the Spice.ai chat REPL! Type your message to chat with the model.")
+	cmd.Println()
+	cmd.Printf("Connected to remote Spice instance at: %s\n", httpEndpoint)
+	cmd.Printf("Using model: %s\n", model)
+	cmd.Println()
+
+	var messages []Message
+	line := liner.NewLiner()
+	line.SetCtrlCAborts(true)
+	defer func() {
+		if err := line.Close(); err != nil {
+			slog.Error("closing line", "error", err)
+		}
+	}()
+
+	for {
+		message, err := line.Prompt("chat> ")
+		if err == liner.ErrPromptAborted {
+			break
+		} else if err != nil {
+			slog.Error("reading input line", "error", err)
+			continue
+		}
+
+		line.AppendHistory(message)
+		messages = append(messages, Message{Role: "user", Content: message})
+
+		messages, err = sendChatRequest(messages, true)
+		if err != nil {
+			slog.Error("chat request failed", "error", err)
+			continue
+		}
+	}
+}
+
 func init() {
 	chatCmd.Flags().String(constants.ModelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().Float32("temperature", 1, "Model temperature for chat request")
 	chatCmd.Flags().Bool("responses", false, "Whether to use the responses API for all completions")
+	chatCmd.Flags().String("endpoint", "", "Specifies the remote Spice instance HTTP endpoint (e.g., http://localhost:8090)")
 
 	RootCmd.AddCommand(chatCmd)
 }
