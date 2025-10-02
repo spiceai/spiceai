@@ -37,9 +37,20 @@ pub enum Error {
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display(
+        "Invalid connection pool configuration: connection_pool_min_idle ({connection_pool_min_idle}) cannot be greater than connection_pool_max ({connection_pool_max})"
+    ))]
+    InvalidConnectionPoolConfiguration {
+        connection_pool_min_idle: usize,
+        connection_pool_max: usize,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+const DEFAULT_CONNECTION_POOL_MIN: usize = 5;
+const DEFAULT_CONNECTION_POOL_MAX: usize = 10;
 
 pub struct PostgresAccelerator {
     postgres_factory: PostgresTableProviderFactory,
@@ -68,9 +79,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pass").secret(),
     ParameterSpec::component("sslmode"),
     ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("connection_pool_min")
+        .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
+        .default("5"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::runtime("connection_pool_size")
-        .description("The maximum number of connections created in the connection pool")
+        .description("The maximum number of connections created in the connection pool.")
         .default("10"),
 ];
 
@@ -99,6 +113,26 @@ impl DataAccelerator for PostgresAccelerator {
         );
 
         let ctx = SessionContext::new();
+
+        // Validate and normalize pool_min and connection_pool_size
+        let connection_pool_min_idle = cmd
+            .options
+            .get("connection_pool_min")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CONNECTION_POOL_MIN);
+        let connection_pool_max = cmd
+            .options
+            .get("connection_pool_size")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CONNECTION_POOL_MAX);
+
+        if connection_pool_min_idle > connection_pool_max {
+            return Err(Error::InvalidConnectionPoolConfiguration {
+                connection_pool_min_idle,
+                connection_pool_max,
+            }
+            .into());
+        }
 
         cmd.options.insert(
             "application_name".to_string(),
