@@ -287,7 +287,7 @@ impl EmbeddingConnector {
         file_format: Option<&str>,
     ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
         let chunker = construct_chunker(
-            model_name.as_str(),
+            model_name,
             &ChunkingConfig {
                 target_chunk_size: chunking.target_chunk_size,
                 overlap_size: chunking.overlap_size,
