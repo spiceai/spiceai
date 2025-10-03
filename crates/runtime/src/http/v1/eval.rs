@@ -125,13 +125,13 @@ pub(crate) async fn post(
             .into_response();
     }
 
-    match handle_eval_run(
+    match Box::pin(handle_eval_run(
         eval,
         model,
         Arc::clone(&df),
         Arc::clone(&llms),
         eval_scorer_registry,
-    )
+    ))
     .await
     {
         Ok(id) => {

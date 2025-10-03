@@ -13,11 +13,11 @@ limitations under the License.
 
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
-use std::{path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use bytes::BytesMut;
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path as ObjectPath};
 use snafu::prelude::*;
@@ -39,6 +39,8 @@ const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Snafu)]
 pub enum SnapshotDownloadError {
+    #[snafu(display("Dataset checkpointer factory not set for snapshot manager"))]
+    CheckpointerFactoryNotSet,
     #[snafu(display("Failed to list snapshots at {path}: {source}"))]
     ListSnapshots {
         path: String,
@@ -116,21 +118,43 @@ struct SnapshotCandidate {
     timestamp: String,
 }
 
+fn parse_snapshot_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(timestamp, SNAPSHOT_TIMESTAMP_FORMAT)
+        .map(|naive| Utc.from_utc_datetime(&naive))
+        .or_else(|_| DateTime::parse_from_rfc3339(timestamp).map(|dt| dt.with_timezone(&Utc)))
+        .ok()
+}
+
 /// Manages snapshots for a specific accelerated dataset.
+#[derive(Clone)]
 pub struct SnapshotManager {
     dataset_name: String,
     snapshots_location: object_store::path::Path,
     local_path: PathBuf,
-    object_store: Box<dyn ObjectStore>,
+    object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
-    checkpointer_factory: DatasetCheckpointerFactory,
+    checkpointer_factory: Option<DatasetCheckpointerFactory>,
+}
+
+impl std::fmt::Debug for SnapshotManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotManager")
+            .field("dataset_name", &self.dataset_name)
+            .field("snapshots_location", &self.snapshots_location)
+            .field("local_path", &self.local_path)
+            .field(
+                "bootstrap_failure_behavior",
+                &self.bootstrap_failure_behavior,
+            )
+            .field("object_store", &self.object_store)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SnapshotManager {
     pub async fn try_new(
         dataset_name: String,
         snapshots: SnapshotBehavior,
-        checkpointer_factory: DatasetCheckpointerFactory,
         local_path: PathBuf,
     ) -> Option<Self> {
         let snapshot_config = match snapshots {
@@ -186,10 +210,17 @@ impl SnapshotManager {
             dataset_name,
             snapshots_location: path,
             local_path,
-            object_store: store,
-            checkpointer_factory,
+            object_store: store.into(),
+            checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
         })
+    }
+
+    /// Sets a factory function to create a new dataset checkpointer for this snapshot manager.
+    #[must_use]
+    pub fn with_checkpointer_factory(mut self, factory: DatasetCheckpointerFactory) -> Self {
+        self.checkpointer_factory = Some(factory);
+        self
     }
 
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
@@ -347,27 +378,37 @@ impl SnapshotManager {
     pub async fn download_latest_snapshot(
         &self,
     ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
+        let checkpointer_factory = Arc::clone(
+            self.checkpointer_factory
+                .as_ref()
+                .context(CheckpointerFactoryNotSetSnafu)?,
+        );
         match self.bootstrap_failure_behavior {
-            BootstrapOnFailureBehavior::Warn => match self.download_latest_once().await {
-                Ok(result) => Ok(result),
-                Err(err) => {
-                    let location = self.snapshots_location.to_string();
-                    tracing::warn!(
-                        dataset = %self.dataset_name,
-                        location = %location,
-                        error = %err,
-                        "Failed to bootstrap snapshot; continuing without a downloaded snapshot."
-                    );
-                    Ok(None)
+            BootstrapOnFailureBehavior::Warn => {
+                match self.download_latest_once(checkpointer_factory).await {
+                    Ok(result) => Ok(result),
+                    Err(err) => {
+                        let location = self.snapshots_location.to_string();
+                        tracing::warn!(
+                            dataset = %self.dataset_name,
+                            location = %location,
+                            error = %err,
+                            "Failed to bootstrap snapshot; continuing without a downloaded snapshot."
+                        );
+                        Ok(None)
+                    }
                 }
-            },
+            }
             BootstrapOnFailureBehavior::Retry => {
                 let retry_strategy = FibonacciBackoff::default();
                 let dataset_name = self.dataset_name.clone();
                 let location = self.snapshots_location.to_string();
 
                 retry(retry_strategy, || async {
-                    match self.download_latest_once().await {
+                    match self
+                        .download_latest_once(Arc::clone(&checkpointer_factory))
+                        .await
+                    {
                         Ok(result) => Ok(result),
                         Err(err) => {
                             tracing::error!(
@@ -382,23 +423,28 @@ impl SnapshotManager {
                 })
                 .await
             }
-            BootstrapOnFailureBehavior::Fallback => match self.download_with_fallback().await {
-                Ok(result) => Ok(result),
-                Err(err) => {
-                    let location = self.snapshots_location.to_string();
-                    tracing::warn!(
-                        dataset = %self.dataset_name,
-                        location = %location,
-                        error = %err,
-                        "Failed to bootstrap snapshot even after fallback attempts; continuing."
-                    );
-                    Ok(None)
+            BootstrapOnFailureBehavior::Fallback => {
+                match self.download_with_fallback(checkpointer_factory).await {
+                    Ok(result) => Ok(result),
+                    Err(err) => {
+                        let location = self.snapshots_location.to_string();
+                        tracing::warn!(
+                            dataset = %self.dataset_name,
+                            location = %location,
+                            error = %err,
+                            "Failed to bootstrap snapshot even after fallback attempts; continuing."
+                        );
+                        Ok(None)
+                    }
                 }
-            },
+            }
         }
     }
 
-    async fn download_latest_once(&self) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
+    async fn download_latest_once(
+        &self,
+        checkpointer_factory: DatasetCheckpointerFactory,
+    ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
         let candidates = self.list_snapshot_candidates().await?;
         if let Some(candidate) = candidates.into_iter().next() {
             tracing::info!(
@@ -407,7 +453,9 @@ impl SnapshotManager {
                 timestamp = %candidate.timestamp,
                 "Downloading latest snapshot."
             );
-            self.download_snapshot(&candidate.location).await.map(Some)
+            self.download_snapshot(&candidate.location, checkpointer_factory)
+                .await
+                .map(Some)
         } else {
             tracing::debug!(
                 dataset = %self.dataset_name,
@@ -418,7 +466,10 @@ impl SnapshotManager {
         }
     }
 
-    async fn download_with_fallback(&self) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
+    async fn download_with_fallback(
+        &self,
+        checkpointer_factory: DatasetCheckpointerFactory,
+    ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
         let candidates = self.list_snapshot_candidates().await?;
         if candidates.is_empty() {
             return Ok(None);
@@ -426,7 +477,10 @@ impl SnapshotManager {
 
         for candidate in candidates {
             let path_display = candidate.location.to_string();
-            match self.download_snapshot(&candidate.location).await {
+            match self
+                .download_snapshot(&candidate.location, Arc::clone(&checkpointer_factory))
+                .await
+            {
                 Ok(schema) => return Ok(Some(schema)),
                 Err(SnapshotDownloadError::MissingSchema { path }) => {
                     tracing::warn!(
@@ -476,7 +530,31 @@ impl SnapshotManager {
             }
         }
 
-        snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        let mut snapshots_with_ts: Vec<(Option<DateTime<Utc>>, SnapshotCandidate)> = snapshots
+            .into_iter()
+            .map(|candidate| {
+                let parsed = parse_snapshot_timestamp(&candidate.timestamp);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        snapshot = %candidate.location.to_string(),
+                        timestamp = %candidate.timestamp,
+                        "Failed to parse snapshot timestamp; falling back to lexicographic order."
+                    );
+                }
+                (parsed, candidate)
+            })
+            .collect();
+
+        snapshots_with_ts.sort_by(|(a_ts, a_candidate), (b_ts, b_candidate)| {
+            b_ts.cmp(a_ts)
+                .then_with(|| b_candidate.timestamp.cmp(&a_candidate.timestamp))
+        });
+
+        let snapshots: Vec<SnapshotCandidate> = snapshots_with_ts
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect();
         tracing::info!(
             dataset = %self.dataset_name,
             location = %self.snapshots_location.to_string(),
@@ -490,6 +568,7 @@ impl SnapshotManager {
     async fn download_snapshot(
         &self,
         location: &ObjectPath,
+        checkpointer_factory: DatasetCheckpointerFactory,
     ) -> Result<SchemaRef, SnapshotDownloadError> {
         let path_display = location.to_string();
 
@@ -540,7 +619,7 @@ impl SnapshotManager {
             self.local_path.to_string_lossy()
         );
 
-        let checkpointer = (self.checkpointer_factory)()
+        let checkpointer = (checkpointer_factory)()
             .await
             .map_err(|source| SnapshotDownloadError::CheckpointerInit { source })?;
 
@@ -720,13 +799,13 @@ mod tests {
             dataset_name: "dataset".to_string(),
             snapshots_location: Path::from("snapshots"),
             local_path: PathBuf::from("/tmp/unused.db"),
-            object_store: Box::new(store),
+            object_store: Arc::new(store),
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
-            checkpointer_factory: Arc::new(|| {
+            checkpointer_factory: Some(Arc::new(|| {
                 Box::pin(async {
                     Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(NoopCheckpointer))
                 })
-            }),
+            })),
         };
 
         let candidates =
@@ -751,6 +830,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn list_snapshot_candidates_places_unparsable_after_parsable() {
+        let store = InMemory::new();
+
+        block_on(async {
+            store
+                .put(
+                    &Path::from("snapshots/dataset_20251003T123312Z.db"),
+                    Bytes::from_static(b"a").into(),
+                )
+                .await
+                .expect("write snapshot file");
+            store
+                .put(
+                    &Path::from("snapshots/dataset_20251003T123421Z.db"),
+                    Bytes::from_static(b"b").into(),
+                )
+                .await
+                .expect("write snapshot file");
+            store
+                .put(
+                    &Path::from("snapshots/dataset_250927T13340914Z.db"),
+                    Bytes::from_static(b"c").into(),
+                )
+                .await
+                .expect("write snapshot file");
+            store
+                .put(
+                    &Path::from("snapshots/other_20251003T123421Z.db"),
+                    Bytes::from_static(b"d").into(),
+                )
+                .await
+                .expect("write snapshot file");
+        });
+
+        let manager = SnapshotManager {
+            dataset_name: "dataset".to_string(),
+            snapshots_location: Path::from("snapshots"),
+            local_path: PathBuf::from("/tmp/unused.db"),
+            object_store: Arc::new(store),
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
+            checkpointer_factory: Some(Arc::new(|| {
+                Box::pin(async {
+                    Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(NoopCheckpointer))
+                })
+            })),
+        };
+
+        let candidates =
+            block_on(manager.list_snapshot_candidates()).expect("list snapshot candidates");
+        let filenames: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .location
+                    .filename()
+                    .expect("snapshot object should have filename")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            filenames,
+            vec![
+                "dataset_20251003T123421Z.db".to_string(),
+                "dataset_20251003T123312Z.db".to_string(),
+                "dataset_250927T13340914Z.db".to_string()
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn create_snapshot_streams_file_to_store() {
         let mut temp_file = NamedTempFile::new().expect("create temp file");
@@ -764,13 +914,13 @@ mod tests {
             dataset_name: "dataset".to_string(),
             snapshots_location: Path::from("snapshots"),
             local_path: local_path.clone(),
-            object_store: Box::new(InMemory::new()),
+            object_store: Arc::new(InMemory::new()),
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
-            checkpointer_factory: Arc::new(|| {
+            checkpointer_factory: Some(Arc::new(|| {
                 Box::pin(async {
                     Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(NoopCheckpointer))
                 })
-            }),
+            })),
         };
 
         let uploaded_path = manager.create_snapshot().await.expect("upload snapshot");

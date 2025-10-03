@@ -44,9 +44,17 @@ use super::{
 pub enum Error {
     #[snafu(display("Unable to create MySQL connection pool: {source}"))]
     UnableToCreateMySQLConnectionPool { source: DbConnectionPoolError },
+
+    #[snafu(display(
+        "Invalid connection pool configuration: pool_min ({pool_min}) cannot be greater than pool_max ({pool_max})"
+    ))]
+    InvalidConnectionPoolConfiguration { pool_min: usize, pool_max: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+const DEFAULT_CONNECTION_POOL_MIN: usize = 1;
+const DEFAULT_CONNECTION_POOL_MAX: usize = 5;
 
 pub struct MySQL {
     mysql_factory: MySQLTableFactory,
@@ -84,10 +92,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sslrootcert"),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
-        .default("10"),
+        .default("1"),
     ParameterSpec::component("pool_max")
-        .description("The maximum number of connections to allow in the pool.")
-        .default("100"),
+        .description("The maximum number of connections created in the connection pool.")
+        .default("5"),
     ParameterSpec::component("time_zone")
         .description("The time zone to use for the connection. Default is '+00:00' (UTC)."),
 ];
@@ -105,7 +113,7 @@ impl DataConnectorFactory for MySQLFactory {
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let mut pool_min = params
+            let pool_min = params
                 .parameters
                 .get("pool_min")
                 .ok()
@@ -114,13 +122,13 @@ impl DataConnectorFactory for MySQLFactory {
                     let parsed_pool_min = pool_min_str.parse::<usize>();
                     if parsed_pool_min.is_err() {
                         tracing::warn!(
-                            "Invalid pool_min value: {pool_min_str}, using default of 10"
+                            "Invalid pool_min value: {pool_min_str}, using default of {DEFAULT_CONNECTION_POOL_MIN}"
                         );
                     }
                     parsed_pool_min.ok()
                 })
-                .unwrap_or(10);
-            let mut pool_max = params
+                .unwrap_or(DEFAULT_CONNECTION_POOL_MIN);
+            let pool_max = params
                 .parameters
                 .get("pool_max")
                 .ok()
@@ -129,26 +137,17 @@ impl DataConnectorFactory for MySQLFactory {
                     let parsed_pool_max = pool_max_str.parse::<usize>();
                     if parsed_pool_max.is_err() {
                         tracing::warn!(
-                            "Invalid pool_max value: {pool_max_str}, using default of 100"
+                            "Invalid pool_max value: {pool_max_str}, using default of {DEFAULT_CONNECTION_POOL_MAX}"
                         );
                     }
                     parsed_pool_max.ok()
                 })
-                .unwrap_or(100);
+                .unwrap_or(DEFAULT_CONNECTION_POOL_MAX);
 
             if pool_min > pool_max {
-                tracing::warn!(
-                    "pool_min value: {pool_min} is greater than pool_max value: {pool_max}, using default values of 10 and 100"
+                return Err(
+                    Error::InvalidConnectionPoolConfiguration { pool_min, pool_max }.into(),
                 );
-                pool_min = 10;
-                pool_max = 100;
-
-                params
-                    .parameters
-                    .insert("pool_min".to_string(), pool_min.to_string().into());
-                params
-                    .parameters
-                    .insert("pool_max".to_string(), pool_max.to_string().into());
             }
 
             if let Some(time_zone) = params.parameters.get("time_zone").expose().ok() {
