@@ -23,7 +23,7 @@ use crate::{
         },
         view::View,
     },
-    dataaccelerator::FilePathError,
+    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -49,6 +49,7 @@ use std::{
     cmp::max,
     collections::HashSet,
     ffi::OsStr,
+    path::PathBuf,
     sync::{Arc, Once},
 };
 
@@ -314,6 +315,8 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
                 .into());
             }
+
+            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
 
             self.get_shared_pool(source).await?;
         }
