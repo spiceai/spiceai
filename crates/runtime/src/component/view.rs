@@ -33,6 +33,7 @@ use super::{
 use spicepod::semantic::Column;
 
 /// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
+#[derive(Clone)]
 pub struct View {
     pub name: TableReference,
     pub sql: Arc<str>,
