@@ -33,7 +33,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
-use datafusion_expr::{LogicalPlanBuilder, ident, select_expr::SelectExpr};
+use datafusion_expr::{LogicalPlanBuilder, ident};
 
 use itertools::Itertools;
 use search::index::VectorIndex;
@@ -95,7 +95,8 @@ impl VectorScanTableProvider {
             projection
                 .iter()
                 .sorted_unstable()
-                .map(|p| SelectExpr::Expression(indent(p.clone())))
+                .cloned()
+                .map(ident)
                 .collect(),
         )?
     }

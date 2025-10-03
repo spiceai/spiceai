@@ -29,7 +29,6 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{
         LogicalPlan, LogicalPlanBuilder, Operator, SortExpr, TableProviderFilterPushDown,
-        select_expr::SelectExpr,
     },
     physical_plan::ExecutionPlan,
     prelude::{Expr, array_element, binary_expr, cast, col, ident, lit, substring},
@@ -229,16 +228,12 @@ impl SearchQueryProvider {
                         && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
                 })
                 .map(|(tbl, field_ref)| match tbl {
-                    Some(table_ref) => SelectExpr::Expression(Expr::Column(Column::new(
-                        Some(table_ref.clone()),
-                        field_ref.name(),
-                    ))),
-                    None => SelectExpr::Expression(Expr::Column(Column::new(
-                        None::<TableReference>,
-                        field_ref.name(),
-                    ))),
+                    Some(table_ref) => {
+                        Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
+                    }
+                    None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
                 })
-                .collect::<Vec<SelectExpr>>(),
+                .collect::<Vec<Expr>>(),
         )?;
 
         // Apply all filters after JOIN. This is to ensure that if a filter is pushed onto RHS,
@@ -278,7 +273,7 @@ impl SearchQueryProvider {
         let first = array_element(col(&search_offset), lit(1));
         let second = array_element(col(&search_offset), lit(2));
 
-        let input_with_match: Vec<SelectExpr> = vec![
+        let input_with_match: Vec<Expr> = vec![
             input
                 .schema()
                 .columns()
@@ -304,7 +299,6 @@ impl SearchQueryProvider {
         ]
         .concat()
         .into_iter()
-        .map(SelectExpr::Expression)
         .collect();
 
         input.project(input_with_match)
@@ -496,7 +490,7 @@ impl TableProvider for SearchQueryProvider {
                 schema_proj
                     .fields()
                     .into_iter()
-                    .map(|f| SelectExpr::Expression(ident(f.name().clone())))
+                    .map(|f| ident(f.name().clone()))
                     .collect::<Vec<_>>(),
             )?
             .build()?;
