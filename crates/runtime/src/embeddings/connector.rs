@@ -291,6 +291,8 @@ impl EmbeddingConnector {
         );
         Ok(Arc::new(provider))
     }
+
+    #[cfg(feature = "s3_vectors")]
     async fn construct_s3_chunked_vector_index(
         &self,
         mut provider: IndexedTableProvider,
