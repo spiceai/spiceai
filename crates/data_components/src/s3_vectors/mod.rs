@@ -25,7 +25,6 @@ use std::fmt::{Display, Formatter};
 
 pub mod list_provider;
 pub mod partition;
-pub mod put_vectors_sink;
 pub mod query_provider;
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};

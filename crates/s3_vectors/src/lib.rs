@@ -63,6 +63,7 @@ pub static PUT_VECTORS_MAX_ITEMS: usize = 500;
 
 mod list_vectors;
 pub mod mock_client;
+mod put_vectors;
 mod query_vectors;
 pub mod table;
 
