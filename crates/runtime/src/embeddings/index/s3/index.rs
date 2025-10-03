@@ -170,8 +170,8 @@ impl SearchIndex for S3Vector {
                             let partitioned_index_name = PartitionedIndexName::new(
                                 index_name,
                                 &self.embedded_column,
-                                &partition_value,
                                 &self.partition_by,
+                                &partition_value,
                             )?;
                             let index_name = partitioned_index_name.to_index_name();
                             tracing::trace!(
