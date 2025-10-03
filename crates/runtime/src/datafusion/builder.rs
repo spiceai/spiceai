@@ -20,7 +20,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
+use crate::{
+    dataaccelerator::AcceleratorEngineRegistry,
+    datafusion::{
+        SPICE_SCP_SCHEMA, extension::cache_invalidation::CacheInvalidationExtensionPlanner,
+    },
+};
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
 use datafusion::{
@@ -173,6 +178,7 @@ impl DataFusionBuilder {
                 vec![
                     Arc::new(FederatedPlanner::new()),
                     Arc::new(SpiceExtensionPlanner::new()),
+                    Arc::new(CacheInvalidationExtensionPlanner::new()),
                 ],
             )))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))

@@ -20,6 +20,7 @@ limitations under the License.
 
 use std::{
     any::Any,
+    collections::HashSet,
     fmt::{self, Debug},
     hash::{Hash, Hasher},
     sync::{Arc, Weak},
@@ -181,6 +182,39 @@ impl UserDefinedLogicalNodeCore for CacheInvalidationNode {
             caching: Weak::clone(&self.caching),
         })
     }
+
+    fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
+        // Allow filters for all columns to be pushed down
+        HashSet::new()
+    }
+
+    /// Returns the necessary input columns for this node required to compute
+    /// the columns in the output schema
+    ///
+    /// This is used for projection push-down when `DataFusion` has determined that
+    /// only a subset of the output columns of this node are needed by its parents.
+    /// This API is used to tell `DataFusion` which, if any, of the input columns are no longer
+    /// needed.
+    ///
+    /// Return `None`, the default, if this information can not be determined.
+    /// Returns `Some(_)` with the column indices for each child of this node that are
+    /// needed to compute `output_columns`
+    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        // Default implementation
+        None
+    }
+
+    /// Returns `true` if a limit can be safely pushed down through this
+    /// `UserDefinedLogicalNode` node.
+    ///
+    /// If this method returns `true`, and the query plan contains a limit at
+    /// the output of this node, `DataFusion` will push the limit to the input
+    /// of this node.
+    fn supports_limit_pushdown(&self) -> bool {
+        // Disallow limit push-down (default implementation).
+        // The node wraps write operations which produce a single output row.
+        false
+    }
 }
 
 impl PartialEq<CacheInvalidationNode> for CacheInvalidationNode {
@@ -271,12 +305,24 @@ impl ExecutionPlan for CacheInvalidationExec {
         vec![&self.input_exec]
     }
 
+    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
+        // Enforce single partition to ensure cache invalidation happens once after all input is processed
+        vec![datafusion::physical_plan::Distribution::SinglePartition; self.children().len()]
+    }
+
+    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
+    }
+
+    fn required_input_ordering(
+        &self,
+    ) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
+        vec![None; self.children().len()]
     }
 
     fn with_new_children(
