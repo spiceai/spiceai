@@ -22,14 +22,16 @@ use datafusion::common::{Constraints, TableReference, ToDFSchema};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::CreateExternalTable;
-use datafusion_federation::FederatedTableProviderAdaptor;
+use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
 use runtime::Runtime;
 use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
-use runtime::datafusion::builder::get_analyzer_rules;
-use runtime::datafusion::extension::SpiceQueryPlanner;
+use runtime::datafusion::builder::AnalyzerRulesBuilder;
+use runtime::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
 use runtime::execution_plan::schema_cast::EnsureSchema;
-use runtime_datafusion_index::analyzer::IndexTableScanOptimizerRule;
+use runtime_datafusion_index::analyzer::{
+    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
+};
 use runtime_object_store::registry::default_runtime_env;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,8 +101,14 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
             let mut state = SessionStateBuilder::new()
                 .with_runtime_env(default_runtime_env())
                 .with_default_features()
-                .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
-                .with_analyzer_rules(get_analyzer_rules())
+                .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
+                    vec![
+                        Arc::new(FederatedPlanner::new()),
+                        Arc::new(SpiceExtensionPlanner::new()),
+                        Arc::new(IndexTableScanExtensionPlanner::new()),
+                    ],
+                )))
+                .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
                 .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
                 .build();
 

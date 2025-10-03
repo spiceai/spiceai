@@ -27,11 +27,11 @@ use datafusion_table_providers::{
 use runtime_table_partition::expression::PartitionBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
+use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::FilePathError,
+    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
@@ -238,6 +238,8 @@ impl DataAccelerator for SqliteAccelerator {
                 }
                 .into());
             }
+
+            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
 
             self.get_shared_pool(source).await?;
         }
