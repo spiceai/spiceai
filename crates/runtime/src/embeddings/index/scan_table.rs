@@ -225,20 +225,23 @@ impl TableProvider for VectorScanTableProvider {
 
             return state.create_physical_plan(&lp).await;
         }
-        if Self::schema_is_sufficient(
-            self.vector_index_list.schema().fields(),
-            &columns_requested,
-            filters,
-        ) {
-            let lp = Self::apply_proj_and_filter(
-                LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list)),
-                &columns_requested,
-                filters,
-            )?
-            .build()?;
 
-            return state.create_physical_plan(&lp).await;
-        }
+        // Reenable once we can distinguish between query and indexing `.scan()`.
+        // See `<https://github.com/spiceai/spiceai/issues/7404>`
+        // if Self::schema_is_sufficient(
+        //     self.vector_index_list.schema().fields(),
+        //     &columns_requested,
+        //     filters,
+        // ) {
+        //     let lp = Self::apply_proj_and_filter(
+        //         LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list)),
+        //         &columns_requested,
+        //         filters,
+        //     )?
+        //     .build()?;
+
+        //     return state.create_physical_plan(&lp).await;
+        // }
 
         // Join on primary keys, prefer to use columns from base table, push down filters where we can.
         let mut join = LogicalPlanBuilder::scan(
