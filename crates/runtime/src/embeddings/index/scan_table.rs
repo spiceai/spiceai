@@ -212,20 +212,22 @@ impl TableProvider for VectorScanTableProvider {
 
             return state.create_physical_plan(&lp).await;
         }
-        if Self::schema_is_sufficient(
-            self.vector_index_list.schema().fields(),
-            &columns_requested,
-            filters,
-        ) {
-            let lp = Self::apply_proj_and_filter(
-                Arc::clone(&self.vector_index_list),
-                &columns_requested,
-                filters,
-            )?;
 
-            return state.create_physical_plan(&lp).await;
-        }
+        // Reenable once we can distinguish between query and indexing `.scan()`.
+        // See `<https://github.com/spiceai/spiceai/issues/7404>`
+        // if Self::schema_is_sufficient(
+        //     self.vector_index_list.schema().fields(),
+        //     &columns_requested,
+        //     filters,
+        // ) {
+        //     let lp = Self::apply_proj_and_filter(
+        //         Arc::clone(&self.vector_index_list),
+        //         &columns_requested,
+        //         filters,
+        //     )?;
 
+        //     return state.create_physical_plan(&lp).await;
+        // }
         let base_ts = LogicalPlan::TableScan(TableScan::try_new(
             TableReference::parse_str("base_table"),
             Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),

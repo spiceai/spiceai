@@ -9,7 +9,14 @@ snapshot_kind: text
 | logical_plan  | Projection: my_vectored_table.pk1, my_vectored_table.pk2, my_vectored_table.pk3, my_vectored_table.body_embedding |
 |               |   Limit: skip=0, fetch=5                                                                                          |
 |               |     TableScan: my_vectored_table projection=[body_embedding, pk1, pk2, pk3], fetch=5                              |
-| physical_plan | GlobalLimitExec: skip=0, fetch=5                                                                                  |
-|               |   PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding"] filter=[] limit=None                     |
+| physical_plan | ProjectionExec: expr=[pk1@1 as pk1, pk2@2 as pk2, pk3@3 as pk3, body_embedding@0 as body_embedding]               |
+|               |   CoalescePartitionsExec: fetch=5                                                                                 |
+|               |     ProjectionExec: expr=[body_embedding@6 as body_embedding, pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3]           |
+|               |       CoalesceBatchesExec: target_batch_size=8192, fetch=5                                                        |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                               |
+|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk1@0, pk1@0), (pk2@1, pk2@1), (pk3@2, pk3@2)]     |
+|               |             BaseTable: projection=["pk1", "pk2", "pk3"] filter=[] limit=Some(5)                                   |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                  |
+|               |               PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding"] filter=[] limit=None         |
 |               |                                                                                                                   |
 +---------------+-------------------------------------------------------------------------------------------------------------------+
