@@ -153,7 +153,7 @@ impl DataSource for ListVectorsSource {
                     ],
                 )?;
 
-                Result::Ok(Some((batch, next_token)))
+                Ok(Some((batch, next_token)))
             }
         });
 
@@ -211,7 +211,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_list_vectors_data_source() -> Result<()> {
+    async fn list_vectors_data_source() -> Result<()> {
         let mock_client = MockClient::new();
         let index_name = "test_index";
         let index_arn = "test_arn";

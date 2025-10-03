@@ -51,7 +51,7 @@ use aws_sdk_s3vectors::{
         put_vectors::{PutVectorsError, PutVectorsInput, PutVectorsOutput},
         query_vectors::{QueryVectorsError, QueryVectorsInput, QueryVectorsOutput},
     },
-    types::{IndexSummary, ListOutputVector},
+    types::{IndexSummary, ListOutputVector, QueryOutputVector},
 };
 pub use aws_smithy_types::{DateTime, Document, Number, error::operation::BuildError};
 
@@ -206,8 +206,34 @@ impl S3Vectors for MockClient {
 
     async fn query_vectors(
         &self,
-        _input: QueryVectorsInput,
+        input: QueryVectorsInput,
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
-        unimplemented!()
+        let index_name = input.index_name().unwrap_or_default();
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+
+        // The mock implementation will just return all vectors from the given index,
+        // ignoring the actual query vector.
+        // A real implementation would calculate distances and sort.
+        let index_vectors = data.vectors.get(index_name).cloned().unwrap_or_default();
+
+        let query_output_vectors: Vec<QueryOutputVector> = index_vectors
+            .into_iter()
+            .map(|v| {
+                QueryOutputVector::builder()
+                    .key(v.key)
+                    .set_data(v.data)
+                    // Mock distance
+                    .distance(0.5)
+                    .build()
+            })
+            .collect::<Result<_, _>>()
+            .map_err(SdkError::construction_failure)?;
+
+        Ok(QueryVectorsOutput::builder()
+            .set_vectors(Some(query_output_vectors))
+            .build()?)
     }
 }
