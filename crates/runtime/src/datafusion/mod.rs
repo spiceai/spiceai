@@ -70,8 +70,6 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
-use runtime_acceleration::dataset_checkpoint::make_checkpointer_factory;
-use runtime_acceleration::snapshot::SnapshotManager;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
