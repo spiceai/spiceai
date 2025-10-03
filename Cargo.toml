@@ -194,7 +194,7 @@ tiberius = { version = "0.12.3", default-features = false, features = [
     "chrono",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
-tokio-postgres = { version = "0.7.13", features = [
+tokio-postgres = { version = "0.7.14", features = [
     "with-chrono-0_4",
     "with-uuid-1",
 ] }
