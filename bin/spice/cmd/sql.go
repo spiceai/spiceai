@@ -84,7 +84,9 @@ func decompressResponse(body []byte, encoding string) ([]byte, error) {
 	}
 
 	if decompressor != nil {
-		defer decompressor.Close()
+		defer func() {
+			_ = decompressor.Close()
+		}()
 		return io.ReadAll(decompressor)
 	}
 
@@ -592,7 +594,8 @@ func displayJSONResults(jsonData []byte) (int, uint64, error) {
 	var colTypes []string
 
 	// Check if this is the vnd.spiceai.sql.v1+json format (starts with '{' and has "rows" or "data" field)
-	if trimmed[0] == '{' {
+	switch trimmed[0] {
+	case '{':
 		// Try to parse as application/vnd.spiceai.sql.v1+json format
 		var rawResponse map[string]interface{}
 		if err := json.Unmarshal(jsonData, &rawResponse); err != nil {
@@ -666,7 +669,7 @@ func displayJSONResults(jsonData []byte) (int, uint64, error) {
 			// Not vnd format, might be plain JSON object - but we don't support that yet
 			return 0, 0, fmt.Errorf("unrecognized JSON format (expected vnd.spiceai.sql.v1+json with 'rows' or 'data' field)")
 		}
-	} else if trimmed[0] == '[' {
+	case '[':
 		// Parse as plain application/json format (array of objects)
 		if err := json.Unmarshal(jsonData, &records); err != nil {
 			return 0, 0, fmt.Errorf("parsing application/json response: %w", err)
@@ -684,7 +687,7 @@ func displayJSONResults(jsonData []byte) (int, uint64, error) {
 		// Sort column names for consistent ordering
 		sort.Strings(colNames)
 		colTypes = nil // No types available in plain JSON format
-	} else {
+	default:
 		return 0, 0, fmt.Errorf("invalid JSON format (must start with '[' or '{')")
 	}
 

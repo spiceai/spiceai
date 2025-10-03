@@ -60,7 +60,9 @@ func IsRuntimeServerReady(serverBaseUrl string, httpClient *http.Client, apiKey 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != 200 {
 		return errors.New(resp.Status)
