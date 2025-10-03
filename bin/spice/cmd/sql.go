@@ -419,7 +419,7 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		}
 
 		req.Header.Set("Content-Type", "text/plain")
-		req.Header.Set("Accept", "application/vnd.spiceai.sql.v1+json")
+		req.Header.Set("Accept", "application/vnd.spiceai.sql.v1+json, application/json")
 		if apiKey != "" {
 			req.Header.Set("X-API-Key", apiKey)
 		}
@@ -477,47 +477,67 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 
 // displayJSONResults parses JSON response and displays it as a table
 func displayJSONResults(jsonData []byte) (int, uint64, error) {
-	// Parse JSON response - expected format from application/vnd.spiceai.sql.v1+json
-	var response struct {
-		RowCount int `json:"row_count"`
-		Schema   struct {
-			Fields []struct {
-				Name string `json:"name"`
-				Type struct {
-					Name string `json:"name"`
-				} `json:"type"`
-			} `json:"fields"`
-		} `json:"schema"`
-		Data []map[string]interface{} `json:"data"`
-	}
-	if err := json.Unmarshal(jsonData, &response); err != nil {
+	// Try to detect which format we received by checking for the presence of specific fields
+	var rawResponse map[string]interface{}
+	if err := json.Unmarshal(jsonData, &rawResponse); err != nil {
 		return 0, 0, fmt.Errorf("parsing JSON response: %w", err)
 	}
 
-	records := response.Data
-	if len(records) == 0 {
-		fmt.Println("No results.")
-		return 0, 0, nil
-	}
-
-	// Extract column names and types from schema if available, otherwise from first record
+	var records []map[string]interface{}
 	var colNames []string
 	var colTypes []string
-	if len(response.Schema.Fields) > 0 {
-		for _, field := range response.Schema.Fields {
-			colNames = append(colNames, field.Name)
-			// Extract type if available
-			typeName := field.Type.Name
-			colTypes = append(colTypes, typeName)
+
+	// Check if this is the vnd.spiceai.sql.v1+json format (has "data" and "schema" fields)
+	if _, hasData := rawResponse["data"]; hasData {
+		// Parse as application/vnd.spiceai.sql.v1+json format
+		var response struct {
+			RowCount int `json:"row_count"`
+			Schema   struct {
+				Fields []struct {
+					Name string `json:"name"`
+					Type struct {
+						Name string `json:"name"`
+					} `json:"type"`
+				} `json:"fields"`
+			} `json:"schema"`
+			Data []map[string]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal(jsonData, &response); err != nil {
+			return 0, 0, fmt.Errorf("parsing vnd.spiceai.sql.v1+json response: %w", err)
+		}
+
+		records = response.Data
+		if len(records) == 0 {
+			fmt.Println("No results.")
+			return 0, 0, nil
+		}
+
+		// Extract column names and types from schema
+		if len(response.Schema.Fields) > 0 {
+			for _, field := range response.Schema.Fields {
+				colNames = append(colNames, field.Name)
+				typeName := field.Type.Name
+				colTypes = append(colTypes, typeName)
+			}
 		}
 	} else {
-		// Fallback: extract from first record
+		// Parse as plain application/json format (array of objects)
+		if err := json.Unmarshal(jsonData, &records); err != nil {
+			return 0, 0, fmt.Errorf("parsing application/json response: %w", err)
+		}
+
+		if len(records) == 0 {
+			fmt.Println("No results.")
+			return 0, 0, nil
+		}
+
+		// Extract column names from first record
 		for colName := range records[0] {
 			colNames = append(colNames, colName)
 		}
 		// Sort column names for consistent ordering
 		sort.Strings(colNames)
-		colTypes = nil // No types available
+		colTypes = nil // No types available in plain JSON format
 	}
 
 	// Collect all row data as strings and calculate column widths
