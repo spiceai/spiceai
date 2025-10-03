@@ -1,19 +1,36 @@
-use std::{any::Any, sync::Arc};
+use std::{any::Any, fmt, sync::Arc};
 
 use async_trait::async_trait;
+use aws_sdk_s3vectors::types::Index;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::{Session, TableProvider},
     common::Result,
-    datasource::TableType,
+    datasource::{TableType, sink::DataSinkExec},
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
-#[derive(Debug)]
+use crate::{S3Vectors, put_vectors::PutVectorsSink};
+
+static NAME: &str = "S3VectorsTable";
+
 pub struct S3VectorsTable {
+    client: Arc<dyn S3Vectors + Send + Sync>,
+    index: Index,
     schema: SchemaRef,
+}
+
+impl fmt::Debug for S3VectorsTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{NAME} bucket={} index={}",
+            self.index.vector_bucket_name(),
+            self.index.index_name
+        )
+    }
 }
 
 #[async_trait]
@@ -50,9 +67,16 @@ impl TableProvider for S3VectorsTable {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        _input: Arc<dyn ExecutionPlan>,
+        input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        let client = Arc::clone(&self.client);
+        let index = self.index.clone();
+        let schema = Arc::clone(&self.schema);
+
+        let sink = Arc::new(PutVectorsSink::new(client, index, schema));
+        let sort_order = None;
+        let exec = DataSinkExec::new(input, sink, sort_order);
+        Ok(Arc::new(exec))
     }
 }
