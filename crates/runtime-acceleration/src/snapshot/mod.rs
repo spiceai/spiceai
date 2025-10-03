@@ -17,7 +17,7 @@ use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use bytes::BytesMut;
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use futures::StreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path as ObjectPath};
 use snafu::prelude::*;
@@ -117,6 +117,13 @@ pub enum SnapshotUploadError {
 struct SnapshotCandidate {
     location: ObjectPath,
     timestamp: String,
+}
+
+fn parse_snapshot_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(timestamp, SNAPSHOT_TIMESTAMP_FORMAT)
+        .map(|naive| Utc.from_utc_datetime(&naive))
+        .or_else(|_| DateTime::parse_from_rfc3339(timestamp).map(|dt| dt.with_timezone(&Utc)))
+        .ok()
 }
 
 /// Manages snapshots for a specific accelerated dataset.
@@ -524,7 +531,31 @@ impl SnapshotManager {
             }
         }
 
-    snapshots.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        let mut snapshots_with_ts: Vec<(Option<DateTime<Utc>>, SnapshotCandidate)> = snapshots
+            .into_iter()
+            .map(|candidate| {
+                let parsed = parse_snapshot_timestamp(&candidate.timestamp);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        snapshot = %candidate.location.to_string(),
+                        timestamp = %candidate.timestamp,
+                        "Failed to parse snapshot timestamp; falling back to lexicographic order."
+                    );
+                }
+                (parsed, candidate)
+            })
+            .collect();
+
+        snapshots_with_ts.sort_by(|(a_ts, a_candidate), (b_ts, b_candidate)| {
+            b_ts.cmp(a_ts)
+                .then_with(|| b_candidate.timestamp.cmp(&a_candidate.timestamp))
+        });
+
+        let snapshots: Vec<SnapshotCandidate> = snapshots_with_ts
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect();
         tracing::info!(
             dataset = %self.dataset_name,
             location = %self.snapshots_location.to_string(),
@@ -796,6 +827,77 @@ mod tests {
             vec![
                 "dataset_20250201T000000Z.db".to_string(),
                 "dataset_20250101T000000Z.db".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn list_snapshot_candidates_places_unparsable_after_parsable() {
+        let store = InMemory::new();
+
+        block_on(async {
+            store
+                .put(
+                    &Path::from("snapshots/dataset_20251003T123312Z.db"),
+                    Bytes::from_static(b"a").into(),
+                )
+                .await
+                .expect("write snapshot file");
+            store
+                .put(
+                    &Path::from("snapshots/dataset_20251003T123421Z.db"),
+                    Bytes::from_static(b"b").into(),
+                )
+                .await
+                .expect("write snapshot file");
+            store
+                .put(
+                    &Path::from("snapshots/dataset_250927T13340914Z.db"),
+                    Bytes::from_static(b"c").into(),
+                )
+                .await
+                .expect("write snapshot file");
+            store
+                .put(
+                    &Path::from("snapshots/other_20251003T123421Z.db"),
+                    Bytes::from_static(b"d").into(),
+                )
+                .await
+                .expect("write snapshot file");
+        });
+
+        let manager = SnapshotManager {
+            dataset_name: "dataset".to_string(),
+            snapshots_location: Path::from("snapshots"),
+            local_path: PathBuf::from("/tmp/unused.db"),
+            object_store: Arc::new(store),
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
+            checkpointer_factory: Some(Arc::new(|| {
+                Box::pin(async {
+                    Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(NoopCheckpointer))
+                })
+            })),
+        };
+
+        let candidates =
+            block_on(manager.list_snapshot_candidates()).expect("list snapshot candidates");
+        let filenames: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .location
+                    .filename()
+                    .expect("snapshot object should have filename")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            filenames,
+            vec![
+                "dataset_20251003T123421Z.db".to_string(),
+                "dataset_20251003T123312Z.db".to_string(),
+                "dataset_250927T13340914Z.db".to_string()
             ]
         );
     }

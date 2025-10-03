@@ -713,13 +713,8 @@ impl Refresher {
                             if let Some(checkpointer) = &checkpointer {
                                 match (checkpointer.checkpoint(&federated_schema).await, snapshot_manager.as_ref()) {
                                     (Ok(()), Some(snapshot_manager)) => {
-                                        match snapshot_manager.create_snapshot().await {
-                                            Ok(path) => {
-                                                tracing::info!("Created snapshot for dataset {}: {}", &dataset_name.to_string(), path);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("Failed to create snapshot for dataset {}: {e}", &dataset_name.to_string());
-                                            }
+                                        if let Err(e) = snapshot_manager.create_snapshot().await {
+                                            tracing::warn!("Failed to create snapshot for dataset {}: {e}", &dataset_name.to_string());
                                         }
                                     }
                                     (Err(e), _) => {
