@@ -134,15 +134,17 @@ impl DataSource for ListVectorsSource {
 
                 let mut key_builder = StringBuilder::new();
                 let mut data_builder = ListBuilder::new(Float32Builder::new());
-                // TODO: (function) add metadata
-                // TODO: (optimization) if we know/store the vector dimension we can make a fixed size list
+                let mut distance_builder = Float32Builder::new();
 
                 for vector in vectors {
                     key_builder.append_value(vector.key);
                     if let Some(VectorData::Float32(data)) = vector.data {
                         data_builder.values().append_slice(&data);
+                        data_builder.append(true);
+                    } else {
+                        data_builder.append(false);
                     }
-                    data_builder.append(true);
+                    distance_builder.append_null();
                 }
 
                 let batch = RecordBatch::try_new(
@@ -150,6 +152,7 @@ impl DataSource for ListVectorsSource {
                     vec![
                         Arc::new(key_builder.finish()),
                         Arc::new(data_builder.finish()),
+                        Arc::new(distance_builder.finish()),
                     ],
                 )?;
 
