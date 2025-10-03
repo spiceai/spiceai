@@ -61,6 +61,7 @@ pub use aws_smithy_types::{Document, Number, error::operation::BuildError};
 pub static LIST_VECTORS_MAX_RESULTS: usize = 500;
 pub static PUT_VECTORS_MAX_ITEMS: usize = 500;
 
+mod list_vectors;
 pub mod table;
 
 /// Trait representing the capabilities of the Amazon S3 Vectors API. Amazon S3 Vectors clients implement this trait.
