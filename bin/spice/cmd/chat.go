@@ -34,6 +34,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -878,6 +879,8 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		}
 
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept-Encoding", "zstd, gzip, deflate")
+		req.Header.Set("User-Agent", spice_http.UserAgent())
 		if apiKey != "" {
 			req.Header.Set("X-API-Key", apiKey)
 		}
@@ -908,8 +911,22 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 			return messages, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 		}
 
+		// Get decompressing reader if response is compressed
+		bodyReader := io.ReadCloser(resp.Body)
+		contentEncoding := resp.Header.Get("Content-Encoding")
+		if contentEncoding != "" {
+			decompReader, err := getDecompressingReader(resp.Body, contentEncoding)
+			if err != nil {
+				if useSpinner {
+					done <- true
+				}
+				return messages, fmt.Errorf("creating decompressor: %w", err)
+			}
+			bodyReader = decompReader
+		}
+
 		// Handle streaming response
-		scanner := bufio.NewScanner(resp.Body)
+		scanner := bufio.NewScanner(bodyReader)
 		var responseMessage string
 
 		for scanner.Scan() {

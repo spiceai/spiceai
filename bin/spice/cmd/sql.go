@@ -17,6 +17,9 @@ limitations under the License.
 package cmd
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,17 +36,88 @@ import (
 
 	"github.com/apache/arrow/go/v17/arrow/array"
 	"github.com/dustin/go-humanize"
+	"github.com/klauspost/compress/zstd"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/gospice/v7"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	rtcontext "github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/display"
+	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
 // QueryExecutor defines a function that executes a SQL query with a cancellable context
 type QueryExecutor func(ctx context.Context, query string) error
+
+// decompressResponse decompresses the response body based on Content-Encoding header
+func decompressResponse(body []byte, encoding string) ([]byte, error) {
+	if encoding == "" || encoding == "identity" {
+		return body, nil
+	}
+
+	reader := bytes.NewReader(body)
+	var decompressor io.ReadCloser
+	var err error
+
+	switch encoding {
+	case "gzip":
+		decompressor, err = gzip.NewReader(reader)
+		if err != nil {
+			return nil, fmt.Errorf("creating gzip reader: %w", err)
+		}
+	case "deflate":
+		decompressor = flate.NewReader(reader)
+	case "zstd":
+		decoder, err := zstd.NewReader(reader)
+		if err != nil {
+			return nil, fmt.Errorf("creating zstd reader: %w", err)
+		}
+		defer decoder.Close()
+		return io.ReadAll(decoder)
+	case "br":
+		// Brotli support requires additional package
+		// For now, return error - server should fall back to other encodings
+		return nil, fmt.Errorf("brotli encoding not supported in this build")
+	default:
+		return nil, fmt.Errorf("unsupported content encoding: %s", encoding)
+	}
+
+	if decompressor != nil {
+		defer decompressor.Close()
+		return io.ReadAll(decompressor)
+	}
+
+	return body, nil
+}
+
+// getDecompressingReader wraps a reader with a decompressing reader based on Content-Encoding
+func getDecompressingReader(reader io.Reader, encoding string) (io.ReadCloser, error) {
+	if encoding == "" || encoding == "identity" {
+		return io.NopCloser(reader), nil
+	}
+
+	switch encoding {
+	case "gzip":
+		gzReader, err := gzip.NewReader(reader)
+		if err != nil {
+			return nil, fmt.Errorf("creating gzip reader: %w", err)
+		}
+		return gzReader, nil
+	case "deflate":
+		return flate.NewReader(reader), nil
+	case "zstd":
+		decoder, err := zstd.NewReader(reader)
+		if err != nil {
+			return nil, fmt.Errorf("creating zstd reader: %w", err)
+		}
+		return io.NopCloser(decoder), nil
+	case "br":
+		return nil, fmt.Errorf("brotli encoding not supported in this build")
+	default:
+		return nil, fmt.Errorf("unsupported content encoding: %s", encoding)
+	}
+}
 
 var sqlCmd = &cobra.Command{
 	Use:   "sql",
@@ -239,8 +313,14 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 
 	// Strip grpc:// or grpc+tls:// scheme for gospice SDK
 	flightAddress := grpcEndpoint
+	isTLS := strings.HasPrefix(flightAddress, "grpc+tls://")
 	flightAddress = strings.TrimPrefix(flightAddress, "grpc://")
 	flightAddress = strings.TrimPrefix(flightAddress, "grpc+tls://")
+
+	// If TLS is specified without a port, default to 443
+	if isTLS && !strings.Contains(flightAddress, ":") {
+		flightAddress = flightAddress + ":443"
+	}
 
 	// Build init options
 	initOpts := []gospice.SpiceClientModifier{gospice.WithFlightAddress(flightAddress)}
@@ -420,6 +500,8 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 
 		req.Header.Set("Content-Type", "text/plain")
 		req.Header.Set("Accept", "application/vnd.spiceai.sql.v1+json, application/json")
+		req.Header.Set("Accept-Encoding", "zstd, gzip, deflate")
+		req.Header.Set("User-Agent", spice_http.UserAgent())
 		if apiKey != "" {
 			req.Header.Set("X-API-Key", apiKey)
 		}
@@ -447,6 +529,15 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+
+		// Decompress response if needed
+		contentEncoding := resp.Header.Get("Content-Encoding")
+		if contentEncoding != "" {
+			body, err = decompressResponse(body, contentEncoding)
+			if err != nil {
+				return fmt.Errorf("decompressing response: %w", err)
+			}
 		}
 
 		// Parse JSON response and display as table
@@ -477,50 +568,92 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 
 // displayJSONResults parses JSON response and displays it as a table
 func displayJSONResults(jsonData []byte) (int, uint64, error) {
-	// Try to detect which format we received by checking for the presence of specific fields
-	var rawResponse map[string]interface{}
-	if err := json.Unmarshal(jsonData, &rawResponse); err != nil {
-		return 0, 0, fmt.Errorf("parsing JSON response: %w", err)
+	// Detect format by checking if JSON starts with '[' (array) or '{' (object)
+	trimmed := bytes.TrimSpace(jsonData)
+	if len(trimmed) == 0 {
+		return 0, 0, fmt.Errorf("empty JSON response")
 	}
 
 	var records []map[string]interface{}
 	var colNames []string
 	var colTypes []string
 
-	// Check if this is the vnd.spiceai.sql.v1+json format (has "data" and "schema" fields)
-	if _, hasData := rawResponse["data"]; hasData {
-		// Parse as application/vnd.spiceai.sql.v1+json format
-		var response struct {
-			RowCount int `json:"row_count"`
-			Schema   struct {
-				Fields []struct {
+	// Check if this is the vnd.spiceai.sql.v1+json format (starts with '{' and has "rows" or "data" field)
+	if trimmed[0] == '{' {
+		// Try to parse as application/vnd.spiceai.sql.v1+json format
+		var rawResponse map[string]interface{}
+		if err := json.Unmarshal(jsonData, &rawResponse); err != nil {
+			return 0, 0, fmt.Errorf("parsing JSON response: %w", err)
+		}
+
+		// Check if it has the "rows" field (vnd format) or "data" field (alternative vnd format)
+		if _, hasRows := rawResponse["rows"]; hasRows {
+			// Parse as application/vnd.spiceai.sql.v1+json format with "rows"
+			var response struct {
+				RowCount int `json:"rowCount"`
+				Schema   []struct {
 					Name string `json:"name"`
 					Type struct {
 						Name string `json:"name"`
 					} `json:"type"`
-				} `json:"fields"`
-			} `json:"schema"`
-			Data []map[string]interface{} `json:"data"`
-		}
-		if err := json.Unmarshal(jsonData, &response); err != nil {
-			return 0, 0, fmt.Errorf("parsing vnd.spiceai.sql.v1+json response: %w", err)
-		}
-
-		records = response.Data
-		if len(records) == 0 {
-			fmt.Println("No results.")
-			return 0, 0, nil
-		}
-
-		// Extract column names and types from schema
-		if len(response.Schema.Fields) > 0 {
-			for _, field := range response.Schema.Fields {
-				colNames = append(colNames, field.Name)
-				typeName := field.Type.Name
-				colTypes = append(colTypes, typeName)
+				} `json:"schema"`
+				Rows []map[string]interface{} `json:"rows"`
 			}
+			if err := json.Unmarshal(jsonData, &response); err != nil {
+				return 0, 0, fmt.Errorf("parsing vnd.spiceai.sql.v1+json response: %w", err)
+			}
+
+			records = response.Rows
+			if len(records) == 0 {
+				fmt.Println("No results.")
+				return 0, 0, nil
+			}
+
+			// Extract column names and types from schema
+			if len(response.Schema) > 0 {
+				for _, field := range response.Schema {
+					colNames = append(colNames, field.Name)
+					typeName := field.Type.Name
+					colTypes = append(colTypes, typeName)
+				}
+			}
+		} else if _, hasData := rawResponse["data"]; hasData {
+			// Alternative format with "data" field
+			var response struct {
+				RowCount int `json:"row_count"`
+				Schema   struct {
+					Fields []struct {
+						Name string `json:"name"`
+						Type struct {
+							Name string `json:"name"`
+						} `json:"type"`
+					} `json:"fields"`
+				} `json:"schema"`
+				Data []map[string]interface{} `json:"data"`
+			}
+			if err := json.Unmarshal(jsonData, &response); err != nil {
+				return 0, 0, fmt.Errorf("parsing vnd.spiceai.sql.v1+json response: %w", err)
+			}
+
+			records = response.Data
+			if len(records) == 0 {
+				fmt.Println("No results.")
+				return 0, 0, nil
+			}
+
+			// Extract column names and types from schema
+			if len(response.Schema.Fields) > 0 {
+				for _, field := range response.Schema.Fields {
+					colNames = append(colNames, field.Name)
+					typeName := field.Type.Name
+					colTypes = append(colTypes, typeName)
+				}
+			}
+		} else {
+			// Not vnd format, might be plain JSON object - but we don't support that yet
+			return 0, 0, fmt.Errorf("unrecognized JSON format (expected vnd.spiceai.sql.v1+json with 'rows' or 'data' field)")
 		}
-	} else {
+	} else if trimmed[0] == '[' {
 		// Parse as plain application/json format (array of objects)
 		if err := json.Unmarshal(jsonData, &records); err != nil {
 			return 0, 0, fmt.Errorf("parsing application/json response: %w", err)
@@ -538,6 +671,8 @@ func displayJSONResults(jsonData []byte) (int, uint64, error) {
 		// Sort column names for consistent ordering
 		sort.Strings(colNames)
 		colTypes = nil // No types available in plain JSON format
+	} else {
+		return 0, 0, fmt.Errorf("invalid JSON format (must start with '[' or '{')")
 	}
 
 	// Collect all row data as strings and calculate column widths

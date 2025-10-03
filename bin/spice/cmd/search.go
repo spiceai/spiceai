@@ -34,6 +34,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/display"
+	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -456,6 +457,8 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Cache-Control", cache_control)
+		req.Header.Set("Accept-Encoding", "zstd, gzip, deflate")
+		req.Header.Set("User-Agent", spice_http.UserAgent())
 		if apiKey != "" {
 			req.Header.Set("X-API-Key", apiKey)
 		}
@@ -483,6 +486,16 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 		if resp.StatusCode != http.StatusOK {
 			slog.Error("search failed", "error", string(body))
 			continue
+		}
+
+		// Decompress response if needed
+		contentEncoding := resp.Header.Get("Content-Encoding")
+		if contentEncoding != "" {
+			body, err = decompressResponse(body, contentEncoding)
+			if err != nil {
+				slog.Error("decompressing response", "error", err)
+				continue
+			}
 		}
 
 		var searchResponse SearchResponse
