@@ -29,7 +29,7 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{
         LogicalPlan, LogicalPlanBuilder, Operator, SortExpr, TableProviderFilterPushDown,
-        TableScan, select_expr::SelectExpr,
+        select_expr::SelectExpr,
     },
     physical_plan::ExecutionPlan,
     prelude::{Expr, array_element, binary_expr, cast, col, ident, lit, substring},
@@ -146,7 +146,7 @@ impl SearchQueryProvider {
             .table_provider
             .supports_filters_pushdown(filter_refs.as_slice())?;
 
-        let underlying_filters: Vec<Expr> = filters
+        let underlying_filter: Option<Expr> = filters
             .iter()
             .zip(supported_filters.iter())
             .filter_map(|(f, supp)| {
@@ -157,17 +157,20 @@ impl SearchQueryProvider {
                     Some(f.clone())
                 }
             })
-            .collect();
+            .reduce(Expr::and);
 
-        Ok(LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("base_table"),
+        let mut scan = LogicalPlanBuilder::scan(
+            "base_table",
             Arc::new(DefaultTableSource::new(
                 Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
             )),
             Some(base_proj),
-            underlying_filters,
-            None,
-        )?))
+        )?;
+
+        if let Some(f) = underlying_filter {
+            scan = scan.filter(f)?;
+        }
+        scan.build()
     }
 
     fn join_with_base(

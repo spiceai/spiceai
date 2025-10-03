@@ -24,7 +24,7 @@ use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{LogicalPlan, TableScan};
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::DocParsingError;
@@ -434,17 +434,18 @@ impl SearchIndex for FullTextDatabaseIndex {
             .boxed()
             .map_err(DataFusionError::External)?;
 
-        Ok(Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-            self.name(),
-            Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
-                index: field_index,
-                query: query.to_string(),
-                pre_limit: None,
-            }))),
-            None,
-            vec![],
-            None,
-        )?)))
+        Ok(Arc::new(
+            LogicalPlanBuilder::scan(
+                self.name(),
+                Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
+                    index: field_index,
+                    query: query.to_string(),
+                    pre_limit: None,
+                }))),
+                None,
+            )?
+            .build()?,
+        ))
     }
 }
 

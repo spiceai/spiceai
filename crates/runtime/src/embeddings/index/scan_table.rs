@@ -27,13 +27,13 @@ use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
     common::{Column, Constraints, JoinType},
-    datasource::{TableProvider, TableType},
+    datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
     sql::TableReference,
 };
-use datafusion_expr::{LogicalPlanBuilder, ident, select_expr::SelectExpr, table_scan};
+use datafusion_expr::{LogicalPlanBuilder, ident, select_expr::SelectExpr};
 
 use itertools::Itertools;
 use search::index::VectorIndex;
@@ -213,7 +213,11 @@ impl TableProvider for VectorScanTableProvider {
             filters,
         ) {
             let lp = Self::apply_proj_and_filter(
-                table_scan("base_table", Arc::clone(&self.table_provider), None)?,
+                LogicalPlanBuilder::scan(
+                    "base_table",
+                    DefaultTableSource::new(Arc::clone(&self.table_provider)).into(),
+                    None,
+                )?,
                 &columns_requested,
                 filters,
             )?
@@ -237,28 +241,32 @@ impl TableProvider for VectorScanTableProvider {
         }
 
         // Join on primary keys, prefer to use columns from base table, push down filters where we can.
-        let mut join = table_scan(Some("base_table"), Arc::clone(&self.table_provider), None)?
-            .join(
-                LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list))
-                    .project(self.columns_needed_from_index())?
-                    .alias("vector_index")?
-                    .build()?,
-                JoinType::Left,
-                self.primary_key
-                    .iter()
-                    .map(|pk| (Column::from_name(pk.clone()), Column::from_name(pk.clone())))
-                    .collect(),
-                // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
-                filters
-                    .iter()
-                    .filter(|f| {
-                        f.column_refs()
-                            .iter()
-                            .any(|col| !self.primary_key.contains(&col.name))
-                    })
-                    .cloned()
-                    .collect(),
-            )?;
+        let mut join = LogicalPlanBuilder::scan(
+            "base_table",
+            Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
+            None,
+        )?
+        .join(
+            LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list))
+                .project(self.columns_needed_from_index())?
+                .alias("vector_index")?
+                .build()?,
+            JoinType::Left,
+            self.primary_key
+                .iter()
+                .map(|pk| (Column::from_name(pk.clone()), Column::from_name(pk.clone())))
+                .collect(),
+            // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+            filters
+                .iter()
+                .filter(|f| {
+                    f.column_refs()
+                        .iter()
+                        .any(|col| !self.primary_key.contains(&col.name))
+                })
+                .cloned()
+                .collect(),
+        )?;
 
         join.project(
             // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
