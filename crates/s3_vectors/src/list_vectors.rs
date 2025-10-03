@@ -30,7 +30,10 @@ use datafusion::{
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     physical_expr::EquivalenceProperties,
-    physical_plan::{DisplayFormatType, Partitioning, stream::RecordBatchStreamAdapter},
+    physical_plan::{
+        DisplayFormatType, ExecutionPlan, Partitioning, projection::ProjectionExec,
+        stream::RecordBatchStreamAdapter,
+    },
 };
 use futures::stream;
 
@@ -183,9 +186,9 @@ impl DataSource for ListVectorsSource {
 
     fn try_swapping_with_projection(
         &self,
-        _projection: &datafusion::physical_plan::projection::ProjectionExec,
-    ) -> Result<Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>> {
-        todo!()
+        _projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
     }
 }
 
