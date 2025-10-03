@@ -70,8 +70,6 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
-use runtime_acceleration::dataset_checkpoint::make_checkpointer_factory;
-use runtime_acceleration::snapshot::SnapshotManager;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
@@ -912,31 +910,6 @@ impl DataFusion {
                     name: dataset.name.to_string(),
                 })?;
 
-        if acceleration_settings.snapshots.bootstrap_enabled()
-            && let Ok(file_path) = acceleration_file_path(dataset).await
-        {
-            let dataset_name = dataset.name.to_string();
-            let dataset = dataset.clone();
-            let checkpoint_factory = make_checkpointer_factory(move || {
-                let dataset = dataset.clone();
-                async move {
-                    DatasetCheckpoint::try_new(&dataset, OpenOption::OpenExisting)
-                        .await
-                        .boxed()
-                }
-            });
-            if let Some(manager) = SnapshotManager::try_new(
-                dataset_name,
-                acceleration_settings.snapshots.clone(),
-                checkpoint_factory,
-                file_path,
-            )
-            .await
-            {
-                let _ = manager.download_latest_snapshot().await.ok().flatten();
-            }
-        }
-
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
             refresh_sql::validate_refresh_sql(
@@ -1063,9 +1036,21 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
+        if acceleration_settings.snapshots.create_enabled()
+            && let Ok(snapshot_path) = acceleration_file_path(dataset).await
+        {
+            accelerated_table_builder
+                .snapshot_behavior(acceleration_settings.snapshots.clone(), Some(snapshot_path));
+        }
+
         accelerated_table_builder.checkpointer_opt(
             DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
                 .await
+                .map(|checkpoint| {
+                    checkpoint
+                        .with_snapshot_behavior(acceleration_settings.snapshots)
+                        .to_arc()
+                })
                 .ok(),
         );
 
@@ -1583,6 +1568,11 @@ impl DataFusion {
         builder.checkpointer_opt(
             DatasetCheckpoint::try_new(view, OpenOption::CreateIfNotExists)
                 .await
+                .map(|checkpoint| {
+                    checkpoint
+                        .with_snapshot_behavior(acceleration.snapshots.clone())
+                        .to_arc()
+                })
                 .ok(),
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
