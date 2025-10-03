@@ -205,12 +205,17 @@ impl TableProvider for S3VectorsQueryTable {
             return exec_err!("No bucket name or index name for bucket query");
         };
 
+        let prefix =
+            PartitionedIndexName::common_prefix(&index_name, &self.column_name, &self.partition_by)
+                .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+
         let list_indexes_output = self
             .table
             .client
             .list_indexes(
                 ListIndexesInput::builder()
                     .set_vector_bucket_name(Some(bucket_name.clone()))
+                    .set_prefix(Some(prefix))
                     .build()
                     .boxed()
                     .map_err(DataFusionError::External)?,
@@ -245,6 +250,10 @@ impl TableProvider for S3VectorsQueryTable {
                 ) {
                     Some(idx.index_name().to_string())
                 } else {
+                    tracing::debug!(
+                        "S3 index {} returned but does not belong with this dataset: {index_name}",
+                        idx.index_name()
+                    );
                     None
                 }
             })
