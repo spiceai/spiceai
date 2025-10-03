@@ -40,22 +40,27 @@ pub(super) async fn download_snapshot_if_needed(
 
     let source_name = source.name().to_string();
     let source = source.clone_arc();
+    let snapshot_behavior = acceleration.snapshots.clone();
     let checkpoint_factory = make_checkpointer_factory(move || {
         let source = Arc::clone(&source);
+        let snapshot_behavior = snapshot_behavior.clone();
         async move {
             DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
                 .await
                 .boxed()
+                .map(|checkpoint| {
+                    checkpoint
+                        .with_snapshot_behavior(snapshot_behavior)
+                        .to_arc()
+                })
         }
     });
-    if let Some(manager) = SnapshotManager::try_new(
-        source_name,
-        acceleration.snapshots.clone(),
-        checkpoint_factory,
-        path,
-    )
-    .await
+    if let Some(manager) =
+        SnapshotManager::try_new(source_name, acceleration.snapshots.clone(), path).await
     {
-        let _ = manager.download_latest_snapshot().await.ok().flatten();
+        let manager = manager.with_checkpointer_factory(checkpoint_factory);
+        let _ = manager.download_latest_snapshot().await.inspect_err(|e| {
+            tracing::error!("Failed to download snapshot: {}", e);
+        });
     }
 }

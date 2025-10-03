@@ -1039,6 +1039,11 @@ impl DataFusion {
         accelerated_table_builder.checkpointer_opt(
             DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
                 .await
+                .map(|checkpoint| {
+                    checkpoint
+                        .with_snapshot_behavior(acceleration_settings.snapshots)
+                        .to_arc()
+                })
                 .ok(),
         );
 
@@ -1556,6 +1561,11 @@ impl DataFusion {
         builder.checkpointer_opt(
             DatasetCheckpoint::try_new(view, OpenOption::CreateIfNotExists)
                 .await
+                .map(|checkpoint| {
+                    checkpoint
+                        .with_snapshot_behavior(acceleration.snapshots.clone())
+                        .to_arc()
+                })
                 .ok(),
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);

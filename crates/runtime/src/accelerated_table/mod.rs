@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
 use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
@@ -243,6 +244,7 @@ pub struct Builder {
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
+    snapshot_local_path: Option<PathBuf>,
 }
 
 impl Builder {
@@ -274,6 +276,7 @@ impl Builder {
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
+            snapshot_local_path: None,
         }
     }
 
@@ -388,8 +391,13 @@ impl Builder {
     }
 
     /// Configure whether snapshots are taken of the accelerated table after refreshes.
-    pub fn snapshot_behavior(&mut self, snapshot_behavior: SnapshotBehavior) -> &mut Self {
+    pub fn snapshot_behavior(
+        &mut self,
+        snapshot_behavior: SnapshotBehavior,
+        snapshot_path: Option<PathBuf>,
+    ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
+        self.snapshot_local_path = snapshot_path;
         self
     }
 
@@ -459,7 +467,7 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
-        refresher.with_snapshot_behavior(self.snapshot_behavior);
+        refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
 
         let refresh_handle = refresher.start(acceleration_refresh_mode).await;
         let refresher = Arc::new(refresher);

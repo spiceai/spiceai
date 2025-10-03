@@ -213,6 +213,7 @@ mod tests {
     use datafusion_table_providers::sql::db_connection_pool::{
         Mode, sqlitepool::SqliteConnectionPoolFactory,
     };
+    use runtime_acceleration::snapshot::SnapshotBehavior;
 
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
         let pool = SqliteConnectionPoolFactory::new(
@@ -232,6 +233,7 @@ mod tests {
         DatasetCheckpoint {
             dataset_name: "test_dataset".to_string(),
             acceleration_connection: AccelerationConnection::SQLite(pool),
+            snapshot_behavior: SnapshotBehavior::Disabled,
         }
     }
 
@@ -282,6 +284,7 @@ mod tests {
                 acceleration_connection: AccelerationConnection::SQLite(
                     pool.try_clone().await.expect("to clone pool"),
                 ),
+                snapshot_behavior: SnapshotBehavior::Disabled,
             },
             pool,
         )

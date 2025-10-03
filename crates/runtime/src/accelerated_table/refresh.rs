@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -33,7 +34,7 @@ use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
@@ -427,6 +428,7 @@ pub struct Refresher {
     refresh_on_startup: RefreshOnStartup,
     synchronize_with: Option<SynchronizedTable>,
     snapshot_behavior: SnapshotBehavior,
+    snapshot_local_path: Option<PathBuf>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -472,6 +474,7 @@ impl Refresher {
             semaphore: None,
             on_complete_notification: None,
             snapshot_behavior: SnapshotBehavior::default(),
+            snapshot_local_path: None,
         }
     }
 
@@ -515,8 +518,13 @@ impl Refresher {
         self
     }
 
-    pub fn with_snapshot_behavior(&mut self, snapshot_behavior: SnapshotBehavior) -> &mut Self {
+    pub fn with_snapshot_behavior(
+        &mut self,
+        snapshot_behavior: SnapshotBehavior,
+        snapshot_path: Option<PathBuf>,
+    ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
+        self.snapshot_local_path = snapshot_path;
         self
     }
 
@@ -630,6 +638,22 @@ impl Refresher {
         let synchronize_with = self.synchronize_with.clone();
         let federated_schema = self.federated.schema();
 
+        let snapshot_manager = match (
+            self.snapshot_behavior.create_enabled(),
+            self.snapshot_local_path.clone(),
+        ) {
+            (true, Some(snapshot_local_path)) => Some(
+                SnapshotManager::try_new(
+                    self.dataset_name.to_string(),
+                    self.snapshot_behavior.clone(),
+                    snapshot_local_path,
+                )
+                .await,
+            ),
+            _ => None,
+        }
+        .flatten();
+
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
         //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`
@@ -686,10 +710,24 @@ impl Refresher {
                                     }
                             }
 
-                            if let Some(checkpointer) = &checkpointer
-                                && let Err(e) = checkpointer.checkpoint(&federated_schema).await {
-                                    tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
+                            if let Some(checkpointer) = &checkpointer {
+                                match (checkpointer.checkpoint(&federated_schema).await, snapshot_manager.as_ref()) {
+                                    (Ok(()), Some(snapshot_manager)) => {
+                                        match snapshot_manager.create_snapshot().await {
+                                            Ok(path) => {
+                                                tracing::info!("Created snapshot for dataset {}: {}", &dataset_name.to_string(), path);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Failed to create snapshot for dataset {}: {e}", &dataset_name.to_string());
+                                            }
+                                        }
+                                    }
+                                    (Err(e), _) => {
+                                        tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
+                                    }
+                                    (_, None) => {}
                                 }
+                            }
                         }
 
                         // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
