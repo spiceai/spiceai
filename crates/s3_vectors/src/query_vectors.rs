@@ -227,18 +227,18 @@ mod tests {
         let top_k = 10;
 
         {
-            let mut data = mock_client.data.lock().unwrap();
+            let mut data = mock_client.data.lock().expect("lock");
             let vectors = vec![
                 ListOutputVector::builder()
                     .key("v1")
                     .data(VectorData::Float32(vec![1.0, 2.0, 3.0]))
                     .build()
-                    .unwrap(),
+                    .expect("build"),
                 ListOutputVector::builder()
                     .key("v2")
                     .data(VectorData::Float32(vec![4.0, 5.0, 6.0]))
                     .build()
-                    .unwrap(),
+                    .expect("build"),
             ];
             data.vectors.insert(index_name.to_string(), vectors);
         }
@@ -287,7 +287,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .unwrap();
+            .expect("StringArray");
         assert_eq!(key_col.value(0), "v1");
         assert_eq!(key_col.value(1), "v2");
 
@@ -295,12 +295,12 @@ mod tests {
             .column(1)
             .as_any()
             .downcast_ref::<ListArray>()
-            .unwrap();
+            .expect("ListArray");
         let data_v1 = data_col
             .value(0)
             .as_any()
             .downcast_ref::<Float32Array>()
-            .unwrap()
+            .expect("Float32Array")
             .values()
             .to_vec();
         assert_eq!(data_v1, vec![1.0, 2.0, 3.0]);
@@ -308,7 +308,7 @@ mod tests {
             .value(1)
             .as_any()
             .downcast_ref::<Float32Array>()
-            .unwrap()
+            .expect("Float32Array")
             .values()
             .to_vec();
         assert_eq!(data_v2, vec![4.0, 5.0, 6.0]);
@@ -317,7 +317,7 @@ mod tests {
             .column(2)
             .as_any()
             .downcast_ref::<Float32Array>()
-            .unwrap();
+            .expect("Float32Array");
         assert_eq!(distance_col.value(0), 0.5);
         assert_eq!(distance_col.value(1), 0.5);
 

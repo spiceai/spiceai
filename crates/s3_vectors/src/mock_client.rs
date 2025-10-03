@@ -51,19 +51,29 @@ use aws_sdk_s3vectors::{
         put_vectors::{PutVectorsError, PutVectorsInput, PutVectorsOutput},
         query_vectors::{QueryVectorsError, QueryVectorsInput, QueryVectorsOutput},
     },
-    types::{IndexSummary, ListOutputVector, QueryOutputVector},
+    types::{IndexSummary, ListOutputVector, PutInputVector, QueryOutputVector},
 };
 pub use aws_smithy_types::{DateTime, Document, Number, error::operation::BuildError};
 
 use crate::S3Vectors;
 
-#[derive(Default, Debug)]
 pub struct MockData {
     pub indexes: HashMap<String, Vec<IndexSummary>>,
     pub vectors: HashMap<String, Vec<ListOutputVector>>,
+    pub put_vectors: Vec<PutInputVector>,
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for MockData {
+    fn default() -> Self {
+        Self {
+            indexes: HashMap::new(),
+            vectors: HashMap::new(),
+            put_vectors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct MockClient {
     pub data: Arc<Mutex<MockData>>,
 }
@@ -199,9 +209,12 @@ impl S3Vectors for MockClient {
 
     async fn put_vectors(
         &self,
-        _input: PutVectorsInput,
+        input: PutVectorsInput,
     ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
-        unimplemented!()
+        let mut data = self.data.lock().unwrap();
+        data.put_vectors.extend(input.vectors.unwrap_or_default());
+
+        Ok(PutVectorsOutput::builder().build())
     }
 
     async fn query_vectors(
