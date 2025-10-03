@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -33,6 +34,7 @@ use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
@@ -425,6 +427,8 @@ pub struct Refresher {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
     synchronize_with: Option<SynchronizedTable>,
+    snapshot_behavior: SnapshotBehavior,
+    snapshot_local_path: Option<PathBuf>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -469,6 +473,8 @@ impl Refresher {
             disable_federation: false,
             semaphore: None,
             on_complete_notification: None,
+            snapshot_behavior: SnapshotBehavior::default(),
+            snapshot_local_path: None,
         }
     }
 
@@ -509,6 +515,16 @@ impl Refresher {
 
     pub fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
         self.on_complete_notification = Some(on_complete_notification);
+        self
+    }
+
+    pub fn with_snapshot_behavior(
+        &mut self,
+        snapshot_behavior: SnapshotBehavior,
+        snapshot_path: Option<PathBuf>,
+    ) -> &mut Self {
+        self.snapshot_behavior = snapshot_behavior;
+        self.snapshot_local_path = snapshot_path;
         self
     }
 
@@ -622,6 +638,22 @@ impl Refresher {
         let synchronize_with = self.synchronize_with.clone();
         let federated_schema = self.federated.schema();
 
+        let snapshot_manager = match (
+            self.snapshot_behavior.create_enabled(),
+            self.snapshot_local_path.clone(),
+        ) {
+            (true, Some(snapshot_local_path)) => Some(
+                SnapshotManager::try_new(
+                    self.dataset_name.to_string(),
+                    self.snapshot_behavior.clone(),
+                    snapshot_local_path,
+                )
+                .await,
+            ),
+            _ => None,
+        }
+        .flatten();
+
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
         //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`
@@ -674,14 +706,23 @@ impl Refresher {
                                 // No cache provider means runtime is shutting down and cache is already cleaned up
                                 if let Some(cache_provider) = cache_provider_ref.upgrade()
                                     && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
-                                        tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                        tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
                                     }
                             }
 
-                            if let Some(checkpointer) = &checkpointer
-                                && let Err(e) = checkpointer.checkpoint(&federated_schema).await {
-                                    tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
+                            if let Some(checkpointer) = &checkpointer {
+                                match (checkpointer.checkpoint(&federated_schema).await, snapshot_manager.as_ref()) {
+                                    (Ok(()), Some(snapshot_manager)) => {
+                                        if let Err(e) = snapshot_manager.create_snapshot().await {
+                                            tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");
+                                        }
+                                    }
+                                    (Err(e), _) => {
+                                        tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+                                    }
+                                    (_, None) => {}
                                 }
+                            }
                         }
 
                         // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher

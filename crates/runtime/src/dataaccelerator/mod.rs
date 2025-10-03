@@ -60,6 +60,7 @@ pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+mod snapshots;
 pub mod spice_sys;
 
 #[derive(Debug, Snafu)]
@@ -488,7 +489,10 @@ impl AcceleratorExternalTableBuilder {
 
 /// Represents acceleration source component, such as a dataset or a view.
 /// Provides additional information about the source, such as its name and associated runtime information.
-pub trait AccelerationSource: Sync {
+pub trait AccelerationSource: Send + Sync {
+    /// Returns a clone of the source as an `Arc<dyn AccelerationSource>`
+    fn clone_arc(&self) -> Arc<dyn AccelerationSource>;
+
     /// Returns true if the source uses file-based acceleration
     fn is_file_accelerated(&self) -> bool;
 
