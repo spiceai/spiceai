@@ -63,6 +63,7 @@ pub static PUT_VECTORS_MAX_ITEMS: usize = 500;
 
 mod list_vectors;
 pub mod mock_client;
+mod query_vectors;
 pub mod table;
 
 /// Trait representing the capabilities of the Amazon S3 Vectors API. Amazon S3 Vectors clients implement this trait.

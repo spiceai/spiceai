@@ -146,9 +146,10 @@ impl ExecutionPlan for ListVectorsExec {
                 let next_token = if token.is_empty() { None } else { Some(token) };
 
                 let input = ListVectorsInput::builder()
-                    .set_vector_bucket_name(Some(index.vector_bucket_name().to_string()))
-                    .set_segment_index(Some(partition as i32))
-                    .set_segment_count(Some(num_partitions as i32))
+                    .vector_bucket_name(index.vector_bucket_name())
+                    .index_name(index.index_name())
+                    .segment_index(partition as i32)
+                    .segment_count(num_partitions as i32)
                     .set_next_token(next_token)
                     .build()
                     .map_err(|e| DataFusionError::External(e.into()))?;
@@ -190,5 +191,117 @@ impl ExecutionPlan for ListVectorsExec {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock_client::MockClient;
+    use aws_sdk_s3vectors::types::{DistanceMetric, Index, ListOutputVector, VectorData};
+    use aws_smithy_types::DateTime;
+    use datafusion::{
+        arrow::{
+            array::{Float32Array, ListArray, StringArray},
+            datatypes::{DataType, Field, Schema},
+        },
+        common::Result,
+        execution::TaskContext,
+        physical_plan::collect,
+    };
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_list_vectors_exec() -> Result<()> {
+        let mock_client = MockClient::new();
+        let index_name = "test_index";
+        let index_arn = "test_arn";
+        let bucket_name = "test_bucket";
+
+        let vectors = vec![
+            ListOutputVector::builder()
+                .key("v1")
+                .data(VectorData::Float32(vec![1.0, 2.0, 3.0]))
+                .build()
+                .expect("valid vector"),
+            ListOutputVector::builder()
+                .key("v2")
+                .data(VectorData::Float32(vec![4.0, 5.0, 6.0]))
+                .build()
+                .expect("valid vector"),
+        ];
+
+        {
+            let mut data = mock_client.data.lock().expect("lock");
+            data.vectors.insert(index_name.to_string(), vectors.clone());
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new(
+                "data",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
+        ]));
+
+        let index = Index::builder()
+            .index_name(index_name)
+            .vector_bucket_name(bucket_name)
+            .index_arn(index_arn)
+            .creation_time(DateTime::from_secs(7))
+            .data_type(aws_sdk_s3vectors::types::DataType::Float32)
+            .dimension(3)
+            .distance_metric(DistanceMetric::Cosine)
+            .build()
+            .expect("valid index");
+
+        let plan = Arc::new(ListVectorsExec::new(
+            Arc::new(mock_client),
+            index,
+            Arc::clone(&schema),
+        ));
+
+        let context = Arc::new(TaskContext::default());
+        let batches = collect(plan, context).await?;
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 2);
+
+        let key_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(key_col.value(0), "v1");
+        assert_eq!(key_col.value(1), "v2");
+
+        let data_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let data_v1 = data_col
+            .value(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(data_v1, vec![1.0, 2.0, 3.0]);
+
+        let data_v2 = data_col
+            .value(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(data_v2, vec![4.0, 5.0, 6.0]);
+
+        Ok(())
     }
 }
