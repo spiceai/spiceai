@@ -25,52 +25,31 @@ use datafusion::{
         array::{Float32Builder, ListBuilder, RecordBatch, StringBuilder},
         datatypes::SchemaRef,
     },
-    common::{Result, internal_err},
+    common::{Result, Statistics},
+    datasource::source::DataSource,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     physical_expr::EquivalenceProperties,
-    physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        execution_plan::{Boundedness, EmissionType},
-        stream::RecordBatchStreamAdapter,
-    },
+    physical_plan::{DisplayFormatType, Partitioning, stream::RecordBatchStreamAdapter},
 };
 use futures::stream;
 
 use crate::S3Vectors;
 
-static NAME: &str = "ListVectorsExec";
+static NAME: &str = "ListVectorsSource";
 
 // We can parallelize ListVectors by using the `segmentCount` and `segmentIndex` parameters.
 const DEFAULT_PARTITIONS: usize = 16;
 
-pub struct ListVectorsExec {
+pub struct ListVectorsSource {
     client: Arc<dyn S3Vectors + Send + Sync>,
     index: Index,
-    properties: PlanProperties,
     schema: SchemaRef,
+    partitioning: Partitioning,
+    eq_properties: EquivalenceProperties,
 }
 
-impl ListVectorsExec {
-    pub fn new(client: Arc<dyn S3Vectors + Send + Sync>, index: Index, schema: SchemaRef) -> Self {
-        let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
-        let partitioning = Partitioning::UnknownPartitioning(DEFAULT_PARTITIONS);
-        let emission_type = EmissionType::Incremental;
-        let boundedness = Boundedness::Bounded;
-
-        let properties =
-            PlanProperties::new(eq_properties, partitioning, emission_type, boundedness);
-
-        Self {
-            client,
-            index,
-            properties,
-            schema,
-        }
-    }
-}
-
-impl fmt::Debug for ListVectorsExec {
+impl fmt::Debug for ListVectorsSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -81,42 +60,27 @@ impl fmt::Debug for ListVectorsExec {
     }
 }
 
-impl DisplayAs for ListVectorsExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{self:?}")
+impl ListVectorsSource {
+    pub fn new(client: Arc<dyn S3Vectors + Send + Sync>, index: Index, schema: SchemaRef) -> Self {
+        let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
+        let partitioning = Partitioning::UnknownPartitioning(DEFAULT_PARTITIONS);
+
+        Self {
+            client,
+            index,
+            schema,
+            partitioning,
+            eq_properties,
+        }
     }
 }
 
-impl ExecutionPlan for ListVectorsExec {
-    fn name(&self) -> &'static str {
-        NAME
-    }
-
+impl DataSource for ListVectorsSource {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        // ListVectorsExec is a leaf node, it does not have any children.
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            internal_err!("Children cannot be replaced in {NAME}")
-        }
-    }
-
-    fn execute(
+    fn open(
         &self,
         partition: usize,
         _context: Arc<TaskContext>,
@@ -124,7 +88,7 @@ impl ExecutionPlan for ListVectorsExec {
         let client = Arc::clone(&self.client);
         let index = self.index.clone();
         let schema = Arc::clone(&self.schema);
-        let num_partitions = self.properties().partitioning.partition_count();
+        let num_partitions = self.output_partitioning().partition_count();
 
         // The state for the stream is `Option<String>`, which is the `next_token` for pagination.
         // We start with `Some(String::new())` to trigger the first request.
@@ -192,6 +156,37 @@ impl ExecutionPlan for ListVectorsExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema))
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        self.partitioning.clone()
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        self.eq_properties.clone()
+    }
+
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &datafusion::physical_plan::projection::ProjectionExec,
+    ) -> Result<Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>> {
+        todo!()
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +200,7 @@ mod tests {
             array::{Float32Array, ListArray, StringArray},
             datatypes::{DataType, Field, Schema},
         },
+        catalog::memory::DataSourceExec,
         common::Result,
         execution::TaskContext,
         physical_plan::collect,
@@ -212,7 +208,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_list_vectors_exec() -> Result<()> {
+    async fn test_list_vectors_data_source() -> Result<()> {
         let mock_client = MockClient::new();
         let index_name = "test_index";
         let index_arn = "test_arn";
@@ -256,16 +252,23 @@ mod tests {
             .build()
             .expect("valid index");
 
-        let plan = Arc::new(ListVectorsExec::new(
+        let source = Arc::new(ListVectorsSource::new(
             Arc::new(mock_client),
             index,
             Arc::clone(&schema),
         ));
 
+        let plan = Arc::new(DataSourceExec::new(source));
+
         let context = Arc::new(TaskContext::default());
         let batches = collect(plan, context).await?;
 
-        assert_eq!(batches.len(), 1);
+        // The mock client doesn't partition, so we get all vectors in each partition.
+        // With DEFAULT_PARTITIONS=16, we expect 16 batches, each with 2 rows.
+        assert_eq!(batches.len(), DEFAULT_PARTITIONS);
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2 * DEFAULT_PARTITIONS);
+
         let batch = &batches[0];
 
         assert_eq!(batch.num_rows(), 2);

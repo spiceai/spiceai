@@ -182,13 +182,10 @@ impl S3Vectors for MockClient {
             Err(e) => e.into_inner(),
         };
 
-        let index_vectors = match input.segment_index {
-            Some(i) if i > 0 => vec![], // if partitioning, only provide to a single partition
-            _ => data.vectors.get(index_name).cloned().unwrap_or_default(),
-        };
-
         Ok(ListVectorsOutput::builder()
-            .set_vectors(Some(index_vectors))
+            .set_vectors(Some(
+                data.vectors.get(index_name).cloned().unwrap_or_default(),
+            ))
             .build()?)
     }
 
