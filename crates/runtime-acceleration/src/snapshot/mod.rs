@@ -524,7 +524,7 @@ impl SnapshotManager {
             }
         }
 
-        snapshots.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    snapshots.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         tracing::info!(
             dataset = %self.dataset_name,
             location = %self.snapshots_location.to_string(),

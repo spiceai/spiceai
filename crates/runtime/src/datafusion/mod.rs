@@ -26,10 +26,10 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self};
+use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -1035,6 +1035,15 @@ impl DataFusion {
         accelerated_table_builder.ready_state(dataset.ready_state);
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
+
+        if acceleration_settings.snapshots.create_enabled() {
+            if let Ok(snapshot_path) = acceleration_file_path(dataset).await {
+                accelerated_table_builder.snapshot_behavior(
+                    acceleration_settings.snapshots.clone(),
+                    Some(snapshot_path),
+                );
+            }
+        }
 
         accelerated_table_builder.checkpointer_opt(
             DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
