@@ -45,6 +45,11 @@ pub enum Error {
         connection_pool_min_idle: usize,
         connection_pool_max: usize,
     },
+
+    #[snafu(display(
+        "Invalid value for parameter '{parameter}': '{value}'. Expected a positive integer."
+    ))]
+    InvalidParameterValue { parameter: String, value: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -115,16 +120,24 @@ impl DataAccelerator for PostgresAccelerator {
         let ctx = SessionContext::new();
 
         // Validate and normalize pool_min and connection_pool_size
-        let connection_pool_min_idle = cmd
-            .options
-            .get("connection_pool_min")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_CONNECTION_POOL_MIN);
-        let connection_pool_max = cmd
-            .options
-            .get("connection_pool_size")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_CONNECTION_POOL_MAX);
+        let connection_pool_min_idle = match cmd.options.get("connection_pool_min") {
+            Some(s) => s
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidParameterValue {
+                    parameter: "connection_pool_min".to_string(),
+                    value: s.clone(),
+                })?,
+            None => DEFAULT_CONNECTION_POOL_MIN,
+        };
+        let connection_pool_max = match cmd.options.get("connection_pool_size") {
+            Some(s) => s
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidParameterValue {
+                    parameter: "connection_pool_size".to_string(),
+                    value: s.clone(),
+                })?,
+            None => DEFAULT_CONNECTION_POOL_MAX,
+        };
 
         if connection_pool_min_idle > connection_pool_max {
             return Err(Error::InvalidConnectionPoolConfiguration {
