@@ -706,7 +706,7 @@ impl Refresher {
                                 // No cache provider means runtime is shutting down and cache is already cleaned up
                                 if let Some(cache_provider) = cache_provider_ref.upgrade()
                                     && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
-                                        tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                        tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
                                     }
                             }
 
@@ -714,11 +714,11 @@ impl Refresher {
                                 match (checkpointer.checkpoint(&federated_schema).await, snapshot_manager.as_ref()) {
                                     (Ok(()), Some(snapshot_manager)) => {
                                         if let Err(e) = snapshot_manager.create_snapshot().await {
-                                            tracing::warn!("Failed to create snapshot for dataset {}: {e}", &dataset_name.to_string());
+                                            tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");
                                         }
                                     }
                                     (Err(e), _) => {
-                                        tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
+                                        tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
                                     }
                                     (_, None) => {}
                                 }
