@@ -166,7 +166,8 @@ impl ExecutionPlan for ListVectorsExec {
 
                 let mut key_builder = StringBuilder::new();
                 let mut data_builder = ListBuilder::new(Float32Builder::new());
-                // TODO: add metadata
+                // TODO: (function) add metadata
+                // TODO: (optimization) if we know/store the vector dimension we can make a fixed size list
 
                 for vector in vectors {
                     key_builder.append_value(vector.key);
