@@ -239,6 +239,11 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
+            // We don't want to eagerly create the SQLite file if we're bootstrapping from a snapshot
+            if acceleration.snapshots.bootstrap_enabled() {
+                return Ok(());
+            }
+
             self.get_shared_pool(source).await?;
         }
 
