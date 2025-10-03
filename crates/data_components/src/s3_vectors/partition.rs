@@ -100,8 +100,8 @@ impl PartitionedIndexName {
         Ok(Self {
             index_name,
             column_name_hash,
-            partition_by_hash,
             partition_value_hash,
+            partition_by_hash,
         })
     }
 
