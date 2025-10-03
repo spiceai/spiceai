@@ -1036,13 +1036,11 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
-        if acceleration_settings.snapshots.create_enabled() {
-            if let Ok(snapshot_path) = acceleration_file_path(dataset).await {
-                accelerated_table_builder.snapshot_behavior(
-                    acceleration_settings.snapshots.clone(),
-                    Some(snapshot_path),
-                );
-            }
+        if acceleration_settings.snapshots.create_enabled()
+            && let Ok(snapshot_path) = acceleration_file_path(dataset).await
+        {
+            accelerated_table_builder
+                .snapshot_behavior(acceleration_settings.snapshots.clone(), Some(snapshot_path));
         }
 
         accelerated_table_builder.checkpointer_opt(
