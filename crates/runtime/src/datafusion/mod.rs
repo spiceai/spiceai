@@ -26,10 +26,10 @@ use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self};
-use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -911,31 +911,6 @@ impl DataFusion {
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
                     name: dataset.name.to_string(),
                 })?;
-
-        if acceleration_settings.snapshots.bootstrap_enabled()
-            && let Ok(file_path) = acceleration_file_path(dataset).await
-        {
-            let dataset_name = dataset.name.to_string();
-            let dataset = dataset.clone();
-            let checkpoint_factory = make_checkpointer_factory(move || {
-                let dataset = dataset.clone();
-                async move {
-                    DatasetCheckpoint::try_new(&dataset, OpenOption::OpenExisting)
-                        .await
-                        .boxed()
-                }
-            });
-            if let Some(manager) = SnapshotManager::try_new(
-                dataset_name,
-                acceleration_settings.snapshots.clone(),
-                checkpoint_factory,
-                file_path,
-            )
-            .await
-            {
-                let _ = manager.download_latest_snapshot().await.ok().flatten();
-            }
-        }
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
