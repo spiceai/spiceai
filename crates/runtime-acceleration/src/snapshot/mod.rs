@@ -13,7 +13,7 @@ limitations under the License.
 
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
-use std::{path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use bytes::BytesMut;
@@ -31,8 +31,8 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
-pub mod analyzer;
 mod behavior;
+pub mod optimizer;
 pub use behavior::SnapshotBehavior;
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
@@ -118,13 +118,29 @@ struct SnapshotCandidate {
 }
 
 /// Manages snapshots for a specific accelerated dataset.
+#[derive(Clone)]
 pub struct SnapshotManager {
     dataset_name: String,
     snapshots_location: object_store::path::Path,
     local_path: PathBuf,
-    object_store: Box<dyn ObjectStore>,
+    object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: DatasetCheckpointerFactory,
+}
+
+impl std::fmt::Debug for SnapshotManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotManager")
+            .field("dataset_name", &self.dataset_name)
+            .field("snapshots_location", &self.snapshots_location)
+            .field("local_path", &self.local_path)
+            .field(
+                "bootstrap_failure_behavior",
+                &self.bootstrap_failure_behavior,
+            )
+            .field("object_store", &self.object_store)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SnapshotManager {
@@ -187,7 +203,7 @@ impl SnapshotManager {
             dataset_name,
             snapshots_location: path,
             local_path,
-            object_store: store,
+            object_store: store.into(),
             checkpointer_factory,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
         })
@@ -721,7 +737,7 @@ mod tests {
             dataset_name: "dataset".to_string(),
             snapshots_location: Path::from("snapshots"),
             local_path: PathBuf::from("/tmp/unused.db"),
-            object_store: Box::new(store),
+            object_store: Arc::new(store),
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
             checkpointer_factory: Arc::new(|| {
                 Box::pin(async {
@@ -765,7 +781,7 @@ mod tests {
             dataset_name: "dataset".to_string(),
             snapshots_location: Path::from("snapshots"),
             local_path: local_path.clone(),
-            object_store: Box::new(InMemory::new()),
+            object_store: Arc::new(InMemory::new()),
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
             checkpointer_factory: Arc::new(|| {
                 Box::pin(async {

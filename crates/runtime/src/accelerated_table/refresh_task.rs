@@ -24,21 +24,24 @@ use async_stream::stream;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_planner::ExtensionPlanner;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use runtime_datafusion_index::analyzer::IndexTableScanOptimizerRule;
+use runtime_datafusion_index::analyzer::{
+    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
+};
 use snafu::{OptionExt, ResultExt};
 use tokio::time::Instant;
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
-use crate::datafusion::builder::{get_analyzer_rules, get_df_default_config};
+use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
-use crate::datafusion::extension::SpiceQueryPlanner;
+use crate::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
@@ -76,7 +79,7 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
-use datafusion_federation::FederatedTableProviderAdaptor;
+use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
 
 mod changes;
 mod streaming_append;
@@ -690,28 +693,42 @@ impl RefreshTask {
     }
 
     fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
-        let ctx = if self.disable_federation {
-            SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env())
+        let state_builder = SessionStateBuilder::new()
+            .with_config(get_df_default_config())
+            .with_runtime_env(default_runtime_env())
+            .with_default_features();
+
+        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+            Arc::new(SpiceExtensionPlanner::new()),
+            Arc::new(IndexTableScanExtensionPlanner::new()),
+        ];
+
+        let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
+
+        // If federation is disabled, disable the federation analyzer rule and don't include the federated planner.
+        if self.disable_federation {
+            analyzer_rules_builder = analyzer_rules_builder.include_federation(false);
         } else {
-            let mut state = SessionStateBuilder::new()
-                .with_config(get_df_default_config())
-                .with_runtime_env(default_runtime_env())
-                .with_default_features()
-                .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
-                .with_analyzer_rules(get_analyzer_rules())
-                .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
-                .build();
+            analyzer_rules_builder = analyzer_rules_builder.include_federation(true);
+            extension_planners.push(Arc::new(FederatedPlanner::new()));
+        }
 
-            if let Err(e) = datafusion_functions_json::register_all(&mut state) {
-                tracing::error!("Unable to register JSON functions: {e}");
-            }
+        let query_planner = SpiceQueryPlanner::new().with_extension_planners(extension_planners);
 
-            SessionContext::new_with_state(state)
-        };
+        let mut state = state_builder
+            .with_query_planner(Arc::new(query_planner))
+            .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+            .with_analyzer_rules(analyzer_rules_builder.build())
+            .build();
 
-        let ctx_state = ctx.state();
-        let default_catalog = &ctx_state.config_options().catalog.default_catalog;
-        match schema::ensure_schema_exists(&ctx, default_catalog, &self.dataset_name) {
+        if let Err(e) = datafusion_functions_json::register_all(&mut state) {
+            tracing::error!("Unable to register JSON functions: {e}");
+        }
+
+        let default_catalog = state.config_options().catalog.default_catalog.clone();
+        let ctx = SessionContext::new_with_state(state);
+
+        match schema::ensure_schema_exists(&ctx, &default_catalog, &self.dataset_name) {
             Ok(()) => (),
             Err(_) => {
                 unreachable!("The default catalog should always exist");
