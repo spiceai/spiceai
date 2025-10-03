@@ -14,7 +14,9 @@ async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono.workspace = true
+datafusion.workspace = true
 futures.workspace = true
+itertools.workspace = true
 object_store.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true

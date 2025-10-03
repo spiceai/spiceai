@@ -268,6 +268,6 @@ impl FederatedTable {
         let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref(), OpenOption::OpenExisting)
             .await
             .ok()?;
-        Some(checkpoint)
+        Some(checkpoint.to_arc())
     }
 }

@@ -649,6 +649,7 @@ impl Runtime {
 
         // Start Spicepod watcher
         let self_ref = Arc::clone(&self);
+        #[allow(clippy::large_futures)]
         let pods_watcher_future = self
             .start_runtime_task(PODS_WATCHER, None, async move {
                 self_ref
