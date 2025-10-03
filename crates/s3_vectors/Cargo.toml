@@ -15,6 +15,7 @@ aws-credential-types.workspace = true
 aws-sdk-s3vectors.workspace = true
 aws-smithy-types.workspace = true
 datafusion.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

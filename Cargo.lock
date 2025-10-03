@@ -12626,6 +12626,7 @@ dependencies = [
  "aws-sdk-s3vectors",
  "aws-smithy-types",
  "datafusion",
+ "futures",
  "tokio",
 ]
 
