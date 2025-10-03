@@ -60,10 +60,10 @@ impl MongoDBFactory {
     }
 }
 
-const DEFAULT_MIN_POOL_SIZE: usize = 0;
-const DEFAULT_MIN_POOL_SIZE_STR: &str = "0";
-const DEFAULT_MAX_POOL_SIZE: usize = 10;
-const DEFAULT_MAX_POOL_SIZE_STR: &str = "10";
+const DEFAULT_CONNECTION_POOL_MIN: usize = 1;
+const DEFAULT_CONNECTION_POOL_MIN_STR: &str = "1";
+const DEFAULT_CONNECTION_POOL_MAX: usize = 5;
+const DEFAULT_CONNECTION_POOL_MAX_STR: &str = "5";
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
@@ -98,11 +98,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("num_docs_to_infer_schema")
         .description("Number of documents to use to infer the schema. Defaults to 400."),
     ParameterSpec::component("pool_min")
-        .description("Minimum number of connections to keep open in the pool, created lazily when first needed. Defaults to 10.")
-        .default(DEFAULT_MIN_POOL_SIZE_STR),
+        .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
+        .default(DEFAULT_CONNECTION_POOL_MIN_STR),
     ParameterSpec::component("pool_max")
-        .description("Maximum number of connections allowed in the pool. Defaults to 100.")
-        .default(DEFAULT_MAX_POOL_SIZE_STR),
+        .description("The maximum number of connections created in the connection pool.")
+        .default(DEFAULT_CONNECTION_POOL_MAX_STR),
 ];
 
 const IGNORED_IF_URI: &[&str] = &[
@@ -151,12 +151,12 @@ impl DataConnectorFactory for MongoDBFactory {
                     let parsed_pool_min = pool_min_str.parse::<usize>();
                     if parsed_pool_min.is_err() {
                         tracing::warn!(
-                            "Invalid pool_min value: {pool_min_str}, using default of {DEFAULT_MIN_POOL_SIZE_STR}"
+                            "Invalid pool_min value: {pool_min_str}, using default of {DEFAULT_CONNECTION_POOL_MIN_STR}"
                         );
                     }
                     parsed_pool_min.ok()
                 })
-                .unwrap_or(DEFAULT_MIN_POOL_SIZE);
+                .unwrap_or(DEFAULT_CONNECTION_POOL_MIN);
             let mut pool_max = params
                 .parameters
                 .get("pool_max")
@@ -166,19 +166,19 @@ impl DataConnectorFactory for MongoDBFactory {
                     let parsed_pool_max = pool_max_str.parse::<usize>();
                     if parsed_pool_max.is_err() {
                         tracing::warn!(
-                            "Invalid pool_max value: {pool_max_str}, using default of {DEFAULT_MAX_POOL_SIZE_STR}"
+                            "Invalid pool_max value: {pool_max_str}, using default of {DEFAULT_CONNECTION_POOL_MAX_STR}"
                         );
                     }
                     parsed_pool_max.ok()
                 })
-                .unwrap_or(DEFAULT_MAX_POOL_SIZE);
+                .unwrap_or(DEFAULT_CONNECTION_POOL_MAX);
 
             if pool_min > pool_max {
                 tracing::warn!(
-                    "pool_min value: {pool_min} is greater than pool_max value: {pool_max}, using default values of {DEFAULT_MIN_POOL_SIZE_STR} and {DEFAULT_MAX_POOL_SIZE_STR}"
+                    "pool_min value: {pool_min} is greater than pool_max value: {pool_max}, using default values of {DEFAULT_CONNECTION_POOL_MIN_STR} and {DEFAULT_CONNECTION_POOL_MAX_STR}"
                 );
-                pool_min = DEFAULT_MIN_POOL_SIZE;
-                pool_max = DEFAULT_MAX_POOL_SIZE;
+                pool_min = DEFAULT_CONNECTION_POOL_MIN;
+                pool_max = DEFAULT_CONNECTION_POOL_MAX;
 
                 params
                     .parameters
