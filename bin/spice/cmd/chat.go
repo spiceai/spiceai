@@ -643,9 +643,12 @@ spice chat --model <model> "What is Spice.ai?"
 			message, err := line.Prompt("chat> ")
 			if err == liner.ErrPromptAborted {
 				break
+			} else if err == io.EOF {
+				// EOF reached (Ctrl+D or piped input exhausted)
+				break
 			} else if err != nil {
 				slog.Error("reading input line", "error", err)
-				continue
+				break
 			}
 
 			line.AppendHistory(message)
@@ -1020,9 +1023,12 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		message, err := line.Prompt("chat> ")
 		if err == liner.ErrPromptAborted {
 			break
+		} else if err == io.EOF {
+			// EOF reached (Ctrl+D or piped input exhausted)
+			break
 		} else if err != nil {
 			slog.Error("reading input line", "error", err)
-			continue
+			break
 		}
 
 		line.AppendHistory(message)

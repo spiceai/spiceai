@@ -190,9 +190,12 @@ spice search --cloud
 			message, err := line.Prompt("search> ")
 			if err == liner.ErrPromptAborted {
 				break
+			} else if err == io.EOF {
+				// EOF reached (Ctrl+D or piped input exhausted)
+				break
 			} else if err != nil {
 				slog.Error("reading input line", "error", err)
-				continue
+				break
 			}
 
 			if strings.Trim(message, " ") == "" {
@@ -423,9 +426,12 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 		message, err := line.Prompt("search> ")
 		if err == liner.ErrPromptAborted {
 			break
+		} else if err == io.EOF {
+			// EOF reached (Ctrl+D or piped input exhausted)
+			break
 		} else if err != nil {
 			slog.Error("reading input line", "error", err)
-			continue
+			break
 		}
 
 		if strings.Trim(message, " ") == "" {

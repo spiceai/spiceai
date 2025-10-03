@@ -311,15 +311,25 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 		}
 	}()
 
-	// Strip grpc:// or grpc+tls:// scheme for gospice SDK
+	// Convert grpc+tls:// to address without prefix for gospice SDK
+	// The SDK uses the presence of "grpc://" prefix to determine non-TLS mode
+	// If no "grpc://" prefix, it uses TLS by default
 	flightAddress := grpcEndpoint
 	isTLS := strings.HasPrefix(flightAddress, "grpc+tls://")
+
+	// Strip the scheme prefixes
 	flightAddress = strings.TrimPrefix(flightAddress, "grpc://")
 	flightAddress = strings.TrimPrefix(flightAddress, "grpc+tls://")
 
 	// If TLS is specified without a port, default to 443
 	if isTLS && !strings.Contains(flightAddress, ":") {
 		flightAddress = flightAddress + ":443"
+	}
+
+	// If it was non-TLS (grpc://), prepend grpc:// back so SDK knows to use insecure
+	// Otherwise, leave without prefix so SDK uses TLS
+	if !isTLS {
+		flightAddress = "grpc://" + flightAddress
 	}
 
 	// Build init options
@@ -408,9 +418,12 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 		query, err := line.Prompt("sql> ")
 		if err == liner.ErrPromptAborted {
 			break
+		} else if err == io.EOF {
+			// EOF reached (Ctrl+D or piped input exhausted)
+			break
 		} else if err != nil {
 			slog.Error("reading line", "error", err)
-			continue
+			break
 		}
 
 		query = strings.TrimSpace(query)
