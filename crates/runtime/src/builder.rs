@@ -135,6 +135,13 @@ impl RuntimeBuilder {
 
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> Runtime {
+        // Initialize DataFusion tracer for span context propagation across async boundaries
+        if let Err(e) = tracers::init_datafusion_tracer() {
+            tracing::warn!(
+                "Failed to initialize DataFusion tracer: {e}. Span context may not propagate correctly across async boundaries."
+            );
+        }
+
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
