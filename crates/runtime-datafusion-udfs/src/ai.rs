@@ -227,6 +227,7 @@ impl AsyncScalarUDFImpl for Ai {
 
         // Emit timing metrics for explain analyze
         let elapsed = start_time.elapsed();
+        #[allow(clippy::cast_possible_truncation)]
         let elapsed_compute_ns = elapsed.as_nanos() as u64;
 
         // Log metrics in a format consistent with DataFusion explain analyze
@@ -288,11 +289,8 @@ impl Ai {
 
             // Performance: Process stream chunks efficiently with cancellation support
             while let Some(chunk_result) = stream.next().await {
-                // Check if the current task has been cancelled (e.g., query timeout or user cancellation)
-                if tokio::task::is_cancelled() {
-                    tracing::debug!("AI model call cancelled for row {}", row_index);
-                    return Err("Query cancelled".into());
-                }
+                // Yield to allow tokio to cancel this task if needed (e.g., query timeout)
+                tokio::task::yield_now().await;
 
                 let chunk = chunk_result?;
 
@@ -315,10 +313,12 @@ impl Ai {
             let model_call_elapsed = model_call_start.elapsed();
 
             // Emit per-row timing metrics for explain analyze
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed_ns = model_call_elapsed.as_nanos() as u64;
             tracing::debug!(
                 target: "datafusion::physical_plan::metrics",
                 row = row_index,
-                elapsed_ns = model_call_elapsed.as_nanos() as u64,
+                elapsed_ns,
                 response_len = complete_response.len(),
                 "ai model call completed"
             );
@@ -371,6 +371,8 @@ impl Ai {
         message_array: &StringArray,
         max_parallelism: usize,
     ) -> DataFusionResult<ArrayRef> {
+        use futures::stream::{self, StreamExt};
+
         let array_len = message_array.len();
         let parent_span = Span::current();
 
@@ -378,26 +380,26 @@ impl Ai {
         // Limit to batch size to avoid over-spawning
         let parallelism = std::cmp::min(max_parallelism, array_len);
 
-        // Performance: Use stream with buffer_unordered to properly limit concurrent tasks
-        // This ensures we only spawn `parallelism` tasks at a time, not all tasks at once
-        use futures::stream::{self, StreamExt};
+        // Collect messages into owned strings to avoid lifetime issues with async
+        let messages: Vec<(usize, Option<String>)> = message_array
+            .iter()
+            .enumerate()
+            .map(|(idx, msg_opt)| (idx, msg_opt.map(std::string::ToString::to_string)))
+            .collect();
 
-        let results: Result<Vec<Option<String>>, DataFusionError> = stream::iter(message_array.iter().enumerate())
-            .map(|(row_index, message_opt)| {
+        let results: Result<Vec<Option<String>>, DataFusionError> = stream::iter(messages)
+            .map(|(row_index, message_str)| {
                 let model = Arc::clone(model);
                 let model_name_str = model_name.to_string();
                 let parent_span = parent_span.clone();
 
-                (async move {
-                    // Check for task cancellation before processing each message
-                    if tokio::task::is_cancelled() {
-                        tracing::debug!("Query cancelled, skipping message at row {}", row_index);
-                        return Err(DataFusionError::Execution("Query cancelled".to_string()));
-                    }
+                async move {
+                    let _entered = parent_span.enter();
 
-                    if let Some(message) = message_opt {
-                        let message = message.to_string();
+                    // Yield to allow tokio to cancel this task if needed (e.g., query timeout or user cancellation)
+                    tokio::task::yield_now().await;
 
+                    if let Some(message) = message_str {
                         match Self::call_model(&model, &model_name_str, &message, row_index).await {
                             Ok(Some(result)) => {
                                 tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
@@ -419,7 +421,7 @@ impl Ai {
                     } else {
                         Ok::<Option<String>, DataFusionError>(None)
                     }
-                }).instrument(parent_span)
+                }
             })
             .buffer_unordered(parallelism)
             .collect::<Vec<Result<Option<String>, DataFusionError>>>()
@@ -454,7 +456,6 @@ mod tests {
     use datafusion::logical_expr::{ScalarFunctionArgs, ScalarUDFImpl, Volatility};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
     use tokio::sync::RwLock;
 
     // Mock Chat implementation for testing
@@ -1436,111 +1437,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_metrics_emission() {
-        use std::sync::Arc;
-        use std::sync::Mutex;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        // Capture tracing events to verify metrics are emitted
-        #[derive(Clone)]
-        struct MetricsCollector {
-            events: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl MetricsCollector {
-            fn new() -> Self {
-                Self {
-                    events: Arc::new(Mutex::new(Vec::new())),
-                }
-            }
-
-            fn get_events(&self) -> Vec<String> {
-                self.events.lock().unwrap().clone()
-            }
-        }
-
-        impl<S> tracing_subscriber::layer::Layer<S> for MetricsCollector
-        where
-            S: tracing::Subscriber,
-        {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let metadata = event.metadata();
-                if metadata.target() == "datafusion::physical_plan::metrics" {
-                    let mut visitor = MetricsVisitor { fields: Vec::new() };
-                    event.record(&mut visitor);
-                    let event_str = format!("{}: {:?}", metadata.target(), visitor.fields);
-                    self.events.lock().unwrap().push(event_str);
-                }
-            }
-        }
-
-        struct MetricsVisitor {
-            fields: Vec<(String, String)>,
-        }
-
-        impl tracing::field::Visit for MetricsVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.fields
-                    .push((field.name().to_string(), format!("{:?}", value)));
-            }
-        }
-
-        // Set up tracing with our collector
-        let collector = MetricsCollector::new();
-        let subscriber = tracing_subscriber::registry().with(collector.clone());
-
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        // Run the AI UDF
-        let model_store = create_test_model_store();
-        let udf = Ai::new(model_store);
-
-        let message_scalar =
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some("Test metrics".to_string())));
-        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("test-model".to_string())));
-
-        let args = ScalarFunctionArgs {
-            args: vec![message_scalar, model_scalar],
-            arg_fields: vec![],
-            number_rows: 1,
-            return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
-        };
-
-        let _result = udf
-            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
-            .await
-            .expect("UDF should execute successfully");
-
-        // Verify metrics were emitted
-        let events = collector.get_events();
-
-        // Should have at least 2 events: one for the overall UDF execution and one for the model call
-        assert!(
-            events.len() >= 2,
-            "Expected at least 2 metric events, got {}. Events: {:?}",
-            events.len(),
-            events
-        );
-
-        // Check that the events contain expected metric fields
-        let events_str = events.join("\n");
-        assert!(
-            events_str.contains("elapsed"),
-            "Expected metrics to contain 'elapsed' field. Events: {}",
-            events_str
-        );
-        assert!(
-            events_str.contains("rows_produced") || events_str.contains("row"),
-            "Expected metrics to contain row information. Events: {}",
-            events_str
-        );
-    }
-
     #[tokio::test]
     async fn test_response_size_limit() {
         // Mock Chat that returns very large responses
@@ -1735,7 +1631,7 @@ mod tests {
             }
 
             fn get_events(&self) -> Vec<String> {
-                self.events.lock().unwrap().clone()
+                self.events.lock().expect("lock poisoned").clone()
             }
         }
 
@@ -1753,7 +1649,7 @@ mod tests {
                     let mut visitor = MetricsVisitor { fields: Vec::new() };
                     event.record(&mut visitor);
                     let event_str = format!("{}: {:?}", metadata.target(), visitor.fields);
-                    self.events.lock().unwrap().push(event_str);
+                    self.events.lock().expect("lock poisoned").push(event_str);
                 }
             }
         }
