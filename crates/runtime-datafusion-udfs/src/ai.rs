@@ -388,7 +388,7 @@ impl Ai {
                 let model_name_str = model_name.to_string();
                 let parent_span = parent_span.clone();
 
-                async move {
+                (async move {
                     // Check for task cancellation before processing each message
                     if tokio::task::is_cancelled() {
                         tracing::debug!("Query cancelled, skipping message at row {}", row_index);
@@ -398,10 +398,7 @@ impl Ai {
                     if let Some(message) = message_opt {
                         let message = message.to_string();
 
-                        match Self::call_model(&model, &model_name_str, &message, row_index)
-                            .instrument(parent_span)
-                            .await
-                        {
+                        match Self::call_model(&model, &model_name_str, &message, row_index).await {
                             Ok(Some(result)) => {
                                 tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
                                 Ok(Some(result))
@@ -422,7 +419,7 @@ impl Ai {
                     } else {
                         Ok::<Option<String>, DataFusionError>(None)
                     }
-                }
+                }).instrument(parent_span)
             })
             .buffer_unordered(parallelism)
             .collect::<Vec<Result<Option<String>, DataFusionError>>>()
@@ -1820,6 +1817,9 @@ mod tests {
             events_str.contains("rows_produced") || events_str.contains("row"),
             "Expected metrics to contain row information. Events: {}",
             events_str
+        );
+    }
+}
         );
     }
 }
