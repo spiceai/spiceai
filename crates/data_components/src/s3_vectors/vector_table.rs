@@ -48,8 +48,8 @@ use tokio::sync::mpsc::Sender;
 /// An S3 Vector index.
 #[derive(Clone)]
 pub struct S3VectorsTable {
-    pub(super) idx: S3VectorIdentifier,
-    pub(super) client: Arc<dyn S3Vectors + Send + Sync>,
+    pub idx: S3VectorIdentifier,
+    pub client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
     // - `data` Float32
@@ -58,6 +58,10 @@ pub struct S3VectorsTable {
     pub schema: SchemaRef,
 
     pub(super) constraints: Constraints,
+
+    pub dimension: i64,
+    pub columns: MetadataColumns,
+    pub distance_metric: DistanceMetric,
 }
 
 impl std::fmt::Debug for S3VectorsTable {
@@ -91,6 +95,7 @@ impl S3VectorsTable {
     pub async fn try_new_table(
         id: S3VectorIdentifier,
         client: Arc<dyn S3Vectors + Send + Sync>,
+        dimension: i64,
         columns: MetadataColumns,
         distance_metric: &DistanceMetric,
     ) -> Result<S3VectorTableResult> {
@@ -107,13 +112,16 @@ impl S3VectorsTable {
                         specified: distance_metric.clone(),
                     });
                 }
-                let schema = Self::compute_schema(index.dimension(), columns);
+                let schema = Self::compute_schema(index.dimension(), columns.clone());
                 let constraints = Self::primary_key(&schema);
                 Ok(S3VectorTableResult::Table(Self {
                     idx: id,
                     client,
                     schema,
                     constraints,
+                    dimension,
+                    columns,
+                    distance_metric: distance_metric.clone(),
                 }))
             }
             None | Some(GetIndexOutput { index: None, .. }) => {
@@ -143,6 +151,7 @@ impl S3VectorsTable {
         match Self::try_new_table(
             id.clone(),
             Arc::clone(&client),
+            dimension,
             columns.clone(),
             &distance_metric,
         )
@@ -159,7 +168,7 @@ impl S3VectorsTable {
                     &distance_metric,
                 )
                 .await?;
-                Self::try_new_table(id, client, columns, &distance_metric)
+                Self::try_new_table(id, client, dimension, columns, &distance_metric)
                     .await
                     .map(S3VectorTableResult::table)
             }
@@ -172,7 +181,7 @@ impl S3VectorsTable {
                     &distance_metric,
                 )
                 .await?;
-                Self::try_new_table(id, client, columns, &distance_metric)
+                Self::try_new_table(id, client, dimension, columns, &distance_metric)
                     .await
                     .map(S3VectorTableResult::table)
             }

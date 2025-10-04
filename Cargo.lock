@@ -3758,6 +3758,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest",
+ "runtime-table-partition",
  "rusqlite",
  "s3_vectors",
  "s3_vectors_metadata_filter",
