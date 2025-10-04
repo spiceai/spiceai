@@ -754,6 +754,10 @@ pub struct FullTextSearchDatasetConfig {
 }
 
 impl AccelerationSource for Dataset {
+    fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+        Arc::new(self.clone())
+    }
+
     fn is_file_accelerated(&self) -> bool {
         self.is_file_accelerated()
     }

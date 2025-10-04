@@ -108,6 +108,13 @@ impl DatasetCheckpoint {
             .execute(&upsert, [&self.dataset_name, &schema_json])
             .map_err(Error::external)?;
 
+        if self.snapshot_behavior.create_enabled() {
+            // Force a DuckDB checkpoint so the WAL and database pages are flushed to disk before the snapshot is taken.
+            duckdb_conn
+                .execute("CHECKPOINT", [])
+                .map_err(Error::external)?;
+        }
+
         Ok(())
     }
 
@@ -155,6 +162,7 @@ impl DatasetCheckpoint {
 mod tests {
     use crate::dataaccelerator::spice_sys::AccelerationConnection;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use runtime_acceleration::snapshot::SnapshotBehavior;
 
     use super::*;
     use std::sync::Arc;
@@ -169,6 +177,7 @@ mod tests {
             DatasetCheckpoint {
                 dataset_name: "test_dataset".to_string(),
                 acceleration_connection: AccelerationConnection::DuckDB(Arc::clone(&pool)),
+                snapshot_behavior: SnapshotBehavior::Disabled,
             },
             pool,
         )
@@ -246,6 +255,7 @@ mod tests {
         let checkpoint = DatasetCheckpoint {
             dataset_name: "legacy_dataset".to_string(),
             acceleration_connection: AccelerationConnection::DuckDB(Arc::clone(&pool)),
+            snapshot_behavior: SnapshotBehavior::Disabled,
         };
 
         // Run migration

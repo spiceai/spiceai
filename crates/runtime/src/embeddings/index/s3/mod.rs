@@ -21,6 +21,7 @@ use data_components::s3_vectors::{
     MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
 use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion_expr::Expr;
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
 use search::{
@@ -91,6 +92,7 @@ pub async fn try_from_dataset(
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
+    partition_by: Vec<Expr>,
 ) -> Result<S3Vector, Box<dyn std::error::Error + Send + Sync>> {
     // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
     let pks_from_table = get_primary_keys(&underlying).await.boxed()?;
@@ -130,6 +132,7 @@ pub async fn try_from_dataset(
         metadata_columns,
         config.model.clone(),
         embedding_models,
+        partition_by,
     ))
 }
 

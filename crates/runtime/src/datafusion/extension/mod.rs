@@ -23,19 +23,38 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
-use datafusion_federation::FederatedPlanner;
-use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use std::sync::Arc;
 
 pub mod bytes_processed;
 
-#[derive(Debug, Default)]
-pub struct SpiceQueryPlanner {}
+#[derive(Default)]
+pub struct SpiceQueryPlanner {
+    extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SpiceQueryPlanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpiceQueryPlanner")
+            .field("extension_planners", &self.extension_planners.len())
+            .finish()
+    }
+}
 
 impl SpiceQueryPlanner {
     #[must_use]
     pub fn new() -> Self {
-        SpiceQueryPlanner {}
+        SpiceQueryPlanner {
+            extension_planners: vec![],
+        }
+    }
+
+    #[must_use]
+    pub fn with_extension_planners(
+        mut self,
+        planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+    ) -> Self {
+        self.extension_planners = planners;
+        self
     }
 }
 
@@ -46,11 +65,8 @@ impl QueryPlanner for SpiceQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![
-            Arc::new(FederatedPlanner::new()),
-            Arc::new(SpiceExtensionPlanner::new()),
-            Arc::new(IndexTableScanExtensionPlanner::new()),
-        ]);
+        let physical_planner =
+            DefaultPhysicalPlanner::with_extension_planners(self.extension_planners.clone());
         physical_planner
             .create_physical_plan(logical_plan, session_state)
             .await
