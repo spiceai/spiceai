@@ -31,9 +31,6 @@ use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use runtime_table_partition::insert::partition_batch;
-use search::SEARCH_SCORE_COLUMN_NAME;
-use search::index::{SearchIndex, VectorIndex};
-use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
