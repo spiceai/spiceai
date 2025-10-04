@@ -84,36 +84,26 @@ impl TableProvider for S3VectorsTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut query_vector = None;
-
-        if let Some(filter) = filters.iter().find(|f| contains_cosine_similarity_udf(f)) {
-            let _ = filter.apply(|e| {
-                if let Expr::ScalarFunction(ScalarFunction { args, .. }) = e {
-                    if args.len() == 2 {
-                        query_vector = extract_vector_from_expr(&args[1]);
-                        return Ok(TreeNodeRecursion::Stop);
-                    }
-                }
-                Ok(TreeNodeRecursion::Continue)
-            });
+        let mut source = None;
+        for filter in filters {
+            if let Some(query_vector) = extract_query_vector(filter) {
+                let top_k = limit.unwrap_or(DEFAULT_TOP_K) as i32;
+                source = Some(Arc::new(QueryVectorsSource::new(
+                    Arc::clone(&self.client),
+                    self.index.clone(),
+                    self.schema(),
+                    query_vector,
+                    top_k,
+                )) as Arc<dyn DataSource>);
+                break;
+            }
         }
 
-        let source: Arc<dyn DataSource> = if let Some(query_vector) = query_vector {
-            let top_k = limit.unwrap_or(DEFAULT_TOP_K) as i32;
-            Arc::new(QueryVectorsSource::new(
-                Arc::clone(&self.client),
-                self.index.clone(),
-                self.schema(),
-                query_vector,
-                top_k,
-            ))
-        } else {
-            Arc::new(ListVectorsSource::new(
-                Arc::clone(&self.client),
-                self.index.clone(),
-                self.schema(),
-            ))
-        };
+        let source = source.unwrap_or(Arc::new(ListVectorsSource::new(
+            Arc::clone(&self.client),
+            self.index.clone(),
+            self.schema(),
+        )));
 
         Ok(Arc::new(DataSourceExec::new(source)))
     }
@@ -125,7 +115,7 @@ impl TableProvider for S3VectorsTable {
         Ok(filters
             .iter()
             .map(|f| {
-                if contains_cosine_similarity_udf(f) {
+                if extract_query_vector(f).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -151,37 +141,34 @@ impl TableProvider for S3VectorsTable {
     }
 }
 
-fn is_cosine_similarity_udf(expr: &Expr) -> bool {
-    if let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr {
-        func.name() == "cosine_similarity"
-    } else {
-        false
-    }
-}
-
-fn contains_cosine_similarity_udf(expr: &Expr) -> bool {
-    match expr.apply(|e| {
-        Ok(if is_cosine_similarity_udf(e) {
-            TreeNodeRecursion::Stop
-        } else {
-            TreeNodeRecursion::Continue
-        })
-    }) {
-        Ok(TreeNodeRecursion::Stop) => true,
-        _ => false,
-    }
-}
-
-fn extract_vector_from_expr(expr: &Expr) -> Option<VectorData> {
-    if let Expr::Literal(ScalarValue::List(array), _) = expr {
-        if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
-            let values = list_array.values();
-            if let Some(float32_array) = values.as_any().downcast_ref::<Float32Array>() {
-                return Some(VectorData::Float32(float32_array.values().to_vec()));
+fn contains_cosine_similarity_udf(expr: &Expr) -> Option<VectorData> {
+    if let Expr::ScalarFunction(ScalarFunction { func, args }) = expr {
+        if func.name() == "cosine_similarity" && args.len() == 2 {
+            if let Expr::Literal(ScalarValue::List(array), _) = &args[1] {
+                if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
+                    let values = list_array.values();
+                    if let Some(float32_array) = values.as_any().downcast_ref::<Float32Array>() {
+                        return Some(VectorData::Float32(float32_array.values().to_vec()));
+                    }
+                }
             }
         }
     }
     None
+}
+
+fn extract_query_vector(expr: &Expr) -> Option<VectorData> {
+    let mut query_vector = None;
+    let _ = expr.apply(|e| {
+        Ok(if let Some(vector) = contains_cosine_similarity_udf(e) {
+            query_vector = Some(vector);
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+
+    query_vector
 }
 
 #[cfg(test)]
