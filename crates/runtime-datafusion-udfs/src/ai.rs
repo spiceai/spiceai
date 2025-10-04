@@ -394,13 +394,14 @@ impl Ai {
                 let parent_span = parent_span.clone();
 
                 async move {
-                    let _entered = parent_span.enter();
-
                     // Yield to allow tokio to cancel this task if needed (e.g., query timeout or user cancellation)
                     tokio::task::yield_now().await;
 
                     if let Some(message) = message_str {
-                        match Self::call_model(&model, &model_name_str, &message, row_index).await {
+                        match Self::call_model(&model, &model_name_str, &message, row_index)
+                            .instrument(parent_span)
+                            .await
+                        {
                             Ok(Some(result)) => {
                                 tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
                                 Ok(Some(result))
