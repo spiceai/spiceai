@@ -3,9 +3,15 @@ use std::{any::Any, fmt, sync::Arc};
 use async_trait::async_trait;
 use aws_sdk_s3vectors::types::{Index, VectorData};
 use datafusion::{
-    arrow::datatypes::{DataType, Field, Schema, SchemaRef},
+    arrow::{
+        array::{Array, Float32Array, ListArray},
+        datatypes::{DataType, Field, Schema, SchemaRef},
+    },
     catalog::{Session, TableProvider, memory::DataSourceExec},
-    common::Result,
+    common::{
+        Result,
+        tree_node::{TreeNode, TreeNodeRecursion},
+    },
     datasource::{TableType, sink::DataSinkExec, source::DataSource},
     logical_expr::{Expr, TableProviderFilterPushDown, dml::InsertOp, expr::ScalarFunction},
     physical_plan::ExecutionPlan,
@@ -18,6 +24,8 @@ use crate::{
 };
 
 static NAME: &str = "S3VectorsTable";
+
+const DEFAULT_TOP_K: usize = 10;
 
 pub struct S3VectorsTable {
     client: Arc<dyn S3Vectors + Send + Sync>,
@@ -72,38 +80,40 @@ impl TableProvider for S3VectorsTable {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        _projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut query_vector = None;
-        let mut top_k = None;
 
-        if let Some(filter) = filters.iter().find(|f| is_cosine_similarity_udf(f)) {
-            if let Expr::ScalarFunction(ScalarFunction { args, .. }) = filter {
-                if args.len() == 3 {
-                    query_vector = extract_vector_from_expr(&args[1])?;
-                    top_k = extract_top_k_from_expr(&args[2])?;
+        if let Some(filter) = filters.iter().find(|f| contains_cosine_similarity_udf(f)) {
+            let _ = filter.apply(|e| {
+                if let Expr::ScalarFunction(ScalarFunction { args, .. }) = e {
+                    if args.len() == 2 {
+                        query_vector = extract_vector_from_expr(&args[1]);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
                 }
-            }
+                Ok(TreeNodeRecursion::Continue)
+            });
         }
 
-        let source: Arc<dyn DataSource> =
-            if let (Some(query_vector), Some(top_k)) = (query_vector, top_k) {
-                Arc::new(QueryVectorsSource::new(
-                    Arc::clone(&self.client),
-                    self.index.clone(),
-                    self.schema(),
-                    query_vector,
-                    top_k,
-                ))
-            } else {
-                Arc::new(ListVectorsSource::new(
-                    Arc::clone(&self.client),
-                    self.index.clone(),
-                    self.schema(),
-                ))
-            };
+        let source: Arc<dyn DataSource> = if let Some(query_vector) = query_vector {
+            let top_k = limit.unwrap_or(DEFAULT_TOP_K) as i32;
+            Arc::new(QueryVectorsSource::new(
+                Arc::clone(&self.client),
+                self.index.clone(),
+                self.schema(),
+                query_vector,
+                top_k,
+            ))
+        } else {
+            Arc::new(ListVectorsSource::new(
+                Arc::clone(&self.client),
+                self.index.clone(),
+                self.schema(),
+            ))
+        };
 
         Ok(Arc::new(DataSourceExec::new(source)))
     }
@@ -115,7 +125,7 @@ impl TableProvider for S3VectorsTable {
         Ok(filters
             .iter()
             .map(|f| {
-                if is_cosine_similarity_udf(f) {
+                if contains_cosine_similarity_udf(f) {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -149,26 +159,123 @@ fn is_cosine_similarity_udf(expr: &Expr) -> bool {
     }
 }
 
-fn extract_vector_from_expr(expr: &Expr) -> Result<Option<VectorData>> {
-    if let Expr::Literal(ScalarValue::Utf8(Some(s)), _) = expr {
-        let s = s.trim();
-        if s.starts_with('[') && s.ends_with(']') {
-            let floats: std::result::Result<Vec<f32>, _> = s[1..s.len() - 1]
-                .split(',')
-                .map(|s| s.trim().parse::<f32>())
-                .collect();
-            if let Ok(floats) = floats {
-                return Ok(Some(VectorData::Float32(floats)));
+fn contains_cosine_similarity_udf(expr: &Expr) -> bool {
+    match expr.apply(|e| {
+        Ok(if is_cosine_similarity_udf(e) {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    }) {
+        Ok(TreeNodeRecursion::Stop) => true,
+        _ => false,
+    }
+}
+
+fn extract_vector_from_expr(expr: &Expr) -> Option<VectorData> {
+    if let Expr::Literal(ScalarValue::List(array), _) = expr {
+        if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
+            let values = list_array.values();
+            if let Some(float32_array) = values.as_any().downcast_ref::<Float32Array>() {
+                return Some(VectorData::Float32(float32_array.values().to_vec()));
             }
         }
     }
-    Ok(None)
+    None
 }
 
-fn extract_top_k_from_expr(expr: &Expr) -> Result<Option<i32>> {
-    if let Expr::Literal(ScalarValue::Int64(Some(k)), _) = expr {
-        Ok(Some(*k as i32))
-    } else {
-        Ok(None)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock_client::MockClient;
+    use aws_sdk_s3vectors::types::DistanceMetric;
+    use aws_smithy_types::DateTime;
+    use datafusion::{
+        arrow::util::pretty::pretty_format_batches,
+        logical_expr::{ColumnarValue, ScalarUDF, Volatility},
+        prelude::{SessionContext, create_udf},
+    };
+
+    fn cosine_similarity() -> ScalarUDF {
+        create_udf(
+            "cosine_similarity",
+            vec![
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            ],
+            DataType::Float32,
+            Volatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Float32(Some(1.0))))),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_scan_list_vectors() -> Result<()> {
+        let client = Arc::new(MockClient::new());
+        let index_name = "test_index";
+        let index_arn = "test_arn";
+        let bucket_name = "test_bucket";
+
+        let index = Index::builder()
+            .index_name(index_name)
+            .vector_bucket_name(bucket_name)
+            .index_arn(index_arn)
+            .creation_time(DateTime::from_secs(7))
+            .data_type(aws_sdk_s3vectors::types::DataType::Float32)
+            .dimension(3)
+            .distance_metric(DistanceMetric::Cosine)
+            .build()
+            .expect("valid index");
+
+        let table = S3VectorsTable::new(client, index);
+        let ctx = SessionContext::new();
+        let udf = cosine_similarity();
+        ctx.register_udf(udf);
+
+        ctx.register_table("s3_vectors", Arc::new(table))?;
+
+        let df = ctx
+            .sql("EXPLAIN SELECT key, data FROM s3_vectors LIMIT 10")
+            .await?;
+        let batches = df.collect().await?;
+        let explain = pretty_format_batches(&batches)?.to_string();
+        assert!(!explain.contains("QueryVectorsSource"));
+        assert!(explain.contains("ListVectorsSource"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_scan_query_vectors() -> Result<()> {
+        let client = Arc::new(MockClient::new());
+        let index_name = "test_index";
+        let index_arn = "test_arn";
+        let bucket_name = "test_bucket";
+
+        let index = Index::builder()
+            .index_name(index_name)
+            .vector_bucket_name(bucket_name)
+            .index_arn(index_arn)
+            .creation_time(DateTime::from_secs(7))
+            .data_type(aws_sdk_s3vectors::types::DataType::Float32)
+            .dimension(3)
+            .distance_metric(DistanceMetric::Cosine)
+            .build()
+            .expect("valid index");
+
+        let table = S3VectorsTable::new(client, index);
+        let ctx = SessionContext::new();
+        let udf = cosine_similarity();
+        ctx.register_udf(udf);
+
+        ctx.register_table("s3_vectors", Arc::new(table))?;
+
+        let df = ctx.sql("EXPLAIN SELECT key, data FROM s3_vectors WHERE cosine_similarity(data, make_array(1.0, 2.0, 3.0)) > 0.8 LIMIT 10").await?;
+        let batches = df.collect().await?;
+        let explain = pretty_format_batches(&batches)?.to_string();
+        assert!(explain.contains("QueryVectorsSource"));
+        assert!(!explain.contains("ListVectorsSource"));
+
+        Ok(())
     }
 }

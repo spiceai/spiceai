@@ -45,8 +45,8 @@ pub struct QueryVectorsSource {
     client: Arc<dyn S3Vectors + Send + Sync>,
     index: Index,
     schema: SchemaRef,
-    query_vector: VectorData,
-    top_k: i32,
+    pub(crate) query_vector: VectorData,
+    pub(crate) top_k: i32,
     partitioning: Partitioning,
     eq_properties: EquivalenceProperties,
 }
@@ -55,9 +55,10 @@ impl fmt::Debug for QueryVectorsSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{NAME} bucket={} index={}",
+            "{NAME} bucket={} index={} top_k={}",
             self.index.vector_bucket_name(),
-            self.index.index_name
+            self.index.index_name,
+            self.top_k,
         )
     }
 }
