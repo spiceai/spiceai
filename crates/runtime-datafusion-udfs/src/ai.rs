@@ -49,7 +49,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
-use tracing::Span;
 
 // Security and performance constants
 const MAX_MESSAGE_SIZE: usize = 1_000_000; // 1MB per message
@@ -216,6 +215,15 @@ impl AsyncScalarUDFImpl for Ai {
         // Use target_partitions from config for parallelism control
         let max_parallelism = config.execution.target_partitions;
 
+        // Create the parent 'ai' span that will contain all ai_completion spans
+        // This span is a child of the sql_query span from DataFusion
+        let ai_span = tracing::span!(
+            Level::INFO,
+            "ai",
+            model = %model_name,
+            rows = %args.number_rows
+        );
+
         let result = self
             .process_messages(
                 Arc::clone(model),
@@ -223,6 +231,7 @@ impl AsyncScalarUDFImpl for Ai {
                 message_array,
                 max_parallelism,
             )
+            .instrument(ai_span)
             .await;
 
         // Emit timing metrics for explain analyze
@@ -245,7 +254,7 @@ impl AsyncScalarUDFImpl for Ai {
 impl Ai {
     async fn call_model(
         model: &Arc<dyn Chat>,
-        model_name: &str,
+        _model_name: &str,
         message: &str,
         row_index: usize,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
@@ -261,77 +270,72 @@ impl Ai {
             .into());
         }
 
-        async {
-            let model_call_start = Instant::now();
-            tracing::debug!("Starting AI model call for message: {}", message);
+        let model_call_start = Instant::now();
+        tracing::debug!("Starting AI model call for message: {}", message);
 
-            let mut stream = model
-                .chat_stream(
-                    CreateChatCompletionRequestArgs::default()
-                        .messages(vec![
-                            ChatCompletionRequestUserMessageArgs::default()
-                                .content(message)
-                                .build()
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?
-                                .into(),
-                        ])
-                        .stream(true)
-                        .stream_options(ChatCompletionStreamOptions {
-                            include_usage: true,
-                        })
-                        .build()?,
-                )
-                .await?;
+        let mut stream = model
+            .chat_stream(
+                CreateChatCompletionRequestArgs::default()
+                    .messages(vec![
+                        ChatCompletionRequestUserMessageArgs::default()
+                            .content(message)
+                            .build()
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?
+                            .into(),
+                    ])
+                    .stream(true)
+                    .stream_options(ChatCompletionStreamOptions {
+                        include_usage: true,
+                    })
+                    .build()?,
+            )
+            .await?;
 
-            // Performance: Pre-allocate with estimated size to reduce reallocations
-            let mut complete_response = String::with_capacity(512);
-            let max_response_size = MAX_MESSAGE_SIZE * 2;
+        // Performance: Pre-allocate with estimated size to reduce reallocations
+        let mut complete_response = String::with_capacity(512);
+        let max_response_size = MAX_MESSAGE_SIZE * 2;
 
-            // Performance: Process stream chunks efficiently with cancellation support
-            while let Some(chunk_result) = stream.next().await {
-                // Yield to allow tokio to cancel this task if needed (e.g., query timeout)
-                tokio::task::yield_now().await;
+        // Performance: Process stream chunks efficiently with cancellation support
+        while let Some(chunk_result) = stream.next().await {
+            // Yield to allow tokio to cancel this task if needed (e.g., query timeout)
+            tokio::task::yield_now().await;
 
-                let chunk = chunk_result?;
+            let chunk = chunk_result?;
 
-                // Performance: Use iterator directly to avoid intermediate allocations
-                for choice in chunk.choices {
-                    if let Some(ref content) = choice.delta.content {
-                        let new_len = complete_response.len() + content.len();
+            // Performance: Use iterator directly to avoid intermediate allocations
+            for choice in chunk.choices {
+                if let Some(ref content) = choice.delta.content {
+                    let new_len = complete_response.len() + content.len();
 
-                        // Security: Check accumulated response size
-                        if new_len > max_response_size {
-                            return Err("Response size exceeds maximum allowed size".into());
-                        }
-
-                        // Performance: push_str is optimized for string concatenation
-                        complete_response.push_str(content);
+                    // Security: Check accumulated response size
+                    if new_len > max_response_size {
+                        return Err("Response size exceeds maximum allowed size".into());
                     }
+
+                    // Performance: push_str is optimized for string concatenation
+                    complete_response.push_str(content);
                 }
             }
-
-            let model_call_elapsed = model_call_start.elapsed();
-
-            // Emit per-row timing metrics for explain analyze
-            #[allow(clippy::cast_possible_truncation)]
-            let elapsed_ns = model_call_elapsed.as_nanos() as u64;
-            tracing::debug!(
-                target: "datafusion::physical_plan::metrics",
-                row = row_index,
-                elapsed_ns,
-                response_len = complete_response.len(),
-                "ai model call completed"
-            );
-
-            Ok(if complete_response.is_empty() {
-                None
-            } else {
-                Some(complete_response)
-            })
         }
-        // Instrument the async block with an AI span as a child of the current (sql_query) span
-        .instrument(tracing::span!(Level::INFO, "ai", model = %model_name))
-        .await
+
+        let model_call_elapsed = model_call_start.elapsed();
+
+        // Emit per-row timing metrics for explain analyze
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ns = model_call_elapsed.as_nanos() as u64;
+        tracing::debug!(
+            target: "datafusion::physical_plan::metrics",
+            row = row_index,
+            elapsed_ns,
+            response_len = complete_response.len(),
+            "ai model call completed"
+        );
+
+        Ok(if complete_response.is_empty() {
+            None
+        } else {
+            Some(complete_response)
+        })
     }
 
     async fn process_messages(
@@ -374,7 +378,6 @@ impl Ai {
         use futures::stream::{self, StreamExt};
 
         let array_len = message_array.len();
-        let parent_span = Span::current();
 
         // Performance: Use configured parallelism from DataFusion config (target_partitions)
         // Limit to batch size to avoid over-spawning
@@ -391,31 +394,55 @@ impl Ai {
             .map(|(row_index, message_str)| {
                 let model = Arc::clone(model);
                 let model_name_str = model_name.to_string();
-                let parent_span = parent_span.clone();
 
                 async move {
                     // Yield to allow tokio to cancel this task if needed (e.g., query timeout or user cancellation)
                     tokio::task::yield_now().await;
 
                     if let Some(message) = message_str {
+                        // Create ai_completion span as child of current (ai) span
+                        // This span will be visible in traces for each individual completion
+                        let ai_completion_span = tracing::span!(
+                            Level::INFO,
+                            "ai_completion",
+                            model = %model_name_str,
+                            row = %row_index
+                        );
+
                         match Self::call_model(&model, &model_name_str, &message, row_index)
-                            .instrument(parent_span)
+                            .instrument(ai_completion_span.clone())
                             .await
                         {
                             Ok(Some(result)) => {
-                                tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
+                                tracing::info!(
+                                    target: "task_history",
+                                    parent: &ai_completion_span,
+                                    captured_output = %result,
+                                    row = %row_index
+                                );
                                 Ok(Some(result))
                             }
                             Ok(None) => {
                                 tracing::debug!(
+                                    parent: &ai_completion_span,
                                     "AI model returned empty response for row {}",
                                     row_index
                                 );
                                 Ok(None)
                             }
                             Err(e) => {
-                                tracing::error!(target: "task_history", "AI model error for row {}", row_index);
-                                tracing::debug!(target: "task_history", "AI model error details: {}", e);
+                                tracing::error!(
+                                    target: "task_history",
+                                    parent: &ai_completion_span,
+                                    "AI model error for row {}",
+                                    row_index
+                                );
+                                tracing::debug!(
+                                    target: "task_history",
+                                    parent: &ai_completion_span,
+                                    "AI model error details: {}",
+                                    e
+                                );
                                 Err(DataFusionError::External(e))
                             }
                         }
