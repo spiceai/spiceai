@@ -12225,6 +12225,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tracing-test",
  "tract-core",
 ]

@@ -158,6 +158,11 @@ impl AsyncScalarUDFImpl for Ai {
         args: ScalarFunctionArgs,
         config: &datafusion::config::ConfigOptions,
     ) -> DataFusionResult<ArrayRef> {
+        use std::time::Instant;
+
+        // Start timing for explain analyze metrics
+        let start_time = Instant::now();
+
         // Security: Validate argument count
         if args.args.is_empty() || args.args.len() > 2 {
             return exec_err!(
@@ -211,13 +216,28 @@ impl AsyncScalarUDFImpl for Ai {
         // Use target_partitions from config for parallelism control
         let max_parallelism = config.execution.target_partitions;
 
-        self.process_messages(
-            Arc::clone(model),
-            &model_name,
-            message_array,
-            max_parallelism,
-        )
-        .await
+        let result = self
+            .process_messages(
+                Arc::clone(model),
+                &model_name,
+                message_array,
+                max_parallelism,
+            )
+            .await;
+
+        // Emit timing metrics for explain analyze
+        let elapsed = start_time.elapsed();
+        let elapsed_compute_ns = elapsed.as_nanos() as u64;
+
+        // Log metrics in a format consistent with DataFusion explain analyze
+        tracing::debug!(
+            target: "datafusion::physical_plan::metrics",
+            elapsed_compute = elapsed_compute_ns,
+            rows_produced = args.number_rows,
+            "ai UDF execution metrics"
+        );
+
+        result
     }
 }
 
@@ -226,8 +246,10 @@ impl Ai {
         model: &Arc<dyn Chat>,
         model_name: &str,
         message: &str,
-        _row_index: usize,
+        row_index: usize,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
+        use std::time::Instant;
+
         // Security: Validate message size before processing
         if message.len() > MAX_MESSAGE_SIZE {
             return Err(format!(
@@ -239,6 +261,7 @@ impl Ai {
         }
 
         async {
+            let model_call_start = Instant::now();
             tracing::debug!("Starting AI model call for message: {}", message);
             let mut stream = model
                 .chat_stream(
@@ -281,6 +304,17 @@ impl Ai {
                     }
                 }
             }
+
+            let model_call_elapsed = model_call_start.elapsed();
+
+            // Emit per-row timing metrics for explain analyze
+            tracing::debug!(
+                target: "datafusion::physical_plan::metrics",
+                row = row_index,
+                elapsed_ns = model_call_elapsed.as_nanos() as u64,
+                response_len = complete_response.len(),
+                "ai model call completed"
+            );
 
             Ok(if complete_response.is_empty() {
                 None
@@ -347,41 +381,49 @@ impl Ai {
             let model = Arc::clone(model);
             let model_name_str = model_name.to_string();
             let semaphore = Arc::clone(&semaphore);
-            let parent_span = parent_span.clone();
 
             let task = if let Some(message) = message_opt {
                 // Performance: Convert to owned string once before spawning
                 let message = message.to_string();
 
-                tokio::spawn(async move {
-                    let _permit = semaphore
-                        .acquire()
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                // Instrument the spawned task to ensure it inherits the current span context.
+                // This ensures that when JoinSetTracer is configured in DataFusion, the spawned
+                // tasks will properly emit metrics and traces in the context of the parent query.
+                tokio::spawn(
+                    async move {
+                        let _permit = semaphore
+                            .acquire()
+                            .await
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                    match Self::call_model(&model, &model_name_str, &message, row_index).await {
-                        Ok(Some(result)) => {
-                            tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
-                            Ok(Some(result))
-                        }
-                        Ok(None) => {
-                            tracing::debug!(
-                                "AI model returned empty response for row {}",
-                                row_index
-                            );
-                            Ok(None)
-                        }
-                        Err(e) => {
-                            // Security: Don't leak detailed error messages to parent span
-                            tracing::error!(target: "task_history", parent: &parent_span, "AI model error for row {}", row_index);
-                            tracing::debug!(target: "task_history", parent: &parent_span, "AI model error details: {}", e);
-                            Err(DataFusionError::External(e))
+                        match Self::call_model(&model, &model_name_str, &message, row_index).await {
+                            Ok(Some(result)) => {
+                                tracing::info!(target: "task_history", captured_output = %result, row = %row_index);
+                                Ok(Some(result))
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    "AI model returned empty response for row {}",
+                                    row_index
+                                );
+                                Ok(None)
+                            }
+                            Err(e) => {
+                                tracing::error!(target: "task_history", "AI model error for row {}", row_index);
+                                tracing::debug!(target: "task_history", "AI model error details: {}", e);
+                                Err(DataFusionError::External(e))
+                            }
                         }
                     }
-                })
+                    .instrument(parent_span.clone()),
+                )
             } else {
                 // Performance: Don't spawn task for null values, return immediately
-                tokio::spawn(async move { Ok::<Option<String>, DataFusionError>(None) })
+                // Still instrument to maintain consistent span context
+                tokio::spawn(
+                    async move { Ok::<Option<String>, DataFusionError>(None) }
+                        .instrument(parent_span.clone()),
+                )
             };
 
             tasks.push(task);
@@ -2076,5 +2118,110 @@ mod tests {
         assert_eq!(string_array.value(2), "Response from test-model: Message 3");
         assert!(string_array.is_null(3));
         assert_eq!(string_array.value(4), "Response from test-model: Message 5");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_emission() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Capture tracing events to verify metrics are emitted
+        #[derive(Clone)]
+        struct MetricsCollector {
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl MetricsCollector {
+            fn new() -> Self {
+                Self {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn get_events(&self) -> Vec<String> {
+                self.events.lock().unwrap().clone()
+            }
+        }
+
+        impl<S> tracing_subscriber::layer::Layer<S> for MetricsCollector
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let metadata = event.metadata();
+                if metadata.target() == "datafusion::physical_plan::metrics" {
+                    let mut visitor = MetricsVisitor { fields: Vec::new() };
+                    event.record(&mut visitor);
+                    let event_str = format!("{}: {:?}", metadata.target(), visitor.fields);
+                    self.events.lock().unwrap().push(event_str);
+                }
+            }
+        }
+
+        struct MetricsVisitor {
+            fields: Vec<(String, String)>,
+        }
+
+        impl tracing::field::Visit for MetricsVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .push((field.name().to_string(), format!("{:?}", value)));
+            }
+        }
+
+        // Set up tracing with our collector
+        let collector = MetricsCollector::new();
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Run the AI UDF
+        let model_store = create_test_model_store();
+        let udf = Ai::new(model_store);
+
+        let message_scalar =
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("Test metrics".to_string())));
+        let model_scalar = ColumnarValue::Scalar(ScalarValue::Utf8(Some("test-model".to_string())));
+
+        let args = ScalarFunctionArgs {
+            args: vec![message_scalar, model_scalar],
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+        };
+
+        let _result = udf
+            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .await
+            .expect("UDF should execute successfully");
+
+        // Verify metrics were emitted
+        let events = collector.get_events();
+
+        // Should have at least 2 events: one for the overall UDF execution and one for the model call
+        assert!(
+            events.len() >= 2,
+            "Expected at least 2 metric events, got {}. Events: {:?}",
+            events.len(),
+            events
+        );
+
+        // Check that the events contain expected metric fields
+        let events_str = events.join("\n");
+        assert!(
+            events_str.contains("elapsed"),
+            "Expected metrics to contain 'elapsed' field. Events: {}",
+            events_str
+        );
+        assert!(
+            events_str.contains("rows_produced") || events_str.contains("row"),
+            "Expected metrics to contain row information. Events: {}",
+            events_str
+        );
     }
 }
