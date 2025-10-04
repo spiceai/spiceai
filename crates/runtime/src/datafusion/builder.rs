@@ -20,8 +20,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
+use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -39,7 +39,7 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::sql::federation_analyzer_rule;
+use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -166,9 +166,14 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(self.config)
             .with_default_features()
-            .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
+            .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
+                vec![
+                    Arc::new(FederatedPlanner::new()),
+                    Arc::new(SpiceExtensionPlanner::new()),
+                ],
+            )))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
-            .with_analyzer_rules(get_analyzer_rules())
+            .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -244,18 +249,58 @@ impl DataFusionBuilder {
     }
 }
 
-/// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
-/// as opposed to when underlying federated query engines will execute the query.
-///
-/// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added.
-#[must_use]
-pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
-    vec![
-        Arc::new(federation_analyzer_rule()),
+pub struct AnalyzerRulesBuilder {
+    include_federation: bool,
+    extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+}
+
+impl AnalyzerRulesBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn include_federation(mut self, include: bool) -> Self {
+        self.include_federation = include;
+        self
+    }
+
+    #[must_use]
+    pub fn with_extra_rules(
+        mut self,
+        extra_rules: impl IntoIterator<Item = Arc<dyn AnalyzerRule + Send + Sync>>,
+    ) -> Self {
+        self.extra_rules.extend(extra_rules);
+        self
+    }
+
+    /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
+    /// as opposed to when underlying federated query engines will execute the query.
+    ///
+    /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added first.
+    #[must_use]
+    pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+        let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
+        if self.include_federation {
+            rules.push(Arc::new(federation_analyzer_rule()));
+        }
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
-        Arc::new(ResolveGroupingFunction::new()),
-        Arc::new(TypeCoercion::new()),
-    ]
+        rules.extend([
+            Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+            Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+        ]);
+        rules.into_iter().chain(self.extra_rules).collect()
+    }
+}
+
+impl Default for AnalyzerRulesBuilder {
+    fn default() -> Self {
+        Self {
+            include_federation: true,
+            extra_rules: vec![],
+        }
+    }
 }
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
@@ -318,7 +363,7 @@ mod tests {
 
     /// Verifies that the default analyzer rules are in the expected order.
     ///
-    /// If this test fails, `DataFusion` has modified the default analyzer rules and `get_analyzer_rules()` should be updated.
+    /// If this test fails, `DataFusion` has modified the default analyzer rules and `AnalyzerRulesBuilder::build()` should be updated.
     #[test]
     fn test_verify_default_analyzer_rules() {
         let default_rules = Analyzer::new().rules;

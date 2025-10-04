@@ -13,8 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::{
+    Runtime,
+    tools::{SpiceModelTool, utils::parameters},
+};
 use app::App;
 use arrow_schema::{Field, Schema};
+use arrow_tools::format::table_schemas_to_markdown_table;
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -30,14 +35,10 @@ use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spicepod::semantic::Column;
-use std::{borrow::Cow, sync::Arc};
-
-use crate::{
-    Runtime,
-    tools::{SpiceModelTool, utils::parameters},
-};
 use snafu::ResultExt;
+use spicepod::semantic::Column;
+use std::collections::HashMap;
+use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 /// A tool to retrieve the schema of one or more available SQL tables.
@@ -102,76 +103,73 @@ impl TableSchemaTool {
                 .iter()
                 .map(|t| {
                     let tbl = TableReference::parse_str(t);
-                    let cols = Self::column_information_for_table(&tbl, &Arc::clone(&app));
+                    let cols = Self::table_column_information_for_table(&tbl, &Arc::clone(&app));
                     (tbl.clone(), cols)
                 })
                 .collect_vec(),
             _ => vec![],
         };
 
-        let result: Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> = async {
-            let mut table_schemas: Vec<Value> = Vec::with_capacity(tables.len());
-            for (i, t) in tables.iter().enumerate() {
-                let base_schema = self
-                    .rt
-                    .datafusion()
-                    .get_arrow_schema(t)
-                    .instrument(span.clone())
-                    .await
-                    .boxed()?;
+        let result: Result<Vec<(String, Schema)>, Box<dyn std::error::Error + Send + Sync>> =
+            async {
+                let mut table_schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
 
-                let schema = match output {
-                    OutputType::Minimal => base_schema,
-                    OutputType::Full => {
-                        let Schema {
-                            mut fields,
-                            metadata,
-                        } = base_schema;
+                for (i, t) in tables.iter().enumerate() {
+                    let base_schema = self
+                        .rt
+                        .datafusion()
+                        .get_arrow_schema(t)
+                        .instrument(span.clone())
+                        .await
+                        .boxed()?;
 
-                        if let Some((_tbl, Some(columns))) = column_info.get(i) {
-                            fields = fields
-                                .into_iter()
-                                .map(|f| {
-                                    let col = columns.iter().find(|c| c.name == *f.name());
-                                    match col {
-                                        Some(c) => Arc::new(
-                                            Field::new(
-                                                f.name(),
-                                                f.data_type().clone(),
-                                                f.is_nullable(),
-                                            )
-                                            .with_metadata(c.metadata().clone()),
-                                        ),
-                                        None => Arc::clone(f),
-                                    }
-                                })
-                                .collect();
+                    let schema = match output {
+                        OutputType::Minimal => base_schema,
+                        OutputType::Full => {
+                            let Schema {
+                                mut fields,
+                                mut metadata,
+                            } = base_schema;
+
+                            if let Some((_tbl, Some((table_info, columns)))) = column_info.get(i) {
+                                fields = fields
+                                    .into_iter()
+                                    .map(|f| {
+                                        let col = columns.iter().find(|c| c.name == *f.name());
+                                        match col {
+                                            Some(c) => Arc::new(
+                                                Field::new(
+                                                    f.name(),
+                                                    f.data_type().clone(),
+                                                    f.is_nullable(),
+                                                )
+                                                .with_metadata(c.metadata().clone()),
+                                            ),
+                                            None => Arc::clone(f),
+                                        }
+                                    })
+                                    .collect();
+
+                                metadata.extend(table_info.clone());
+                            }
+
+                            Schema::new_with_metadata(fields, metadata)
                         }
+                    };
 
-                        Schema::new_with_metadata(fields, metadata)
-                    }
-                };
+                    table_schemas.push((t.to_string(), schema));
+                }
 
-                let schema_value = serde_json::value::to_value(schema).boxed()?;
-
-                let table_schema = serde_json::json!({
-                    "table": t,
-                    "schema": schema_value
-                });
-
-                table_schemas.push(table_schema);
+                Ok(table_schemas)
             }
-
-            Ok(table_schemas)
-        }
-        .instrument(span.clone())
-        .await;
+            .instrument(span.clone())
+            .await;
 
         match result {
             Ok(table_schemas) => {
-                let captured_output_json = serde_json::to_string(&table_schemas).boxed()?;
-                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
-                Ok(Value::Array(table_schemas))
+                let schemas_as_string = table_schemas_to_markdown_table(table_schemas);
+                tracing::info!(target: "task_history", parent: &span, captured_output = %schemas_as_string);
+                Ok(Value::String(schemas_as_string))
             }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -181,20 +179,23 @@ impl TableSchemaTool {
     }
 
     /// Retrieve column information for the given table.
-    fn column_information_for_table(tbl: &TableReference, app: &Arc<App>) -> Option<Vec<Column>> {
+    fn table_column_information_for_table(
+        tbl: &TableReference,
+        app: &Arc<App>,
+    ) -> Option<(HashMap<String, String>, Vec<Column>)> {
         if let Some(ds) = app
             .datasets
             .iter()
             .find(|d| tbl.resolved_eq(&TableReference::parse_str(&d.name)))
         {
-            return Some(ds.columns.clone());
+            return Some((ds.metadata(), ds.columns.clone()));
         }
         if let Some(view) = app
             .views
             .iter()
             .find(|v| tbl.resolved_eq(&TableReference::parse_str(&v.name)))
         {
-            return Some(view.columns.clone());
+            return Some((view.metadata(), view.columns.clone()));
         }
         None
     }

@@ -19,14 +19,21 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use data_components::s3_vectors::query_provider::ComputeQueryVector;
 use data_components::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
-    list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
+    list_provider::S3VectorsListTable, partition::PartitionedIndexName,
+    query_provider::ComputeQueryVector, query_provider::S3VectorsQueryTable,
 };
+use datafusion::common::DFSchema;
+use datafusion::physical_expr::create_physical_expr;
+use datafusion_expr::execution_props::ExecutionProps;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
+use runtime_table_partition::insert::partition_batch;
+use search::SEARCH_SCORE_COLUMN_NAME;
+use search::index::{SearchIndex, VectorIndex};
+use search::metadata::{MetadataColumn, MetadataColumns};
 use snafu::ResultExt;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
@@ -65,10 +72,16 @@ pub struct S3Vector {
     pub metadata_columns: MetadataColumns,
 
     pub compute_query: Arc<dyn Embed>,
+
+    pub partition_by: Vec<Expr>,
 }
 
 impl S3Vector {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::too_many_arguments
+    )]
     #[must_use]
     pub fn new(
         table: S3VectorsTable,
@@ -76,6 +89,7 @@ impl S3Vector {
         primary_key: Vec<Field>,
         metadata_columns: MetadataColumns,
         compute_query: Arc<dyn Embed>,
+        partition_by: Vec<Expr>,
     ) -> Self {
         Self {
             table,
@@ -83,6 +97,7 @@ impl S3Vector {
             primary_key,
             metadata_columns,
             compute_query,
+            partition_by,
         }
     }
 
@@ -124,7 +139,68 @@ impl SearchIndex for S3Vector {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        write::write(self, record).await.boxed()
+        match self.partition_by.first() {
+            Some(partition_by) => {
+                let input_dfschema = DFSchema::try_from(record.schema())?;
+                let execution_props = ExecutionProps::new();
+                let physical_expr =
+                    create_physical_expr(partition_by, &input_dfschema, &execution_props)?;
+                let partitions = partition_batch(&record, physical_expr.as_ref())?;
+
+                for (partition_value, partition_record) in partitions.into_values() {
+                    // change the index name to a partition name
+                    let id = match &self.table.idx {
+                        S3VectorIdentifier::IndexArn(_) => {
+                            tracing::warn!(
+                                "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
+                            );
+                            return write::write(self, &self.table, record).await.boxed();
+                        }
+                        S3VectorIdentifier::Index {
+                            bucket_name,
+                            index_name,
+                        } => {
+                            let partitioned_index_name = PartitionedIndexName::new(
+                                index_name,
+                                &self.embedded_column,
+                                &self.partition_by,
+                                &partition_value,
+                            )?;
+                            let index_name = partitioned_index_name.to_index_name();
+                            tracing::trace!(
+                                "writing {} records to index: {index_name}",
+                                partition_record.num_rows(),
+                            );
+                            S3VectorIdentifier::Index {
+                                bucket_name: bucket_name.clone(),
+                                index_name,
+                            }
+                        }
+                    };
+
+                    let table = S3VectorsTable::try_create_new_table(
+                        id,
+                        Arc::clone(&self.table.client),
+                        self.table.dimension,
+                        self.table.columns.clone(),
+                        Some(self.table.distance_metric.clone()),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "S3 vector index could not be read or created".to_string(),
+                        )
+                    })?;
+
+                    write::write(self, &table, partition_record).await.boxed()?;
+                }
+            }
+            None => {
+                return write::write(self, &self.table, record).await.boxed();
+            }
+        }
+
+        Ok(record)
     }
 
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
@@ -157,6 +233,8 @@ impl SearchIndex for S3Vector {
                 Arc::new(EmbedQuery(Arc::clone(&self.compute_query)))
                     as Arc<dyn ComputeQueryVector>,
                 query.to_string(),
+                self.embedded_column.clone(),
+                self.partition_by.clone(),
             )),
             projection,
         )
@@ -193,7 +271,11 @@ impl VectorIndex for S3Vector {
         )));
 
         table_with_projection(
-            Arc::new(S3VectorsListTable::from(self.table.clone())),
+            Arc::new(S3VectorsListTable::new(
+                self.table.clone(),
+                self.search_column(),
+                self.partition_by.clone(),
+            )),
             projection,
         )
     }

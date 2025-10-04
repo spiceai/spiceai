@@ -4,12 +4,12 @@
 *.dll
 *.so
 *.dylib
-cmd/spice/spice
-cmd/spice/.spice
-cmd/spice/data
-cmd/spiced/spiced
-cmd/spiced/.spice
-cmd/spiced/data
+bin/spice/spice
+bin/spice/.spice
+bin/spice/data
+bin/spiced/spiced
+bin/spiced/.spice
+bin/spiced/data
 spicepods
 Makefile.local
 

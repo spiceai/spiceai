@@ -32,6 +32,7 @@ chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
+datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
@@ -64,6 +65,7 @@ oracle = { version = "0.6", optional = true }
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex = "1.11.3"
 reqwest.workspace = true
+runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
