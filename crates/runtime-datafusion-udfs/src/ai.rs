@@ -230,6 +230,7 @@ impl AsyncScalarUDFImpl for Ai {
             .await?;
 
         // Record overall UDF metrics for EXPLAIN ANALYZE
+        #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = udf_start.elapsed().as_millis() as u64;
         tracing::Span::current().record("total_execution_time_ms", elapsed_ms);
         tracing::Span::current().record("output_rows", args.number_rows);
@@ -304,7 +305,9 @@ impl Ai {
                     if let Some(ref content) = choice.delta.content {
                         // Record time to first token
                         if !first_token_received && !content.is_empty() {
-                            time_to_first_token_ms = Some(ai_start.elapsed().as_millis() as u64);
+                            #[allow(clippy::cast_possible_truncation)]
+                            let ttft = ai_start.elapsed().as_millis() as u64;
+                            time_to_first_token_ms = Some(ttft);
                             first_token_received = true;
                         }
 
@@ -321,6 +324,7 @@ impl Ai {
                 }
             }
 
+            #[allow(clippy::cast_possible_truncation)]
             let elapsed_ai_completion_ms = ai_start.elapsed().as_millis() as u64;
 
             // Track time spent in compute (processing the response)
@@ -332,6 +336,7 @@ impl Ai {
                 Some(complete_response)
             };
 
+            #[allow(clippy::cast_possible_truncation)]
             let elapsed_compute_ms = compute_start.elapsed().as_micros() as u64; // Use micros since compute is typically very fast
 
             // Record metrics in the current span

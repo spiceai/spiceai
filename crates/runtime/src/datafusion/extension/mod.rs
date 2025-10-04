@@ -24,9 +24,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
-use datafusion_federation::FederatedPlanner;
 use partition_ai_by_provider::{AiSourcePartitionExec, AiSourcePartitionNode};
-use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use std::sync::Arc;
 
 pub mod bytes_processed;
@@ -113,19 +111,57 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
         if let Some(ai_partition_node) = node.as_any().downcast_ref::<AiSourcePartitionNode>() {
             assert_eq!(logical_inputs.len(), 1, "should have 1 input");
             assert_eq!(physical_inputs.len(), 1, "should have 1 input");
-            let physical_input = &physical_inputs[0];
 
-            // Convert DFSchema to Arrow Schema for physical plan
-            let arrow_schema = ArrowSchema::from(ai_partition_node.schema.as_ref());
+            // The AiSourcePartitionNode contains the expressions but doesn't execute them.
+            // We need to create a projection that actually evaluates the AI UDFs.
+            // For now, create a logical projection and let DataFusion convert it to physical.
 
-            let exec_plan = Arc::new(AiSourcePartitionExec::new(
-                Arc::clone(physical_input),
-                ai_partition_node.source_groups.clone(),
-                ai_partition_node.passthrough_exprs.clone(),
-                Arc::new(arrow_schema),
-                ai_partition_node.field_order.clone(),
-            ));
-            return Ok(Some(exec_plan));
+            // Build the projection expressions in the correct order
+            use datafusion::logical_expr::Projection;
+            let mut proj_exprs = Vec::new();
+
+            // Add all expressions in the order specified by field_order
+            for field_name in &ai_partition_node.field_order {
+                // Find the expression with this alias
+                let mut found = false;
+
+                // Check AI expressions
+                for group in &ai_partition_node.source_groups {
+                    for (expr, _model_name, alias) in &group.ai_exprs {
+                        if alias == field_name {
+                            proj_exprs.push(expr.clone().alias(field_name.clone()));
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+
+                // Check passthrough expressions
+                if !found {
+                    for (expr, alias) in &ai_partition_node.passthrough_exprs {
+                        if alias == field_name {
+                            proj_exprs.push(expr.clone().alias(field_name.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Create a logical projection
+            let logical_projection = LogicalPlan::Projection(Projection::try_new(
+                proj_exprs,
+                Arc::clone(&ai_partition_node.input),
+            )?);
+
+            // Plan the projection to physical
+            let physical_projection = _planner
+                .create_physical_plan(&logical_projection, _session_state)
+                .await?;
+
+            return Ok(Some(physical_projection));
         }
 
         Ok(None)

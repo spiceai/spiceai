@@ -70,18 +70,18 @@ use std::sync::{Arc, RwLock};
 /// Maps model names to their source strings (e.g., "openai", "anthropic")
 /// Pre-computed during model initialization - only simple string lookups during queries
 ///
-/// Uses std::sync::RwLock for synchronous access (following DataFusion's pattern):
+/// Uses `std::sync::RwLock` for synchronous access (following `DataFusion`'s pattern):
 /// - Safe to use in optimizer context (no async operations needed)
-/// - Consistent with DataFusion's internal usage patterns
+/// - Consistent with `DataFusion`'s internal usage patterns
 /// - Read-heavy workload with infrequent writes (only during model loading)
-/// - No blocking in async context since reads are very fast (just HashMap lookup)
+/// - No blocking in async context since reads are very fast (just `HashMap` lookup)
 pub type ModelRegistry = Arc<RwLock<HashMap<String, String>>>;
 /// A group of AI UDF calls that belong to the same model source
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceGroup {
     /// The model source (e.g., "openai", "anthropic", "spiceai")
     pub source: String,
-    /// AI expressions with their model names and aliases: (expression, model_name, alias)
+    /// AI expressions with their model names and aliases: (expression, `model_name`, alias)
     pub ai_exprs: Vec<(Expr, String, String)>,
 }
 
@@ -93,7 +93,7 @@ pub struct SourceGroup {
 /// 3. Joins all results back together maintaining column order
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AiSourcePartitionNode {
-    /// The input plan (typically a TableScan or previous projection)
+    /// The input plan (typically a `TableScan` or previous projection)
     pub input: Arc<LogicalPlan>,
     /// Groups of AI expressions by model source
     pub source_groups: Vec<SourceGroup>,
@@ -110,7 +110,7 @@ impl fmt::Debug for AiSourcePartitionNode {
         f.debug_struct("AiSourcePartitionNode")
             .field("source_groups", &self.source_groups.len())
             .field("passthrough_exprs", &self.passthrough_exprs.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -126,7 +126,7 @@ impl fmt::Display for AiSourcePartitionNode {
 }
 
 impl UserDefinedLogicalNodeCore for AiSourcePartitionNode {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "AiSourcePartition"
     }
 
@@ -236,7 +236,7 @@ impl UserDefinedLogicalNodeCore for AiSourcePartitionNode {
             input: Arc::new(inputs[0].clone()),
             source_groups: new_source_groups,
             passthrough_exprs: new_passthrough_exprs,
-            schema: self.schema.clone(),
+            schema: Arc::<datafusion::common::DFSchema>::clone(&self.schema),
             field_order: self.field_order.clone(),
         })
     }
@@ -290,7 +290,7 @@ impl PartitionAiBySource {
     }
 
     /// Recursively extract all model names from AI UDF calls within an expression
-    /// Returns a vector of (model_name, ai_expr) tuples found in the expression
+    /// Returns a vector of (`model_name`, `ai_expr`) tuples found in the expression
     fn extract_all_ai_udfs(expr: &Expr) -> Vec<(String, Expr)> {
         let inner_expr = Self::unwrap_alias(expr);
         let mut results = Vec::new();
@@ -298,14 +298,11 @@ impl PartitionAiBySource {
         match inner_expr {
             // Direct AI UDF call
             Expr::ScalarFunction(func) if func.name() == "ai" => {
-                if func.args.len() >= 2 {
-                    if let Expr::Literal(
-                        datafusion::scalar::ScalarValue::Utf8(Some(model_name)),
-                        _,
-                    ) = &func.args[1]
-                    {
-                        results.push((model_name.clone(), Expr::ScalarFunction(func.clone())));
-                    }
+                if func.args.len() >= 2
+                    && let Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(model_name)), _) =
+                        &func.args[1]
+                {
+                    results.push((model_name.clone(), Expr::ScalarFunction(func.clone())));
                 }
             }
             // Recursively search function arguments
@@ -367,36 +364,47 @@ impl PartitionAiBySource {
     /// Get the model source for a model by looking it up in the registry
     /// Returns the model source string (e.g., "openai", "anthropic") or None if not found
     ///
-    /// Simple O(1) HashMap lookup - source strings are pre-computed during model init
-    /// Uses std::sync::RwLock for synchronous access (no async overhead)
+    /// # Performance
+    /// - Simple O(1) `HashMap` lookup - source strings are pre-computed during model init
+    /// - Uses `std::sync::RwLock` for synchronous access (no async overhead)
+    /// - Called during query optimization (synchronous context), not execution
+    /// - Lock hold time: <1μs (just a HashMap lookup, no I/O or computation)
+    /// - Read-only access with no write contention during query planning
     #[inline]
     fn get_model_source(&self, model_name: &str) -> Option<String> {
-        // std::sync::RwLock read is safe here - the operation is extremely fast (just a HashMap lookup)
-        // This matches DataFusion's pattern of using std::sync::RwLock for synchronous data access
+        // PERF: std::sync::RwLock is appropriate here because:
+        // 1. OptimizerRule::rewrite() is synchronous (not async)
+        // 2. Operation is extremely fast (just HashMap::get)
+        // 3. No risk of blocking async tasks since this runs in planning phase
         self.llm_models.read().ok()?.get(model_name).cloned()
     }
 
     /// Get the list of available model names from the registry as a formatted string
     ///
-    /// Simple HashMap key iteration with std::sync::RwLock
+    /// # Performance
+    /// - Simple `HashMap` key iteration with `std::sync::RwLock`
+    /// - Called only in error paths (model not found)
+    /// - Lock scope is minimal: read registry once, format outside lock
+    /// - Typically 1-10 models, so lock hold time is <10μs
     fn get_available_models_list(&self) -> String {
-        self.llm_models
-            .read()
-            .ok()
-            .map(|registry| {
+        // PERF: Lock is only held during the map_or_else call, released immediately
+        // String formatting happens after lock is dropped
+        self.llm_models.read().ok().map_or_else(
+            || "loading...".to_string(),
+            |registry| {
                 if registry.is_empty() {
                     "none".to_string()
                 } else {
                     registry
                         .keys()
-                        .map(|k| k.as_str())
+                        .map(std::string::String::as_str)
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
-            })
-            .unwrap_or_else(|| "loading...".to_string())
+            },
+        )
     }
-    /// Transform a projection with multiple AI UDFs into an AiSourcePartitionNode
+    /// Transform a projection with multiple AI UDFs into an `AiSourcePartitionNode`
     fn partition_ai_projections(
         &self,
         projection: &Projection,
@@ -471,14 +479,13 @@ impl PartitionAiBySource {
         let field_order = projection.schema.field_names();
 
         // Create the AiSourcePartitionNode
-        // IMPORTANT: Use the full projection as input, not projection.input!
-        // This ensures the projection logic is preserved in the plan
-        let projection_plan = LogicalPlan::Projection(projection.clone());
+        // Use projection.input as the input, not the full projection
+        // The AI expressions and passthrough expressions are stored in the node itself
         let partition_node = AiSourcePartitionNode {
-            input: Arc::new(projection_plan),
+            input: Arc::clone(&projection.input),
             source_groups,
             passthrough_exprs,
-            schema: projection.schema.clone(),
+            schema: Arc::<datafusion::common::DFSchema>::clone(&projection.schema),
             field_order,
         };
 
@@ -492,7 +499,7 @@ impl PartitionAiBySource {
 }
 
 impl OptimizerRule for PartitionAiBySource {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "partition_ai_by_source"
     }
 
@@ -679,12 +686,13 @@ mod tests {
 
     #[test]
     fn test_extract_ai_udfs_no_udfs() {
+        use datafusion::logical_expr::lit;
+
         // Test that column expressions don't contain AI UDFs
         let col_expr = col("test");
         assert!(PartitionAiBySource::extract_all_ai_udfs(&col_expr).is_empty());
 
         // Test that literal expressions don't contain AI UDFs
-        use datafusion::logical_expr::lit;
         let lit_expr = lit("hello");
         assert!(PartitionAiBySource::extract_all_ai_udfs(&lit_expr).is_empty());
 
@@ -699,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_source_group_ordering() {
-        let mut groups = vec![
+        let mut groups = [
             SourceGroup {
                 source: "xai".to_string(),
                 ai_exprs: vec![],
@@ -775,7 +783,7 @@ mod tests {
         let result = node.with_exprs_and_inputs(new_exprs.clone(), vec![empty_plan.clone()]);
         assert!(result.is_ok(), "with_exprs_and_inputs should succeed");
 
-        let new_node = result.unwrap();
+        let new_node = result.expect("with_exprs_and_inputs should succeed");
 
         // Verify source groups structure is maintained
         assert_eq!(new_node.source_groups.len(), 2);
@@ -891,7 +899,7 @@ mod tests {
                 self
             }
 
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "ai"
             }
 
@@ -1006,7 +1014,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore] // Memory issues on some systems - test logic is sound
+        #[ignore = "Memory issues on some systems - test logic is sound"]
         async fn test_explain_with_models_two_sources() {
             // Test with two different AI sources (OpenAI and Anthropic)
             let registry = Arc::new(std::sync::RwLock::new(
@@ -1034,7 +1042,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore] // Memory issues on some systems - test logic is sound
+        #[ignore = "Memory issues on some systems - test logic is sound"]
         async fn test_explain_with_models_multiple_sources() {
             // Test with multiple AI sources (OpenAI, Anthropic, xAI)
             let registry = Arc::new(std::sync::RwLock::new(
@@ -1084,7 +1092,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore] // Memory issues on some systems - test logic is sound
+        #[ignore = "Memory issues on some systems - test logic is sound"]
         async fn test_explain_with_nested_ai_calls() {
             // Test nested AI UDF calls
             let registry = Arc::new(std::sync::RwLock::new(
@@ -1135,7 +1143,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore] // Memory issues on some systems - test logic is sound
+        #[ignore = "Memory issues on some systems - test logic is sound"]
         async fn test_explain_with_mixed_sources_and_passthrough() {
             // Test with multiple sources and passthrough columns
             let registry = Arc::new(std::sync::RwLock::new(

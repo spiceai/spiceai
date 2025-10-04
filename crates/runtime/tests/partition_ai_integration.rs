@@ -16,12 +16,10 @@ limitations under the License.
 
 //! Integration tests for AI UDF partitioning by provider
 
-use datafusion::assert_batches_eq;
 use datafusion::prelude::*;
-use runtime_datafusion_udfs::Ai;
+use runtime_datafusion_udfs::ai::Ai;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[tokio::test]
 async fn test_partition_ai_by_provider_explain() {
@@ -29,13 +27,15 @@ async fn test_partition_ai_by_provider_explain() {
     let ctx = SessionContext::new();
 
     // Register a simple AI UDF
-    let model_store = Arc::new(RwLock::new(HashMap::new()));
+    let model_store = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let ai_udf = Ai::new(Arc::clone(&model_store)).into_async_udf();
     ctx.register_udf(ai_udf);
 
     // Register the partition optimizer rule
     ctx.add_optimizer_rule(Arc::new(
-        runtime::datafusion::extension::partition_ai_by_provider::PartitionAiByProvider::new(),
+        runtime::datafusion::extension::partition_ai_by_provider::PartitionAiBySource::new(
+            model_store,
+        ),
     ));
 
     // Create a simple table
@@ -74,13 +74,15 @@ async fn test_single_provider_no_partition() {
     let ctx = SessionContext::new();
 
     // Register AI UDF
-    let model_store = Arc::new(RwLock::new(HashMap::new()));
+    let model_store = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let ai_udf = Ai::new(Arc::clone(&model_store)).into_async_udf();
     ctx.register_udf(ai_udf);
 
     // Register the partition optimizer rule
     ctx.add_optimizer_rule(Arc::new(
-        runtime::datafusion::extension::partition_ai_by_provider::PartitionAiByProvider::new(),
+        runtime::datafusion::extension::partition_ai_by_provider::PartitionAiBySource::new(
+            model_store,
+        ),
     ));
 
     // Create a simple table

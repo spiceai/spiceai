@@ -183,7 +183,7 @@ impl RuntimeBuilder {
         // Maps model names to source strings (e.g., "gpt-4o" -> "openai")
         // Pre-computed during model initialization for fast O(1) query-time lookups
         // Uses std::sync::RwLock following DataFusion's pattern for synchronous data
-        let model_registry = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let model_registry = Arc::new(std::sync::RwLock::new(HashMap::<String, String>::new()));
 
         #[allow(unused_mut)]
         let mut df_builder = DataFusion::builder(

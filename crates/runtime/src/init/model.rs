@@ -89,6 +89,27 @@ impl Runtime {
 
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
 
+        // Prepare parameters with secrets
+        let params = self.prepare_model_params(m).await;
+
+        // Validate local files if needed
+        if matches!(source, Some(ModelSource::File)) && verify_local_files_exist(m).is_err() {
+            self.handle_model_load_error(&model.name, "Local file verification failed");
+            return;
+        }
+
+        // Load the model based on its type
+        let result = self.load_model_by_type(m, params).await;
+
+        // Handle success or failure
+        self.finalize_model_load(&model, &source_str, result).await;
+    }
+
+    /// Prepare model parameters by resolving secrets
+    async fn prepare_model_params(
+        &self,
+        m: &SpicepodModel,
+    ) -> HashMap<String, secrecy::SecretString> {
         // TODO: Have downstream code using model parameters to accept `Hashmap<String, Value>`.
         // This will require handling secrets with `Value` type.
         let p = m
@@ -103,85 +124,119 @@ impl Runtime {
                 }
             })
             .collect::<HashMap<_, _>>();
-        let params = get_params_with_secrets(self.secrets(), &p).await;
+        get_params_with_secrets(self.secrets(), &p).await
+    }
 
-        if matches!(source, Some(ModelSource::File)) {
-            // Verify all referenced local files exist before attempting to load the model and determine its type.
-            // Otherwise, we will fail to determine the model type and the error will be confusing.
-            if let Err(err) = verify_local_files_exist(m) {
-                metrics::models::LOAD_ERROR.add(1, &[]);
-                self.status
-                    .update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!("{err}");
-                return;
-            }
-        }
-
+    /// Load a model based on its type (LLM or ML)
+    async fn load_model_by_type(
+        &self,
+        m: &SpicepodModel,
+        params: HashMap<String, secrecy::SecretString>,
+    ) -> Result<(), Error> {
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
-        let result: Result<(), Error> = match model_type {
-            Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
-                Ok((completions_model, Some(responses_model))) => {
-                    let mut llm_map = self.completion_llms.write().await;
-                    llm_map.insert(m.name.clone(), completions_model);
-                    drop(llm_map);
-                    let mut responses_llm_map = self.responses_llms.write().await;
-                    responses_llm_map.insert(m.name.clone(), responses_model);
-                    drop(responses_llm_map);
 
-                    // Populate the model registry for AI UDF partitioning
-                    // Pre-compute the source string once during model loading
-                    #[cfg(feature = "models")]
-                    if let Some(source) = m.get_source() {
-                        if let Ok(mut registry) = self.model_registry.write() {
-                            registry.insert(m.name.clone(), source.to_string());
-                        }
-                    }
-                    Ok(())
-                }
-                Ok((model, None)) => {
-                    let mut llm_map = self.completion_llms.write().await;
-                    llm_map.insert(m.name.clone(), model);
-                    drop(llm_map);
-
-                    // Populate the model registry for AI UDF partitioning
-                    // Pre-compute the source string once during model loading
-                    #[cfg(feature = "models")]
-                    if let Some(source) = m.get_source() {
-                        if let Ok(mut registry) = self.model_registry.write() {
-                            registry.insert(m.name.clone(), source.to_string());
-                        }
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(Error::FailedToLoadLLM {
-                    name: m.name.clone(),
-                    source: Box::new(e),
-                }),
-            },
-            Some(ModelType::Ml) => match Model::load(m.clone(), params).await {
-                Ok(in_m) => {
-                    let mut model_map = self.models.write().await;
-                    model_map.insert(m.name.clone(), in_m);
-                    Ok(())
-                }
-                Err(e) => Err(Error::FailedToLoadRunnableModel {
-                    name: m.name.clone(),
-                    source: Box::new(e),
-                }),
-            },
+        match model_type {
+            Some(ModelType::Llm) => self.load_and_register_llm(m, params).await,
+            Some(ModelType::Ml) => self.load_and_register_ml(m, params).await,
             None => Err(Error::UnableToDetermineModelType {
                 name: m.name.clone(),
             }),
-        };
+        }
+    }
+
+    /// Load an LLM model and register it in the appropriate maps
+    async fn load_and_register_llm(
+        &self,
+        m: &SpicepodModel,
+        params: HashMap<String, secrecy::SecretString>,
+    ) -> Result<(), Error> {
+        match self.load_llm(m.clone(), params).await {
+            Ok((completions_model, Some(responses_model))) => {
+                self.completion_llms
+                    .write()
+                    .await
+                    .insert(m.name.clone(), completions_model);
+                self.responses_llms
+                    .write()
+                    .await
+                    .insert(m.name.clone(), responses_model);
+                self.register_model_in_registry(m);
+                Ok(())
+            }
+            Ok((model, None)) => {
+                self.completion_llms
+                    .write()
+                    .await
+                    .insert(m.name.clone(), model);
+                self.register_model_in_registry(m);
+                Ok(())
+            }
+            Err(e) => Err(Error::FailedToLoadLLM {
+                name: m.name.clone(),
+                source: Box::new(e),
+            }),
+        }
+    }
+
+    /// Load an ML model and register it
+    async fn load_and_register_ml(
+        &self,
+        m: &SpicepodModel,
+        params: HashMap<String, secrecy::SecretString>,
+    ) -> Result<(), Error> {
+        match Model::load(m.clone(), params).await {
+            Ok(in_m) => {
+                self.models.write().await.insert(m.name.clone(), in_m);
+                Ok(())
+            }
+            Err(e) => Err(Error::FailedToLoadRunnableModel {
+                name: m.name.clone(),
+                source: Box::new(e),
+            }),
+        }
+    }
+
+    /// Register a model in the AI UDF partitioning registry
+    #[cfg(feature = "models")]
+    fn register_model_in_registry(&self, m: &SpicepodModel) {
+        // Populate the model registry for AI UDF partitioning
+        // Pre-compute the source string once during model loading
+        if let Some(source) = m.get_source()
+            && let Ok(mut registry) = self.model_registry.write()
+        {
+            registry.insert(m.name.clone(), source.to_string());
+        }
+    }
+
+    #[cfg(not(feature = "models"))]
+    fn register_model_in_registry(&self, _m: &SpicepodModel) {
+        // No-op when models feature is disabled
+    }
+
+    /// Handle model load error by updating metrics and status
+    fn handle_model_load_error(&self, model_name: &str, message: &str) {
+        metrics::models::LOAD_ERROR.add(1, &[]);
+        self.status
+            .update_model(model_name, status::ComponentStatus::Error);
+        tracing::warn!("{message}");
+    }
+
+    /// Finalize model loading by updating metrics and status based on result
+    async fn finalize_model_load(
+        &self,
+        model: &SpicepodModel,
+        source_str: &str,
+        result: Result<(), Error>,
+    ) {
         match result {
             Ok(()) => {
-                tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
+                tracing::info!("Model [{}] deployed, ready for inferencing", model.name);
                 metrics::models::COUNT.add(
                     1,
                     &[
-                        KeyValue::new("model", m.name.clone()),
-                        KeyValue::new("source", source_str),
+                        KeyValue::new("model", model.name.clone()),
+                        KeyValue::new("source", source_str.to_string()),
                     ],
                 );
                 self.status
