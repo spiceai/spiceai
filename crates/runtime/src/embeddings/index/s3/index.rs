@@ -45,7 +45,6 @@ use snafu::ResultExt;
 use crate::embeddings::index::s3::compute_vector::ComputeQuery;
 use crate::{embedding_col, embeddings::index::s3::write, model::EmbeddingModelStore};
 use datafusion::{
-    catalog::TableProvider,
     common::Column,
     error::DataFusionError,
     logical_expr::{LogicalPlan, Operator, expr::ScalarFunction},
@@ -264,12 +263,11 @@ impl VectorIndex for S3Vector {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         LogicalPlanBuilder::scan(
             "tbl",
-            DefaultTableSource::new(Arc::new(S3VectorsListTable::new(
+            Arc::new(DefaultTableSource::new(Arc::new(S3VectorsListTable::new(
                 self.table.clone(),
                 self.search_column(),
                 self.partition_by.clone(),
-            )))
-            .into(),
+            )))),
             None,
         )?
         .project(

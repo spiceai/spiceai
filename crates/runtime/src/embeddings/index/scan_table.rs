@@ -97,8 +97,8 @@ impl VectorScanTableProvider {
                 .sorted_unstable()
                 .cloned()
                 .map(ident)
-                .collect(),
-        )?
+                .collect::<Vec<Expr>>(),
+        )
     }
 
     fn columns_projected(
@@ -132,12 +132,11 @@ impl VectorScanTableProvider {
             .columns()
             .into_iter()
             .filter(|c| {
-                table_schema
-                    .columns_with_unqualified_name(&c.name)
-                    .is_empty()
+                table_schema.column_with_name(&c.name).is_none()
                     || self.primary_key.contains(&c.name)
             })
-            .map(ident)
+            .map(Expr::Column)
+            .collect()
     }
 }
 
@@ -216,7 +215,7 @@ impl TableProvider for VectorScanTableProvider {
             let lp = Self::apply_proj_and_filter(
                 LogicalPlanBuilder::scan(
                     "base_table",
-                    DefaultTableSource::new(Arc::clone(&self.table_provider)).into(),
+                    Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
                     None,
                 )?,
                 &columns_requested,
@@ -269,13 +268,14 @@ impl TableProvider for VectorScanTableProvider {
                         .any(|col| !self.primary_key.contains(&col.name))
                 })
                 .cloned()
-                .collect(),
+                .reduce(Expr::and),
         )?;
 
-        join.project(
+        let join_schema = Arc::clone(&join.schema());
+        join = join.project(
             // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
             // case, we will remove duplicate primary key columns from the right table.
-            Arc::clone(&join.schema())
+            join_schema
                 .iter()
                 .filter(|(tbl, f)| {
                     !(self.primary_key.contains(f.name())
@@ -297,12 +297,11 @@ impl TableProvider for VectorScanTableProvider {
                     .into_iter()
                     .sorted_unstable()
                     .map(ident)
-                    .collect(),
+                    .collect::<Vec<Expr>>(),
             )?
-            .limit(0, limit)?
-            .build()?;
+            .limit(0, limit)?;
 
-        state.create_physical_plan(&join).await
+        state.create_physical_plan(&join.build()?).await
     }
 }
 

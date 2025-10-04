@@ -179,7 +179,7 @@ impl SearchQueryProvider {
         filters: &[Expr],
     ) -> Result<LogicalPlanBuilder, DataFusionError> {
         let schema = self.schema();
-        let search_index_schema = Arc::clone(&search_index_table.schema());
+        let search_index_schema = Arc::clone(search_index_table.schema());
         let projection_column_names: Vec<String> = match projection {
             None => schema.fields().iter().map(|f| f.name().clone()).collect(),
             Some(proj) => schema
@@ -218,7 +218,7 @@ impl SearchQueryProvider {
                     .cloned()
                     .reduce(Expr::and),
             )?;
-        let join_schema = Arc::clone(&bldr.schema());
+        let join_schema = Arc::clone(bldr.schema());
 
         bldr = bldr.project(
             join_schema
@@ -273,7 +273,7 @@ impl SearchQueryProvider {
         let first = array_element(col(&search_offset), lit(1));
         let second = array_element(col(&search_offset), lit(2));
 
-        let input_with_match: Vec<Expr> = vec![
+        let input_with_match: Vec<Expr> = [
             input
                 .schema()
                 .columns()
@@ -448,14 +448,11 @@ impl TableProvider for SearchQueryProvider {
             .limit(0, self.pre_limit)?;
 
         let just_use_index = self.search_index_table_is_sufficient(
-            &Arc::clone(&self.search_index_query.schema()),
+            &Arc::clone(self.search_index_query.schema()),
             inner_proj.as_ref(),
             filters,
         )?;
-        search_lp = match (
-            just_use_index,
-            filters.into_iter().cloned().reduce(Expr::and),
-        ) {
+        search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
             (true, None) => search_lp,
             (true, Some(filter)) => search_lp.filter(filter)?,
             (false, _) => {

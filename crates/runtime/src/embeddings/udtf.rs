@@ -44,7 +44,9 @@ use datafusion::{
     sql::TableReference,
 };
 
-use datafusion_expr::{LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, ident};
+use datafusion_expr::{
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
+};
 use futures::FutureExt;
 use itertools::Itertools;
 use std::{
@@ -505,10 +507,10 @@ impl TableProvider for VectorSearchUDTFProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         telemetry::track_vector_search(&request_context.to_dimensions());
-        let (col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
+        let (embed_col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
 
         let query_vector = self
-            .vector(&col, &cfg)
+            .vector(&embed_col, &cfg)
             .await
             .map_err(DataFusionError::External)?;
 
@@ -562,7 +564,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     func: cosine_distance_udf,
                     args: vec![
                         lit(ScalarValue::FixedSizeList(Arc::new(query_vector))),
-                        ident(embedding_col!(col)),
+                        ident(embedding_col!(embed_col)),
                     ],
                 }),
             )
@@ -585,9 +587,9 @@ impl TableProvider for VectorSearchUDTFProvider {
             )])?
             .limit(0, Some(self.limit_to_use(limit)))?
             // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
-            .alias("tbl")
+            .alias("tbl")?
             .project(final_expr)?
-            .build();
+            .build()?;
 
         state.create_physical_plan(&final_plan).await
     }
