@@ -220,7 +220,7 @@ impl SearchIndex for S3Vector {
                 s3_vectors_primary_key_cast(&self.primary_fields()),
                 metadata_columns_to_exprs(&self.metadata_columns),
                 vec![
-                    col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col(self.search_column())),
+                    col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col(&self.search_column())),
                     binary_expr(lit(1.0), Operator::Minus, col("distance"))
                         .alias(SEARCH_SCORE_COLUMN_NAME),
                 ],
@@ -263,7 +263,7 @@ impl VectorIndex for S3Vector {
             [
                 s3_vectors_primary_key_cast(&self.primary_fields()),
                 metadata_columns_to_exprs(&self.metadata_columns),
-                vec![col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col(self.search_column()))],
+                vec![col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col(&self.search_column()))],
             ]
             .concat(),
         )?
