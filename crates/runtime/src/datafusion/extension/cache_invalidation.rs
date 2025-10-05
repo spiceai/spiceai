@@ -198,9 +198,8 @@ impl UserDefinedLogicalNodeCore for CacheInvalidationNode {
     /// Return `None`, the default, if this information can not be determined.
     /// Returns `Some(_)` with the column indices for each child of this node that are
     /// needed to compute `output_columns`
-    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        // Default implementation
-        None
+    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+        Some(vec![output_columns.to_vec()])
     }
 
     /// Returns `true` if a limit can be safely pushed down through this
@@ -210,9 +209,7 @@ impl UserDefinedLogicalNodeCore for CacheInvalidationNode {
     /// the output of this node, `DataFusion` will push the limit to the input
     /// of this node.
     fn supports_limit_pushdown(&self) -> bool {
-        // Disallow limit push-down (default implementation).
-        // The node wraps write operations which produce a single output row.
-        false
+        true
     }
 }
 
@@ -266,7 +263,7 @@ fn create_cache_invalidation_exec(
             write!(f, "CacheInvalidationExec: table={table_fmt_fn}")
         }
         DisplayFormatType::TreeRender => {
-            write!(f, "CacheInvalidationExec")
+            write!(f, "table={table_fmt_fn}")
         }
     };
 

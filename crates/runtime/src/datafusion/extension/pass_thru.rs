@@ -102,9 +102,10 @@ where
             fmt_fn(t, f)
         } else {
             match t {
-                DisplayFormatType::Default
-                | DisplayFormatType::Verbose
-                | DisplayFormatType::TreeRender => write!(f, "{}", self.name),
+                DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                    write!(f, "{}", self.name)
+                }
+                DisplayFormatType::TreeRender => Ok(()),
             }
         }
     }
