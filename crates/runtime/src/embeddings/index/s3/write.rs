@@ -23,6 +23,7 @@ use arrow::array::{
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field, Schema};
 use async_openai::types::EmbeddingInput;
+use data_components::s3_vectors::S3VectorsTable;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use search::index::SearchIndex;
@@ -111,7 +112,11 @@ pub enum Error {
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
 #[allow(clippy::too_many_lines)]
-pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch, Error> {
+pub async fn write(
+    index: &S3Vector,
+    table: &S3VectorsTable,
+    record: RecordBatch,
+) -> Result<RecordBatch, Error> {
     let Some((embedded_column_idx, _)) = record
         .schema()
         .column_with_name(index.embedded_column.as_str())
@@ -178,8 +183,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
     let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
 
-    index
-        .table
+    table
         .write_data(filtered_embeddings, filtered_primary_key, filtered_metadata)
         .await
         .context(CannotWriteIndexSnafu {

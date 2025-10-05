@@ -52,14 +52,16 @@ pub use aws_sdk_s3vectors::{
         query_vectors::{QueryVectorsError, QueryVectorsInput, QueryVectorsOutput},
     },
     types::{
-        DataType, DistanceMetric, ListOutputVector, MetadataConfiguration, PutInputVector,
-        QueryOutputVector, VectorData,
+        DataType, DistanceMetric, IndexSummary, ListOutputVector, MetadataConfiguration,
+        PutInputVector, QueryOutputVector, VectorData,
     },
 };
 pub use aws_smithy_types::{Document, Number, error::operation::BuildError};
 
 pub static LIST_VECTORS_MAX_RESULTS: usize = 500;
 pub static PUT_VECTORS_MAX_ITEMS: usize = 500;
+
+pub mod mock;
 
 /// Trait representing the capabilities of the Amazon S3 Vectors API. Amazon S3 Vectors clients implement this trait.
 #[async_trait]

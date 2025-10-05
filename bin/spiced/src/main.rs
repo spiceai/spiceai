@@ -104,6 +104,7 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
             tracing::info!("Starting runtime {version}", version = get_version_string());
         }
     });
+    #[allow(clippy::large_futures)]
     spiced::run(args).await?;
     Ok(())
 }

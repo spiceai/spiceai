@@ -33,6 +33,7 @@ use super::{
 use spicepod::semantic::Column;
 
 /// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
+#[derive(Clone)]
 pub struct View {
     pub name: TableReference,
     pub sql: Arc<str>,
@@ -212,6 +213,10 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
 }
 
 impl AccelerationSource for View {
+    fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+        Arc::new(self.clone()) as Arc<dyn AccelerationSource>
+    }
+
     fn is_file_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
             if acceleration.engine == acceleration::Engine::PostgreSQL {

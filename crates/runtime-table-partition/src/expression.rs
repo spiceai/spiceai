@@ -33,6 +33,7 @@ use datafusion::{
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Failed to determine data type: {source}"))]
     DataTypeError { source: DataFusionError },
@@ -125,7 +126,7 @@ pub trait Criterion: Send + Sync {
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult;
 }
 
-pub struct PartitionCriteria;
+struct PartitionCriteria;
 
 impl PartitionCriteria {
     const CRITERIA: &[&dyn Criterion] = &[

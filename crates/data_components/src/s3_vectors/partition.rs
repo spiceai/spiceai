@@ -83,19 +83,19 @@ impl PartitionedIndexName {
     pub fn new(
         index_name: &str,
         column_name: &str,
-        partition_value: &ScalarValue,
         partition_by: &[Expr],
+        partition_value: &ScalarValue,
     ) -> Result<Self, Error> {
         validate_index(index_name)?;
         let index_name = truncate(&sanitize_column(index_name), INDEX_NAME_MAX_LENGTH);
         let column_name_hash = truncate(&hash_to_hex(column_name), COLUMN_NAME_MAX_LENGTH);
-        let partition_value_hash = truncate(
-            &hash_to_hex(&partition_value.to_string()),
-            PARTITION_VALUE_MAX_LENGTH,
-        );
         let partition_by_hash = truncate(
             &hash_to_hex(&to_stable_string(partition_by)?),
             PARTITION_BY_MAX_LENGTH,
+        );
+        let partition_value_hash = truncate(
+            &hash_to_hex(&partition_value.to_string()),
+            PARTITION_VALUE_MAX_LENGTH,
         );
         Ok(Self {
             index_name,
@@ -105,14 +105,29 @@ impl PartitionedIndexName {
         })
     }
 
+    pub fn common_prefix(
+        index_name: &str,
+        column_name: &str,
+        partition_by: &[Expr],
+    ) -> Result<String, Error> {
+        validate_index(index_name)?;
+        let index_name = truncate(&sanitize_column(index_name), INDEX_NAME_MAX_LENGTH);
+        let column_name_hash = truncate(&hash_to_hex(column_name), COLUMN_NAME_MAX_LENGTH);
+        let partition_by_hash = truncate(
+            &hash_to_hex(&to_stable_string(partition_by)?),
+            PARTITION_BY_MAX_LENGTH,
+        );
+        Ok([index_name, column_name_hash, partition_by_hash].join(PARTS_SEPARATOR))
+    }
+
     /// Format an index name suitable for S3 Vectors
     #[must_use]
     pub fn to_index_name(&self) -> String {
         [
             self.index_name.clone(),
             self.column_name_hash.clone(),
-            self.partition_value_hash.clone(),
             self.partition_by_hash.clone(),
+            self.partition_value_hash.clone(),
         ]
         .join(PARTS_SEPARATOR)
     }
@@ -124,8 +139,8 @@ impl PartitionedIndexName {
         Ok(Self {
             index_name: parts[0].to_string(),
             column_name_hash: parts[1].to_string(),
-            partition_value_hash: parts[2].to_string(),
-            partition_by_hash: parts[3].to_string(),
+            partition_by_hash: parts[2].to_string(),
+            partition_value_hash: parts[3].to_string(),
         })
     }
 
@@ -157,7 +172,7 @@ impl PartitionedIndexName {
 }
 
 fn sanitize_column(s: &str) -> String {
-    s.replace('_', "-")
+    s.replace(['_', '.'], "-")
 }
 
 fn validate_index(index: &str) -> Result<(), Error> {
@@ -333,7 +348,7 @@ mod tests {
         let column_name = "_my.column";
         let partition_by = &[col(column_name)];
 
-        let this = PartitionedIndexName::from_index_name("mydataset.29d6f.b0543.7f7c5")?;
+        let this = PartitionedIndexName::from_index_name("mydataset.29d6f.7f7c5.blahh")?;
 
         assert_eq!(
             this.belongs_with(index_name, column_name, partition_by),
@@ -363,7 +378,7 @@ mod tests {
         let partition_by = vec![col("col1")];
 
         assert!(
-            PartitionedIndexName::new(&index_name, column_name, &partition_value, &partition_by)
+            PartitionedIndexName::new(&index_name, column_name, &partition_by, &partition_value)
                 .is_err()
         );
     }
@@ -376,7 +391,7 @@ mod tests {
         let partition_by = vec![col("col1")];
 
         let result =
-            PartitionedIndexName::new(index_name, column_name, &partition_value, &partition_by)?;
+            PartitionedIndexName::new(index_name, column_name, &partition_by, &partition_value)?;
 
         assert_eq!(result.index_name, "test-index");
         assert_eq!(result.column_name_hash.len(), COLUMN_NAME_MAX_LENGTH);
@@ -391,13 +406,13 @@ mod tests {
 
     #[test]
     fn from_index_name_valid() -> Result<()> {
-        let name = "test-index.test-col.12345.abcde";
+        let name = "test-index.test-col.abcde.12345";
         let result = PartitionedIndexName::from_index_name(name)?;
 
         assert_eq!(result.index_name, "test-index");
         assert_eq!(result.column_name_hash, "test-col");
-        assert_eq!(result.partition_value_hash, "12345");
         assert_eq!(result.partition_by_hash, "abcde");
+        assert_eq!(result.partition_value_hash, "12345");
 
         Ok(())
     }
@@ -437,12 +452,12 @@ mod tests {
         let index = PartitionedIndexName {
             index_name: "idx".to_string(),
             column_name_hash: "col".to_string(),
-            partition_value_hash: "12345".to_string(),
             partition_by_hash: "abcde".to_string(),
+            partition_value_hash: "12345".to_string(),
         };
 
         let result = index.to_index_name();
-        assert_eq!(result, "idx.col.12345.abcde");
+        assert_eq!(result, "idx.col.abcde.12345");
     }
 
     #[derive(Debug)]

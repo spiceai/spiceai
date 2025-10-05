@@ -27,7 +27,7 @@ use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::dataaccelerator::{AccelerationSource, spice_sys::OpenOption};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
-use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::{dataset_checkpoint::DatasetCheckpointer, snapshot::SnapshotBehavior};
 use serde_json;
 use snafu::ResultExt;
 
@@ -71,19 +71,32 @@ impl DatasetCheckpointer for DatasetCheckpoint {
 pub struct DatasetCheckpoint {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
+    snapshot_behavior: SnapshotBehavior,
 }
 
 impl DatasetCheckpoint {
-    pub async fn try_new(
-        source: &dyn AccelerationSource,
-        open_option: OpenOption,
-    ) -> Result<Arc<dyn DatasetCheckpointer>> {
+    pub async fn try_new(source: &dyn AccelerationSource, open_option: OpenOption) -> Result<Self> {
         let acceleration_connection = acceleration_connection(source, open_option).await?;
         Self::init(&acceleration_connection).await?;
-        Ok(Arc::new(Self {
+        Ok(Self {
             dataset_name: source.name().to_string(),
             acceleration_connection,
-        }) as Arc<dyn DatasetCheckpointer>)
+            snapshot_behavior: SnapshotBehavior::Disabled,
+        })
+    }
+
+    #[must_use]
+    pub fn with_snapshot_behavior(self, snapshot_behavior: SnapshotBehavior) -> Self {
+        Self {
+            dataset_name: self.dataset_name,
+            acceleration_connection: self.acceleration_connection,
+            snapshot_behavior,
+        }
+    }
+
+    #[must_use]
+    pub fn to_arc(self) -> Arc<dyn DatasetCheckpointer> {
+        Arc::new(self)
     }
 
     async fn init(connection: &AccelerationConnection) -> Result<()> {
