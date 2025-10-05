@@ -20,6 +20,7 @@ use arrow::array::FixedSizeListArray;
 use arrow::datatypes::Float32Type;
 use async_openai::types::EmbeddingInput;
 
+use datafusion::catalog::TableProvider;
 use datafusion::common::{Column, DFSchema, UnnestOptions};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::DataFusionError;
@@ -32,7 +33,7 @@ use datafusion::sql::TableReference;
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{
     Expr as LogicalExpr, ExprFunctionExt, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
-    ScalarUDF, Unnest, binary_expr, col, ident, lit, unnest,
+    ScalarUDF, binary_expr, col, ident, lit,
 };
 use itertools::Itertools;
 use llms::embeddings::Embed;
@@ -51,8 +52,6 @@ use crate::datafusion::DataFusion;
 // static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
 // Surrogate unique identifier name to use when no primary keys are provided.
 static VSS_TEMP_GEN_ID_COLUMN: &str = "vss_temp_gen_id";
-// Temporary table name to provide surrogate unique id for vector search query when no primary keys are provided.
-static VSS_TEMP_TABLE_NAME: &str = "vss_temp_table";
 
 /// A [`CandidateGeneration`] for datasets that have a chunked embedding column, but aren't using a vector index.
 pub struct ChunkedNonIndexVectorGeneration {
@@ -98,26 +97,34 @@ impl ChunkedNonIndexVectorGeneration {
 
     fn chunked_sql(
         &self,
+        tbl: &Arc<dyn TableProvider>,
         additional_columns: Vec<LogicalExpr>,
         embedding: &[f32],
         opt_filters: Vec<LogicalExpr>,
         n: usize,
     ) -> Result<LogicalPlan, DataFusionError> {
         let (pks, score_table, additional_table) =
-            self.score_cte_sql(&additional_columns, embedding, opt_filters)?;
+            self.score_cte_sql(tbl, &additional_columns, embedding, &opt_filters)?;
 
         // First project just the columns we need
         let plan = LogicalPlanBuilder::new(score_table).project(
-            vec![
+            [
                 pks.iter().map(ident).collect(),
                 vec![col("score"), col("offset")],
             ]
             .concat(),
         )?;
 
+        // Filter out primary keys from additional columns if duplicated
+        let final_additional_columns: Vec<_> = additional_columns
+            .iter()
+            .filter(|&c| !self.primary_keys.contains(&c.to_string()))
+            .cloned()
+            .collect();
+
         // Then apply the window function in a separate step
         let window_expr = row_number()
-            .partition_by(pks.iter().map(|pk| col(pk)).collect())
+            .partition_by(pks.iter().map(col).collect())
             .order_by(vec![col("score").sort(false, false)])
             .build()?
             .alias("chunk_rank");
@@ -136,8 +143,8 @@ impl ChunkedNonIndexVectorGeneration {
                 None,
             )?
             .project(
-                vec![
-                    additional_columns,
+                [
+                    final_additional_columns,
                     self.primary_keys
                         .iter()
                         .map(|pk| Column::new(Some("rank"), pk).into())
@@ -161,6 +168,7 @@ impl ChunkedNonIndexVectorGeneration {
             .build()
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn score_expr(&self, embedding: &[f32]) -> LogicalExpr {
         binary_expr(
             lit(1.0),
@@ -171,7 +179,7 @@ impl ChunkedNonIndexVectorGeneration {
                     lit(ScalarValue::FixedSizeList(Arc::new(
                         FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                             vec![Some(
-                                embedding.into_iter().cloned().map(Some).collect::<Vec<_>>(),
+                                embedding.iter().copied().map(Some).collect::<Vec<_>>(),
                             )],
                             embedding.len() as i32,
                         ),
@@ -187,15 +195,15 @@ impl ChunkedNonIndexVectorGeneration {
     ///
     /// Returns:
     ///   0: primary keys (could be artificial from temporary table if none exist in underlying table)
-    ///   1: LogicalPlan of the scores. should have score and `match`(?) content.
-    ///   2: LogicalPlan of additional columns. primary keys from 0 should be able to join uniquely between this and 1.
+    ///   1: [`LogicalPlan`] of the scores. should have score and `match`(?) content.
+    ///   2: [`LogicalPlan`] of additional columns. primary keys from 0 should be able to join uniquely between this and 1.
     fn score_cte_sql(
         &self,
+        tbl: &Arc<dyn TableProvider>,
         additional_columns: &[LogicalExpr],
         embedding: &[f32],
-        filters: Vec<LogicalExpr>,
+        filters: &[LogicalExpr],
     ) -> Result<(Vec<String>, LogicalPlan, LogicalPlan), DataFusionError> {
-        let tbl = self.df.get_table_sync(&self.tbl).unwrap();
         let mut lp = LogicalPlanBuilder::scan(
             self.tbl.clone(),
             Arc::new(DefaultTableSource::new(Arc::clone(&tbl))),
@@ -203,7 +211,7 @@ impl ChunkedNonIndexVectorGeneration {
         )?;
 
         if self.primary_keys.is_empty() {
-            self.score_cte_sql_without_pks(lp, &additional_columns, embedding, &filters)
+            self.score_cte_sql_without_pks(lp, additional_columns, embedding, &filters)
         } else {
             if let Some(f) = filters.iter().cloned().reduce(LogicalExpr::and) {
                 lp = lp.filter(f)?;
@@ -211,7 +219,7 @@ impl ChunkedNonIndexVectorGeneration {
 
             lp = lp
                 .project(
-                    vec![
+                    [
                         self.primary_keys.iter().map(ident).collect(),
                         vec![
                             ident(self.embedding_column.clone()),
@@ -264,13 +272,6 @@ impl ChunkedNonIndexVectorGeneration {
         embedding: &[f32],
         filters: &[LogicalExpr],
     ) -> Result<(Vec<String>, LogicalPlan, LogicalPlan), DataFusionError> {
-        // Filter out embedding_column from additional columns if duplicated
-        let additional_columns: Vec<_> = additional_columns
-            .iter()
-            .filter(|&c| c.to_string() != *self.embedding_column)
-            .cloned()
-            .collect();
-
         // Apply filters if any
         if let Some(f) = filters.iter().cloned().reduce(LogicalExpr::and) {
             lp = lp.filter(f)?;
@@ -343,7 +344,14 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             .boxed()
             .map_err(|e| SearchGenerationError::InternalError { source: e })?;
 
-        let tbl = self.df.get_table_sync(&self.tbl).unwrap();
+        let Some(tbl) = self.df.get_table_sync(&self.tbl) else {
+            return Err(search::generation::Error::InternalError {
+                source: Box::from(format!(
+                    "Could not access table source for dataset '{}'.",
+                    self.tbl
+                )),
+            });
+        };
         let schema = Arc::new(
             DFSchema::from_unqualified_fields(tbl.schema().fields.clone(), HashMap::default())
                 .context(QuerySnafu)?,
@@ -371,7 +379,7 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             .context(QuerySnafu)?;
 
         let plan = self
-            .chunked_sql(projection, embedding.as_slice(), filters, limit)
+            .chunked_sql(&tbl, projection, embedding.as_slice(), filters, limit)
             .context(QuerySnafu)?;
 
         tracing::debug!(
