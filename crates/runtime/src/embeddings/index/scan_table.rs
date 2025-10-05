@@ -271,7 +271,7 @@ impl TableProvider for VectorScanTableProvider {
                 .reduce(Expr::and),
         )?;
 
-        let join_schema = Arc::clone(&join.schema());
+        let join_schema = Arc::clone(join.schema());
         join = join.project(
             // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
             // case, we will remove duplicate primary key columns from the right table.

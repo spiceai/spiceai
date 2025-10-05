@@ -525,11 +525,15 @@ impl TableProvider for VectorSearchUDTFProvider {
         };
 
         // TODO: eventually this will need to be a join on underlying, and auxiliary table.
-        let scan = LogicalPlanBuilder::scan(
+        let mut scan = LogicalPlanBuilder::scan(
             self.args.tbl.clone(),
             Arc::new(DefaultTableSource::new(Arc::clone(&self.underlying))),
             None,
         )?;
+
+        if let Some(f) = filters.iter().cloned().reduce(Expr::and) {
+            scan = scan.filter(f)?;
+        }
 
         let search_field_index = self
             .schema()

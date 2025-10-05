@@ -227,7 +227,7 @@ impl SearchIndex for S3Vector {
             None,
         )?
         .project(
-            vec![
+            [
                 s3_vectors_primary_key_cast(&self.primary_fields()),
                 metadata_columns_to_exprs(&self.metadata_columns),
                 vec![
@@ -271,7 +271,7 @@ impl VectorIndex for S3Vector {
             None,
         )?
         .project(
-            vec![
+            [
                 s3_vectors_primary_key_cast(&self.primary_fields()),
                 metadata_columns_to_exprs(&self.metadata_columns),
                 vec![col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col!(self.search_column()))],
