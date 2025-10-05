@@ -23,6 +23,9 @@ use async_trait::async_trait;
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
+pub mod chunking;
+pub mod s3_vectors;
+
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
 /// This trait supports both vector similarity search and full-text search implementations.
 ///
@@ -68,4 +71,8 @@ pub trait VectorIndex: SearchIndex {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError>;
 
     fn dimension(&self) -> i32;
+}
+
+fn embedding_col(search_column: &str) -> String {
+    format!("{search_column}_embedding")
 }

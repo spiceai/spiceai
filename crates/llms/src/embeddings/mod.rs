@@ -12,10 +12,12 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+pub use async_openai::types::EmbeddingInput;
 use async_openai::types::{
-    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
-    EmbeddingVector, EncodingFormat,
+    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingUsage, EmbeddingVector,
+    EncodingFormat,
 };
+
 use async_trait::async_trait;
 use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
