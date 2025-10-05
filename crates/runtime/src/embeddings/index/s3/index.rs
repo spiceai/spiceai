@@ -28,10 +28,11 @@ use data_components::s3_vectors::{
 
 use datafusion::common::DFSchema;
 use datafusion::datasource::DefaultTableSource;
+use datafusion::functions::core::union_extract::UnionExtractFun;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::prelude::arrow_cast;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_expr::{LogicalPlanBuilder, binary_expr, cast, col};
+use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
@@ -362,10 +363,19 @@ pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
                 cast(
                     arrow_cast(
                         Expr::ScalarFunction(ScalarFunction {
-                            func: json_get_udf(),
-                            args: vec![col(S3_VECTOR_PRIMARY_KEY_NAME), lit(col_name.clone())],
+                            func: Arc::new(ScalarUDF::new_from_impl(UnionExtractFun::default())),
+                            args: vec![
+                                Expr::ScalarFunction(ScalarFunction {
+                                    func: json_get_udf(),
+                                    args: vec![
+                                        col(S3_VECTOR_PRIMARY_KEY_NAME),
+                                        lit(col_name.clone()),
+                                    ],
+                                }),
+                                lit(data_type_to_union_variant(&data_type)),
+                            ],
                         }),
-                        lit(data_type_to_union_variant(&data_type)),
+                        lit(data_type.to_string()),
                     ),
                     data_type,
                 )
