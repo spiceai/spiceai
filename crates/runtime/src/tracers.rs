@@ -147,35 +147,55 @@ macro_rules! error_spaced {
 
 /// A tracer that ensures spawned tasks and blocking closures inherit the current span context.
 ///
-/// When DataFusion spawns tasks internally (e.g., for parallel query execution), without this
-/// tracer the span context is lost when crossing thread boundaries. This tracer ensures that:
+/// This tracer implements `DataFusion`'s `JoinSetTracer` trait to propagate tracing spans across
+/// async task boundaries. When `DataFusion` spawns tasks internally (e.g., for parallel query
+/// execution), this tracer ensures the span context is preserved.
 ///
-/// 1. Async futures spawned via DataFusion's `JoinSet` run with the current span as their parent
-/// 2. Blocking closures run within the current span's scope
+/// ## How It Works
 ///
-/// This is essential for proper trace hierarchies like:
+/// 1. **For async futures**: Uses `.in_current_span()` to capture and propagate the current span
+/// 2. **For blocking closures**: Captures the span and runs the closure within that span's scope
+///
+/// This enables proper trace hierarchies like:
 /// ```text
-/// sql_query
-///   └── ai (UDF call)
-///         └── ai_completion (individual row processing)
+/// sql_query (DataFusion query execution)
+///   └── ai (UDF invoked within query)
+///         └── ai_completion (parallel row processing)
+///               └── model_call (individual LLM invocation)
 /// ```
 ///
-/// Without this tracer, the `ai_completion` spans would not properly parent under `sql_query`.
+/// Without this tracer, spans from tasks on worker threads would appear as orphaned root spans.
 ///
-/// ## Scope
+/// ## Scope and Usage
 ///
-/// This tracer **only affects DataFusion's internal task spawning** via `JoinSet`. For other
-/// async operations (e.g., direct `tokio::spawn` calls), use `.instrument(span)` or capture
-/// the span context manually before entering async boundaries.
+/// **Automatically handled:**
+/// - All `DataFusion` internal operations (`JoinSet` spawns)
+/// - SQL query execution with parallel operators
+/// - UDTFs like `vector_search`, `text_search`, `rrf`
 ///
-/// ## Usage
+/// **Requires manual instrumentation:**
+/// - Direct `tokio::spawn` calls must use `.instrument(span)`
+/// - Example: `tokio::spawn(async { ... }.instrument(span))`
+/// - Or create child spans with explicit `parent:` parameter
 ///
-/// This tracer is automatically initialized during runtime startup via `init_datafusion_tracer()`.
-/// No additional configuration is needed for DataFusion operations to properly propagate spans.
+/// ## Initialization
 ///
-/// For non-DataFusion async code emitting to `target: "task_history"`:
-/// - Use `.instrument(span)` on futures before spawning them
-/// - Or capture `Span::current()` before async boundaries and use `parent: &span` in child spans
+/// This tracer is set globally during runtime startup via `init_datafusion_tracer()`.
+/// Once set, all `DataFusion` `SessionContext` instances (new or existing) use this tracer
+/// automatically. No per-query configuration needed.
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// // DataFusion operations - automatic
+/// let result = ctx.sql("SELECT ai('query', message) FROM table").await?;
+///
+/// // Direct tokio::spawn - needs .instrument()
+/// let span = tracing::Span::current();
+/// tokio::spawn(async move {
+///     // work here
+/// }.instrument(span))
+/// ```
 pub struct TaskHistorySpanTracer;
 
 impl JoinSetTracer for TaskHistorySpanTracer {
@@ -203,11 +223,11 @@ impl JoinSetTracer for TaskHistorySpanTracer {
     }
 }
 
-/// Initializes the global `JoinSetTracer` for DataFusion.
+/// Initializes the global `JoinSetTracer` for `DataFusion`.
 ///
-/// This should be called once during runtime initialization, before any DataFusion
+/// This should be called once during runtime initialization, before any `DataFusion`
 /// queries are executed. It sets up the `TaskHistorySpanTracer` globally so that
-/// all DataFusion operations will properly propagate span context.
+/// all `DataFusion` operations will properly propagate span context.
 ///
 /// # Errors
 ///

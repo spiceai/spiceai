@@ -174,7 +174,26 @@ impl AsyncScalarUDFImpl for Ai {
             );
         }
 
-        let model_name = if args.args.len() == 2 {
+        // Format the input as it appears in SQL: ai('message') or ai('message', 'model')
+        let input_str = if args.args.len() == 2 {
+            format!("ai({}, {})", 
+                Self::format_arg(&args.args[0]), 
+                Self::format_arg(&args.args[1]))
+        } else {
+            format!("ai({})", Self::format_arg(&args.args[0]))
+        };
+
+        // Create the 'ai' span for the entire UDF invocation
+        let ai_span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "ai",
+            input = %input_str
+        );
+
+        // Execute the entire UDF within the ai span
+        async move {
+            let model_name = if args.args.len() == 2 {
             let model_arg = &args.args[1];
             match model_arg {
                 ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
@@ -208,20 +227,33 @@ impl AsyncScalarUDFImpl for Ai {
             ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
         };
 
-        // Use target_partitions from config for parallelism control
-        let max_parallelism = config.execution.target_partitions;
+            // Use target_partitions from config for parallelism control
+            let max_parallelism = config.execution.target_partitions;
 
-        self.process_messages(
-            Arc::clone(model),
-            &model_name,
-            message_array,
-            max_parallelism,
-        )
+            self.process_messages(
+                Arc::clone(model),
+                &model_name,
+                message_array,
+                max_parallelism,
+            )
+            .await
+        }
+        .instrument(ai_span)
         .await
     }
 }
 
 impl Ai {
+    /// Format a ColumnarValue as it would appear in SQL for the span input
+    fn format_arg(arg: &ColumnarValue) -> String {
+        match arg {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => format!("'{}'", s),
+            ColumnarValue::Scalar(ScalarValue::Utf8(None)) => "NULL".to_string(),
+            ColumnarValue::Scalar(v) => format!("{:?}", v),
+            ColumnarValue::Array(_) => "<array>".to_string(),
+        }
+    }
+
     async fn call_model(
         model: &Arc<dyn Chat>,
         model_name: &str,
@@ -288,8 +320,6 @@ impl Ai {
                 Some(complete_response)
             })
         }
-        // Instrument the async block with an AI span as a child of the current (sql_query) span
-        .instrument(tracing::span!(Level::INFO, "ai", model = %model_name))
         .await
     }
 
@@ -353,6 +383,17 @@ impl Ai {
                 // Performance: Convert to owned string once before spawning
                 let message = message.to_string();
 
+                // Create ai_completion span as child of the ai span
+                let ai_completion_span = tracing::span!(
+                    target: "task_history",
+                    parent: &parent_span,
+                    tracing::Level::INFO,
+                    "ai_completion",
+                    model = %model_name_str,
+                    input = %message,
+                    row = %row_index
+                );
+
                 tokio::spawn(async move {
                     let _permit = semaphore
                         .acquire()
@@ -372,13 +413,13 @@ impl Ai {
                             Ok(None)
                         }
                         Err(e) => {
-                            // Security: Don't leak detailed error messages to parent span
-                            tracing::error!(target: "task_history", parent: &parent_span, "AI model error for row {}", row_index);
-                            tracing::debug!(target: "task_history", parent: &parent_span, "AI model error details: {}", e);
+                            // Security: Don't leak detailed error messages
+                            tracing::error!(target: "task_history", "AI model error for row {}", row_index);
+                            tracing::debug!(target: "task_history", "AI model error details: {}", e);
                             Err(DataFusionError::External(e))
                         }
                     }
-                })
+                }.instrument(ai_completion_span))
             } else {
                 // Performance: Don't spawn task for null values, return immediately
                 tokio::spawn(async move { Ok::<Option<String>, DataFusionError>(None) })
