@@ -19,7 +19,6 @@ limitations under the License.
 //! Automatically injects cache invalidation logic after successful write operations
 
 use std::{
-    any::Any,
     collections::HashSet,
     fmt::{self, Debug},
     hash::{Hash, Hasher},
@@ -34,18 +33,18 @@ use datafusion::{
         DFSchemaRef,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
-    error::{DataFusionError, Result},
-    execution::{SendableRecordBatchStream, TaskContext},
+    error::Result,
+    execution::SendableRecordBatchStream,
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
-    physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, stream::RecordBatchStreamAdapter,
-    },
+    physical_plan::{DisplayFormatType, ExecutionPlan, stream::RecordBatchStreamAdapter},
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
     prelude::Expr,
     sql::TableReference,
 };
 use futures::StreamExt;
+
+use crate::datafusion::extension::pass_thru::PassThruExec;
 
 /// [`OptimizerRule`] that detects write operations in a `DataFusion` logical plan and injects a cache invalidation node [`CacheInvalidationNode`].
 ///
@@ -232,153 +231,63 @@ impl Hash for CacheInvalidationNode {
     }
 }
 
-/// Physical [`ExecutionPlan`] that wraps a write operation and invalidates cache after successful completion.
-pub(crate) struct CacheInvalidationExec {
-    input_exec: Arc<dyn ExecutionPlan>,
-    table: TableReference,
+/// Creates physical [`ExecutionPlan`] that wraps a write operation and invalidates cache after successful completion.
+fn create_cache_invalidation_exec(
+    input: Arc<dyn ExecutionPlan>,
+    table: &TableReference,
     caching: Weak<Caching>,
-}
+) -> Arc<dyn ExecutionPlan> {
+    let table_exec = table.clone();
+    let exec = move |input_exec: &Arc<dyn ExecutionPlan>, partition, ctx| {
+        let schema = input_exec.schema();
+        let input_stream = input_exec.execute(partition, ctx)?;
+        let caching = Weak::clone(&caching);
+        let table = table_exec.clone();
 
-impl CacheInvalidationExec {
-    pub(crate) fn new(
-        input_exec: Arc<dyn ExecutionPlan>,
-        table: TableReference,
-        caching: Weak<Caching>,
-    ) -> Self {
-        Self {
-            input_exec,
-            table,
-            caching,
-        }
-    }
-
-    fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
-        if let Some(cache) = caching.upgrade() {
-            if let Err(e) = cache.invalidate_for_table(table.clone()) {
-                tracing::warn!("Failed to invalidate cache for table {table}: {e}");
-            } else {
-                tracing::trace!("Successfully invalidated cache for table {table}");
-            }
-        } else {
-            tracing::debug!(
-                "Cache reference for table {table} could not be upgraded; cache may have been dropped"
-            );
-        }
-    }
-}
-
-impl std::fmt::Debug for CacheInvalidationExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("CacheInvalidationExec")
-            .field("table", &self.table)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DisplayAs for CacheInvalidationExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "CacheInvalidationExec: table={}", self.table)
-            }
-            DisplayFormatType::TreeRender => {
-                write!(f, "CacheInvalidationExec")
-            }
-        }
-    }
-}
-
-impl ExecutionPlan for CacheInvalidationExec {
-    fn name(&self) -> &'static str {
-        "CacheInvalidationExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
-        self.input_exec.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input_exec]
-    }
-
-    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
-        // Enforce single partition to ensure cache invalidation happens once after all input is processed
-        vec![datafusion::physical_plan::Distribution::SinglePartition; self.children().len()]
-    }
-
-    /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true; self.children().len()]
-    }
-
-    fn required_input_ordering(
-        &self,
-    ) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
-        vec![None; self.children().len()]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(
-                "CacheInvalidationExec requires exactly one child".to_string(),
-            ));
-        }
-
-        let Some(input) = children.into_iter().next() else {
-            unreachable!("should have one input");
-        };
-
-        Ok(Arc::new(Self::new(
-            input,
-            self.table.clone(),
-            Weak::clone(&self.caching),
-        )))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let input_stream = self.input_exec.execute(partition, context)?;
-        let schema = self.input_exec.schema();
-
-        let table = self.table.clone();
-        let caching = Weak::clone(&self.caching);
-
-        // Create an async stream that wraps the input and handles cache invalidation
-        let stream = stream! {
-            let mut input_stream = input_stream;
-            let mut exec_failed = false;
-
-            while let Some(batch_result) = input_stream.next().await {
-                match batch_result {
-                    Ok(batch) => yield Ok(batch),
-                    Err(e) => {
-                        exec_failed = true;
-                        yield Err(e);
-                    }
+        let s = stream! {
+            let mut input = input_stream;
+            let mut ok = true;
+            while let Some(item) = input.next().await {
+                match item {
+                    Ok(b) => yield Ok(b),
+                    Err(e) => { ok = false; yield Err(e); }
                 }
             }
-
-            // If wrapped input_exec completed without error, invalidate the cache
-            if !exec_failed {
-                Self::invalidate_cache_for_table(&table, &caching);
+            if ok {
+                invalidate_cache_for_table(&table, &caching);
             }
         };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)) as SendableRecordBatchStream)
+    };
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    let table_fmt_fn = table.clone();
+    let display_fmt_fn = move |t: DisplayFormatType, f: &mut fmt::Formatter| match t {
+        DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            write!(f, "CacheInvalidationExec: table={table_fmt_fn}")
+        }
+        DisplayFormatType::TreeRender => {
+            write!(f, "CacheInvalidationExec")
+        }
+    };
+
+    Arc::new(
+        PassThruExec::new(input, "CacheInvalidationExec", exec)
+            .with_input_partitioning(datafusion::physical_plan::Distribution::SinglePartition)
+            .with_display_fmt_fn(display_fmt_fn),
+    )
+}
+
+fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
+    if let Some(cache) = caching.upgrade() {
+        if let Err(e) = cache.invalidate_for_table(table.clone()) {
+            tracing::warn!("Failed to invalidate cache for table {table}: {e}");
+        } else {
+            tracing::trace!("Successfully invalidated cache for table {table}");
+        }
+    } else {
+        tracing::debug!(
+            "Cache reference for table {table} could not be upgraded; cache may have been dropped"
+        );
     }
 }
 
@@ -422,13 +331,11 @@ impl ExtensionPlanner for CacheInvalidationExtensionPlanner {
 
         let physical_input = &physical_inputs[0];
 
-        let exec = CacheInvalidationExec::new(
+        Ok(Some(create_cache_invalidation_exec(
             Arc::clone(physical_input),
-            cache_node.table.clone(),
+            &cache_node.table,
             Weak::clone(&cache_node.caching),
-        );
-
-        Ok(Some(Arc::new(exec)))
+        )))
     }
 }
 
