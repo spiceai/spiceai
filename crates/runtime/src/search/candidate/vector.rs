@@ -98,9 +98,9 @@ impl ChunkedNonIndexVectorGeneration {
     fn chunked_sql(
         &self,
         tbl: &Arc<dyn TableProvider>,
-        additional_columns: Vec<LogicalExpr>,
+        additional_columns: &[LogicalExpr],
         embedding: &[f32],
-        opt_filters: Vec<LogicalExpr>,
+        opt_filters: &[LogicalExpr],
         n: usize,
     ) -> Result<LogicalPlan, DataFusionError> {
         let (pks, score_table, additional_table) =
@@ -206,12 +206,12 @@ impl ChunkedNonIndexVectorGeneration {
     ) -> Result<(Vec<String>, LogicalPlan, LogicalPlan), DataFusionError> {
         let mut lp = LogicalPlanBuilder::scan(
             self.tbl.clone(),
-            Arc::new(DefaultTableSource::new(Arc::clone(&tbl))),
+            Arc::new(DefaultTableSource::new(Arc::clone(tbl))),
             None,
         )?;
 
         if self.primary_keys.is_empty() {
-            self.score_cte_sql_without_pks(lp, additional_columns, embedding, &filters)
+            self.score_cte_sql_without_pks(lp, embedding, filters)
         } else {
             if let Some(f) = filters.iter().cloned().reduce(LogicalExpr::and) {
                 lp = lp.filter(f)?;
@@ -252,7 +252,7 @@ impl ChunkedNonIndexVectorGeneration {
                 lp.build()?,
                 LogicalPlanBuilder::scan(
                     self.tbl.clone(),
-                    Arc::new(DefaultTableSource::new(Arc::clone(&tbl))),
+                    Arc::new(DefaultTableSource::new(Arc::clone(tbl))),
                     None,
                 )?
                 .build()?,
@@ -268,7 +268,6 @@ impl ChunkedNonIndexVectorGeneration {
     fn score_cte_sql_without_pks(
         &self,
         mut lp: LogicalPlanBuilder,
-        additional_columns: &[LogicalExpr],
         embedding: &[f32],
         filters: &[LogicalExpr],
     ) -> Result<(Vec<String>, LogicalPlan, LogicalPlan), DataFusionError> {
@@ -379,7 +378,7 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             .context(QuerySnafu)?;
 
         let plan = self
-            .chunked_sql(&tbl, projection, embedding.as_slice(), filters, limit)
+            .chunked_sql(&tbl, &projection, embedding.as_slice(), &filters, limit)
             .context(QuerySnafu)?;
 
         tracing::debug!(
