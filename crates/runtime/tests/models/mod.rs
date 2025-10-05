@@ -31,6 +31,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+mod ai_udf;
 mod bedrock;
 mod embedding;
 mod hf;
@@ -170,6 +171,27 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         refresh_sql: Some("SELECT * FROM taxi_trips LIMIT 10".to_string()),
+        ..Default::default()
+    });
+    dataset
+}
+
+pub(crate) fn get_taxi_zones_direct_dataset() -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-demo-datasets/taxi_zones.parquet",
+        "taxi_zones_direct",
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_sql: Some("SELECT * FROM taxi_zones_direct LIMIT 10".to_string()),
         ..Default::default()
     });
     dataset
@@ -540,4 +562,50 @@ async fn get_params_with_secrets_value(
         .collect::<HashMap<_, _>>();
 
     get_params_with_secrets(rt.secrets(), &params).await
+}
+
+pub(crate) fn get_anthropic_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model =
+        spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
+    model.params.insert(
+        "anthropic_api_key".to_string(),
+        "${ secrets:SPICE_ANTHROPIC_API_KEY }".into(),
+    );
+    model
+}
+
+pub(crate) fn get_xai_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model =
+        spicepod::component::model::Model::new(format!("openai:{}", model.into()), name);
+    model.params.insert(
+        "openai_api_key".to_string(),
+        "${ secrets:SPICE_XAI_API_KEY }".into(),
+    );
+    model
+        .params
+        .insert("openai_api_base".to_string(), "https://api.x.ai/v1".into());
+    model
+}
+
+pub(crate) fn get_local_model(
+    hf_model: impl Into<String>,
+    model_type: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model = spicepod::component::model::Model::new(
+        format!("huggingface:huggingface.co/{}", hf_model.into()),
+        name,
+    );
+    model.params.insert(
+        "model_type".to_string(),
+        model_type.into().into(),
+    );
+    // Local models don't require HF token for public models like Phi
+    model
 }
