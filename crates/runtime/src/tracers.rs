@@ -147,10 +147,10 @@ macro_rules! error_spaced {
 
 /// A tracer that ensures spawned tasks and blocking closures inherit the current span context.
 ///
-/// When DataFusion spawns tasks internally (e.g., for parallel query execution), without this
+/// When `DataFusion` spawns tasks internally (e.g., for parallel query execution), without this
 /// tracer the span context is lost when crossing thread boundaries. This tracer ensures that:
 ///
-/// 1. Async futures spawned via DataFusion's `JoinSet` run with the current span as their parent
+/// 1. Async futures spawned via `DataFusion`'s `JoinSet` run with the current span as their parent
 /// 2. Blocking closures run within the current span's scope
 ///
 /// This is essential for proper trace hierarchies like:
@@ -164,14 +164,14 @@ macro_rules! error_spaced {
 ///
 /// ## Scope
 ///
-/// This tracer **only affects DataFusion's internal task spawning** via `JoinSet`. For other
+/// This tracer **only affects `DataFusion`'s internal task spawning** via `JoinSet`. For other
 /// async operations (e.g., direct `tokio::spawn` calls), use `.instrument(span)` or capture
 /// the span context manually before entering async boundaries.
 ///
 /// ## Usage
 ///
 /// This tracer is automatically initialized during runtime startup via `init_datafusion_tracer()`.
-/// No additional configuration is needed for DataFusion operations to properly propagate spans.
+/// No additional configuration is needed for `DataFusion` operations to properly propagate spans.
 ///
 /// For non-DataFusion async code emitting to `target: "task_history"`:
 /// - Use `.instrument(span)` on futures before spawning them
@@ -203,11 +203,11 @@ impl JoinSetTracer for TaskHistorySpanTracer {
     }
 }
 
-/// Initializes the global `JoinSetTracer` for DataFusion.
+/// Initializes the global `JoinSetTracer` for `DataFusion`.
 ///
-/// This should be called once during runtime initialization, before any DataFusion
+/// This should be called once during runtime initialization, before any `DataFusion`
 /// queries are executed. It sets up the `TaskHistorySpanTracer` globally so that
-/// all DataFusion operations will properly propagate span context.
+/// all `DataFusion` operations will properly propagate span context.
 ///
 /// # Errors
 ///
