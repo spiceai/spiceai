@@ -141,7 +141,7 @@ jobs:
           os: 'linux'
 
       - name: Clean up Disk
-        uses: ./.github/action/cleanup-disk
+        uses: ./.github/actions/cleanup-disk
 
       - name: Install Oracle ODPI-C
         run: |
