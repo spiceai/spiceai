@@ -39,8 +39,8 @@ use datafusion::{
 use futures::future::BoxFuture;
 
 use crate::{
-    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, chunking::ChunkedSearchIndex,
-    index::SearchIndex,
+    SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
+    index::{SearchIndex, chunking::ChunkedSearchIndex},
 };
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]

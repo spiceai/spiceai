@@ -23,11 +23,11 @@ use datafusion::common::Column;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
-use search::chunking::ChunkedSearchIndex;
 use search::generation::CandidateGeneration;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::generation::util::get_primary_keys;
 use search::index::SearchIndex;
+use search::index::chunking::ChunkedSearchIndex;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
@@ -210,7 +210,7 @@ pub async fn embedding_columns_from_table(
     // embedding columns from [`IndexedTableProvider`].
     #[cfg(feature = "s3_vectors")]
     {
-        use crate::embeddings::index::s3::S3Vector;
+        use search::index::s3_vectors::S3Vector;
         if let Some((indexes, _)) = find_index_in_table_provider::<S3Vector>(&table_provider) {
             embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
         }
