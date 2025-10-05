@@ -176,9 +176,11 @@ impl AsyncScalarUDFImpl for Ai {
 
         // Format the input as it appears in SQL: ai('message') or ai('message', 'model')
         let input_str = if args.args.len() == 2 {
-            format!("ai({}, {})", 
-                Self::format_arg(&args.args[0]), 
-                Self::format_arg(&args.args[1]))
+            format!(
+                "ai({}, {})",
+                Self::format_arg(&args.args[0]),
+                Self::format_arg(&args.args[1])
+            )
         } else {
             format!("ai({})", Self::format_arg(&args.args[0]))
         };
@@ -194,38 +196,38 @@ impl AsyncScalarUDFImpl for Ai {
         // Execute the entire UDF within the ai span
         async move {
             let model_name = if args.args.len() == 2 {
-            let model_arg = &args.args[1];
-            match model_arg {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
-                    // Security: Validate model name (prevent injection)
-                    if model_name.is_empty() || model_name.len() > 256 {
-                        return exec_err!("{AI_UDF_NAME} invalid model name length");
+                let model_arg = &args.args[1];
+                match model_arg {
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => {
+                        // Security: Validate model name (prevent injection)
+                        if model_name.is_empty() || model_name.len() > 256 {
+                            return exec_err!("{AI_UDF_NAME} invalid model name length");
+                        }
+                        model_name.clone()
                     }
-                    model_name.clone()
+                    _ => {
+                        return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
+                    }
                 }
-                _ => {
-                    return exec_err!("{AI_UDF_NAME} unsupported model parameter: {model_arg}");
-                }
-            }
-        } else {
-            self.get_default_model_name().await?
-        };
+            } else {
+                self.get_default_model_name().await?
+            };
 
-        let model_store = self.model_store.read().await;
-        let Some(model) = model_store.get(&model_name) else {
-            return exec_err!(
-                "{AI_UDF_NAME} cannot find model '{}'. Available models: {}",
-                model_name,
-                model_store.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-        };
+            let model_store = self.model_store.read().await;
+            let Some(model) = model_store.get(&model_name) else {
+                return exec_err!(
+                    "{AI_UDF_NAME} cannot find model '{}'. Available models: {}",
+                    model_name,
+                    model_store.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            };
 
-        // Only convert the message argument to array (not the model name)
-        // The model name is always a scalar and shouldn't be part of the columnar data
-        let message_array = match &args.args[0] {
-            ColumnarValue::Array(arr) => Arc::clone(arr),
-            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
-        };
+            // Only convert the message argument to array (not the model name)
+            // The model name is always a scalar and shouldn't be part of the columnar data
+            let message_array = match &args.args[0] {
+                ColumnarValue::Array(arr) => Arc::clone(arr),
+                ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(args.number_rows)?,
+            };
 
             // Use target_partitions from config for parallelism control
             let max_parallelism = config.execution.target_partitions;
