@@ -177,8 +177,8 @@ impl<'a> SnapshotPathLayout<'a> {
         format!("dataset={}", self.dataset_name)
     }
 
-    fn dataset_partition_encoded(&'a self) -> PathPart<'a> {
-        PathPart::from(format!("dataset={}", self.dataset_name_path().as_ref()))
+    fn dataset_partition_expected(&self) -> String {
+        format!("dataset={}", self.dataset_name_path().as_ref())
     }
 
     fn build_location(&self, base: &ObjectPath, instant: DateTime<Utc>) -> ObjectPath {
@@ -221,10 +221,10 @@ impl<'a> SnapshotPathLayout<'a> {
             return None;
         }
 
-        let expected_dataset_part = self.dataset_partition_encoded();
-        if dataset_part != &expected_dataset_part {
+        let expected_dataset_part = self.dataset_partition_expected();
+        if dataset_part.as_ref() != expected_dataset_part {
             tracing::trace!(
-                expected = %expected_dataset_part.as_ref(),
+                expected = %expected_dataset_part,
                 actual = %dataset_part.as_ref(),
                 "Dataset partition mismatch while parsing snapshot path",
             );
