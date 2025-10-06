@@ -19,7 +19,7 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser::ast::{self, Function, FunctionArgExpr, Ident, ObjectName};
 use datafusion_expr::sqlparser;
-use datafusion_expr::sqlparser::ast::{FunctionArg, ValueWithSpan};
+use datafusion_expr::sqlparser::ast::{Array, FunctionArg, ValueWithSpan};
 use itertools::Itertools;
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
@@ -250,9 +250,13 @@ impl DuckDBRegexpFunction {
             DuckDBRegexpFunction::Match => {
                 // DuckDB ``regexp_extract`` returns a plain string
                 // DataFusion ``regexp_match`` returns an array with a single string value
-                // wrap the output of the DuckDB function with ``array_value(arg1, ...)``
-                // https://github.com/spiceai/spiceai/issues/6964
-                ast_fn = Self::wrap_function(ast_fn, "array_value");
+                ast_fn = ast::Expr::Named {
+                    expr: Box::new(ast::Expr::Array(Array {
+                        elem: vec![ast_fn],
+                        named: true,
+                    })),
+                    name: Ident::new("item"),
+                }
             }
             DuckDBRegexpFunction::Count => {
                 // Wrap the extract array in a ``len()``

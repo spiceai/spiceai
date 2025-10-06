@@ -293,11 +293,10 @@ async fn duckdb_regexp() -> Result<(), String> {
                     "test_regexp_like_with_case_insensitive_flag",
                     "SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')",
                 ),
-                // disabled until github.com/spiceai/spiceai/issues/6964 is addressed
-                // (
-                //     "test_regexp_match",
-                //     "SELECT regexp_match(region, 'AMERICA') FROM csv_test",
-                // ),
+                (
+                    "test_regexp_match",
+                    "SELECT regexp_match(region, 'AMERICA') FROM csv_test",
+                ),
                 (
                     "test_regexp_count",
                     "SELECT regexp_count(region, 'AMERICA') FROM csv_test",
