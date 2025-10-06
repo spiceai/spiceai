@@ -2,7 +2,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    index::{SearchIndex, VectorIndex},
+    index::{SearchIndex, VectorIndex, embedding_col},
     metadata::{MetadataColumn, MetadataColumns},
 };
 
@@ -124,11 +124,6 @@ impl ChunkedSearchIndex {
     #[must_use]
     pub fn chunking_offset_col(search_column: &str) -> String {
         format!("{search_column}_offset")
-    }
-
-    #[must_use]
-    pub fn embedding_col(search_column: &str) -> String {
-        format!("{search_column}_embedding")
     }
 
     #[must_use]
@@ -279,7 +274,7 @@ impl SearchIndex for ChunkedSearchIndex {
             .collect::<Result<Vec<_>, ArrowError>>()?
             .into_iter()
             .filter(|(f, _)| {
-                *f.name() != Self::embedding_col(self.search_column().as_str())
+                *f.name() != embedding_col(self.search_column().as_str())
                     && *f.name() != Self::chunking_offset_col(self.search_column().as_str())
             })
             .unzip();
@@ -332,7 +327,7 @@ impl SearchIndex for ChunkedSearchIndex {
             }
         }
 
-        let embeddings = Self::embedding_col(self.search_column().as_str());
+        let embeddings = embedding_col(&self.search_column());
         if let Some(arr) = inner_rb.column_by_name(&embeddings) {
             let f = Arc::new(Field::new("item", arr.data_type().clone(), true));
             let arr = Arc::new(
@@ -465,9 +460,9 @@ impl VectorIndex for ChunkedVectorIndex {
                 ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
             )),
             Expr::Alias(Alias::new(
-                array_agg(Expr::Column(Column::new_unqualified(
-                    ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
-                )))
+                array_agg(Expr::Column(Column::new_unqualified(embedding_col(
+                    self.search_column().as_str(),
+                ))))
                 .order_by(vec![SortExpr::new(
                     Expr::Column(Column::new_unqualified(CHUNKED_INDEX_CHUNK_KEY)),
                     true,
@@ -475,7 +470,7 @@ impl VectorIndex for ChunkedVectorIndex {
                 )])
                 .build()?,
                 None::<TableReference>,
-                ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
+                embedding_col(self.search_column().as_str()),
             )),
         ];
         aggr_expr.extend(
@@ -486,7 +481,7 @@ impl VectorIndex for ChunkedVectorIndex {
                 .filter_map(|c| {
                     if [
                         ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
-                        ChunkedSearchIndex::embedding_col(self.search_column().as_str()),
+                        embedding_col(self.search_column().as_str()),
                         CHUNKED_INDEX_CHUNK_KEY.to_string(),
                     ]
                     .contains(c)
