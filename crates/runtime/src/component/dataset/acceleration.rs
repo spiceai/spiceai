@@ -132,6 +132,7 @@ pub enum Engine {
     DuckDB,
     PartitionedDuckDB,
     Sqlite,
+    Turso,
     PostgreSQL,
 }
 
@@ -141,6 +142,7 @@ impl Display for Engine {
             Engine::Arrow => write!(f, "arrow"),
             Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
+            Engine::Turso => write!(f, "turso"),
             Engine::PostgreSQL => write!(f, "postgres"),
         }
     }
@@ -154,6 +156,7 @@ impl TryFrom<&str> for Engine {
             "arrow" => Ok(Engine::Arrow),
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
+            "turso" => Ok(Engine::Turso),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
