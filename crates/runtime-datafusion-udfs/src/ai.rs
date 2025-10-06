@@ -215,11 +215,25 @@ impl AsyncScalarUDFImpl for Ai {
         // Use target_partitions from config for parallelism control
         let max_parallelism = config.execution.target_partitions;
 
-        // Create the parent 'ai' span that will contain all ai_completion spans
-        // This span is a child of the sql_query span from DataFusion
+        // Format the input to show the full UDF call: ai('message', 'model')
+        let input = if args.args.len() == 2 {
+            format!(
+                "ai({}, {})",
+                Self::format_arg(&args.args[0]),
+                Self::format_arg(&args.args[1])
+            )
+        } else {
+            format!("ai({})", Self::format_arg(&args.args[0]))
+        };
+
+        // Create the 'ai' span that will contain all model_call operations
+        // model_call internally emits ai_completion spans to task_history
+        // Hierarchy: sql_query → ai → model_call (which emits ai_completion)
         let ai_span = tracing::span!(
+            target: "task_history",
             Level::INFO,
             "ai",
+            input = %input,
             model = %model_name,
             rows = %args.number_rows
         );
@@ -252,6 +266,16 @@ impl AsyncScalarUDFImpl for Ai {
 }
 
 impl Ai {
+    /// Formats a `ColumnarValue` argument as SQL syntax for tracing
+    fn format_arg(arg: &ColumnarValue) -> String {
+        match arg {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => format!("'{s}'"),
+            ColumnarValue::Scalar(ScalarValue::Utf8(None)) => "NULL".to_string(),
+            ColumnarValue::Array(_) => "<array>".to_string(),
+            ColumnarValue::Scalar(_) => format!("{arg:?}"),
+        }
+    }
+
     async fn call_model(
         model: &Arc<dyn Chat>,
         _model_name: &str,
@@ -400,49 +424,19 @@ impl Ai {
                     tokio::task::yield_now().await;
 
                     if let Some(message) = message_str {
-                        // Create ai_completion span as child of current (ai) span
-                        // This span will be visible in traces for each individual completion
-                        let ai_completion_span = tracing::span!(
-                            Level::INFO,
-                            "ai_completion",
-                            model = %model_name_str,
-                            row = %row_index
-                        );
-
-                        match Self::call_model(&model, &model_name_str, &message, row_index)
-                            .instrument(ai_completion_span.clone())
-                            .await
-                        {
-                            Ok(Some(result)) => {
-                                tracing::info!(
-                                    target: "task_history",
-                                    parent: &ai_completion_span,
-                                    captured_output = %result,
-                                    row = %row_index
-                                );
-                                Ok(Some(result))
-                            }
+                        // call_model internally calls chat_stream, which emits ai_completion spans
+                        // Hierarchy: sql_query → ai → model_call (emits ai_completion to task_history)
+                        match Self::call_model(&model, &model_name_str, &message, row_index).await {
+                            Ok(Some(result)) => Ok(Some(result)),
                             Ok(None) => {
                                 tracing::debug!(
-                                    parent: &ai_completion_span,
                                     "AI model returned empty response for row {}",
                                     row_index
                                 );
                                 Ok(None)
                             }
                             Err(e) => {
-                                tracing::error!(
-                                    target: "task_history",
-                                    parent: &ai_completion_span,
-                                    "AI model error for row {}",
-                                    row_index
-                                );
-                                tracing::debug!(
-                                    target: "task_history",
-                                    parent: &ai_completion_span,
-                                    "AI model error details: {}",
-                                    e
-                                );
+                                tracing::error!("AI model error for row {}: {}", row_index, e);
                                 Err(DataFusionError::External(e))
                             }
                         }

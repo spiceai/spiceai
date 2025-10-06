@@ -285,8 +285,7 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
             let result = run_ai_query(&rt, query).await?;
             assert!(
                 !result.is_empty(),
-                "Local model (phi-local) should return a response, got: '{}'",
-                result
+                "Local model (phi-local) should return a response, got: '{result}'"
             );
 
             // Test 9: Verify local model works synchronously
@@ -360,7 +359,7 @@ async fn run_ai_query_multiple(
             results.push(int_array.value(0).to_string());
         } else {
             // For other types, use Debug format
-            results.push(format!("{:?}", col));
+            results.push(format!("{col:?}"));
         }
     }
 
