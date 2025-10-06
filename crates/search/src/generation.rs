@@ -12,6 +12,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::sqlparser::ast::Expr;
 use snafu::Snafu;
@@ -22,11 +23,15 @@ pub mod text_search;
 pub mod util;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Error occured during search: {source}"))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("A query engine error occured during search: {source}"))]
+    QueryError { source: DataFusionError },
 
     #[cfg(feature = "text_search")]
     #[snafu(display("Error occured performing full text search: {source}"))]

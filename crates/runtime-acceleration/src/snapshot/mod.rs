@@ -13,13 +13,16 @@ limitations under the License.
 
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{cmp::Ordering, path::PathBuf, str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use bytes::BytesMut;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use futures::StreamExt;
-use object_store::{ObjectMeta, ObjectStore, path::Path as ObjectPath};
+use object_store::{
+    ObjectMeta, ObjectStore,
+    path::{Path as ObjectPath, PathPart},
+};
 use snafu::prelude::*;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::ParamValue};
 use tokio::{
@@ -115,7 +118,147 @@ pub enum SnapshotUploadError {
 #[derive(Debug, Clone)]
 struct SnapshotCandidate {
     location: ObjectPath,
-    timestamp: String,
+    timestamp: DateTime<Utc>,
+    display_timestamp: String,
+}
+
+impl SnapshotCandidate {
+    fn location(&self) -> &ObjectPath {
+        &self.location
+    }
+}
+
+impl PartialEq for SnapshotCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.location == other.location && self.timestamp == other.timestamp
+    }
+}
+
+impl Eq for SnapshotCandidate {}
+
+impl PartialOrd for SnapshotCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SnapshotCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.display_timestamp.cmp(&other.display_timestamp))
+            .then_with(|| self.location.as_ref().cmp(other.location.as_ref()))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotPathLayout<'a> {
+    dataset_name: &'a str,
+}
+
+impl<'a> SnapshotPathLayout<'a> {
+    fn new(dataset_name: &'a str) -> Self {
+        Self { dataset_name }
+    }
+
+    fn dataset_name_path(&'a self) -> PathPart<'a> {
+        PathPart::from(self.dataset_name)
+    }
+
+    fn snapshot_filename(&self, instant: DateTime<Utc>) -> String {
+        format!(
+            "{}_{}.db",
+            self.dataset_name,
+            instant.format(SNAPSHOT_TIMESTAMP_FORMAT)
+        )
+    }
+
+    fn dataset_partition_raw(&self) -> String {
+        format!("dataset={}", self.dataset_name)
+    }
+
+    fn dataset_partition_expected(&self) -> String {
+        format!("dataset={}", self.dataset_name_path().as_ref())
+    }
+
+    fn build_location(&self, base: &ObjectPath, instant: DateTime<Utc>) -> ObjectPath {
+        let month_partition = format!("month={}", instant.format("%Y-%m"));
+        let day_partition = format!("day={}", instant.format("%Y-%m-%d"));
+        let dataset_partition = self.dataset_partition_raw();
+        base.child(month_partition)
+            .child(day_partition)
+            .child(dataset_partition)
+            .child(self.snapshot_filename(instant))
+    }
+
+    fn parse_filename_timestamp(&self, filename: &str) -> Option<(String, DateTime<Utc>)> {
+        let name_without_ext = filename.strip_suffix(".db")?;
+        let (name_part, timestamp_str) = name_without_ext.rsplit_once('_')?;
+        if name_part != self.dataset_name_path().as_ref() {
+            return None;
+        }
+        if timestamp_str.len() != 16 {
+            return None;
+        }
+        let parsed = parse_snapshot_timestamp(timestamp_str)?;
+        Some((timestamp_str.to_string(), parsed))
+    }
+
+    fn candidate_from_meta(&self, meta: ObjectMeta) -> Option<SnapshotCandidate> {
+        let location = meta.location;
+        let parts: Vec<_> = location.parts().collect();
+        if parts.len() < 4 {
+            return None;
+        }
+
+        let mut parts_rev = parts.iter().rev();
+        let filename = parts_rev.next()?.as_ref();
+        let dataset_part = parts_rev.next()?;
+        let day_part = parts_rev.next()?.as_ref();
+        let month_part = parts_rev.next()?.as_ref();
+
+        if !month_part.starts_with("month=") || !day_part.starts_with("day=") {
+            return None;
+        }
+
+        let expected_dataset_part = self.dataset_partition_expected();
+        if dataset_part.as_ref() != expected_dataset_part {
+            tracing::trace!(
+                expected = %expected_dataset_part,
+                actual = %dataset_part.as_ref(),
+                "Dataset partition mismatch while parsing snapshot path",
+            );
+            return None;
+        }
+
+        let (display_timestamp, timestamp) = self.parse_filename_timestamp(filename)?;
+
+        let expected_month_part = format!("month={}", timestamp.format("%Y-%m"));
+        if month_part != expected_month_part {
+            tracing::trace!(
+                expected = %expected_month_part,
+                actual = %month_part,
+                "Month partition mismatch while parsing snapshot path",
+            );
+            return None;
+        }
+
+        let expected_day_part = format!("day={}", timestamp.format("%Y-%m-%d"));
+        if day_part != expected_day_part {
+            tracing::trace!(
+                expected = %expected_day_part,
+                actual = %day_part,
+                "Day partition mismatch while parsing snapshot path",
+            );
+            return None;
+        }
+
+        Some(SnapshotCandidate {
+            location,
+            timestamp,
+            display_timestamp,
+        })
+    }
 }
 
 fn parse_snapshot_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
@@ -231,9 +374,9 @@ impl SnapshotManager {
     /// - If communicating with the backing object store fails at any stage of the upload.
     #[allow(clippy::too_many_lines)]
     pub async fn create_snapshot(&self) -> Result<ObjectPath, SnapshotUploadError> {
-        let timestamp = Utc::now().format(SNAPSHOT_TIMESTAMP_FORMAT).to_string();
-        let filename = format!("{}_{}.db", self.dataset_name, timestamp);
-        let location = self.snapshots_location.child(filename);
+        let now = Utc::now();
+        let layout = SnapshotPathLayout::new(&self.dataset_name);
+        let location = layout.build_location(&self.snapshots_location, now);
         let location_path = location.to_string();
         let local_path = self.local_path.clone();
 
@@ -450,10 +593,10 @@ impl SnapshotManager {
             tracing::info!(
                 dataset = %self.dataset_name,
                 snapshot = %candidate.location.to_string(),
-                timestamp = %candidate.timestamp,
+                timestamp = %candidate.display_timestamp,
                 "Downloading latest snapshot."
             );
-            self.download_snapshot(&candidate.location, checkpointer_factory)
+            self.download_snapshot(candidate.location(), checkpointer_factory)
                 .await
                 .map(Some)
         } else {
@@ -476,9 +619,9 @@ impl SnapshotManager {
         }
 
         for candidate in candidates {
-            let path_display = candidate.location.to_string();
+            let path_display = candidate.location().to_string();
             match self
-                .download_snapshot(&candidate.location, Arc::clone(&checkpointer_factory))
+                .download_snapshot(candidate.location(), Arc::clone(&checkpointer_factory))
                 .await
             {
                 Ok(schema) => return Ok(Some(schema)),
@@ -530,31 +673,7 @@ impl SnapshotManager {
             }
         }
 
-        let mut snapshots_with_ts: Vec<(Option<DateTime<Utc>>, SnapshotCandidate)> = snapshots
-            .into_iter()
-            .map(|candidate| {
-                let parsed = parse_snapshot_timestamp(&candidate.timestamp);
-                if parsed.is_none() {
-                    tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %candidate.location.to_string(),
-                        timestamp = %candidate.timestamp,
-                        "Failed to parse snapshot timestamp; falling back to lexicographic order."
-                    );
-                }
-                (parsed, candidate)
-            })
-            .collect();
-
-        snapshots_with_ts.sort_by(|(a_ts, a_candidate), (b_ts, b_candidate)| {
-            b_ts.cmp(a_ts)
-                .then_with(|| b_candidate.timestamp.cmp(&a_candidate.timestamp))
-        });
-
-        let snapshots: Vec<SnapshotCandidate> = snapshots_with_ts
-            .into_iter()
-            .map(|(_, candidate)| candidate)
-            .collect();
+        snapshots.sort_by(|a, b| b.cmp(a));
         tracing::info!(
             dataset = %self.dataset_name,
             location = %self.snapshots_location.to_string(),
@@ -648,36 +767,17 @@ impl SnapshotManager {
         meta: ObjectMeta,
         dataset_name: &str,
     ) -> Option<SnapshotCandidate> {
-        let location = meta.location;
-        let filename = location.filename()?;
-        let timestamp = Self::parse_snapshot_timestamp(filename, dataset_name)?;
+        let layout = SnapshotPathLayout::new(dataset_name);
+        let candidate = layout.candidate_from_meta(meta)?;
 
         tracing::debug!(
             dataset = %dataset_name,
-            snapshot = %location.to_string(),
-            timestamp = %timestamp,
+            snapshot = %candidate.location.to_string(),
+            timestamp = %candidate.display_timestamp,
             "Found snapshot candidate."
         );
 
-        Some(SnapshotCandidate {
-            location,
-            timestamp,
-        })
-    }
-
-    fn parse_snapshot_timestamp(filename: &str, dataset_name: &str) -> Option<String> {
-        let name_without_ext = filename.strip_suffix(".db")?;
-
-        let (name_part, timestamp) = name_without_ext.rsplit_once('_')?;
-        if name_part != dataset_name {
-            return None;
-        }
-
-        if timestamp.len() != 16 {
-            return None;
-        }
-
-        Some(timestamp.to_string())
+        Some(candidate)
     }
 }
 
@@ -728,22 +828,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_snapshot_timestamp_valid() {
-        let timestamp =
-            SnapshotManager::parse_snapshot_timestamp("dataset_20250102T030405Z.db", "dataset");
-        assert_eq!(timestamp, Some("20250102T030405Z".to_string()));
-    }
+    fn snapshot_path_layout_encodes_and_parses_dataset() {
+        let layout = SnapshotPathLayout::new("dataset with spaces/slash");
+        let base = ObjectPath::from("snapshots/prefix");
+        let instant = Utc
+            .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
+            .single()
+            .expect("valid timestamp");
 
-    #[test]
-    fn parse_snapshot_timestamp_rejects_invalid_dataset() {
-        let timestamp =
-            SnapshotManager::parse_snapshot_timestamp("other_20250102T030405Z.db", "dataset");
-        assert!(timestamp.is_none());
+        let location = layout.build_location(&base, instant);
+        let location_string = location.to_string();
+        assert!(
+            location_string.contains("dataset=dataset with spaces%2Fslash"),
+            "dataset partition should be percent encoded"
+        );
+        assert!(
+            !location_string.contains("dataset=dataset with spaces/slash"),
+            "dataset partition should not contain raw dataset name"
+        );
+
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: Utc
+                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            size: 1,
+            e_tag: None,
+            version: None,
+        };
+        let candidate = layout
+            .candidate_from_meta(meta)
+            .expect("expected valid candidate");
+
+        assert_eq!(candidate.display_timestamp, "20250102T030405Z");
     }
 
     #[test]
     fn snapshot_candidate_from_meta_filters_by_dataset() {
-        let meta = test_meta("snapshots/dataset_20250102T030405Z.db");
+        let meta = test_meta(
+            "snapshots/month=2025-01/day=2025-01-02/dataset=dataset/dataset_20250102T030405Z.db",
+        );
         let candidate = SnapshotManager::snapshot_candidate_from_meta(meta, "dataset")
             .expect("expected valid snapshot candidate");
 
@@ -751,12 +876,53 @@ mod tests {
             candidate.location.filename(),
             Some("dataset_20250102T030405Z.db")
         );
-        assert_eq!(candidate.timestamp, "20250102T030405Z");
+        assert_eq!(candidate.display_timestamp, "20250102T030405Z");
     }
 
     #[test]
     fn snapshot_candidate_from_meta_rejects_invalid_file() {
-        let meta = test_meta("snapshots/dataset_invalid.db");
+        let meta =
+            test_meta("snapshots/month=2025-01/day=2025-01-02/dataset=dataset/dataset_invalid.db");
+        assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
+    }
+
+    #[test]
+    fn snapshot_candidate_from_meta_rejects_mismatched_dataset_partition() {
+        let meta = test_meta(
+            "snapshots/month=2025-01/day=2025-01-02/dataset=other/dataset_20250102T030405Z.db",
+        );
+        assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
+    }
+
+    #[test]
+    fn snapshot_candidate_from_meta_rejects_mismatched_month_partition() {
+        let meta = test_meta(
+            "snapshots/month=2025-02/day=2025-01-02/dataset=dataset/dataset_20250102T030405Z.db",
+        );
+        assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
+    }
+
+    #[test]
+    fn snapshot_candidate_from_meta_rejects_mismatched_day_partition() {
+        let meta = test_meta(
+            "snapshots/month=2025-01/day=2025-01-03/dataset=dataset/dataset_20250102T030405Z.db",
+        );
+        assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
+    }
+
+    #[test]
+    fn snapshot_candidate_from_meta_rejects_missing_partitions() {
+        let meta = test_meta("snapshots/dataset=dataset/dataset_20250102T030405Z.db");
+        assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
+
+        let meta =
+            test_meta("snapshots/day=2025-01-02/dataset=dataset/dataset_20250102T030405Z.db");
+        assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
+
+        let meta = test_meta("snapshots/month=2025-01/dataset=dataset/dataset_20250102T030405Z.db");
+        assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
+
+        let meta = test_meta("snapshots/dataset_20250102T030405Z.db");
         assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
     }
 
@@ -767,28 +933,30 @@ mod tests {
         block_on(async {
             store
                 .put(
-                    &Path::from("snapshots/dataset_20250101T000000Z.db"),
+                    &Path::from("snapshots/month=2025-01/day=2025-01-01/dataset=dataset/dataset_20250101T000000Z.db"),
                     Bytes::from_static(b"a").into(),
                 )
                 .await
                 .expect("write snapshot file");
             store
                 .put(
-                    &Path::from("snapshots/dataset_20250201T000000Z.db"),
+                    &Path::from("snapshots/month=2025-02/day=2025-02-01/dataset=dataset/dataset_20250201T000000Z.db"),
                     Bytes::from_static(b"b").into(),
                 )
                 .await
                 .expect("write snapshot file");
             store
                 .put(
-                    &Path::from("snapshots/other_20250301T000000Z.db"),
+                    &Path::from("snapshots/month=2025-03/day=2025-03-01/dataset=other/other_20250301T000000Z.db"),
                     Bytes::from_static(b"c").into(),
                 )
                 .await
                 .expect("write snapshot file");
             store
                 .put(
-                    &Path::from("snapshots/dataset_invalid.db"),
+                    &Path::from(
+                        "snapshots/month=2025-01/day=2025-01-01/dataset=dataset/dataset_invalid.db",
+                    ),
                     Bytes::from_static(b"d").into(),
                 )
                 .await
@@ -831,34 +999,75 @@ mod tests {
     }
 
     #[test]
-    fn list_snapshot_candidates_places_unparsable_after_parsable() {
+    fn list_snapshot_candidates_returns_latest_first() {
         let store = InMemory::new();
 
         block_on(async {
             store
                 .put(
-                    &Path::from("snapshots/dataset_20251003T123312Z.db"),
+                    &Path::from("snapshots/month=2025-05/day=2025-05-10/dataset=dataset/dataset_20250510T120000Z.db"),
+                    Bytes::from_static(b"latest").into(),
+                )
+                .await
+                .expect("write snapshot file");
+            store
+                .put(
+                    &Path::from("snapshots/month=2025-04/day=2025-04-10/dataset=dataset/dataset_20250410T120000Z.db"),
+                    Bytes::from_static(b"older").into(),
+                )
+                .await
+                .expect("write snapshot file");
+        });
+
+        let manager = SnapshotManager {
+            dataset_name: "dataset".to_string(),
+            snapshots_location: Path::from("snapshots"),
+            local_path: PathBuf::from("/tmp/unused.db"),
+            object_store: Arc::new(store),
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Fallback,
+            checkpointer_factory: Some(Arc::new(|| {
+                Box::pin(async {
+                    Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(NoopCheckpointer))
+                })
+            })),
+        };
+
+        let candidates =
+            block_on(manager.list_snapshot_candidates()).expect("list snapshot candidates");
+
+        let first = candidates.first().expect("expected at least one candidate");
+        assert_eq!(first.display_timestamp, "20250510T120000Z");
+    }
+
+    #[test]
+    fn list_snapshot_candidates_ignores_unparsable() {
+        let store = InMemory::new();
+
+        block_on(async {
+            store
+                .put(
+                    &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=dataset/dataset_20251003T123312Z.db"),
                     Bytes::from_static(b"a").into(),
                 )
                 .await
                 .expect("write snapshot file");
             store
                 .put(
-                    &Path::from("snapshots/dataset_20251003T123421Z.db"),
+                    &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=dataset/dataset_20251003T123421Z.db"),
                     Bytes::from_static(b"b").into(),
                 )
                 .await
                 .expect("write snapshot file");
             store
                 .put(
-                    &Path::from("snapshots/dataset_250927T13340914Z.db"),
+                    &Path::from("snapshots/month=2025-09/day=2025-09-27/dataset=dataset/dataset_250927T13340914Z.db"),
                     Bytes::from_static(b"c").into(),
                 )
                 .await
                 .expect("write snapshot file");
             store
                 .put(
-                    &Path::from("snapshots/other_20251003T123421Z.db"),
+                    &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=other/other_20251003T123421Z.db"),
                     Bytes::from_static(b"d").into(),
                 )
                 .await
@@ -895,8 +1104,7 @@ mod tests {
             filenames,
             vec![
                 "dataset_20251003T123421Z.db".to_string(),
-                "dataset_20251003T123312Z.db".to_string(),
-                "dataset_250927T13340914Z.db".to_string()
+                "dataset_20251003T123312Z.db".to_string()
             ]
         );
     }
@@ -933,9 +1141,27 @@ mod tests {
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
         );
+        let layout = SnapshotPathLayout::new("dataset");
         assert!(
-            SnapshotManager::parse_snapshot_timestamp(filename, "dataset").is_some(),
+            layout.parse_filename_timestamp(filename).is_some(),
             "snapshot filename should contain a parsable timestamp"
+        );
+
+        let path_parts: Vec<_> = uploaded_path
+            .parts()
+            .map(|part| part.as_ref().to_string())
+            .collect();
+        assert!(
+            path_parts.iter().any(|part| part.starts_with("month=")),
+            "snapshot path missing month partition"
+        );
+        assert!(
+            path_parts.iter().any(|part| part.starts_with("day=")),
+            "snapshot path missing day partition"
+        );
+        assert!(
+            path_parts.iter().any(|part| part == "dataset=dataset"),
+            "snapshot path missing dataset partition"
         );
 
         let stored_bytes = manager

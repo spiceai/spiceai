@@ -37,17 +37,16 @@ use datafusion::{
     common::Column,
     datasource::{DefaultTableSource, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{
-        BinaryExpr, LogicalPlan, Operator, Projection, Sort, SortExpr, TableScan,
-        expr::{Alias, ScalarFunction},
-    },
+    logical_expr::{Operator, SortExpr, expr::ScalarFunction},
     physical_plan::ExecutionPlan,
     prelude::{Expr, lit},
     scalar::ScalarValue,
     sql::TableReference,
 };
 
-use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, SubqueryAlias};
+use datafusion_expr::{
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
+};
 use futures::FutureExt;
 use itertools::Itertools;
 use std::{
@@ -508,10 +507,10 @@ impl TableProvider for VectorSearchUDTFProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         telemetry::track_vector_search(&request_context.to_dimensions());
-        let (col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
+        let (embed_col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
 
         let query_vector = self
-            .vector(&col, &cfg)
+            .vector(&embed_col, &cfg)
             .await
             .map_err(DataFusionError::External)?;
 
@@ -526,13 +525,15 @@ impl TableProvider for VectorSearchUDTFProvider {
         };
 
         // TODO: eventually this will need to be a join on underlying, and auxiliary table.
-        let scan = LogicalPlan::TableScan(TableScan::try_new(
+        let mut scan = LogicalPlanBuilder::scan(
             self.args.tbl.clone(),
             Arc::new(DefaultTableSource::new(Arc::clone(&self.underlying))),
             None,
-            filters.to_vec(),
-            None,
-        )?);
+        )?;
+
+        if let Some(f) = filters.iter().cloned().reduce(Expr::and) {
+            scan = scan.filter(f)?;
+        }
 
         let search_field_index = self
             .schema()
@@ -551,7 +552,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
                 // Check it is in projection
                 if projection.is_none() || projection.is_some_and(|proj| proj.contains(&i)) {
-                    Some(Expr::Column(Column::from_name(f.name())))
+                    Some(ident(f.name()))
                 } else {
                     None
                 }
@@ -559,48 +560,41 @@ impl TableProvider for VectorSearchUDTFProvider {
             .collect();
         let mut base_expr = final_expr.clone();
 
-        base_expr.push(Expr::Alias(Alias {
-            expr: Box::from(Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(lit(1.0)),
+        base_expr.push(
+            binary_expr(
+                lit(1.0),
                 Operator::Minus,
-                Box::new(Expr::ScalarFunction(ScalarFunction {
+                Expr::ScalarFunction(ScalarFunction {
                     func: cosine_distance_udf,
                     args: vec![
-                        Expr::Literal(ScalarValue::FixedSizeList(Arc::new(query_vector)), None),
-                        Expr::Column(Column::from_name(embedding_col!(col))),
+                        lit(ScalarValue::FixedSizeList(Arc::new(query_vector))),
+                        ident(embedding_col!(embed_col)),
                     ],
-                })),
-            ))),
-            relation: None,
-            name: SEARCH_SCORE_COLUMN_NAME.to_string(),
-            metadata: None,
-        }));
+                }),
+            )
+            .alias(SEARCH_SCORE_COLUMN_NAME),
+        );
 
         // only include score in the projection if it is requested.
         // Otherwise, if the query is `SELECT a FROM vector_search(...)`, it will fail because we supplied too many columns in the response!
         if projection.is_none() || projection.is_some_and(|proj| proj.contains(&search_field_index))
         {
-            final_expr.push(Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)));
+            final_expr.push(col(SEARCH_SCORE_COLUMN_NAME));
         }
 
-        let proj = LogicalPlan::Projection(Projection::try_new(base_expr, Arc::new(scan))?);
-        let sort = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr::new(
+        let final_plan = scan
+            .project(base_expr)?
+            .sort(vec![SortExpr::new(
                 Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)),
                 false,
                 false,
-            )],
-            input: Arc::new(proj),
-            fetch: Some(self.limit_to_use(limit)),
-        });
+            )])?
+            .limit(0, Some(self.limit_to_use(limit)))?
+            // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
+            .alias("tbl")?
+            .project(final_expr)?
+            .build()?;
 
-        // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
-        let score_subquery =
-            LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(sort), "tbl")?);
-
-        let final_proj =
-            LogicalPlan::Projection(Projection::try_new(final_expr, Arc::new(score_subquery))?);
-
-        state.create_physical_plan(&final_proj).await
+        state.create_physical_plan(&final_plan).await
     }
 }
