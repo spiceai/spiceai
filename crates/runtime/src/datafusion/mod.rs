@@ -941,6 +941,8 @@ impl DataFusion {
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
 
+        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
+
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
@@ -948,12 +950,19 @@ impl DataFusion {
         if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
-            self.runtime_status
-                .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-            initial_load_complete = true;
-        }
+            // For append refreshes that rely on a time column (i.e. file-based appends) that have
+            // snapshotting enabled, we delay readiness until the first refresh completes so that
+            // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
+            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
+                && dataset.time_column.is_some()
+                && acceleration_settings.snapshots.bootstrap_enabled();
 
-        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
+            if !delay_initial_ready {
+                self.runtime_status
+                    .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                initial_load_complete = true;
+            }
+        }
 
         let mut refresh = Refresh::new(refresh_mode).with_retry(
             dataset.refresh_retry_enabled(),

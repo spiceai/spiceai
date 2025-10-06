@@ -140,6 +140,9 @@ jobs:
         with:
           os: 'linux'
 
+      - name: Clean up Disk
+        uses: ./.github/actions/cleanup-disk
+
       - name: Install Oracle ODPI-C
         run: |
           curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip

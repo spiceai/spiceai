@@ -26,15 +26,14 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, JoinConstraint, JoinType, NullEquality},
+    common::{Column, Constraints, JoinType},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{Expr, Filter, Join, Limit, LogicalPlan, Projection, TableScan},
+    logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
-    scalar::ScalarValue,
     sql::TableReference,
 };
-use datafusion_expr::{SubqueryAlias, ident};
+use datafusion_expr::{LogicalPlanBuilder, ident};
 
 use itertools::Itertools;
 use search::index::VectorIndex;
@@ -82,24 +81,24 @@ impl VectorScanTableProvider {
     }
 
     fn apply_proj_and_filter(
-        input: Arc<LogicalPlan>,
+        input: LogicalPlanBuilder,
         projection: &HashSet<String>,
         filters: &[Expr],
-    ) -> Result<LogicalPlan, DataFusionError> {
+    ) -> Result<LogicalPlanBuilder, DataFusionError> {
         let filtered = if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-            Arc::new(LogicalPlan::Filter(Filter::try_new(filter, input)?))
+            input.filter(filter)?
         } else {
             input
         };
 
-        Ok(LogicalPlan::Projection(Projection::try_new(
+        filtered.project(
             projection
                 .iter()
                 .sorted_unstable()
-                .map(|p| Expr::Column(Column::new_unqualified(p.clone())))
-                .collect(),
-            filtered,
-        )?))
+                .cloned()
+                .map(ident)
+                .collect::<Vec<Expr>>(),
+        )
     }
 
     fn columns_projected(
@@ -123,6 +122,21 @@ impl VectorScanTableProvider {
             .collect();
 
         Ok(columns_requested)
+    }
+
+    /// Return all columns that appear in the [`Self::vector_index_list`] that are not in [`Self::table_provider`] as well as all primary keys.
+    fn columns_needed_from_index(&self) -> Vec<Expr> {
+        let table_schema = self.table_provider.schema();
+        self.vector_index_list
+            .schema()
+            .columns()
+            .into_iter()
+            .filter(|c| {
+                table_schema.column_with_name(&c.name).is_none()
+                    || self.primary_key.contains(&c.name)
+            })
+            .map(Expr::Column)
+            .collect()
     }
 }
 
@@ -199,16 +213,15 @@ impl TableProvider for VectorScanTableProvider {
             filters,
         ) {
             let lp = Self::apply_proj_and_filter(
-                Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+                LogicalPlanBuilder::scan(
                     "base_table",
                     Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
                     None,
-                    vec![],
-                    None,
-                )?)),
+                )?,
                 &columns_requested,
                 filters,
-            )?;
+            )?
+            .build()?;
 
             return state.create_physical_plan(&lp).await;
         }
@@ -221,129 +234,74 @@ impl TableProvider for VectorScanTableProvider {
         //     filters,
         // ) {
         //     let lp = Self::apply_proj_and_filter(
-        //         Arc::clone(&self.vector_index_list),
+        //         LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list)),
         //         &columns_requested,
         //         filters,
-        //     )?;
+        //     )?
+        //     .build()?;
 
         //     return state.create_physical_plan(&lp).await;
         // }
-        let base_ts = LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("base_table"),
+
+        // Join on primary keys, prefer to use columns from base table, push down filters where we can.
+        let mut join = LogicalPlanBuilder::scan(
+            "base_table",
             Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
             None,
-            vec![],
-            None,
-        )?);
-
-        // Only include fields from index that aren't in base table (including metadata), except primary key.
-        let index_lp = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-            Arc::new(LogicalPlan::Projection(Projection::try_new(
-                self.vector_index_list
-                    .schema()
-                    .columns()
-                    .iter()
-                    .filter(|c| {
-                        base_ts
-                            .schema()
-                            .columns_with_unqualified_name(&c.name)
-                            .is_empty()
-                            || self.primary_key.contains(&c.name)
-                    })
-                    .map(|c| Expr::Column(c.clone()))
-                    .collect(),
-                Arc::clone(&self.vector_index_list),
-            )?)),
-            TableReference::parse_str("vector_index"),
-        )?);
-
-        let join_schema = base_ts.schema().join(index_lp.schema())?;
-
-        // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
-        let join_filters: Vec<Expr> = filters
-            .iter()
-            .filter(|f| {
-                f.column_refs()
-                    .iter()
-                    .any(|col| !self.primary_key.contains(&col.name))
-            })
-            .cloned()
-            .collect();
-
-        let join_conditions: Vec<(Expr, Expr)> = self
-            .primary_key
-            .iter()
-            .map(|pk| {
-                (
-                    Expr::Column(Column::new(
-                        Some(TableReference::parse_str("base_table")),
-                        pk.clone(),
-                    )),
-                    Expr::Column(Column::new(
-                        Some(TableReference::parse_str("vector_index")),
-                        pk.clone(),
-                    )),
-                )
-            })
-            .collect();
-
-        // Left Join so that all rows in the underlying table are returned.
-        // Rows may not have associated vectors periodically due to indexing delays.
-        let join = LogicalPlan::Join(Join {
-            left: Arc::new(base_ts),
-            right: Arc::new(index_lp),
-            join_type: JoinType::Left,
-            join_constraint: JoinConstraint::On,
-            on: join_conditions,
-            filter: join_filters.into_iter().reduce(Expr::and),
-            schema: join_schema.into(),
-            null_equality: NullEquality::NullEqualsNothing,
-        });
-
-        // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
-        // case, we will remove duplicate primary key columns from the right table.
-        let deduped_join_proj_exprs: Vec<_> = join
-            .schema()
-            .iter()
-            .filter(|(tbl, f)| {
-                !(self.primary_key.contains(f.name())
-                    && tbl.is_some_and(|t| *t == TableReference::parse_str("vector_index")))
-            })
-            .map(|(tbl, field_ref)| match tbl {
-                Some(table_ref) => {
-                    Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
-                }
-                None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
-            })
-            .collect();
-
-        let proj =
-            LogicalPlan::Projection(Projection::try_new(deduped_join_proj_exprs, join.into())?);
-
-        let filtered = if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-            LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
-        } else {
-            proj
-        };
-
-        let output_proj = LogicalPlan::Projection(Projection::try_new(
-            columns_requested
-                .into_iter()
-                .sorted_unstable()
-                .map(ident)
+        )?
+        .join(
+            LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list))
+                .project(self.columns_needed_from_index())?
+                .alias("vector_index")?
+                .build()?,
+            JoinType::Left,
+            self.primary_key
+                .iter()
+                .map(|pk| (Column::from_name(pk.clone()), Column::from_name(pk.clone())))
                 .collect(),
-            Arc::new(filtered),
-        )?);
+            // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+            filters
+                .iter()
+                .filter(|f| {
+                    f.column_refs()
+                        .iter()
+                        .any(|col| !self.primary_key.contains(&col.name))
+                })
+                .cloned()
+                .reduce(Expr::and),
+        )?;
 
-        let limit = LogicalPlan::Limit(Limit {
-            input: Arc::new(output_proj),
-            fetch: Some(Box::new(Expr::Literal(
-                ScalarValue::UInt64(limit.map(|l| l as u64)),
-                None,
-            ))),
-            skip: None,
-        });
-        state.create_physical_plan(&limit).await
+        let join_schema = Arc::clone(join.schema());
+        join = join.project(
+            // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
+            // case, we will remove duplicate primary key columns from the right table.
+            join_schema
+                .iter()
+                .filter(|(tbl, f)| {
+                    !(self.primary_key.contains(f.name())
+                        && tbl.is_some_and(|t| *t == TableReference::parse_str("vector_index")))
+                })
+                .map(|(tbl, field_ref)| match tbl {
+                    Some(table_ref) => Column::new(Some(table_ref.clone()), field_ref.name()),
+                    None => Column::new(None::<TableReference>, field_ref.name()),
+                }),
+        )?;
+
+        if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+            join = join.filter(filter)?;
+        }
+
+        join = join
+            .project(
+                columns_requested
+                    .into_iter()
+                    .sorted_unstable()
+                    .map(ident)
+                    .collect::<Vec<Expr>>(),
+            )?
+            .limit(0, limit)?;
+
+        state.create_physical_plan(&join.build()?).await
     }
 }
 
