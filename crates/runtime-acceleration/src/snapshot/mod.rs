@@ -161,8 +161,8 @@ impl<'a> SnapshotPathLayout<'a> {
         Self { dataset_name }
     }
 
-    fn encoded_dataset_name(&self) -> String {
-        PathPart::from(self.dataset_name).as_ref().to_string()
+    fn dataset_name_path(&'a self) -> PathPart<'a> {
+        PathPart::from(self.dataset_name)
     }
 
     fn snapshot_filename(&self, instant: DateTime<Utc>) -> String {
@@ -177,8 +177,8 @@ impl<'a> SnapshotPathLayout<'a> {
         format!("dataset={}", self.dataset_name)
     }
 
-    fn dataset_partition_encoded(&self) -> String {
-        format!("dataset={}", self.encoded_dataset_name())
+    fn dataset_partition_encoded(&'a self) -> PathPart<'a> {
+        PathPart::from(format!("dataset={}", self.dataset_name_path().as_ref()))
     }
 
     fn build_location(&self, base: &ObjectPath, instant: DateTime<Utc>) -> ObjectPath {
@@ -194,7 +194,7 @@ impl<'a> SnapshotPathLayout<'a> {
     fn parse_filename_timestamp(&self, filename: &str) -> Option<(String, DateTime<Utc>)> {
         let name_without_ext = filename.strip_suffix(".db")?;
         let (name_part, timestamp_str) = name_without_ext.rsplit_once('_')?;
-        if name_part != self.encoded_dataset_name() {
+        if name_part != self.dataset_name_path().as_ref() {
             return None;
         }
         if timestamp_str.len() != 16 {
@@ -213,7 +213,7 @@ impl<'a> SnapshotPathLayout<'a> {
 
         let mut parts_rev = parts.iter().rev();
         let filename = parts_rev.next()?.as_ref();
-        let dataset_part = parts_rev.next()?.as_ref();
+        let dataset_part = parts_rev.next()?;
         let day_part = parts_rev.next()?.as_ref();
         let month_part = parts_rev.next()?.as_ref();
 
@@ -222,10 +222,10 @@ impl<'a> SnapshotPathLayout<'a> {
         }
 
         let expected_dataset_part = self.dataset_partition_encoded();
-        if dataset_part != expected_dataset_part {
+        if dataset_part != &expected_dataset_part {
             tracing::trace!(
-                expected = %expected_dataset_part,
-                actual = %dataset_part,
+                expected = %expected_dataset_part.as_ref(),
+                actual = %dataset_part.as_ref(),
                 "Dataset partition mismatch while parsing snapshot path",
             );
             return None;
