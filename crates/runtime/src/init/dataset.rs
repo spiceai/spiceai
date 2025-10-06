@@ -742,7 +742,7 @@ impl Runtime {
         for ds in initialized_datasets {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
                 if ds != *current_ds {
-                    Arc::clone(&self).update_dataset(ds).await;
+                    Box::pin(Arc::clone(&self).update_dataset(ds)).await;
                 }
             } else {
                 self.status
