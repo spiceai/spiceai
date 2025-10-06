@@ -78,6 +78,8 @@ pub async fn with_find_max_timestamp_in_stream(
     time_format: Option<TimeFormat>,
     source_name: String,
 ) -> (StreamingDataUpdate, Option<Arc<Mutex<Option<i64>>>>) {
+    return (data_update, None);
+
     let Some(time_column) = time_column else {
         return (data_update, None);
     };
