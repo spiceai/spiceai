@@ -37,6 +37,7 @@ tikv-jemallocator = { version = "0.6.0", optional = true }
 tokio.workspace = true
 tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tracing.workspace = true
+tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util" }
