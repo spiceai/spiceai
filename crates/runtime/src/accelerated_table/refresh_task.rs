@@ -419,6 +419,7 @@ impl RefreshTask {
             None => None,
         };
 
+        #[allow(clippy::cast_possible_truncation)]
         let current_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -452,44 +453,6 @@ impl RefreshTask {
             {
                 let ingestion_lag_ms = current_time_ms - after;
                 metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
-            }
-        }
-    }
-
-    async fn handle_metrics_old(
-        &self,
-        dataset_metrics_label_sets: &[Vec<KeyValue>],
-        max_timestamp_before_refresh_ms: Option<i64>,
-        max_timestamp_after_refresh_ms: Option<Arc<Mutex<Option<i64>>>>,
-    ) {
-        if let (Some(max_timestamp_before_refresh_ms), Some(max_timestamp_after_refresh_ms)) = (
-            max_timestamp_before_refresh_ms,
-            max_timestamp_after_refresh_ms,
-        ) {
-            let max_timestamp_after_refresh_ms = {
-                let guard = max_timestamp_after_refresh_ms.lock().await;
-                *guard
-            };
-
-            if let Some(max_timestamp_after_refresh_ms) = max_timestamp_after_refresh_ms {
-                #[allow(clippy::cast_possible_truncation)]
-                let current_time_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-
-                let refresh_lag_ms =
-                    max_timestamp_after_refresh_ms - max_timestamp_before_refresh_ms;
-                let ingestion_lag_ms = current_time_ms - max_timestamp_after_refresh_ms;
-
-                for label_set in dataset_metrics_label_sets {
-                    metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS
-                        .record(max_timestamp_before_refresh_ms, label_set);
-                    metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS
-                        .record(max_timestamp_after_refresh_ms, label_set);
-                    metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
-                    metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
-                }
             }
         }
     }
