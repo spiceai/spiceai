@@ -20,16 +20,14 @@ use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{
     MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
-use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
 use search::{
-    generation::util::get_primary_keys,
     index::s3_vectors::S3Vector,
     metadata::{MetadataColumn, MetadataColumns},
 };
-use snafu::ResultExt;
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig},
@@ -84,19 +82,17 @@ pub async fn try_from_dataset(
     column: String,
     config: ColumnLevelEmbeddingConfig,
     vector_store_config: &VectorStore,
-    underlying: Arc<dyn TableProvider>,
+    primary_keys: Vec<String>,
+    inner_schema: SchemaRef,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
     partition_by: Vec<Expr>,
 ) -> Result<S3Vector, Box<dyn std::error::Error + Send + Sync>> {
-    // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
-    let pks_from_table = get_primary_keys(&underlying).await.boxed()?;
-    let inner_schema = underlying.schema();
     let primary_key: Vec<_> = config
         .row_ids
         .clone()
-        .unwrap_or(pks_from_table)
+        .unwrap_or(primary_keys)
         .into_iter()
         .filter_map(|c| {
             let (_, f) = inner_schema.column_with_name(c.as_str())?;
