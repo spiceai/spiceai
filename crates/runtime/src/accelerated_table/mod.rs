@@ -555,7 +555,6 @@ impl AcceleratedTable {
     }
 
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
-        println!("trigger_refresh");
         if let Some(refresh_trigger) = self.refresh_trigger() {
             refresh_trigger
                 .send(overrides)
