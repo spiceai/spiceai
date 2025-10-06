@@ -99,6 +99,10 @@ impl UnityCatalog {
         }
 
         let user_agent: Option<String>;
+        #[cfg(not(feature = "databricks"))]
+        {
+            user_agent = None;
+        }
         #[cfg(feature = "databricks")]
         // Include user_agent, if connects to Databricks instance
         {
