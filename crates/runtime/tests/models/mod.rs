@@ -176,27 +176,6 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-pub(crate) fn get_taxi_zones_direct_dataset() -> Dataset {
-    let mut dataset = Dataset::new(
-        "s3://spiceai-demo-datasets/taxi_zones.parquet",
-        "taxi_zones_direct",
-    );
-    dataset.params = Some(Params::from_string_map(
-        vec![
-            ("file_format".to_string(), "parquet".to_string()),
-            ("client_timeout".to_string(), "120s".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-    ));
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        refresh_sql: Some("SELECT * FROM taxi_zones_direct LIMIT 10".to_string()),
-        ..Default::default()
-    });
-    dataset
-}
-
 fn get_small_clickbench_dataset(name: &str) -> Dataset {
     let mut dataset = Dataset::new(
         "s3://spiceai-public-datasets/clickbench/hits_small.parquet",
@@ -581,15 +560,11 @@ pub(crate) fn get_xai_model(
     model: impl Into<String>,
     name: impl Into<String>,
 ) -> spicepod::component::model::Model {
-    let mut model =
-        spicepod::component::model::Model::new(format!("openai:{}", model.into()), name);
+    let mut model = spicepod::component::model::Model::new(format!("xai:{}", model.into()), name);
     model.params.insert(
-        "openai_api_key".to_string(),
+        "xai_api_key".to_string(),
         "${ secrets:SPICE_XAI_API_KEY }".into(),
     );
-    model
-        .params
-        .insert("openai_api_base".to_string(), "https://api.x.ai/v1".into());
     model
 }
 

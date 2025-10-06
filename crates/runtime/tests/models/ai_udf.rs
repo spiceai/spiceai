@@ -17,8 +17,8 @@ limitations under the License.
 use crate::{
     init_tracing,
     models::{
-        create_api_bindings_config, get_anthropic_model, get_local_model,
-        get_taxi_zones_direct_dataset, get_xai_model, openai::get_openai_model,
+        create_api_bindings_config, get_anthropic_model, get_local_model, get_mega_science_dataset,
+        get_xai_model, openai::get_openai_model,
     },
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
@@ -64,13 +64,13 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Test 1: Basic ai() call with default model
-            let query = "SELECT ai('hi')";
+            // Test 1: Basic ai() call with specific model (OpenAI)
+            let query = "SELECT ai('hi', 'gpt-4o-mini')";
             tracing::info!("Testing: {}", query);
             let result = run_ai_query(&rt, query).await?;
             assert!(
                 !result.is_empty(),
-                "Basic ai('hi') should return a response"
+                "Basic ai('hi', 'gpt-4o-mini') should return a response"
             );
 
             // Test 2: ai() call with specific model (OpenAI)
@@ -140,7 +140,7 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
                 .map_err(anyhow::Error::msg)?;
 
             let app = AppBuilder::new("ai_udf_test")
-                .with_dataset(get_taxi_zones_direct_dataset())
+                .with_dataset(get_mega_science_dataset(None, None, None))
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
                 .with_model(get_xai_model("grok-4-fast-non-reasoning", "grok-4"))
                 .with_model(get_anthropic_model("claude-3-5-haiku-latest", "claude-haiku"))
@@ -163,21 +163,21 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Test 6: ai() with dataset - three models (OpenAI, xAI, Anthropic)
-            let query = r#"SELECT LocationID, Zone, 
-                ai(concat_ws(' ', 'Categorize the zone', Zone, 'in a single word. Only return the word.'), 'gpt-4o-mini') as "openai",
-                ai(concat_ws(' ', 'Categorize the zone', Zone, 'in a single word. Only return the word.'), 'grok-4') as "xai",
-                ai(concat_ws(' ', 'Categorize the zone', Zone, 'in a single word. Only return the word.'), 'claude-haiku') as "anthropic"
-            FROM taxi_zones_direct
-            LIMIT 10"#;
-            tracing::info!("Testing: multi-model categorization with 3 providers (OpenAI, xAI, Anthropic)");
+            // Test 6: ai() with dataset - answer questions using three models (OpenAI, xAI, Anthropic)
+            let query = r#"SELECT id, question, 
+                ai(concat('Answer this question in 10 words or less: ', question), 'gpt-4o-mini') as "openai_answer",
+                ai(concat('Answer this question in 10 words or less: ', question), 'grok-4') as "xai_answer",
+                ai(concat('Answer this question in 10 words or less: ', question), 'claude-haiku') as "anthropic_answer"
+            FROM megascience
+            LIMIT 5"#;
+            tracing::info!("Testing: AI answering questions from MegaScience dataset with 3 providers (OpenAI, xAI, Anthropic)");
             let results = run_ai_query_multiple(&rt, query).await?;
-            // Should have 5 columns: LocationID, Zone, openai, xai, anthropic
+            // Should have 5 columns: id, question, openai_answer, xai_answer, anthropic_answer
             assert_eq!(results.len(), 5, "Query should return 5 columns");
             // Check that AI responses are not empty
-            assert!(!results[2].is_empty(), "OpenAI (gpt-4o-mini) response should not be empty");
-            assert!(!results[3].is_empty(), "xAI (grok-4) response should not be empty");
-            assert!(!results[4].is_empty(), "Anthropic (claude-haiku) response should not be empty");
+            assert!(!results[2].is_empty(), "OpenAI (gpt-4o-mini) answer should not be empty");
+            assert!(!results[3].is_empty(), "xAI (grok-4) answer should not be empty");
+            assert!(!results[4].is_empty(), "Anthropic (claude-haiku) answer should not be empty");
 
             Ok(())
         })
@@ -252,11 +252,11 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Local model test - uses Llama 3
+            // Local model test - uses Phi-3.5 mini (has chat template support)
             let app = AppBuilder::new("ai_udf_local_test")
                 .with_model(get_local_model(
-                    "meta-llama/Meta-Llama-3-8B-Instruct",
-                    "llama",
+                    "microsoft/Phi-3.5-mini-instruct",
+                    "phi3",
                     "llama3",
                 ))
                 .build();
@@ -281,7 +281,7 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
 
             // Test 8: Basic query with local model
             let query = "SELECT ai('Say hello in one word', 'llama3')";
-            tracing::info!("Testing: Local model (Llama 3)");
+            tracing::info!("Testing: Local model (Phi-3.5-mini)");
             let result = run_ai_query(&rt, query).await?;
             assert!(
                 !result.is_empty(),
