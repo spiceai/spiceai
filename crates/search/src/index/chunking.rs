@@ -37,7 +37,7 @@ pub static CHUNKED_INDEX_CHUNK_KEY: &str = "_spice.chunk_id";
 
 /// Additional metadata field to store in underlying search index. This is only used when the
 /// underlying index has [`SearchIndex::search_column`] in [`SearchIndex::metadata_columns`].
-pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "spicefull_search_field";
+pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
 
 /// A [`SearchIndex`] that chunks the [`SearchIndex::search_column`] before each [`SearchIndex::write`].
 ///
