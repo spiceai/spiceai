@@ -21,6 +21,11 @@ use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, Zer
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
+use crate::execution_plan::TableScanParams;
+use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
+use crate::execution_plan::schema_cast::SchemaCastScanExec;
+use crate::execution_plan::slice::SliceExec;
+use crate::execution_plan::tee::TeeExec;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::SchemaRef;
@@ -45,15 +50,10 @@ use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
-
-use crate::execution_plan::TableScanParams;
-use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
-use crate::execution_plan::schema_cast::SchemaCastScanExec;
-use crate::execution_plan::slice::SliceExec;
-use crate::execution_plan::tee::TeeExec;
 
 pub mod federation;
 mod metrics;
@@ -103,7 +103,7 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display(
-        "Failed to find latest timestamp in accelerated table. Is the 'time_column' parameter correct?"
+        "Failed to find latest timestamp in accelerated table. Is the 'time_column' parameter correct? {source}"
     ))]
     FailedToQueryLatestTimestamp { source: DataFusionError },
 
@@ -245,6 +245,7 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    dataset_metrics: Option<Metrics>,
 }
 
 impl Builder {
@@ -277,6 +278,7 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            dataset_metrics: None,
         }
     }
 
@@ -312,6 +314,11 @@ impl Builder {
 
     pub fn refresh_semaphore(&mut self, refresh_semaphore: Arc<Semaphore>) -> &mut Self {
         self.refresh_semaphore = Some(refresh_semaphore);
+        self
+    }
+
+    pub fn dataset_metrics(&mut self, dataset_metrics: Metrics) -> &mut Self {
+        self.dataset_metrics = Some(dataset_metrics);
         self
     }
 
@@ -461,6 +468,7 @@ impl Builder {
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
         refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_dataset_metrics(self.dataset_metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
         }
@@ -547,6 +555,7 @@ impl AcceleratedTable {
     }
 
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
+        println!("trigger_refresh");
         if let Some(refresh_trigger) = self.refresh_trigger() {
             refresh_trigger
                 .send(overrides)

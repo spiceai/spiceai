@@ -1084,6 +1084,8 @@ impl DataFusion {
             accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
+        accelerated_table_builder.dataset_metrics(dataset.metrics.clone());
+
         if refresh_mode == RefreshMode::Changes {
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
