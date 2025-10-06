@@ -68,6 +68,7 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
             let query = "SELECT ai('hi', 'gpt-4o-mini')";
             tracing::info!("Testing: {}", query);
             let result = run_ai_query(&rt, query).await?;
+            tracing::info!("✓ Test 1 result (gpt-4o-mini): {}", result);
             assert!(
                 !result.is_empty(),
                 "Basic ai('hi', 'gpt-4o-mini') should return a response"
@@ -77,6 +78,7 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
             let query = "SELECT ai('hi', 'gpt-4o-mini')";
             tracing::info!("Testing: {}", query);
             let result = run_ai_query(&rt, query).await?;
+            tracing::info!("✓ Test 2 result (gpt-4o-mini): {}", result);
             assert!(
                 !result.is_empty(),
                 "ai('hi', 'gpt-4o-mini') should return a response"
@@ -86,6 +88,7 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
             let query = r#"SELECT ai('hi', 'claude-haiku') as "claude-haiku""#;
             tracing::info!("Testing: {}", query);
             let result = run_ai_query(&rt, query).await?;
+            tracing::info!("✓ Test 3 result (claude-haiku): {}", result);
             assert!(
                 !result.is_empty(),
                 "ai('hi', 'claude-haiku') with alias should return a response"
@@ -95,6 +98,11 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
             let query = "SELECT LEFT(ai('hi', 'gpt-4o-mini'), 10)";
             tracing::info!("Testing: {}", query);
             let result = run_ai_query(&rt, query).await?;
+            tracing::info!(
+                "✓ Test 4 result (LEFT 10 chars): '{}' (length: {})",
+                result,
+                result.len()
+            );
             assert!(
                 result.len() <= 10,
                 "LEFT(ai(), 10) should return at most 10 characters"
@@ -104,6 +112,9 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
             let query = "SELECT ai('hi', 'gpt-4o-mini'), ai('hi', 'claude-haiku')";
             tracing::info!("Testing: {}", query);
             let results = run_ai_query_multiple(&rt, query).await?;
+            tracing::info!("✓ Test 5 results:");
+            tracing::info!("  - gpt-4o-mini: {}", results[0]);
+            tracing::info!("  - claude-haiku: {}", results[1]);
             assert_eq!(
                 results.len(),
                 2,
@@ -172,6 +183,12 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
             LIMIT 5"#;
             tracing::info!("Testing: AI answering questions from MegaScience dataset with 3 providers (OpenAI, xAI, Anthropic)");
             let results = run_ai_query_multiple(&rt, query).await?;
+            tracing::info!("✓ Test 6 results (MegaScience Q&A):");
+            tracing::info!("  - Question ID: {}", results[0]);
+            tracing::info!("  - Question: {}", results[1]);
+            tracing::info!("  - OpenAI answer: {}", results[2]);
+            tracing::info!("  - xAI answer: {}", results[3]);
+            tracing::info!("  - Anthropic answer: {}", results[4]);
             // Should have 5 columns: id, question, openai_answer, xai_answer, anthropic_answer
             assert_eq!(results.len(), 5, "Query should return 5 columns");
             // Check that AI responses are not empty
@@ -230,6 +247,10 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
                 left(ai('What datasets do you have access to?', 'claude-haiku'), 25) as "anthropic""#;
             tracing::info!("Testing: LEFT truncation with 3 providers (OpenAI, xAI, Anthropic)");
             let results = run_ai_query_multiple(&rt, query).await?;
+            tracing::info!("✓ Test 7 results (LEFT 25 chars):");
+            tracing::info!("  - OpenAI: '{}' (length: {})", results[0], results[0].len());
+            tracing::info!("  - xAI: '{}' (length: {})", results[1], results[1].len());
+            tracing::info!("  - Anthropic: '{}' (length: {})", results[2], results[2].len());
             assert_eq!(results.len(), 3, "Query should return 3 columns");
             let provider_names = ["OpenAI (gpt-4o-mini)", "xAI (grok-4)", "Anthropic (claude-haiku)"];
             for (idx, result) in results.iter().enumerate() {
@@ -283,6 +304,7 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
             let query = "SELECT ai('Say hello in one word', 'llama3')";
             tracing::info!("Testing: Local model (Phi-3.5-mini)");
             let result = run_ai_query(&rt, query).await?;
+            tracing::info!("✓ Test 8 result (Phi-3.5-mini): {}", result);
             assert!(
                 !result.is_empty(),
                 "Local model (llama3) should return a response, got: '{result}'"
@@ -292,6 +314,9 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
             let query = "SELECT ai('hi', 'llama3'), ai('hello', 'llama3')";
             tracing::info!("Testing: Multiple calls to local model");
             let results = run_ai_query_multiple(&rt, query).await?;
+            tracing::info!("✓ Test 9 results (multiple local model calls):");
+            tracing::info!("  - First call ('hi'): {}", results[0]);
+            tracing::info!("  - Second call ('hello'): {}", results[1]);
             assert_eq!(results.len(), 2, "Query should return 2 columns");
             assert!(
                 !results[0].is_empty(),
