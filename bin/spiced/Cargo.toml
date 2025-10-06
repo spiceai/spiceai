@@ -65,6 +65,7 @@ default = [
     "clickhouse",
     "sharepoint",
     "snowflake",
+    "snapshots",
     "spark",
     "ftp",
     "debezium",
