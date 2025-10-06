@@ -426,7 +426,7 @@ impl AppBuilder {
         if snapshots.is_some() {
             in_tracing_context(|| {
                 tracing::warn!(
-                    "Snapshots configuration is defined. This feature is currently in preview."
+                    "Snapshots configuration is defined. Acceleration snapshots (preview) enabled."
                 );
             });
         }
