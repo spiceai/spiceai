@@ -414,7 +414,7 @@ impl Ai {
             .map(|(idx, msg_opt)| (idx, msg_opt.map(std::string::ToString::to_string)))
             .collect();
 
-        let results: Result<Vec<Option<String>>, DataFusionError> = stream::iter(messages)
+        let results: Result<Vec<(usize, Option<String>)>, DataFusionError> = stream::iter(messages)
             .map(|(row_index, message_str)| {
                 let model = Arc::clone(model);
                 let model_name_str = model_name.to_string();
@@ -423,7 +423,7 @@ impl Ai {
                     // Yield to allow tokio to cancel this task if needed (e.g., query timeout or user cancellation)
                     tokio::task::yield_now().await;
 
-                    if let Some(message) = message_str {
+                    let result = if let Some(message) = message_str {
                         // call_model internally calls chat_stream, which emits ai_completion spans
                         // Hierarchy: sql_query → ai → model_call (emits ai_completion to task_history)
                         match Self::call_model(&model, &model_name_str, &message, row_index).await {
@@ -442,24 +442,32 @@ impl Ai {
                         }
                     } else {
                         Ok::<Option<String>, DataFusionError>(None)
-                    }
+                    };
+                    result.map(|r| (row_index, r))
                 }
             })
             .buffer_unordered(parallelism)
-            .collect::<Vec<Result<Option<String>, DataFusionError>>>()
+            .collect::<Vec<Result<(usize, Option<String>), DataFusionError>>>()
             .await
             .into_iter()
             .collect();
 
-        let results = results?;
+        let mut results = results?;
+
+        // Restore original order by sorting by row_index
+        results.sort_by_key(|(idx, _)| *idx);
+
+        // Extract just the results, now in the correct order
+        let ordered_results: Vec<Option<String>> =
+            results.into_iter().map(|(_, result)| result).collect();
 
         debug_assert_eq!(
-            results.len(),
+            ordered_results.len(),
             array_len,
             "Result array length must match input array length"
         );
 
-        Ok(Arc::new(StringArray::from(results)) as ArrayRef)
+        Ok(Arc::new(StringArray::from(ordered_results)) as ArrayRef)
     }
 }
 
@@ -1299,8 +1307,8 @@ mod tests {
 
         let model_store_guard = model_store.read().await;
         let model = model_store_guard
-            .get("slow-model")
-            .expect("should get slow-model");
+            .get("test-model")
+            .expect("should get test-model");
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("Message 1"),
@@ -1313,7 +1321,7 @@ mod tests {
         let result = udf
             .process_messages(
                 Arc::clone(model),
-                "slow-model",
+                "test-model",
                 messages,
                 std::thread::available_parallelism()
                     .map(std::num::NonZero::get)
@@ -1331,7 +1339,7 @@ mod tests {
         for i in 0..5 {
             assert_eq!(
                 string_array.value(i),
-                format!("Response from slow-model: Message {}", i + 1)
+                format!("Response from test-model: Message {}", i + 1)
             );
         }
     }
