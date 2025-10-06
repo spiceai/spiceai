@@ -166,8 +166,8 @@ impl ChunkedSearchIndex {
                 MetadataColumn::NonFilterable(_) => {
                     additional.push(MetadataColumn::NonFilterable(new_field.into()));
                 }
-            };
-        };
+            }
+        }
         additional
     }
 
@@ -293,7 +293,7 @@ impl SearchIndex for ChunkedSearchIndex {
                         Arc::new(StringArray::from(
                             flatten_chunks
                                 .iter()
-                                .map(|s| s.to_string())
+                                .map(|s| (*s).to_string())
                                 .collect::<Vec<_>>(),
                         )) as ArrayRef,
                     ))
@@ -564,7 +564,7 @@ impl VectorIndex for ChunkedVectorIndex {
                 ),
                 None::<TableReference>,
                 self.search_column(),
-            )))
+            )));
         }
 
         Ok(LogicalPlan::Aggregate(

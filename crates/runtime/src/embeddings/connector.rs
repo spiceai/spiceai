@@ -236,16 +236,15 @@ impl EmbeddingConnector {
             .collect();
         let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
         for (column, config) in embedding_columns {
-            let (dataset_columns, index_schema) =
-                if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
-                    Self::updated_chunked_search_index_format(
-                        &inner_table_provider,
-                        dataset,
-                        column.clone(),
-                    )
-                } else {
-                    (dataset.columns.clone(), inner_table_provider.schema())
-                };
+            let (dataset_columns, index_schema) = if config
+                .chunking
+                .as_ref()
+                .is_some_and(|cfg| cfg.enabled)
+            {
+                Self::updated_chunked_search_index_format(&inner_table_provider, dataset, &column)
+            } else {
+                (dataset.columns.clone(), inner_table_provider.schema())
+            };
 
             let vector_index = super::index::s3::try_from_dataset(
                 &dataset.name,
@@ -398,7 +397,7 @@ impl EmbeddingConnector {
     fn updated_chunked_search_index_format(
         inner_table_provider: &Arc<dyn TableProvider>,
         dataset: &Dataset,
-        column: String,
+        column: &str,
     ) -> (Vec<spicepod::semantic::Column>, SchemaRef) {
         let mut dataset_columns = dataset.columns.clone();
         let mut dataset_fields = inner_table_provider
@@ -407,7 +406,7 @@ impl EmbeddingConnector {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        if let Some((_, f)) = inner_table_provider.schema().column_with_name(&column) {
+        if let Some((_, f)) = inner_table_provider.schema().column_with_name(column) {
             // These are internal columns that won't exist in existing columns. No need to find & replace.
             // get search field as metadata column.
             let search_metadata =
@@ -415,18 +414,16 @@ impl EmbeddingConnector {
                     .iter()
                     .find(|&c| c.name == column)
                     .and_then(|c| match c.metadata.get("vectors") {
-                        Some(serde_json::Value::String(v))
-                            if *v == "non-filterable".to_string() =>
-                        {
+                        Some(serde_json::Value::String(v)) if v == "non-filterable" => {
                             Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
                         }
-                        Some(serde_json::Value::String(v)) if *v == "filterable".to_string() => {
+                        Some(serde_json::Value::String(v)) if v == "filterable" => {
                             Some(MetadataColumn::Filterable(Arc::new(f.clone())))
                         }
                         _ => None,
                     });
 
-            for col in ChunkedSearchIndex::additional_metadata(column.as_str(), search_metadata) {
+            for col in ChunkedSearchIndex::additional_metadata(column, search_metadata) {
                 let vectors_val = match col {
                     MetadataColumn::Filterable(_) => "filterable",
                     MetadataColumn::NonFilterable(_) => "non-filterable",
@@ -442,7 +439,7 @@ impl EmbeddingConnector {
                 );
                 dataset_fields.push(col.field());
             }
-        };
+        }
         (dataset_columns, Arc::new(Schema::new(dataset_fields)))
     }
 }

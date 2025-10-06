@@ -81,11 +81,6 @@ impl MetadataColumns {
     }
 
     #[must_use]
-    pub fn column(&self, name: &str) -> Option<&MetadataColumn> {
-        self.0.iter().find(|m| m.name() == name)
-    }
-
-    #[must_use]
     pub fn non_filterable(&self) -> Vec<FieldRef> {
         self.0
             .iter()
