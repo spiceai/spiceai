@@ -471,14 +471,13 @@ impl TableProvider for SearchQueryProvider {
                 self.join_with_base(inner_proj.as_ref(), search_index, filters)?
             }
         }
-        .sort_with_limit(
-            vec![SortExpr::new(
-                Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
-                false, // descending
-                true,  // nulls_first
-            )],
-            limit,
-        )?;
+        // Can `limit` before sort because `SearchIndex`'s `query_table_provider` is already sorted by `SEARCH_SCORE_COLUMN_NAME`.
+        .limit(0, limit)?
+        .sort(vec![SortExpr::new(
+            Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
+            false, // descending
+            true,  // nulls_first
+        )])?;
 
         // Add final
         let final_plan = self
