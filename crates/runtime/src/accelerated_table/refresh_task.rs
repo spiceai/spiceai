@@ -160,7 +160,7 @@ impl RefreshTaskBuilder {
             enabled_dataset_metrics: self
                 .dataset_metrics
                 .as_ref()
-                .map(|m| m.enabled_metrics())
+                .map(spicepod::metric::Metrics::enabled_metrics)
                 .as_deref()
                 .unwrap_or(&[])
                 .iter()
@@ -425,33 +425,33 @@ impl RefreshTask {
             .as_millis() as i64;
 
         for label_set in dataset_metrics_label_sets {
-            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS) {
-                if let Some(val) = max_timestamp_before_refresh_ms {
-                    metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS.record(val, label_set);
-                }
+            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
+                && let Some(val) = max_timestamp_before_refresh_ms
+            {
+                metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS.record(val, label_set);
             }
 
-            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS) {
-                if let Some(val) = max_timestamp_after_refresh_ms_value {
-                    metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS.record(val, label_set);
-                }
+            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
+                && let Some(val) = max_timestamp_after_refresh_ms_value
+            {
+                metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS.record(val, label_set);
             }
 
-            if self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS) {
-                if let (Some(before), Some(after)) = (
+            if self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS)
+                && let (Some(before), Some(after)) = (
                     max_timestamp_before_refresh_ms,
                     max_timestamp_after_refresh_ms_value,
-                ) {
-                    let refresh_lag_ms = after - before;
-                    metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
-                }
+                )
+            {
+                let refresh_lag_ms = after - before;
+                metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
             }
 
-            if self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS) {
-                if let Some(after) = max_timestamp_after_refresh_ms_value {
-                    let ingestion_lag_ms = current_time_ms - after;
-                    metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
-                }
+            if self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS)
+                && let Some(after) = max_timestamp_after_refresh_ms_value
+            {
+                let ingestion_lag_ms = current_time_ms - after;
+                metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
             }
         }
     }
