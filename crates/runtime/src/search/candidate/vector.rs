@@ -104,7 +104,7 @@ impl ChunkedNonIndexVectorGeneration {
         n: usize,
     ) -> Result<LogicalPlan, DataFusionError> {
         let (pks, score_table, additional_table) =
-            self.score_cte_sql(tbl, &additional_columns, embedding, &opt_filters)?;
+            self.score_cte_sql(tbl, embedding, opt_filters)?;
 
         // First project just the columns we need
         let plan = LogicalPlanBuilder::new(score_table).project(
@@ -200,7 +200,6 @@ impl ChunkedNonIndexVectorGeneration {
     fn score_cte_sql(
         &self,
         tbl: &Arc<dyn TableProvider>,
-        additional_columns: &[LogicalExpr],
         embedding: &[f32],
         filters: &[LogicalExpr],
     ) -> Result<(Vec<String>, LogicalPlan, LogicalPlan), DataFusionError> {
@@ -229,6 +228,7 @@ impl ChunkedNonIndexVectorGeneration {
                     ]
                     .concat(),
                 )?
+                // Note: `datafusion_expr::builder::unnest` does not work for complex queries
                 .unnest_columns_with_options(
                     vec![
                         Column::new_unqualified("offset"),
@@ -300,6 +300,7 @@ impl ChunkedNonIndexVectorGeneration {
                 ident(embedding_col!(self.embedding_column)),
                 col(VSS_TEMP_GEN_ID_COLUMN),
             ])?
+            // Note: `datafusion_expr::builder::unnest` does not work for complex queries
             .unnest_columns_with_options(
                 vec![
                     Column::new_unqualified("offset"),
