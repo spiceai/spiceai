@@ -29,6 +29,7 @@ use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
 use std::time::Duration;
 use tracing::Subscriber;
+use tracing_log::LogTracer;
 use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, registry::LookupSpan};
 
 #[derive(PartialEq, Debug)]
@@ -80,9 +81,10 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "tpc_extension",
     "workers",
     "search",
+    "datafusion",
 ];
 
-const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off";
+const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
 
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
@@ -153,6 +155,7 @@ pub(crate) async fn init_tracing(
         );
 
     tracing::subscriber::set_global_default(subscriber)?;
+    LogTracer::init()?;
 
     Ok(())
 }

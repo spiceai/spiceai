@@ -13626,6 +13626,7 @@ dependencies = [
  "tokio",
  "tpc-extension",
  "tracing",
+ "tracing-log",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "util",
