@@ -113,14 +113,6 @@ impl SnapshotBehavior {
         snapshots: Option<Arc<Snapshots>>,
         snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
     ) -> Self {
-        // Snapshot support must be compiled in for snapshot creation to be possible.
-        if !SNAPSHOTS_ENABLED {
-            tracing::trace!(
-                "Snapshot creation is not enabled because snapshot support is not compiled in."
-            );
-            return SnapshotBehavior::Disabled;
-        }
-
         let Some(snapshots) = snapshots else {
             return SnapshotBehavior::Disabled;
         };
