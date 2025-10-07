@@ -40,6 +40,7 @@ use datafusion::{
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility},
 };
 use futures::StreamExt;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing::{Instrument, Level};
 
 use async_trait::async_trait;
@@ -417,11 +418,14 @@ impl Ai {
         // Clone model_name once outside the iterator to avoid repeated allocations
         let model_name_str = model_name.to_string();
 
+        let ctx = RequestContext::current(AsyncMarker::new().await);
+
         let results: Result<Vec<(usize, Option<String>)>, DataFusionError> = stream::iter(messages)
             .map(|(row_index, message_str)| {
                 let model = Arc::clone(model);
                 let model_name_str = model_name_str.clone();
 
+                // let ctx = RequestContext::current(AsyncMarker::new().await);
                 async move {
                     // Yield to allow tokio to cancel this task if needed (e.g., query timeout or user cancellation)
                     tokio::task::yield_now().await;

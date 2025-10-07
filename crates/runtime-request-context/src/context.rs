@@ -29,9 +29,9 @@ use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use crate::{datafusion::DataFusion, http::traceparent::TraceParent};
+use crate::TraceParent;
 
-use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
+use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
 type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
@@ -204,11 +204,11 @@ impl RequestContext {
         }
     }
 
-    pub async fn load_extensions(&self) {
-        if let Some(extension) = self.extension::<DatabricksAuthExtension>() {
-            extension.load_u2m_components().await;
-        }
-    }
+    // pub async fn load_extensions(&self) {
+    //     if let Some(extension) = self.extension::<DatabricksAuthExtension>() {
+    //         extension.load_u2m_components().await;
+    //     }
+    // }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -231,7 +231,6 @@ pub struct RequestContextBuilder {
     cache_control: CacheControl,
     client_supplied_cache_key: Option<String>,
     app: Option<Arc<App>>,
-    df: Option<Arc<DataFusion>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
     extensions: Extensions,
@@ -246,7 +245,6 @@ impl RequestContextBuilder {
             cache_control: CacheControl::Cache(CacheKeyType::Default),
             client_supplied_cache_key: None,
             app: None,
-            df: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
             extensions: Extensions::default(),
@@ -257,12 +255,6 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
         self.app = app;
-        self
-    }
-
-    #[must_use]
-    pub fn with_df_opt(mut self, df: Option<Arc<DataFusion>>) -> Self {
-        self.df = df;
         self
     }
 
@@ -289,14 +281,7 @@ impl RequestContextBuilder {
 
         self.baggage.extend(baggage::from_headers(headers));
 
-        let app = self.app.as_ref().map(Arc::clone);
-        let df = self.df.as_ref().map(Arc::clone);
-        if let Some(extension) = DatabricksAuthExtension::from_headers(&app, &df, headers) {
-            self.extensions
-                .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
-        }
-
-        match crate::http::traceparent::extract_trace_parent(headers) {
+        match super::extract_trace_parent(headers) {
             Ok(trace_parent) => {
                 self.trace_parent = trace_parent;
             }
@@ -419,9 +404,9 @@ impl RequestContextBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::request::CacheControl;
-    use crate::request::{CacheKeyType, Protocol, RequestContextBuilder};
     use http::{HeaderMap, HeaderValue};
+
+    use crate::{CacheControl, CacheKeyType, Protocol, RequestContextBuilder};
 
     #[test]
     fn test_bind_client_supplied_cache_key() {
