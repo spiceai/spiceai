@@ -263,18 +263,18 @@ impl Runtime {
     async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        let runtime = Arc::clone(&self);
-
         if let Err(err) = self.validate_dataset(&ds) {
             let ds_name = &ds.name;
             metrics::datasets::LOAD_ERROR.add(1, &[]);
             error_spaced!(spaced_tracer, "{}{err}", "");
-            runtime
-                .status
+            self.status
                 .update_dataset(ds_name, status::ComponentStatus::Error);
+            return;
         }
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
+
+        let runtime = Arc::clone(&self);
 
         let _ = retry(retry_strategy, || async {
             let connector = match Arc::clone(&runtime)
