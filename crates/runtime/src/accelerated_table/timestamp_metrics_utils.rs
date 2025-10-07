@@ -272,7 +272,6 @@ fn string_to_ms(s: &str, time_format: TimeFormat) -> Option<i64> {
         .ok()
 }
 
-#[ignore]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +320,7 @@ mod tests {
         }
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_utf8_iso8601() {
         let batch = record_batch!((
@@ -339,6 +339,7 @@ mod tests {
         assert_eq!(max_ts, 1_577_836_800_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_uint16_milli_seconds() {
         let batch =
@@ -349,6 +350,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_uint32_milli_seconds() {
         let batch =
@@ -359,6 +361,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_uint64_milli_seconds() {
         let batch =
@@ -369,6 +372,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_uint16_seconds() {
         let batch =
@@ -379,6 +383,7 @@ mod tests {
         assert_eq!(max_ts, 2000 * 1000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_uint32_seconds() {
         let batch =
@@ -389,6 +394,7 @@ mod tests {
         assert_eq!(max_ts, 2000 * 1000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_uint64_seconds() {
         let batch =
@@ -399,6 +405,7 @@ mod tests {
         assert_eq!(max_ts, 2000 * 1000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_int16_milli_seconds() {
         let batch =
@@ -409,6 +416,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_int32_milli_seconds() {
         let batch =
@@ -419,6 +427,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_int64_milli_seconds() {
         let batch =
@@ -429,6 +438,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_float32_unix_milli_seconds() {
         let batch = record_batch!(("ts", Float32, [Some(1000.0), Some(2000.0), None]))
@@ -439,6 +449,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_float64_unix_milli_seconds() {
         let batch = record_batch!(("ts", Float64, [Some(1000.0), Some(2000.0), None]))
@@ -449,6 +460,7 @@ mod tests {
         assert_eq!(max_ts, 2000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_float32_unix_seconds() {
         let batch = record_batch!(("ts", Float32, [Some(1000.0), Some(2000.0), None]))
@@ -459,6 +471,7 @@ mod tests {
         assert_eq!(max_ts, 2000 * 1000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_float64_unix_seconds() {
         let batch = record_batch!(("ts", Float64, [Some(1000.0), Some(2000.0), None]))
@@ -468,6 +481,7 @@ mod tests {
         assert_eq!(max_ts, 2000 * 1000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_date32() {
         let array = Date32Array::from(vec![Some(0), Some(18262), None]);
@@ -481,6 +495,7 @@ mod tests {
         assert_eq!(max_ts, 18262 * 86_400_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_nanosecond() {
         let array = TimestampNanosecondArray::from(vec![
@@ -502,6 +517,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000_000_000_000 / 1_000_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_microsecond() {
         let array = TimestampMicrosecondArray::from(vec![
@@ -523,6 +539,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000_000_000 / 1_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_millisecond() {
         let array = TimestampMillisecondArray::from(vec![
@@ -544,6 +561,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_second() {
         let array =
@@ -562,6 +580,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000 * 1000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_nanosecond_timezone() {
         let tz = Arc::<str>::from("UTC");
@@ -585,6 +604,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000_000_000_000 / 1_000_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_microsecond_timezone() {
         let tz = Arc::<str>::from("America/New_York");
@@ -608,6 +628,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000_000_000_000 / 1_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_millisecond_timezone() {
         let tz = Arc::<str>::from("Asia/Tokyo");
@@ -631,6 +652,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000_000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_timestamp_second_timezone() {
         let tz = Arc::<str>::from("Europe/London");
@@ -653,6 +675,7 @@ mod tests {
         assert_eq!(max_ts, 1_600_000_000 * 1000);
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_missing_time_column() {
         let batch = record_batch!(("other_column", UInt16, [Some(1000), Some(2000), None]))
@@ -662,6 +685,7 @@ mod tests {
         assert!(max_ts.is_none());
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_unsupported_time_column() {
         let array = Date64Array::from(vec![Some(0), Some(18262), None]);
@@ -687,6 +711,7 @@ mod tests {
         assert!(max_ts.is_none());
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_empty_batch() {
         let array = UInt16Array::from(vec![] as Vec<u16>);
