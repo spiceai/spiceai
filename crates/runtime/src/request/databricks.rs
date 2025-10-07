@@ -17,14 +17,15 @@ limitations under the License.
 use app::App;
 use datafusion::sql::TableReference;
 use http::HeaderMap;
+use runtime_request_context::RequestContextBuilder;
 use secrecy::SecretString;
 use spicepod::{
     component::{catalog::Catalog, dataset::Dataset},
     param::ParamValue,
 };
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{any::TypeId, collections::HashMap};
 
 use crate::{component::access::AccessMode, datafusion::DataFusion};
 
@@ -48,6 +49,24 @@ impl Default for DatabricksAuthExtension {
 }
 
 impl DatabricksAuthExtension {
+    pub fn new(
+        app: Option<Arc<App>>,
+        df: Option<Arc<DataFusion>>,
+        tokens: Arc<HashMap<String, SecretString>>,
+    ) -> Self {
+        Self { app, df, tokens }
+    }
+    pub fn add_from_headers(
+        self,
+        mut bldr: RequestContextBuilder,
+        headers: &HeaderMap,
+    ) -> RequestContextBuilder {
+        if let Some(extension) = DatabricksAuthExtension::from_headers(&self.app, &self.df, headers)
+        {
+            bldr.with_extension(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
+        }
+    }
+
     #[must_use]
     pub fn from_headers(
         app: &Option<Arc<App>>,

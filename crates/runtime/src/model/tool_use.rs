@@ -45,9 +45,9 @@ use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
 use crate::Runtime;
-use crate::request::{AsyncMarker, RequestContext};
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use llms::progress::Progress;
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,

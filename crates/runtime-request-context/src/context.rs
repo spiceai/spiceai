@@ -33,7 +33,7 @@ use crate::TraceParent;
 
 use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
-type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
+type Extensions = HashMap<TypeId, Arc<dyn Extension + Send + Sync>>;
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
@@ -43,7 +43,15 @@ pub struct RequestContext {
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
+    // extensions: Vec<Arc<dyn Extension + Send + Sync>>,
     trace_parent: Option<TraceParent>,
+}
+
+#[async_trait::async_trait]
+pub trait Extension: Any {
+    async fn load(&self) {
+        // no-op
+    }
 }
 
 tokio::task_local! {
@@ -189,13 +197,15 @@ impl RequestContext {
 
     pub fn extension<T>(&self) -> Option<Arc<T>>
     where
-        T: 'static + Send + Sync + Clone,
+        T: 'static + Extension + Send + Sync + Clone,
     {
         let extensions = self.extensions.read().ok()?;
         let type_id = TypeId::of::<T>();
+
+        let z = extensions.get(&type_id).unwrap();
         extensions
             .get(&type_id)
-            .and_then(|arc_any| Arc::clone(arc_any).downcast::<T>().ok())
+            .and_then(|arc_any| Arc::clone(arc_any)downcast::<T>().ok())
     }
 
     pub fn insert_extension<T: 'static + Send + Sync>(&self, extension: T) {
@@ -203,12 +213,6 @@ impl RequestContext {
             extensions.insert(TypeId::of::<T>(), Arc::new(extension));
         }
     }
-
-    // pub async fn load_extensions(&self) {
-    //     if let Some(extension) = self.extension::<DatabricksAuthExtension>() {
-    //         extension.load_u2m_components().await;
-    //     }
-    // }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -250,6 +254,12 @@ impl RequestContextBuilder {
             extensions: Extensions::default(),
             trace_parent: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_extension(mut self, id: TypeId, extension: Arc<dyn Any + Send + Sync>) -> Self {
+        self.extensions.insert(id, extension);
+        self
     }
 
     #[must_use]

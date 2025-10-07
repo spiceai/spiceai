@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::DataFusion;
-use crate::request::RequestContext;
+use runtime_request_context::RequestContext;
 use std::sync::Arc;
 
 #[derive(Clone)]

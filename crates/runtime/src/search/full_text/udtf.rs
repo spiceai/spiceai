@@ -49,12 +49,12 @@ use std::any::Any;
 use std::sync::LazyLock;
 use std::sync::{Arc, Weak};
 
-use crate::request::{AsyncMarker, RequestContext};
 use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
     search::util::{find_index_in_table_provider, table_ref_from_column_expr, to_column_expr},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
 pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> =

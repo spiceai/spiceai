@@ -26,7 +26,7 @@ use opentelemetry::KeyValue;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
-use crate::request::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[derive(Clone)]
 pub struct ModelContextExtension {

@@ -21,11 +21,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{
-    datafusion::{DataFusion, request_context_extension::DataFusionContextExtension},
-    request::{Protocol, RequestContext},
-};
+use crate::datafusion::{DataFusion, request_context_extension::DataFusionContextExtension};
 use app::App;
+use runtime_request_context::{Protocol, RequestContext};
 
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};

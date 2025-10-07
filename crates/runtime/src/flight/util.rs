@@ -20,7 +20,7 @@ use tonic::{
     metadata::{Ascii, MetadataValue},
 };
 
-use crate::request::{AsyncMarker, Protocol, RequestContext};
+use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 
 pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status: CacheStatus) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {

@@ -12106,6 +12106,7 @@ dependencies = [
  "runtime-datafusion-udfs",
  "runtime-object-store",
  "runtime-rate-control",
+ "runtime-request-context",
  "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.31",
@@ -12273,6 +12274,7 @@ name = "runtime-request-context"
 version = "1.8.0-unstable"
 dependencies = [
  "app",
+ "async-trait",
  "axum 0.8.4",
  "base64 0.22.1",
  "futures",

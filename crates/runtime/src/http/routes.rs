@@ -19,16 +19,17 @@ limitations under the License.
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
+use crate::request::DatabricksAuthExtension;
 use crate::{search::search_engine, status::RuntimeStatus};
 
 use crate::Runtime;
+use crate::config;
 #[cfg(feature = "openapi")]
 use crate::http::v1::{
     Format,
     datasets::{DatasetFilter, DatasetQueryParams},
 };
-use crate::request::Protocol;
-use crate::{config, request::RequestContext};
+use runtime_request_context::{Protocol, RequestContext};
 
 #[cfg(feature = "mcp")]
 use crate::tools::mcp::server::RuntimeServer;
@@ -320,13 +321,16 @@ async fn track_metrics(
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
-    let request_context = Arc::new(
-        RequestContext::builder(Protocol::Http)
-            .with_app_opt(app_lock.as_ref().map(Arc::clone))
-            .with_df_opt(Some(Arc::clone(&df)))
-            .from_headers(&headers)
-            .build(),
-    );
+    let app = app_lock.as_ref().map(Arc::clone);
+    let mut request_context_builder = RequestContext::builder(Protocol::Http)
+        .with_app_opt(app_lock.as_ref().map(Arc::clone))
+        .from_headers(&headers);
+
+    if let Some(ext) = DatabricksAuthExtension::from_headers(&app, &Some(Arc::clone(&df)), &headers)
+    {
+        request_context_builder = ext.add_from_headers(request_context_builder, &headers)
+    };
+    let request_context = Arc::new(request_context_builder.build());
 
     request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&df)));
 

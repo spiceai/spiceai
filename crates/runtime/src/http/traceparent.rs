@@ -16,16 +16,11 @@ limitations under the License.
 
 use axum::http::HeaderMap;
 use opentelemetry::trace::{SpanId, TraceId};
+use runtime_request_context::TraceParent;
 use tracing::Span;
 
 const MAX_VERSION: u8 = 254;
 const TRACEPARENT_HEADER: &str = "traceparent";
-
-/// Represents W3C `traceparent` header values.
-pub struct TraceParent {
-    pub trace_id: TraceId,
-    pub span_id: SpanId,
-}
 
 /// Use the span context from the traceparent header to override the `trace_id` & `parent_span_id` columns in the task history table.
 ///
