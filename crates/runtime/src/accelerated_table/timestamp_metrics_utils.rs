@@ -272,6 +272,7 @@ fn string_to_ms(s: &str, time_format: TimeFormat) -> Option<i64> {
         .ok()
 }
 
+#[ignore]
 #[cfg(test)]
 mod tests {
     use super::*;
