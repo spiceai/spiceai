@@ -519,10 +519,7 @@ impl DataFusion {
         };
 
         if matches!(dataset_access_mode, AccessMode::ReadWrite) {
-            self.data_writers
-                .write()
-                .map_err(|_| Error::UnableToLockDataWriters {})?
-                .insert(dataset_table_ref.clone());
+            self.mark_dataset_writable(&dataset_table_ref)?;
         }
 
         Ok(is_ready)
@@ -547,10 +544,24 @@ impl DataFusion {
     }
 
     pub fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
+        tracing::warn!(
+            "Access mode 'read_write' is enabled for catalog {catalog_name}. This feature is currently in preview."
+        );
         self.writable_catalogs
             .write()
             .map_err(|_| Error::UnableToLockWritableCatalogs {})?
             .insert(catalog_name.to_string());
+        Ok(())
+    }
+
+    pub fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
+        tracing::warn!(
+            "Access mode 'read_write' is enabled for dataset {dataset_name}. This feature is currently in preview."
+        );
+        self.data_writers
+            .write()
+            .map_err(|_| Error::UnableToLockDataWriters {})?
+            .insert(dataset_name.clone());
         Ok(())
     }
 

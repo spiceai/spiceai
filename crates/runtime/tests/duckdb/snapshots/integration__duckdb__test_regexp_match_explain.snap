@@ -1,0 +1,17 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                             |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                               |
+|               |   Federated                                                                                                                                                      |
+|               |  Projection: regexp_match(csv_test.region, Utf8("AMERICA"))                                                                                                      |
+|               |   TableScan: csv_test projection=[region]                                                                                                                        |
+| physical_plan | BytesProcessedExec                                                                                                                                               |
+|               |   SchemaCastScanExec                                                                                                                                             |
+|               |     CooperativeExec                                                                                                                                              |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT ARRAY[regexp_extract("csv_test"."region", 'AMERICA')] AS item FROM "csv_test" |
+|               |                                                                                                                                                                  |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+

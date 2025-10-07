@@ -25,13 +25,19 @@ use datafusion::{
     prelude::{Expr, ExprFunctionExt, col},
     sql::TableReference,
 };
+use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
+/// Additional primary key column to uniquely identify chunks within a single database row.
 pub static CHUNKED_INDEX_CHUNK_KEY: &str = "_spice.chunk_id";
+
+/// Additional metadata field to store in underlying search index. This is only used when the
+/// underlying index has [`SearchIndex::search_column`] in [`SearchIndex::metadata_columns`].
+pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
 
 /// A [`SearchIndex`] that chunks the [`SearchIndex::search_column`] before each [`SearchIndex::write`].
 ///
@@ -136,15 +142,33 @@ impl ChunkedSearchIndex {
     }
 
     #[must_use]
-    pub fn additional_metadata(search_column: &str) -> Vec<MetadataColumn> {
-        vec![MetadataColumn::NonFilterable(
+    pub fn additional_metadata(
+        search_column: &str,
+        search_field: Option<MetadataColumn>,
+    ) -> Vec<MetadataColumn> {
+        let mut additional = vec![MetadataColumn::NonFilterable(
             Field::new(
                 Self::chunking_offset_col(search_column),
                 DataType::FixedSizeList(Field::new("item", DataType::Int32, false).into(), 2),
                 false,
             )
             .into(),
-        )]
+        )];
+
+        // Need to add `CHUNKED_INDEX_FULL_SEARCH_FIELD` as metadata field to underlying index.
+        if let Some(search_field_metadata) = search_field {
+            let new_field = Arc::unwrap_or_clone(search_field_metadata.field())
+                .with_name(CHUNKED_INDEX_FULL_SEARCH_FIELD);
+            match search_field_metadata {
+                MetadataColumn::Filterable(_) => {
+                    additional.push(MetadataColumn::Filterable(new_field.into()));
+                }
+                MetadataColumn::NonFilterable(_) => {
+                    additional.push(MetadataColumn::NonFilterable(new_field.into()));
+                }
+            }
+        }
+        additional
     }
 
     pub fn new(inner: Arc<dyn SearchIndex>, chunker: Arc<dyn Chunker>) -> Self {
@@ -212,7 +236,8 @@ impl SearchIndex for ChunkedSearchIndex {
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         let schema = record.schema();
-        let Some((idx, _)) = schema.column_with_name(self.search_column().as_str()) else {
+        let Some((search_field_idx, _)) = schema.column_with_name(self.search_column().as_str())
+        else {
             return WriteFailedNoSearchColumnSnafu {
                 search_column: self.search_column(),
                 schema: record.schema(),
@@ -220,12 +245,12 @@ impl SearchIndex for ChunkedSearchIndex {
             .fail()
             .boxed();
         };
-        let arr = record.column(idx);
+        let search_field_array = record.column(search_field_idx);
 
-        let Some(arr_str) = convert_string_arrow_to_iterator!(arr) else {
+        let Some(arr_str) = convert_string_arrow_to_iterator!(search_field_array) else {
             return WriteFailedSearchColumnNoStringSnafu {
                 search_column: self.search_column(),
-                data_type: arr.data_type().clone(),
+                data_type: search_field_array.data_type().clone(),
             }
             .fail()
             .boxed();
@@ -262,11 +287,24 @@ impl SearchIndex for ChunkedSearchIndex {
             .enumerate()
             .map(|(i, arr)| {
                 let field = schema.field(i).clone();
-                if i == idx {
+                if i == search_field_idx {
                     Ok((
                         field,
-                        Arc::new(StringArray::from(flatten_chunks.clone())) as ArrayRef,
+                        Arc::new(StringArray::from(
+                            flatten_chunks
+                                .iter()
+                                .map(|s| (*s).to_string())
+                                .collect::<Vec<_>>(),
+                        )) as ArrayRef,
                     ))
+                } else if schema
+                    .column_with_name(CHUNKED_INDEX_FULL_SEARCH_FIELD)
+                    .is_some_and(|(idx, _)| i == idx)
+                {
+                    // If self.search_field is in self.inner.metadata_columns, we must add additional column. This colum will have full content.
+                    // During list/search, we shall ask for this column instead of the chunked version.
+                    // The chunked version must be provided to `self.inner` so that it can be indexed appropriately (e.g. embedded).
+                    Ok((field, repeat(search_field_array, &repeats)?))
                 } else {
                     Ok((field, repeat(arr, &repeats)?))
                 }
@@ -372,10 +410,11 @@ impl SearchIndex for ChunkedSearchIndex {
             .collect();
         sort_order_by.extend(pk_order_by); // `sort_order_by` needs to be first (i.e. first sort by 'score').
 
-        let aggr_expr: Vec<_> = schema
+        let mut aggr_expr: Vec<_> = schema
             .fields()
             .iter()
-            .filter(|f| !pk_names.contains(f.name())) // group expressions are in output by default.
+            // group expressions (primary keys) are in output by default.
+            .filter(|f| !pk_names.contains(f.name()) && f.name() != CHUNKED_INDEX_FULL_SEARCH_FIELD)
             .map(|f| {
                 first_value(
                     Expr::Column(Column::new_unqualified(f.name().clone())),
@@ -384,6 +423,20 @@ impl SearchIndex for ChunkedSearchIndex {
                 .alias(f.name().clone())
             })
             .collect();
+
+        // If present, alias `CHUNKED_INDEX_FULL_SEARCH_FIELD` -> self.search_field
+        if !schema
+            .columns_with_unqualified_name(CHUNKED_INDEX_FULL_SEARCH_FIELD)
+            .is_empty()
+        {
+            aggr_expr.push(
+                first_value(
+                    ident(CHUNKED_INDEX_FULL_SEARCH_FIELD),
+                    sort_order_by.clone(),
+                )
+                .alias(self.search_column()),
+            );
+        }
 
         let agg =
             LogicalPlan::Aggregate(Aggregate::try_new(tbl, pk_expr.clone(), aggr_expr.clone())?);
@@ -483,6 +536,7 @@ impl VectorIndex for ChunkedVectorIndex {
                         ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
                         embedding_col(self.search_column().as_str()),
                         CHUNKED_INDEX_CHUNK_KEY.to_string(),
+                        self.search_column(),
                     ]
                     .contains(c)
                     {
@@ -496,6 +550,22 @@ impl VectorIndex for ChunkedVectorIndex {
                 })
                 .collect::<Vec<_>>(),
         );
+
+        if self
+            .inner
+            .metadata_columns()
+            .all_names()
+            .contains(&CHUNKED_INDEX_FULL_SEARCH_FIELD.to_string())
+        {
+            aggr_expr.push(Expr::Alias(Alias::new(
+                first_value(
+                    Expr::Column(Column::new_unqualified(CHUNKED_INDEX_FULL_SEARCH_FIELD)),
+                    vec![],
+                ),
+                None::<TableReference>,
+                self.search_column(),
+            )));
+        }
 
         Ok(LogicalPlan::Aggregate(
             Aggregate::try_new(base_index_table.into(), group_by_pks, aggr_expr).boxed()?,
