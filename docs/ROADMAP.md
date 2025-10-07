@@ -15,20 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v1.8 (October 2025)](https://github.com/spiceai/spiceai/milestone/77)
-
-**Focus:** Hybrid Search.
-
-- **Hybrid Search**:
-  - Boosting and re-ranking for fine-tuned search results.
-- **Search**:
-  - Amazon S3 Vectors cross-index query.
-  - Amazon S3 Vectors chunking support.
-- **Hash Partitioning**: Improved query distribution and performance.
-- **Write Support**:
-  - Write-through caching support for Apache Iceberg.
-- **DataFusion**: Upgrade to v50.
-
 ### [v1.9 (November 2025)](https://github.com/spiceai/spiceai/milestone/78)
 
 **Focus:** Ingestion, Write, and Security.
@@ -38,7 +24,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Search**:
   - Amazon S3 Vectors index spilling.
 - **DuckDB**: Upgrade to v1.4.
-- **DataFusion**: Upgrade to v51.
+- **DataFusion**: Upgrade to v50.
 - **Security**:
   - Authentication improvements.
   - Security hardening.
@@ -51,6 +37,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Write Support**:
   - PostgreSQL write support (expanded).
   - Spice Cloud write support (expanded).
+- **DataFusion**: Upgrade to v51.
 
 ### v1.1x (H1 2026)
 

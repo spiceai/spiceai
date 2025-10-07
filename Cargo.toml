@@ -58,7 +58,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.89"
-version = "1.8.0-unstable"
+version = "1.9.0-unstable"
 
 [workspace.dependencies]
 ahash = "0.8.12"
