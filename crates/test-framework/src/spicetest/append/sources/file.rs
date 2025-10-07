@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -77,9 +78,9 @@ impl AppendableSource for FileAppendableSource {
 
                 for TableWithTimeColumn { name, column } in &self.tables {
                     let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
-                    sql += &format!(
+                    write!(sql,
                                 "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                         COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+                         COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy())?;
                 }
 
                 sql += "COMMIT;";
@@ -96,14 +97,14 @@ impl AppendableSource for FileAppendableSource {
                 for TableWithTimeColumn { name, column } in &self.tables {
                     // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
                     // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
-                    setup_sql += &format!(
+                    write!(setup_sql,
                         "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
                          ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                          INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
                          LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
                          COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
                         load_steps = config.load_steps
-                    );
+                    )?;
                 }
 
                 setup_sql += "COMMIT;";
@@ -150,10 +151,10 @@ impl AppendableSource for FileAppendableSource {
 
                 for TableWithTimeColumn { name, column } in &self.tables {
                     let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
-                    sql += &format!("ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                    write!(sql, "ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                                      INSERT INTO {name} SELECT * FROM {name}_new;
                                      DROP TABLE {name}_new;
-                                     COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+                                     COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy())?;
                 }
 
                 sql += "COMMIT;";
@@ -164,12 +165,12 @@ impl AppendableSource for FileAppendableSource {
                 let mut sql = "BEGIN;\n".to_string();
 
                 for TableWithTimeColumn { name, column } in &self.tables {
-                    sql += &format!("INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
+                    write!(sql, "INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
                                      FROM {name}_gen
                                      LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
                                      OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
                                      COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
-                            load_steps = config.load_steps);
+                            load_steps = config.load_steps)?;
                 }
 
                 sql += "COMMIT;";

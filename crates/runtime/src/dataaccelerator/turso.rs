@@ -21,21 +21,21 @@ use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider}
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::Session,
-    datasource::TableProvider,
+    datasource::{TableProvider, sink::{DataSink, DataSinkExec}},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{CreateExternalTable, Expr, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        insert::{DataSink, DataSinkExec},
         stream::RecordBatchStreamAdapter,
+        execution_plan::{Boundedness, EmissionType},
     },
-    sql::{sqlparser::dialect::SQLiteDialect, unparser::Unparser},
+    scalar::ScalarValue,
+    sql::unparser::{Unparser, dialect::SqliteDialect},
 };
-use datafusion_table_providers::util;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use libsql::{
-    Builder, Connection, Database, Row, Value as LibsqlValue, params::Params as LibsqlParams,
+use turso::{
+    Builder, Connection, Database, Value as TursoValue,
 };
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
@@ -43,7 +43,7 @@ use std::{any::Any, ffi::OsStr, fmt, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::{
-    component::dataset::acceleration::{Engine, Mode},
+    component::dataset::acceleration::Engine,
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -87,7 +87,7 @@ pub enum Error {
     InvalidConfiguration { detail: Arc<str> },
 
     #[snafu(display("Turso database error: {source}"))]
-    TursoDatabaseError { source: libsql::Error },
+    TursoDatabaseError { source: turso::Error },
 
     #[snafu(display(
         "Turso only supports file mode acceleration. Memory mode is not supported. Please set mode: file in your acceleration configuration."
@@ -110,17 +110,15 @@ pub struct TursoConnectionPool {
 
 impl TursoConnectionPool {
     pub async fn new(path: &str) -> Result<Self> {
-        let database = if path == ":memory:" {
-            Builder::new_local(path)
-                .build()
-                .await
-                .context(TursoDatabaseSnafu)?
-        } else {
-            Builder::new_local(path)
-                .build()
-                .await
-                .context(TursoDatabaseSnafu)?
-        };
+        // Turso does not support in-memory mode due to threading requirements
+        if path == ":memory:" {
+            return Err(Error::MemoryModeNotSupported);
+        }
+
+        let database = Builder::new_local(path)
+            .build()
+            .await
+            .context(TursoDatabaseSnafu)?;
 
         Ok(Self {
             database: Arc::new(database),
@@ -149,36 +147,8 @@ impl TursoTableProvider {
         }
     }
 
-    async fn query_to_record_batches(
-        &self,
-        query: String,
-    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.pool.connect().await?;
-        let mut stmt = conn.prepare(&query).await?;
-        let mut rows = stmt.query(()).await?;
-
-        let mut batches = Vec::new();
-        let mut row_data: Vec<Vec<LibsqlValue>> = Vec::new();
-
-        while let Some(row) = rows.next().await? {
-            let mut values = Vec::new();
-            for i in 0..self.schema.fields().len() {
-                let value = row.get_value(i as i32)?;
-                values.push(value);
-            }
-            row_data.push(values);
-        }
-
-        if !row_data.is_empty() {
-            let batch = Self::values_to_record_batch(&row_data, &self.schema)?;
-            batches.push(batch);
-        }
-
-        Ok(batches)
-    }
-
     fn values_to_record_batch(
-        rows: &[Vec<LibsqlValue>],
+        rows: &[Vec<TursoValue>],
         schema: &SchemaRef,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         use arrow::array::*;
@@ -191,8 +161,8 @@ impl TursoTableProvider {
                     let values: Vec<Option<i64>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Integer(i) => Some(*i),
-                            LibsqlValue::Null => None,
+                            TursoValue::Integer(i) => Some(*i),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -202,8 +172,8 @@ impl TursoTableProvider {
                     let values: Vec<Option<i32>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Integer(i) => i32::try_from(*i).ok(),
-                            LibsqlValue::Null => None,
+                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -213,8 +183,8 @@ impl TursoTableProvider {
                     let values: Vec<Option<u64>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Integer(i) => u64::try_from(*i).ok(),
-                            LibsqlValue::Null => None,
+                            TursoValue::Integer(i) => u64::try_from(*i).ok(),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -224,9 +194,9 @@ impl TursoTableProvider {
                     let values: Vec<Option<f64>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Real(f) => Some(*f),
-                            LibsqlValue::Integer(i) => Some(*i as f64),
-                            LibsqlValue::Null => None,
+                            TursoValue::Real(f) => Some(*f),
+                            TursoValue::Integer(i) => Some(*i as f64),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -236,9 +206,9 @@ impl TursoTableProvider {
                     let values: Vec<Option<f32>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Real(f) => Some(*f as f32),
-                            LibsqlValue::Integer(i) => Some(*i as f32),
-                            LibsqlValue::Null => None,
+                            TursoValue::Real(f) => Some(*f as f32),
+                            TursoValue::Integer(i) => Some(*i as f32),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -248,8 +218,8 @@ impl TursoTableProvider {
                     let values: Vec<Option<String>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Text(s) => Some(s.clone()),
-                            LibsqlValue::Null => None,
+                            TursoValue::Text(s) => Some(s.clone()),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -259,8 +229,8 @@ impl TursoTableProvider {
                     let values: Vec<Option<bool>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Integer(i) => Some(*i != 0),
-                            LibsqlValue::Null => None,
+                            TursoValue::Integer(i) => Some(*i != 0),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -270,38 +240,35 @@ impl TursoTableProvider {
                     let values: Vec<Option<&[u8]>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Blob(b) => Some(b.as_slice()),
-                            LibsqlValue::Null => None,
+                            TursoValue::Blob(b) => Some(b.as_slice()),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
                     Arc::new(BinaryArray::from(values))
                 }
-                DataType::Timestamp(unit, _) => {
+                DataType::Timestamp(_unit, _tz) => {
                     // Timestamps stored as INTEGER (milliseconds since epoch)
                     let values: Vec<Option<i64>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Integer(i) => Some(*i),
-                            LibsqlValue::Null => None,
+                            TursoValue::Integer(i) => Some(*i),
+                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
-                    Arc::new(
-                        arrow::array::TimestampMillisecondArray::from(values)
-                            .with_timezone_opt(None),
-                    )
+                    Arc::new(arrow::array::TimestampMillisecondArray::from(values).with_timezone_opt(None::<String>))
                 }
                 _ => {
                     // Default to string representation for unsupported types
                     let values: Vec<Option<String>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            LibsqlValue::Text(s) => Some(s.clone()),
-                            LibsqlValue::Integer(i) => Some(i.to_string()),
-                            LibsqlValue::Real(f) => Some(f.to_string()),
-                            LibsqlValue::Null => None,
-                            LibsqlValue::Blob(_) => Some("[BLOB]".to_string()),
+                            TursoValue::Text(s) => Some(s.clone()),
+                            TursoValue::Integer(i) => Some(i.to_string()),
+                            TursoValue::Real(f) => Some(f.to_string()),
+                            TursoValue::Null => None,
+                            TursoValue::Blob(_) => Some("[BLOB]".to_string()),
                         })
                         .collect();
                     Arc::new(StringArray::from(values))
@@ -352,7 +319,7 @@ impl TableProvider for TursoTableProvider {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _overwrite: InsertOp,
+        overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
@@ -360,8 +327,8 @@ impl TableProvider for TursoTableProvider {
                 Arc::clone(&self.pool),
                 self.table_name.clone(),
                 Arc::clone(&self.schema),
+                overwrite,
             )),
-            Arc::clone(&self.schema),
             None,
         )) as _)
     }
@@ -391,6 +358,7 @@ pub struct TursoExec {
     schema: SchemaRef,
     table_name: String,
     pool: Arc<TursoConnectionPool>,
+    #[allow(dead_code)] // Stored for future optimization of column selection
     projection: Option<Vec<usize>>,
     properties: PlanProperties,
 }
@@ -405,7 +373,8 @@ impl TursoExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
 
         Self {
@@ -487,7 +456,7 @@ impl ExecutionPlan for TursoExec {
                 let mut values = Vec::new();
                 for i in 0..schema.fields().len() {
                     let value = row
-                        .get_value(i as i32)
+                        .get_value(i)
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
                     values.push(value);
                 }
@@ -495,13 +464,13 @@ impl ExecutionPlan for TursoExec {
             }
 
             if all_rows.is_empty() {
-                return Ok(stream::empty().boxed());
+                return Ok::<_, datafusion::error::DataFusionError>(stream::empty().boxed());
             }
 
             let batch = TursoTableProvider::values_to_record_batch(&all_rows, &schema)
-                .map_err(|e| datafusion::error::DataFusionError::External(e))?;
+                .map_err(datafusion::error::DataFusionError::External)?;
 
-            Ok(stream::once(async move { Ok(batch) }).boxed())
+            Ok::<_, datafusion::error::DataFusionError>(stream::once(async move { Ok(batch) }).boxed())
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -512,18 +481,27 @@ impl ExecutionPlan for TursoExec {
 }
 
 /// Data sink for INSERT operations
+#[derive(Debug)]
 struct TursoDataSink {
     pool: Arc<TursoConnectionPool>,
     table_name: String,
     schema: SchemaRef,
+    overwrite: InsertOp,
+}
+
+impl DisplayAs for TursoDataSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "TursoDataSink(table={})", self.table_name)
+    }
 }
 
 impl TursoDataSink {
-    fn new(pool: Arc<TursoConnectionPool>, table_name: String, schema: SchemaRef) -> Self {
+    fn new(pool: Arc<TursoConnectionPool>, table_name: String, schema: SchemaRef, overwrite: InsertOp) -> Self {
         Self {
             pool,
             table_name,
             schema,
+            overwrite,
         }
     }
 
@@ -544,77 +522,61 @@ impl TursoDataSink {
             .map(|i| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let insert_sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            self.table_name,
-            columns.join(", "),
-            placeholders
-        );
+        
+        // Use INSERT OR REPLACE for Overwrite/Replace mode to support UPSERT/UPDATE
+        let insert_sql = match self.overwrite {
+            InsertOp::Overwrite | InsertOp::Replace => format!(
+                "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+                self.table_name,
+                columns.join(", "),
+                placeholders
+            ),
+            InsertOp::Append => format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                self.table_name,
+                columns.join(", "),
+                placeholders
+            ),
+        };
 
         // Insert each row
         for row_idx in 0..batch.num_rows() {
             let mut values = Vec::new();
             for col_idx in 0..batch.num_columns() {
                 let column = batch.column(col_idx);
-                let value = util::arrow_column_value_to_sql_value(column, row_idx)?;
+                let value = ScalarValue::try_from_array(column, row_idx)?;
 
                 // Convert DataFusion ScalarValue to libsql Value
                 let libsql_value = match value {
-                    datafusion::scalar::ScalarValue::Int64(Some(v)) => LibsqlValue::Integer(v),
-                    datafusion::scalar::ScalarValue::Int32(Some(v)) => {
-                        LibsqlValue::Integer(i64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::Int16(Some(v)) => {
-                        LibsqlValue::Integer(i64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::Int8(Some(v)) => {
-                        LibsqlValue::Integer(i64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::UInt64(Some(v)) => {
-                        LibsqlValue::Integer(i64::try_from(v).unwrap_or(i64::MAX))
-                    }
-                    datafusion::scalar::ScalarValue::UInt32(Some(v)) => {
-                        LibsqlValue::Integer(i64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::UInt16(Some(v)) => {
-                        LibsqlValue::Integer(i64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::UInt8(Some(v)) => {
-                        LibsqlValue::Integer(i64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::Float64(Some(v)) => LibsqlValue::Real(v),
-                    datafusion::scalar::ScalarValue::Float32(Some(v)) => {
-                        LibsqlValue::Real(f64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::Utf8(Some(v)) => LibsqlValue::Text(v),
-                    datafusion::scalar::ScalarValue::LargeUtf8(Some(v)) => LibsqlValue::Text(v),
-                    datafusion::scalar::ScalarValue::Boolean(Some(v)) => {
-                        LibsqlValue::Integer(if v { 1 } else { 0 })
-                    }
-                    datafusion::scalar::ScalarValue::Binary(Some(v)) => LibsqlValue::Blob(v),
-                    datafusion::scalar::ScalarValue::LargeBinary(Some(v)) => LibsqlValue::Blob(v),
-                    datafusion::scalar::ScalarValue::TimestampMillisecond(Some(v), _) => {
-                        LibsqlValue::Integer(v)
-                    }
-                    datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(v), _) => {
-                        LibsqlValue::Integer(v / 1000)
-                    }
-                    datafusion::scalar::ScalarValue::TimestampNanosecond(Some(v), _) => {
-                        LibsqlValue::Integer(v / 1_000_000)
-                    }
-                    datafusion::scalar::ScalarValue::TimestampSecond(Some(v), _) => {
-                        LibsqlValue::Integer(v * 1000)
-                    }
-                    datafusion::scalar::ScalarValue::Date32(Some(v)) => {
-                        LibsqlValue::Integer(i64::from(v))
-                    }
-                    datafusion::scalar::ScalarValue::Date64(Some(v)) => LibsqlValue::Integer(v),
-                    _ => LibsqlValue::Null,
+                    ScalarValue::Int64(Some(v)) => TursoValue::Integer(v),
+                    ScalarValue::Int32(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Int16(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Int8(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::UInt64(Some(v)) => TursoValue::Integer(i64::try_from(v).unwrap_or(i64::MAX)),
+                    ScalarValue::UInt32(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::UInt16(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::UInt8(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Float64(Some(v)) => TursoValue::Real(v),
+                    ScalarValue::Float32(Some(v)) => TursoValue::Real(f64::from(v)),
+                    ScalarValue::Utf8(Some(v)) => TursoValue::Text(v),
+                    ScalarValue::LargeUtf8(Some(v)) => TursoValue::Text(v),
+                    ScalarValue::Boolean(Some(v)) => TursoValue::Integer(if v { 1 } else { 0 }),
+                    ScalarValue::Binary(Some(v)) => TursoValue::Blob(v),
+                    ScalarValue::LargeBinary(Some(v)) => TursoValue::Blob(v),
+                    ScalarValue::TimestampMillisecond(Some(v), _) => TursoValue::Integer(v),
+                    ScalarValue::TimestampMicrosecond(Some(v), _) => TursoValue::Integer(v / 1000),
+                    ScalarValue::TimestampNanosecond(Some(v), _) => TursoValue::Integer(v / 1_000_000),
+                    ScalarValue::TimestampSecond(Some(v), _) => TursoValue::Integer(v * 1000),
+                    ScalarValue::Date32(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Date64(Some(v)) => TursoValue::Integer(v),
+                    _ => TursoValue::Null,
                 };
                 values.push(libsql_value);
             }
 
-            conn.execute(&insert_sql, libsql::params::Params::Positional(values))
+            // turso crate requires params as tuples
+            // Use () for empty params since we're using positional placeholders
+            conn.execute(&insert_sql, values)
                 .await?;
         }
 
@@ -626,6 +588,14 @@ impl TursoDataSink {
 impl DataSink for TursoDataSink {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
+        None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     async fn write_all(
@@ -640,7 +610,7 @@ impl DataSink for TursoDataSink {
             total_rows += batch.num_rows() as u64;
             self.insert_batch(&batch)
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                .map_err(datafusion::error::DataFusionError::External)?;
         }
 
         Ok(total_rows)
@@ -667,26 +637,23 @@ impl TursoDeletionSink {
 #[async_trait]
 impl DeletionSink for TursoDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.pool.connect().await?;
-
-        // Build WHERE clause using SQLite dialect unparser
-        let dialect = SQLiteDialect {};
-        let unparser = Unparser::new(&dialect);
-
+        // Build WHERE clause using SQLite dialect unparser (before async)
         let where_clause = if self.filters.is_empty() {
             String::new()
         } else {
-            let filter_sql = self
+            let dialect = SqliteDialect {};
+            let unparser = Unparser::new(&dialect);
+            let filter_sqls: Vec<String> = self
                 .filters
                 .iter()
-                .map(|f| unparser.expr_to_sql(f))
-                .collect::<datafusion::error::Result<Vec<_>>>()?
-                .join(" AND ");
-            format!(" WHERE {}", filter_sql)
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .collect::<datafusion::error::Result<Vec<_>>>()?;
+            format!(" WHERE {}", filter_sqls.join(" AND "))
         };
 
         let delete_sql = format!("DELETE FROM {}{}", self.table_name, where_clause);
 
+        let conn = self.pool.connect().await?;
         let rows_affected = conn
             .execute(&delete_sql, ())
             .await
@@ -765,6 +732,23 @@ impl TursoAccelerator {
         };
 
         db.connect().context(TursoDatabaseSnafu)
+    }
+
+    /// Returns the shared connection pool for a `Turso` database
+    pub async fn get_shared_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<Arc<TursoConnectionPool>> {
+        let turso_file = self.turso_file_path(source)?;
+
+        let mut pools = self.pools.lock().await;
+        if let Some(pool) = pools.get(&turso_file) {
+            Ok(Arc::clone(pool))
+        } else {
+            let pool = Arc::new(TursoConnectionPool::new(&turso_file).await?);
+            pools.insert(turso_file, Arc::clone(&pool));
+            Ok(pool)
+        }
     }
 }
 
@@ -960,12 +944,13 @@ impl DataAccelerator for TursoAccelerator {
         // Wrap in PolyTableProvider for proper read/write separation
         // This allows the table to support both reading and writing operations
         let write_provider = Arc::clone(&turso_provider);
-        let delete_provider = turso_provider;
+        let delete_provider = Arc::clone(&turso_provider);
+        let read_provider = turso_provider as Arc<dyn TableProvider>;
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
             delete_provider,
-            Arc::clone(&write_provider) as Arc<dyn TableProvider>,
+            read_provider,
         ));
 
         Ok(table_provider)

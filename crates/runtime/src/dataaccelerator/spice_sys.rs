@@ -61,7 +61,7 @@ enum AccelerationConnection {
     #[cfg(feature = "sqlite")]
     SQLite(SqliteConnectionPool),
     #[cfg(feature = "turso")]
-    Turso,
+    Turso(Arc<super::turso::TursoConnectionPool>),
 }
 
 #[derive(Debug, Snafu)]
@@ -261,6 +261,7 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "postgres"))]
         Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
+
         #[cfg(feature = "turso")]
         Engine::Turso => {
             let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
@@ -282,14 +283,12 @@ async fn acceleration_connection(
                 return TursoFileMissingSnafu { path: turso_file }.fail();
             }
 
-            let _conn = turso_accelerator
-                .get_connection(source)
+            let pool = turso_accelerator
+                .get_shared_pool(source)
                 .await
                 .context(TursoConnectionSnafu)?;
 
-            // For now, return Turso variant without actual connection pool
-            // This will be improved when full integration is complete
-            Ok(AccelerationConnection::Turso)
+            Ok(AccelerationConnection::Turso(pool))
         }
         #[cfg(not(feature = "turso"))]
         Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),

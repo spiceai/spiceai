@@ -8,7 +8,7 @@ This example demonstrates how to configure Turso as a data acceleration engine i
 
 If you attempt to use memory mode, you will receive an error:
 
-```
+```text
 Turso only supports file mode acceleration. Memory mode is not supported. Please set mode: file in your acceleration configuration.
 ```
 
@@ -119,7 +119,7 @@ Remote Turso database support will be available in the future when Turso is impl
 
 If you attempt to use remote parameters, you will receive an error:
 
-```
+```text
 Remote Turso databases are not supported when using Turso as a file accelerator. Remote database support (turso_url, turso_auth_token) will be available when Turso is used as a data connector.
 ```
 
