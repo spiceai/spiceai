@@ -24,7 +24,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{path::Path, pin::Pin};
-use tracing::Span;
 use tracing_futures::Instrument;
 
 use async_openai::{
@@ -530,33 +529,38 @@ pub fn message_to_mistral(
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        async move {
-            Ok::<Option<String>, OpenAIError>(
-                self.chat_request(
-                    CreateChatCompletionRequestArgs::default()
-                        .messages(vec![
-                            ChatCompletionRequestUserMessageArgs::default()
-                                .content(prompt)
-                                .build()?
-                                .into(),
-                        ])
-                        .build()?,
-                )
-                .instrument(Span::current())
-                .await?
-                .choices
-                .pop()
-                .and_then(|c| c.message.content),
-            )
-        }
-        .instrument(Span::current())
+        // BUG FIX: Remove double .instrument(Span::current()) calls that break span propagation
+        // The outer .instrument is redundant and interferes with parent span context
+        self.chat_request(
+            CreateChatCompletionRequestArgs::default()
+                .messages(vec![
+                    ChatCompletionRequestUserMessageArgs::default()
+                        .content(prompt)
+                        .build()
+                        .map_err(|e| Error::FailedToRunModel {
+                            source: Box::new(e),
+                        })?
+                        .into(),
+                ])
+                .build()
+                .map_err(|e| Error::FailedToRunModel {
+                    source: Box::new(e),
+                })?,
+        )
         .await
-        .boxed()
-        .context(FailedToLoadModelSnafu)
+        .map_err(|e| Error::FailedToRunModel {
+            source: Box::new(e),
+        })
+        .map(|resp| {
+            resp.choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.message.content)
+        })
     }
 
-    /// A basic health check to ensure the model can process future [`Self::run`] requests.
-    /// Default implementation is a basic call to [`Self::run`].
+    /// A basic health check to ensure the model can process future [`Self::run`]
+    /// requests. Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -604,6 +608,8 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
+        // BUG FIX: The stream() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
         let stream = self.stream(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -632,6 +638,9 @@ pub trait Chat: Sync + Send {
             .map(message_to_content)
             .collect::<Vec<String>>()
             .join("\n");
+
+        // BUG FIX: The run() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
         let choices: Vec<ChatChoice> = match self.run(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
