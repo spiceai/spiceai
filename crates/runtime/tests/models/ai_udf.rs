@@ -255,7 +255,7 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
             let provider_names = ["OpenAI (gpt-4o-mini)", "xAI (grok-4)", "Anthropic (claude-haiku)"];
             for (idx, result) in results.iter().enumerate() {
                 assert!(
-                    !result.is_empty() && result.len() <= 25,
+                    !result.is_empty() && result.chars().count() <= 25,
                     "{} result should be non-empty and <= 25 chars, got: '{}'",
                     provider_names[idx],
                     result
