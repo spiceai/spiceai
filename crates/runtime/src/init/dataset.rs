@@ -18,11 +18,11 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
-    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
-    OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
+    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::{
         access::AccessMode,
@@ -249,13 +249,33 @@ impl Runtime {
         Ok(data_connector)
     }
 
+    fn validate_dataset(&self, ds: &Arc<Dataset>) -> Result<()> {
+        if ds.has_full_text_column() && !ds.is_accelerated() {
+            return Err(FullTextSearchRequiresAccelerationSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .build());
+        }
+        Ok(())
+    }
+
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
+        let runtime = Arc::clone(&self);
+
+        if let Err(err) = self.validate_dataset(&ds) {
+            let ds_name = &ds.name;
+            metrics::datasets::LOAD_ERROR.add(1, &[]);
+            error_spaced!(spaced_tracer, "{}{err}", "");
+            runtime
+                .status
+                .update_dataset(ds_name, status::ComponentStatus::Error);
+        }
+
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
-        let runtime = Arc::clone(&self);
         let _ = retry(retry_strategy, || async {
             let connector = match Arc::clone(&runtime)
                 .load_dataset_connector(Arc::clone(&ds))
