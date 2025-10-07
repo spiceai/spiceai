@@ -256,7 +256,6 @@ postgres-write = []
 iceberg-write = []
 s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
-snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",
     "db_connection_pool/snowflake",

@@ -423,6 +423,14 @@ impl AppBuilder {
 
         spicepods.push(spicepod);
 
+        if snapshots.is_some() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Snapshots configuration is defined. Acceleration snapshots (preview) enabled."
+                );
+            });
+        }
+
         Ok(App {
             name: root_spicepod_name,
             secrets,
