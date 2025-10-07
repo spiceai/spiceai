@@ -275,7 +275,6 @@ impl Runtime {
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
-
         let _ = retry(retry_strategy, || async {
             let connector = match Arc::clone(&runtime)
                 .load_dataset_connector(Arc::clone(&ds))
