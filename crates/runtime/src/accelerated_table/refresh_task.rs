@@ -342,9 +342,10 @@ impl RefreshTask {
         Ok(())
     }
 
-    async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<i64> {
-        if refresh.time_column.is_some() {
-            match self.timestamp_nanos_for_append_query(refresh).await {
+    async fn get_max_timestamp_before_refresh(&self, _refresh: &Refresh) -> Option<i64> {
+        return None;
+        if _refresh.time_column.is_some() {
+            match self.timestamp_nanos_for_append_query(_refresh).await {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
                 Ok(None) => None,
                 Err(e) => {
