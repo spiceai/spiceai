@@ -36,7 +36,7 @@ jobs:
       - name: Add REL_VERSION to output
         id: set_version
         run: |
-          echo "rel_version=${{ env.REL_VERSION }}" >> $GITHUB_OUTPUT
+          echo "rel_version=1.8.0" >> $GITHUB_OUTPUT
 
   build-amd64:
     if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'amd64-arm64' || inputs.target == 'all' }}
