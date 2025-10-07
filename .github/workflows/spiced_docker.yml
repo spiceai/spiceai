@@ -18,6 +18,7 @@ on:
           - 'all'
           - 'amd64'
           - 'arm64'
+          - 'amd64-arm64'
           - 'cuda'
         default: 'all'
 
@@ -38,7 +39,7 @@ jobs:
           echo "rel_version=${{ env.REL_VERSION }}" >> $GITHUB_OUTPUT
 
   build-amd64:
-    if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'all' }}
+    if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'amd64-arm64' || inputs.target == 'all' }}
     needs: setup
     runs-on: spiceai-dev-runners
     steps:
@@ -63,8 +64,6 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-amd64
-          cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
@@ -117,7 +116,7 @@ jobs:
           path: /tmp/image-amd64-*.tar
 
   build-arm64:
-    if: ${{ github.event_name == 'push' || inputs.target == 'arm64' || inputs.target == 'all' }}
+    if: ${{ github.event_name == 'push' || inputs.target == 'arm64' || inputs.target == 'amd64-arm64' || inputs.target == 'all' }}
     needs: setup
     runs-on: hosted-linux-arm-runner-16-cores
     env:
@@ -159,8 +158,6 @@ jobs:
           file: Dockerfile
           platforms: linux/arm64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-arm64
-          cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
