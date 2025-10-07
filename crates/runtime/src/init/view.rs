@@ -20,7 +20,7 @@ use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu,
     FullTextSearchNotSupportedForViewSnafu, LogErrors, Result, Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
-    error_spaced, metrics,
+    metrics,
     secrets::Secrets,
     status,
     topological_ordering::construct_effected_in_topological_order,
