@@ -64,7 +64,7 @@ use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
