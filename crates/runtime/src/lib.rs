@@ -117,6 +117,7 @@ mod udtfs;
 mod view;
 mod worker;
 
+#[allow(clippy::result_large_err)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]

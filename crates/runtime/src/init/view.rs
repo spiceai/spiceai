@@ -165,7 +165,7 @@ impl Runtime {
 
     #[allow(clippy::result_large_err)]
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
-        if let Err(err) = self.validate_view(view) {
+        if let Err(err) = validate_view(view) {
             let view_name = &view.name;
             metrics::views::LOAD_ERROR.add(1, &[]);
             self.status
@@ -236,14 +236,6 @@ impl Runtime {
         Arc::clone(&self).remove_view(&view.name).await;
         let secrets = self.secrets();
         let _ = self.load_view(view, secrets);
-    }
-
-    fn validate_view(&self, view: &Arc<View>) -> Result<()> {
-        if view.has_full_text_column() {
-            return Err(FullTextSearchNotSupportedForViewSnafu.build());
-        }
-
-        Ok(())
     }
 
     /// Update views based on changed between the current and new app.
@@ -328,4 +320,12 @@ impl Runtime {
             }
         }
     }
+}
+
+fn validate_view(view: &Arc<View>) -> Result<()> {
+    if view.has_full_text_column() {
+        return Err(FullTextSearchNotSupportedForViewSnafu.build());
+    }
+
+    Ok(())
 }

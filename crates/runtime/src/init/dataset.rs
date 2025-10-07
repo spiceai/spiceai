@@ -249,21 +249,11 @@ impl Runtime {
         Ok(data_connector)
     }
 
-    fn validate_dataset(&self, ds: &Arc<Dataset>) -> Result<()> {
-        if ds.has_full_text_column() && !ds.is_accelerated() {
-            return Err(FullTextSearchRequiresAccelerationSnafu {
-                dataset_name: ds.name.to_string(),
-            }
-            .build());
-        }
-        Ok(())
-    }
-
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        if let Err(err) = self.validate_dataset(&ds) {
+        if let Err(err) = validate_dataset(&ds) {
             let ds_name = &ds.name;
             metrics::datasets::LOAD_ERROR.add(1, &[]);
             error_spaced!(spaced_tracer, "{}{err}", "");
@@ -894,4 +884,14 @@ pub struct RegisterDatasetContext {
     federated_read_table: FederatedTable,
     source: String,
     accelerated_table: Option<Arc<AcceleratedTable>>,
+}
+
+fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
+    if ds.has_full_text_column() && !ds.is_accelerated() {
+        return Err(FullTextSearchRequiresAccelerationSnafu {
+            dataset_name: ds.name.to_string(),
+        }
+        .build());
+    }
+    Ok(())
 }
