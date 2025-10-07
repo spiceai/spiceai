@@ -52,6 +52,7 @@ macro_rules! max_ts_macro {
     }};
 }
 
+#[allow(unreachable_code, unused_variables)]
 /// Extracts the maximum timestamp from a stream of record batches.
 ///
 /// The extraction uses `time_column` and `time_format` to interpret timestamps
@@ -73,26 +74,26 @@ macro_rules! max_ts_macro {
 ///             - If batches were not empty, a warning is logged
 pub async fn with_find_max_timestamp_in_stream(
     data_update: StreamingDataUpdate,
-    _schema: SchemaRef,
-    _time_column: Option<String>,
-    _time_format: Option<TimeFormat>,
-    _source_name: String,
+    schema: SchemaRef,
+    time_column: Option<String>,
+    time_format: Option<TimeFormat>,
+    source_name: String,
 ) -> (StreamingDataUpdate, Option<Arc<Mutex<Option<i64>>>>) {
     return (data_update, None);
 
-    let Some(time_column) = _time_column else {
+    let Some(time_column) = time_column else {
         return (data_update, None);
     };
 
-    let time_format = _time_format.unwrap_or_default();
-    let Some(field) = _schema
+    let time_format = time_format.unwrap_or_default();
+    let Some(field) = schema
         .column_with_name(&time_column)
         .map(|(_, f)| f)
         .cloned()
     else {
         tracing::warn!(
             "Failed to extract max_timestamp after refresh for {}: column {} not found in schema.",
-            _source_name,
+            source_name,
             time_column,
         );
         return (data_update, None);
@@ -107,8 +108,8 @@ pub async fn with_find_max_timestamp_in_stream(
         time_format,
         field,
         max_ts_clone,
-        Arc::clone(&_schema),
-        _source_name,
+        Arc::clone(&schema),
+        source_name,
     );
 
     let new_data_update = StreamingDataUpdate {
