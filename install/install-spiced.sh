@@ -255,7 +255,7 @@ installFile() {
         exit 1
     fi
 
-    chmod o+x "$tmp_root_spiced"
+    chmod a+x "$tmp_root_spiced"
     
     # Copy to install directory (use runAsRoot if needed)
     if [ "$USE_SUDO" = "true" ]; then
