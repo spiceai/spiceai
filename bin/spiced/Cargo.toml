@@ -65,6 +65,7 @@ default = [
     "dremio",
     "clickhouse",
     "sharepoint",
+    "snapshots",
     "snowflake",
     "spark",
     "ftp",
@@ -104,6 +105,7 @@ postgres-write = ["runtime/postgres-write"]
 release = []
 sharepoint = ["runtime/sharepoint"]
 snowflake = ["runtime/snowflake"]
+snapshots = ["runtime/snapshots"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
