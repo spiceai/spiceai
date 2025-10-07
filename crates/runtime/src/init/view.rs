@@ -322,7 +322,6 @@ impl Runtime {
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn validate_view(view: &Arc<View>) -> Result<()> {
     if view.has_full_text_column() {
         return Err(FullTextSearchNotSupportedForViewSnafu.build());

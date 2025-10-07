@@ -886,7 +886,6 @@ pub struct RegisterDatasetContext {
     accelerated_table: Option<Arc<AcceleratedTable>>,
 }
 
-#[allow(clippy::result_large_err)]
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
         return Err(FullTextSearchRequiresAccelerationSnafu {

@@ -136,17 +136,11 @@ pub enum Error {
     #[snafu(display("Unable to start OpenTelemetry server: {source}"))]
     UnableToStartOpenTelemetryServer { source: opentelemetry::Error },
 
-    #[snafu(display("Unknown data source: {data_source}"))]
-    UnknownDataSource { data_source: String },
-
     #[snafu(display("Unable to create data backend: {source}"))]
     UnableToCreateBackend { source: datafusion::Error },
 
     #[snafu(display("Unable to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
-
-    #[snafu(display("Unable to attach dataset index: {source}"))]
-    UnableToAttachIndex { source: datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
@@ -190,20 +184,6 @@ pub enum Error {
         "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     OdbcNotInstalled,
-
-    #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
-    UnableToLoadDataConnectorSecrets { data_connector: String },
-
-    #[snafu(display("Unable to get secret for data connector {data_connector}: {source}"))]
-    UnableToGetSecretForDataConnector {
-        source: Box<dyn std::error::Error + Send + Sync>,
-        data_connector: String,
-    },
-
-    #[snafu(display("Unable to get secret for LLM: {source}"))]
-    UnableToGetSecretForLLM {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 
     #[snafu(display("Failed to setup the {connector_component} ({data_connector}). {source}"))]
     UnableToAttachDataConnector {
@@ -279,22 +259,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to load worker: {source}"))]
-    UnableToLoadWorker {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("The data connector {dataconnector} doesn't support catalogs."))]
-    DataConnectorDoesntSupportCatalogs { dataconnector: String },
-
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
         dataset: TableReference,
         source: datafusion::Error,
     },
-
-    #[snafu(display("Unable to receive accelerated table status: {source}"))]
-    UnableToReceiveAcceleratedTableStatus { source: RecvError },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
@@ -307,9 +276,6 @@ pub enum Error {
 
     #[snafu(display("Unable to create eval runs table: {source}"))]
     UnableToCreateEvalRunsTable { source: InternalTableError },
-
-    #[snafu(display("Unable to register metrics table: {source}"))]
-    UnableToRegisterMetricsTable { source: datafusion::Error },
 
     #[snafu(display("Invalid dataset defined in Spicepod: {source}"))]
     InvalidSpicepodDataset {
