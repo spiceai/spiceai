@@ -1,0 +1,45 @@
+[package]
+name = "runtime-secrets"
+description = "Secrets management utilities for the Spice.ai runtime"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+dotenvy.workspace = true
+indexmap.workspace = true
+logos.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tracing.workspace = true
+
+# Optional dependencies for feature-gated secret stores
+aws-config = { workspace = true, optional = true }
+aws-sdk-secretsmanager = { workspace = true, optional = true }
+aws-sdk-sts = { workspace = true, optional = true }
+keyring = { version = "3.6.3", features = [
+    "apple-native",
+    "windows-native",
+    "linux-native",
+], optional = true }
+
+[dev-dependencies]
+rand.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+
+[features]
+aws-secrets-manager = [
+    "dep:aws-config",
+    "dep:aws-sdk-secretsmanager",
+    "dep:aws-sdk-sts",
+]
+default = ["keyring-secret-store", "aws-secrets-manager"]
+keyring-secret-store = ["dep:keyring"]

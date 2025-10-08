@@ -12014,7 +12014,6 @@ dependencies = [
  "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
  "aws-sdk-glue",
- "aws-sdk-secretsmanager",
  "aws-sdk-sts",
  "axum 0.8.4",
  "axum-extra",
@@ -12043,7 +12042,6 @@ dependencies = [
  "db_connection_pool",
  "dirs",
  "document_parse",
- "dotenvy",
  "duckdb",
  "event_stream",
  "flight_client",
@@ -12070,9 +12068,7 @@ dependencies = [
  "itertools 0.14.0",
  "jsonpath-rust",
  "jsonwebtoken",
- "keyring",
  "llms",
- "logos",
  "mediatype",
  "model_components",
  "moka",
@@ -12107,6 +12103,7 @@ dependencies = [
  "runtime-datafusion-udfs",
  "runtime-object-store",
  "runtime-rate-control",
+ "runtime-secrets",
  "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.31",
@@ -12264,6 +12261,29 @@ dependencies = [
  "governor",
  "rand 0.9.2",
  "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "runtime-secrets"
+version = "1.9.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-secretsmanager",
+ "aws-sdk-sts",
+ "base64 0.22.1",
+ "dotenvy",
+ "indexmap 2.11.4",
+ "keyring",
+ "logos",
+ "rand 0.9.2",
+ "reqwest",
+ "secrecy",
+ "serde_json",
+ "snafu",
+ "spicepod",
  "tokio",
  "tracing",
 ]

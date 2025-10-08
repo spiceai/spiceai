@@ -85,6 +85,11 @@ impl Secrets {
     /// Initializes the runtime secrets based on the provided secret store configuration.
     ///
     /// If no secret stores are provided, the default secret store is set to `env`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the `from` field references an unknown store or when a store
+    /// requires (or disallows) a selector and the config is invalid.
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
         self.stores.clear();
 
@@ -152,6 +157,10 @@ impl Secrets {
     }
 
     /// Gets a secret key from the connected secret stores in precedence order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by an underlying secret store implementation.
     pub async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
         for store in self.stores.values() {
             match store.get_secret(key).await {
