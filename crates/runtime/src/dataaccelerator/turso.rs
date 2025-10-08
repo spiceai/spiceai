@@ -607,33 +607,32 @@ impl SQLExecutor for TursoTableProvider {
                     DataFusionError::Execution(format!("Failed to connect to Turso: {}", e))
                 })?;
 
-                let mut stmt = conn.prepare(&query).await.map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to prepare query: {}", e))
-                })?;
-
-                let mut rows = stmt.query(()).await.map_err(|e| {
+                let mut rows = conn.query(&query, ()).await.map_err(|e| {
                     DataFusionError::Execution(format!("Turso query failed: {}", e))
                 })?;
 
-                let mut all_rows = Vec::new();
+                let mut rows_vec: Vec<Vec<TursoValue>> = Vec::new();
                 while let Some(row) = rows.next().await.map_err(|e| {
                     DataFusionError::Execution(format!("Failed to fetch row: {}", e))
                 })? {
                     let mut values = Vec::new();
                     for i in 0..schema_clone.fields().len() {
                         let value = row.get_value(i).map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to get value: {}", e))
+                            DataFusionError::Execution(format!(
+                                "Failed to get value at index {}: {}",
+                                i, e
+                            ))
                         })?;
                         values.push(value);
                     }
-                    all_rows.push(values);
+                    rows_vec.push(values);
                 }
 
-                if all_rows.is_empty() {
+                if rows_vec.is_empty() {
                     return Ok(RecordBatch::new_empty(schema_clone));
                 }
 
-                TursoTableProvider::values_to_record_batch(&all_rows, &schema_clone).map_err(|e| {
+                TursoTableProvider::values_to_record_batch(&rows_vec, &schema_clone).map_err(|e| {
                     DataFusionError::Execution(format!("Failed to convert Turso results: {}", e))
                 })
             };
@@ -655,11 +654,7 @@ impl SQLExecutor for TursoTableProvider {
 
         // Query the table schema using SQLite's pragma
         let query = format!("PRAGMA table_info({})", table_name);
-        let mut stmt = conn.prepare(&query).await.map_err(|e| {
-            DataFusionError::Execution(format!("Failed to prepare schema query: {}", e))
-        })?;
-
-        let mut rows = stmt.query(()).await.map_err(|e| {
+        let mut rows = conn.query(&query, ()).await.map_err(|e| {
             DataFusionError::Execution(format!("Failed to get table schema: {}", e))
         })?;
 
@@ -670,6 +665,7 @@ impl SQLExecutor for TursoTableProvider {
             .map_err(|e| DataFusionError::Execution(format!("Failed to fetch schema row: {}", e)))?
         {
             // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+            // We need to extract: name (index 1), type (index 2), notnull (index 3)
             let col_name = row.get_value(1).map_err(|e| {
                 DataFusionError::Execution(format!("Failed to get column name: {}", e))
             })?;
@@ -677,14 +673,14 @@ impl SQLExecutor for TursoTableProvider {
                 DataFusionError::Execution(format!("Failed to get column type: {}", e))
             })?;
             let not_null = row.get_value(3).map_err(|e| {
-                DataFusionError::Execution(format!("Failed to get not_null: {}", e))
+                DataFusionError::Execution(format!("Failed to get notnull flag: {}", e))
             })?;
 
             if let (
                 TursoValue::Text(col_name),
                 TursoValue::Text(col_type),
                 TursoValue::Integer(not_null),
-            ) = (col_name, col_type, not_null)
+            ) = (&col_name, &col_type, &not_null)
             {
                 let data_type = match col_type.to_uppercase().as_str() {
                     "INTEGER" => DataType::Int64,
@@ -693,8 +689,8 @@ impl SQLExecutor for TursoTableProvider {
                     "BLOB" => DataType::Binary,
                     _ => DataType::Utf8,
                 };
-                let nullable = not_null == 0;
-                fields.push(Field::new(&col_name, data_type, nullable));
+                let nullable = *not_null == 0;
+                fields.push(Field::new(col_name.as_str(), data_type, nullable));
             }
         }
 
@@ -1833,6 +1829,8 @@ mod tests {
 
         // Clean up if file exists from previous test
         let _ = std::fs::remove_file(test_path);
+        let _ = std::fs::remove_file(format!("{}-wal", test_path));
+        let _ = std::fs::remove_file(format!("{}-shm", test_path));
 
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
