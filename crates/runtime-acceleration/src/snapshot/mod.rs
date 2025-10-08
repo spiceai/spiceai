@@ -224,9 +224,8 @@ impl<'a> SnapshotPathLayout<'a> {
         let expected_dataset_part = self.dataset_partition_expected();
         if dataset_part.as_ref() != expected_dataset_part {
             tracing::trace!(
-                expected = %expected_dataset_part,
-                actual = %dataset_part.as_ref(),
-                "Dataset partition mismatch while parsing snapshot path",
+                "Dataset partition mismatch while parsing snapshot path. expected={expected_dataset_part} actual={}",
+                dataset_part.as_ref()
             );
             return None;
         }
@@ -236,9 +235,7 @@ impl<'a> SnapshotPathLayout<'a> {
         let expected_month_part = format!("month={}", timestamp.format("%Y-%m"));
         if month_part != expected_month_part {
             tracing::trace!(
-                expected = %expected_month_part,
-                actual = %month_part,
-                "Month partition mismatch while parsing snapshot path",
+                "Month partition mismatch while parsing snapshot path. expected={expected_month_part} actual={month_part}"
             );
             return None;
         }
@@ -246,9 +243,7 @@ impl<'a> SnapshotPathLayout<'a> {
         let expected_day_part = format!("day={}", timestamp.format("%Y-%m-%d"));
         if day_part != expected_day_part {
             tracing::trace!(
-                expected = %expected_day_part,
-                actual = %day_part,
-                "Day partition mismatch while parsing snapshot path",
+                "Day partition mismatch while parsing snapshot path. expected={expected_day_part} actual={day_part}"
             );
             return None;
         }
@@ -381,9 +376,8 @@ impl SnapshotManager {
         let local_path = self.local_path.clone();
 
         tracing::info!(
-            dataset = %self.dataset_name,
-            snapshot = %location,
-            "Uploading snapshot."
+            "Uploading snapshot. dataset={} snapshot={location}",
+            self.dataset_name
         );
 
         let file = fs::File::open(&local_path).await.context(OpenLocalSnafu {
@@ -415,17 +409,13 @@ impl SnapshotManager {
                     }
                     Err(source) => {
                         tracing::error!(
-                            dataset = %self.dataset_name,
-                            snapshot = %location,
-                            error = %source,
-                            "Failed to read local snapshot file while uploading."
+                            "Failed to read local snapshot file while uploading. dataset={} snapshot={location} error={source}",
+                            self.dataset_name
                         );
                         if let Err(abort_source) = upload.abort().await {
                             tracing::warn!(
-                                dataset = %self.dataset_name,
-                                snapshot = %location,
-                                error = %abort_source,
-                                "Failed to abort snapshot upload after read failure."
+                                "Failed to abort snapshot upload after read failure. dataset={} snapshot={location} error={abort_source}",
+                                self.dataset_name
                             );
                             return Err(SnapshotUploadError::AbortUpload {
                                 path: location_path.clone(),
@@ -449,17 +439,13 @@ impl SnapshotManager {
 
             if let Err(source) = upload.put_part(chunk.into()).await {
                 tracing::error!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location,
-                    error = %source,
-                    "Snapshot upload part failed."
+                    "Snapshot upload part failed. dataset={} snapshot={location} error={source}",
+                    self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %location,
-                        error = %abort_source,
-                        "Failed to abort snapshot upload after part failure."
+                        "Failed to abort snapshot upload after part failure. dataset={} snapshot={location} error={abort_source}",
+                        self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
                         path: location_path.clone(),
@@ -476,26 +462,20 @@ impl SnapshotManager {
         match upload.complete().await {
             Ok(_) => {
                 tracing::info!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location,
-                    size = total_bytes,
-                    "Snapshot uploaded."
+                    "Snapshot uploaded. dataset={} snapshot={location} size={total_bytes}",
+                    self.dataset_name
                 );
                 Ok(location)
             }
             Err(source) => {
                 tracing::error!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location,
-                    error = %source,
-                    "Failed to finalize snapshot upload."
+                    "Failed to finalize snapshot upload. dataset={} snapshot={location} error={source}",
+                    self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %location,
-                        error = %abort_source,
-                        "Failed to abort snapshot upload after completion failure."
+                        "Failed to abort snapshot upload after completion failure. dataset={} snapshot={location} error={abort_source}",
+                        self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
                         path: location_path,
@@ -533,10 +513,9 @@ impl SnapshotManager {
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
                         tracing::warn!(
-                            dataset = %self.dataset_name,
-                            location = %location,
-                            error = %err,
-                            "Failed to bootstrap snapshot; continuing without a downloaded snapshot."
+                            "Failed to bootstrap snapshot; continuing without a downloaded snapshot. dataset={} location={} error={err}",
+                            self.dataset_name,
+                            location
                         );
                         Ok(None)
                     }
@@ -555,10 +534,9 @@ impl SnapshotManager {
                         Ok(result) => Ok(result),
                         Err(err) => {
                             tracing::error!(
-                                dataset = %dataset_name,
-                                location = %location,
-                                error = %err,
-                                "Failed to bootstrap snapshot; retrying."
+                                "Failed to bootstrap snapshot; retrying. dataset={} location={} error={err}",
+                                dataset_name,
+                                location
                             );
                             Err(RetryError::transient(err))
                         }
@@ -572,10 +550,8 @@ impl SnapshotManager {
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
                         tracing::warn!(
-                            dataset = %self.dataset_name,
-                            location = %location,
-                            error = %err,
-                            "Failed to bootstrap snapshot even after fallback attempts; continuing."
+                            "Failed to bootstrap snapshot even after fallback attempts; continuing. dataset={} location={location} error={err}",
+                            self.dataset_name,
                         );
                         Ok(None)
                     }
@@ -590,20 +566,20 @@ impl SnapshotManager {
     ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
         let candidates = self.list_snapshot_candidates().await?;
         if let Some(candidate) = candidates.into_iter().next() {
+            let snapshot_display = candidate.location.to_string();
+            let timestamp_display = candidate.display_timestamp.clone();
             tracing::info!(
-                dataset = %self.dataset_name,
-                snapshot = %candidate.location.to_string(),
-                timestamp = %candidate.display_timestamp,
-                "Downloading latest snapshot."
+                "Downloading latest snapshot. dataset={} snapshot={snapshot_display} timestamp={timestamp_display}",
+                self.dataset_name
             );
             self.download_snapshot(candidate.location(), checkpointer_factory)
                 .await
                 .map(Some)
         } else {
+            let location_display = self.snapshots_location.to_string();
             tracing::debug!(
-                dataset = %self.dataset_name,
-                location = %self.snapshots_location.to_string(),
-                "No snapshots found; continuing without bootstrapping."
+                "No snapshots found; continuing without bootstrapping. dataset={} location={location_display}",
+                self.dataset_name
             );
             Ok(None)
         }
@@ -627,27 +603,24 @@ impl SnapshotManager {
                 Ok(schema) => return Ok(Some(schema)),
                 Err(SnapshotDownloadError::MissingSchema { path }) => {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %path,
-                        "Snapshot missing schema; attempting to download the next available snapshot."
+                        "Snapshot missing schema; attempting to download the next available snapshot. dataset={} snapshot={path}",
+                        self.dataset_name,
                     );
                 }
                 Err(err) => {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %path_display,
-                        error = %err,
-                        "Failed to download snapshot while attempting fallback."
+                        "Failed to download snapshot while attempting fallback. dataset={} snapshot={path_display} error={err}",
+                        self.dataset_name,
                     );
                     return Err(err);
                 }
             }
         }
 
+        let location_display = self.snapshots_location.to_string();
         tracing::warn!(
-            dataset = %self.dataset_name,
-            location = %self.snapshots_location.to_string(),
-            "All available snapshots are missing schemas; continuing without bootstrapping."
+            "All available snapshots are missing schemas; continuing without bootstrapping. dataset={} location={location_display}",
+            self.dataset_name
         );
 
         Ok(None)
@@ -666,7 +639,11 @@ impl SnapshotManager {
                     path: listing_path.clone(),
                     source,
                 })
-                .inspect_err(|e| tracing::error!(error = %e))?;
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "Failed to list snapshots while iterating object store listing. path={listing_path} error={e}"
+                    );
+                })?;
 
             if let Some(candidate) = Self::snapshot_candidate_from_meta(meta, &self.dataset_name) {
                 snapshots.push(candidate);
@@ -674,12 +651,11 @@ impl SnapshotManager {
         }
 
         snapshots.sort_by(|a, b| b.cmp(a));
+        let location_display = self.snapshots_location.to_string();
+        let count = snapshots.len();
         tracing::info!(
-            dataset = %self.dataset_name,
-            location = %self.snapshots_location.to_string(),
-            count = snapshots.len(),
-            "Found {} snapshot candidates.",
-            snapshots.len()
+            "Found {count} snapshot candidates. dataset={} location={location_display}",
+            self.dataset_name
         );
         Ok(snapshots)
     }
@@ -699,9 +675,8 @@ impl SnapshotManager {
         })?;
 
         tracing::info!(
-            dataset = %self.dataset_name,
-            snapshot = %location.to_string(),
-            "Downloading snapshot."
+            "Downloading snapshot. dataset={} snapshot={location}",
+            self.dataset_name
         );
 
         let bytes =
@@ -730,12 +705,10 @@ impl SnapshotManager {
             }
         })?;
 
+        let local_path_display = self.local_path.display();
         tracing::info!(
-            dataset = %self.dataset_name,
-            snapshot = %location.to_string(),
-            size = bytes_len,
-            "Snapshot downloaded to {}.",
-            self.local_path.to_string_lossy()
+            "Snapshot downloaded to {local_path_display}. dataset={} snapshot={location} size={bytes_len}",
+            self.dataset_name
         );
 
         let checkpointer = (checkpointer_factory)()
@@ -748,16 +721,14 @@ impl SnapshotManager {
             .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?
         {
             tracing::info!(
-                dataset = %self.dataset_name,
-                snapshot = %location.to_string(),
-                "Snapshot schema verified."
+                "Snapshot schema verified. dataset={} snapshot={location}",
+                self.dataset_name
             );
             Ok(schema)
         } else {
             tracing::warn!(
-                dataset = %self.dataset_name,
-                snapshot = %location.to_string(),
-                "Snapshot schema not found."
+                "Snapshot schema not found. dataset={} snapshot={location}",
+                self.dataset_name
             );
             Err(SnapshotDownloadError::MissingSchema { path: path_display })
         }
@@ -770,11 +741,11 @@ impl SnapshotManager {
         let layout = SnapshotPathLayout::new(dataset_name);
         let candidate = layout.candidate_from_meta(meta)?;
 
+        let snapshot_display = candidate.location.to_string();
+        let timestamp = &candidate.display_timestamp;
         tracing::debug!(
-            dataset = %dataset_name,
-            snapshot = %candidate.location.to_string(),
-            timestamp = %candidate.display_timestamp,
-            "Found snapshot candidate."
+            "Found snapshot candidate. dataset={} snapshot={snapshot_display} timestamp={timestamp}",
+            dataset_name
         );
 
         Some(candidate)
