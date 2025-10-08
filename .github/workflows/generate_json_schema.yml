@@ -18,6 +18,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
 
       - name: Set up make
+        if: runner.os != 'macOS'
         uses: ./.github/actions/setup-make
 
       - name: Build Cargo project
