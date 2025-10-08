@@ -142,6 +142,12 @@ pub fn from_s3_url_and_config(
     Ok(Box::new(builder.build()?))
 }
 
+/// Extracts the bucket name from an S3 URL
+///
+/// # Errors
+///
+/// Returns an error if the URL does not contain a valid bucket name
+#[must_use]
 pub fn get_bucket_name(url: &Url) -> Result<&str> {
     url.host_str().ok_or_else(|| Error::ParseBucketName {
         url: url.to_string(),
