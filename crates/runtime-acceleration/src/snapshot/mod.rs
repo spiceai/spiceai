@@ -857,7 +857,7 @@ async fn build_s3_object_store(
 
     if load_credentials_from_environment {
         tracing::trace!("Loading S3 credentials from environment");
-        if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config()
+        if let Some(sdk_config) = aws_sdk_credential_bridge::initialize_sdk_config().await
             && sdk_config.credentials_provider().is_some()
         {
             tracing::trace!("Using S3 credentials provider from SDK config");
