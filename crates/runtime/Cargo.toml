@@ -27,7 +27,6 @@ aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
-aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
@@ -51,7 +50,6 @@ datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
-dotenvy.workspace = true
 duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",
@@ -79,13 +77,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.3", features = [
-    "apple-native",
-    "windows-native",
-    "linux-native",
-], optional = true }
 llms = { path = "../llms" }
-logos.workspace = true
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -132,6 +124,7 @@ runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-table-partition = { path = "../runtime-table-partition" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 rusqlite = { workspace = true, optional = true }
@@ -208,8 +201,8 @@ rdkafka = { workspace = true, features = ["ssl-vendored"] }
 [features]
 aws-secrets-manager = [
     "dep:aws-config",
-    "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
+    "runtime-secrets/aws-secrets-manager",
 ]
 bedrock = ["dep:aws-config"]
 clickhouse = [
@@ -237,7 +230,7 @@ extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
 imap = ["data_components/imap", "dep:imap"]
-keyring-secret-store = ["dep:keyring"]
+keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
 models = ["model_components/full", "mcp", "dep:strsim", "runtime-datafusion-udfs/models"]
