@@ -125,20 +125,13 @@ impl TursoConnectionPool {
     pub async fn new(path: &str) -> Result<Self> {
         // Turso supports both file and memory modes
         // Memory mode uses ":memory:" as the path
+        // Enable MVCC (Multi-Version Concurrency Control)
+        // This is required for BEGIN CONCURRENT transactions
         let database = Builder::new_local(path)
+            .with_mvcc(true)
             .build()
             .await
             .context(TursoDatabaseSnafu)?;
-
-        // Enable MVCC (Multi-Version Concurrency Control) by setting WAL mode
-        // This is required for BEGIN CONCURRENT transactions
-        let conn = database.connect().context(TursoDatabaseSnafu)?;
-        let mut rows = conn
-            .query("PRAGMA journal_mode=WAL", ())
-            .await
-            .context(TursoDatabaseSnafu)?;
-        // Consume the result row (PRAGMA returns the mode that was set)
-        let _ = rows.next().await;
 
         Ok(Self {
             database: Arc::new(database),
@@ -1107,11 +1100,13 @@ impl TursoAccelerator {
 
         let db = if source.is_file_accelerated() {
             Builder::new_local(&turso_file)
+                .with_mvcc(true)
                 .build()
                 .await
                 .context(TursoDatabaseSnafu)?
         } else {
             Builder::new_local(":memory:")
+                .with_mvcc(true)
                 .build()
                 .await
                 .context(TursoDatabaseSnafu)?
