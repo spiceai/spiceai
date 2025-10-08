@@ -26,7 +26,9 @@ use datafusion::{
         sink::{DataSink, DataSinkExec},
     },
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{CreateExternalTable, Expr, TableType, dml::InsertOp},
+    logical_expr::{
+        CreateExternalTable, Expr, TableProviderFilterPushDown, TableType, dml::InsertOp,
+    },
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
