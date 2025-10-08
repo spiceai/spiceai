@@ -1777,10 +1777,12 @@ mod tests {
         let pool = Arc::new(TursoConnectionPool {
             database: Arc::new(
                 Builder::new_local(":memory:")
+                    .with_mvcc(true)
                     .build()
                     .await
                     .expect("should create database"),
             ),
+            mvcc_enabled: true,
         });
 
         // Test 1: Full schema (no projection), no filter, no limit
@@ -1880,6 +1882,7 @@ mod tests {
         let _ = std::fs::remove_file(test_path);
         let _ = std::fs::remove_file(format!("{}-wal", test_path));
         let _ = std::fs::remove_file(format!("{}-shm", test_path));
+        let _ = std::fs::remove_file(format!("{}-log", test_path));
 
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
@@ -1983,6 +1986,7 @@ mod tests {
         let _ = std::fs::remove_file(test_path);
         let _ = std::fs::remove_file(format!("{}-wal", test_path));
         let _ = std::fs::remove_file(format!("{}-shm", test_path));
+        let _ = std::fs::remove_file(format!("{}-log", test_path));
     }
 
     #[tokio::test]
