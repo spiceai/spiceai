@@ -427,17 +427,15 @@ impl TableProvider for TursoTableProvider {
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
-    ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+    ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
         let dialect = SqliteDialect {};
         let unparser = Unparser::new(&dialect);
 
         let mut filter_push_down = vec![];
         for filter in filters {
             match unparser.expr_to_sql(filter) {
-                Ok(_) => filter_push_down
-                    .push(datafusion::logical_expr::TableProviderFilterPushDown::Exact),
-                Err(_) => filter_push_down
-                    .push(datafusion::logical_expr::TableProviderFilterPushDown::Unsupported),
+                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
         }
         Ok(filter_push_down)
