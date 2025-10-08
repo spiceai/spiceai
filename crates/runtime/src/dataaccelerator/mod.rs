@@ -682,3 +682,381 @@ mod test {
         fs::remove_file(path).expect("file removed");
     }
 }
+
+#[cfg(all(test, any(feature = "sqlite", feature = "turso")))]
+mod sqlite_compat_tests {
+    //! Shared compatibility test suite for SQLite and Turso accelerators.
+    //! These tests ensure both accelerators behave identically for common operations.
+    
+    use super::*;
+    use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray, UInt64Array, Float64Array, BooleanArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use data_components::delete::get_deletion_provider;
+    use datafusion::{
+        common::{Constraints, TableReference, ToDFSchema},
+        execution::context::SessionContext,
+        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
+        physical_plan::collect,
+        scalar::ScalarValue,
+    };
+    use datafusion_table_providers::util::test::MockExec;
+    use std::collections::HashMap;
+
+    /// Test helper that runs the same test logic against both SQLite and Turso
+    async fn run_compat_test<F, Fut>(test_fn: F)
+    where
+        F: Fn(Engine, Arc<dyn TableProvider>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let engines = vec![
+            #[cfg(feature = "sqlite")]
+            Engine::Sqlite,
+            #[cfg(feature = "turso")]
+            Engine::Turso,
+        ];
+
+        for engine in engines {
+            println!("Testing with engine: {:?}", engine);
+            
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+            let external_table = CreateExternalTable {
+                schema: df_schema,
+                name: TableReference::bare(format!("test_table_{:?}", engine)),
+                location: String::new(),
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::new_unverified(vec![]),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+
+            let ctx = SessionContext::new();
+            
+            let table = match engine {
+                #[cfg(feature = "sqlite")]
+                Engine::Sqlite => {
+                    use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                    SqliteAccelerator::new()
+                        .create_external_table(external_table, None, None)
+                        .await
+                        .expect("SQLite table should be created")
+                }
+                #[cfg(feature = "turso")]
+                Engine::Turso => {
+                    use crate::dataaccelerator::turso::TursoAccelerator;
+                    TursoAccelerator::new()
+                        .create_external_table(external_table, None, None)
+                        .await
+                        .expect("Turso table should be created")
+                }
+                _ => panic!("Unsupported engine for this test"),
+            };
+
+            test_fn(engine, table).await;
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unreadable_literal)]
+    async fn test_basic_insert_and_query() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            // Insert test data
+            let id_array = Int64Array::from(vec![1, 2, 3]);
+            let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+            let value_array = Float64Array::from(vec![Some(1.5), Some(2.5), None]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(value_array)],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Query back the data
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            assert_eq!(results.len(), 1, "{:?}: should have 1 batch", engine);
+            let batch = &results[0];
+            assert_eq!(batch.num_rows(), 3, "{:?}: should have 3 rows", engine);
+            assert_eq!(batch.num_columns(), 3, "{:?}: should have 3 columns", engine);
+
+            // Verify data
+            let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id should be Int64Array");
+            assert_eq!(id_col.value(0), 1);
+            assert_eq!(id_col.value(1), 2);
+            assert_eq!(id_col.value(2), 3);
+
+            let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().expect("name should be StringArray");
+            assert_eq!(name_col.value(0), "Alice");
+            assert_eq!(name_col.value(1), "Bob");
+            assert_eq!(name_col.value(2), "Charlie");
+
+            let value_col = batch.column(2).as_any().downcast_ref::<Float64Array>().expect("value should be Float64Array");
+            assert_eq!(value_col.value(0), 1.5);
+            assert_eq!(value_col.value(1), 2.5);
+            assert!(value_col.is_null(2));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unreadable_literal)]
+    async fn test_delete_operations() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            // Insert test data
+            let id_array = Int64Array::from(vec![1, 2, 3, 4, 5]);
+            let name_array = StringArray::from(vec!["A", "B", "C", "D", "E"]);
+            let value_array = Float64Array::from(vec![Some(10.0), Some(20.0), Some(30.0), Some(40.0), Some(50.0)]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(value_array)],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Get deletion provider
+            let table = get_deletion_provider(table).expect("should support deletion");
+
+            // Delete rows where id > 3
+            let filter = col("id").gt(lit(3_i64));
+            let plan = table
+                .delete_from(&ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("deletion successful");
+
+            let actual = result
+                .first()
+                .expect("result should have at least one batch")
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("result should be UInt64Array");
+
+            assert_eq!(actual.value(0), 2, "{:?}: should delete 2 rows", engine);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_null_handling() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            // Insert data with nulls
+            let id_array = Int64Array::from(vec![1, 2, 3]);
+            let name_array = StringArray::from(vec!["X", "Y", "Z"]);
+            let value_array = Float64Array::from(vec![Some(1.0), None, Some(3.0)]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(value_array)],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Query back and verify nulls are preserved
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let batch = &results[0];
+            let value_col = batch.column(2).as_any().downcast_ref::<Float64Array>().expect("value should be Float64Array");
+
+            assert!(!value_col.is_null(0), "{:?}: row 0 should not be null", engine);
+            assert!(value_col.is_null(1), "{:?}: row 1 should be null", engine);
+            assert!(!value_col.is_null(2), "{:?}: row 2 should not be null", engine);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_boolean_values() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("active", DataType::Boolean, false),
+            ]));
+
+            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+            let external_table = CreateExternalTable {
+                schema: df_schema,
+                name: TableReference::bare(format!("test_bool_{:?}", engine)),
+                location: String::new(),
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::new_unverified(vec![]),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+
+            let bool_table = match engine {
+                #[cfg(feature = "sqlite")]
+                Engine::Sqlite => {
+                    use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                    SqliteAccelerator::new()
+                        .create_external_table(external_table, None, None)
+                        .await
+                        .expect("SQLite table should be created")
+                }
+                #[cfg(feature = "turso")]
+                Engine::Turso => {
+                    use crate::dataaccelerator::turso::TursoAccelerator;
+                    TursoAccelerator::new()
+                        .create_external_table(external_table, None, None)
+                        .await
+                        .expect("Turso table should be created")
+                }
+                _ => panic!("Unsupported engine"),
+            };
+
+            // Insert boolean data
+            let id_array = Int64Array::from(vec![1, 2, 3]);
+            let name_array = StringArray::from(vec!["A", "B", "C"]);
+            let bool_array = BooleanArray::from(vec![true, false, true]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(bool_array)],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = bool_table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Query and verify boolean values
+            let scan = bool_table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let batch = &results[0];
+            let bool_col = batch.column(2).as_any().downcast_ref::<BooleanArray>().expect("active should be BooleanArray");
+
+            assert_eq!(bool_col.value(0), true, "{:?}: row 0 should be true", engine);
+            assert_eq!(bool_col.value(1), false, "{:?}: row 1 should be false", engine);
+            assert_eq!(bool_col.value(2), true, "{:?}: row 2 should be true", engine);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_empty_result_set() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+
+            // Query empty table
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            // Both should return empty results gracefully
+            assert!(results.is_empty() || results[0].num_rows() == 0, 
+                "{:?}: empty table should return empty results", engine);
+        })
+        .await;
+    }
+}
