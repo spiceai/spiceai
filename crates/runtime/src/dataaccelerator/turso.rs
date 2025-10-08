@@ -34,9 +34,8 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
-    sql::{unparser::{Unparser, dialect::SqliteDialect}, TableReference},
+    sql::unparser::{Unparser, dialect::SqliteDialect},
 };
-use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
@@ -241,8 +240,9 @@ impl TursoTableProvider {
                         .collect();
                     Arc::new(BinaryArray::from(values))
                 }
-                DataType::Timestamp(_unit, _tz) => {
-                    // Timestamps stored as INTEGER (milliseconds since epoch)
+                DataType::Timestamp(unit, tz) => {
+                    // Timestamps stored as INTEGER in Turso/SQLite (milliseconds since epoch by default)
+                    // but we need to match the schema's expected unit
                     let values: Vec<Option<i64>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
@@ -251,10 +251,26 @@ impl TursoTableProvider {
                             _ => None,
                         })
                         .collect();
-                    Arc::new(
-                        arrow::array::TimestampMillisecondArray::from(values)
-                            .with_timezone_opt(None::<String>),
-                    )
+
+                    use arrow::datatypes::TimeUnit;
+                    match unit {
+                        TimeUnit::Second => Arc::new(
+                            arrow::array::TimestampSecondArray::from(values)
+                                .with_timezone_opt(tz.clone()),
+                        ),
+                        TimeUnit::Millisecond => Arc::new(
+                            arrow::array::TimestampMillisecondArray::from(values)
+                                .with_timezone_opt(tz.clone()),
+                        ),
+                        TimeUnit::Microsecond => Arc::new(
+                            arrow::array::TimestampMicrosecondArray::from(values)
+                                .with_timezone_opt(tz.clone()),
+                        ),
+                        TimeUnit::Nanosecond => Arc::new(
+                            arrow::array::TimestampNanosecondArray::from(values)
+                                .with_timezone_opt(tz.clone()),
+                        ),
+                    }
                 }
                 _ => {
                     // Default to string representation for unsupported types
@@ -514,21 +530,85 @@ impl TursoDataSink {
         &self,
         batch: &RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
         let conn = self.pool.connect().await?;
 
-        // Use the same InsertBuilder pattern as SQLite and other SQL accelerators
-        let insert_table_builder =
-            InsertBuilder::new(&TableReference::bare(self.table_name.clone()), vec![batch.clone()]);
+        // Build column list and placeholders for prepared statement
+        let columns: Vec<String> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
 
-        let sql = insert_table_builder
-            .build_sqlite(None) // Turso uses SQLite syntax, no ON CONFLICT support
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let placeholders = (1..=columns.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        // Wrap in a transaction for atomic batch insert
-        let batch_sql = format!("BEGIN;\n{}\nCOMMIT;", sql);
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            self.table_name,
+            columns.join(", "),
+            placeholders
+        );
 
-        // Execute the entire batch in one call
-        conn.execute_batch(&batch_sql).await?;
+        // Use a transaction to batch all inserts
+        conn.execute("BEGIN", ()).await?;
+
+        // Prepare the statement once
+        let mut stmt = conn.prepare(&insert_sql).await?;
+
+        // Execute for each row using prepared statement (much faster than building SQL strings)
+        for row_idx in 0..batch.num_rows() {
+            let mut values = Vec::new();
+            for col_idx in 0..batch.num_columns() {
+                let column = batch.column(col_idx);
+                let value = ScalarValue::try_from_array(column, row_idx)?;
+
+                // Convert DataFusion ScalarValue to Turso Value
+                let turso_value = match value {
+                    ScalarValue::Int64(Some(v)) => TursoValue::Integer(v),
+                    ScalarValue::Int32(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Int16(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Int8(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::UInt64(Some(v)) => {
+                        TursoValue::Integer(i64::try_from(v).unwrap_or(i64::MAX))
+                    }
+                    ScalarValue::UInt32(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::UInt16(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::UInt8(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Float64(Some(v)) => TursoValue::Real(v),
+                    ScalarValue::Float32(Some(v)) => TursoValue::Real(f64::from(v)),
+                    ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
+                        TursoValue::Text(v)
+                    }
+                    ScalarValue::Boolean(Some(v)) => TursoValue::Integer(if v { 1 } else { 0 }),
+                    ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => {
+                        TursoValue::Blob(v)
+                    }
+                    ScalarValue::TimestampMillisecond(Some(v), _) => TursoValue::Integer(v),
+                    ScalarValue::TimestampMicrosecond(Some(v), _) => TursoValue::Integer(v / 1000),
+                    ScalarValue::TimestampNanosecond(Some(v), _) => {
+                        TursoValue::Integer(v / 1_000_000)
+                    }
+                    ScalarValue::TimestampSecond(Some(v), _) => TursoValue::Integer(v * 1000),
+                    ScalarValue::Date32(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Date64(Some(v)) => TursoValue::Integer(v),
+                    _ => TursoValue::Null,
+                };
+                values.push(turso_value);
+            }
+
+            // Execute the prepared statement with parameters (fast!)
+            stmt.execute(values).await?;
+        }
+
+        // Commit the transaction
+        conn.execute("COMMIT", ()).await?;
 
         Ok(())
     }
@@ -638,7 +718,7 @@ impl TursoAccelerator {
         if !source.is_file_accelerated() {
             return Ok(":memory:".to_string());
         }
-        
+
         if let Some(acceleration) = source.acceleration() {
             let acceleration_params = &acceleration.params;
 
