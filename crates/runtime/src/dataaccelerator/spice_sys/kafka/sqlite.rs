@@ -27,19 +27,21 @@ impl KafkaSys {
         pool: &SqliteConnectionPool,
         metadata: &KafkaMetadata,
     ) -> Result<()> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
+        let pool = pool.clone();
         let schema_json = Self::serialize_schema(&metadata.schema)?;
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
 
-        conn.conn
-            .call(move |conn| {
+        tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err(Error::DowncastFailed {
+                    target: "SqliteConnection",
+                });
+            };
+
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let create_table = format!(
                     "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
                         dataset_name TEXT PRIMARY KEY,
@@ -72,21 +74,22 @@ impl KafkaSys {
                 )?;
 
                 Ok(())
-            })
-            .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            }))
+            .map_err(Error::external)
+        })
+        .await
+        .map_err(|e| Error::external(Box::new(e)))?
     }
 
     pub(super) async fn get_sqlite(&self, pool: &SqliteConnectionPool) -> Option<KafkaMetadata> {
-        let conn_sync = pool.connect_sync();
-        let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+        let pool = pool.clone();
         let dataset_name = self.dataset_name.clone();
 
-        conn
-            .conn
-            .call(move |conn| {
+        tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let query = format!(
                     "SELECT consumer_group_id, topic, schema_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
                 );
@@ -107,8 +110,12 @@ impl KafkaSys {
                 } else {
                     Err(tokio_rusqlite::Error::Other("No row found".into()))
                 }
-            })
-            .await.ok()
+            }))
+            .ok()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 

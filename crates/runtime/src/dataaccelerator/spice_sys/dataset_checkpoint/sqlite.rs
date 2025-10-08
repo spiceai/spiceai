@@ -25,14 +25,17 @@ use datafusion_table_providers::sql::db_connection_pool::{
 
 impl DatasetCheckpoint {
     pub(super) async fn init_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
-        conn.conn
-            .call(move |conn| {
+        let pool = pool.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err(Error::DowncastFailed {
+                    target: "SqliteConnection",
+                });
+            };
+            
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let create_table = format!(
                     "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
                         dataset_name TEXT PRIMARY KEY,
@@ -44,23 +47,25 @@ impl DatasetCheckpoint {
                 conn.execute(&create_table, [])?;
 
                 Ok(())
-            })
-            .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            }))
+            .map_err(Error::external)
+        })
+        .await
+        .map_err(|e| Error::external(Box::new(e)))?
     }
 
     pub(super) async fn migrate_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
+        let pool = pool.clone();
 
-        conn.conn
-            .call(move |conn| {
+        tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err(Error::DowncastFailed {
+                    target: "SqliteConnection",
+                });
+            };
+
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 // Check if schema_json column exists
                 let columns: Vec<String> = conn
                     .prepare(&format!("PRAGMA table_info({CHECKPOINT_TABLE_NAME})"))?
@@ -75,62 +80,67 @@ impl DatasetCheckpoint {
                 }
 
                 Ok(())
-            })
-            .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            }))
+            .map_err(Error::external)
+        })
+        .await
+        .map_err(|e| Error::external(Box::new(e)))?
     }
 
     pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
+        let pool = pool.clone();
         let dataset_name = self.dataset_name.clone();
-        let exists = conn
-            .conn
-            .call(move |conn| {
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err(Error::DowncastFailed {
+                    target: "SqliteConnection",
+                });
+            };
+
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let query =
                     format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
                 Ok(rows.next()?.is_some())
-            })
-            .await
-            .map_err(Error::external)?;
-
-        Ok(exists)
+            }))
+            .map_err(Error::external)
+        })
+        .await
+        .map_err(|e| Error::external(Box::new(e)))?
     }
 
     pub(super) async fn last_checkpoint_time_sqlite(
         &self,
         pool: &SqliteConnectionPool,
     ) -> Result<Option<SystemTime>> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
+        let pool = pool.clone();
         let dataset_name = self.dataset_name.clone();
 
-        let query = format!(
-            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
-        );
-        let checkpoint_time: Option<DateTime<Utc>> = conn
-            .conn
-            .call(move |conn| {
+        let checkpoint_time: Option<DateTime<Utc>> = tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err(Error::DowncastFailed {
+                    target: "SqliteConnection",
+                });
+            };
+
+            let query = format!(
+                "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+            );
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([&dataset_name])?;
                 Ok(rows.next()?.map(|row| row.get(0)))
-            })
-            .await
+            }))
             .map_err(Error::external)?
             .transpose()
-            .map_err(Error::external)?;
+            .map_err(Error::external)
+        })
+        .await
+        .map_err(|e| Error::external(Box::new(e)))??;
 
         let checkpoint_time = checkpoint_time.map(Into::into);
         Ok(checkpoint_time)
@@ -141,17 +151,19 @@ impl DatasetCheckpoint {
         pool: &SqliteConnectionPool,
         schema: &SchemaRef,
     ) -> Result<()> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
+        let pool = pool.clone();
         let dataset_name = self.dataset_name.clone();
         let schema_json = Self::serialize_schema(schema)?;
 
-        conn.conn
-            .call(move |conn| {
+        tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err(Error::DowncastFailed {
+                    target: "SqliteConnection",
+                });
+            };
+
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let upsert = format!(
                     "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, updated_at)
                      VALUES (?1, ?2, CURRENT_TIMESTAMP)
@@ -161,28 +173,29 @@ impl DatasetCheckpoint {
                 conn.execute(&upsert, [&dataset_name, &schema_json])?;
 
                 Ok(())
-            })
-            .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            }))
+            .map_err(Error::external)
+        })
+        .await
+        .map_err(|e| Error::external(Box::new(e)))?
     }
 
     pub(super) async fn get_schema_sqlite(
         &self,
         pool: &SqliteConnectionPool,
     ) -> Result<Option<SchemaRef>> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
+        let pool = pool.clone();
         let dataset_name = self.dataset_name.clone();
 
-        let schema_json: Option<String> = conn
-            .conn
-            .call(move |conn| {
+        let schema_json: Option<String> = tokio::task::spawn_blocking(move || {
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err(Error::DowncastFailed {
+                    target: "SqliteConnection",
+                });
+            };
+
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let query = format!(
                     "SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?"
                 );
@@ -194,9 +207,11 @@ impl DatasetCheckpoint {
                 } else {
                     Ok(None)
                 }
-            })
-            .await
-            .map_err(Error::external)?;
+            }))
+            .map_err(Error::external)
+        })
+        .await
+        .map_err(|e| Error::external(Box::new(e)))??;
 
         match schema_json {
             Some(json) => Ok(Some(Self::deserialize_schema(&json)?)),
@@ -248,14 +263,15 @@ mod tests {
         .expect("to build in-memory sqlite connection pool");
 
         // Create legacy table without schema_json column
-        let conn_sync = pool.connect_sync();
-        let conn = conn_sync
-            .as_any()
-            .downcast_ref::<SqliteConnection>()
-            .expect("sqlite connection");
+        let pool_clone = pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn_sync = pool_clone.connect_sync();
+            let conn = conn_sync
+                .as_any()
+                .downcast_ref::<SqliteConnection>()
+                .expect("sqlite connection");
 
-        conn.conn
-            .call(move |conn| {
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 conn.execute(
                     &format!(
                         "CREATE TABLE {CHECKPOINT_TABLE_NAME} (
@@ -274,9 +290,11 @@ mod tests {
                 )?;
 
                 Ok(())
-            })
-            .await
-            .expect("Failed to create legacy table");
+            }))
+        })
+        .await
+        .expect("spawn_blocking")
+        .expect("Failed to create legacy table");
 
         (
             DatasetCheckpoint {
@@ -421,18 +439,21 @@ mod tests {
         let AccelerationConnection::SQLite(pool) = &checkpoint.acceleration_connection else {
             panic!("Unexpected acceleration connection type");
         };
-        let conn_sync = pool.connect_sync();
-        let conn = conn_sync
-            .as_any()
-            .downcast_ref::<SqliteConnection>()
-            .expect("sqlite connection");
-        let result = conn.conn
-            .call(move |conn| {
+        let pool_clone = pool.clone();
+        let dataset_name_clone = checkpoint.dataset_name.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let conn_sync = pool_clone.connect_sync();
+            let conn = conn_sync
+                .as_any()
+                .downcast_ref::<SqliteConnection>()
+                .expect("sqlite connection");
+            
+            futures::executor::block_on(conn.conn.call(move |conn| {
                 let query = format!(
                     "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
                 );
                 let mut stmt = conn.prepare(&query)?;
-                let mut rows = stmt.query([&checkpoint.dataset_name])?;
+                let mut rows = stmt.query([&dataset_name_clone])?;
 
                 if let Some(row) = rows.next()? {
                     let created_at: String = row.get(0)?;
@@ -443,9 +464,11 @@ mod tests {
                         "No checkpoint found".into(),
                     ))
                 }
-            })
-            .await
-            .expect("Failed to fetch checkpoint data");
+            }))
+        })
+        .await
+        .expect("spawn_blocking")
+        .expect("Failed to fetch checkpoint data");
 
         let (created_at, updated_at) = result;
         assert_ne!(

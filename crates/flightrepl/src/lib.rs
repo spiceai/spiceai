@@ -217,7 +217,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         user_agent = new_agent;
     }
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
-        let tls_root_certificate = std::fs::read(&tls_root_certificate_file).map_err(|e| {
+        let tls_root_certificate = tokio::task::spawn_blocking({
+            let path = tls_root_certificate_file.clone();
+            move || std::fs::read(&path)
+        })
+        .await
+        .map_err(|e| format!("Failed to spawn blocking task: {e}"))?
+        .map_err(|e| {
             format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
         })?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
