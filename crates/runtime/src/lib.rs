@@ -58,8 +58,6 @@ use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStor
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
-use secrecy::SecretString;
-use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
@@ -1059,25 +1057,6 @@ impl Runtime {
             };
         Some(tool)
     }
-}
-
-#[allow(clippy::implicit_hasher)]
-pub async fn get_params_with_secrets(
-    secrets: Arc<RwLock<Secrets>>,
-    params: &HashMap<String, String>,
-) -> HashMap<String, SecretString> {
-    let secrets = secrets.read().await;
-
-    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-    // Inject secrets from the user-supplied params.
-    // This will replace any instances of `${ store:key }` with the actual secret value.
-    for (k, v) in params {
-        let secret = secrets.inject_secrets(k, ParamStr(v)).await;
-        params_with_secrets.insert(k.clone(), secret);
-    }
-
-    params_with_secrets
 }
 
 #[must_use]

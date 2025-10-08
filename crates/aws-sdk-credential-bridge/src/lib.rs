@@ -142,7 +142,7 @@ pub fn from_s3_url_and_config(
     Ok(Box::new(builder.build()?))
 }
 
-fn get_bucket_name(url: &Url) -> Result<&str> {
+pub fn get_bucket_name(url: &Url) -> Result<&str> {
     url.host_str().ok_or_else(|| Error::ParseBucketName {
         url: url.to_string(),
     })

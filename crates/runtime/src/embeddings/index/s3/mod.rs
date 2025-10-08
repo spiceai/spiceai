@@ -37,12 +37,11 @@ use tokio::sync::RwLock;
 
 use crate::{
     dataconnector::parameters::aws::load_config,
-    get_params_with_secrets,
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
-    secrets::Secrets,
 };
 use retry_client::S3VectorRetryClientBuilder;
+use runtime_secrets::{Secrets, get_params_with_secrets};
 mod retry_client;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
