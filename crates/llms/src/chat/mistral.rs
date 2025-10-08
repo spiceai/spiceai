@@ -654,7 +654,7 @@ fn stream_from_response(
                     }));
                 },
                 MistralResponse::Speech{..} => {
-                    tracing::trace!("MistralResponse::Speech{..}");
+                    tracing::trace!("MistralResponse::Speech");
                     yield Err(OpenAIError::ApiError(ApiError {
                         message: "Speech generation is not supported".to_string(),
                         r#type: None,
