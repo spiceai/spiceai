@@ -358,18 +358,27 @@ impl TursoTableProvider {
                     Arc::new(LargeBinaryArray::from(values))
                 }
                 DataType::Timestamp(unit, tz) => {
-                    // Timestamps stored as INTEGER in Turso/SQLite (milliseconds since epoch by default)
-                    // but we need to match the schema's expected unit
+                    // Timestamps are stored as INTEGER in Turso/SQLite in milliseconds
+                    // We need to convert from milliseconds to the schema's expected unit
+                    use arrow::datatypes::TimeUnit;
+
                     let values: Vec<Option<i64>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => Some(*i),
+                            TursoValue::Integer(millis) => {
+                                // Convert from stored milliseconds to the target unit
+                                Some(match unit {
+                                    TimeUnit::Second => millis / 1000,
+                                    TimeUnit::Millisecond => *millis,
+                                    TimeUnit::Microsecond => millis * 1000,
+                                    TimeUnit::Nanosecond => millis * 1_000_000,
+                                })
+                            }
                             TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
 
-                    use arrow::datatypes::TimeUnit;
                     match unit {
                         TimeUnit::Second => Arc::new(
                             arrow::array::TimestampSecondArray::from(values)
@@ -1386,6 +1395,60 @@ impl DataAccelerator for TursoAccelerator {
                 source: Box::new(e),
             })?;
 
+        // Handle indexes if specified
+        if let Some(indexes_str) = cmd.options.get("indexes") {
+            if mvcc_enabled {
+                // Indexes are not yet supported in MVCC mode
+                tracing::warn!(
+                    "Indexes are not yet supported in MVCC mode for Turso. Skipping index creation for table '{}'",
+                    table_name
+                );
+            } else {
+                // Parse the indexes option string
+                use datafusion_table_providers::util::hashmap_from_option_string;
+                let indexes = hashmap_from_option_string::<String, String>(indexes_str);
+
+                // Create indexes
+                for (column_ref_str, index_type_str) in indexes {
+                    let index_type = crate::component::dataset::acceleration::IndexType::from(
+                        index_type_str.as_str(),
+                    );
+                    let index_name = format!(
+                        "idx_{}_{}",
+                        table_name,
+                        column_ref_str.replace(['(', ')', ' ', ','], "_")
+                    );
+                    let unique_clause = match &index_type {
+                        crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
+                        crate::component::dataset::acceleration::IndexType::Enabled => "",
+                    };
+
+                    let create_index_sql = format!(
+                        "CREATE {}INDEX IF NOT EXISTS {} ON {} ({})",
+                        unique_clause, index_name, table_name, column_ref_str
+                    );
+
+                    conn.execute(&create_index_sql, ()).await.map_err(|e| {
+                        Error::AccelerationCreationFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+
+                    tracing::debug!(
+                        "Created {}index '{}' on table '{}' for columns: {}",
+                        if unique_clause.is_empty() {
+                            ""
+                        } else {
+                            "unique "
+                        },
+                        index_name,
+                        table_name,
+                        column_ref_str
+                    );
+                }
+            }
+        }
+
         // Create the table provider
         let schema = Arc::new(Schema::new(
             cmd.schema
@@ -2106,5 +2169,287 @@ mod tests {
 
         // Clean up
         std::fs::remove_file(&file_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_unit_conversion() {
+        // Test that timestamps are correctly converted between different units
+        // All timestamps are stored as milliseconds in Turso, but should be
+        // correctly scaled when reading back based on the schema's unit
+
+        use arrow::array::{
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray,
+        };
+        use arrow::datatypes::TimeUnit;
+
+        // Test value: 2024-01-01 00:00:00 UTC
+        // In different units:
+        const TEST_TIMESTAMP_SECONDS: i64 = 1704067200;
+        const TEST_TIMESTAMP_MILLIS: i64 = 1704067200000;
+        const TEST_TIMESTAMP_MICROS: i64 = 1704067200000000;
+        const TEST_TIMESTAMP_NANOS: i64 = 1704067200000000000;
+
+        let ctx = SessionContext::new();
+
+        // Test 1: TimestampSecond
+        {
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            )]));
+
+            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+            let external_table = CreateExternalTable {
+                schema: df_schema,
+                name: TableReference::bare("test_ts_seconds"),
+                location: String::new(),
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::new_unverified(vec![]),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+
+            let table = TursoAccelerator::new()
+                .create_external_table(external_table, None, None)
+                .await
+                .expect("table should be created");
+
+            // Insert timestamp in seconds
+            let ts_arr = TimestampSecondArray::from(vec![TEST_TIMESTAMP_SECONDS]);
+            let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ts_arr)])
+                .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Read back and verify
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan");
+            let results = collect(scan, ctx.task_ctx()).await.expect("collect");
+
+            let ts_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .expect("should be TimestampSecondArray");
+
+            assert_eq!(
+                ts_col.value(0),
+                TEST_TIMESTAMP_SECONDS,
+                "TimestampSecond should round-trip correctly"
+            );
+        }
+
+        // Test 2: TimestampMillisecond
+        {
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            )]));
+
+            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+            let external_table = CreateExternalTable {
+                schema: df_schema,
+                name: TableReference::bare("test_ts_millis"),
+                location: String::new(),
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::new_unverified(vec![]),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+
+            let table = TursoAccelerator::new()
+                .create_external_table(external_table, None, None)
+                .await
+                .expect("table should be created");
+
+            // Insert timestamp in milliseconds
+            let ts_arr = TimestampMillisecondArray::from(vec![TEST_TIMESTAMP_MILLIS]);
+            let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ts_arr)])
+                .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Read back and verify
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan");
+            let results = collect(scan, ctx.task_ctx()).await.expect("collect");
+
+            let ts_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("should be TimestampMillisecondArray");
+
+            assert_eq!(
+                ts_col.value(0),
+                TEST_TIMESTAMP_MILLIS,
+                "TimestampMillisecond should round-trip correctly"
+            );
+        }
+
+        // Test 3: TimestampMicrosecond
+        {
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )]));
+
+            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+            let external_table = CreateExternalTable {
+                schema: df_schema,
+                name: TableReference::bare("test_ts_micros"),
+                location: String::new(),
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::new_unverified(vec![]),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+
+            let table = TursoAccelerator::new()
+                .create_external_table(external_table, None, None)
+                .await
+                .expect("table should be created");
+
+            // Insert timestamp in microseconds
+            let ts_arr = TimestampMicrosecondArray::from(vec![TEST_TIMESTAMP_MICROS]);
+            let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ts_arr)])
+                .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Read back and verify
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan");
+            let results = collect(scan, ctx.task_ctx()).await.expect("collect");
+
+            let ts_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("should be TimestampMicrosecondArray");
+
+            assert_eq!(
+                ts_col.value(0),
+                TEST_TIMESTAMP_MICROS,
+                "TimestampMicrosecond should round-trip correctly"
+            );
+        }
+
+        // Test 4: TimestampNanosecond
+        {
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]));
+
+            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+            let external_table = CreateExternalTable {
+                schema: df_schema,
+                name: TableReference::bare("test_ts_nanos"),
+                location: String::new(),
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::new_unverified(vec![]),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+
+            let table = TursoAccelerator::new()
+                .create_external_table(external_table, None, None)
+                .await
+                .expect("table should be created");
+
+            // Insert timestamp in nanoseconds
+            let ts_arr = TimestampNanosecondArray::from(vec![TEST_TIMESTAMP_NANOS]);
+            let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ts_arr)])
+                .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Read back and verify
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan");
+            let results = collect(scan, ctx.task_ctx()).await.expect("collect");
+
+            let ts_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("should be TimestampNanosecondArray");
+
+            assert_eq!(
+                ts_col.value(0),
+                TEST_TIMESTAMP_NANOS,
+                "TimestampNanosecond should round-trip correctly"
+            );
+        }
     }
 }
