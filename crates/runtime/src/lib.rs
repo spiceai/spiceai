@@ -102,7 +102,9 @@ pub mod podswatcher;
 pub mod request;
 mod scheduling;
 pub mod search;
-pub mod secrets;
+pub mod secrets {
+    pub use runtime_secrets::*;
+}
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use secrecy::SecretString;
 
-use crate::secrets::SecretStore;
+use crate::SecretStore;
 
 const ENV_SECRET_PREFIX: &str = "SPICE_";
 
@@ -90,7 +90,7 @@ impl SecretStore for EnvSecretStore {
     ///
     /// However, the convention is to use uppercase for environment variables - so to make the experience
     /// consistent across secret stores that don't have this convention we will search for both original and uppercased keys.
-    async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
+    async fn get_secret(&self, key: &str) -> crate::AnyErrorResult<Option<SecretString>> {
         let uppercase_key = key.to_uppercase();
 
         [
