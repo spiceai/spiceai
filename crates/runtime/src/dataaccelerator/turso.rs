@@ -115,6 +115,16 @@ impl TursoConnectionPool {
             .await
             .context(TursoDatabaseSnafu)?;
 
+        // Enable MVCC (Multi-Version Concurrency Control) by setting WAL mode
+        // This is required for BEGIN CONCURRENT transactions
+        let conn = database.connect().context(TursoDatabaseSnafu)?;
+        let mut rows = conn
+            .query("PRAGMA journal_mode=WAL", ())
+            .await
+            .context(TursoDatabaseSnafu)?;
+        // Consume the result row (PRAGMA returns the mode that was set)
+        let _ = rows.next().await;
+
         Ok(Self {
             database: Arc::new(database),
         })
