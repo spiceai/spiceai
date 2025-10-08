@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::large_futures)]
-
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
