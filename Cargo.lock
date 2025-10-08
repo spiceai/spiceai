@@ -12168,6 +12168,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "object_store",
+ "runtime-secrets",
  "snafu",
  "spicepod",
  "tempfile",

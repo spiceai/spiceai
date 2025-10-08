@@ -295,14 +295,14 @@ impl SnapshotManager {
         snapshots: SnapshotBehavior,
         local_path: PathBuf,
     ) -> Option<Self> {
-        let snapshot_config = match snapshots {
+        let (snapshot_config, secrets) = match snapshots {
             SnapshotBehavior::Disabled => {
                 tracing::debug!("Snapshots are disabled for {dataset_name}");
                 return None;
             }
-            SnapshotBehavior::Enabled(s)
-            | SnapshotBehavior::BootstrapOnly(s)
-            | SnapshotBehavior::CreateOnly(s) => s,
+            SnapshotBehavior::Enabled(s, secrets)
+            | SnapshotBehavior::BootstrapOnly(s, secrets)
+            | SnapshotBehavior::CreateOnly(s, secrets) => (s, secrets),
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
 

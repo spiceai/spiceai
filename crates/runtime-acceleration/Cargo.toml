@@ -18,6 +18,7 @@ datafusion.workspace = true
 futures.workspace = true
 itertools.workspace = true
 object_store.workspace = true
+runtime-secrets = { path = "../runtime-secrets" }
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
 snafu.workspace = true

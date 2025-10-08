@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Weak;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
@@ -463,6 +464,11 @@ impl Runtime {
     #[must_use]
     pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
         Arc::clone(&self.secrets)
+    }
+
+    #[must_use]
+    pub fn secrets_weak(&self) -> Weak<RwLock<secrets::Secrets>> {
+        Arc::downgrade(&self.secrets)
     }
 
     #[must_use]
