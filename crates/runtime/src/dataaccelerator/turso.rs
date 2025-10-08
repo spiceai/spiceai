@@ -1972,8 +1972,17 @@ mod tests {
         assert_eq!(name_col.value(1), "Bob");
         assert_eq!(name_col.value(2), "Charlie");
 
-        // Clean up
-        std::fs::remove_file(test_path).expect("should remove test file");
+        // Clean up - drop the table first to close connections
+        drop(table);
+        drop(ctx);
+
+        // Give a moment for connections to close
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clean up all database files
+        let _ = std::fs::remove_file(test_path);
+        let _ = std::fs::remove_file(format!("{}-wal", test_path));
+        let _ = std::fs::remove_file(format!("{}-shm", test_path));
     }
 
     #[tokio::test]
