@@ -422,13 +422,36 @@ impl TableProvider for TursoTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::error::Result<Vec<datafusion::datasource::TableProviderFilterPushDown>> {
+        let dialect = SqliteDialect {};
+        let unparser = Unparser::new(&dialect);
+
+        let mut filter_push_down = vec![];
+        for filter in filters {
+            match unparser.expr_to_sql(filter) {
+                Ok(_) => filter_push_down
+                    .push(datafusion::datasource::TableProviderFilterPushDown::Exact),
+                Err(_) => filter_push_down
+                    .push(datafusion::datasource::TableProviderFilterPushDown::Unsupported),
+            }
+        }
+        Ok(filter_push_down)
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Handle projection pushdown: create a schema with only the requested columns
+        // When projection is Some([0, 2]), we select only columns at indices 0 and 2
+        // The projected_schema will contain only those fields, which TursoExec will use
+        // to build the SELECT clause with only the necessary columns
         let projected_schema = match projection {
             Some(p) => Arc::new(self.schema.project(p)?),
             None => Arc::clone(&self.schema),
@@ -438,7 +461,8 @@ impl TableProvider for TursoTableProvider {
             Arc::clone(&projected_schema),
             self.table_name.clone(),
             Arc::clone(&self.pool),
-            projection.cloned(),
+            filters,
+            limit,
         )))
     }
 
@@ -493,8 +517,8 @@ pub struct TursoExec {
     schema: SchemaRef,
     table_name: String,
     pool: Arc<TursoConnectionPool>,
-    #[allow(dead_code)] // Stored for future optimization of column selection
-    projection: Option<Vec<usize>>,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -503,7 +527,8 @@ impl TursoExec {
         schema: SchemaRef,
         table_name: String,
         pool: Arc<TursoConnectionPool>,
-        projection: Option<Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -516,15 +541,58 @@ impl TursoExec {
             schema,
             table_name,
             pool,
-            projection,
+            filters: filters.to_vec(),
+            limit,
             properties,
         }
+    }
+
+    /// Build the SQL query with projection, filters, and limit
+    ///
+    /// Note: Projection pushdown is handled by the schema parameter passed to `new()`,
+    /// which is already the projected schema created in `scan()` via `schema.project(indices)`.
+    /// Therefore, iterating over `self.schema.fields()` gives us only the projected columns.
+    fn sql(&self) -> datafusion::error::Result<String> {
+        // Build column list from projected schema - this handles projection pushdown
+        let columns = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let where_expr = if self.filters.is_empty() {
+            String::new()
+        } else {
+            let dialect = SqliteDialect {};
+            let unparser = Unparser::new(&dialect);
+            let filter_sqls: Vec<String> = self
+                .filters
+                .iter()
+                .map(|f| unparser.expr_to_sql(f).map(|ast| format!("{ast}")))
+                .collect::<datafusion::error::Result<Vec<_>>>()?;
+            format!(" WHERE {}", filter_sqls.join(" AND "))
+        };
+
+        let limit_expr = match self.limit {
+            Some(limit) => format!(" LIMIT {limit}"),
+            None => String::new(),
+        };
+
+        Ok(format!(
+            "SELECT {} FROM {}{}{}",
+            columns, self.table_name, where_expr, limit_expr
+        ))
     }
 }
 
 impl DisplayAs for TursoExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "TursoExec: table={}", self.table_name)
+        let sql = self
+            .sql()
+            .unwrap_or_else(|_| format!("SELECT * FROM {}", self.table_name));
+        write!(f, "TursoExec sql={}", sql)
     }
 }
 
@@ -562,8 +630,8 @@ impl ExecutionPlan for TursoExec {
         _context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let pool = Arc::clone(&self.pool);
-        let table_name = self.table_name.clone();
         let schema = Arc::clone(&self.schema);
+        let query = self.sql()?;
 
         let stream = async move {
             let conn = pool
@@ -571,7 +639,6 @@ impl ExecutionPlan for TursoExec {
                 .await
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
-            let query = format!("SELECT * FROM {}", table_name);
             let mut stmt = conn
                 .prepare(&query)
                 .await
@@ -1128,6 +1195,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
+    use futures::FutureExt;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -1333,5 +1401,229 @@ mod tests {
             .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn test_projection_filter_limit_pushdown() {
+        // Create a schema with multiple columns
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("name", DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", DataType::Int64, false),
+        ]));
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("test_pushdown_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let ctx = SessionContext::new();
+        let table = TursoAccelerator::new()
+            .create_external_table(external_table, None, None)
+            .await
+            .expect("table should be created");
+
+        // Insert test data
+        let id_arr = Int64Array::from(vec![1, 2, 3, 4, 5]);
+        let name_arr = StringArray::from(vec!["Alice", "Bob", "Charlie", "David", "Eve"]);
+        let value_arr = Int64Array::from(vec![100, 200, 300, 400, 500]);
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(id_arr), Arc::new(name_arr), Arc::new(value_arr)],
+        )
+        .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        // Test 1: Projection pushdown - select only specific columns
+        let projection = Some(vec![0_usize, 2_usize]); // id and value columns
+        let scan_plan = table
+            .scan(&ctx.state(), projection.as_ref(), &[], None)
+            .await
+            .expect("scan should be successful");
+
+        // Verify the projected schema only contains the selected columns
+        let projected_schema = scan_plan.schema();
+        assert_eq!(projected_schema.fields().len(), 2);
+        assert_eq!(projected_schema.field(0).name(), "id");
+        assert_eq!(projected_schema.field(1).name(), "value");
+
+        // Test 2: Filter pushdown - add WHERE clause
+        let filter = col("value").gt(lit(200_i64));
+        let scan_with_filter = table
+            .scan(&ctx.state(), None, &[filter], None)
+            .await
+            .expect("scan with filter should be successful");
+
+        let result = collect(scan_with_filter, ctx.task_ctx())
+            .await
+            .expect("query with filter successful");
+
+        // Should return 3 rows (value > 200: 300, 400, 500)
+        assert_eq!(result[0].num_rows(), 3);
+
+        // Test 3: Limit pushdown
+        let scan_with_limit = table
+            .scan(&ctx.state(), None, &[], Some(2))
+            .await
+            .expect("scan with limit should be successful");
+
+        let result_with_limit = collect(scan_with_limit, ctx.task_ctx())
+            .await
+            .expect("query with limit successful");
+
+        // Should return at most 2 rows
+        let total_rows: usize = result_with_limit.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows <= 2);
+
+        // Test 4: Combined projection, filter, and limit
+        let projection = Some(vec![1_usize]); // name column only
+        let filter = col("id").gt(lit(2_i64));
+        let limit = Some(2);
+
+        let scan_combined = table
+            .scan(&ctx.state(), projection.as_ref(), &[filter], limit)
+            .await
+            .expect("combined scan should be successful");
+
+        // Verify schema has only the projected column
+        let combined_schema = scan_combined.schema();
+        assert_eq!(combined_schema.fields().len(), 1);
+        assert_eq!(combined_schema.field(0).name(), "name");
+
+        let result_combined = collect(scan_combined, ctx.task_ctx())
+            .await
+            .expect("combined query successful");
+
+        // Should return at most 2 rows with id > 2 (Charlie, David)
+        let total_rows: usize = result_combined.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows <= 2);
+        assert!(total_rows > 0);
+    }
+
+    #[test]
+    fn test_sql_generation() {
+        // Test SQL generation with various combinations
+        let full_schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("name", DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", DataType::Int64, false),
+        ]));
+
+        let pool = Arc::new(TursoConnectionPool {
+            database: Arc::new(
+                Builder::new_local(":memory:")
+                    .build()
+                    .block_on()
+                    .expect("should create database"),
+            ),
+        });
+
+        // Test 1: Full schema (no projection), no filter, no limit
+        let exec1 = TursoExec::new(
+            Arc::clone(&full_schema),
+            "test_table".to_string(),
+            Arc::clone(&pool),
+            &[],
+            None,
+        );
+        let sql1 = exec1.sql().expect("should generate SQL");
+        assert!(sql1.contains("SELECT"));
+        assert!(sql1.contains("\"id\""));
+        assert!(sql1.contains("\"name\""));
+        assert!(sql1.contains("\"value\""));
+        assert!(sql1.contains("FROM test_table"));
+        assert!(!sql1.contains("WHERE"));
+        assert!(!sql1.contains("LIMIT"));
+
+        // Test 1b: Projected schema (only id and name columns) - simulates projection pushdown
+        let projected_schema = Arc::new(full_schema.project(&[0, 1]).expect("should project"));
+        let exec1b = TursoExec::new(
+            Arc::clone(&projected_schema),
+            "test_table".to_string(),
+            Arc::clone(&pool),
+            &[],
+            None,
+        );
+        let sql1b = exec1b.sql().expect("should generate SQL");
+        assert!(sql1b.contains("SELECT"));
+        assert!(sql1b.contains("\"id\""));
+        assert!(sql1b.contains("\"name\""));
+        assert!(
+            !sql1b.contains("\"value\""),
+            "Projected schema should not include 'value' column"
+        );
+        assert_eq!(
+            sql1b, "SELECT \"id\", \"name\" FROM test_table",
+            "SQL should only include projected columns"
+        );
+
+        // Test 2: With limit
+        let exec2 = TursoExec::new(
+            Arc::clone(&full_schema),
+            "test_table".to_string(),
+            Arc::clone(&pool),
+            &[],
+            Some(10),
+        );
+        let sql2 = exec2.sql().expect("should generate SQL");
+        assert!(sql2.contains("LIMIT 10"));
+
+        // Test 3: With filter
+        let filter = col("id").gt(lit(5_i64));
+        let exec3 = TursoExec::new(
+            Arc::clone(&full_schema),
+            "test_table".to_string(),
+            Arc::clone(&pool),
+            &[filter],
+            None,
+        );
+        let sql3 = exec3.sql().expect("should generate SQL");
+        assert!(sql3.contains("WHERE"));
+
+        // Test 4: With projection, filter and limit - full pushdown test
+        let projected_schema = Arc::new(full_schema.project(&[1]).expect("should project")); // Only "name" column
+        let filter = col("id").gt(lit(5_i64));
+        let exec4 = TursoExec::new(
+            projected_schema,
+            "test_table".to_string(),
+            pool,
+            &[filter],
+            Some(5),
+        );
+        let sql4 = exec4.sql().expect("should generate SQL");
+        assert!(sql4.contains("\"name\""), "Should contain projected column");
+        assert!(
+            !sql4.contains("\"id\""),
+            "Should not contain non-projected id column in SELECT list"
+        );
+        assert!(
+            !sql4.contains("\"value\""),
+            "Should not contain non-projected value column"
+        );
+        assert!(sql4.contains("WHERE"), "Should have filter");
+        assert!(sql4.contains("LIMIT 5"), "Should have limit");
+        // Note: The WHERE clause will reference 'id' even though it's not in the projection
+        // This is correct SQL behavior - you can filter on columns not in the SELECT list
     }
 }
