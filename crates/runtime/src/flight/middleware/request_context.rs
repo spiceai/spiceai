@@ -21,7 +21,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::datafusion::{DataFusion, request_context_extension::DataFusionContextExtension};
+use crate::{
+    datafusion::{DataFusion, request_context_extension::DataFusionContextExtension},
+    model::ModelContextExtension,
+};
 use app::App;
 use runtime_request_context::{Protocol, RequestContext};
 
@@ -84,12 +87,11 @@ where
         let request_context = Arc::new(
             RequestContext::builder(Protocol::Flight)
                 .with_app_opt(self.app.clone())
-                .with_df_opt(Some(Arc::clone(&self.df)))
+                .with_extension(DataFusionContextExtension::new(Arc::clone(&self.df)))
+                .with_extension(ModelContextExtension::new())
                 .from_headers(headers)
                 .build(),
         );
-
-        request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&self.df)));
 
         req.extensions_mut()
             .insert::<Arc<dyn AuthRequestContext + Send + Sync>>(

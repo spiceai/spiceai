@@ -195,7 +195,7 @@ pub(crate) fn routes(
     cors_config: &CorsConfig,
 ) -> Router {
     let mut authenticated_router = Router::new()
-        .route("/v1/sql", post(v1::query::post))
+        .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
@@ -330,9 +330,11 @@ async fn track_metrics(
     {
         request_context_builder = ext.add_from_headers(request_context_builder, &headers)
     };
-    let request_context = Arc::new(request_context_builder.build());
-
-    request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&df)));
+    let request_context = Arc::new(
+        request_context_builder
+            .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
+            .build(),
+    );
 
     let request_dimensions = request_context.to_dimensions();
 

@@ -15,21 +15,20 @@ limitations under the License.
 */
 
 use std::{
-    any::{Any, TypeId},
+    any::TypeId,
     collections::HashMap,
     future::Future,
     marker::PhantomData,
     sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
 };
 
+use crate::TraceParent;
 use app::App;
 use http::HeaderMap;
 use opentelemetry::KeyValue;
 use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
-
-use crate::TraceParent;
 
 use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
@@ -43,15 +42,16 @@ pub struct RequestContext {
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
-    // extensions: Vec<Arc<dyn Extension + Send + Sync>>,
     trace_parent: Option<TraceParent>,
 }
 
 #[async_trait::async_trait]
-pub trait Extension: Any {
+pub trait Extension: std::any::Any + Send + Sync {
     async fn load(&self) {
         // no-op
     }
+
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 tokio::task_local! {
@@ -195,22 +195,36 @@ impl RequestContext {
         &self.trace_parent
     }
 
-    pub fn extension<T>(&self) -> Option<Arc<T>>
+    pub fn extension<T>(&self) -> Option<T>
     where
-        T: 'static + Extension + Send + Sync + Clone,
+        T: Extension + Clone,
     {
         let extensions = self.extensions.read().ok()?;
         let type_id = TypeId::of::<T>();
-
-        let z = extensions.get(&type_id).unwrap();
         extensions
-            .get(&type_id)
-            .and_then(|arc_any| Arc::clone(arc_any)downcast::<T>().ok())
+            .get(&type_id)?
+            .as_any()
+            .downcast_ref::<T>()
+            .cloned()
     }
 
-    pub fn insert_extension<T: 'static + Send + Sync>(&self, extension: T) {
+    pub async fn insert_extension<T: Extension + Send + Sync>(&self, extension: T) {
         if let Ok(mut extensions) = self.extensions.write() {
-            extensions.insert(TypeId::of::<T>(), Arc::new(extension));
+            extensions.insert(extension.type_id(), Arc::new(extension));
+        };
+    }
+
+    pub async fn load_extensions(&self) {
+        // Cannot hold `RwLockReadGuard` across async boundary.
+        let extensions = {
+            let Ok(guard) = self.extensions.read() else {
+                return;
+            };
+            guard.values().cloned().collect::<Vec<_>>()
+        };
+
+        for ext in extensions {
+            ext.load().await;
         }
     }
 }
@@ -257,8 +271,9 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
-    pub fn with_extension(mut self, id: TypeId, extension: Arc<dyn Any + Send + Sync>) -> Self {
-        self.extensions.insert(id, extension);
+    pub fn with_extension(mut self, extension: impl Extension) -> Self {
+        self.extensions
+            .insert(extension.type_id(), Arc::new(extension));
         self
     }
 

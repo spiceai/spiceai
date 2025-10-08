@@ -317,9 +317,9 @@ mod tests {
     use crate::{
         builder::RuntimeBuilder,
         datafusion::{DataFusion, query::QueryBuilder},
-        request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
     };
+    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
 
     // Helper function to create a test RequestContext
     fn create_test_request_context(

@@ -101,5 +101,4 @@ static AI_INFERENCES_WITH_SPICE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(||
 
 pub fn track_ai_inferences_with_spice_count(dimensions: &[KeyValue]) {
     telemetry::track_ai_inferences_with_spice_count(dimensions);
-    AI_INFERENCES_WITH_SPICE_COUNT.add(1, dimensions);
 }

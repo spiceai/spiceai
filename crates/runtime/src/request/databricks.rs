@@ -15,17 +15,18 @@ limitations under the License.
 */
 
 use app::App;
+use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use http::HeaderMap;
-use runtime_request_context::RequestContextBuilder;
+use runtime_request_context::{Extension, RequestContextBuilder};
 use secrecy::SecretString;
 use spicepod::{
     component::{catalog::Catalog, dataset::Dataset},
     param::ParamValue,
 };
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{any::TypeId, collections::HashMap};
 
 use crate::{component::access::AccessMode, datafusion::DataFusion};
 
@@ -48,6 +49,17 @@ impl Default for DatabricksAuthExtension {
     }
 }
 
+#[async_trait]
+impl Extension for DatabricksAuthExtension {
+    async fn load(&self) {
+        self.load_u2m_components().await;
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl DatabricksAuthExtension {
     pub fn new(
         app: Option<Arc<App>>,
@@ -63,8 +75,9 @@ impl DatabricksAuthExtension {
     ) -> RequestContextBuilder {
         if let Some(extension) = DatabricksAuthExtension::from_headers(&self.app, &self.df, headers)
         {
-            bldr.with_extension(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
+            bldr = bldr.with_extension(extension);
         }
+        bldr
     }
 
     #[must_use]

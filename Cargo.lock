@@ -12089,6 +12089,7 @@ dependencies = [
  "otel-arrow",
  "package",
  "paste",
+ "percent-encoding",
  "pin-project",
  "postcard",
  "prometheus",
