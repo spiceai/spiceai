@@ -736,7 +736,7 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         .transpose()
         .map_err(OpenAIError::JSONDeserialize)?;
 
-    Ok(ChatChoiceStream {
+    let stream = ChatChoiceStream {
         index: *index as u32,
         delta: ChatCompletionStreamResponseDelta {
             content: delta.content.clone(),
@@ -751,7 +751,11 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         },
         finish_reason,
         logprobs: None,
-    })
+    };
+
+    println!("chunk_choices_to_openai: {:?}", stream);
+
+    Ok(stream)
 }
 
 fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
