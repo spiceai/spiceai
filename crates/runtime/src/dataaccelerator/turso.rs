@@ -425,7 +425,7 @@ impl TableProvider for TursoTableProvider {
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
-    ) -> datafusion::error::Result<Vec<datafusion::datasource::TableProviderFilterPushDown>> {
+    ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         let dialect = SqliteDialect {};
         let unparser = Unparser::new(&dialect);
 
@@ -433,9 +433,9 @@ impl TableProvider for TursoTableProvider {
         for filter in filters {
             match unparser.expr_to_sql(filter) {
                 Ok(_) => filter_push_down
-                    .push(datafusion::datasource::TableProviderFilterPushDown::Exact),
+                    .push(datafusion::logical_expr::TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down
-                    .push(datafusion::datasource::TableProviderFilterPushDown::Unsupported),
+                    .push(datafusion::logical_expr::TableProviderFilterPushDown::Unsupported),
             }
         }
         Ok(filter_push_down)
@@ -1521,8 +1521,8 @@ mod tests {
         assert!(total_rows > 0);
     }
 
-    #[test]
-    fn test_sql_generation() {
+    #[tokio::test]
+    async fn test_sql_generation() {
         // Test SQL generation with various combinations
         let full_schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
@@ -1534,7 +1534,7 @@ mod tests {
             database: Arc::new(
                 Builder::new_local(":memory:")
                     .build()
-                    .block_on()
+                    .await
                     .expect("should create database"),
             ),
         });
@@ -1625,5 +1625,227 @@ mod tests {
         assert!(sql4.contains("LIMIT 5"), "Should have limit");
         // Note: The WHERE clause will reference 'id' even though it's not in the projection
         // This is correct SQL behavior - you can filter on columns not in the SELECT list
+    }
+
+    #[tokio::test]
+    async fn test_file_mode_turso_creation() {
+        // Test that file mode creates a Turso database at a specified path
+        let test_path = "/tmp/test_turso_file_mode.db";
+
+        // Clean up if file exists from previous test
+        let _ = std::fs::remove_file(test_path);
+
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+
+        let mut params = HashMap::new();
+        params.insert("turso_file_path".to_string(), test_path.to_string());
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("test_file_mode_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: params,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let ctx = SessionContext::new();
+        let table = TursoAccelerator::new()
+            .create_external_table(external_table, None, None)
+            .await
+            .expect("table should be created");
+
+        // Verify the file was created
+        assert!(
+            std::path::Path::new(test_path).exists(),
+            "Turso database file should be created at specified path"
+        );
+
+        // Test that we can insert and query data
+        let id_arr = Int64Array::from(vec![1, 2, 3]);
+        let name_arr = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(id_arr), Arc::new(name_arr)],
+        )
+        .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        // Query back the data
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be successful");
+
+        let results = collect(scan, ctx.task_ctx())
+            .await
+            .expect("scan successful");
+
+        assert_eq!(results.len(), 1, "should have 1 batch");
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 3, "should have 3 rows");
+
+        // Verify data
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64Array");
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(id_col.value(1), 2);
+        assert_eq!(id_col.value(2), 3);
+
+        let name_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name should be StringArray");
+        assert_eq!(name_col.value(0), "Alice");
+        assert_eq!(name_col.value(1), "Bob");
+        assert_eq!(name_col.value(2), "Charlie");
+
+        // Clean up
+        std::fs::remove_file(test_path).expect("should remove test file");
+    }
+
+    #[tokio::test]
+    async fn test_file_mode_turso_creation_default_path() {
+        // Test that file mode creates a Turso database using default path when not specified
+        let app = app::AppBuilder::new("test").build();
+        let rt = Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new(
+            "turso_default_path_test".to_string(),
+            "turso_default_path_test",
+        )
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Turso,
+            mode: Mode::File,
+            ..Default::default()
+        });
+
+        let accelerator = TursoAccelerator::new();
+
+        // Initialize the accelerator
+        accelerator
+            .init(&dataset)
+            .await
+            .expect("initialization should be successful");
+
+        // Verify initialization
+        assert!(
+            accelerator.is_initialized(&dataset),
+            "accelerator should be initialized"
+        );
+
+        // Get the file path
+        let file_path = accelerator
+            .file_path(&dataset)
+            .expect("should have file path");
+
+        // Verify the file was created at the default location
+        assert!(
+            std::path::Path::new(&file_path).exists(),
+            "Turso database file should be created at default path"
+        );
+
+        // Verify the path includes the dataset name
+        assert!(
+            file_path.contains("turso_default_path_test"),
+            "File path should contain dataset name"
+        );
+
+        // Now test that we can create a table and use it
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("test_default_path_table"),
+            location: file_path.clone(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let ctx = SessionContext::new();
+        let table = TursoAccelerator::new()
+            .create_external_table(external_table, None, None)
+            .await
+            .expect("table should be created");
+
+        // Insert test data
+        let id_arr = Int64Array::from(vec![10, 20, 30]);
+        let value_arr = StringArray::from(vec!["A", "B", "C"]);
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(id_arr), Arc::new(value_arr)],
+        )
+        .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        // Query back the data to verify it works
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be successful");
+
+        let results = collect(scan, ctx.task_ctx())
+            .await
+            .expect("scan successful");
+
+        assert_eq!(results.len(), 1, "should have 1 batch");
+        assert_eq!(results[0].num_rows(), 3, "should have 3 rows");
+
+        // Clean up
+        std::fs::remove_file(&file_path).ok();
     }
 }

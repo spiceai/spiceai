@@ -688,22 +688,24 @@ mod sqlite_compat_tests {
     //! Shared compatibility test suite for SQLite and Turso accelerators.
     //! These tests ensure both accelerators behave identically for common operations.
 
-    use super::*;
-    use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
-    use arrow::{
-        array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array},
+    use crate::component::dataset::acceleration::Engine;
+    use crate::dataaccelerator::DataAccelerator;
+    use ::arrow::{
+        array::{
+            Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+        },
         datatypes::{DataType, Field, Schema},
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
+        datasource::TableProvider,
         execution::context::SessionContext,
-        logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
+        logical_expr::{CreateExternalTable, col, dml::InsertOp, lit},
         physical_plan::collect,
-        scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
     /// Test helper that runs the same test logic against both SQLite and Turso
     async fn run_compat_test<F, Fut>(test_fn: F)
@@ -1129,6 +1131,388 @@ mod sqlite_compat_tests {
                 "{:?}: empty table should return empty results",
                 engine
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_filter_predicates() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            // Insert test data
+            let id_array = Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            let name_array = StringArray::from(vec![
+                "Alice", "Bob", "Charlie", "David", "Eve", "Frank", "Grace", "Henry", "Ivy", "Jack",
+            ]);
+            let value_array = Float64Array::from(vec![
+                Some(10.5),
+                Some(20.5),
+                Some(30.5),
+                Some(40.5),
+                Some(50.5),
+                Some(60.5),
+                Some(70.5),
+                Some(80.5),
+                Some(90.5),
+                Some(100.5),
+            ]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(value_array),
+                ],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Test 1: Filter with greater than predicate
+            let filter = col("id").gt(lit(5_i64));
+            let scan = table
+                .scan(&ctx.state(), None, &[filter], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 5,
+                "{:?}: should have 5 rows with id > 5",
+                engine
+            );
+
+            // Test 2: Filter with less than or equal predicate
+            let filter = col("value").lt_eq(lit(30.5_f64));
+            let scan = table
+                .scan(&ctx.state(), None, &[filter], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 3,
+                "{:?}: should have 3 rows with value <= 30.5",
+                engine
+            );
+
+            // Test 3: Filter with equality predicate
+            let filter = col("name").eq(lit("Charlie"));
+            let scan = table
+                .scan(&ctx.state(), None, &[filter], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 1,
+                "{:?}: should have 1 row with name = Charlie",
+                engine
+            );
+
+            // Test 4: Multiple filters (AND condition)
+            let filter1 = col("id").gt(lit(3_i64));
+            let filter2 = col("value").lt(lit(70.5_f64));
+            let scan = table
+                .scan(&ctx.state(), None, &[filter1, filter2], None)
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 3,
+                "{:?}: should have 3 rows with id > 3 AND value < 70.5",
+                engine
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushdown() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            // Insert test data
+            let id_array = Int64Array::from(vec![1, 2, 3]);
+            let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+            let value_array = Float64Array::from(vec![Some(1.5), Some(2.5), Some(3.5)]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(value_array),
+                ],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Test projection: select only id and name columns (indices 0 and 1)
+            let projection = Some(vec![0_usize, 1_usize]);
+            let scan = table
+                .scan(&ctx.state(), projection.as_ref(), &[], None)
+                .await
+                .expect("scan should be successful");
+
+            // Verify projected schema
+            let projected_schema = scan.schema();
+            assert_eq!(
+                projected_schema.fields().len(),
+                2,
+                "{:?}: should have 2 projected columns",
+                engine
+            );
+            assert_eq!(
+                projected_schema.field(0).name(),
+                "id",
+                "{:?}: first field should be id",
+                engine
+            );
+            assert_eq!(
+                projected_schema.field(1).name(),
+                "name",
+                "{:?}: second field should be name",
+                engine
+            );
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let batch = &results[0];
+            assert_eq!(
+                batch.num_columns(),
+                2,
+                "{:?}: should have 2 columns in result",
+                engine
+            );
+            assert_eq!(
+                batch.num_rows(),
+                3,
+                "{:?}: should have 3 rows in result",
+                engine
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_limit_pushdown() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            // Insert 10 rows
+            let id_array = Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            let name_array =
+                StringArray::from(vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]);
+            let value_array = Float64Array::from(vec![
+                Some(1.0),
+                Some(2.0),
+                Some(3.0),
+                Some(4.0),
+                Some(5.0),
+                Some(6.0),
+                Some(7.0),
+                Some(8.0),
+                Some(9.0),
+                Some(10.0),
+            ]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(value_array),
+                ],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Test limit of 3
+            let scan = table
+                .scan(&ctx.state(), None, &[], Some(3))
+                .await
+                .expect("scan should be successful");
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert!(
+                total_rows <= 3,
+                "{:?}: should have at most 3 rows with limit 3",
+                engine
+            );
+            assert!(total_rows > 0, "{:?}: should have at least 1 row", engine);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_combined_filter_projection_limit() {
+        run_compat_test(|engine, table| async move {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            // Insert test data
+            let id_array = Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            let name_array = StringArray::from(vec![
+                "Alice", "Bob", "Charlie", "David", "Eve", "Frank", "Grace", "Henry", "Ivy", "Jack",
+            ]);
+            let value_array = Float64Array::from(vec![
+                Some(10.0),
+                Some(20.0),
+                Some(30.0),
+                Some(40.0),
+                Some(50.0),
+                Some(60.0),
+                Some(70.0),
+                Some(80.0),
+                Some(90.0),
+                Some(100.0),
+            ]);
+
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(value_array),
+                ],
+            )
+            .expect("data should be created");
+
+            let exec = MockExec::new(vec![Ok(data)], schema);
+
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                .await
+                .expect("insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("insert successful");
+
+            // Test: projection (only name), filter (id > 3), and limit (2)
+            let projection = Some(vec![1_usize]); // name column
+            let filter = col("id").gt(lit(3_i64));
+            let limit = Some(2);
+
+            let scan = table
+                .scan(&ctx.state(), projection.as_ref(), &[filter], limit)
+                .await
+                .expect("scan should be successful");
+
+            // Verify projected schema
+            let projected_schema = scan.schema();
+            assert_eq!(
+                projected_schema.fields().len(),
+                1,
+                "{:?}: should have 1 projected column",
+                engine
+            );
+            assert_eq!(
+                projected_schema.field(0).name(),
+                "name",
+                "{:?}: projected field should be name",
+                engine
+            );
+
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert!(
+                total_rows <= 2,
+                "{:?}: should have at most 2 rows with limit 2",
+                engine
+            );
+            assert!(
+                total_rows > 0,
+                "{:?}: should have at least 1 row with id > 3",
+                engine
+            );
+
+            // Verify only name column is present
+            for batch in &results {
+                assert_eq!(
+                    batch.num_columns(),
+                    1,
+                    "{:?}: should have 1 column in result",
+                    engine
+                );
+            }
         })
         .await;
     }
