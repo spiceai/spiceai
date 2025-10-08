@@ -12102,6 +12102,7 @@ dependencies = [
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",
+ "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
  "runtime-table-partition",
@@ -12251,6 +12252,18 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "runtime-parameters"
+version = "1.9.0-unstable"
+dependencies = [
+ "itertools 0.14.0",
+ "runtime-secrets",
+ "secrecy",
+ "snafu",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -45,7 +45,7 @@ members = [
     "tools/spicepodschema/",
     "tools/spiceschema",
     "tools/testoperator",
-    "tools/parsley",
+    "tools/parsley", "crates/runtime-parameters",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
