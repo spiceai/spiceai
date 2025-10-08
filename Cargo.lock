@@ -12234,7 +12234,6 @@ dependencies = [
  "graph-rs-sdk",
  "graphql-parser",
  "headers-accept",
- "hex",
  "hf-hub",
  "http 1.3.1",
  "http-body-util",

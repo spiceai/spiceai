@@ -67,7 +67,6 @@ governor.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 headers-accept = "0.1.3"
-hex.workspace = true
 http.workspace = true
 http-body-util = "0.1.3"
 hyper = "1.7.0"

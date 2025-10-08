@@ -34,8 +34,9 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
-    sql::unparser::{Unparser, dialect::SqliteDialect},
+    sql::{unparser::{Unparser, dialect::SqliteDialect}, TableReference},
 };
+use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
@@ -91,11 +92,6 @@ pub enum Error {
     TursoDatabaseError { source: turso::Error },
 
     #[snafu(display(
-        "Turso only supports file mode acceleration. Memory mode is not supported. Please set mode: file in your acceleration configuration."
-    ))]
-    MemoryModeNotSupported,
-
-    #[snafu(display(
         "Remote Turso databases are not supported when using Turso as a file accelerator. Remote database support (turso_url, turso_auth_token) will be available when Turso is used as a data connector."
     ))]
     RemoteDatabaseNotSupported,
@@ -111,11 +107,8 @@ pub struct TursoConnectionPool {
 
 impl TursoConnectionPool {
     pub async fn new(path: &str) -> Result<Self> {
-        // Turso does not support in-memory mode due to threading requirements
-        if path == ":memory:" {
-            return Err(Error::MemoryModeNotSupported);
-        }
-
+        // Turso supports both file and memory modes
+        // Memory mode uses ":memory:" as the path
         let database = Builder::new_local(path)
             .build()
             .await
@@ -523,71 +516,16 @@ impl TursoDataSink {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.connect().await?;
 
-        // Build column list for INSERT statement
-        let columns: Vec<String> = self
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        // Use the same InsertBuilder pattern as SQLite and other SQL accelerators
+        let insert_table_builder =
+            InsertBuilder::new(&TableReference::bare(self.table_name.clone()), vec![batch.clone()]);
 
-        // Build a batch SQL statement with all INSERT statements
-        let mut batch_sql = String::new();
-        batch_sql.push_str("BEGIN;\n");
+        let sql = insert_table_builder
+            .build_sqlite(None) // Turso uses SQLite syntax, no ON CONFLICT support
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        // Build INSERT statements for each row
-        for row_idx in 0..batch.num_rows() {
-            let mut values_str = Vec::new();
-
-            for col_idx in 0..batch.num_columns() {
-                let column = batch.column(col_idx);
-                let value = ScalarValue::try_from_array(column, row_idx)?;
-
-                // Convert DataFusion ScalarValue to SQL literal string
-                let sql_value = match value {
-                    ScalarValue::Int64(Some(v)) => v.to_string(),
-                    ScalarValue::Int32(Some(v)) => v.to_string(),
-                    ScalarValue::Int16(Some(v)) => v.to_string(),
-                    ScalarValue::Int8(Some(v)) => v.to_string(),
-                    ScalarValue::UInt64(Some(v)) => v.to_string(),
-                    ScalarValue::UInt32(Some(v)) => v.to_string(),
-                    ScalarValue::UInt16(Some(v)) => v.to_string(),
-                    ScalarValue::UInt8(Some(v)) => v.to_string(),
-                    ScalarValue::Float64(Some(v)) => v.to_string(),
-                    ScalarValue::Float32(Some(v)) => v.to_string(),
-                    ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
-                        format!("'{}'", v.replace('\'', "''"))
-                    }
-                    ScalarValue::Boolean(Some(v)) => {
-                        if v {
-                            "1".to_string()
-                        } else {
-                            "0".to_string()
-                        }
-                    }
-                    ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => {
-                        format!("X'{}'", hex::encode(v))
-                    }
-                    ScalarValue::TimestampMillisecond(Some(v), _) => v.to_string(),
-                    ScalarValue::TimestampMicrosecond(Some(v), _) => (v / 1000).to_string(),
-                    ScalarValue::TimestampNanosecond(Some(v), _) => (v / 1_000_000).to_string(),
-                    ScalarValue::TimestampSecond(Some(v), _) => (v * 1000).to_string(),
-                    ScalarValue::Date32(Some(v)) => v.to_string(),
-                    ScalarValue::Date64(Some(v)) => v.to_string(),
-                    _ => "NULL".to_string(),
-                };
-                values_str.push(sql_value);
-            }
-
-            batch_sql.push_str(&format!(
-                "INSERT INTO {} ({}) VALUES ({});\n",
-                self.table_name,
-                columns.join(", "),
-                values_str.join(", ")
-            ));
-        }
-
-        batch_sql.push_str("COMMIT;");
+        // Wrap in a transaction for atomic batch insert
+        let batch_sql = format!("BEGIN;\n{}\nCOMMIT;", sql);
 
         // Execute the entire batch in one call
         conn.execute_batch(&batch_sql).await?;
@@ -696,11 +634,12 @@ impl TursoAccelerator {
 
     /// Returns the `Turso` file path that would be used for a file-based `Turso` accelerator from this dataset
     pub fn turso_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+        // Memory mode uses ":memory:" as the path
         if !source.is_file_accelerated() {
-            Err(Error::InvalidConfiguration {
-                detail: Arc::from("Dataset is not file accelerated"),
-            })
-        } else if let Some(acceleration) = source.acceleration() {
+            return Ok(":memory:".to_string());
+        }
+        
+        if let Some(acceleration) = source.acceleration() {
             let acceleration_params = &acceleration.params;
 
             // Check for remote database parameters (not supported as accelerator)
@@ -794,23 +733,20 @@ impl DataAccelerator for TursoAccelerator {
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
         if !source.is_file_accelerated() {
-            return false; // Turso requires file mode
+            // Memory mode is never pre-initialized (always starts fresh)
+            return false;
         }
 
-        // Check if the file exists
+        // Check if the file exists for file mode
         self.has_existing_file(source)
     }
 
     /// Initializes a `Turso` database for the dataset
-    /// Turso only supports file mode
+    /// Turso supports both file and memory modes
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !source.is_file_accelerated() {
-            return Err(Error::MemoryModeNotSupported.into());
-        }
-
         // Check for remote database parameters early
         if let Some(acceleration) = source.acceleration() {
             if acceleration.params.contains_key("turso_url")
@@ -822,6 +758,14 @@ impl DataAccelerator for TursoAccelerator {
 
         let path = self.file_path(source)?;
 
+        // Skip file operations for memory mode
+        if path == ":memory:" {
+            // Initialize the in-memory database
+            self.get_connection(source).await?;
+            return Ok(());
+        }
+
+        // File mode initialization
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("turso_file") {
                 make_spice_data_directory()
@@ -866,20 +810,14 @@ impl DataAccelerator for TursoAccelerator {
             }
         );
 
-        // Turso only supports file mode
-        if let Some(source) = source {
-            if !source.is_file_accelerated() {
-                return Err(Error::MemoryModeNotSupported.into());
-            }
-        }
-
-        // Determine the database path
+        // Determine the database path (supports both file and memory modes)
         let db_path = if let Some(source) = source {
             self.turso_file_path(source)?
         } else if let Some(file) = cmd.options.get("file") {
             file.clone()
         } else {
-            return Err(Error::MemoryModeNotSupported.into());
+            // Default to memory mode if no file specified
+            ":memory:".to_string()
         };
 
         // Get or create connection pool

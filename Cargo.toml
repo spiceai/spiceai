@@ -130,7 +130,6 @@ governor = "0.10.1"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
-hex = "0.4"
 http = "1.3.1"
 iceberg = "0.7.0"
 iceberg-catalog-glue = "0.7.0"
