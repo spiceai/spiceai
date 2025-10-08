@@ -96,7 +96,7 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
-pub mod parameters;
+pub use runtime_parameters as parameters;
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
