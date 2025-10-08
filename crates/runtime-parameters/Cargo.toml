@@ -1,5 +1,6 @@
 [package]
 name = "runtime-parameters"
+description = "Runtime parameters management for the workspace."
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
