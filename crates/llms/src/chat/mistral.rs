@@ -634,8 +634,9 @@ fn stream_from_response(
 
             match resp {
                 // MistralResponse::CompletionChunk(chunk) => yield chunk_to_openai_stream(chunk),
-                MistralResponse::Chunk(chunk) => yield chunk_to_openai_stream(chunk),
+                MistralResponse::Chunk(chunk) => {tracing::trace!("MistralResponse::Chunk"); yield chunk_to_openai_stream(chunk)},
                 MistralResponse::ModelError(err_msg, _) | MistralResponse::CompletionModelError(err_msg, _)=> {
+                    tracing::trace!("MistralResponse::ModelError(err_msg, _) | MistralResponse::CompletionModelError(err_msg, _)");
                     yield Err(OpenAIError::ApiError(ApiError {
                         message: err_msg,
                         r#type: None,
@@ -644,6 +645,7 @@ fn stream_from_response(
                     }));
                 },
                 MistralResponse::InternalError(err_msg) | MistralResponse::ValidationError(err_msg) => {
+                    tracing::trace!("MistralResponse::InternalError(err_msg) | MistralResponse::ValidationError(err_msg)");
                     yield Err(OpenAIError::ApiError(ApiError {
                         message: err_msg.to_string(),
                         r#type: None,
@@ -652,6 +654,7 @@ fn stream_from_response(
                     }));
                 },
                 MistralResponse::Speech{..} => {
+                    tracing::trace!("MistralResponse::Speech{..}");
                     yield Err(OpenAIError::ApiError(ApiError {
                         message: "Speech generation is not supported".to_string(),
                         r#type: None,
@@ -660,6 +663,7 @@ fn stream_from_response(
                     }));
                 },
                 MistralResponse::ImageGeneration(_) => {
+                    tracing::trace!("MistralResponse::ImageGeneration(_)");
                     yield Err(OpenAIError::ApiError(ApiError {
                         message: "image generation is not supported".to_string(),
                         r#type: None,
