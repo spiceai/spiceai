@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
 use std::{
     any::TypeId,
@@ -208,10 +209,10 @@ impl RequestContext {
             .cloned()
     }
 
-    pub async fn insert_extension<T: Extension + Send + Sync>(&self, extension: T) {
+    pub fn insert_extension<T: Extension + Send + Sync>(&self, extension: T) {
         if let Ok(mut extensions) = self.extensions.write() {
             extensions.insert(extension.type_id(), Arc::new(extension));
-        };
+        }
     }
 
     pub async fn load_extensions(&self) {

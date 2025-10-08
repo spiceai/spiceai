@@ -80,7 +80,7 @@ where
 
         Box::pin(async move {
             let context = RequestContext::current(AsyncMarker::new().await);
-            context.insert_extension(ModelContextExtension::new()).await;
+            context.insert_extension(ModelContextExtension::new());
 
             let mut inner_service = inner;
             inner_service.call(req).await

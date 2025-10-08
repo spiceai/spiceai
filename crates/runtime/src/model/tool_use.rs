@@ -410,7 +410,7 @@ impl Chat for ToolUsingChat {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let context = RequestContext::current(AsyncMarker::new().await);
         if context.extension::<ModelContextExtension>().is_none() {
-            context.insert_extension(ModelContextExtension::new()).await;
+            context.insert_extension(ModelContextExtension::new());
         }
         let inner_req = self.prepare_req(req).await?;
 
@@ -425,7 +425,7 @@ impl Chat for ToolUsingChat {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let context = RequestContext::current(AsyncMarker::new().await);
         if context.extension::<ModelContextExtension>().is_none() {
-            context.insert_extension(ModelContextExtension::new()).await;
+            context.insert_extension(ModelContextExtension::new());
         }
 
         let inner_req = self.prepare_req(req).await?;
