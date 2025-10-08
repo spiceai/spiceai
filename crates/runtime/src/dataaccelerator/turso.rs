@@ -509,11 +509,7 @@ impl DisplayAs for TursoDataSink {
 }
 
 impl TursoDataSink {
-    fn new(
-        pool: Arc<TursoConnectionPool>,
-        table_name: String,
-        schema: SchemaRef,
-    ) -> Self {
+    fn new(pool: Arc<TursoConnectionPool>, table_name: String, schema: SchemaRef) -> Self {
         Self {
             pool,
             table_name,
@@ -542,7 +538,7 @@ impl TursoDataSink {
         // Build INSERT statements for each row
         for row_idx in 0..batch.num_rows() {
             let mut values_str = Vec::new();
-            
+
             for col_idx in 0..batch.num_columns() {
                 let column = batch.column(col_idx);
                 let value = ScalarValue::try_from_array(column, row_idx)?;
@@ -562,7 +558,13 @@ impl TursoDataSink {
                     ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
                         format!("'{}'", v.replace('\'', "''"))
                     }
-                    ScalarValue::Boolean(Some(v)) => if v { "1".to_string() } else { "0".to_string() },
+                    ScalarValue::Boolean(Some(v)) => {
+                        if v {
+                            "1".to_string()
+                        } else {
+                            "0".to_string()
+                        }
+                    }
                     ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => {
                         format!("X'{}'", hex::encode(v))
                     }
