@@ -69,8 +69,7 @@ impl DatasetCheckpoint {
     pub(super) async fn exists_turso(&self, pool: &Arc<TursoConnectionPool>) -> Result<bool> {
         let conn = pool.connect().await.map_err(Error::external)?;
 
-        let query =
-            format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
+        let query = format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
         let mut rows = conn
             .query(&query, turso::params![self.dataset_name.clone()])
             .await
@@ -96,10 +95,9 @@ impl DatasetCheckpoint {
 
         if let Some(row) = rows.next().await.map_err(Error::external)? {
             let timestamp_str: String = row.get(0).map_err(Error::external)?;
-            let checkpoint_time: DateTime<Utc> =
-                DateTime::parse_from_rfc3339(&timestamp_str)
-                    .map_err(Error::external)?
-                    .into();
+            let checkpoint_time: DateTime<Utc> = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map_err(Error::external)?
+                .into();
             Ok(Some(checkpoint_time.into()))
         } else {
             Ok(None)
@@ -136,9 +134,8 @@ impl DatasetCheckpoint {
     ) -> Result<Option<SchemaRef>> {
         let conn = pool.connect().await.map_err(Error::external)?;
 
-        let query = format!(
-            "SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?"
-        );
+        let query =
+            format!("SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
         let mut rows = conn
             .query(&query, turso::params![self.dataset_name.clone()])
             .await

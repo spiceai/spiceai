@@ -738,7 +738,7 @@ impl TursoDataSink {
         );
 
         // Use a transaction to batch all inserts
-        conn.execute("BEGIN", ()).await?;
+        conn.execute("BEGIN CONCURRENT", ()).await?;
 
         // Prepare the statement once
         let mut stmt = conn.prepare(&insert_sql).await?;
@@ -1195,7 +1195,6 @@ mod tests {
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
-    use futures::FutureExt;
     use std::collections::HashMap;
 
     #[tokio::test]

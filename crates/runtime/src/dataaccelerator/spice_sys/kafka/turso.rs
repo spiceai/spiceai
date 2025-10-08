@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use super::{KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Error, Result};
+use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use crate::dataaccelerator::turso::TursoConnectionPool;
 
 impl KafkaSys {
@@ -57,12 +57,7 @@ impl KafkaSys {
         );
         conn.execute(
             &upsert,
-            turso::params![
-                dataset_name,
-                consumer_group_id,
-                topic,
-                schema_json,
-            ],
+            turso::params![dataset_name, consumer_group_id, topic, schema_json,],
         )
         .await
         .map_err(Error::external)?;
@@ -77,7 +72,10 @@ impl KafkaSys {
             "SELECT consumer_group_id, topic, schema_json FROM {KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
 
-        let mut rows = conn.query(&query, turso::params![dataset_name]).await.ok()?;
+        let mut rows = conn
+            .query(&query, turso::params![dataset_name])
+            .await
+            .ok()?;
         let row = rows.next().await.ok()??;
 
         let consumer_group_id = row.get::<String>(0).ok()?;

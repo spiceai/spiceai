@@ -18,13 +18,13 @@ use crate::acceleration::wait_for_checkpoints;
 use anyhow::anyhow;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use turso::Connection;
 use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     component::dataset::Dataset,
 };
 use std::sync::Arc;
+use turso::Connection;
 
 use crate::{
     acceleration::get_params,
@@ -107,24 +107,24 @@ async fn test_acceleration_turso_checkpoint() -> Result<(), anyhow::Error> {
                 .build()
                 .await
                 .map_err(|e| anyhow!("Failed to build libsql database: {}", e))?;
-            let conn = db.connect()
+            let conn = db
+                .connect()
                 .map_err(|e| anyhow!("Failed to connect to libsql database: {}", e))?;
 
             // Query checkpoint table
             let checkpoint_result = query_to_record_batches(
                 &conn,
-                "SELECT dataset_name FROM spice_sys_dataset_checkpoint"
-            ).await?;
+                "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
+            )
+            .await?;
 
             let pretty = arrow::util::pretty::pretty_format_batches(&checkpoint_result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!(pretty);
 
             // Query persisted data
-            let persisted_records = query_to_record_batches(
-                &conn,
-                "SELECT * FROM decimal ORDER BY id"
-            ).await?;
+            let persisted_records =
+                query_to_record_batches(&conn, "SELECT * FROM decimal ORDER BY id").await?;
 
             let persisted_records_pretty =
                 arrow::util::pretty::pretty_format_batches(&persisted_records)
@@ -147,20 +147,28 @@ async fn query_to_record_batches(
     use arrow::array::*;
     use arrow::datatypes::{DataType, Field, Schema};
 
-    let mut stmt = conn.prepare(query).await
+    let mut stmt = conn
+        .prepare(query)
+        .await
         .map_err(|e| anyhow!("Failed to prepare statement: {}", e))?;
-    let mut rows = stmt.query(()).await
+    let mut rows = stmt
+        .query(())
+        .await
         .map_err(|e| anyhow!("Failed to query: {}", e))?;
 
     let mut all_rows: Vec<Vec<turso::Value>> = Vec::new();
 
     // Collect all rows
-    while let Some(row) = rows.next().await
-        .map_err(|e| anyhow!("Failed to fetch row: {}", e))? {
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| anyhow!("Failed to fetch row: {}", e))?
+    {
         let column_count = row.column_count();
         let mut row_values = Vec::with_capacity(column_count as usize);
         for i in 0..column_count {
-            let value = row.get_value(i)
+            let value = row
+                .get_value(i)
                 .map_err(|e| anyhow!("Failed to get value: {}", e))?;
             row_values.push(value);
         }
@@ -171,9 +179,11 @@ async fn query_to_record_batches(
         // Return empty batch with inferred schema from the first query
         // For checkpoint query, we know it has dataset_name column
         let schema = if query.contains("spice_sys_dataset_checkpoint") {
-            Arc::new(Schema::new(vec![
-                Field::new("dataset_name", DataType::Utf8, true),
-            ]))
+            Arc::new(Schema::new(vec![Field::new(
+                "dataset_name",
+                DataType::Utf8,
+                true,
+            )]))
         } else {
             // For decimal table, infer from column names
             Arc::new(Schema::new(vec![
@@ -187,15 +197,18 @@ async fn query_to_record_batches(
     // Get column names from statement
     let column_count = all_rows[0].len();
     let mut fields = Vec::new();
-    
+
     // Re-prepare statement to get column names
-    let stmt = conn.prepare(query).await
+    let stmt = conn
+        .prepare(query)
+        .await
         .map_err(|e| anyhow!("Failed to prepare statement for column names: {}", e))?;
-    
+
     let columns = stmt.columns();
-    
+
     for i in 0..column_count {
-        let field_name = columns.get(i)
+        let field_name = columns
+            .get(i)
             .map(|col| col.name().to_string())
             .unwrap_or_else(|| format!("column_{}", i));
         let data_type = match &all_rows[0][i] {
@@ -207,12 +220,12 @@ async fn query_to_record_batches(
         };
         fields.push(Field::new(field_name, data_type, true));
     }
-    
+
     let schema = Arc::new(Schema::new(fields));
 
     // Convert to Arrow arrays
     let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
-    
+
     for col_idx in 0..column_count {
         let column: Arc<dyn arrow::array::Array> = match &all_rows[0][col_idx] {
             turso::Value::Integer(_) => {
@@ -260,10 +273,7 @@ async fn query_to_record_batches(
                 Arc::new(BinaryArray::from(values))
             }
             turso::Value::Null => {
-                let values: Vec<Option<String>> = all_rows
-                    .iter()
-                    .map(|_row| None)
-                    .collect();
+                let values: Vec<Option<String>> = all_rows.iter().map(|_row| None).collect();
                 Arc::new(StringArray::from(values))
             }
         };

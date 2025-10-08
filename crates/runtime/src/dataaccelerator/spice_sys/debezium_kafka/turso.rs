@@ -88,7 +88,10 @@ impl DebeziumKafkaSys {
             "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
         );
 
-        let mut rows = conn.query(&query, turso::params![dataset_name]).await.ok()?;
+        let mut rows = conn
+            .query(&query, turso::params![dataset_name])
+            .await
+            .ok()?;
         let row = rows.next().await.ok()??;
 
         let consumer_group_id = row.get::<String>(0).ok()?;
