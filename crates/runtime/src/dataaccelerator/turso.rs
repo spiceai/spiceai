@@ -1179,9 +1179,9 @@ impl DataAccelerator for TursoAccelerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::acceleration::Acceleration;
+    use crate::Runtime;
+    use crate::component::dataset::acceleration::{Acceleration, Mode};
     use crate::component::dataset::builder::DatasetBuilder;
-    use crate::{Runtime, app};
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -1190,7 +1190,7 @@ mod tests {
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, dml::InsertOp, lit},
+        logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
