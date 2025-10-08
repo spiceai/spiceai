@@ -26,7 +26,7 @@ impl DebeziumKafkaSys {
         pool: &SqliteConnectionPool,
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
@@ -92,7 +92,7 @@ impl DebeziumKafkaSys {
         &self,
         pool: &SqliteConnectionPool,
     ) -> Option<DebeziumKafkaMetadata> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.ok()?;
         let dataset_name = self.dataset_name.clone();
         
         tokio::task::spawn_blocking(move || {

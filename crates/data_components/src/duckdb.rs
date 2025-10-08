@@ -104,34 +104,44 @@ impl DeletionSink for DuckDBDeletionSink {
         let table_definition = self.table_definition.clone();
         let filters = self.filters.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let mut db_conn = pool.connect_sync()?;
-            let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
-            let tx = duckdb_conn
-                .conn
-                .transaction()
-                .context(UnableToBeginTransactionSnafu)?;
-            let has_table = table_definition.has_table(&tx)?;
-            let mut internal_tables = table_definition.list_internal_tables(&tx)?;
-            let table_name = match (internal_tables.pop(), has_table) {
-                (Some((table_name, _)), true) => {
-                    return Err(Box::new(Error::UnableToDeleteDataInternalTable {
-                        internal_table: table_name.to_string(),
-                        table_name: table_definition.name().to_string(),
-                    }));
-                }
-                (Some((table_name, _)), false) => table_name,
-                (None, true) => table_definition.name().clone(),
-                (None, false) => {
-                    return Ok(0);
-                }
-            };
+        tokio::task::spawn_blocking(
+            move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                let mut db_conn = pool.connect_sync()?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let tx = duckdb_conn
+                    .conn
+                    .transaction()
+                    .context(UnableToBeginTransactionSnafu)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let has_table = table_definition
+                    .has_table(&tx)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let mut internal_tables = table_definition
+                    .list_internal_tables(&tx)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let table_name = match (internal_tables.pop(), has_table) {
+                    (Some((table_name, _)), true) => {
+                        return Err(Box::new(Error::UnableToDeleteDataInternalTable {
+                            internal_table: table_name.to_string(),
+                            table_name: table_definition.name().to_string(),
+                        }));
+                    }
+                    (Some((table_name, _)), false) => table_name,
+                    (None, true) => table_definition.name().clone(),
+                    (None, false) => {
+                        return Ok(0);
+                    }
+                };
 
-            let sql = util::filters_to_sql(&filters, Some(Engine::DuckDB))?;
-            let count = delete_from(&table_name.to_string(), tx, &sql)?;
+                let sql = util::filters_to_sql(&filters, Some(Engine::DuckDB))
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let count = delete_from(&table_name.to_string(), tx, &sql)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-            Ok(count)
-        })
+                Ok(count)
+            },
+        )
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
     }

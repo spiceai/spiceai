@@ -27,7 +27,7 @@ impl KafkaSys {
         pool: &SqliteConnectionPool,
         metadata: &KafkaMetadata,
     ) -> Result<()> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let schema_json = Self::serialize_schema(&metadata.schema)?;
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
@@ -82,7 +82,7 @@ impl KafkaSys {
     }
 
     pub(super) async fn get_sqlite(&self, pool: &SqliteConnectionPool) -> Option<KafkaMetadata> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.ok()?;
         let dataset_name = self.dataset_name.clone();
 
         tokio::task::spawn_blocking(move || {

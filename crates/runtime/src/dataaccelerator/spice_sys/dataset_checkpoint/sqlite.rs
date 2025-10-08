@@ -25,7 +25,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
 
 impl DatasetCheckpoint {
     pub(super) async fn init_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         
         tokio::task::spawn_blocking(move || {
             let conn_sync = pool.connect_sync();
@@ -55,7 +55,7 @@ impl DatasetCheckpoint {
     }
 
     pub(super) async fn migrate_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
 
         tokio::task::spawn_blocking(move || {
             let conn_sync = pool.connect_sync();
@@ -88,7 +88,7 @@ impl DatasetCheckpoint {
     }
 
     pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let dataset_name = self.dataset_name.clone();
         
         tokio::task::spawn_blocking(move || {
@@ -116,7 +116,7 @@ impl DatasetCheckpoint {
         &self,
         pool: &SqliteConnectionPool,
     ) -> Result<Option<SystemTime>> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let dataset_name = self.dataset_name.clone();
 
         let checkpoint_time: Option<DateTime<Utc>> = tokio::task::spawn_blocking(move || {
@@ -151,7 +151,7 @@ impl DatasetCheckpoint {
         pool: &SqliteConnectionPool,
         schema: &SchemaRef,
     ) -> Result<()> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let dataset_name = self.dataset_name.clone();
         let schema_json = Self::serialize_schema(schema)?;
 
@@ -184,7 +184,7 @@ impl DatasetCheckpoint {
         &self,
         pool: &SqliteConnectionPool,
     ) -> Result<Option<SchemaRef>> {
-        let pool = pool.clone();
+        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let dataset_name = self.dataset_name.clone();
 
         let schema_json: Option<String> = tokio::task::spawn_blocking(move || {
