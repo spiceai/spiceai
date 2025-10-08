@@ -7,15 +7,25 @@ Spice.ai acknowledges the following open source projects for making this project
 ## Go Modules
 
 github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.5.0/LICENSE, MIT
+github.com/apache/arrow/go/v17, https://github.com/apache/arrow/blob/go/v17.0.0/go/LICENSE.txt, Apache-2.0
+github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/v4.3.0/LICENSE, MIT
 github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
+github.com/dustin/go-humanize, https://github.com/dustin/go-humanize/blob/v1.0.1/LICENSE, MIT
 github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.9.0/LICENSE, BSD-3-Clause
+github.com/go-logr/logr, https://github.com/go-logr/logr/blob/v1.4.2/LICENSE, Apache-2.0
+github.com/go-logr/stdr, https://github.com/go-logr/stdr/blob/v1.2.2/LICENSE, Apache-2.0
 github.com/go-viper/mapstructure/v2, https://github.com/go-viper/mapstructure/blob/v2.4.0/LICENSE, MIT
 github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/b87c2d0e983a/LICENSE, MIT
+github.com/goccy/go-json, https://github.com/goccy/go-json/blob/v0.10.3/LICENSE, MIT
 github.com/golang-jwt/jwt/v5, https://github.com/golang-jwt/jwt/blob/v5.2.2/LICENSE, MIT
+github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/v24.3.25/LICENSE, Apache-2.0
 github.com/google/uuid, https://github.com/google/uuid/blob/v1.6.0/LICENSE, BSD-3-Clause
 github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/v0.5.2/LICENSE, MPL-2.0
 github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/v0.7.8/LICENSE, MPL-2.0
 github.com/joho/godotenv, https://github.com/joho/godotenv/blob/v1.5.1/LICENCE, MIT
+github.com/klauspost/compress, https://github.com/klauspost/compress/blob/v1.17.11/LICENSE, Apache-2.0
+github.com/klauspost/compress/internal/snapref, https://github.com/klauspost/compress/blob/v1.17.11/internal/snapref/LICENSE, BSD-3-Clause
+github.com/klauspost/compress/zstd/internal/xxhash, https://github.com/klauspost/compress/blob/v1.17.11/zstd/internal/xxhash/LICENSE.txt, MIT
 github.com/kylelemons/godebug, https://github.com/kylelemons/godebug/blob/v1.1.0/LICENSE, Apache-2.0
 github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/v2.0.3/LICENSE, Unlicense
 github.com/manifoldco/promptui, https://github.com/manifoldco/promptui/blob/v0.9.0/LICENSE.md, BSD-3-Clause
@@ -23,6 +33,7 @@ github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.1
 github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v0.0.5/LICENSE.md, MIT
 github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.2.4/LICENSE, MIT
 github.com/peterh/liner, https://github.com/peterh/liner/blob/v1.2.2/COPYING, MIT
+github.com/pierrec/lz4/v4, https://github.com/pierrec/lz4/blob/v4.1.21/LICENSE, BSD-3-Clause
 github.com/pkg/browser, https://github.com/pkg/browser/blob/5ac0b6a4141c/LICENSE, BSD-2-Clause
 github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/v0.4.6/LICENSE.txt, MIT
 github.com/sagikazarmark/locafero, https://github.com/sagikazarmark/locafero/blob/v0.11.0/LICENSE, MIT
@@ -32,11 +43,23 @@ github.com/spf13/cast, https://github.com/spf13/cast/blob/v1.10.0/LICENSE, MIT
 github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.10.1/LICENSE.txt, Apache-2.0
 github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.10/LICENSE, BSD-3-Clause
 github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.21.0/LICENSE, MIT
+github.com/spiceai/gospice/v7, https://github.com/spiceai/gospice/blob/v7.0.0/LICENSE, Apache-2.0
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
+github.com/zeebo/xxh3, https://github.com/zeebo/xxh3/blob/v1.0.2/LICENSE, BSD-2-Clause
+go.opentelemetry.io/otel, https://github.com/open-telemetry/opentelemetry-go/blob/v1.31.0/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/metric, https://github.com/open-telemetry/opentelemetry-go/blob/metric/v1.31.0/metric/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/sdk, https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.31.0/sdk/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/trace, https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.31.0/trace/LICENSE, Apache-2.0
 go.yaml.in/yaml/v3, https://github.com/yaml/go-yaml/blob/v3.0.4/LICENSE, MIT
+golang.org/x/exp, https://cs.opensource.google/go/x/exp/+/f66d83c2:LICENSE, BSD-3-Clause
 golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.28.0:LICENSE, BSD-3-Clause
-golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.36.0:LICENSE, BSD-3-Clause
+golang.org/x/net, https://cs.opensource.google/go/x/net/+/v0.43.0:LICENSE, BSD-3-Clause
+golang.org/x/sys, https://cs.opensource.google/go/x/sys/+/v0.36.0:LICENSE, BSD-3-Clause
 golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.28.0:LICENSE, BSD-3-Clause
+golang.org/x/xerrors, https://cs.opensource.google/go/x/xerrors/+/7835f813:LICENSE, BSD-3-Clause
+google.golang.org/genproto/googleapis/rpc/status, https://github.com/googleapis/go-genproto/blob/324edc3d5d38/googleapis/rpc/LICENSE, Apache-2.0
+google.golang.org/grpc, https://github.com/grpc/grpc-go/blob/v1.67.1/LICENSE, Apache-2.0
+google.golang.org/protobuf, https://github.com/protocolbuffers/protobuf-go/blob/v1.35.1/LICENSE, BSD-3-Clause
 gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 ## Rust Crates
@@ -155,7 +178,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - azure_core 0.21.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_core 0.27.0, MIT 
+- azure_core 0.28.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
 - azure_storage 0.21.0, MIT 
@@ -260,9 +283,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - delta_kernel 0.14.0, Apache-2.0 
   <br/>https://github.com/delta-io/delta-kernel-rs
 
-- dirs 5.0.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/soc/dirs-rs
-
 - dirs 6.0.0, Apache-2.0 OR MIT 
   <br/>https://github.com/soc/dirs-rs
 
@@ -341,19 +361,19 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hyper-util 0.1.16, MIT 
   <br/>https://github.com/hyperium/hyper-util
 
-- iceberg 0.5.2, Apache-2.0 
+- iceberg 0.7.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-catalog-glue 0.5.2, Apache-2.0 
+- iceberg-catalog-glue 0.7.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-catalog-rest 0.5.2, Apache-2.0 
+- iceberg-catalog-rest 0.7.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-datafusion 0.5.2, Apache-2.0 
+- iceberg-datafusion 0.7.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg_test_utils 0.5.2, Apache-2.0 
+- iceberg_test_utils 0.7.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
 - imap 3.0.0-alpha.14, Apache-2.0 OR MIT 
@@ -362,7 +382,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
-- indexmap 2.11.0, Apache-2.0 OR MIT 
+- indexmap 2.11.4, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
 
 - indicatif 0.17.11, MIT 
@@ -407,7 +427,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - mediatype 0.19.20, MIT 
   <br/>https://github.com/picoHz/mediatype
 
-- mimalloc 0.1.47, MIT 
+- mimalloc 0.1.48, MIT 
   <br/>https://github.com/purpleprotocol/mimalloc_rust
 
 - mistralrs 0.6.0, MIT 
@@ -419,7 +439,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - model2vec-rs 0.1.3,  LICENSE
   <br/>https://github.com/MinishLab/model2vec-rs
 
-- moka 0.12.10, Apache-2.0 OR MIT 
+- moka 0.12.11, (Apache-2.0 OR MIT) AND Apache-2.0 
   <br/>https://github.com/moka-rs/moka
 
 - mongodb 3.3.0, Apache-2.0 
@@ -440,7 +460,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - notify 8.2.0, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
-- object_store 0.12.3, Apache-2.0 OR MIT 
+- object_store 0.12.4, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs-object-store
 
 - octocrab 0.45.0, Apache-2.0 OR MIT 
@@ -452,7 +472,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - once_cell 1.21.3, Apache-2.0 OR MIT 
   <br/>https://github.com/matklad/once_cell
 
-- opendal 0.53.3, Apache-2.0 
+- opendal 0.54.0, Apache-2.0 
   <br/>https://github.com/apache/opendal
 
 - opentelemetry 0.27.1, Apache-2.0 
@@ -551,7 +571,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rdkafka 0.38.0, MIT 
   <br/>https://github.com/fede1024/rust-rdkafka
 
-- regex 1.11.2, Apache-2.0 OR MIT 
+- regex 1.11.3, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/regex
 
 - reqwest 0.12.23, Apache-2.0 OR MIT 
@@ -605,13 +625,13 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - secrecy 0.10.3, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- serde 1.0.219, Apache-2.0 OR MIT 
+- serde 1.0.226, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
 - serde-value 0.7.0, MIT 
   <br/>https://github.com/arcnmx/serde-value
 
-- serde_json 1.0.143, Apache-2.0 OR MIT 
+- serde_json 1.0.145, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
 
 - serde_qs 0.8.5, Apache-2.0 OR MIT 
@@ -704,8 +724,8 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokio 1.47.1, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
-- tokio-postgres 0.7.13, Apache-2.0 OR MIT 
-  <br/>https://github.com/sfackler/rust-postgres
+- tokio-postgres 0.7.14, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-postgres/rust-postgres
 
 - tokio-rusqlite 0.5.1, MIT 
   <br/>https://github.com/programatik29/tokio-rusqlite
@@ -743,11 +763,17 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tracing-futures 0.2.5, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
+- tracing-log 0.2.0, MIT 
+  <br/>https://github.com/tokio-rs/tracing
+
 - tracing-opentelemetry 0.28.0, MIT 
   <br/>https://github.com/tokio-rs/tracing-opentelemetry
 
 - tracing-subscriber 0.3.20, MIT 
   <br/>https://github.com/tokio-rs/tracing
+
+- tracing-test 0.2.5, MIT 
+  <br/>https://github.com/dbrgn/tracing-test
 
 - tract-core 0.22.0, Apache-2.0 OR MIT 
   <br/>https://github.com/snipsco/tract
