@@ -41,16 +41,12 @@ impl PartialEq for SnapshotBehavior {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (SnapshotBehavior::Disabled, SnapshotBehavior::Disabled) => true,
-            (SnapshotBehavior::Enabled(snap1, _), SnapshotBehavior::Enabled(snap2, _)) => {
-                snap1 == snap2
-            }
-            (
+            (SnapshotBehavior::Enabled(snap1, _), SnapshotBehavior::Enabled(snap2, _))
+            | (SnapshotBehavior::CreateOnly(snap1, _), SnapshotBehavior::CreateOnly(snap2, _))
+            | (
                 SnapshotBehavior::BootstrapOnly(snap1, _),
                 SnapshotBehavior::BootstrapOnly(snap2, _),
             ) => snap1 == snap2,
-            (SnapshotBehavior::CreateOnly(snap1, _), SnapshotBehavior::CreateOnly(snap2, _)) => {
-                snap1 == snap2
-            }
             _ => false,
         }
     }
