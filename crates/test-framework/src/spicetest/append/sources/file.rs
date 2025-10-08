@@ -97,7 +97,8 @@ impl AppendableSource for FileAppendableSource {
                 for TableWithTimeColumn { name, column } in &self.tables {
                     // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
                     // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
-                    write!(setup_sql,
+                    write!(
+                        setup_sql,
                         "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
                          ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                          INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen

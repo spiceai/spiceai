@@ -21,26 +21,27 @@ use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider}
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::Session,
-    datasource::{TableProvider, sink::{DataSink, DataSinkExec}},
+    datasource::{
+        TableProvider,
+        sink::{DataSink, DataSinkExec},
+    },
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{CreateExternalTable, Expr, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        stream::RecordBatchStreamAdapter,
         execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
     sql::unparser::{Unparser, dialect::SqliteDialect},
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
-use turso::{
-    Builder, Connection, Database, Value as TursoValue,
-};
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, fmt, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
+use turso::{Builder, Connection, Database, Value as TursoValue};
 
 use crate::{
     component::dataset::acceleration::Engine,
@@ -257,7 +258,10 @@ impl TursoTableProvider {
                             _ => None,
                         })
                         .collect();
-                    Arc::new(arrow::array::TimestampMillisecondArray::from(values).with_timezone_opt(None::<String>))
+                    Arc::new(
+                        arrow::array::TimestampMillisecondArray::from(values)
+                            .with_timezone_opt(None::<String>),
+                    )
                 }
                 _ => {
                     // Default to string representation for unsupported types
@@ -321,13 +325,21 @@ impl TableProvider for TursoTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Turso does not support UPSERT/ON CONFLICT operations yet
+        // Warn if overwrite mode is requested
+        if !matches!(overwrite, InsertOp::Append) {
+            tracing::warn!(
+                "Turso accelerator does not support UPSERT/ON CONFLICT operations. InsertOp::{:?} will be treated as Append.",
+                overwrite
+            );
+        }
+
         Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(TursoDataSink::new(
                 Arc::clone(&self.pool),
                 self.table_name.clone(),
                 Arc::clone(&self.schema),
-                overwrite,
             )),
             None,
         )) as _)
@@ -470,7 +482,9 @@ impl ExecutionPlan for TursoExec {
             let batch = TursoTableProvider::values_to_record_batch(&all_rows, &schema)
                 .map_err(datafusion::error::DataFusionError::External)?;
 
-            Ok::<_, datafusion::error::DataFusionError>(stream::once(async move { Ok(batch) }).boxed())
+            Ok::<_, datafusion::error::DataFusionError>(
+                stream::once(async move { Ok(batch) }).boxed(),
+            )
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -486,7 +500,6 @@ struct TursoDataSink {
     pool: Arc<TursoConnectionPool>,
     table_name: String,
     schema: SchemaRef,
-    overwrite: InsertOp,
 }
 
 impl DisplayAs for TursoDataSink {
@@ -496,12 +509,15 @@ impl DisplayAs for TursoDataSink {
 }
 
 impl TursoDataSink {
-    fn new(pool: Arc<TursoConnectionPool>, table_name: String, schema: SchemaRef, overwrite: InsertOp) -> Self {
+    fn new(
+        pool: Arc<TursoConnectionPool>,
+        table_name: String,
+        schema: SchemaRef,
+    ) -> Self {
         Self {
             pool,
             table_name,
             schema,
-            overwrite,
         }
     }
 
@@ -511,74 +527,68 @@ impl TursoDataSink {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.connect().await?;
 
-        // Build INSERT statement
+        // Build column list for INSERT statement
         let columns: Vec<String> = self
             .schema
             .fields()
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        let placeholders = (0..columns.len())
-            .map(|i| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        
-        // Use INSERT OR REPLACE for Overwrite/Replace mode to support UPSERT/UPDATE
-        let insert_sql = match self.overwrite {
-            InsertOp::Overwrite | InsertOp::Replace => format!(
-                "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
-                self.table_name,
-                columns.join(", "),
-                placeholders
-            ),
-            InsertOp::Append => format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                self.table_name,
-                columns.join(", "),
-                placeholders
-            ),
-        };
 
-        // Insert each row
+        // Build a batch SQL statement with all INSERT statements
+        let mut batch_sql = String::new();
+        batch_sql.push_str("BEGIN;\n");
+
+        // Build INSERT statements for each row
         for row_idx in 0..batch.num_rows() {
-            let mut values = Vec::new();
+            let mut values_str = Vec::new();
+            
             for col_idx in 0..batch.num_columns() {
                 let column = batch.column(col_idx);
                 let value = ScalarValue::try_from_array(column, row_idx)?;
 
-                // Convert DataFusion ScalarValue to libsql Value
-                let libsql_value = match value {
-                    ScalarValue::Int64(Some(v)) => TursoValue::Integer(v),
-                    ScalarValue::Int32(Some(v)) => TursoValue::Integer(i64::from(v)),
-                    ScalarValue::Int16(Some(v)) => TursoValue::Integer(i64::from(v)),
-                    ScalarValue::Int8(Some(v)) => TursoValue::Integer(i64::from(v)),
-                    ScalarValue::UInt64(Some(v)) => TursoValue::Integer(i64::try_from(v).unwrap_or(i64::MAX)),
-                    ScalarValue::UInt32(Some(v)) => TursoValue::Integer(i64::from(v)),
-                    ScalarValue::UInt16(Some(v)) => TursoValue::Integer(i64::from(v)),
-                    ScalarValue::UInt8(Some(v)) => TursoValue::Integer(i64::from(v)),
-                    ScalarValue::Float64(Some(v)) => TursoValue::Real(v),
-                    ScalarValue::Float32(Some(v)) => TursoValue::Real(f64::from(v)),
-                    ScalarValue::Utf8(Some(v)) => TursoValue::Text(v),
-                    ScalarValue::LargeUtf8(Some(v)) => TursoValue::Text(v),
-                    ScalarValue::Boolean(Some(v)) => TursoValue::Integer(if v { 1 } else { 0 }),
-                    ScalarValue::Binary(Some(v)) => TursoValue::Blob(v),
-                    ScalarValue::LargeBinary(Some(v)) => TursoValue::Blob(v),
-                    ScalarValue::TimestampMillisecond(Some(v), _) => TursoValue::Integer(v),
-                    ScalarValue::TimestampMicrosecond(Some(v), _) => TursoValue::Integer(v / 1000),
-                    ScalarValue::TimestampNanosecond(Some(v), _) => TursoValue::Integer(v / 1_000_000),
-                    ScalarValue::TimestampSecond(Some(v), _) => TursoValue::Integer(v * 1000),
-                    ScalarValue::Date32(Some(v)) => TursoValue::Integer(i64::from(v)),
-                    ScalarValue::Date64(Some(v)) => TursoValue::Integer(v),
-                    _ => TursoValue::Null,
+                // Convert DataFusion ScalarValue to SQL literal string
+                let sql_value = match value {
+                    ScalarValue::Int64(Some(v)) => v.to_string(),
+                    ScalarValue::Int32(Some(v)) => v.to_string(),
+                    ScalarValue::Int16(Some(v)) => v.to_string(),
+                    ScalarValue::Int8(Some(v)) => v.to_string(),
+                    ScalarValue::UInt64(Some(v)) => v.to_string(),
+                    ScalarValue::UInt32(Some(v)) => v.to_string(),
+                    ScalarValue::UInt16(Some(v)) => v.to_string(),
+                    ScalarValue::UInt8(Some(v)) => v.to_string(),
+                    ScalarValue::Float64(Some(v)) => v.to_string(),
+                    ScalarValue::Float32(Some(v)) => v.to_string(),
+                    ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
+                        format!("'{}'", v.replace('\'', "''"))
+                    }
+                    ScalarValue::Boolean(Some(v)) => if v { "1".to_string() } else { "0".to_string() },
+                    ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => {
+                        format!("X'{}'", hex::encode(v))
+                    }
+                    ScalarValue::TimestampMillisecond(Some(v), _) => v.to_string(),
+                    ScalarValue::TimestampMicrosecond(Some(v), _) => (v / 1000).to_string(),
+                    ScalarValue::TimestampNanosecond(Some(v), _) => (v / 1_000_000).to_string(),
+                    ScalarValue::TimestampSecond(Some(v), _) => (v * 1000).to_string(),
+                    ScalarValue::Date32(Some(v)) => v.to_string(),
+                    ScalarValue::Date64(Some(v)) => v.to_string(),
+                    _ => "NULL".to_string(),
                 };
-                values.push(libsql_value);
+                values_str.push(sql_value);
             }
 
-            // turso crate requires params as tuples
-            // Use () for empty params since we're using positional placeholders
-            conn.execute(&insert_sql, values)
-                .await?;
+            batch_sql.push_str(&format!(
+                "INSERT INTO {} ({}) VALUES ({});\n",
+                self.table_name,
+                columns.join(", "),
+                values_str.join(", ")
+            ));
         }
+
+        batch_sql.push_str("COMMIT;");
+
+        // Execute the entire batch in one call
+        conn.execute_batch(&batch_sql).await?;
 
         Ok(())
     }

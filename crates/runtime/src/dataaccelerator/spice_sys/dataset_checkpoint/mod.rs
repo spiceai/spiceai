@@ -112,7 +112,12 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await?,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => Self::init_turso(pool).await?,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => return Err(Error::NoAccelerationConnection),
         }
 
@@ -126,7 +131,12 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => Self::migrate_sqlite(conn).await?,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => Self::migrate_turso(pool).await?,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => return Err(Error::NoAccelerationConnection),
         }
 
@@ -158,7 +168,12 @@ impl DatasetCheckpoint {
             AccelerationConnection::Turso(pool) => {
                 self.exists_turso(pool).await.ok().unwrap_or(false)
             }
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => false,
         }
     }
@@ -175,7 +190,12 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => self.last_checkpoint_time_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.last_checkpoint_time_turso(pool).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => Err(Error::NoAccelerationConnection),
         }
     }
@@ -190,7 +210,12 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn, schema).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.checkpoint_turso(pool, schema).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => Err(Error::NoAccelerationConnection),
         }
     }
@@ -205,7 +230,12 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => self.get_schema_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_schema_turso(pool).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => Err(Error::NoAccelerationConnection),
         }
     }

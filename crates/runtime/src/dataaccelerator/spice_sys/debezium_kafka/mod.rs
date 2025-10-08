@@ -64,7 +64,12 @@ impl DebeziumKafkaSys {
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => None,
         }
     }
@@ -79,7 +84,12 @@ impl DebeziumKafkaSys {
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres", feature = "turso")))]
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => Err(Error::NoAccelerationConnection),
         }
     }
