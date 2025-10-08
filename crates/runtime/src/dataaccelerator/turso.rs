@@ -1642,8 +1642,8 @@ mod tests {
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
-        let mut params = HashMap::new();
-        params.insert("turso_file_path".to_string(), test_path.to_string());
+        let mut options = HashMap::new();
+        options.insert("file".to_string(), test_path.to_string());
 
         let external_table = CreateExternalTable {
             schema: df_schema,
@@ -1655,7 +1655,7 @@ mod tests {
             definition: None,
             order_exprs: vec![],
             unbounded: false,
-            options: params,
+            options,
             constraints: Constraints::new_unverified(vec![]),
             column_defaults: HashMap::default(),
             temporary: false,
