@@ -119,6 +119,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct TursoConnectionPool {
     database: Arc<Database>,
     mvcc_enabled: bool,
+    db_path: String,
 }
 
 impl TursoConnectionPool {
@@ -136,6 +137,7 @@ impl TursoConnectionPool {
         Ok(Self {
             database: Arc::new(database),
             mvcc_enabled,
+            db_path: path.to_string(),
         })
     }
 
@@ -146,6 +148,16 @@ impl TursoConnectionPool {
     /// Returns true if MVCC (Multi-Version Concurrency Control) is enabled
     pub fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
+    }
+
+    /// Returns true if this is a memory database
+    pub fn is_memory_db(&self) -> bool {
+        self.db_path == ":memory:"
+    }
+
+    /// Returns the database path
+    pub fn db_path(&self) -> &str {
+        &self.db_path
     }
 }
 
@@ -1194,13 +1206,7 @@ impl TursoAccelerator {
         let turso_file = self.turso_file_path(source)?;
         let mvcc_enabled = self.parse_mvcc_enabled(source)?;
 
-        let db_path = if source.is_file_accelerated() {
-            turso_file
-        } else {
-            ":memory:".to_string()
-        };
-
-        let db = Builder::new_local(&db_path)
+        let db = Builder::new_local(&turso_file)
             .with_mvcc(mvcc_enabled)
             .build()
             .await
