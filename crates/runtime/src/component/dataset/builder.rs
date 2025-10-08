@@ -238,9 +238,11 @@ impl DatasetBuilder {
         })?;
 
         if let Some(acceleration) = self.acceleration.as_mut() {
-            let secrets = Arc::downgrade(&runtime.secrets());
-            acceleration.snapshots =
-                SnapshotBehavior::from(app.snapshots.clone(), self.acceleration_snapshot, secrets);
+            acceleration.snapshots = SnapshotBehavior::from(
+                app.snapshots.clone(),
+                self.acceleration_snapshot,
+                runtime.secrets_weak(),
+            );
         }
 
         let dataset = Dataset {
