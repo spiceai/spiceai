@@ -25,6 +25,7 @@ use datafusion::{
         TableProvider,
         sink::{DataSink, DataSinkExec},
     },
+    error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{
         CreateExternalTable, Expr, TableProviderFilterPushDown, TableType, dml::InsertOp,
@@ -36,7 +37,21 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
-    sql::unparser::{Unparser, dialect::SqliteDialect},
+    sql::{
+        TableReference,
+        sqlparser::ast::{self, VisitMut},
+        unparser::{
+            Unparser,
+            dialect::{Dialect, SqliteDialect},
+        },
+    },
+};
+use datafusion_federation::{
+    FederatedTableProviderAdaptor, FederatedTableSource,
+    sql::{
+        RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
+        ast_analyzer::{AstAnalyzer, AstAnalyzerRule},
+    },
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
 use runtime_table_partition::expression::PartitionBy;
@@ -518,6 +533,155 @@ impl DeletionTableProvider for TursoTableProvider {
             )),
             &self.schema(),
         )))
+    }
+}
+
+// Federation support for Turso
+impl TursoTableProvider {
+    /// Creates a federated table source for cross-database queries
+    fn create_federated_table_source(
+        self: Arc<Self>,
+    ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
+        let table_name = TableReference::bare(self.table_name.clone());
+        let schema = Arc::clone(&self.schema);
+        let fed_provider = Arc::new(SQLFederationProvider::new(self));
+
+        Ok(Arc::new(SQLTableSource::new_with_schema(
+            fed_provider,
+            RemoteTableRef::from(table_name),
+            schema,
+        )))
+    }
+
+    /// Creates a federated table provider that supports query federation
+    pub fn create_federated_table_provider(
+        self: Arc<Self>,
+    ) -> DataFusionResult<FederatedTableProviderAdaptor> {
+        let table_source = Self::create_federated_table_source(Arc::clone(&self))?;
+        Ok(FederatedTableProviderAdaptor::new_with_provider(
+            table_source,
+            self,
+        ))
+    }
+
+    /// Returns AST analyzer rules for Turso-specific SQL transformations
+    /// Similar to SQLite, Turso uses SQLite dialect and may need interval/between transformations
+    fn turso_ast_analyzer(&self) -> AstAnalyzerRule {
+        Box::new(|ast| {
+            match ast {
+                ast::Statement::Query(_query) => {
+                    // For now, pass through without transformations
+                    // In the future, we could add Turso-specific transformations here
+                    // similar to SQLite's INTERVAL handling
+                    Ok(ast)
+                }
+                _ => Ok(ast),
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl SQLExecutor for TursoTableProvider {
+    fn name(&self) -> &str {
+        &self.table_name
+    }
+
+    fn compute_context(&self) -> Option<String> {
+        None
+    }
+
+    fn dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect {})
+    }
+
+    fn ast_analyzer(&self) -> Option<AstAnalyzer> {
+        Some(AstAnalyzer::new(vec![self.turso_ast_analyzer()]))
+    }
+
+    fn execute(
+        &self,
+        query: &str,
+        schema: SchemaRef,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let pool = Arc::clone(&self.pool);
+        let query = query.to_string();
+        let schema_clone = Arc::clone(&schema);
+
+        let fut = async move {
+            let conn = pool.connect().await.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to connect to Turso: {}", e))
+            })?;
+
+            let rows = conn
+                .query(&query, ())
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Turso query failed: {}", e)))?;
+
+            let rows_vec: Vec<Vec<TursoValue>> =
+                rows.rows.into_iter().map(|row| row.values).collect();
+
+            if rows_vec.is_empty() {
+                return Ok(RecordBatch::new_empty(schema_clone));
+            }
+
+            TursoTableProvider::values_to_record_batch(&rows_vec, &schema_clone).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to convert Turso results: {}", e))
+            })
+        };
+
+        let stream = futures::stream::once(fut).boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    async fn table_names(&self) -> DataFusionResult<Vec<String>> {
+        Err(DataFusionError::NotImplemented(
+            "table inference not implemented".to_string(),
+        ))
+    }
+
+    async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
+        let conn = self.pool.connect().await.map_err(|e| {
+            DataFusionError::Execution(format!("Failed to connect to Turso: {}", e))
+        })?;
+
+        // Query the table schema using SQLite's pragma
+        let query = format!("PRAGMA table_info({})", table_name);
+        let rows = conn.query(&query, ()).await.map_err(|e| {
+            DataFusionError::Execution(format!("Failed to get table schema: {}", e))
+        })?;
+
+        let mut fields = Vec::new();
+        for row in rows.rows {
+            // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+            if row.values.len() >= 4 {
+                if let (
+                    TursoValue::Text(col_name),
+                    TursoValue::Text(col_type),
+                    TursoValue::Integer(not_null),
+                ) = (&row.values[1], &row.values[2], &row.values[3])
+                {
+                    let data_type = match col_type.to_uppercase().as_str() {
+                        "INTEGER" => DataType::Int64,
+                        "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
+                        "TEXT" => DataType::Utf8,
+                        "BLOB" => DataType::Binary,
+                        _ => DataType::Utf8,
+                    };
+                    let nullable = *not_null == 0;
+                    fields.push(Field::new(col_name.as_str(), data_type, nullable));
+                }
+            }
+        }
+
+        if fields.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "Table '{}' not found or has no columns",
+                table_name
+            )));
+        }
+
+        Ok(Arc::new(Schema::new(fields)))
     }
 }
 

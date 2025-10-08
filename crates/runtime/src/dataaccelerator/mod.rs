@@ -746,8 +746,6 @@ mod sqlite_compat_tests {
                 temporary: false,
             };
 
-            let ctx = SessionContext::new();
-
             let table = match engine {
                 #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
@@ -1000,7 +998,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_boolean_values() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, _table| async move {
             let ctx = SessionContext::new();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -1112,11 +1110,11 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_empty_result_set() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, _table| async move {
             let ctx = SessionContext::new();
 
             // Query empty table
-            let scan = table
+            let scan = _table
                 .scan(&ctx.state(), None, &[], None)
                 .await
                 .expect("scan should be successful");
