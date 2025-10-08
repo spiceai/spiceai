@@ -39,7 +39,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::{
         TableReference,
-        sqlparser::ast::{self, VisitMut},
+        sqlparser::ast,
         unparser::{
             Unparser,
             dialect::{Dialect, SqliteDialect},
