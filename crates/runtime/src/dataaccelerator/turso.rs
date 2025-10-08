@@ -140,6 +140,19 @@ impl TursoTableProvider {
         }
     }
 
+    /// Converts Turso database rows to Arrow RecordBatch, matching the exact schema types.
+    ///
+    /// This function is critical for reading data from Turso - it must respect the schema's
+    /// exact data types (e.g., LargeUtf8 vs Utf8, Timestamp units) to avoid type mismatches.
+    ///
+    /// Supported types:
+    /// - Integers: Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64
+    /// - Floats: Float32, Float64
+    /// - Strings: Utf8, LargeUtf8
+    /// - Binary: Binary, LargeBinary
+    /// - Boolean
+    /// - Timestamps: All time units (Second, Millisecond, Microsecond, Nanosecond)
+    /// - Dates: Date32, Date64
     fn values_to_record_batch(
         rows: &[Vec<TursoValue>],
         schema: &SchemaRef,
@@ -150,6 +163,39 @@ impl TursoTableProvider {
 
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let column: Arc<dyn arrow::array::Array> = match field.data_type() {
+                DataType::Int8 => {
+                    let values: Vec<Option<i8>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => i8::try_from(*i).ok(),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(Int8Array::from(values))
+                }
+                DataType::Int16 => {
+                    let values: Vec<Option<i16>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => i16::try_from(*i).ok(),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(Int16Array::from(values))
+                }
+                DataType::Int32 => {
+                    let values: Vec<Option<i32>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(Int32Array::from(values))
+                }
                 DataType::Int64 => {
                     let values: Vec<Option<i64>> = rows
                         .iter()
@@ -161,16 +207,38 @@ impl TursoTableProvider {
                         .collect();
                     Arc::new(Int64Array::from(values))
                 }
-                DataType::Int32 => {
-                    let values: Vec<Option<i32>> = rows
+                DataType::UInt8 => {
+                    let values: Vec<Option<u8>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
-                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                            TursoValue::Integer(i) => u8::try_from(*i).ok(),
                             TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
-                    Arc::new(arrow::array::Int32Array::from(values))
+                    Arc::new(UInt8Array::from(values))
+                }
+                DataType::UInt16 => {
+                    let values: Vec<Option<u16>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => u16::try_from(*i).ok(),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(UInt16Array::from(values))
+                }
+                DataType::UInt32 => {
+                    let values: Vec<Option<u32>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => u32::try_from(*i).ok(),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(UInt32Array::from(values))
                 }
                 DataType::UInt64 => {
                     let values: Vec<Option<u64>> = rows
@@ -218,6 +286,17 @@ impl TursoTableProvider {
                         .collect();
                     Arc::new(StringArray::from(values))
                 }
+                DataType::LargeUtf8 => {
+                    let values: Vec<Option<String>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Text(s) => Some(s.clone()),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(LargeStringArray::from(values))
+                }
                 DataType::Boolean => {
                     let values: Vec<Option<bool>> = rows
                         .iter()
@@ -229,7 +308,7 @@ impl TursoTableProvider {
                         .collect();
                     Arc::new(BooleanArray::from(values))
                 }
-                DataType::Binary | DataType::LargeBinary => {
+                DataType::Binary => {
                     let values: Vec<Option<&[u8]>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
@@ -239,6 +318,17 @@ impl TursoTableProvider {
                         })
                         .collect();
                     Arc::new(BinaryArray::from(values))
+                }
+                DataType::LargeBinary => {
+                    let values: Vec<Option<&[u8]>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Blob(b) => Some(b.as_slice()),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(LargeBinaryArray::from(values))
                 }
                 DataType::Timestamp(unit, tz) => {
                     // Timestamps stored as INTEGER in Turso/SQLite (milliseconds since epoch by default)
@@ -271,6 +361,30 @@ impl TursoTableProvider {
                                 .with_timezone_opt(tz.clone()),
                         ),
                     }
+                }
+                DataType::Date32 => {
+                    // Date32 stored as days since Unix epoch
+                    let values: Vec<Option<i32>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(Date32Array::from(values))
+                }
+                DataType::Date64 => {
+                    // Date64 stored as milliseconds since Unix epoch
+                    let values: Vec<Option<i64>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => Some(*i),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(Date64Array::from(values))
                 }
                 _ => {
                     // Default to string representation for unsupported types
