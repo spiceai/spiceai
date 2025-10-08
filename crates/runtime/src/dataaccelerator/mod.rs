@@ -687,18 +687,18 @@ mod test {
 mod sqlite_compat_tests {
     //! Shared compatibility test suite for SQLite and Turso accelerators.
     //! These tests ensure both accelerators behave identically for common operations.
-    
+
     use super::*;
     use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
     use arrow::{
-        array::{Int64Array, RecordBatch, StringArray, UInt64Array, Float64Array, BooleanArray},
+        array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
+        logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
@@ -720,7 +720,7 @@ mod sqlite_compat_tests {
 
         for engine in engines {
             println!("Testing with engine: {:?}", engine);
-            
+
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("name", DataType::Utf8, false),
@@ -745,7 +745,7 @@ mod sqlite_compat_tests {
             };
 
             let ctx = SessionContext::new();
-            
+
             let table = match engine {
                 #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
@@ -788,7 +788,11 @@ mod sqlite_compat_tests {
 
             let data = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(value_array)],
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(value_array),
+                ],
             )
             .expect("data should be created");
 
@@ -816,20 +820,37 @@ mod sqlite_compat_tests {
             assert_eq!(results.len(), 1, "{:?}: should have 1 batch", engine);
             let batch = &results[0];
             assert_eq!(batch.num_rows(), 3, "{:?}: should have 3 rows", engine);
-            assert_eq!(batch.num_columns(), 3, "{:?}: should have 3 columns", engine);
+            assert_eq!(
+                batch.num_columns(),
+                3,
+                "{:?}: should have 3 columns",
+                engine
+            );
 
             // Verify data
-            let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id should be Int64Array");
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id should be Int64Array");
             assert_eq!(id_col.value(0), 1);
             assert_eq!(id_col.value(1), 2);
             assert_eq!(id_col.value(2), 3);
 
-            let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().expect("name should be StringArray");
+            let name_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name should be StringArray");
             assert_eq!(name_col.value(0), "Alice");
             assert_eq!(name_col.value(1), "Bob");
             assert_eq!(name_col.value(2), "Charlie");
 
-            let value_col = batch.column(2).as_any().downcast_ref::<Float64Array>().expect("value should be Float64Array");
+            let value_col = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("value should be Float64Array");
             assert_eq!(value_col.value(0), 1.5);
             assert_eq!(value_col.value(1), 2.5);
             assert!(value_col.is_null(2));
@@ -851,11 +872,21 @@ mod sqlite_compat_tests {
             // Insert test data
             let id_array = Int64Array::from(vec![1, 2, 3, 4, 5]);
             let name_array = StringArray::from(vec!["A", "B", "C", "D", "E"]);
-            let value_array = Float64Array::from(vec![Some(10.0), Some(20.0), Some(30.0), Some(40.0), Some(50.0)]);
+            let value_array = Float64Array::from(vec![
+                Some(10.0),
+                Some(20.0),
+                Some(30.0),
+                Some(40.0),
+                Some(50.0),
+            ]);
 
             let data = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(value_array)],
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(value_array),
+                ],
             )
             .expect("data should be created");
 
@@ -914,7 +945,11 @@ mod sqlite_compat_tests {
 
             let data = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(value_array)],
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(value_array),
+                ],
             )
             .expect("data should be created");
 
@@ -940,11 +975,23 @@ mod sqlite_compat_tests {
                 .expect("scan successful");
 
             let batch = &results[0];
-            let value_col = batch.column(2).as_any().downcast_ref::<Float64Array>().expect("value should be Float64Array");
+            let value_col = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("value should be Float64Array");
 
-            assert!(!value_col.is_null(0), "{:?}: row 0 should not be null", engine);
+            assert!(
+                !value_col.is_null(0),
+                "{:?}: row 0 should not be null",
+                engine
+            );
             assert!(value_col.is_null(1), "{:?}: row 1 should be null", engine);
-            assert!(!value_col.is_null(2), "{:?}: row 2 should not be null", engine);
+            assert!(
+                !value_col.is_null(2),
+                "{:?}: row 2 should not be null",
+                engine
+            );
         })
         .await;
     }
@@ -1003,7 +1050,11 @@ mod sqlite_compat_tests {
 
             let data = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(id_array), Arc::new(name_array), Arc::new(bool_array)],
+                vec![
+                    Arc::new(id_array),
+                    Arc::new(name_array),
+                    Arc::new(bool_array),
+                ],
             )
             .expect("data should be created");
 
@@ -1029,11 +1080,30 @@ mod sqlite_compat_tests {
                 .expect("scan successful");
 
             let batch = &results[0];
-            let bool_col = batch.column(2).as_any().downcast_ref::<BooleanArray>().expect("active should be BooleanArray");
+            let bool_col = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("active should be BooleanArray");
 
-            assert_eq!(bool_col.value(0), true, "{:?}: row 0 should be true", engine);
-            assert_eq!(bool_col.value(1), false, "{:?}: row 1 should be false", engine);
-            assert_eq!(bool_col.value(2), true, "{:?}: row 2 should be true", engine);
+            assert_eq!(
+                bool_col.value(0),
+                true,
+                "{:?}: row 0 should be true",
+                engine
+            );
+            assert_eq!(
+                bool_col.value(1),
+                false,
+                "{:?}: row 1 should be false",
+                engine
+            );
+            assert_eq!(
+                bool_col.value(2),
+                true,
+                "{:?}: row 2 should be true",
+                engine
+            );
         })
         .await;
     }
@@ -1054,8 +1124,11 @@ mod sqlite_compat_tests {
                 .expect("scan successful");
 
             // Both should return empty results gracefully
-            assert!(results.is_empty() || results[0].num_rows() == 0, 
-                "{:?}: empty table should return empty results", engine);
+            assert!(
+                results.is_empty() || results[0].num_rows() == 0,
+                "{:?}: empty table should return empty results",
+                engine
+            );
         })
         .await;
     }
