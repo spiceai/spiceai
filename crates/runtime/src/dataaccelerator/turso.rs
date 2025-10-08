@@ -1205,12 +1205,11 @@ impl DataAccelerator for TursoAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Check for remote database parameters early
-        if let Some(acceleration) = source.acceleration() {
-            if acceleration.params.contains_key("turso_url")
-                || acceleration.params.contains_key("turso_auth_token")
-            {
-                return Err(Error::RemoteDatabaseNotSupported.into());
-            }
+        if let Some(acceleration) = source.acceleration()
+            && (acceleration.params.contains_key("turso_url")
+                || acceleration.params.contains_key("turso_auth_token"))
+        {
+            return Err(Error::RemoteDatabaseNotSupported.into());
         }
 
         let path = self.file_path(source)?;
