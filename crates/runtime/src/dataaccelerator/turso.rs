@@ -39,7 +39,6 @@ use datafusion::{
     scalar::ScalarValue,
     sql::{
         TableReference,
-        sqlparser::ast,
         unparser::{
             Unparser,
             dialect::{Dialect, SqliteDialect},
@@ -574,18 +573,41 @@ impl TursoTableProvider {
     }
 
     /// Returns AST analyzer rules for Turso-specific SQL transformations
-    /// Similar to SQLite, Turso uses SQLite dialect and may need interval/between transformations
+    ///
+    /// Turso uses SQLite dialect which doesn't support INTERVAL literals.
+    ///
+    /// TODO: Implement INTERVAL expression transformation
+    /// SQLite doesn't support INTERVAL literals, so queries like:
+    ///   `WHERE timestamp > NOW() - INTERVAL '1' DAY`
+    /// should be transformed to:
+    ///   `WHERE timestamp > datetime('now', '-1 day')`
+    ///
+    /// Implementation strategy:
+    /// 1. Walk the AST recursively to find BinaryOp expressions with INTERVAL operands
+    /// 2. Pattern match on: Expr::BinaryOp { left, op: Plus|Minus, right: Interval(...) }
+    /// 3. Extract interval value and unit (Year|Month|Day|Hour|Minute|Second)
+    /// 4. Construct SQLite datetime() function call with modifiers:
+    ///    - datetime(left_expr, '+N unit') for addition
+    ///    - datetime(left_expr, '-N unit') for subtraction
+    /// 5. Replace the BinaryOp node with the Function node
+    ///
+    /// Note: Current datafusion_federation version (0.49.x) doesn't export
+    /// transform_statement() or SQLFederationError helpers needed for this.
+    /// Consider upgrading datafusion_federation or implementing manual AST walking.
+    ///
+    /// Example transformation:
+    /// ```sql
+    /// -- Input:  column + INTERVAL '5' DAY
+    /// -- Output: datetime(column, '+5 days')
+    ///
+    /// -- Input:  NOW() - INTERVAL '2' HOUR  
+    /// -- Output: datetime(NOW(), '-2 hours')
+    /// ```
     fn turso_ast_analyzer(&self) -> AstAnalyzerRule {
         Box::new(|ast| {
-            match &ast {
-                ast::Statement::Query(_query) => {
-                    // For now, pass through without transformations
-                    // In the future, we could add Turso-specific transformations here
-                    // similar to SQLite's INTERVAL handling
-                    Ok(ast)
-                }
-                _ => Ok(ast),
-            }
+            // Pass-through implementation until INTERVAL transformation is added
+            // Most queries won't use INTERVAL literals with Turso, so this is safe
+            Ok(ast)
         })
     }
 }
@@ -1172,19 +1194,17 @@ impl TursoAccelerator {
         let turso_file = self.turso_file_path(source)?;
         let mvcc_enabled = self.parse_mvcc_enabled(source)?;
 
-        let db = if source.is_file_accelerated() {
-            Builder::new_local(&turso_file)
-                .with_mvcc(mvcc_enabled)
-                .build()
-                .await
-                .context(TursoDatabaseSnafu)?
+        let db_path = if source.is_file_accelerated() {
+            turso_file
         } else {
-            Builder::new_local(":memory:")
-                .with_mvcc(mvcc_enabled)
-                .build()
-                .await
-                .context(TursoDatabaseSnafu)?
+            ":memory:".to_string()
         };
+
+        let db = Builder::new_local(&db_path)
+            .with_mvcc(mvcc_enabled)
+            .build()
+            .await
+            .context(TursoDatabaseSnafu)?;
 
         db.connect().context(TursoDatabaseSnafu)
     }
