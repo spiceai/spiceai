@@ -50,13 +50,23 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{ExpressionRef, Predicate};
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
+use object_store::path::PathPart;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
 use crate::Read;
+
+static DELTA_LOG_PATH_PART: LazyLock<PathPart<'static>> = LazyLock::new(|| {
+    let Ok(path_part) = PathPart::parse("_delta_log") else {
+        unreachable!("_delta_log is a valid path part");
+    };
+
+    path_part
+});
 
 mod pruning;
 
@@ -412,6 +422,24 @@ impl TableProvider for DeltaTable {
                         .map_err(map_delta_error_to_datafusion_err)?;
                 }
 
+                scan_context.files = scan_context
+                    .files
+                    .iter()
+                    .filter(|f| {
+                        !f.partitioned_file
+                            .object_meta
+                            .location
+                            .filename()
+                            .is_some_and(|f| f.ends_with(".checkpoint.parquet"))
+                            && f.partitioned_file
+                                .object_meta
+                                .location
+                                .parts()
+                                .any(|p| p == *DELTA_LOG_PATH_PART)
+                    })
+                    .cloned()
+                    .collect();
+
                 Ok::<_, datafusion::error::DataFusionError>((
                     scan_context,
                     parquet_file_reader_factory,
@@ -578,6 +606,7 @@ fn project_delta_schema(
     }
 }
 
+#[derive(Clone)]
 struct PartitionFileContext {
     partitioned_file: PartitionedFile,
     selection_vector: Option<Vec<bool>>,
