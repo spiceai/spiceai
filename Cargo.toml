@@ -227,12 +227,12 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "66bc82c976528798e80e873c9f1f917c0faa925d" }            # spiceai/spiceai-49
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "66bc82c976528798e80e873c9f1f917c0faa925d" }     # spiceai/spiceai-49
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "66bc82c976528798e80e873c9f1f917c0faa925d" } # spiceai/spiceai-49
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "66bc82c976528798e80e873c9f1f917c0faa925d" }  # spiceai/spiceai-49
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "66bc82c976528798e80e873c9f1f917c0faa925d" }       # spiceai/spiceai-49
-datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "66bc82c976528798e80e873c9f1f917c0faa925d" }       # spiceai/spiceai-49
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }            # spiceai/spiceai-49
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }     # spiceai/spiceai-49
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" } # spiceai/spiceai-49
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }  # spiceai/spiceai-49
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }       # spiceai/spiceai-49
+datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }       # spiceai/spiceai-49
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5ad2f52b9bafc6eaa50851f2e1fcf0585fb5184d" }                      # spiceai-49
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "e751fb367eb29f299683ff5125f8da2f654e0479" } # spiceai
