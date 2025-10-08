@@ -1095,8 +1095,8 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 
     let app = AppBuilder::new("cached_search")
         .with_dataset(chunked)
-        .with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-32M",
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
             "hf_minilm",
         ))
         .with_search_cache(cache_config)
@@ -1113,7 +1113,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                 "with_cache_pre_cache",
                 SearchTestType::Http(json!({
                     "text": "new patient",
-                    "limit": 50,
+                    "limit": 100,
                 })),
             ), None, false).await?;
             let duration = start.elapsed();
@@ -1124,7 +1124,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                     "with_cache_post_cache",
                     SearchTestType::Http(json!({
                         "text": "new patient",
-                        "limit": 50,
+                        "limit": 100,
                     })),
                 ), None, false).await?;
                 let duration_cached = start.elapsed();
