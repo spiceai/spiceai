@@ -119,27 +119,34 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct TursoConnectionPool {
     database: Arc<Database>,
+    mvcc_enabled: bool,
 }
 
 impl TursoConnectionPool {
-    pub async fn new(path: &str) -> Result<Self> {
+    pub async fn new(path: &str, mvcc_enabled: bool) -> Result<Self> {
         // Turso supports both file and memory modes
         // Memory mode uses ":memory:" as the path
-        // Enable MVCC (Multi-Version Concurrency Control)
-        // This is required for BEGIN CONCURRENT transactions
+        // MVCC (Multi-Version Concurrency Control) can be enabled via configuration
+        // When enabled, it supports BEGIN CONCURRENT transactions
         let database = Builder::new_local(path)
-            .with_mvcc(true)
+            .with_mvcc(mvcc_enabled)
             .build()
             .await
             .context(TursoDatabaseSnafu)?;
 
         Ok(Self {
             database: Arc::new(database),
+            mvcc_enabled,
         })
     }
 
     pub async fn connect(&self) -> Result<Connection> {
         self.database.connect().context(TursoDatabaseSnafu)
+    }
+
+    /// Returns true if MVCC (Multi-Version Concurrency Control) is enabled
+    pub fn is_mvcc_enabled(&self) -> bool {
+        self.mvcc_enabled
     }
 }
 
@@ -932,7 +939,13 @@ impl TursoDataSink {
         );
 
         // Use a transaction to batch all inserts
-        conn.execute("BEGIN CONCURRENT", ()).await?;
+        // If MVCC is enabled, use BEGIN CONCURRENT for better concurrency
+        let begin_stmt = if self.pool.is_mvcc_enabled() {
+            "BEGIN CONCURRENT"
+        } else {
+            "BEGIN"
+        };
+        conn.execute(begin_stmt, ()).await?;
 
         // Prepare the statement once
         let mut stmt = conn.prepare(&insert_sql).await?;
@@ -1087,6 +1100,30 @@ impl TursoAccelerator {
         }
     }
 
+    /// Parses the `turso_mvcc` parameter from the acceleration configuration
+    /// Returns true if MVCC should be enabled, false otherwise (default: disabled)
+    fn parse_mvcc_enabled(&self, source: &dyn AccelerationSource) -> Result<bool> {
+        if let Some(acceleration) = source.acceleration() {
+            if let Some(mvcc_value) = acceleration.params.get("turso_mvcc") {
+                match mvcc_value.as_str() {
+                    "enabled" => Ok(true),
+                    "disabled" => Ok(false),
+                    _ => Err(Error::InvalidConfiguration {
+                        detail: Arc::from(format!(
+                            "Invalid 'turso_mvcc' value: '{}'. Expected 'enabled' or 'disabled'.",
+                            mvcc_value
+                        )),
+                    }),
+                }
+            } else {
+                // Default to disabled
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Returns the `Turso` file path that would be used for a file-based `Turso` accelerator from this dataset
     pub fn turso_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         // Memory mode uses ":memory:" as the path
@@ -1124,16 +1161,17 @@ impl TursoAccelerator {
     /// Returns an existing `Turso` connection for the given dataset, or creates a new one if it doesn't exist.
     pub async fn get_connection(&self, source: &dyn AccelerationSource) -> Result<Connection> {
         let turso_file = self.turso_file_path(source)?;
+        let mvcc_enabled = self.parse_mvcc_enabled(source)?;
 
         let db = if source.is_file_accelerated() {
             Builder::new_local(&turso_file)
-                .with_mvcc(true)
+                .with_mvcc(mvcc_enabled)
                 .build()
                 .await
                 .context(TursoDatabaseSnafu)?
         } else {
             Builder::new_local(":memory:")
-                .with_mvcc(true)
+                .with_mvcc(mvcc_enabled)
                 .build()
                 .await
                 .context(TursoDatabaseSnafu)?
@@ -1148,12 +1186,13 @@ impl TursoAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<Arc<TursoConnectionPool>> {
         let turso_file = self.turso_file_path(source)?;
+        let mvcc_enabled = self.parse_mvcc_enabled(source)?;
 
         let mut pools = self.pools.lock().await;
         if let Some(pool) = pools.get(&turso_file) {
             Ok(Arc::clone(pool))
         } else {
-            let pool = Arc::new(TursoConnectionPool::new(&turso_file).await?);
+            let pool = Arc::new(TursoConnectionPool::new(&turso_file, mvcc_enabled).await?);
             pools.insert(turso_file, Arc::clone(&pool));
             Ok(pool)
         }
@@ -1162,6 +1201,10 @@ impl TursoAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("turso_file"),
+    ParameterSpec::component("turso_mvcc")
+        .description("Enable Multi-Version Concurrency Control (MVCC) for Turso database")
+        .default("disabled")
+        .one_of(&["enabled", "disabled"]),
     // Note: turso_url and turso_auth_token are not supported as accelerator parameters
     // They will be supported when Turso is implemented as a data connector
 ];
@@ -1276,13 +1319,20 @@ impl DataAccelerator for TursoAccelerator {
             ":memory:".to_string()
         };
 
+        // Get MVCC setting
+        let mvcc_enabled = if let Some(source) = source {
+            self.parse_mvcc_enabled(source)?
+        } else {
+            false // Default to disabled for external tables without source
+        };
+
         // Get or create connection pool
         let pool = {
             let mut pools = self.pools.lock().await;
             if let Some(pool) = pools.get(&db_path) {
                 Arc::clone(pool)
             } else {
-                let new_pool = Arc::new(TursoConnectionPool::new(&db_path).await?);
+                let new_pool = Arc::new(TursoConnectionPool::new(&db_path, mvcc_enabled).await?);
                 pools.insert(db_path.clone(), Arc::clone(&new_pool));
                 new_pool
             }
