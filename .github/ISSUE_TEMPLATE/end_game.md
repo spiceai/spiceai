@@ -22,7 +22,8 @@ assignees: ''
 | Planning        | TBD (e.g. Mon, Mar 11)                          |
 | Branch Creation | TBD (e.g. Day before release, e.g. Sun, Mar 10) |
 | Release         | TBD (e.g. Mon, Mar 11)                          |
-| Announcement    | TBD (e.g. Mon, Mar 11)                          |
+| Blog            | TBD (e.g. Tue, Mar 12)                          |
+| Announcements   | TBD (e.g. Wed, Mar 13)                          |
 
 ## Planning Checklist
 
@@ -189,9 +190,6 @@ assignees: ''
 
 - [ ] Mark the [release](https://github.com/spiceai/spiceai/releases) as official once all binaries and Docker images finish building.
 - [ ] Perform a final test pass on the released binaries and Docker images.
-
-## Post-Release Housekeeping
-
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
   - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_ai.yml)
@@ -200,6 +198,10 @@ assignees: ''
       - Branch: `trunk`
       - Build the CLI: `false`
       - Release Version: the version tag released.
+- [ ] Notify that the OSS release is complete and ready for communications.
+
+## Post-Release Housekeeping
+
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
 - [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator_dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator_dispatch.yml) to use the new release branch.
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
