@@ -328,8 +328,8 @@ async fn track_metrics(
 
     if let Some(ext) = DatabricksAuthExtension::from_headers(&app, &Some(Arc::clone(&df)), &headers)
     {
-        request_context_builder = ext.add_from_headers(request_context_builder, &headers)
-    };
+        request_context_builder = ext.add_from_headers(request_context_builder, &headers);
+    }
     let request_context = Arc::new(
         request_context_builder
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))

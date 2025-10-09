@@ -61,6 +61,7 @@ impl Extension for DatabricksAuthExtension {
 }
 
 impl DatabricksAuthExtension {
+    #[must_use]
     pub fn new(
         app: Option<Arc<App>>,
         df: Option<Arc<DataFusion>>,
@@ -68,6 +69,8 @@ impl DatabricksAuthExtension {
     ) -> Self {
         Self { app, df, tokens }
     }
+
+    #[must_use]
     pub fn add_from_headers(
         self,
         mut bldr: RequestContextBuilder,
