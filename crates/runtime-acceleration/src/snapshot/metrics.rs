@@ -21,13 +21,12 @@ use opentelemetry::{
 static METER: LazyLock<Meter> =
     LazyLock::new(|| global::meter("dataset_acceleration_snapshot_metrics"));
 
-static SNAPSHOT_BOOTSTRAP_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static SNAPSHOT_BOOTSTRAP_DURATION_MS: LazyLock<Counter<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("dataset_acceleration_snapshot_bootstrap_duration_ms")
+        .f64_counter("dataset_acceleration_snapshot_bootstrap_duration_ms")
         .with_description(
             "Time in milliseconds taken to download the snapshot used to bootstrap acceleration.",
         )
-        .with_unit("ms")
         .build()
 });
 
@@ -92,7 +91,7 @@ fn dataset_label(dataset: &str) -> KeyValue {
 pub fn record_bootstrap_metrics(dataset: &str, duration_ms: f64, bytes: u64, checksum: &str) {
     let dataset_attr = dataset_label(dataset);
     let duration_labels = [dataset_attr.clone()];
-    SNAPSHOT_BOOTSTRAP_DURATION_MS.record(duration_ms, &duration_labels);
+    SNAPSHOT_BOOTSTRAP_DURATION_MS.add(duration_ms, &duration_labels);
 
     let bytes_labels = [dataset_attr.clone()];
     SNAPSHOT_BOOTSTRAP_BYTES.record(bytes, &bytes_labels);
