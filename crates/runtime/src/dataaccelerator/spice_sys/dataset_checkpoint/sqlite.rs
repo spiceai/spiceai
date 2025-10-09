@@ -31,6 +31,7 @@ impl DatasetCheckpoint {
                 target: "SqliteConnection",
             });
         };
+
         conn.conn
             .call(move |conn| {
                 let create_table = format!(
@@ -46,9 +47,7 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            .map_err(Error::external)
     }
 
     pub(super) async fn migrate_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
@@ -77,21 +76,20 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            .map_err(Error::external)
     }
 
     pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
+        let dataset_name = self.dataset_name.clone();
+
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
             return Err(Error::DowncastFailed {
                 target: "SqliteConnection",
             });
         };
-        let dataset_name = self.dataset_name.clone();
-        let exists = conn
-            .conn
+
+        conn.conn
             .call(move |conn| {
                 let query =
                     format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
@@ -100,22 +98,21 @@ impl DatasetCheckpoint {
                 Ok(rows.next()?.is_some())
             })
             .await
-            .map_err(Error::external)?;
-
-        Ok(exists)
+            .map_err(Error::external)
     }
 
     pub(super) async fn last_checkpoint_time_sqlite(
         &self,
         pool: &SqliteConnectionPool,
     ) -> Result<Option<SystemTime>> {
+        let dataset_name = self.dataset_name.clone();
+
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
             return Err(Error::DowncastFailed {
                 target: "SqliteConnection",
             });
         };
-        let dataset_name = self.dataset_name.clone();
 
         let query = format!(
             "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
@@ -141,14 +138,15 @@ impl DatasetCheckpoint {
         pool: &SqliteConnectionPool,
         schema: &SchemaRef,
     ) -> Result<()> {
+        let dataset_name = self.dataset_name.clone();
+        let schema_json = Self::serialize_schema(schema)?;
+
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
             return Err(Error::DowncastFailed {
                 target: "SqliteConnection",
             });
         };
-        let dataset_name = self.dataset_name.clone();
-        let schema_json = Self::serialize_schema(schema)?;
 
         conn.conn
             .call(move |conn| {
@@ -163,22 +161,21 @@ impl DatasetCheckpoint {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            .map_err(Error::external)
     }
 
     pub(super) async fn get_schema_sqlite(
         &self,
         pool: &SqliteConnectionPool,
     ) -> Result<Option<SchemaRef>> {
+        let dataset_name = self.dataset_name.clone();
+
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
             return Err(Error::DowncastFailed {
                 target: "SqliteConnection",
             });
         };
-        let dataset_name = self.dataset_name.clone();
 
         let schema_json: Option<String> = conn
             .conn

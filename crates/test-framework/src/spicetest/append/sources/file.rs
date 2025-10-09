@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use duckdb::Connection;
+use tokio::fs;
 use tonic::async_trait;
 
 use crate::{
@@ -49,82 +50,94 @@ impl FileAppendableSource {
 #[async_trait]
 impl AppendableSource for FileAppendableSource {
     async fn setup(&self, config: &AppendConfig) -> Result<()> {
-        if std::fs::exists(&self.dest_db_file)? {
-            std::fs::remove_file(&self.dest_db_file)?;
+        if fs::try_exists(&self.dest_db_file).await? {
+            fs::remove_file(&self.dest_db_file).await?;
         }
 
         for TableWithTimeColumn { name, .. } in &self.tables {
             let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
-            if std::fs::exists(&parquet_path)? {
-                std::fs::remove_file(&parquet_path)?;
+            if fs::try_exists(&parquet_path).await? {
+                fs::remove_file(&parquet_path).await?;
             }
         }
 
-        let dest_conn = Connection::open(&self.dest_db_file)?;
-        println!(
-            "Loading initial data for {} benchmark suite",
-            config.query_set
-        );
-        match config.query_set {
-            QuerySet::Tpch => {
-                let mut sql = format!(
-                    "INSTALL tpch;
-                     LOAD tpch;
-                     BEGIN;
-                     CALL dbgen(sf=1, children={load_steps}, step=0);\n",
-                    load_steps = config.load_steps
-                );
+        let dest_db_file = self.dest_db_file.clone();
+        let query_set = config.query_set;
+        let load_steps = config.load_steps;
+        let tables = self.tables.clone();
+        let temp_directory = config.temp_directory.clone();
 
-                for TableWithTimeColumn { name, column } in &self.tables {
-                    let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
-                    sql += &format!(
-                                "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                         COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
-                }
-
-                sql += "COMMIT;";
-
-                dest_conn.execute_batch(&sql)?;
-            }
-            QuerySet::Tpcds => {
-                let mut setup_sql = "INSTALL tpcds;
-                         LOAD tpcds;
+        tokio::task::spawn_blocking(move || {
+            let dest_conn = Connection::open(&dest_db_file)?;
+            println!(
+                "Loading initial data for {} benchmark suite",
+                query_set
+            );
+            match query_set {
+                QuerySet::Tpch => {
+                    let mut sql = format!(
+                        "INSTALL tpch;
+                         LOAD tpch;
                          BEGIN;
-                         CALL dsdgen(sf=1, suffix='_gen');\n"
-                    .to_string();
-
-                for TableWithTimeColumn { name, column } in &self.tables {
-                    // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
-                    // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
-                    setup_sql += &format!(
-                        "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
-                         ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                         INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
-                         LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
-                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
-                        load_steps = config.load_steps
+                         CALL dbgen(sf=1, children={load_steps}, step=0);\n",
+                        load_steps = load_steps
                     );
+
+                    for TableWithTimeColumn { name, column } in &tables {
+                        let parquet_path = temp_directory.join(format!("{name}.parquet"));
+                        sql += &format!(
+                                    "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                             COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+                    }
+
+                    sql += "COMMIT;";
+
+                    dest_conn.execute_batch(&sql)?;
                 }
+                QuerySet::Tpcds => {
+                    let mut setup_sql = "INSTALL tpcds;
+                             LOAD tpcds;
+                             BEGIN;
+                             CALL dsdgen(sf=1, suffix='_gen');\n"
+                        .to_string();
 
-                setup_sql += "COMMIT;";
+                    for TableWithTimeColumn { name, column } in &tables {
+                        // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
+                        // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
+                        setup_sql += &format!(
+                            "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
+                             ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                             INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
+                             LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
+                             COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
+                            load_steps = load_steps
+                        );
+                    }
 
-                dest_conn.execute_batch(&setup_sql)?;
+                    setup_sql += "COMMIT;";
+
+                    dest_conn.execute_batch(&setup_sql)?;
+                }
+                QuerySet::Clickbench => {
+                    // import the parquet file into the database so we can use it for OFFSET delayed loading
+                    // limit to 40 million rows because the file connector goes OOM with the full file
+                    let setup_sql = "BEGIN;
+                                     CREATE TABLE hits AS SELECT * FROM read_parquet('hits.parquet') LIMIT 40000000;
+                                     CREATE TABLE hits_delayed AS SELECT * FROM hits WHERE 1=0;
+                                     ALTER TABLE hits_delayed ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                                     COMMIT;";
+
+                    dest_conn.execute_batch(setup_sql)?;
+                }
+                QuerySet::ParameterizedTpch => todo!(),
             }
-            QuerySet::Clickbench => {
-                // import the parquet file into the database so we can use it for OFFSET delayed loading
-                // limit to 40 million rows because the file connector goes OOM with the full file
-                let setup_sql = "BEGIN;
-                                 CREATE TABLE hits AS SELECT * FROM read_parquet('hits.parquet') LIMIT 40000000;
-                                 CREATE TABLE hits_delayed AS SELECT * FROM hits WHERE 1=0;
-                                 ALTER TABLE hits_delayed ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                                 COMMIT;";
 
-                dest_conn.execute_batch(setup_sql)?;
-            }
-            QuerySet::ParameterizedTpch => todo!(),
-        }
+            drop(dest_conn);
 
-        drop(dest_conn);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
 
         Ok(())
     }
@@ -136,60 +149,73 @@ impl AppendableSource for FileAppendableSource {
             load_steps = config.load_steps,
             load_index = load_index + 1, // display index is 1-based
         );
-        let dest_conn = Connection::open(&self.dest_db_file)?;
 
-        match config.query_set {
-            QuerySet::Tpch => {
-                let mut sql = format!(
-                    "INSTALL tpch;
-                     LOAD tpch;
-                     BEGIN;
-                     CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n",
-                    load_steps = config.load_steps
-                );
+        let dest_db_file = self.dest_db_file.clone();
+        let query_set = config.query_set;
+        let load_steps = config.load_steps;
+        let tables = self.tables.clone();
+        let temp_directory = config.temp_directory.clone();
 
-                for TableWithTimeColumn { name, column } in &self.tables {
-                    let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
-                    sql += &format!("ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                                     INSERT INTO {name} SELECT * FROM {name}_new;
-                                     DROP TABLE {name}_new;
-                                     COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+        tokio::task::spawn_blocking(move || {
+            let dest_conn = Connection::open(&dest_db_file)?;
+
+            match query_set {
+                QuerySet::Tpch => {
+                    let mut sql = format!(
+                        "INSTALL tpch;
+                         LOAD tpch;
+                         BEGIN;
+                         CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n",
+                        load_steps = load_steps
+                    );
+
+                    for TableWithTimeColumn { name, column } in &tables {
+                        let parquet_path = temp_directory.join(format!("{name}.parquet"));
+                        sql += &format!("ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                                         INSERT INTO {name} SELECT * FROM {name}_new;
+                                         DROP TABLE {name}_new;
+                                         COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+                    }
+
+                    sql += "COMMIT;";
+
+                    dest_conn.execute_batch(&sql)?;
                 }
+                QuerySet::Tpcds => {
+                    let mut sql = "BEGIN;\n".to_string();
 
-                sql += "COMMIT;";
+                    for TableWithTimeColumn { name, column } in &tables {
+                        sql += &format!("INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
+                                         FROM {name}_gen
+                                         LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
+                                         OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
+                                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
+                                load_steps = load_steps);
+                    }
 
-                dest_conn.execute_batch(&sql)?;
-            }
-            QuerySet::Tpcds => {
-                let mut sql = "BEGIN;\n".to_string();
+                    sql += "COMMIT;";
 
-                for TableWithTimeColumn { name, column } in &self.tables {
-                    sql += &format!("INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
-                                     FROM {name}_gen
-                                     LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
-                                     OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
-                                     COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
-                            load_steps = config.load_steps);
+                    dest_conn.execute_batch(&sql)?;
                 }
+                QuerySet::Clickbench => {
+                    let sql = format!("BEGIN;
+                                       INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at
+                                       FROM hits
+                                       LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
+                                       OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
+                                       COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
+                                       COMMIT;",
+                                                    load_steps = load_steps);
 
-                sql += "COMMIT;";
-
-                dest_conn.execute_batch(&sql)?;
+                    dest_conn.execute_batch(&sql)?;
+                }
+                QuerySet::ParameterizedTpch => todo!(),
             }
-            QuerySet::Clickbench => {
-                let sql = format!("BEGIN;
-                                   INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at
-                                   FROM hits
-                                   LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
-                                   OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
-                                   COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
-                                   COMMIT;",
-                                                load_steps = config.load_steps);
 
-                dest_conn.execute_batch(&sql)?;
-            }
-            QuerySet::ParameterizedTpch => todo!(),
-        }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
 
         Ok(())
     }
