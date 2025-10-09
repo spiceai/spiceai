@@ -1,0 +1,5 @@
+---
+source: crates/runtime-table-partition/src/naming.rs
+expression: "to_stable_string::<StandardConfig>(partition_by)?"
+---
+Case(Some(ScalarFunction(regexp_match(Column(a), Literal(^DATAFUSION(-cli)*)))), (Literal(true) => Literal(datafusion)), Literal(other))

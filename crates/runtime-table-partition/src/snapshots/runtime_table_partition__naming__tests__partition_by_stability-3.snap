@@ -1,0 +1,5 @@
+---
+source: crates/runtime-table-partition/src/naming.rs
+expression: "to_stable_string::<StandardConfig>(partition_by)?"
+---
+BinaryExpr(Column(a) % Literal(10))

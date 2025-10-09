@@ -12314,6 +12314,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "futures",
+ "insta",
  "parking_lot 0.12.4",
  "runtime-datafusion-udfs",
  "serde",
@@ -12322,6 +12323,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "twox-hash 2.1.2",
 ]
 
 [[package]]
