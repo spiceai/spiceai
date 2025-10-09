@@ -63,14 +63,16 @@ pub struct StdFileSystem;
 #[async_trait]
 impl ReadablePath for StdFileSystem {
     async fn open(&self, path: PathBuf) -> Result<Box<dyn io::Read + Send + Sync>> {
-        let path_clone = path.clone();
-        let file = tokio::task::spawn_blocking(move || std::fs::File::open(&path_clone))
-            .await
-            .map_err(|e| Error::UnableToOpenPath {
-                source: std::io::Error::other(e),
-                path: path.clone(),
-            })?
-            .context(UnableToOpenPathSnafu { path })?;
+        let file =
+            tokio::fs::File::open(&path)
+                .await
+                .map_err(|source| Error::UnableToOpenPath {
+                    source,
+                    path: path.clone(),
+                })?;
+
+        let file = file.into_std().await;
+
         Ok(Box::new(file))
     }
 }

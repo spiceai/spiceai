@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use duckdb::Connection;
+use tokio::fs;
 use tonic::async_trait;
 
 use crate::{
@@ -49,26 +50,15 @@ impl FileAppendableSource {
 #[async_trait]
 impl AppendableSource for FileAppendableSource {
     async fn setup(&self, config: &AppendConfig) -> Result<()> {
-        let dest_db_file = self.dest_db_file.clone();
-        tokio::task::spawn_blocking(move || {
-            if std::fs::exists(&dest_db_file)? {
-                std::fs::remove_file(&dest_db_file)?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
+        if fs::try_exists(&self.dest_db_file).await? {
+            fs::remove_file(&self.dest_db_file).await?;
+        }
 
         for TableWithTimeColumn { name, .. } in &self.tables {
             let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
-            tokio::task::spawn_blocking(move || {
-                if std::fs::exists(&parquet_path)? {
-                    std::fs::remove_file(&parquet_path)?;
-                }
-                Ok::<(), anyhow::Error>(())
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
+            if fs::try_exists(&parquet_path).await? {
+                fs::remove_file(&parquet_path).await?;
+            }
         }
 
         let dest_db_file = self.dest_db_file.clone();
