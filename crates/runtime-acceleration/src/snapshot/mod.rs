@@ -1518,12 +1518,8 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("/")
             })
-            .filter(|rel| !rel.is_empty());
-
-        match relative {
-            Some(rel) => format!("{SNAPSHOT_URI_PREFIX}/{rel}"),
-            None => format!("{SNAPSHOT_URI_PREFIX}/{location}"),
-        }
+            .unwrap_or_else(|| location.to_string());
+        format!("{}/{}", SNAPSHOT_URI_PREFIX, relative)
     }
 
     fn dataset_metadata(

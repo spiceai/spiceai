@@ -217,9 +217,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         user_agent = new_agent;
     }
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
-        let tls_root_certificate = std::fs::read(&tls_root_certificate_file).map_err(|e| {
-            format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
-        })?;
+        let tls_root_certificate = tokio::fs::read(&tls_root_certificate_file)
+            .await
+            .map_err(|e| {
+                format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
+            })?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
         let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
         if repl_flight_endpoint == "http://localhost:50051" {
