@@ -38,6 +38,14 @@ pub(super) async fn download_snapshot_if_needed(
         return;
     }
 
+    if path.exists() {
+        tracing::debug!(
+            "Acceleration already exists at {}, skipping snapshot download",
+            path.display()
+        );
+        return;
+    }
+
     let source_name = source.name().to_string();
     let source = source.clone_arc();
     let snapshot_behavior = acceleration.snapshots.clone();

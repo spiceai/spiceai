@@ -19,6 +19,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
 
       - name: Set up make
+        if: runner.os != 'macOS'
         uses: ./.github/actions/setup-make
 
       - name: Generate Acknowledgements
@@ -27,9 +28,8 @@ jobs:
           echo -e "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > acknowledgements.md
           make -s generate-acknowledgements-go
           make -s generate-acknowledgements-rust
-          sed -i 's/\"//g' acknowledgements.md
-          sed -i 's/,/, /g' acknowledgements.md
-          sed -i 's/,  /, /g' acknowledgements.md
+          sed -i.bak -e 's/\"//g' -e 's/,/, /g' -e 's/,  /, /g' acknowledgements.md
+          rm acknowledgements.md.bak
           cat acknowledgements.md
 
       - name: Create PR

@@ -13,21 +13,32 @@ limitations under the License.
 
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
-use std::{cmp::Ordering, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
 
 use arrow::datatypes::SchemaRef;
+use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use bytes::BytesMut;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use futures::StreamExt;
 use object_store::{
-    ObjectMeta, ObjectStore,
+    ClientOptions, ObjectMeta, ObjectStore,
+    aws::AmazonS3Builder,
     path::{Path as ObjectPath, PathPart},
 };
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_secrets::{Secrets, get_params_with_secrets};
 use snafu::prelude::*;
-use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::ParamValue};
+use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use tokio::{
     fs,
     io::{AsyncReadExt, BufReader},
+    sync::RwLock,
 };
 use url::Url;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
@@ -224,9 +235,8 @@ impl<'a> SnapshotPathLayout<'a> {
         let expected_dataset_part = self.dataset_partition_expected();
         if dataset_part.as_ref() != expected_dataset_part {
             tracing::trace!(
-                expected = %expected_dataset_part,
-                actual = %dataset_part.as_ref(),
-                "Dataset partition mismatch while parsing snapshot path",
+                "Dataset partition mismatch while parsing snapshot path. expected={expected_dataset_part} actual={}",
+                dataset_part.as_ref()
             );
             return None;
         }
@@ -236,9 +246,7 @@ impl<'a> SnapshotPathLayout<'a> {
         let expected_month_part = format!("month={}", timestamp.format("%Y-%m"));
         if month_part != expected_month_part {
             tracing::trace!(
-                expected = %expected_month_part,
-                actual = %month_part,
-                "Month partition mismatch while parsing snapshot path",
+                "Month partition mismatch while parsing snapshot path. expected={expected_month_part} actual={month_part}"
             );
             return None;
         }
@@ -246,9 +254,7 @@ impl<'a> SnapshotPathLayout<'a> {
         let expected_day_part = format!("day={}", timestamp.format("%Y-%m-%d"));
         if day_part != expected_day_part {
             tracing::trace!(
-                expected = %expected_day_part,
-                actual = %day_part,
-                "Day partition mismatch while parsing snapshot path",
+                "Day partition mismatch while parsing snapshot path. expected={expected_day_part} actual={day_part}"
             );
             return None;
         }
@@ -300,14 +306,14 @@ impl SnapshotManager {
         snapshots: SnapshotBehavior,
         local_path: PathBuf,
     ) -> Option<Self> {
-        let snapshot_config = match snapshots {
+        let (snapshot_config, secrets) = match snapshots {
             SnapshotBehavior::Disabled => {
                 tracing::debug!("Snapshots are disabled for {dataset_name}");
                 return None;
             }
-            SnapshotBehavior::Enabled(s)
-            | SnapshotBehavior::BootstrapOnly(s)
-            | SnapshotBehavior::CreateOnly(s) => s,
+            SnapshotBehavior::Enabled(s, secrets)
+            | SnapshotBehavior::BootstrapOnly(s, secrets)
+            | SnapshotBehavior::CreateOnly(s, secrets) => (s, secrets.upgrade()?),
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
 
@@ -328,21 +334,21 @@ impl SnapshotManager {
             }
         };
 
-        let s3_region = snapshot_config
-            .as_ref()
-            .params
-            .as_ref()
-            .and_then(|params| params.data.get("s3_region").map(ParamValue::as_string));
-
         let (store, path) = match (
             snapshots_location_url.scheme(),
             snapshots_location_url.path(),
         ) {
             ("s3", path) => {
-                let store =
-                    aws_sdk_credential_bridge::from_s3_url(&snapshots_location_url, s3_region)
-                        .await
-                        .ok()?;
+                let store = build_s3_object_store(
+                    &snapshots_location_url,
+                    secrets,
+                    snapshot_config.params.as_ref().map(Params::as_string_map),
+                )
+                .await
+                .inspect_err(|e| {
+                    tracing::error!("Error connecting to S3 snapshot location: {e}");
+                })
+                .ok()?;
                 let path = object_store::path::Path::from(path);
                 (store, path)
             }
@@ -381,9 +387,8 @@ impl SnapshotManager {
         let local_path = self.local_path.clone();
 
         tracing::info!(
-            dataset = %self.dataset_name,
-            snapshot = %location,
-            "Uploading snapshot."
+            "Uploading snapshot. dataset={} snapshot={location}",
+            self.dataset_name
         );
 
         let file = fs::File::open(&local_path).await.context(OpenLocalSnafu {
@@ -415,17 +420,13 @@ impl SnapshotManager {
                     }
                     Err(source) => {
                         tracing::error!(
-                            dataset = %self.dataset_name,
-                            snapshot = %location,
-                            error = %source,
-                            "Failed to read local snapshot file while uploading."
+                            "Failed to read local snapshot file while uploading. dataset={} snapshot={location} error={source}",
+                            self.dataset_name
                         );
                         if let Err(abort_source) = upload.abort().await {
                             tracing::warn!(
-                                dataset = %self.dataset_name,
-                                snapshot = %location,
-                                error = %abort_source,
-                                "Failed to abort snapshot upload after read failure."
+                                "Failed to abort snapshot upload after read failure. dataset={} snapshot={location} error={abort_source}",
+                                self.dataset_name
                             );
                             return Err(SnapshotUploadError::AbortUpload {
                                 path: location_path.clone(),
@@ -449,17 +450,13 @@ impl SnapshotManager {
 
             if let Err(source) = upload.put_part(chunk.into()).await {
                 tracing::error!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location,
-                    error = %source,
-                    "Snapshot upload part failed."
+                    "Snapshot upload part failed. dataset={} snapshot={location} error={source}",
+                    self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %location,
-                        error = %abort_source,
-                        "Failed to abort snapshot upload after part failure."
+                        "Failed to abort snapshot upload after part failure. dataset={} snapshot={location} error={abort_source}",
+                        self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
                         path: location_path.clone(),
@@ -476,26 +473,20 @@ impl SnapshotManager {
         match upload.complete().await {
             Ok(_) => {
                 tracing::info!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location,
-                    size = total_bytes,
-                    "Snapshot uploaded."
+                    "Snapshot uploaded. dataset={} snapshot={location} size={total_bytes}",
+                    self.dataset_name
                 );
                 Ok(location)
             }
             Err(source) => {
                 tracing::error!(
-                    dataset = %self.dataset_name,
-                    snapshot = %location,
-                    error = %source,
-                    "Failed to finalize snapshot upload."
+                    "Failed to finalize snapshot upload. dataset={} snapshot={location} error={source}",
+                    self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %location,
-                        error = %abort_source,
-                        "Failed to abort snapshot upload after completion failure."
+                        "Failed to abort snapshot upload after completion failure. dataset={} snapshot={location} error={abort_source}",
+                        self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
                         path: location_path,
@@ -533,10 +524,9 @@ impl SnapshotManager {
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
                         tracing::warn!(
-                            dataset = %self.dataset_name,
-                            location = %location,
-                            error = %err,
-                            "Failed to bootstrap snapshot; continuing without a downloaded snapshot."
+                            "Failed to bootstrap snapshot; continuing without a downloaded snapshot. dataset={} location={} error={err}",
+                            self.dataset_name,
+                            location
                         );
                         Ok(None)
                     }
@@ -555,10 +545,9 @@ impl SnapshotManager {
                         Ok(result) => Ok(result),
                         Err(err) => {
                             tracing::error!(
-                                dataset = %dataset_name,
-                                location = %location,
-                                error = %err,
-                                "Failed to bootstrap snapshot; retrying."
+                                "Failed to bootstrap snapshot; retrying. dataset={} location={} error={err}",
+                                dataset_name,
+                                location
                             );
                             Err(RetryError::transient(err))
                         }
@@ -572,10 +561,8 @@ impl SnapshotManager {
                     Err(err) => {
                         let location = self.snapshots_location.to_string();
                         tracing::warn!(
-                            dataset = %self.dataset_name,
-                            location = %location,
-                            error = %err,
-                            "Failed to bootstrap snapshot even after fallback attempts; continuing."
+                            "Failed to bootstrap snapshot even after fallback attempts; continuing. dataset={} location={location} error={err}",
+                            self.dataset_name,
                         );
                         Ok(None)
                     }
@@ -590,20 +577,20 @@ impl SnapshotManager {
     ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
         let candidates = self.list_snapshot_candidates().await?;
         if let Some(candidate) = candidates.into_iter().next() {
+            let snapshot_display = candidate.location.to_string();
+            let timestamp_display = candidate.display_timestamp.clone();
             tracing::info!(
-                dataset = %self.dataset_name,
-                snapshot = %candidate.location.to_string(),
-                timestamp = %candidate.display_timestamp,
-                "Downloading latest snapshot."
+                "Downloading latest snapshot. dataset={} snapshot={snapshot_display} timestamp={timestamp_display}",
+                self.dataset_name
             );
             self.download_snapshot(candidate.location(), checkpointer_factory)
                 .await
                 .map(Some)
         } else {
+            let location_display = self.snapshots_location.to_string();
             tracing::debug!(
-                dataset = %self.dataset_name,
-                location = %self.snapshots_location.to_string(),
-                "No snapshots found; continuing without bootstrapping."
+                "No snapshots found; continuing without bootstrapping. dataset={} location={location_display}",
+                self.dataset_name
             );
             Ok(None)
         }
@@ -627,27 +614,24 @@ impl SnapshotManager {
                 Ok(schema) => return Ok(Some(schema)),
                 Err(SnapshotDownloadError::MissingSchema { path }) => {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %path,
-                        "Snapshot missing schema; attempting to download the next available snapshot."
+                        "Snapshot missing schema; attempting to download the next available snapshot. dataset={} snapshot={path}",
+                        self.dataset_name,
                     );
                 }
                 Err(err) => {
                     tracing::warn!(
-                        dataset = %self.dataset_name,
-                        snapshot = %path_display,
-                        error = %err,
-                        "Failed to download snapshot while attempting fallback."
+                        "Failed to download snapshot while attempting fallback. dataset={} snapshot={path_display} error={err}",
+                        self.dataset_name,
                     );
                     return Err(err);
                 }
             }
         }
 
+        let location_display = self.snapshots_location.to_string();
         tracing::warn!(
-            dataset = %self.dataset_name,
-            location = %self.snapshots_location.to_string(),
-            "All available snapshots are missing schemas; continuing without bootstrapping."
+            "All available snapshots are missing schemas; continuing without bootstrapping. dataset={} location={location_display}",
+            self.dataset_name
         );
 
         Ok(None)
@@ -666,7 +650,11 @@ impl SnapshotManager {
                     path: listing_path.clone(),
                     source,
                 })
-                .inspect_err(|e| tracing::error!(error = %e))?;
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "Failed to list snapshots while iterating object store listing. path={listing_path} error={e}"
+                    );
+                })?;
 
             if let Some(candidate) = Self::snapshot_candidate_from_meta(meta, &self.dataset_name) {
                 snapshots.push(candidate);
@@ -674,12 +662,11 @@ impl SnapshotManager {
         }
 
         snapshots.sort_by(|a, b| b.cmp(a));
+        let location_display = self.snapshots_location.to_string();
+        let count = snapshots.len();
         tracing::info!(
-            dataset = %self.dataset_name,
-            location = %self.snapshots_location.to_string(),
-            count = snapshots.len(),
-            "Found {} snapshot candidates.",
-            snapshots.len()
+            "Found {count} snapshot candidates. dataset={} location={location_display}",
+            self.dataset_name
         );
         Ok(snapshots)
     }
@@ -699,9 +686,8 @@ impl SnapshotManager {
         })?;
 
         tracing::info!(
-            dataset = %self.dataset_name,
-            snapshot = %location.to_string(),
-            "Downloading snapshot."
+            "Downloading snapshot. dataset={} snapshot={location}",
+            self.dataset_name
         );
 
         let bytes =
@@ -730,12 +716,10 @@ impl SnapshotManager {
             }
         })?;
 
+        let local_path_display = self.local_path.display();
         tracing::info!(
-            dataset = %self.dataset_name,
-            snapshot = %location.to_string(),
-            size = bytes_len,
-            "Snapshot downloaded to {}.",
-            self.local_path.to_string_lossy()
+            "Snapshot downloaded to {local_path_display}. dataset={} snapshot={location} size={bytes_len}",
+            self.dataset_name
         );
 
         let checkpointer = (checkpointer_factory)()
@@ -748,16 +732,14 @@ impl SnapshotManager {
             .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?
         {
             tracing::info!(
-                dataset = %self.dataset_name,
-                snapshot = %location.to_string(),
-                "Snapshot schema verified."
+                "Snapshot schema verified. dataset={} snapshot={location}",
+                self.dataset_name
             );
             Ok(schema)
         } else {
             tracing::warn!(
-                dataset = %self.dataset_name,
-                snapshot = %location.to_string(),
-                "Snapshot schema not found."
+                "Snapshot schema not found. dataset={} snapshot={location}",
+                self.dataset_name
             );
             Err(SnapshotDownloadError::MissingSchema { path: path_display })
         }
@@ -770,14 +752,143 @@ impl SnapshotManager {
         let layout = SnapshotPathLayout::new(dataset_name);
         let candidate = layout.candidate_from_meta(meta)?;
 
+        let snapshot_display = candidate.location.to_string();
+        let timestamp = &candidate.display_timestamp;
         tracing::debug!(
-            dataset = %dataset_name,
-            snapshot = %candidate.location.to_string(),
-            timestamp = %candidate.display_timestamp,
-            "Found snapshot candidate."
+            "Found snapshot candidate. dataset={} snapshot={snapshot_display} timestamp={timestamp}",
+            dataset_name
         );
 
         Some(candidate)
+    }
+}
+
+static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    vec![
+        ParameterSpec::component("region").secret(),
+        ParameterSpec::component("endpoint").secret(),
+        ParameterSpec::component("key").secret(),
+        ParameterSpec::component("secret").secret(),
+        ParameterSpec::component("session_token").secret(),
+        ParameterSpec::component("auth")
+            .description("Configures the authentication method for S3. Supported methods are: iam_role, key.")
+            .default("iam_role")
+            .one_of(&["iam_role", "key"])
+            .secret(),
+        ParameterSpec::runtime("client_timeout")
+            .description("The timeout setting for S3 client."),
+        ParameterSpec::runtime("allow_http")
+            .description("Allow HTTP protocol for S3 endpoint.")
+    ]
+});
+
+#[derive(Debug, Snafu)]
+enum S3ObjectStoreError {
+    #[snafu(transparent)]
+    InvalidBucketName {
+        source: aws_sdk_credential_bridge::Error,
+    },
+
+    #[snafu(display("Unable to parse client_timeout: {source}"))]
+    ClientTimeoutParse { source: fundu::ParseError },
+
+    #[snafu(display("Unexpected S3 auth method: {method}"))]
+    UnexpectedS3AuthMethod { method: String },
+
+    #[snafu(display("Unable to load S3 credentials from environment: {source}"))]
+    EnvLoad {
+        source: aws_sdk_credential_bridge::Error,
+    },
+
+    #[snafu(transparent)]
+    ObjectStore { source: object_store::Error },
+}
+
+async fn build_s3_object_store(
+    snapshots_url: &Url,
+    secrets: Arc<RwLock<Secrets>>,
+    params: Option<HashMap<String, String>>,
+) -> Result<Box<dyn ObjectStore>, S3ObjectStoreError> {
+    let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref()).await;
+
+    let s3_region = s3_params.get("region").expose().ok();
+    let allow_http = s3_params
+        .get("allow_http")
+        .expose()
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(false);
+    let s3_endpoint = s3_params.get("endpoint").expose().ok();
+    let client_timeout = s3_params.get("client_timeout").expose().ok();
+    let bucket_name = get_bucket_name(snapshots_url)?;
+
+    let mut s3_builder = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket_name)
+        .with_allow_http(allow_http);
+    let mut client_options = ClientOptions::default();
+
+    if let Some(region) = s3_region {
+        s3_builder = s3_builder.with_region(region);
+    }
+    if let Some(endpoint) = s3_endpoint {
+        s3_builder = s3_builder.with_endpoint(endpoint);
+        if endpoint.starts_with("http://") {
+            client_options = client_options.with_allow_http(true);
+        }
+    }
+    if let Some(timeout) = client_timeout {
+        client_options = client_options
+            .with_timeout(fundu::parse_duration(timeout).context(ClientTimeoutParseSnafu)?);
+    }
+    let mut load_credentials_from_environment = true;
+
+    if let (Some(key), Some(secret)) = (
+        s3_params.get("key").expose().ok(),
+        s3_params.get("secret").expose().ok(),
+    ) {
+        s3_builder = s3_builder.with_access_key_id(key);
+        s3_builder = s3_builder.with_secret_access_key(secret);
+        if let Some(token) = s3_params.get("session_token").expose().ok() {
+            s3_builder = s3_builder.with_token(token);
+        }
+        load_credentials_from_environment = false;
+    }
+    s3_builder = s3_builder.with_client_options(client_options);
+
+    if load_credentials_from_environment {
+        tracing::trace!("Loading S3 credentials from environment");
+        if let Some(sdk_config) = aws_sdk_credential_bridge::initialize_sdk_config().await
+            && sdk_config.credentials_provider().is_some()
+        {
+            tracing::trace!("Using S3 credentials provider from SDK config");
+            s3_builder = s3_builder.with_credentials(Arc::new(
+                S3CredentialProvider::from_config(sdk_config).context(EnvLoadSnafu)?,
+            ));
+        }
+    }
+
+    Ok(Box::new(s3_builder.build()?))
+}
+
+async fn build_s3_parameters(
+    secrets: Arc<RwLock<Secrets>>,
+    params: Option<&HashMap<String, String>>,
+) -> Parameters {
+    let default_params = || Parameters::new(vec![], "s3", &S3_PARAMETERS);
+    match params {
+        Some(p) => {
+            let secret_params = get_params_with_secrets(Arc::clone(&secrets), p).await;
+            Parameters::try_new(
+                "snapshot",
+                secret_params.into_iter().collect(),
+                "s3",
+                secrets,
+                &S3_PARAMETERS,
+            )
+            .await
+            .unwrap_or_else(|_| default_params())
+        }
+        None => default_params(),
     }
 }
 

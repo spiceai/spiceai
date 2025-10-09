@@ -22,9 +22,9 @@ use datafusion_table_providers::UnsupportedTypeAction;
 use tokio::sync::RwLock;
 
 use crate::{
-    Runtime, catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY, get_params_with_secrets,
-    parameters::Parameters, secrets::Secrets,
+    Runtime, catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY, parameters::Parameters,
 };
+use runtime_secrets::{Secrets, get_params_with_secrets};
 
 use super::{
     ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError, ODBC_DATACONNECTOR,

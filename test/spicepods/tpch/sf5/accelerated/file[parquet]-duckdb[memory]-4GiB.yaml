@@ -1,0 +1,47 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-duckdb[memory]-4GiB
+datasets:
+  - from: s3://benchmarks/tpch_sf5/customer/
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration: &acceleration
+      enabled: true
+      engine: duckdb
+      mode: memory
+      params:
+        duckdb_memory_limit: 4GiB
+  - from: s3://benchmarks/tpch_sf5/lineitem/
+    name: lineitem
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf5/nation/
+    name: nation
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf5/orders/
+    name: orders
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf5/part/
+    name: part
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf5/partsupp/
+    name: partsupp
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf5/region/
+    name: region
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf5/supplier/
+    name: supplier
+    params: *s3_params
+    acceleration: *acceleration
