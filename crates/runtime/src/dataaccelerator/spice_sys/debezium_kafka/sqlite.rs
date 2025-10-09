@@ -26,12 +26,6 @@ impl DebeziumKafkaSys {
         pool: &SqliteConnectionPool,
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
-        let conn_sync = pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(Error::DowncastFailed {
-                target: "SqliteConnection",
-            });
-        };
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
@@ -39,6 +33,13 @@ impl DebeziumKafkaSys {
             serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
 
         conn.conn
             .call(move |conn| {
@@ -81,9 +82,7 @@ impl DebeziumKafkaSys {
                 Ok(())
             })
             .await
-            .map_err(Error::external)?;
-
-        Ok(())
+            .map_err(Error::external)
     }
 
     pub(super) async fn get_sqlite(
@@ -91,36 +90,38 @@ impl DebeziumKafkaSys {
         pool: &SqliteConnectionPool,
     ) -> Option<DebeziumKafkaMetadata> {
         let dataset_name = self.dataset_name.clone();
+
         let conn_sync = pool.connect_sync();
         let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+
         conn.conn
             .call(move |conn| {
-            let query = format!(
-                "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
-            );
-            let mut stmt = conn.prepare(&query)?;
-            let mut rows = stmt.query([dataset_name])?;
+                let query = format!(
+                    "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
+                );
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([dataset_name])?;
 
-            if let Some(row) = rows.next()? {
-                let consumer_group_id: String = row.get(0)?;
-                let topic: String = row.get(1)?;
-                let primary_keys: String = row.get(2)?;
-                let schema_fields: String = row.get(3)?;
+                if let Some(row) = rows.next()? {
+                    let consumer_group_id: String = row.get(0)?;
+                    let topic: String = row.get(1)?;
+                    let primary_keys: String = row.get(2)?;
+                    let schema_fields: String = row.get(3)?;
 
-                let primary_keys: Vec<String> = serde_json::from_str(&primary_keys).map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
-                let schema_fields: Vec<change_event::Field> = serde_json::from_str(&schema_fields).map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let primary_keys: Vec<String> = serde_json::from_str(&primary_keys).map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let schema_fields: Vec<change_event::Field> = serde_json::from_str(&schema_fields).map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
 
-                Ok(DebeziumKafkaMetadata {
-                    consumer_group_id,
-                    topic,
-                    primary_keys,
-                    schema_fields,
-                })
-            } else {
-                Err(tokio_rusqlite::Error::Other("No row found".into()))
-            }
-        })
-        .await
-        .ok()
+                    Ok(DebeziumKafkaMetadata {
+                        consumer_group_id,
+                        topic,
+                        primary_keys,
+                        schema_fields,
+                    })
+                } else {
+                    Err(tokio_rusqlite::Error::Other("No row found".into()))
+                }
+            })
+            .await
+            .ok()
     }
 }

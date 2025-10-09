@@ -32,6 +32,7 @@ use crate::{
             builder::DatasetBuilder,
         },
     },
+    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -77,7 +78,6 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
         let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
-
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
         let mut localpod_datasets = Vec::new();
@@ -838,6 +838,12 @@ impl Runtime {
                 initialized_datasets.push(Arc::clone(ds)); // non-accelerated datasets are always successfully initialized
             }
         }
+
+        let snapshot_sources: Vec<Arc<dyn AccelerationSource>> = initialized_datasets
+            .iter()
+            .map(|ds| ds.clone_arc())
+            .collect();
+        validate_snapshot_paths(snapshot_sources).await;
 
         initialized_datasets
     }

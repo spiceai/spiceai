@@ -14,17 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use runtime_acceleration::{
-    dataset_checkpoint::make_checkpointer_factory, snapshot::SnapshotManager,
+    dataset_checkpoint::make_checkpointer_factory,
+    snapshot::{SnapshotBehavior, SnapshotManager},
 };
 use snafu::ResultExt;
 
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
-        AccelerationSource,
+        AccelerationSource, acceleration_file_path,
         spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     },
 };
@@ -70,5 +71,46 @@ pub(super) async fn download_snapshot_if_needed(
         let _ = manager.download_latest_snapshot().await.inspect_err(|e| {
             tracing::error!("Failed to download snapshot: {}", e);
         });
+    }
+}
+
+pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSource>>) {
+    let mut paths: HashMap<PathBuf, Vec<String>> = HashMap::new();
+
+    for source in sources {
+        let Some(acceleration) = source.acceleration() else {
+            continue;
+        };
+
+        if matches!(acceleration.snapshots, SnapshotBehavior::Disabled) {
+            continue;
+        }
+
+        if !source.is_file_accelerated() {
+            continue;
+        }
+
+        match acceleration_file_path(source.as_ref()).await {
+            Ok(path) => {
+                paths
+                    .entry(path)
+                    .or_default()
+                    .push(source.name().to_string());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Unable to determine acceleration file path for dataset {} while validating snapshot configuration: {err}",
+                    source.name()
+                );
+            }
+        }
+    }
+
+    for (path, datasets) in paths.into_iter().filter(|(_, ds)| ds.len() > 1) {
+        tracing::warn!(
+            "Datasets [{}] are configured to use the same acceleration file path '{}' while snapshots are enabled. Each dataset must use a unique file path to prevent snapshot conflicts.",
+            datasets.join(", "),
+            path.display()
+        );
     }
 }

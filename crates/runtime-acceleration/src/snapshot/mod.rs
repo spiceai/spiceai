@@ -1405,10 +1405,10 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
+    use arrow_schema::{DataType, Field};
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use object_store::{memory::InMemory, path::Path};
     use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
@@ -1487,20 +1487,16 @@ mod tests {
 
     fn snapshot_uri(location: &ObjectPath) -> String {
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let relative = location
-            .prefix_match(&base)
-            .map(|parts| {
+        let relative = location.prefix_match(&base).map_or_else(
+            || location.to_string(),
+            |parts| {
                 parts
                     .map(|p| p.as_ref().to_owned())
                     .collect::<Vec<_>>()
                     .join("/")
-            })
-            .filter(|rel| !rel.is_empty());
-
-        match relative {
-            Some(rel) => format!("{SNAPSHOT_URI_PREFIX}/{rel}"),
-            None => format!("{SNAPSHOT_URI_PREFIX}/{location}"),
-        }
+            },
+        );
+        format!("{SNAPSHOT_URI_PREFIX}/{relative}")
     }
 
     fn dataset_metadata(
