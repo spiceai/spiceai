@@ -899,7 +899,6 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
-    use futures::executor::block_on;
     use object_store::{memory::InMemory, path::Path};
     use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::NamedTempFile;
@@ -1037,42 +1036,40 @@ mod tests {
         assert!(SnapshotManager::snapshot_candidate_from_meta(meta, "dataset").is_none());
     }
 
-    #[test]
-    fn list_snapshot_candidates_sorts_descending() {
+    #[tokio::test]
+    async fn list_snapshot_candidates_sorts_descending() {
         let store = InMemory::new();
 
-        block_on(async {
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-01/day=2025-01-01/dataset=dataset/dataset_20250101T000000Z.db"),
-                    Bytes::from_static(b"a").into(),
-                )
-                .await
-                .expect("write snapshot file");
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-02/day=2025-02-01/dataset=dataset/dataset_20250201T000000Z.db"),
-                    Bytes::from_static(b"b").into(),
-                )
-                .await
-                .expect("write snapshot file");
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-03/day=2025-03-01/dataset=other/other_20250301T000000Z.db"),
-                    Bytes::from_static(b"c").into(),
-                )
-                .await
-                .expect("write snapshot file");
-            store
-                .put(
-                    &Path::from(
-                        "snapshots/month=2025-01/day=2025-01-01/dataset=dataset/dataset_invalid.db",
-                    ),
-                    Bytes::from_static(b"d").into(),
-                )
-                .await
-                .expect("write snapshot file");
-        });
+        store
+            .put(
+                &Path::from("snapshots/month=2025-01/day=2025-01-01/dataset=dataset/dataset_20250101T000000Z.db"),
+                Bytes::from_static(b"a").into(),
+            )
+            .await
+            .expect("write snapshot file");
+        store
+            .put(
+                &Path::from("snapshots/month=2025-02/day=2025-02-01/dataset=dataset/dataset_20250201T000000Z.db"),
+                Bytes::from_static(b"b").into(),
+            )
+            .await
+            .expect("write snapshot file");
+        store
+            .put(
+                &Path::from("snapshots/month=2025-03/day=2025-03-01/dataset=other/other_20250301T000000Z.db"),
+                Bytes::from_static(b"c").into(),
+            )
+            .await
+            .expect("write snapshot file");
+        store
+            .put(
+                &Path::from(
+                    "snapshots/month=2025-01/day=2025-01-01/dataset=dataset/dataset_invalid.db",
+                ),
+                Bytes::from_static(b"d").into(),
+            )
+            .await
+            .expect("write snapshot file");
 
         let manager = SnapshotManager {
             dataset_name: "dataset".to_string(),
@@ -1087,8 +1084,10 @@ mod tests {
             })),
         };
 
-        let candidates =
-            block_on(manager.list_snapshot_candidates()).expect("list snapshot candidates");
+        let candidates = manager
+            .list_snapshot_candidates()
+            .await
+            .expect("list snapshot candidates");
         let filenames: Vec<_> = candidates
             .iter()
             .map(|candidate| {
@@ -1109,26 +1108,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_snapshot_candidates_returns_latest_first() {
+    #[tokio::test]
+    async fn list_snapshot_candidates_returns_latest_first() {
         let store = InMemory::new();
 
-        block_on(async {
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-05/day=2025-05-10/dataset=dataset/dataset_20250510T120000Z.db"),
-                    Bytes::from_static(b"latest").into(),
-                )
-                .await
-                .expect("write snapshot file");
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-04/day=2025-04-10/dataset=dataset/dataset_20250410T120000Z.db"),
-                    Bytes::from_static(b"older").into(),
-                )
-                .await
-                .expect("write snapshot file");
-        });
+        store
+            .put(
+                &Path::from("snapshots/month=2025-05/day=2025-05-10/dataset=dataset/dataset_20250510T120000Z.db"),
+                Bytes::from_static(b"latest").into(),
+            )
+            .await
+            .expect("write snapshot file");
+        store
+            .put(
+                &Path::from("snapshots/month=2025-04/day=2025-04-10/dataset=dataset/dataset_20250410T120000Z.db"),
+                Bytes::from_static(b"older").into(),
+            )
+            .await
+            .expect("write snapshot file");
 
         let manager = SnapshotManager {
             dataset_name: "dataset".to_string(),
@@ -1143,47 +1140,47 @@ mod tests {
             })),
         };
 
-        let candidates =
-            block_on(manager.list_snapshot_candidates()).expect("list snapshot candidates");
+        let candidates = manager
+            .list_snapshot_candidates()
+            .await
+            .expect("list snapshot candidates");
 
         let first = candidates.first().expect("expected at least one candidate");
         assert_eq!(first.display_timestamp, "20250510T120000Z");
     }
 
-    #[test]
-    fn list_snapshot_candidates_ignores_unparsable() {
+    #[tokio::test]
+    async fn list_snapshot_candidates_ignores_unparsable() {
         let store = InMemory::new();
 
-        block_on(async {
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=dataset/dataset_20251003T123312Z.db"),
-                    Bytes::from_static(b"a").into(),
-                )
-                .await
-                .expect("write snapshot file");
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=dataset/dataset_20251003T123421Z.db"),
-                    Bytes::from_static(b"b").into(),
-                )
-                .await
-                .expect("write snapshot file");
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-09/day=2025-09-27/dataset=dataset/dataset_250927T13340914Z.db"),
-                    Bytes::from_static(b"c").into(),
-                )
-                .await
-                .expect("write snapshot file");
-            store
-                .put(
-                    &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=other/other_20251003T123421Z.db"),
-                    Bytes::from_static(b"d").into(),
-                )
-                .await
-                .expect("write snapshot file");
-        });
+        store
+            .put(
+                &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=dataset/dataset_20251003T123312Z.db"),
+                Bytes::from_static(b"a").into(),
+            )
+            .await
+            .expect("write snapshot file");
+        store
+            .put(
+                &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=dataset/dataset_20251003T123421Z.db"),
+                Bytes::from_static(b"b").into(),
+            )
+            .await
+            .expect("write snapshot file");
+        store
+            .put(
+                &Path::from("snapshots/month=2025-09/day=2025-09-27/dataset=dataset/dataset_250927T13340914Z.db"),
+                Bytes::from_static(b"c").into(),
+            )
+            .await
+            .expect("write snapshot file");
+        store
+            .put(
+                &Path::from("snapshots/month=2025-10/day=2025-10-03/dataset=other/other_20251003T123421Z.db"),
+                Bytes::from_static(b"d").into(),
+            )
+            .await
+            .expect("write snapshot file");
 
         let manager = SnapshotManager {
             dataset_name: "dataset".to_string(),
@@ -1198,8 +1195,10 @@ mod tests {
             })),
         };
 
-        let candidates =
-            block_on(manager.list_snapshot_candidates()).expect("list snapshot candidates");
+        let candidates = manager
+            .list_snapshot_candidates()
+            .await
+            .expect("list snapshot candidates");
         let filenames: Vec<_> = candidates
             .iter()
             .map(|candidate| {
