@@ -1872,6 +1872,7 @@ mod tests {
                     .expect("should create database"),
             ),
             mvcc_enabled: true,
+            db_path: ":memory:".to_string(),
         });
 
         // Test 1: Full schema (no projection), no filter, no limit
