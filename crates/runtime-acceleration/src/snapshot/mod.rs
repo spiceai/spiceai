@@ -1127,7 +1127,7 @@ impl SnapshotManager {
         let dataset_name = self.dataset_name.clone();
         let snapshot_uri = self.snapshot_uri_for_location(location);
 
-        /// Retry loop to handle precondition failures due to concurrent updates.
+        // Retry loop to handle precondition failures due to concurrent updates.
         loop {
             let handle = self
                 .load_metadata()
