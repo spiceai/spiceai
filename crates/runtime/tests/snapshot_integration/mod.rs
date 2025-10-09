@@ -271,14 +271,27 @@ fn build_snapshots_config(
     context: &SnapshotS3Context,
     behavior: BootstrapOnFailureBehavior,
 ) -> Snapshots {
+    let mut param_map = HashMap::from([("s3_region".to_string(), SNAPSHOT_REGION.to_string())]);
+
+    if env::var("AWS_PROFILE").is_ok() {
+        param_map.insert("s3_auth".to_string(), "iam_role".to_string());
+    } else {
+        param_map.insert("s3_auth".to_string(), "key".to_string());
+        param_map.insert(
+            "s3_key".to_string(),
+            "${secrets:AWS_SNAPSHOT_KEY}".to_string(),
+        );
+        param_map.insert(
+            "s3_secret".to_string(),
+            "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
+        );
+    }
+
     Snapshots {
         enabled: true,
         location: Some(context.location_uri()),
         bootstrap_on_failure_behavior: behavior,
-        params: Some(Params::from_string_map(HashMap::from([
-            ("s3_auth".to_string(), "iam_role".to_string()),
-            ("s3_region".to_string(), SNAPSHOT_REGION.to_string()),
-        ]))),
+        params: Some(Params::from_string_map(param_map)),
     }
 }
 
