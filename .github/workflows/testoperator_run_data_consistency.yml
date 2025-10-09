@@ -66,6 +66,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Validate spicepod files exist
+        run: |
+          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
+            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+
+          if [ ! -f "${{ github.event.inputs.compare_spicepod_path }}" ]; then
+            echo "Error: Compare spicepod file not found at ${{ github.event.inputs.compare_spicepod_path }}"
+            exit 1
+          fi
+          echo "Compare spicepod file found at ${{ github.event.inputs.compare_spicepod_path }}"
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:

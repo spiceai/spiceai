@@ -84,6 +84,14 @@ jobs:
           SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
