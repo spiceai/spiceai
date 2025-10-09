@@ -151,4 +151,4 @@ runs:
       with:
         name: testoperator-${{ steps.detect-os.outputs.os }}
         path: target/release/testoperator${{ steps.detect-os.outputs.ext }}
-        retention-days: 7
+        retention-days: 28
