@@ -25,7 +25,7 @@ use snafu::ResultExt;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
-        acceleration_file_path, AccelerationSource,
+        AccelerationSource, acceleration_file_path,
         spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     },
 };
@@ -74,9 +74,7 @@ pub(super) async fn download_snapshot_if_needed(
     }
 }
 
-pub(crate) async fn validate_snapshot_paths(
-    sources: Vec<Arc<dyn AccelerationSource>>,
-) {
+pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSource>>) {
     let mut paths: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
     for source in sources {
