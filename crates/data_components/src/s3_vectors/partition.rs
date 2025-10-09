@@ -101,7 +101,7 @@ mod tests {
         let column_name = "_my.column";
         let partition_by = &[col(column_name)];
 
-        let this = PartitionedIndexName::from_index_name("mydataset-29d6f.7f7c5.blahh")?;
+        let this = PartitionedIndexName::from_index_name("mydataset.29d6f.7f7c5.blahh")?;
 
         assert_eq!(
             this.belongs_with(index_name, column_name, partition_by),
@@ -146,17 +146,9 @@ mod tests {
         let result =
             PartitionedIndexName::new(index_name, column_name, &partition_by, &partition_value)?;
 
-        assert_eq!(result.inner.prefix, "test-index-17308");
+        assert_eq!(result.inner.prefix, "test-index.17308");
 
         Ok(())
-    }
-
-    #[test]
-    fn from_index_name_invalid_parts() {
-        let name = "mydata.col.expr.value";
-        let result = PartitionedIndexName::from_index_name(name);
-
-        assert!(result.is_err());
     }
 
     #[test]

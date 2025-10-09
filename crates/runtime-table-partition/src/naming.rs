@@ -25,18 +25,14 @@ const HASH_SEED: u64 = 7;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Expected exactly 4 parts in prefix name separated by periods, but found {num_parts}"
+        "Expected at least 3 parts in partition name separated by '{separator}', but found {num_parts}"
     ))]
-    IncorrectNumPartsInName { num_parts: usize },
-    #[snafu(display("The 'partition_by' expression, {expr}, is not supported"))]
-    UnsupportedPartitionByExpression { expr: Box<Expr> },
-    #[snafu(display(
-        "Prefix name, '{prefix}', cannot contain '{separator}' when using 'partition_by'"
-    ))]
-    InvalidPrefixName {
-        prefix: String,
+    IncorrectNumPartsInName {
+        num_parts: usize,
         separator: &'static str,
     },
+    #[snafu(display("The 'partition_by' expression, {expr}, is not supported"))]
+    UnsupportedPartitionByExpression { expr: Box<Expr> },
     #[snafu(display(
         "Prefixes are restricted to {max_length} characters when using 'partition_by', but {prefix} is {len} characters"
     ))]
@@ -57,7 +53,7 @@ pub trait PartitionNameConfig {
     const PARTS_SEPARATOR: &'static str;
 
     fn sanitize(prefix: &str) -> String {
-        prefix.replace(['_', '.'], "-")
+        prefix.replace(['_'], "-")
     }
 
     fn validate(prefix: &str) -> Result<()> {
@@ -68,13 +64,6 @@ pub trait PartitionNameConfig {
                 prefix: prefix.to_string(),
                 len,
                 max_length: Self::PREFIX_MAX_LENGTH
-            }
-        );
-        ensure!(
-            !prefix.contains(Self::PARTS_SEPARATOR),
-            InvalidPrefixNameSnafu {
-                prefix,
-                separator: Self::PARTS_SEPARATOR
             }
         );
 
@@ -178,11 +167,17 @@ impl PartitionedName {
     pub fn from_partition_name<C: PartitionNameConfig>(partition_name: &str) -> Result<Self> {
         let parts: Vec<&str> = partition_name.split(C::PARTS_SEPARATOR).collect();
         let num_parts = parts.len();
-        ensure!(num_parts == 3, IncorrectNumPartsInNameSnafu { num_parts });
+        ensure!(
+            num_parts >= 3,
+            IncorrectNumPartsInNameSnafu {
+                num_parts,
+                separator: C::PARTS_SEPARATOR
+            }
+        );
         Ok(Self {
-            prefix: parts[0].to_string(),
-            partition_by_hash: parts[1].to_string(),
-            partition_value_hash: parts[2].to_string(),
+            prefix: parts[0..num_parts - 2].join(C::PARTS_SEPARATOR),
+            partition_by_hash: parts[num_parts - 2].to_string(),
+            partition_value_hash: parts[num_parts - 1].to_string(),
         })
     }
 
