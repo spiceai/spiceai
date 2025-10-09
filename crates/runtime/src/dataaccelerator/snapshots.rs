@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
-    snapshot::{SnapshotBehavior, SnapshotManager},
+    snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
 };
 use snafu::ResultExt;
 
@@ -47,7 +47,7 @@ pub(super) async fn download_snapshot_if_needed(
         return;
     }
 
-    let source_name = source.name().to_string();
+    let dataset_name = source.name().to_string();
     let source = source.clone_arc();
     let snapshot_behavior = acceleration.snapshots.clone();
     let checkpoint_factory = make_checkpointer_factory(move || {
@@ -65,12 +65,29 @@ pub(super) async fn download_snapshot_if_needed(
         }
     });
     if let Some(manager) =
-        SnapshotManager::try_new(source_name, acceleration.snapshots.clone(), path).await
+        SnapshotManager::try_new(dataset_name.clone(), acceleration.snapshots.clone(), path).await
     {
         let manager = manager.with_checkpointer_factory(checkpoint_factory);
-        let _ = manager.download_latest_snapshot().await.inspect_err(|e| {
-            tracing::error!("Failed to download snapshot: {}", e);
-        });
+        let start_time = Instant::now();
+        match manager.download_latest_snapshot().await {
+            Ok(Some(SnapshotDownloadInfo {
+                schema: _,
+                bytes_downloaded,
+                checksum,
+            })) => {
+                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                metrics::record_bootstrap_metrics(
+                    &dataset_name,
+                    duration_ms,
+                    bytes_downloaded,
+                    &checksum,
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("Failed to download snapshot: {}", e);
+            }
+        }
     }
 }
 
