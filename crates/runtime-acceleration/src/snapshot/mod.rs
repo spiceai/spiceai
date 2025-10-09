@@ -13,21 +13,32 @@ limitations under the License.
 
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
-use std::{cmp::Ordering, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
 
 use arrow::datatypes::SchemaRef;
+use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use bytes::BytesMut;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use futures::StreamExt;
 use object_store::{
-    ObjectMeta, ObjectStore,
+    ClientOptions, ObjectMeta, ObjectStore,
+    aws::AmazonS3Builder,
     path::{Path as ObjectPath, PathPart},
 };
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_secrets::{Secrets, get_params_with_secrets};
 use snafu::prelude::*;
-use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::ParamValue};
+use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use tokio::{
     fs,
     io::{AsyncReadExt, BufReader},
+    sync::RwLock,
 };
 use url::Url;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
@@ -295,14 +306,14 @@ impl SnapshotManager {
         snapshots: SnapshotBehavior,
         local_path: PathBuf,
     ) -> Option<Self> {
-        let snapshot_config = match snapshots {
+        let (snapshot_config, secrets) = match snapshots {
             SnapshotBehavior::Disabled => {
                 tracing::debug!("Snapshots are disabled for {dataset_name}");
                 return None;
             }
-            SnapshotBehavior::Enabled(s)
-            | SnapshotBehavior::BootstrapOnly(s)
-            | SnapshotBehavior::CreateOnly(s) => s,
+            SnapshotBehavior::Enabled(s, secrets)
+            | SnapshotBehavior::BootstrapOnly(s, secrets)
+            | SnapshotBehavior::CreateOnly(s, secrets) => (s, secrets.upgrade()?),
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
 
@@ -323,21 +334,21 @@ impl SnapshotManager {
             }
         };
 
-        let s3_region = snapshot_config
-            .as_ref()
-            .params
-            .as_ref()
-            .and_then(|params| params.data.get("s3_region").map(ParamValue::as_string));
-
         let (store, path) = match (
             snapshots_location_url.scheme(),
             snapshots_location_url.path(),
         ) {
             ("s3", path) => {
-                let store =
-                    aws_sdk_credential_bridge::from_s3_url(&snapshots_location_url, s3_region)
-                        .await
-                        .ok()?;
+                let store = build_s3_object_store(
+                    &snapshots_location_url,
+                    secrets,
+                    snapshot_config.params.as_ref().map(Params::as_string_map),
+                )
+                .await
+                .inspect_err(|e| {
+                    tracing::error!("Error connecting to S3 snapshot location: {e}");
+                })
+                .ok()?;
                 let path = object_store::path::Path::from(path);
                 (store, path)
             }
@@ -749,6 +760,135 @@ impl SnapshotManager {
         );
 
         Some(candidate)
+    }
+}
+
+static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    vec![
+        ParameterSpec::component("region").secret(),
+        ParameterSpec::component("endpoint").secret(),
+        ParameterSpec::component("key").secret(),
+        ParameterSpec::component("secret").secret(),
+        ParameterSpec::component("session_token").secret(),
+        ParameterSpec::component("auth")
+            .description("Configures the authentication method for S3. Supported methods are: iam_role, key.")
+            .default("iam_role")
+            .one_of(&["iam_role", "key"])
+            .secret(),
+        ParameterSpec::runtime("client_timeout")
+            .description("The timeout setting for S3 client."),
+        ParameterSpec::runtime("allow_http")
+            .description("Allow HTTP protocol for S3 endpoint.")
+    ]
+});
+
+#[derive(Debug, Snafu)]
+enum S3ObjectStoreError {
+    #[snafu(transparent)]
+    InvalidBucketName {
+        source: aws_sdk_credential_bridge::Error,
+    },
+
+    #[snafu(display("Unable to parse client_timeout: {source}"))]
+    ClientTimeoutParse { source: fundu::ParseError },
+
+    #[snafu(display("Unexpected S3 auth method: {method}"))]
+    UnexpectedS3AuthMethod { method: String },
+
+    #[snafu(display("Unable to load S3 credentials from environment: {source}"))]
+    EnvLoad {
+        source: aws_sdk_credential_bridge::Error,
+    },
+
+    #[snafu(transparent)]
+    ObjectStore { source: object_store::Error },
+}
+
+async fn build_s3_object_store(
+    snapshots_url: &Url,
+    secrets: Arc<RwLock<Secrets>>,
+    params: Option<HashMap<String, String>>,
+) -> Result<Box<dyn ObjectStore>, S3ObjectStoreError> {
+    let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref()).await;
+
+    let s3_region = s3_params.get("region").expose().ok();
+    let allow_http = s3_params
+        .get("allow_http")
+        .expose()
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(false);
+    let s3_endpoint = s3_params.get("endpoint").expose().ok();
+    let client_timeout = s3_params.get("client_timeout").expose().ok();
+    let bucket_name = get_bucket_name(snapshots_url)?;
+
+    let mut s3_builder = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket_name)
+        .with_allow_http(allow_http);
+    let mut client_options = ClientOptions::default();
+
+    if let Some(region) = s3_region {
+        s3_builder = s3_builder.with_region(region);
+    }
+    if let Some(endpoint) = s3_endpoint {
+        s3_builder = s3_builder.with_endpoint(endpoint);
+        if endpoint.starts_with("http://") {
+            client_options = client_options.with_allow_http(true);
+        }
+    }
+    if let Some(timeout) = client_timeout {
+        client_options = client_options
+            .with_timeout(fundu::parse_duration(timeout).context(ClientTimeoutParseSnafu)?);
+    }
+    let mut load_credentials_from_environment = true;
+
+    if let (Some(key), Some(secret)) = (
+        s3_params.get("key").expose().ok(),
+        s3_params.get("secret").expose().ok(),
+    ) {
+        s3_builder = s3_builder.with_access_key_id(key);
+        s3_builder = s3_builder.with_secret_access_key(secret);
+        if let Some(token) = s3_params.get("session_token").expose().ok() {
+            s3_builder = s3_builder.with_token(token);
+        }
+        load_credentials_from_environment = false;
+    }
+    s3_builder = s3_builder.with_client_options(client_options);
+
+    if load_credentials_from_environment {
+        tracing::trace!("Loading S3 credentials from environment");
+        if let Some(sdk_config) = aws_sdk_credential_bridge::initialize_sdk_config().await
+            && sdk_config.credentials_provider().is_some()
+        {
+            tracing::trace!("Using S3 credentials provider from SDK config");
+            s3_builder = s3_builder.with_credentials(Arc::new(
+                S3CredentialProvider::from_config(sdk_config).context(EnvLoadSnafu)?,
+            ));
+        }
+    }
+
+    Ok(Box::new(s3_builder.build()?))
+}
+
+async fn build_s3_parameters(
+    secrets: Arc<RwLock<Secrets>>,
+    params: Option<&HashMap<String, String>>,
+) -> Parameters {
+    let default_params = || Parameters::new(vec![], "s3", &S3_PARAMETERS);
+    match params {
+        Some(p) => {
+            let secret_params = get_params_with_secrets(Arc::clone(&secrets), p).await;
+            Parameters::try_new(
+                "snapshot",
+                secret_params.into_iter().collect(),
+                "s3",
+                secrets,
+                &S3_PARAMETERS,
+            )
+            .await
+            .unwrap_or_else(|_| default_params())
+        }
+        None => default_params(),
     }
 }
 

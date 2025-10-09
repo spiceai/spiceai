@@ -8,12 +8,12 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.cached_search",
       "matches": {
-        "cp_description": "Members comfort major horses. All good vehicles must perform ago wrong new conditions. P"
+        "cp_description": "In general basic characters welcome. Clearly lively friends con"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 20
+        "cp_catalog_page_sk": 1
       },
-      "score": 0.52
+      "score": 0.94
     },
     {
       "dataset": "spice.public.cached_search",
@@ -23,37 +23,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 15
       },
-      "score": 0.51
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Human, successive tears highlight also as radical prod"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 10
-      },
-      "score": 0.51
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make "
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 8
-      },
-      "score": 0.51
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Times could not address disabled indians. Effectively public ports "
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 12
-      },
-      "score": 0.5
+      "score": 0.93
     },
     {
       "dataset": "spice.public.cached_search",
@@ -63,87 +33,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 3
       },
-      "score": 0.49
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "So appropriate hopes cannot constitute with a shapes. Investors know therefo"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 9
-      },
-      "score": 0.49
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Social pictures welcome almost british teams. Awful preparations leave g"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 16
-      },
-      "score": 0.49
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 1
-      },
-      "score": 0.48
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Necessary, major terms give still now joint thoughts. Only considerable wome"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 14
-      },
-      "score": 0.48
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Respects might appear early, long metres. Cases would understan"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 13
-      },
-      "score": 0.47
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Even democratic stairs would know happy investigations. Hist"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 2
-      },
-      "score": 0.46
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Good questions borrow only base children. Remarkably present "
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 19
-      },
-      "score": 0.46
-    },
-    {
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch t"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 6
-      },
-      "score": 0.46
+      "score": 0.93
     },
     {
       "dataset": "spice.public.cached_search",
@@ -153,17 +43,27 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 7
       },
-      "score": 0.45
+      "score": 0.92
     },
     {
       "dataset": "spice.public.cached_search",
       "matches": {
-        "cp_description": "Programmes receive just likely, key homes. Relevant"
+        "cp_description": "Human, successive tears highlight also as radical prod"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 11
+        "cp_catalog_page_sk": 10
       },
-      "score": 0.44
+      "score": 0.91
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Even democratic stairs would know happy investigations. Hist"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2
+      },
+      "score": 0.91
     },
     {
       "dataset": "spice.public.cached_search",
@@ -173,7 +73,37 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 17
       },
-      "score": 0.43
+      "score": 0.91
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make "
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 8
+      },
+      "score": 0.9
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Good questions borrow only base children. Remarkably present "
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 19
+      },
+      "score": 0.9
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Necessary, major terms give still now joint thoughts. Only considerable wome"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 14
+      },
+      "score": 0.9
     },
     {
       "dataset": "spice.public.cached_search",
@@ -183,7 +113,47 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 18
       },
-      "score": 0.42
+      "score": 0.89
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Programmes receive just likely, key homes. Relevant"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 11
+      },
+      "score": 0.89
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Respects might appear early, long metres. Cases would understan"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 13
+      },
+      "score": 0.89
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Times could not address disabled indians. Effectively public ports "
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 12
+      },
+      "score": 0.88
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Members comfort major horses. All good vehicles must perform ago wrong new conditions. P"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 20
+      },
+      "score": 0.87
     },
     {
       "dataset": "spice.public.cached_search",
@@ -193,7 +163,37 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 5
       },
-      "score": 0.42
+      "score": 0.87
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "So appropriate hopes cannot constitute with a shapes. Investors know therefo"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 9
+      },
+      "score": 0.86
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Social pictures welcome almost british teams. Awful preparations leave g"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 16
+      },
+      "score": 0.84
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch t"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 6
+      },
+      "score": 0.82
     }
   ]
 }

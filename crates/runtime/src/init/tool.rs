@@ -17,12 +17,12 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu, get_params_with_secrets, metrics,
-    status,
+    Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu, metrics, status,
     tools::{self, Tooling, factory::default_available_catalogs},
 };
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::tool::Tool;

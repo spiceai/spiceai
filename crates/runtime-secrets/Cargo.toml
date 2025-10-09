@@ -20,6 +20,7 @@ serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 # Optional dependencies for feature-gated secret stores
 aws-config = { workspace = true, optional = true }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::models::hf::get_model_to_vec_embeddings;
+use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
@@ -1095,8 +1095,8 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 
     let app = AppBuilder::new("cached_search")
         .with_dataset(chunked)
-        .with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-32M",
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
             "hf_minilm",
         ))
         .with_search_cache(cache_config)
@@ -1113,7 +1113,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                 "with_cache_pre_cache",
                 SearchTestType::Http(json!({
                     "text": "new patient",
-                    "limit": 50,
+                    "limit": 100,
                 })),
             ), None, false).await?;
             let duration = start.elapsed();
@@ -1124,7 +1124,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                     "with_cache_post_cache",
                     SearchTestType::Http(json!({
                         "text": "new patient",
-                        "limit": 50,
+                        "limit": 100,
                     })),
                 ), None, false).await?;
                 let duration_cached = start.elapsed();
