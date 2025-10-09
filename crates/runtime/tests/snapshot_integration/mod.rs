@@ -27,7 +27,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use aws_sdk_credential_bridge::{S3CredentialProvider, initialize_sdk_config};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use datafusion::sql::TableReference;
 #[cfg(feature = "duckdb")]
 use duckdb::Connection;
@@ -106,7 +106,7 @@ impl SnapshotS3Context {
             .bytes()
             .await
             .context("Reading snapshot metadata bytes")?;
-        Ok(serde_json::from_slice(&data).context("Parsing snapshot metadata as JSON")?)
+        serde_json::from_slice(&data).context("Parsing snapshot metadata as JSON")
     }
 
     async fn snapshot_objects(&self, dataset: &str) -> Result<Vec<ObjectMeta>> {
@@ -115,7 +115,10 @@ impl SnapshotS3Context {
         while let Some(entry) = stream.next().await {
             let meta = entry?;
             if meta.location.filename().is_some_and(|filename| {
-                filename.ends_with(".db")
+                Path::new(filename)
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
                     && meta
                         .location
                         .as_ref()
@@ -134,28 +137,31 @@ impl SnapshotS3Context {
         max_wait: Duration,
     ) -> Result<Vec<ObjectMeta>> {
         let deadline = Instant::now() + max_wait;
-        let mut last_error: Option<anyhow::Error> = None;
 
         loop {
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "Timed out waiting for at least {minimum} snapshot objects for dataset {dataset}"
+                ));
+            }
+
             match self.snapshot_objects(dataset).await {
                 Ok(entries) if entries.len() >= minimum => return Ok(entries),
                 Ok(entries) => {
-                    last_error = Some(anyhow!(
-                        "Only found {} snapshot objects (expected at least {minimum})",
-                        entries.len()
-                    ));
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "Timed out waiting for at least {minimum} snapshot objects for dataset {dataset}; last observed {} snapshot objects",
+                            entries.len()
+                        ));
+                    }
                 }
                 Err(err) => {
-                    last_error = Some(err);
+                    if Instant::now() >= deadline {
+                        return Err(err.context(format!(
+                            "Timed out while waiting for snapshot objects for dataset {dataset}"
+                        )));
+                    }
                 }
-            }
-
-            if Instant::now() >= deadline {
-                return Err(last_error.unwrap_or_else(|| {
-                    anyhow!(
-                        "Timed out waiting for at least {minimum} snapshot objects for dataset {dataset}"
-                    )
-                }));
             }
 
             sleep(Duration::from_millis(500)).await;
@@ -188,7 +194,7 @@ impl SnapshotS3Context {
 
 struct SnapshotFixture {
     context: SnapshotS3Context,
-    temp_dir: TempDir,
+    _temp_dir: TempDir,
     dataset_from: String,
     local_db_path: PathBuf,
     dataset_params: HashMap<String, String>,
@@ -256,12 +262,14 @@ fn build_dataset(
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(Params::from_string_map(dataset_params.clone()));
 
-    let mut acceleration = Acceleration::default();
-    acceleration.mode = Mode::File;
-    acceleration.engine = Some(engine.to_string());
-    acceleration.params = Some(Params::from_string_map(accel_params.clone()));
-    acceleration.refresh_on_startup = refresh_on_startup;
-    acceleration.snapshots = snapshot_behavior;
+    let acceleration = Acceleration {
+        mode: Mode::File,
+        engine: Some(engine.to_string()),
+        params: Some(Params::from_string_map(accel_params.clone())),
+        refresh_on_startup,
+        snapshots: snapshot_behavior,
+        ..Default::default()
+    };
     dataset.acceleration = Some(acceleration);
 
     dataset
@@ -311,12 +319,12 @@ fn build_metadata_document(
             let snapshot_path = format!("s3://{SNAPSHOT_BUCKET}/{}", meta.location);
             let checksum = meta.e_tag.clone().unwrap_or_default();
             json!({
-                "snapshot-id": idx as i64,
+                "snapshot-id": idx,
                 "timestamp-ms": timestamp_ms,
                 "snapshot": snapshot_path,
                 "snapshot-checksum": checksum,
                 "snapshot-checksum-algorithm": if checksum.is_empty() { Value::Null } else { Value::from("ETag") },
-                "snapshot-size": meta.size as i64,
+                "snapshot-size": meta.size,
             })
         })
         .collect();
@@ -451,7 +459,7 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
 
     Ok(SnapshotFixture {
         context,
-        temp_dir,
+        _temp_dir: temp_dir,
         dataset_from,
         local_db_path,
         dataset_params,
@@ -523,7 +531,7 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
 
     Ok(SnapshotFixture {
         context,
-        temp_dir,
+        _temp_dir: temp_dir,
         dataset_from,
         local_db_path,
         dataset_params,
@@ -541,13 +549,13 @@ fn remove_existing_local_files(path: &Path) {
         PathBuf::from(format!("{}-shm", path.to_string_lossy())),
     ];
     for candidate in candidates {
-        if let Err(err) = std::fs::remove_file(&candidate) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    "Failed to remove local acceleration file {}: {err}",
-                    candidate.display()
-                );
-            }
+        if let Err(err) = std::fs::remove_file(&candidate)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "Failed to remove local acceleration file {}: {err}",
+                candidate.display()
+            );
         }
     }
 }
@@ -942,6 +950,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
         .await
 }
 
+#[allow(clippy::too_many_lines)]
 #[cfg_attr(not(feature = "duckdb"), ignore)]
 #[tokio::test]
 async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Result<()> {
@@ -986,7 +995,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             .await
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?;
 
-            let mut conn = Connection::open(&fixture.local_db_path)
+            let conn = Connection::open(&fixture.local_db_path)
                 .context("Opening DuckDB acceleration file for modification")?;
             conn.execute("DROP TABLE IF EXISTS taxi_trips_modified", [])
                 .context("Cleaning up temporary snapshot modification table")?;
