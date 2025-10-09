@@ -947,8 +947,33 @@ impl SnapshotManager {
     }
 
     fn snapshot_uri_to_object_path(&self, uri: &str) -> Result<ObjectPath, SnapshotDownloadError> {
+        let base_uri = self.snapshot_location_uri.trim_end_matches('/');
+        if let Some(relative) = uri.strip_prefix(base_uri) {
+            let relative = relative.trim_start_matches('/');
+            let combined = if relative.is_empty() {
+                self.snapshots_location.to_string()
+            } else {
+                format!("{}/{}", self.snapshots_location, relative)
+            };
+            return Ok(ObjectPath::from(combined));
+        }
+
         match Url::parse(uri) {
-            Ok(url) => Ok(ObjectPath::from(url.path())),
+            Ok(parsed_uri) => {
+                let mut combined = self.snapshots_location.to_string();
+                if let Some(host) = parsed_uri.host_str() {
+                    combined = format!("{combined}/{host}");
+                }
+                let path = parsed_uri
+                    .path()
+                    .trim_start_matches('/')
+                    .trim();
+                if path.is_empty() {
+                    Ok(ObjectPath::from(combined))
+                } else {
+                    Ok(ObjectPath::from(format!("{combined}/{path}")))
+                }
+            }
             Err(parse_err) => {
                 if uri.contains("://") {
                     Err(SnapshotDownloadError::InvalidSnapshotUri {
@@ -962,6 +987,7 @@ impl SnapshotManager {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn download_snapshot_entry(
         &self,
         entry: &SnapshotEntry,
@@ -1115,6 +1141,7 @@ impl SnapshotManager {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn update_metadata_after_upload(
         &self,
         location: &ObjectPath,
@@ -1135,15 +1162,14 @@ impl SnapshotManager {
                 .map_err(SnapshotUploadError::from)?;
 
             let now_ms = Utc::now().timestamp_millis();
-            let mut metadata = handle
-                .as_ref()
-                .map(|h| h.metadata.clone())
-                .unwrap_or_else(|| {
-                    SnapshotMetadata::empty(self.snapshot_location_uri.clone(), now_ms)
-                });
+            let mut metadata = if let Some(existing) = handle.as_ref() {
+                existing.metadata.clone()
+            } else {
+                SnapshotMetadata::empty(self.snapshot_location_uri.clone(), now_ms)
+            };
 
             if metadata.location.is_empty() {
-                metadata.location = self.snapshot_location_uri.clone();
+                metadata.location.clone_from(&self.snapshot_location_uri);
             }
             metadata.last_updated_ms = now_ms;
 
@@ -1154,7 +1180,7 @@ impl SnapshotManager {
                     name: dataset_name.clone(),
                     ..Default::default()
                 });
-            dataset_entry.name = dataset_name.clone();
+            dataset_entry.name.clone_from(&dataset_name);
 
             if dataset_entry.schemas.is_empty() {
                 let schema_metadata = SchemaMetadata::from_schema(0, schema).map_err(|source| {
@@ -1191,14 +1217,14 @@ impl SnapshotManager {
                 .iter()
                 .map(|entry| entry.snapshot_id)
                 .max()
-                .map(|max_id| max_id + 1)
-                .unwrap_or(0);
+                .map_or(0, |max_id| max_id + 1);
 
+            let checksum_for_metadata = checksum.clone();
             let snapshot_entry = SnapshotEntry {
                 snapshot_id: next_snapshot_id,
                 timestamp_ms,
                 snapshot: snapshot_uri.clone(),
-                snapshot_checksum: checksum.clone(),
+                snapshot_checksum: checksum_for_metadata,
                 snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
                 snapshot_size: size,
             };
@@ -1220,7 +1246,7 @@ impl SnapshotManager {
                 (true, None) => PutMode::Overwrite,
             };
 
-            let payload = PutPayload::from(serialized.clone());
+            let payload = PutPayload::from(serialized);
 
             match self
                 .object_store
@@ -1229,11 +1255,8 @@ impl SnapshotManager {
             {
                 Ok(_) => return Ok(()),
                 Err(object_store::Error::AlreadyExists { .. })
-                    if matches!(put_mode, PutMode::Create) =>
-                {
-                    continue;
-                }
-                Err(object_store::Error::Precondition { .. }) => continue,
+                    if matches!(put_mode, PutMode::Create) => {}
+                Err(object_store::Error::Precondition { .. }) => {}
                 Err(object_store::Error::NotSupported { .. })
                     if matches!(put_mode, PutMode::Update(_)) =>
                 {
@@ -1271,7 +1294,7 @@ fn compute_sha256_hex(bytes: &[u8]) -> String {
 fn encode_hex_lower(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        let _ = write!(output, "{:02x}", byte);
+        let _ = write!(output, "{byte:02x}");
     }
     output
 }
@@ -1438,7 +1461,7 @@ mod tests {
         }
 
         async fn get_schema(&self) -> DatasetCheckpointResult<Option<SchemaRef>> {
-            Ok(Some(self.schema.clone()))
+            Ok(Some(Arc::clone(&self.schema)))
         }
 
         async fn last_checkpoint_time(&self) -> DatasetCheckpointResult<Option<SystemTime>> {
@@ -1458,17 +1481,17 @@ mod tests {
         store: Arc<InMemory>,
         local_path: PathBuf,
         behavior: BootstrapOnFailureBehavior,
-        schema: SchemaRef,
+        schema: &SchemaRef,
     ) -> SnapshotManager {
-        let schema_for_factory = schema.clone();
+        let schema_for_factory = Arc::clone(schema);
         let factory: DatasetCheckpointerFactory = Arc::new(move || {
-            let schema = schema_for_factory.clone();
+            let schema = Arc::clone(&schema_for_factory);
             Box::pin(async move {
                 Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(StaticSchemaCheckpointer { schema }))
             })
         });
 
-        let object_store: Arc<dyn ObjectStore> = store.clone();
+        let object_store: Arc<dyn ObjectStore> = store;
 
         SnapshotManager {
             dataset_name: DATASET_NAME.to_string(),
@@ -1490,7 +1513,16 @@ mod tests {
     }
 
     fn snapshot_uri(location: &ObjectPath) -> String {
-        format!("{SNAPSHOT_URI_PREFIX}/{}", location.to_string())
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let relative = location
+            .prefix_match(&base)
+            .map(|parts| parts.map(|p| p.as_ref().to_owned()).collect::<Vec<_>>().join("/"))
+            .filter(|rel| !rel.is_empty());
+
+        match relative {
+            Some(rel) => format!("{SNAPSHOT_URI_PREFIX}/{rel}"),
+            None => format!("{SNAPSHOT_URI_PREFIX}/{location}"),
+        }
     }
 
     fn dataset_metadata(
@@ -1519,7 +1551,7 @@ mod tests {
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
-            schema,
+            &schema,
         );
 
         let result = manager
@@ -1579,7 +1611,7 @@ mod tests {
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
-            schema.clone(),
+            &schema,
         );
 
         let result = manager
@@ -1662,7 +1694,7 @@ mod tests {
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
-            schema.clone(),
+            &schema,
         );
 
         let result = manager
@@ -1693,7 +1725,7 @@ mod tests {
             Arc::clone(&store),
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
-            schema.clone(),
+            &schema,
         );
 
         let uploaded_path = manager.create_snapshot().await.expect("create snapshot");
