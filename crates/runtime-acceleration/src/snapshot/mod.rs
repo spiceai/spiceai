@@ -284,8 +284,6 @@ impl From<MetadataLoadError> for SnapshotUploadError {
 
 #[derive(Debug, Snafu)]
 pub enum SnapshotUploadError {
-    #[snafu(display("Dataset checkpointer factory not set for snapshot manager"))]
-    UploadCheckpointerFactoryNotSet,
     #[snafu(display("Failed to open local snapshot file {}: {source}", path.display()))]
     OpenLocal {
         path: PathBuf,
@@ -316,16 +314,6 @@ pub enum SnapshotUploadError {
         path: String,
         source: object_store::Error,
     },
-    #[snafu(display("Failed to initialize dataset checkpointer: {source}"))]
-    UploadCheckpointerInit {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    #[snafu(display("Failed to fetch schema from dataset checkpointer: {source}"))]
-    UploadCheckpointerSchema {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    #[snafu(display("Dataset {dataset} schema not available for snapshot metadata"))]
-    UploadSchemaMissing { dataset: String },
     #[snafu(display("Failed to serialize schema for dataset {dataset}: {source}"))]
     UploadSchemaSerialize {
         dataset: String,
@@ -583,29 +571,16 @@ impl SnapshotManager {
     /// - If the local acceleration file cannot be opened or read.
     /// - If communicating with the backing object store fails at any stage of the upload.
     #[allow(clippy::too_many_lines)]
-    pub async fn create_snapshot(&self) -> Result<ObjectPath, SnapshotUploadError> {
+    pub async fn create_snapshot(
+        &self,
+        schema: &SchemaRef,
+    ) -> Result<ObjectPath, SnapshotUploadError> {
         let now = Utc::now();
         let layout = SnapshotPathLayout::new(&self.dataset_name);
         let location = layout.build_location(&self.snapshots_location, now);
         let location_path = location.to_string();
         let local_path = self.local_path.clone();
         let timestamp_ms = now.timestamp_millis();
-
-        let checkpointer_factory = Arc::clone(
-            self.checkpointer_factory
-                .as_ref()
-                .ok_or(SnapshotUploadError::UploadCheckpointerFactoryNotSet)?,
-        );
-        let checkpointer = (checkpointer_factory)()
-            .await
-            .map_err(|source| SnapshotUploadError::UploadCheckpointerInit { source })?;
-        let schema_ref = checkpointer
-            .get_schema()
-            .await
-            .map_err(|source| SnapshotUploadError::UploadCheckpointerSchema { source })?
-            .ok_or_else(|| SnapshotUploadError::UploadSchemaMissing {
-                dataset: self.dataset_name.clone(),
-            })?;
 
         tracing::info!(
             "Uploading snapshot. dataset={} snapshot={location}",
@@ -705,7 +680,7 @@ impl SnapshotManager {
                     checksum,
                     total_bytes,
                     timestamp_ms,
-                    &schema_ref,
+                    schema,
                 )
                 .await?;
 
@@ -1152,6 +1127,7 @@ impl SnapshotManager {
         let dataset_name = self.dataset_name.clone();
         let snapshot_uri = self.snapshot_uri_for_location(location);
 
+        /// Retry loop to handle precondition failures due to concurrent updates.
         loop {
             let handle = self
                 .load_metadata()
@@ -1730,7 +1706,10 @@ mod tests {
             &schema,
         );
 
-        let uploaded_path = manager.create_snapshot().await.expect("create snapshot");
+        let uploaded_path = manager
+            .create_snapshot(&schema)
+            .await
+            .expect("create snapshot");
 
         let stored_bytes = store
             .get(&uploaded_path)
