@@ -146,12 +146,33 @@ impl SnapshotBehavior {
         match snapshot_behavior {
             spicepod_acceleration::SnapshotBehavior::Disabled => SnapshotBehavior::Disabled,
             spicepod_acceleration::SnapshotBehavior::Enabled => {
+                if !snapshots.enabled {
+                    tracing::warn!(
+                        "Snapshots are enabled for this dataset, but the spicepod snapshot configuration is disabled."
+                    );
+                    return SnapshotBehavior::Disabled;
+                }
+
                 SnapshotBehavior::Enabled(snapshots, secrets)
             }
             spicepod_acceleration::SnapshotBehavior::BootstrapOnly => {
+                if !snapshots.enabled {
+                    tracing::warn!(
+                        "Snapshots are enabled for this dataset, but the spicepod snapshot configuration is disabled."
+                    );
+                    return SnapshotBehavior::Disabled;
+                }
+
                 SnapshotBehavior::BootstrapOnly(snapshots, secrets)
             }
             spicepod_acceleration::SnapshotBehavior::CreateOnly => {
+                if !snapshots.enabled {
+                    tracing::warn!(
+                        "Snapshots are enabled for this dataset, but the spicepod snapshot configuration is disabled."
+                    );
+                    return SnapshotBehavior::Disabled;
+                }
+
                 SnapshotBehavior::CreateOnly(snapshots, secrets)
             }
         }
