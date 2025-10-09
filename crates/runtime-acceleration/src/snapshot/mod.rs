@@ -19,6 +19,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{Arc, LazyLock},
+    time::Instant,
 };
 
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
@@ -48,6 +49,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
+pub mod metrics;
 pub use behavior::SnapshotBehavior;
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
@@ -129,6 +131,13 @@ impl DatasetMetadata {
             .iter()
             .find(|schema| schema.schema_id == self.current_schema_id)
     }
+}
+
+/// Details captured when downloading a snapshot for bootstrapping.
+pub struct SnapshotDownloadInfo {
+    pub schema: SchemaRef,
+    pub bytes_downloaded: u64,
+    pub checksum: String,
 }
 
 #[derive(Debug, Clone)]
@@ -575,6 +584,7 @@ impl SnapshotManager {
         &self,
         schema: &SchemaRef,
     ) -> Result<ObjectPath, SnapshotUploadError> {
+        let start_time = Instant::now();
         let now = Utc::now();
         let layout = SnapshotPathLayout::new(&self.dataset_name);
         let location = layout.build_location(&self.snapshots_location, now);
@@ -677,12 +687,21 @@ impl SnapshotManager {
 
                 self.update_metadata_after_upload(
                     &location,
-                    checksum,
+                    checksum.clone(),
                     total_bytes,
                     timestamp_ms,
                     schema,
                 )
                 .await?;
+
+                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                metrics::record_write_metrics(
+                    &self.dataset_name,
+                    timestamp_ms / 1000,
+                    duration_ms,
+                    total_bytes,
+                    &checksum,
+                );
 
                 tracing::info!(
                     "Snapshot uploaded. dataset={} snapshot={location} size={total_bytes}",
@@ -713,7 +732,7 @@ impl SnapshotManager {
         }
     }
 
-    /// Attempts to download the latest snapshot, returning the schema if successful.
+    /// Attempts to download the latest snapshot, returning details if successful.
     ///
     /// # Errors
     ///
@@ -723,7 +742,7 @@ impl SnapshotManager {
     /// - If there is an error fetching the schema from the dataset checkpointer.
     pub async fn download_latest_snapshot(
         &self,
-    ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
+    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
         let checkpointer_factory = Arc::clone(
             self.checkpointer_factory
                 .as_ref()
@@ -786,7 +805,7 @@ impl SnapshotManager {
     async fn download_latest_once(
         &self,
         checkpointer_factory: DatasetCheckpointerFactory,
-    ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
+    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
         let metadata_handle = match self.load_metadata().await {
             Ok(Some(handle)) => handle,
             Ok(None) => {
@@ -835,7 +854,7 @@ impl SnapshotManager {
     async fn download_with_fallback(
         &self,
         checkpointer_factory: DatasetCheckpointerFactory,
-    ) -> Result<Option<SchemaRef>, SnapshotDownloadError> {
+    ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
         let metadata_handle = match self.load_metadata().await {
             Ok(Some(handle)) => handle,
             Ok(None) => return Ok(None),
@@ -965,7 +984,7 @@ impl SnapshotManager {
         entry: &SnapshotEntry,
         dataset_metadata: &DatasetMetadata,
         checkpointer_factory: DatasetCheckpointerFactory,
-    ) -> Result<SchemaRef, SnapshotDownloadError> {
+    ) -> Result<SnapshotDownloadInfo, SnapshotDownloadError> {
         let object_path = self.snapshot_uri_to_object_path(&entry.snapshot)?;
         let path_display = object_path.to_string();
 
@@ -1102,7 +1121,11 @@ impl SnapshotManager {
                 self.dataset_name,
                 entry.snapshot
             );
-            Ok(schema)
+            Ok(SnapshotDownloadInfo {
+                schema,
+                bytes_downloaded: actual_size,
+                checksum: actual_checksum,
+            })
         } else {
             tracing::warn!(
                 "Snapshot schema not found. dataset={} snapshot={}",
@@ -1563,7 +1586,7 @@ mod tests {
             snapshot_id: 0,
             timestamp_ms: instant.timestamp_millis(),
             snapshot: snapshot_uri(&location),
-            snapshot_checksum: checksum,
+            snapshot_checksum: checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
         };
@@ -1592,13 +1615,15 @@ mod tests {
             &schema,
         );
 
-        let result = manager
+        let info = manager
             .download_latest_snapshot()
             .await
             .expect("download should succeed")
-            .expect("expected schema");
+            .expect("expected snapshot");
 
-        assert_eq!(result.as_ref(), schema.as_ref());
+        assert_eq!(info.schema.as_ref(), schema.as_ref());
+        assert_eq!(info.bytes_downloaded, contents.len() as u64);
+        assert_eq!(info.checksum, checksum);
         let downloaded = fs::read(&local_path)
             .await
             .expect("read downloaded snapshot");
@@ -1642,11 +1667,12 @@ mod tests {
             snapshot_size: first_contents.len() as u64,
         };
 
+        let valid_checksum = compute_sha256_hex(second_contents.as_ref());
         let valid_snapshot = SnapshotEntry {
             snapshot_id: 0,
             timestamp_ms: second_instant.timestamp_millis(),
             snapshot: snapshot_uri(&second_location),
-            snapshot_checksum: compute_sha256_hex(second_contents.as_ref()),
+            snapshot_checksum: valid_checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: second_contents.len() as u64,
         };
@@ -1675,13 +1701,15 @@ mod tests {
             &schema,
         );
 
-        let result = manager
+        let info = manager
             .download_latest_snapshot()
             .await
             .expect("download should succeed")
-            .expect("expected schema");
+            .expect("expected snapshot");
 
-        assert_eq!(result.as_ref(), schema.as_ref());
+        assert_eq!(info.schema.as_ref(), schema.as_ref());
+        assert_eq!(info.bytes_downloaded, second_contents.len() as u64);
+        assert_eq!(info.checksum, valid_checksum);
         let downloaded = fs::read(&local_path)
             .await
             .expect("read downloaded snapshot");

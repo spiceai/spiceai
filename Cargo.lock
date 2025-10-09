@@ -12171,6 +12171,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "object_store",
+ "opentelemetry 0.27.1",
  "runtime-parameters",
  "runtime-secrets",
  "serde",
