@@ -964,10 +964,7 @@ impl SnapshotManager {
                 if let Some(host) = parsed_uri.host_str() {
                     combined = format!("{combined}/{host}");
                 }
-                let path = parsed_uri
-                    .path()
-                    .trim_start_matches('/')
-                    .trim();
+                let path = parsed_uri.path().trim_start_matches('/').trim();
                 if path.is_empty() {
                     Ok(ObjectPath::from(combined))
                 } else {
@@ -1516,7 +1513,12 @@ mod tests {
         let base = Path::from(SNAPSHOT_BASE_PATH);
         let relative = location
             .prefix_match(&base)
-            .map(|parts| parts.map(|p| p.as_ref().to_owned()).collect::<Vec<_>>().join("/"))
+            .map(|parts| {
+                parts
+                    .map(|p| p.as_ref().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
             .filter(|rel| !rel.is_empty());
 
         match relative {
@@ -1772,5 +1774,304 @@ mod tests {
             .to_schema_ref()
             .expect("deserialize schema");
         assert_eq!(metadata_schema.as_ref(), schema.as_ref());
+    }
+
+    #[tokio::test]
+    async fn download_snapshot_entry_rejects_checksum_mismatch() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 3, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"correct-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let schema = sample_schema();
+        let checksum = compute_sha256_hex(b"other-bytes");
+        let entry = SnapshotEntry {
+            snapshot_id: 0,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            schemas: vec![SchemaMetadata::from_schema(0, &schema).expect("serialize schema")],
+            current_schema_id: 0,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(0),
+            properties: HashMap::new(),
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+        let factory = Arc::clone(
+            manager
+                .checkpointer_factory
+                .as_ref()
+                .expect("factory present"),
+        );
+
+        let result = manager
+            .download_snapshot_entry(&entry, &metadata, factory)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SnapshotDownloadError::ChecksumMismatch { .. })
+        ));
+        assert!(!local_path.exists());
+    }
+
+    #[tokio::test]
+    async fn download_snapshot_entry_rejects_size_mismatch() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 4, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"size-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let schema = sample_schema();
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let entry = SnapshotEntry {
+            snapshot_id: 1,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64 + 1,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            schemas: vec![SchemaMetadata::from_schema(0, &schema).expect("serialize schema")],
+            current_schema_id: 0,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(1),
+            properties: HashMap::new(),
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+        let factory = Arc::clone(
+            manager
+                .checkpointer_factory
+                .as_ref()
+                .expect("factory present"),
+        );
+
+        let result = manager
+            .download_snapshot_entry(&entry, &metadata, factory)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SnapshotDownloadError::SizeMismatch { .. })
+        ));
+        assert!(!local_path.exists());
+    }
+
+    #[tokio::test]
+    async fn download_snapshot_entry_rejects_unsupported_checksum_algorithm() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 5, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"alg-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let schema = sample_schema();
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let entry = SnapshotEntry {
+            snapshot_id: 2,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: "MD5".to_string(),
+            snapshot_size: contents.len() as u64,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            schemas: vec![SchemaMetadata::from_schema(0, &schema).expect("serialize schema")],
+            current_schema_id: 0,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(2),
+            properties: HashMap::new(),
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+        let factory = Arc::clone(
+            manager
+                .checkpointer_factory
+                .as_ref()
+                .expect("factory present"),
+        );
+
+        let result = manager
+            .download_snapshot_entry(&entry, &metadata, factory)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SnapshotDownloadError::UnsupportedChecksumAlgorithm { .. })
+        ));
+        assert!(!local_path.exists());
+    }
+
+    #[tokio::test]
+    async fn download_snapshot_entry_rejects_schema_mismatch() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"schema-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let runtime_schema = sample_schema();
+        let metadata_schema = Arc::new(Schema::new(vec![Field::new(
+            "other",
+            DataType::Utf8,
+            false,
+        )]));
+        let checksum = compute_sha256_hex(contents.as_ref());
+        let entry = SnapshotEntry {
+            snapshot_id: 3,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            schemas: vec![
+                SchemaMetadata::from_schema(0, &metadata_schema).expect("serialize schema"),
+            ],
+            current_schema_id: 0,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(3),
+            properties: HashMap::new(),
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &runtime_schema,
+        );
+        let factory = Arc::clone(
+            manager
+                .checkpointer_factory
+                .as_ref()
+                .expect("factory present"),
+        );
+
+        let result = manager
+            .download_snapshot_entry(&entry, &metadata, factory)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SnapshotDownloadError::SchemaMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_uri_to_object_path_handles_relative_uris() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+
+        let uri = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
+        let path = manager
+            .snapshot_uri_to_object_path(&uri)
+            .expect("convert uri to path");
+
+        assert_eq!(
+            path.to_string(),
+            "snapshots/month=2025-01/day=01/dataset=dataset/file.db"
+        );
+    }
+
+    #[test]
+    fn snapshot_uri_to_object_path_preserves_absolute_paths() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            PathBuf::from("/tmp/unused"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+
+        let uri = "memory://other-prefix/path/to/file.db";
+        let path = manager
+            .snapshot_uri_to_object_path(uri)
+            .expect("convert uri to path");
+
+        assert_eq!(path.to_string(), "snapshots/other-prefix/path/to/file.db");
     }
 }
