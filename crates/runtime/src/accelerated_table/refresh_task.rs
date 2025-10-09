@@ -834,7 +834,10 @@ impl RefreshTask {
         let result = &df
             .collect()
             .await
-            .map_err(find_datafusion_root)
+            .map_err(|e| {
+                tracing::error!("max_timestamp_df collect failed: {:?}", e);
+                find_datafusion_root(e)
+            })
             .context(super::FailedToQueryLatestTimestampSnafu)?;
 
         let Some(result) = result.first() else {
