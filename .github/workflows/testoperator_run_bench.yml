@@ -1,5 +1,5 @@
 name: benchmark e2e tests
-run-name: benchmark - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
