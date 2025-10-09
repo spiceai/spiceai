@@ -1510,16 +1510,16 @@ mod tests {
 
     fn snapshot_uri(location: &ObjectPath) -> String {
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let relative = location
-            .prefix_match(&base)
-            .map(|parts| {
+        let relative = location.prefix_match(&base).map_or_else(
+            || location.to_string(),
+            |parts| {
                 parts
                     .map(|p| p.as_ref().to_owned())
                     .collect::<Vec<_>>()
                     .join("/")
-            })
-            .unwrap_or_else(|| location.to_string());
-        format!("{}/{}", SNAPSHOT_URI_PREFIX, relative)
+            },
+        );
+        format!("{SNAPSHOT_URI_PREFIX}/{relative}")
     }
 
     fn dataset_metadata(
