@@ -434,7 +434,7 @@ impl MistralLlama {
         let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
 
         let sampling = SamplingParams {
-            temperature: Some(0.1),
+            temperature: Some(0.5),
             top_k: None,
             top_p: req.top_p.map(f64::from),
             min_p: None,
@@ -445,7 +445,7 @@ impl MistralLlama {
                 Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
                 Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
-            max_len: req.max_completion_tokens.map(|x| x as usize),
+            max_len: Some(10),
             logits_bias: None,
             n_choices: req.n.unwrap_or(1) as usize,
             dry_params: None,
