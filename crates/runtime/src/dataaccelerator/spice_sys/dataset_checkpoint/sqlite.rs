@@ -26,7 +26,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
 impl DatasetCheckpoint {
     pub(super) async fn init_sqlite(pool: &SqliteConnectionPool) -> Result<()> {
         let pool = (*pool).try_clone().await.map_err(Error::external)?;
-        
+
         tokio::task::spawn_blocking(move || {
             let conn_sync = pool.connect_sync();
             let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -34,7 +34,7 @@ impl DatasetCheckpoint {
                     target: "SqliteConnection",
                 });
             };
-            
+
             futures::executor::block_on(conn.conn.call(move |conn| {
                 let create_table = format!(
                     "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
@@ -90,7 +90,7 @@ impl DatasetCheckpoint {
     pub(super) async fn exists_sqlite(&self, pool: &SqliteConnectionPool) -> Result<bool> {
         let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let dataset_name = self.dataset_name.clone();
-        
+
         tokio::task::spawn_blocking(move || {
             let conn_sync = pool.connect_sync();
             let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -263,7 +263,7 @@ mod tests {
         .expect("to build in-memory sqlite connection pool");
 
         // Create legacy table without schema_json column
-        let pool_clone = pool.clone();
+        let pool_clone = pool.try_clone().await.expect("to clone pool");
         tokio::task::spawn_blocking(move || {
             let conn_sync = pool_clone.connect_sync();
             let conn = conn_sync
@@ -436,10 +436,10 @@ mod tests {
         assert_eq!(&schema2, retrieved_schema.as_ref());
 
         // Verify that the updated_at timestamp has changed
-        let AccelerationConnection::SQLite(pool) = &checkpoint.acceleration_connection else {
-            panic!("Unexpected acceleration connection type");
+        let pool_clone = match &checkpoint.acceleration_connection {
+            AccelerationConnection::SQLite(pool) => pool.try_clone().await.expect("to clone pool"),
+            _ => panic!("Unexpected acceleration connection type"),
         };
-        let pool_clone = pool.clone();
         let dataset_name_clone = checkpoint.dataset_name.clone();
         let result = tokio::task::spawn_blocking(move || {
             let conn_sync = pool_clone.connect_sync();
@@ -447,7 +447,7 @@ mod tests {
                 .as_any()
                 .downcast_ref::<SqliteConnection>()
                 .expect("sqlite connection");
-            
+
             futures::executor::block_on(conn.conn.call(move |conn| {
                 let query = format!(
                     "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",

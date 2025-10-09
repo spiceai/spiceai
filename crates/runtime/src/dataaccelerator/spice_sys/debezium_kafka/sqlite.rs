@@ -94,11 +94,11 @@ impl DebeziumKafkaSys {
     ) -> Option<DebeziumKafkaMetadata> {
         let pool = (*pool).try_clone().await.ok()?;
         let dataset_name = self.dataset_name.clone();
-        
+
         tokio::task::spawn_blocking(move || {
             let conn_sync = pool.connect_sync();
             let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
-            
+
             futures::executor::block_on(conn.conn.call(move |conn| {
                 let query = format!(
                     "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"

@@ -140,6 +140,7 @@ impl ObjectStore for SFTPObjectStore {
         unimplemented!()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn get_opts(
         &self,
         location: &Path,
@@ -206,7 +207,7 @@ impl ObjectStore for SFTPObjectStore {
         let location_clone = object_meta.location.clone();
 
         let stream = stream! {
-            let client = client.clone();
+            let client = Arc::clone(&client);
             let location = location_clone.clone();
             let mut file_result = tokio::task::spawn_blocking(move || {
                 let client = client.get_client()?;
@@ -289,7 +290,7 @@ impl ObjectStore for SFTPObjectStore {
         let client = Arc::clone(&self.client);
 
         let stream = stream! {
-            let client_clone = client.clone();
+            let client_clone = Arc::clone(&client);
             let location_clone = location.clone();
 
             let entries = tokio::task::spawn_blocking(move || {

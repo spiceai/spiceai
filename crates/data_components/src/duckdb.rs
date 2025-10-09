@@ -101,7 +101,7 @@ impl DuckDBDeletionSink {
 impl DeletionSink for DuckDBDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let table_definition = self.table_definition.clone();
+        let table_definition = Arc::clone(&self.table_definition);
         let filters = self.filters.clone();
 
         tokio::task::spawn_blocking(
