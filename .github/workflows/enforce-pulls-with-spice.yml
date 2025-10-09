@@ -19,6 +19,6 @@ jobs:
         if: github.event_name == 'pull_request_target'
         with:
           require_title_min_length: '10'
-          required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame,kind/task'
+          required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame,kind/task,kind/performance'
           banned_labels: 'invalid,wontfix,nomerge,duplicate'
           require_assignee: 'true'
