@@ -26,7 +26,6 @@ impl DebeziumKafkaSys {
         pool: &SqliteConnectionPool,
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
-        let pool = (*pool).try_clone().await.map_err(Error::external)?;
         let dataset_name = self.dataset_name.clone();
         let consumer_group_id = metadata.consumer_group_id.clone();
         let topic = metadata.topic.clone();
@@ -35,15 +34,15 @@ impl DebeziumKafkaSys {
         let schema_fields =
             serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
 
-        tokio::task::spawn_blocking(move || {
-            let conn_sync = pool.connect_sync();
-            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-                return Err(Error::DowncastFailed {
-                    target: "SqliteConnection",
-                });
-            };
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
 
-            futures::executor::block_on(conn.conn.call(move |conn| {
+        conn.conn
+            .call(move |conn| {
                 let create_table = format!(
                     "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
                     dataset_name TEXT PRIMARY KEY,
@@ -81,25 +80,22 @@ impl DebeziumKafkaSys {
                 )?;
 
                 Ok(())
-            }))
+            })
+            .await
             .map_err(Error::external)
-        })
-        .await
-        .map_err(|e| Error::external(Box::new(e)))?
     }
 
     pub(super) async fn get_sqlite(
         &self,
         pool: &SqliteConnectionPool,
     ) -> Option<DebeziumKafkaMetadata> {
-        let pool = (*pool).try_clone().await.ok()?;
         let dataset_name = self.dataset_name.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let conn_sync = pool.connect_sync();
-            let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+        let conn_sync = pool.connect_sync();
+        let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
 
-            futures::executor::block_on(conn.conn.call(move |conn| {
+        conn.conn
+            .call(move |conn| {
                 let query = format!(
                     "SELECT consumer_group_id, topic, primary_keys, schema_fields FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
                 );
@@ -124,11 +120,8 @@ impl DebeziumKafkaSys {
                 } else {
                     Err(tokio_rusqlite::Error::Other("No row found".into()))
                 }
-            }))
+            })
+            .await
             .ok()
-        })
-        .await
-        .ok()
-        .flatten()
     }
 }
