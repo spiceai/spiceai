@@ -47,6 +47,8 @@ pub enum Error {
     },
 }
 
+pub type Result<T> = std::result::Result<T, Error>;
+
 pub trait PartitionNameConfig {
     const PREFIX_MAX_LENGTH: usize;
     const PARTITION_BY_MAX_LENGTH: usize;
@@ -58,7 +60,7 @@ pub trait PartitionNameConfig {
         prefix.replace(['_', '.'], "-")
     }
 
-    fn validate(prefix: &str) -> Result<(), Error> {
+    fn validate(prefix: &str) -> Result<()> {
         let len = prefix.len();
         ensure!(
             len <= Self::PREFIX_MAX_LENGTH,
@@ -79,7 +81,7 @@ pub trait PartitionNameConfig {
         Ok(())
     }
 
-    fn validate_total_length(parts: &[&str]) -> Result<(), Error> {
+    fn validate_total_length(parts: &[&str]) -> Result<()> {
         let total_length = parts.iter().map(|s| s.len()).sum::<usize>()
             + (parts.len().saturating_sub(1) * Self::PARTS_SEPARATOR.len());
 
@@ -128,7 +130,7 @@ impl PartitionedName {
         prefix: &str,
         partition_by: &[Expr],
         partition_value: &ScalarValue,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         C::validate(prefix)?;
 
         let prefix = truncate(&C::sanitize(prefix), C::PREFIX_MAX_LENGTH);
@@ -151,7 +153,7 @@ impl PartitionedName {
     pub fn common_prefix<C: PartitionNameConfig>(
         prefix: &str,
         partition_by: &[Expr],
-    ) -> Result<String, Error> {
+    ) -> Result<String> {
         C::validate(prefix)?;
 
         let prefix = truncate(&C::sanitize(prefix), C::PREFIX_MAX_LENGTH);
@@ -173,9 +175,7 @@ impl PartitionedName {
         .join(C::PARTS_SEPARATOR)
     }
 
-    pub fn from_partition_name<C: PartitionNameConfig>(
-        partition_name: &str,
-    ) -> Result<Self, Error> {
+    pub fn from_partition_name<C: PartitionNameConfig>(partition_name: &str) -> Result<Self> {
         let parts: Vec<&str> = partition_name.split(C::PARTS_SEPARATOR).collect();
         let num_parts = parts.len();
         ensure!(num_parts == 3, IncorrectNumPartsInNameSnafu { num_parts });
@@ -208,24 +208,24 @@ impl PartitionedName {
     }
 }
 
-fn truncate(s: &str, len: usize) -> String {
+pub fn truncate(s: &str, len: usize) -> String {
     s.chars().take(len).collect()
 }
 
-fn hash_to_hex(input: &str) -> String {
+pub fn hash_to_hex(input: &str) -> String {
     let hash = XxHash64::oneshot(HASH_SEED, input.as_bytes());
     format!("{hash:x}")
 }
 
-fn to_stable_string<C: PartitionNameConfig>(exprs: &[Expr]) -> Result<String, Error> {
+fn to_stable_string<C: PartitionNameConfig>(exprs: &[Expr]) -> Result<String> {
     Ok(exprs
         .iter()
         .map(stable_expr_string)
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>>>()?
         .join(C::PARTS_SEPARATOR))
 }
 
-fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
+fn stable_expr_string(expr: &Expr) -> Result<String> {
     Ok(match expr {
         Expr::Column(col) => {
             format!("Column({})", col.name())
@@ -303,7 +303,7 @@ fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
                         stable_expr_string(t)?
                     ))
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>>>()?
                 .join(", ");
             format!("Case({expr}, {when_then_expr}, {else_expr})")
         }
@@ -319,7 +319,7 @@ fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
             let args_str = args
                 .iter()
                 .map(stable_expr_string)
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>>>()?
                 .join(", ");
             format!("ScalarFunction({}({args_str}))", func.name())
         }
@@ -329,7 +329,7 @@ fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
                 .list
                 .iter()
                 .map(stable_expr_string)
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>>>()?
                 .join(", ");
             format!("InList({expr}, [{list_str}])")
         }

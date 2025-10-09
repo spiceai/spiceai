@@ -17,7 +17,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    partition::{BelongsWith, PartitionedIndexName},
+    partition::PartitionedIndexName,
     vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
@@ -46,6 +46,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use runtime_table_partition::naming::BelongsWith;
 use s3_vectors::{
     Document, ListIndexesInput, QueryOutputVector, QueryVectorsInput, QueryVectorsOutput,
     S3Vectors, SdkError, VectorData,
