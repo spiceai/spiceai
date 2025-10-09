@@ -434,7 +434,7 @@ impl MistralLlama {
         let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
 
         let sampling = SamplingParams {
-            temperature: Some(0.5),
+            temperature: req.temperature.map(f64::from),
             top_k: None,
             top_p: req.top_p.map(f64::from),
             min_p: None,
