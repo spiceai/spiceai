@@ -29,6 +29,8 @@ use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
+use arrow_schema::Schema;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use chunking::ChunkingConfig;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
@@ -37,9 +39,12 @@ use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
+use search::generation::util::get_primary_keys;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
+use search::metadata::MetadataColumn;
+
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 #[cfg(feature = "s3_vectors")]
@@ -231,14 +236,33 @@ impl EmbeddingConnector {
             .collect();
         let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
         for (column, config) in embedding_columns {
+            let (dataset_columns, index_schema) = if config
+                .chunking
+                .as_ref()
+                .is_some_and(|cfg| cfg.enabled)
+            {
+                Self::updated_chunked_search_index_format(&inner_table_provider, dataset, &column)
+            } else {
+                (dataset.columns.clone(), inner_table_provider.schema())
+            };
+
             let vector_index = super::index::s3::try_from_dataset(
                 &dataset.name,
                 column,
                 config.clone(),
                 vector_store,
-                Arc::clone(&inner_table_provider),
+                // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
+                get_primary_keys(&inner_table_provider)
+                    .await
+                    .boxed()
+                    .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                        dataconnector: dataset.source().to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    })?,
+                index_schema,
                 Arc::clone(&self.embedding_models),
-                dataset.columns.clone(),
+                dataset_columns,
                 Arc::clone(&self.secrets),
                 partition_by.clone(),
             )
@@ -295,7 +319,7 @@ impl EmbeddingConnector {
         &self,
         mut provider: IndexedTableProvider,
         chunking: &EmbeddingChunkConfig,
-        vector_index: S3Vector,
+        mut vector_index: S3Vector,
         model_name: &str,
         file_format: Option<&str>,
     ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
@@ -312,9 +336,6 @@ impl EmbeddingConnector {
         .await
         .boxed()?;
 
-        let additional_meta =
-            ChunkedSearchIndex::additional_metadata(vector_index.search_column().as_str());
-        let mut vector_index = vector_index.add_metadata(additional_meta);
         vector_index.primary_key =
             ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
 
@@ -370,6 +391,56 @@ impl EmbeddingConnector {
             .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
         Ok(ChangeEnvelope::new(change_committer, new_change_batch))
+    }
+
+    /// Provide updated columns and underlying [`SchemaRef`] for a [`SearchIndex`] to use based off the index being chunked.
+    fn updated_chunked_search_index_format(
+        inner_table_provider: &Arc<dyn TableProvider>,
+        dataset: &Dataset,
+        column: &str,
+    ) -> (Vec<spicepod::semantic::Column>, SchemaRef) {
+        let mut dataset_columns = dataset.columns.clone();
+        let mut dataset_fields = inner_table_provider
+            .schema()
+            .fields()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some((_, f)) = inner_table_provider.schema().column_with_name(column) {
+            // These are internal columns that won't exist in existing columns. No need to find & replace.
+            // get search field as metadata column.
+            let search_metadata =
+                dataset_columns
+                    .iter()
+                    .find(|&c| c.name == column)
+                    .and_then(|c| match c.metadata.get("vectors") {
+                        Some(serde_json::Value::String(v)) if v == "non-filterable" => {
+                            Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
+                        }
+                        Some(serde_json::Value::String(v)) if v == "filterable" => {
+                            Some(MetadataColumn::Filterable(Arc::new(f.clone())))
+                        }
+                        _ => None,
+                    });
+
+            for col in ChunkedSearchIndex::additional_metadata(column, search_metadata) {
+                let vectors_val = match col {
+                    MetadataColumn::Filterable(_) => "filterable",
+                    MetadataColumn::NonFilterable(_) => "non-filterable",
+                };
+                dataset_columns.push(
+                    spicepod::semantic::Column::new(col.name()).with_metadata(
+                        [(
+                            "vectors".to_string(),
+                            serde_json::Value::String(vectors_val.to_string()),
+                        )]
+                        .into(),
+                    ),
+                );
+                dataset_fields.push(col.field());
+            }
+        }
+        (dataset_columns, Arc::new(Schema::new(dataset_fields)))
     }
 }
 

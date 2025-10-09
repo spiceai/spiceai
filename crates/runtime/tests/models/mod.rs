@@ -19,7 +19,8 @@ use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{Client, header::HeaderMap};
-use runtime::{Runtime, config::Config, get_params_with_secrets};
+use runtime::{Runtime, config::Config};
+use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
@@ -31,6 +32,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+mod ai_udf;
 mod bedrock;
 mod embedding;
 mod hf;
@@ -540,4 +542,45 @@ async fn get_params_with_secrets_value(
         .collect::<HashMap<_, _>>();
 
     get_params_with_secrets(rt.secrets(), &params).await
+}
+
+pub(crate) fn get_anthropic_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model =
+        spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
+    model.params.insert(
+        "anthropic_api_key".to_string(),
+        "${ secrets:SPICE_ANTHROPIC_API_KEY }".into(),
+    );
+    model
+}
+
+pub(crate) fn get_xai_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model = spicepod::component::model::Model::new(format!("xai:{}", model.into()), name);
+    model.params.insert(
+        "xai_api_key".to_string(),
+        "${ secrets:SPICE_XAI_API_KEY }".into(),
+    );
+    model
+}
+
+pub(crate) fn get_local_model(
+    hf_model: impl Into<String>,
+    model_type: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model = spicepod::component::model::Model::new(
+        format!("huggingface:huggingface.co/{}", hf_model.into()),
+        name,
+    );
+    model
+        .params
+        .insert("model_type".to_string(), model_type.into().into());
+    // Local models don't require HF token for public models like Phi
+    model
 }

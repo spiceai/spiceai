@@ -67,6 +67,8 @@ pub mod turso;
 mod snapshots;
 pub mod spice_sys;
 
+pub(crate) use snapshots::validate_snapshot_paths;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]

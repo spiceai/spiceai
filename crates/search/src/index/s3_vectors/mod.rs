@@ -17,7 +17,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
@@ -42,7 +42,7 @@ use snafu::ResultExt;
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
-use crate::metadata::{MetadataColumn, MetadataColumns};
+use crate::metadata::MetadataColumns;
 use datafusion::{
     common::Column,
     error::DataFusionError,
@@ -94,25 +94,6 @@ impl S3Vector {
             compute_query,
             partition_by,
         }
-    }
-
-    /// Add extra metadata columns to the `S3Vector` table schema.
-    #[must_use]
-    pub fn add_metadata(mut self, cols: Vec<MetadataColumn>) -> Self {
-        // Add to schema too.
-        let mut fields: Vec<_> = self.table.schema.fields().into_iter().cloned().collect();
-        fields.extend(
-            cols.iter()
-                .map(|c| Arc::clone(&c.field()))
-                .collect::<Vec<_>>(),
-        );
-        self.table.schema = Schema::new(fields).into();
-
-        let mut new: Vec<_> = self.metadata_columns.into_iter().collect();
-        new.extend(cols);
-        self.metadata_columns = new.into();
-
-        self
     }
 }
 

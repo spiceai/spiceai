@@ -453,8 +453,8 @@ impl TableProvider for SearchQueryProvider {
             filters,
         )?;
         search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
-            (true, None) => search_lp,
-            (true, Some(filter)) => search_lp.filter(filter)?,
+            (true, None) => search_lp.limit(0, limit)?,
+            (true, Some(filter)) => search_lp.filter(filter)?.limit(0, limit)?,
             (false, _) => {
                 // Pushdown indexes to search index
                 let search_index = if let Some(filter) =

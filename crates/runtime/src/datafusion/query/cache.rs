@@ -300,7 +300,6 @@ impl Query {
     }
 }
 
-#[allow(clippy::large_futures)]
 #[cfg(test)]
 mod tests {
     use super::*;

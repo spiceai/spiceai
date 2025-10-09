@@ -80,7 +80,8 @@ lint-rust:
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures
 
 lint-rust-fix:
 	cargo fmt --all
