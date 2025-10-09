@@ -11,10 +11,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
+use runtime_secrets::Secrets;
 use spicepod::acceleration as spicepod_acceleration;
 use spicepod::component::snapshot::Snapshots;
+use tokio::sync::RwLock;
 
 #[cfg(feature = "snapshots")]
 const SNAPSHOTS_ENABLED: bool = true;
@@ -22,17 +24,32 @@ const SNAPSHOTS_ENABLED: bool = true;
 const SNAPSHOTS_ENABLED: bool = false;
 
 /// The behavior of snapshots for individual accelerated datasets.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum SnapshotBehavior {
     /// Snapshots are disabled (default).
     #[default]
     Disabled,
     /// Enable both creating and bootstrapping from snapshots.
-    Enabled(Arc<Snapshots>),
+    Enabled(Arc<Snapshots>, Weak<RwLock<Secrets>>),
     /// Only bootstrap from existing snapshots, don't attempt to create new ones.
-    BootstrapOnly(Arc<Snapshots>),
+    BootstrapOnly(Arc<Snapshots>, Weak<RwLock<Secrets>>),
     /// Only create new snapshots.
-    CreateOnly(Arc<Snapshots>),
+    CreateOnly(Arc<Snapshots>, Weak<RwLock<Secrets>>),
+}
+
+impl PartialEq for SnapshotBehavior {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SnapshotBehavior::Disabled, SnapshotBehavior::Disabled) => true,
+            (SnapshotBehavior::Enabled(snap1, _), SnapshotBehavior::Enabled(snap2, _))
+            | (SnapshotBehavior::CreateOnly(snap1, _), SnapshotBehavior::CreateOnly(snap2, _))
+            | (
+                SnapshotBehavior::BootstrapOnly(snap1, _),
+                SnapshotBehavior::BootstrapOnly(snap2, _),
+            ) => snap1 == snap2,
+            _ => false,
+        }
+    }
 }
 
 impl SnapshotBehavior {
@@ -42,7 +59,7 @@ impl SnapshotBehavior {
     }
 
     #[must_use]
-    pub fn enabled(snapshots: Arc<Snapshots>) -> Self {
+    pub fn enabled(snapshots: Arc<Snapshots>, secrets: Weak<RwLock<Secrets>>) -> Self {
         // Snapshot support must be compiled in for bootstrapping to be possible.
         if !SNAPSHOTS_ENABLED {
             tracing::trace!(
@@ -55,11 +72,11 @@ impl SnapshotBehavior {
             return SnapshotBehavior::Disabled;
         }
 
-        SnapshotBehavior::Enabled(snapshots)
+        SnapshotBehavior::Enabled(snapshots, secrets)
     }
 
     #[must_use]
-    pub fn bootstrap_only(snapshots: Arc<Snapshots>) -> Self {
+    pub fn bootstrap_only(snapshots: Arc<Snapshots>, secrets: Weak<RwLock<Secrets>>) -> Self {
         // Snapshot support must be compiled in for bootstrapping to be possible.
         if !SNAPSHOTS_ENABLED {
             tracing::trace!(
@@ -72,11 +89,11 @@ impl SnapshotBehavior {
             return SnapshotBehavior::Disabled;
         }
 
-        SnapshotBehavior::BootstrapOnly(snapshots)
+        SnapshotBehavior::BootstrapOnly(snapshots, secrets)
     }
 
     #[must_use]
-    pub fn create_only(snapshots: Arc<Snapshots>) -> Self {
+    pub fn create_only(snapshots: Arc<Snapshots>, secrets: Weak<RwLock<Secrets>>) -> Self {
         // Snapshot support must be compiled in for snapshot creation to be possible.
         if !SNAPSHOTS_ENABLED {
             tracing::trace!(
@@ -89,14 +106,14 @@ impl SnapshotBehavior {
             return SnapshotBehavior::Disabled;
         }
 
-        SnapshotBehavior::CreateOnly(snapshots)
+        SnapshotBehavior::CreateOnly(snapshots, secrets)
     }
 
     #[must_use]
     pub fn bootstrap_enabled(&self) -> bool {
         matches!(
             self,
-            SnapshotBehavior::Enabled(_) | SnapshotBehavior::BootstrapOnly(_)
+            SnapshotBehavior::Enabled(_, _) | SnapshotBehavior::BootstrapOnly(_, _)
         )
     }
 
@@ -104,7 +121,7 @@ impl SnapshotBehavior {
     pub fn create_enabled(&self) -> bool {
         matches!(
             self,
-            SnapshotBehavior::Enabled(_) | SnapshotBehavior::CreateOnly(_)
+            SnapshotBehavior::Enabled(_, _) | SnapshotBehavior::CreateOnly(_, _)
         )
     }
 
@@ -112,6 +129,7 @@ impl SnapshotBehavior {
     pub fn from(
         snapshots: Option<Arc<Snapshots>>,
         snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
+        secrets: Weak<RwLock<Secrets>>,
     ) -> Self {
         // Snapshot support must be compiled in for snapshot creation to be possible.
         if !SNAPSHOTS_ENABLED {
@@ -128,13 +146,13 @@ impl SnapshotBehavior {
         match snapshot_behavior {
             spicepod_acceleration::SnapshotBehavior::Disabled => SnapshotBehavior::Disabled,
             spicepod_acceleration::SnapshotBehavior::Enabled => {
-                SnapshotBehavior::Enabled(snapshots)
+                SnapshotBehavior::Enabled(snapshots, secrets)
             }
             spicepod_acceleration::SnapshotBehavior::BootstrapOnly => {
-                SnapshotBehavior::BootstrapOnly(snapshots)
+                SnapshotBehavior::BootstrapOnly(snapshots, secrets)
             }
             spicepod_acceleration::SnapshotBehavior::CreateOnly => {
-                SnapshotBehavior::CreateOnly(snapshots)
+                SnapshotBehavior::CreateOnly(snapshots, secrets)
             }
         }
     }

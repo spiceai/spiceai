@@ -16,7 +16,6 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
-use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -27,6 +26,7 @@ use llms::bedrock::{
     self,
     embed::cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
 };
+use runtime_secrets::{Secrets, get_params_with_secrets};
 
 use llms::embeddings::{
     Embed, Error as EmbedError,

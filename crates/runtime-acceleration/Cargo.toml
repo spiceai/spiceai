@@ -15,9 +15,12 @@ aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
+fundu.workspace = true
 futures.workspace = true
 itertools.workspace = true
 object_store.workspace = true
+runtime-parameters = { path = "../runtime-parameters" }
+runtime-secrets = { path = "../runtime-secrets" }
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
 snafu.workspace = true
