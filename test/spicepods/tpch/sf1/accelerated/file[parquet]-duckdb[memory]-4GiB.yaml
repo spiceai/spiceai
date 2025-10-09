@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file[parquet]-duckdb[memory]-4GiB
+name: file[parquet]-duckdb[memory]-4gib
 datasets:
   - from: file:data/customer.parquet
     name: customer
