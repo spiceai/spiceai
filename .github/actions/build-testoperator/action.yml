@@ -120,7 +120,7 @@ runs:
       shell: bash
       run: |
         sudo mkdir -p /usr/local/bin
-        sudo cp target/release/testoperator /usr/local/bin/testoperator
+        sudo cp target/release/testoperator${{ steps.detect-os.outputs.ext }} /usr/local/bin/testoperator
         sudo chmod +x /usr/local/bin/testoperator
 
     - name: Install testoperator to system path (Windows)
@@ -128,17 +128,21 @@ runs:
       shell: bash
       run: |
         mkdir -p /c/usr/local/bin
-        cp target/release/testoperator.exe /c/usr/local/bin/testoperator.exe
+        copy target/release/testoperator.exe /c/usr/local/bin/testoperator.exe
         chmod +x /c/usr/local/bin/testoperator.exe
 
     - name: Set output path
       id: set-path
       shell: bash
       run: |
-        if [ "${{ steps.detect-os.outputs.os }}" = "windows" ]; then
-          echo "path=/c/usr/local/bin/testoperator.exe" >> $GITHUB_OUTPUT
+        if [ "${{ inputs.install_to_system_path }}" = "true" ]; then
+          if [ "${{ steps.detect-os.outputs.os }}" = "windows" ]; then
+            echo "path=/c/usr/local/bin/testoperator.exe" >> $GITHUB_OUTPUT
+          else
+            echo "path=/usr/local/bin/testoperator" >> $GITHUB_OUTPUT
+          fi
         else
-          echo "path=/usr/local/bin/testoperator" >> $GITHUB_OUTPUT
+          echo "path=${{ github.workspace }}/target/release/testoperator${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
         fi
 
     - name: Upload testoperator artifact
