@@ -70,6 +70,7 @@ jobs:
             });
 
             return filtered;
+
   run-bench:
     name: Run ${{ matrix.target.name }}
     timeout-minutes: 60
