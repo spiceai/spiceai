@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::request::{AsyncMarker, RequestContext};
 use crate::search::Error as VectorSearchError;
 use crate::{embedding_col, offset_col};
 use arrow::array::FixedSizeListArray;
 use arrow::datatypes::Float32Type;
 use async_openai::types::EmbeddingInput;
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use datafusion::catalog::TableProvider;
 use datafusion::common::{Column, DFSchema, UnnestOptions};

@@ -13,14 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{
-    request::{AsyncMarker, RequestContext},
-    search::{
-        Error as VectorSearchError,
-        request::{SearchRequest, SearchRequestHTTPJson},
-        search_engine::SearchEngine,
-        types::{Match, to_matches_sorted},
-    },
+use crate::search::{
+    Error as VectorSearchError,
+    request::{SearchRequest, SearchRequestHTTPJson},
+    search_engine::SearchEngine,
+    types::{Match, to_matches_sorted},
 };
 use axum::{
     Extension, Json,
@@ -28,6 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, HeaderValue};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 use tracing::Instrument;

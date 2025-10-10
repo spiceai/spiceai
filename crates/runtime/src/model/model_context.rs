@@ -26,7 +26,7 @@ use opentelemetry::KeyValue;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
-use crate::request::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, Extension, RequestContext};
 
 #[derive(Clone)]
 pub struct ModelContextExtension {
@@ -127,5 +127,12 @@ pub fn add_tools_used(context: &Arc<RequestContext>, value: usize) {
         model_context.add_tools_used(value);
     } else if cfg!(feature = "dev") {
         panic!("ModelContextExtension not found in request context");
+    }
+}
+
+#[async_trait::async_trait]
+impl Extension for ModelContextExtension {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

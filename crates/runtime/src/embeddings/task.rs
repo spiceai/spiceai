@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{sync::Arc, time::Instant};
 
-use crate::request::{AsyncMarker, RequestContext};
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
 };
@@ -24,6 +23,7 @@ use async_trait::async_trait;
 use cache::key::CacheKey;
 use chunking::{Chunker, ChunkingConfig};
 use llms::embeddings::{Embed, Result as EmbedResult, get_or_infer_size};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing::{Instrument, Span};
 
 use super::metrics::{handle_metrics, request_labels, simple_labels};

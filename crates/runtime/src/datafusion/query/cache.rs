@@ -33,10 +33,8 @@ use tracing::Span;
 use super::{
     BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
 };
-use crate::{
-    datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode},
-    request::{CacheControl, CacheKeyType, RequestContext},
-};
+use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
+use runtime_request_context::{CacheControl, CacheKeyType, RequestContext};
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
@@ -318,9 +316,9 @@ mod tests {
     use crate::{
         builder::RuntimeBuilder,
         datafusion::{DataFusion, query::QueryBuilder},
-        request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
     };
+    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
 
     // Helper function to create a test RequestContext
     fn create_test_request_context(
