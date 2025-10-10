@@ -32,22 +32,34 @@ macro_rules! generate_s3vectors_metrics {
 
             pub static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
                 METER
-                    .u64_counter(concat!($prefix, "_requests"))
+                    .u64_counter(concat!("s3_vectors_", $prefix, "_requests"))
                     .with_description("Number of requests to this operation.")
                     .build()
             });
 
             pub static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
                 METER
-                    .u64_counter(concat!($prefix, "_errors"))
+                    .u64_counter(concat!("s3_vectors_", $prefix, "_errors"))
                     .with_description("Number of errors returned from this operation.")
                     .build()
             });
 
             pub static LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
                 METER
-                    .f64_histogram(concat!($prefix, "_latency"))
+                    .f64_histogram(concat!("s3_vectors_", $prefix, "_latency"))
                     .with_description("Total duration of operation, in milliseconds.")
+                    .with_boundaries(
+                        [
+                            (0..10).map(|i| 100.0 * i as f64).collect::<Vec<_>>(),
+                            (1..20)
+                                .map(|i| 500.0 + 500.0 * i as f64)
+                                .collect::<Vec<_>>(),
+                            (1..10)
+                                .map(|i| 10000.0 + 1000.0 * i as f64)
+                                .collect::<Vec<_>>(),
+                        ]
+                        .concat(),
+                    )
                     .build()
             });
         }
