@@ -15,11 +15,12 @@ limitations under the License.
 */
 
 use std::error::Error;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_credential_types::provider::error::CredentialsError;
 use s3_vectors::{
-    Client, CreateIndexError, CreateIndexInput, CreateIndexOutput, CreateVectorBucketError,
+    CreateIndexError, CreateIndexInput, CreateIndexOutput, CreateVectorBucketError,
     CreateVectorBucketInput, CreateVectorBucketOutput, DeleteIndexError, DeleteIndexInput,
     DeleteIndexOutput, DeleteVectorBucketError, DeleteVectorBucketInput, DeleteVectorBucketOutput,
     DeleteVectorBucketPolicyError, DeleteVectorBucketPolicyInput, DeleteVectorBucketPolicyOutput,
@@ -38,14 +39,14 @@ use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
 use util::{RetryError, retry};
 
 pub struct S3VectorRetryClientBuilder {
-    client: Client,
+    client: Arc<dyn S3Vectors + Send + Sync>,
     retry_strategy: FibonacciBackoff,
     max_parallelism: usize,
 }
 
 impl S3VectorRetryClientBuilder {
     #[must_use]
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Arc<dyn S3Vectors + Send + Sync>) -> Self {
         Self {
             client,
             retry_strategy: FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
@@ -78,7 +79,7 @@ impl S3VectorRetryClientBuilder {
 }
 
 pub struct S3VectorRetryClient {
-    client: Client,
+    client: Arc<dyn S3Vectors + Send + Sync>,
     retry_strategy: FibonacciBackoff,
     semaphore: Semaphore,
 }
@@ -91,18 +92,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .create_index()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_data_type(input.data_type.clone())
-                .set_dimension(input.dimension)
-                .set_distance_metric(input.distance_metric.clone())
-                .set_metadata_configuration(input.metadata_configuration.clone())
-                .send()
-                .await
-            {
+            match self.client.create_index(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -145,14 +135,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .create_vector_bucket()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_encryption_configuration(input.encryption_configuration.clone())
-                .send()
-                .await
-            {
+            match self.client.create_vector_bucket(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -194,15 +177,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .delete_index()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .send()
-                .await
-            {
+            match self.client.delete_index(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -243,14 +218,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .delete_vector_bucket()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_vector_bucket_arn(input.vector_bucket_arn.clone())
-                .send()
-                .await
-            {
+            match self.client.delete_vector_bucket(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -292,14 +260,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .delete_vector_bucket_policy()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_vector_bucket_arn(input.vector_bucket_arn.clone())
-                .send()
-                .await
-            {
+            match self.client.delete_vector_bucket_policy(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -341,16 +302,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .delete_vectors()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .set_keys(input.keys.clone())
-                .send()
-                .await
-            {
+            match self.client.delete_vectors(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -395,15 +347,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .get_index()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .send()
-                .await
-            {
+            match self.client.get_index(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -445,14 +389,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .get_vector_bucket()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_vector_bucket_arn(input.vector_bucket_arn.clone())
-                .send()
-                .await
-            {
+            match self.client.get_vector_bucket(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -494,14 +431,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .get_vector_bucket_policy()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_vector_bucket_arn(input.vector_bucket_arn.clone())
-                .send()
-                .await
-            {
+            match self.client.get_vector_bucket_policy(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -543,18 +473,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .get_vectors()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .set_keys(input.keys.clone())
-                .set_return_data(Some(true))
-                .set_return_metadata(Some(true))
-                .send()
-                .await
-            {
+            match self.client.get_vectors(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -600,18 +519,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .list_indexes()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_vector_bucket_arn(input.vector_bucket_arn.clone())
-                .set_max_results(input.max_results)
-                .set_next_token(input.next_token.clone())
-                .set_max_results(input.max_results)
-                .set_prefix(input.prefix.clone())
-                .send()
-                .await
-            {
+            match self.client.list_indexes(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -653,15 +561,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .list_vector_buckets()
-                .set_max_results(input.max_results)
-                .set_next_token(input.next_token.clone())
-                .set_prefix(input.prefix.clone())
-                .send()
-                .await
-            {
+            match self.client.list_vector_buckets(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -702,21 +602,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .list_vectors()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .set_max_results(input.max_results)
-                .set_next_token(input.next_token.clone())
-                .set_segment_count(input.segment_count)
-                .set_segment_index(input.segment_index)
-                .set_return_data(input.return_data)
-                .set_return_metadata(input.return_metadata)
-                .send()
-                .await
-            {
+            match self.client.list_vectors(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -758,15 +644,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .put_vector_bucket_policy()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_vector_bucket_arn(input.vector_bucket_arn.clone())
-                .set_policy(input.policy.clone())
-                .send()
-                .await
-            {
+            match self.client.put_vector_bucket_policy(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -808,16 +686,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .put_vectors()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .set_vectors(input.vectors.clone())
-                .send()
-                .await
-            {
+            match self.client.put_vectors(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
@@ -863,20 +732,7 @@ impl S3Vectors for S3VectorRetryClient {
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
         retry(self.retry_strategy.clone(), || async {
             let _permit = self.semaphore.acquire().await;
-            match self
-                .client
-                .query_vectors()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .set_query_vector(input.query_vector.clone())
-                .set_top_k(input.top_k)
-                .set_filter(input.filter.clone())
-                .set_return_metadata(input.return_metadata)
-                .set_return_distance(input.return_distance)
-                .send()
-                .await
-            {
+            match self.client.query_vectors(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
