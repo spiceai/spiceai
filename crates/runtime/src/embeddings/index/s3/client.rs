@@ -209,8 +209,8 @@ impl S3Vectors for S3VectorClient {
             .set_index_name(input.index_name)
             .set_index_arn(input.index_arn)
             .set_keys(input.keys)
-            .set_return_data(Some(true))
-            .set_return_metadata(Some(true))
+            .set_return_data(input.return_data)
+            .set_return_metadata(input.return_metadata)
             .send()
             .await
             .inspect_err(|_| super::metrics::get_vectors::ERRORS.add(1, &[]))
