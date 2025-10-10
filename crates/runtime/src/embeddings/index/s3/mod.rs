@@ -168,7 +168,7 @@ async fn try_vector_table(
         .map_err(|_| {
             Box::from(format!(
                 "S3 vectors index configured with invalid 'client_timeout'= '{}'",
-                string_from_params(&params, "client_timeout").unwrap_or_default() // unwrap because we know this will be Some(T).
+                string_from_params(&params, "client_timeout").unwrap_or_default() // If missing, uses default ("").
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
@@ -205,7 +205,7 @@ async fn try_vector_table(
     if let Some(dur) = client_timeout {
         config_bldr =
             config_bldr.timeout_config(TimeoutConfigBuilder::new().operation_timeout(dur).build());
-    };
+    }
 
     let config = config_bldr.load().await;
 
