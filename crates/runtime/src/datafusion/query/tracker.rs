@@ -21,7 +21,7 @@ use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use tokio::time::Instant;
 
-use crate::request::RequestContext;
+use runtime_request_context::RequestContext;
 
 use super::{error_code::ErrorCode, metrics};
 

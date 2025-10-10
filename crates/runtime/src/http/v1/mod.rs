@@ -58,7 +58,7 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-use crate::request::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, RequestContext};
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{

@@ -16,8 +16,8 @@ limitations under the License.
 use crate::{
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     model::run,
-    request::{AsyncMarker, RequestContext},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use app::App;
 use arrow::array::Float32Array;
