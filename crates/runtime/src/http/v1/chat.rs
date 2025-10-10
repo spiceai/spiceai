@@ -21,10 +21,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{
-    model::LLMChatCompletionsModelStore,
-    request::{AsyncMarker, RequestContext},
-};
+use crate::model::LLMChatCompletionsModelStore;
 #[cfg(feature = "openapi")]
 use async_openai::types::CreateChatCompletionResponse;
 use async_openai::{
@@ -48,6 +45,7 @@ use event_stream::get_event_stream;
 use futures::StreamExt;
 use http::HeaderValue;
 use llms::chat::Chat;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::Serialize;
 use tokio::{
     select,

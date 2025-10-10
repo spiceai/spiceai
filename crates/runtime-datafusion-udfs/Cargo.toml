@@ -22,6 +22,7 @@ tokio.workspace = true
 tracing.workspace = true
 tract-core = "0.22.0"
 once_cell = "1.21.3"
+runtime-request-context = {path="../runtime-request-context"}
 
 [dev-dependencies]
 async-stream.workspace = true

@@ -635,7 +635,6 @@ mod tests {
     use crate::datafusion::udf::register_udfs;
     use crate::embeddings::table::EmbeddingColumnConfig;
     use crate::embeddings::table::EmbeddingTable;
-    use crate::request::{Protocol, RequestContext};
     use crate::search::rrf::ReciprocalRankFusionArgs;
     use arrow::array::as_string_array;
     use arrow::record_batch::RecordBatch;
@@ -654,6 +653,7 @@ mod tests {
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{ExprFunctionExt, lit};
     use llms::model2vec::Model2Vec;
+    use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::process::ExitCode;

@@ -41,10 +41,8 @@ use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
-use crate::{
-    model::tool_use::{combine_opt_u32, encode_tool_name},
-    request::{AsyncMarker, RequestContext},
-};
+use crate::model::tool_use::{combine_opt_u32, encode_tool_name};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[derive(Clone, Debug)]
 pub enum OpenAIResponsesTools {

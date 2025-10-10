@@ -22,10 +22,7 @@ use super::{
     namespace::{Namespace, NamespacePath},
 };
 use crate::datafusion::is_spice_internal_schema;
-use crate::{
-    datafusion::request_context_extension::get_current_datafusion,
-    request::{AsyncMarker, RequestContext},
-};
+use crate::datafusion::request_context_extension::get_current_datafusion;
 use arrow::datatypes::Schema as ArrowSchema;
 use axum::{
     Json,
@@ -38,6 +35,7 @@ use iceberg::{
     arrow::arrow_schema_to_schema,
     spec::{PartitionSpec, Schema, SortOrder},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Serialize, Serializer};
 use uuid::Uuid;
 
