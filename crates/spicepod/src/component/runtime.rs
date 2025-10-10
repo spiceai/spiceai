@@ -493,7 +493,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             deserializer.temp_directory.clone(),
             query.temp_directory.clone(),
         ) {
-            // prefer runtime.query.memory_limit
+            // prefer runtime.query.temp_directory
             (_, Some(temp_directory)) => Some(temp_directory),
             (Some(temp_directory), None) => {
                 tracing::warn!(
