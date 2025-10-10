@@ -129,7 +129,7 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
             caching: None,
-            spill_compression: SpillCompression::Zstd,
+            spill_compression: None,
         }
     }
 
