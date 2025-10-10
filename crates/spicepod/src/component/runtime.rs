@@ -65,11 +65,6 @@ pub struct Runtime {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight: Option<Flight>,
 
-    /// Configures where the runtime will store temporary files needed for operations like
-    /// spilling to disk for queries & accelerations that are larger than memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temp_directory: Option<String>,
-
     /// Configures how long the runtime waits for connections to be gracefully drained
     /// and components to shut down cleanly during runtime termination
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,6 +396,11 @@ pub struct Query {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
 
+    /// Configures where the runtime will store temporary files needed for operations like
+    /// spilling to disk for queries & accelerations that are larger than memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_directory: Option<String>,
+
     /// Specifies the compression codec used when spilling data to disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill_compression: Option<SpillCompression>,
@@ -488,6 +488,21 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             (None, None) => None,
         };
 
+        query.temp_directory = match (
+            deserializer.temp_directory.clone(),
+            query.temp_directory.clone(),
+        ) {
+            // prefer runtime.query.memory_limit
+            (_, Some(temp_directory)) => Some(temp_directory),
+            (Some(temp_directory), None) => {
+                tracing::warn!(
+                    "`runtime.temp_directory` is deprecated, use `runtime.query.temp_directory` instead",
+                );
+                Some(temp_directory)
+            }
+            (None, None) => None,
+        };
+
         Ok(Runtime {
             results_cache: deserializer.results_cache,
             caching: deserializer.caching,
@@ -500,7 +515,6 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             auth: deserializer.auth,
             cors: deserializer.cors,
             flight: deserializer.flight,
-            temp_directory: deserializer.temp_directory,
             shutdown_timeout: deserializer.shutdown_timeout,
             output_level: deserializer.output_level,
             query: Some(query),
@@ -512,7 +526,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    
+
     use serde_yaml;
 
     #[test]
@@ -582,6 +596,7 @@ mod tests {
             runtime.query,
             Some(Query {
                 spill_compression: None,
+                temp_directory: None,
                 memory_limit: Some("100MiB".to_string())
             })
         );
@@ -596,6 +611,7 @@ mod tests {
             runtime.query,
             Some(Query {
                 spill_compression: None,
+                temp_directory: None,
                 memory_limit: Some("200MiB".to_string())
             })
         );
@@ -611,6 +627,7 @@ mod tests {
             runtime.query,
             Some(Query {
                 spill_compression: None,
+                temp_directory: None,
                 memory_limit: Some("200MiB".to_string())
             })
         );
@@ -623,6 +640,68 @@ mod tests {
             runtime.query,
             Some(Query {
                 spill_compression: None,
+                temp_directory: None,
+                memory_limit: None
+            })
+        );
+    }
+
+    #[test]
+    fn test_temp_directory_migration() {
+        // Test when only temp_directory is present
+        let yaml = r"
+            temp_directory: '/foo'
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query,
+            Some(Query {
+                spill_compression: None,
+                temp_directory: Some("/foo".to_string()),
+                memory_limit: None
+            })
+        );
+
+        // Test when only query.temp_directory is present
+        let yaml = r"
+            query:
+                temp_directory: '/bar'
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query,
+            Some(Query {
+                spill_compression: None,
+                temp_directory: Some("/bar".to_string()),
+                memory_limit: None
+            })
+        );
+
+        // Test when both are present
+        let yaml = r"
+            temp_directory: '/foo'
+            query:
+                temp_directory: '/bar'
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query,
+            Some(Query {
+                spill_compression: None,
+                temp_directory: Some("/bar".to_string()),
+                memory_limit: None
+            })
+        );
+
+        // Test when neither is present
+        let yaml = r"
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query,
+            Some(Query {
+                spill_compression: None,
+                temp_directory: None,
                 memory_limit: None
             })
         );

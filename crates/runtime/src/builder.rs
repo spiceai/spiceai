@@ -155,11 +155,6 @@ impl RuntimeBuilder {
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
 
-        let temp_directory = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.temp_directory.clone());
-
         let dataset_parallelism = self
             .app
             .as_ref()
@@ -194,13 +189,10 @@ impl RuntimeBuilder {
             Arc::clone(&self.accelerator_engine_registry),
         )
         .memory_limit(memory_limit)
-        .temp_directory(temp_directory)
+        .temp_directory(query.temp_directory)
+        .spill_compression(query.spill_compression)
         .with_task_history(task_history)
         .with_caching(caching);
-
-        if let Some(spill_compression) = query.spill_compression {
-            df_builder = df_builder.spill_compression(spill_compression);
-        }
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);

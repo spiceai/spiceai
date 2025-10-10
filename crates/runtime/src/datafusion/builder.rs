@@ -97,7 +97,7 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
-    spill_compression: SpillCompression,
+    spill_compression: Option<SpillCompression>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -152,11 +152,12 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
-    pub fn spill_compression(mut self, spill_compression: SpiceSpillCompression) -> Self {
+    pub fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
         self.spill_compression = match spill_compression {
-            SpiceSpillCompression::Zstd => SpillCompression::Zstd,
-            SpiceSpillCompression::Lz4Frame => SpillCompression::Lz4Frame,
-            SpiceSpillCompression::Uncompressed => SpillCompression::Uncompressed,
+            Some(SpiceSpillCompression::Zstd) => Some(SpillCompression::Zstd),
+            Some(SpiceSpillCompression::Lz4Frame) => Some(SpillCompression::Lz4Frame),
+            Some(SpiceSpillCompression::Uncompressed) => Some(SpillCompression::Uncompressed),
+            None => None,
         };
         self
     }
@@ -184,7 +185,11 @@ impl DataFusionBuilder {
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
     pub fn build(self) -> DataFusion {
-        let config = self.config.with_spill_compression(self.spill_compression);
+        let mut config = self.config;
+
+        if let Some(spill_compression) = self.spill_compression {
+            config = config.with_spill_compression(spill_compression);
+        }
 
         let mut state = SessionStateBuilder::new()
             .with_config(config)
