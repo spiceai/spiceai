@@ -309,6 +309,7 @@ fn build_snapshots_config(
     }
 }
 
+#[allow(clippy::expect_used)]
 fn build_metadata_document(
     context: &SnapshotS3Context,
     dataset_name: &str,
@@ -460,8 +461,8 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
     let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
         .await
         .context("Retrieving schema for taxi_trips dataset")?
-        .get(0)
-        .map(|batch| batch.schema())
+        .first()
+        .map(RecordBatch::schema)
         .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
 
     runtime.shutdown().await;
@@ -545,8 +546,8 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
     let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
         .await
         .context("Retrieving schema for taxi_trips dataset")?
-        .get(0)
-        .map(|batch| batch.schema())
+        .first()
+        .map(RecordBatch::schema)
         .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
 
     runtime.shutdown().await;
