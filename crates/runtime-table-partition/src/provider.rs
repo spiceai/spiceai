@@ -174,7 +174,7 @@ impl TableProvider for PartitionTableProvider {
 
         let plan = match plans {
             plans if plans.is_empty() => {
-                return Ok(self.empty.scan(state, projection, filters, limit).await?);
+                return self.empty.scan(state, projection, filters, limit).await;
             }
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())
