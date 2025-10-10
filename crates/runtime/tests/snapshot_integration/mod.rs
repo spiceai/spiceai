@@ -1080,7 +1080,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 &fixture.context,
                 TAXI_TRIPS_DATASET_NAME,
                 &updated_objects,
-                &schema
+                &schema,
             );
             fixture
                 .context
