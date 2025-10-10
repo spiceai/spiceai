@@ -448,6 +448,7 @@ pub struct RuntimeDeserializer {
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[deprecated(since = "1.8.0", note = "Use `runtime.query.temp_directory` instead.")]
     pub temp_directory: Option<String>,
     /// Specifies the runtime memory limit. When configured, will spill to disk
     /// for supported queries larger than memory.
