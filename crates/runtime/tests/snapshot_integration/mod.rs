@@ -560,7 +560,7 @@ fn remove_existing_local_files(path: &Path) {
     }
 }
 
-#[cfg_attr(not(feature = "duckdb"), ignore)]
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -619,7 +619,7 @@ async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
         .await
 }
 
-#[cfg_attr(not(feature = "duckdb"), ignore)]
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test2_duckdb_bootstrap_without_federation() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -725,7 +725,7 @@ async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
         .await
 }
 
-#[cfg_attr(not(feature = "duckdb"), ignore)]
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -778,7 +778,7 @@ async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> R
         .await
 }
 
-#[cfg_attr(not(feature = "duckdb"), ignore)]
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -870,7 +870,7 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
         .await
 }
 
-#[cfg_attr(not(feature = "duckdb"), ignore)]
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -951,7 +951,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-#[cfg_attr(not(feature = "duckdb"), ignore)]
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
