@@ -35,7 +35,6 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
-use spicepod::component::runtime::Query;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::{Mutex, RwLock};
 use util::in_tracing_context;

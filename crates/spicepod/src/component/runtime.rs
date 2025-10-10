@@ -512,7 +512,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::component::dataset::UnsupportedTypeAction;
+    
     use serde_yaml;
 
     #[test]
