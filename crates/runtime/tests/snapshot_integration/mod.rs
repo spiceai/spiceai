@@ -25,6 +25,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use arrow::util::pretty::pretty_format_batches;
 use aws_sdk_credential_bridge::{S3CredentialProvider, initialize_sdk_config};
 use chrono::Utc;
@@ -198,6 +199,7 @@ struct SnapshotFixture {
     dataset_from: String,
     local_db_path: PathBuf,
     dataset_params: HashMap<String, String>,
+    schema: SchemaRef,
     baseline: Vec<RecordBatch>,
     engine: &'static str,
     initial_snapshot_count: usize,
@@ -243,6 +245,10 @@ impl SnapshotFixture {
         pretty_format_batches(&self.baseline)
             .map(|fmt| fmt.to_string())
             .context("Formatting baseline snapshot result batches")
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     async fn cleanup(self) -> Result<()> {
@@ -307,6 +313,7 @@ fn build_metadata_document(
     context: &SnapshotS3Context,
     dataset_name: &str,
     snapshot_objects: &[ObjectMeta],
+    schema: &SchemaRef,
 ) -> Value {
     let location = context.location_uri();
     let last_updated_ms = Utc::now().timestamp_millis();
@@ -341,13 +348,17 @@ fn build_metadata_document(
         .and_then(|value| value.get("snapshot-id").and_then(Value::as_i64))
         .unwrap_or(0);
 
+    let schema_json = serde_json::to_value(schema.as_ref()).expect("Serializing schema to JSON");
+
     json!({
         "format-version": 1,
         "location": location,
         "last-updated-ms": last_updated_ms,
         dataset_name: {
             "name": dataset_name,
-            "schemas": [],
+            "schemas": [
+                { "schema-id": 0, "schema": schema_json }
+            ],
             "current-schema-id": 0,
             "snapshots": snapshots,
             "current-snapshot-id": current_snapshot_id,
@@ -446,12 +457,24 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
         .await
         .context("Executing baseline query for DuckDB snapshot")?;
 
+    let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
+        .await
+        .context("Retrieving schema for taxi_trips dataset")?
+        .get(0)
+        .map(|batch| batch.schema())
+        .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
+
     runtime.shutdown().await;
 
     let snapshot_objects = context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
         .await?;
-    let metadata = build_metadata_document(&context, TAXI_TRIPS_DATASET_NAME, &snapshot_objects);
+    let metadata = build_metadata_document(
+        &context,
+        TAXI_TRIPS_DATASET_NAME,
+        &snapshot_objects,
+        &schema,
+    );
     context
         .write_metadata(&metadata)
         .await
@@ -463,6 +486,7 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
         dataset_from,
         local_db_path,
         dataset_params,
+        schema,
         baseline,
         engine: "duckdb",
         initial_snapshot_count: snapshot_objects.len(),
@@ -518,12 +542,24 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
         .await
         .context("Executing baseline query for SQLite snapshot")?;
 
+    let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
+        .await
+        .context("Retrieving schema for taxi_trips dataset")?
+        .get(0)
+        .map(|batch| batch.schema())
+        .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
+
     runtime.shutdown().await;
 
     let snapshot_objects = context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
         .await?;
-    let metadata = build_metadata_document(&context, TAXI_TRIPS_DATASET_NAME, &snapshot_objects);
+    let metadata = build_metadata_document(
+        &context,
+        TAXI_TRIPS_DATASET_NAME,
+        &snapshot_objects,
+        &schema,
+    );
     context
         .write_metadata(&metadata)
         .await
@@ -535,6 +571,7 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
         dataset_from,
         local_db_path,
         dataset_params,
+        schema,
         baseline,
         engine: "sqlite",
         initial_snapshot_count: snapshot_objects.len(),
@@ -878,6 +915,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
     test_request_context()
         .scope(async {
             let fixture = prepare_duckdb_fixture("snapshot_int_test6").await?;
+            let schema = Arc::clone(fixture.schema());
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::CreateOnly,
@@ -918,7 +956,8 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
 
             let snapshot_results = try_join_all((0..10).map(|_| {
                 let manager_clone = manager.clone();
-                async move { manager_clone.create_snapshot().await }
+                let schema = Arc::clone(&schema);
+                async move { manager_clone.create_snapshot(&schema).await }
             }))
             .await
             .context("Creating snapshots concurrently")?;
@@ -959,6 +998,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
     test_request_context()
         .scope(async {
             let fixture = prepare_duckdb_fixture("snapshot_int_test7").await?;
+            let schema = Arc::clone(fixture.schema());
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::CreateOnly,
@@ -1023,7 +1063,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             drop(conn);
 
             manager
-                .create_snapshot()
+                .create_snapshot(&schema)
                 .await
                 .context("Creating modified snapshot after deleting data")?;
 
@@ -1039,6 +1079,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 &fixture.context,
                 TAXI_TRIPS_DATASET_NAME,
                 &updated_objects,
+                &schema
             );
             fixture
                 .context
