@@ -105,10 +105,11 @@ impl PartitionTableProvider {
 
         let partitions = Arc::new(RwLock::new(partitions));
 
+        // This was created from #7449 as a workaround to [`EmptyExec`] and federation support
         let empty = creator
             .create_partition(ScalarValue::Null)
             .await
-            .unwrap()
+            .context(CreatingPartitionSnafu)?
             .table_provider;
 
         Ok(Self {
