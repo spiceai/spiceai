@@ -85,10 +85,13 @@ impl PartitionTableProvider {
         );
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
-        let partitions = creator
+        let mut partitions = creator
             .infer_existing_partitions()
             .await
             .context(CreatingPartitionSnafu)?;
+
+        // Do not consider the Null partition, if it exists.
+        partitions.retain(|p| !matches!(p.partition_value, ScalarValue::Null));
 
         let partition_by = partition_by
             .pop()
