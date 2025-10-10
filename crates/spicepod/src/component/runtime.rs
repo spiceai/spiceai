@@ -416,7 +416,7 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
-/// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory/ deprecation
+/// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
