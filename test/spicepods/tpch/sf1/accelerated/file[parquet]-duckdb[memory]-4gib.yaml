@@ -1,13 +1,13 @@
 version: v1
 kind: Spicepod
-name: file[parquet]-duckdb[file]-4GiB
+name: file[parquet]-duckdb[memory]-4gib
 datasets:
   - from: file:data/customer.parquet
     name: customer
     acceleration: &acceleration
       enabled: true
       engine: duckdb
-      mode: file
+      mode: memory
       params:
         duckdb_memory_limit: 4GiB
   - from: file:data/lineitem.parquet

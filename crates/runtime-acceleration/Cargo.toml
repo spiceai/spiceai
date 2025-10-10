@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
@@ -27,6 +28,10 @@ snafu.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 util = { path = "../util" }
 url.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+opentelemetry.workspace = true
 
 [features]
 default = []
