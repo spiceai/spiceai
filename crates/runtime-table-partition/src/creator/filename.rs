@@ -78,6 +78,7 @@ pub fn decode_pair(value: &str) -> Result<(ScalarValue, u64), Error> {
 
 #[derive(Serialize, Deserialize)]
 enum SupportedScalarValue {
+    Null,
     Boolean(Option<bool>),
     Int8(Option<i8>),
     Int16(Option<i16>),
@@ -108,6 +109,7 @@ impl TryFrom<ScalarValue> for SupportedScalarValue {
 
     fn try_from(value: ScalarValue) -> Result<Self, Self::Error> {
         Ok(match value {
+            ScalarValue::Null => Self::Null,
             ScalarValue::Boolean(maybe_value) => Self::Boolean(maybe_value),
             ScalarValue::Int8(maybe_value) => Self::Int8(maybe_value),
             ScalarValue::Int16(maybe_value) => Self::Int16(maybe_value),
@@ -154,6 +156,7 @@ impl TryFrom<SupportedScalarValue> for ScalarValue {
 
     fn try_from(value: SupportedScalarValue) -> Result<Self, Self::Error> {
         Ok(match value {
+            SupportedScalarValue::Null => Self::Null,
             SupportedScalarValue::Boolean(maybe_value) => Self::Boolean(maybe_value),
             SupportedScalarValue::Int8(maybe_value) => Self::Int8(maybe_value),
             SupportedScalarValue::Int16(maybe_value) => Self::Int16(maybe_value),

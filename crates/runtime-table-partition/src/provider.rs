@@ -24,8 +24,9 @@ use datafusion::{
     datasource::TableType,
     error::DataFusionError,
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
+    physical_plan::{ExecutionPlan, limit::GlobalLimitExec, union::UnionExec},
     prelude::Expr,
+    scalar::ScalarValue,
 };
 use pruning::prune_partition;
 use snafu::prelude::*;
@@ -62,6 +63,7 @@ pub struct PartitionTableProvider {
     partition_by: Expr,
     partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
     schema: SchemaRef,
+    empty: Arc<dyn TableProvider>,
 }
 
 impl PartitionTableProvider {
@@ -103,11 +105,18 @@ impl PartitionTableProvider {
 
         let partitions = Arc::new(RwLock::new(partitions));
 
+        let empty = creator
+            .create_partition(ScalarValue::Null)
+            .await
+            .unwrap()
+            .table_provider;
+
         Ok(Self {
             creator,
             partition_by,
             partitions,
             schema,
+            empty,
         })
     }
 }
@@ -164,7 +173,7 @@ impl TableProvider for PartitionTableProvider {
 
         let plan = match plans {
             plans if plans.is_empty() => {
-                return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))));
+                return Ok(self.empty.scan(state, projection, filters, limit).await?);
             }
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())
