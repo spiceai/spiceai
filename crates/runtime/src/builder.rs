@@ -35,6 +35,7 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
+use spicepod::component::runtime::Query;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::{Mutex, RwLock};
 use util::in_tracing_context;
@@ -147,10 +148,13 @@ impl RuntimeBuilder {
         catalogconnector::register_all().await;
         document_parse::register_all().await;
 
-        let memory_limit = self
+        let query = self
             .app
             .as_ref()
-            .and_then(|app| parse_memory_limit(app.runtime.memory_limit.clone()));
+            .and_then(|app| app.runtime.query.clone())
+            .unwrap_or_default();
+
+        let memory_limit = parse_memory_limit(query.memory_limit.clone());
 
         let temp_directory = self
             .app
@@ -194,6 +198,10 @@ impl RuntimeBuilder {
         .temp_directory(temp_directory)
         .with_task_history(task_history)
         .with_caching(caching);
+
+        if let Some(spill_compression) = query.spill_compression {
+            df_builder = df_builder.spill_compression(spill_compression);
+        }
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
