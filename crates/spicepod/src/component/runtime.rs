@@ -416,7 +416,7 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
-/// Helper struct for deserializing Runtime with custom logic for handling `memory_limit` deprecation
+/// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory/ deprecation
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -448,12 +448,12 @@ pub struct RuntimeDeserializer {
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[deprecated(since = "1.8.0", note = "Use `runtime.query.temp_directory` instead.")]
+    #[deprecated(since = "1.8.1", note = "Use `runtime.query.temp_directory` instead.")]
     pub temp_directory: Option<String>,
     /// Specifies the runtime memory limit. When configured, will spill to disk
     /// for supported queries larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[deprecated(since = "1.8.0", note = "Use `runtime.query.memory_limit` instead.")]
+    #[deprecated(since = "1.8.1", note = "Use `runtime.query.memory_limit` instead.")]
     pub memory_limit: Option<String>,
     /// Configures how long the runtime waits for connections to be gracefully drained
     /// and components to shut down cleanly during runtime termination
@@ -527,7 +527,6 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-
     use serde_yaml;
 
     #[test]
