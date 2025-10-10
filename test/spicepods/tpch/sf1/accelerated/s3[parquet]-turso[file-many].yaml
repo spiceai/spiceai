@@ -15,7 +15,8 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/customer.db
+      params:
+        turso_file: .spice/data/customer.db
   - from: s3:lineitem.parquet
     name: lineitem
     params: *s3_params
