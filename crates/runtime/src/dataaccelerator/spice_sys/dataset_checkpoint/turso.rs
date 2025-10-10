@@ -18,7 +18,7 @@ use std::{sync::Arc, time::SystemTime};
 
 use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Error, Result};
 use crate::dataaccelerator::turso::TursoConnectionPool;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use datafusion::arrow::datatypes::SchemaRef;
 
 impl DatasetCheckpoint {
@@ -95,9 +95,17 @@ impl DatasetCheckpoint {
 
         if let Some(row) = rows.next().await.map_err(Error::external)? {
             let timestamp_str: String = row.get(0).map_err(Error::external)?;
-            let checkpoint_time: DateTime<Utc> = DateTime::parse_from_rfc3339(&timestamp_str)
-                .map_err(Error::external)?
-                .into();
+            // SQLite CURRENT_TIMESTAMP returns 'YYYY-MM-DD HH:MM:SS' format
+            // Parse using strptime format instead of RFC3339
+            let checkpoint_time =
+                NaiveDateTime::parse_from_str(&timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    .map(|naive_dt| DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc))
+                    .or_else(|_| {
+                        // Fallback to RFC3339 for backwards compatibility or if format differs
+                        DateTime::parse_from_rfc3339(&timestamp_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                    })
+                    .map_err(Error::external)?;
             Ok(Some(checkpoint_time.into()))
         } else {
             Ok(None)
