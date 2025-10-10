@@ -23,8 +23,10 @@ use crate::{
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 use app::AppBuilder;
+use datafusion::common::DataFusionError;
 use runtime::{Runtime, auth::EndpointAuth};
 use std::sync::Arc;
+use tokio::time::{Duration, timeout};
 
 #[tokio::test]
 async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
@@ -337,9 +339,22 @@ async fn run_ai_query(rt: &Arc<Runtime>, query: &str) -> Result<String, anyhow::
     use arrow::array::StringArray;
     use futures::TryStreamExt;
 
-    let result = rt.datafusion().query_builder(query).build().run().await?;
-
-    let batches: Vec<_> = result.data.try_collect().await?;
+    let batches: Vec<_> = match timeout(Duration::from_secs(20), async {
+        let result = rt
+            .datafusion()
+            .query_builder(query)
+            .build()
+            .run()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        result.data.try_collect().await
+    })
+    .await
+    {
+        Ok(Ok(batches)) => batches,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow::anyhow!("Executing query timed out")),
+    };
 
     if batches.is_empty() || batches[0].num_rows() == 0 {
         return Err(anyhow::anyhow!("Query returned no results"));
@@ -363,9 +378,22 @@ async fn run_ai_query_multiple(
     use arrow::array::{Array, Int64Array, StringArray};
     use futures::TryStreamExt;
 
-    let result = rt.datafusion().query_builder(query).build().run().await?;
-
-    let batches: Vec<_> = result.data.try_collect().await?;
+    let batches: Vec<_> = match timeout(Duration::from_secs(20), async {
+        let result = rt
+            .datafusion()
+            .query_builder(query)
+            .build()
+            .run()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        result.data.try_collect().await
+    })
+    .await
+    {
+        Ok(Ok(batches)) => batches,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow::anyhow!("Executing query timed out")),
+    };
 
     if batches.is_empty() || batches[0].num_rows() == 0 {
         return Err(anyhow::anyhow!("Query returned no results"));
