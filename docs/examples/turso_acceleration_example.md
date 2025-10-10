@@ -1,15 +1,20 @@
 # Example: Using Turso as Data Accelerator
 
-This example demonstrates how to configure Turso as a data acceleration engine in Spice.ai (once fully implemented).
+This example demonstrates how to configure Turso as a data acceleration engine in Spice.ai.
 
-## Important: File Mode Only
+## Memory Mode
 
-**Turso only supports file mode acceleration.** Memory mode is not supported. This is because Turso is designed for persistent, file-based databases with features like replication and cloud sync.
+```yaml
+version: v1beta1
+kind: Spicepod
+name: turso_file_default
 
-If you attempt to use memory mode, you will receive an error:
-
-```text
-Turso only supports file mode acceleration. Memory mode is not supported. Please set mode: file in your acceleration configuration.
+datasets:
+  - from: postgres:transactions
+    name: transactions
+    acceleration:
+      enabled: true
+      engine: turso
 ```
 
 ## File Mode with Default Path

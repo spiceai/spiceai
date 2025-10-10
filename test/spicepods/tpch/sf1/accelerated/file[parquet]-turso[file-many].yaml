@@ -8,53 +8,53 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/customer.db
+      turso_file: .spice/data/customer.db
   - from: file:data/lineitem.parquet
     name: lineitem
     acceleration:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/lineitem.db
+      turso_file: .spice/data/lineitem.db
   - from: file:data/nation.parquet
     name: nation
     acceleration:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/nation.db
+      turso_file: .spice/data/nation.db
   - from: file:data/orders.parquet
     name: orders
     acceleration:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/orders.db
+      turso_file: .spice/data/orders.db
   - from: file:data/part.parquet
     name: part
     acceleration:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/part.db
+      turso_file: .spice/data/part.db
   - from: file:data/partsupp.parquet
     name: partsupp
     acceleration:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/partsupp.db
+      turso_file: .spice/data/partsupp.db
   - from: file:data/region.parquet
     name: region
     acceleration:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/region.db
+      turso_file: .spice/data/region.db
   - from: file:data/supplier.parquet
     name: supplier
     acceleration:
       enabled: true
       engine: turso
       mode: file
-      turso_file_path: .spice/data/supplier.db
+      turso_file: .spice/data/supplier.db

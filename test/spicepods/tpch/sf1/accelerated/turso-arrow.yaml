@@ -5,7 +5,7 @@ datasets:
   - from: turso:customer
     name: customer
     params: &turso_params
-      turso_file_path: ./data/tpch.db
+      turso_file: ./data/tpch.db
     acceleration: &acceleration
       enabled: true
       engine: arrow
