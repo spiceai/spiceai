@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]-4GiB
+name: s3[parquet]-duckdb[file]-64gib
 datasets:
   - from: s3://benchmarks/tpch_sf100/customer/
     name: customer
@@ -16,7 +16,7 @@ datasets:
       engine: duckdb
       mode: file
       params:
-        duckdb_memory_limit: 4GiB
+        duckdb_memory_limit: 64GiB
   - from: s3://benchmarks/tpch_sf100/lineitem/
     name: lineitem
     params: *s3_params
