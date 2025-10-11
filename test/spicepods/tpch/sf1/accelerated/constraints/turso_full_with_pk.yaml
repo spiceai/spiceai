@@ -11,7 +11,7 @@ runtime:
       enabled: false
 
 datasets:
-  - from: turso:read_parquet('.spice/service_data.parquet')
+  - from: duckdb:read_parquet('.spice/service_data.parquet')
     name: data
     acceleration:
       enabled: true
