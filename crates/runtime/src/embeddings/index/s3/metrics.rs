@@ -50,12 +50,12 @@ macro_rules! generate_s3vectors_metrics {
                     .with_description("Total duration of operation, in milliseconds.")
                     .with_boundaries(
                         [
-                            (0..10).map(|i| 100.0 * i as f64).collect::<Vec<_>>(),
+                            (0..10).map(|i| 100.0 * f64::from(i)).collect::<Vec<_>>(),
                             (1..20)
-                                .map(|i| 500.0 + 500.0 * i as f64)
+                                .map(|i| 500.0 + 500.0 * f64::from(i))
                                 .collect::<Vec<_>>(),
                             (1..10)
-                                .map(|i| 10000.0 + 1000.0 * i as f64)
+                                .map(|i| 10000.0 + 1000.0 * f64::from(i))
                                 .collect::<Vec<_>>(),
                         ]
                         .concat(),
