@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use crate::{
-    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
-    Runtime, UnableToAttachViewSnafu,
+    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu,
+    FullTextSearchNotSupportedForViewSnafu, LogErrors, Result, Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
     metrics,
     secrets::Secrets,
@@ -41,7 +41,8 @@ impl Runtime {
             let runtime = Arc::clone(&self);
             let secrets = runtime.secrets();
             if let Err(e) = runtime.load_view(&view, secrets) {
-                tracing::error!("Unable to load view: {e}");
+                let view_name = &view.name;
+                tracing::error!("Unable to load view {view_name}: {e}");
             }
         }
     }
@@ -164,6 +165,14 @@ impl Runtime {
 
     #[allow(clippy::result_large_err)]
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
+        if let Err(err) = validate_view(view) {
+            let view_name = &view.name;
+            metrics::views::LOAD_ERROR.add(1, &[]);
+            self.status
+                .update_view(view_name, status::ComponentStatus::Error);
+            return Err(err);
+        }
+
         let df = Arc::clone(&self.df);
         let register_task = df
             .register_view(Arc::clone(view), secrets)
@@ -311,4 +320,13 @@ impl Runtime {
             }
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_view(view: &Arc<View>) -> Result<()> {
+    if view.has_full_text_column() {
+        return Err(FullTextSearchNotSupportedForViewSnafu.build());
+    }
+
+    Ok(())
 }
