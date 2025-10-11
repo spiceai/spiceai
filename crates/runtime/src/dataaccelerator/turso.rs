@@ -433,6 +433,325 @@ impl TursoTableProvider {
                         .collect();
                     Arc::new(Date64Array::from(values))
                 }
+                DataType::Time32(unit) => {
+                    // Time32 stored as INTEGER (milliseconds or seconds since midnight)
+                    let values: Vec<Option<i32>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    match unit {
+                        arrow::datatypes::TimeUnit::Millisecond => {
+                            Arc::new(arrow::array::Time32MillisecondArray::from(values))
+                        }
+                        arrow::datatypes::TimeUnit::Second => {
+                            Arc::new(arrow::array::Time32SecondArray::from(values))
+                        }
+                        _ => {
+                            // Fallback to string for unsupported time units
+                            let values: Vec<Option<String>> = rows
+                                .iter()
+                                .map(|row| match &row[col_idx] {
+                                    TursoValue::Integer(i) => Some(i.to_string()),
+                                    TursoValue::Null => None,
+                                    _ => None,
+                                })
+                                .collect();
+                            Arc::new(StringArray::from(values))
+                        }
+                    }
+                }
+                DataType::Time64(unit) => {
+                    // Time64 stored as INTEGER (microseconds or nanoseconds since midnight)
+                    let values: Vec<Option<i64>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => Some(*i),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    match unit {
+                        arrow::datatypes::TimeUnit::Microsecond => {
+                            Arc::new(arrow::array::Time64MicrosecondArray::from(values))
+                        }
+                        arrow::datatypes::TimeUnit::Nanosecond => {
+                            Arc::new(arrow::array::Time64NanosecondArray::from(values))
+                        }
+                        _ => {
+                            // Fallback to string for unsupported time units
+                            let values: Vec<Option<String>> = rows
+                                .iter()
+                                .map(|row| match &row[col_idx] {
+                                    TursoValue::Integer(i) => Some(i.to_string()),
+                                    TursoValue::Null => None,
+                                    _ => None,
+                                })
+                                .collect();
+                            Arc::new(StringArray::from(values))
+                        }
+                    }
+                }
+                DataType::Duration(unit) => {
+                    // Duration stored as INTEGER
+                    let values: Vec<Option<i64>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Integer(i) => Some(*i),
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    match unit {
+                        arrow::datatypes::TimeUnit::Second => {
+                            Arc::new(arrow::array::DurationSecondArray::from(values))
+                        }
+                        arrow::datatypes::TimeUnit::Millisecond => {
+                            Arc::new(arrow::array::DurationMillisecondArray::from(values))
+                        }
+                        arrow::datatypes::TimeUnit::Microsecond => {
+                            Arc::new(arrow::array::DurationMicrosecondArray::from(values))
+                        }
+                        arrow::datatypes::TimeUnit::Nanosecond => {
+                            Arc::new(arrow::array::DurationNanosecondArray::from(values))
+                        }
+                    }
+                }
+                DataType::Interval(unit) => {
+                    // Interval stored as INTEGER
+                    match unit {
+                        arrow::datatypes::IntervalUnit::YearMonth => {
+                            let values: Vec<Option<i32>> = rows
+                                .iter()
+                                .map(|row| match &row[col_idx] {
+                                    TursoValue::Integer(i) => i32::try_from(*i).ok(),
+                                    TursoValue::Null => None,
+                                    _ => None,
+                                })
+                                .collect();
+                            Arc::new(arrow::array::IntervalYearMonthArray::from(values))
+                        }
+                        arrow::datatypes::IntervalUnit::DayTime => {
+                            use arrow::datatypes::IntervalDayTime;
+                            let values: Vec<Option<IntervalDayTime>> = rows
+                                .iter()
+                                .map(|row| match &row[col_idx] {
+                                    TursoValue::Integer(i) => {
+                                        // Unpack i64: upper 32 bits = days, lower 32 bits = milliseconds
+                                        let days = (*i >> 32) as i32;
+                                        let milliseconds = (*i & 0xFFFF_FFFF) as i32;
+                                        Some(IntervalDayTime::new(days, milliseconds))
+                                    }
+                                    TursoValue::Null => None,
+                                    _ => None,
+                                })
+                                .collect();
+                            Arc::new(arrow::array::IntervalDayTimeArray::from(values))
+                        }
+                        arrow::datatypes::IntervalUnit::MonthDayNano => {
+                            use arrow::datatypes::IntervalMonthDayNano;
+                            let values: Vec<Option<IntervalMonthDayNano>> = rows
+                                .iter()
+                                .map(|row| match &row[col_idx] {
+                                    TursoValue::Text(s) => {
+                                        // Deserialize from JSON
+                                        serde_json::from_str::<serde_json::Value>(s).ok().and_then(
+                                            |v| {
+                                                let months = v["months"].as_i64()? as i32;
+                                                let days = v["days"].as_i64()? as i32;
+                                                let nanoseconds = v["nanoseconds"].as_i64()?;
+                                                Some(IntervalMonthDayNano::new(
+                                                    months,
+                                                    days,
+                                                    nanoseconds,
+                                                ))
+                                            },
+                                        )
+                                    }
+                                    TursoValue::Null => None,
+                                    _ => None,
+                                })
+                                .collect();
+                            Arc::new(arrow::array::IntervalMonthDayNanoArray::from(values))
+                        }
+                    }
+                }
+                DataType::List(field) => {
+                    // List stored as TEXT (JSON serialized)
+                    // Reconstruct the list arrays from JSON - only support Int32 lists for now
+                    if matches!(field.data_type(), DataType::Int32) {
+                        use arrow::array::ListBuilder;
+                        let mut list_builder =
+                            ListBuilder::new(arrow::array::Int32Array::builder(rows.len() * 3));
+
+                        for row in rows {
+                            match &row[col_idx] {
+                                TursoValue::Text(json_str) => {
+                                    // Parse JSON array
+                                    if let Ok(values) = serde_json::from_str::<Vec<i32>>(json_str) {
+                                        for val in values {
+                                            list_builder.values().append_value(val);
+                                        }
+                                        list_builder.append(true);
+                                    } else {
+                                        list_builder.append_null();
+                                    }
+                                }
+                                TursoValue::Null => {
+                                    list_builder.append_null();
+                                }
+                                _ => {
+                                    list_builder.append_null();
+                                }
+                            }
+                        }
+
+                        Arc::new(list_builder.finish())
+                    } else {
+                        // For unsupported list element types, return empty list array
+                        use arrow::array::ListBuilder;
+                        let mut list_builder =
+                            ListBuilder::new(arrow::array::Int32Array::builder(0));
+                        for _ in rows {
+                            list_builder.append_null();
+                        }
+                        Arc::new(list_builder.finish())
+                    }
+                }
+                DataType::Map(_, _sorted) => {
+                    // Map stored as TEXT (JSON serialized)
+                    // Reconstruct map arrays from JSON
+                    use arrow::array::{Int32Builder, MapBuilder, StringBuilder};
+
+                    // For now, only support Utf8 keys to Int32 values
+                    let mut map_builder =
+                        MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+
+                    for row in rows {
+                        match &row[col_idx] {
+                            TursoValue::Text(json_str) => {
+                                // Parse JSON object
+                                if let Ok(map) = serde_json::from_str::<
+                                    serde_json::Map<String, serde_json::Value>,
+                                >(json_str)
+                                {
+                                    for (key, value) in map {
+                                        map_builder.keys().append_value(&key);
+                                        if let Some(int_val) = value.as_i64() {
+                                            map_builder.values().append_value(int_val as i32);
+                                        } else {
+                                            map_builder.values().append_null();
+                                        }
+                                    }
+                                    map_builder.append(true).map_err(|e| {
+                                        Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!("Failed to append map: {}", e),
+                                        ))
+                                            as Box<dyn std::error::Error + Send + Sync>
+                                    })?;
+                                } else {
+                                    map_builder.append(false).map_err(|e| {
+                                        Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!("Failed to append null map: {}", e),
+                                        ))
+                                            as Box<dyn std::error::Error + Send + Sync>
+                                    })?;
+                                }
+                            }
+                            TursoValue::Null => {
+                                map_builder.append(false).map_err(|e| {
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("Failed to append null map: {}", e),
+                                    ))
+                                        as Box<dyn std::error::Error + Send + Sync>
+                                })?;
+                            }
+                            _ => {
+                                map_builder.append(false).map_err(|e| {
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("Failed to append null map: {}", e),
+                                    ))
+                                        as Box<dyn std::error::Error + Send + Sync>
+                                })?;
+                            }
+                        }
+                    }
+
+                    Arc::new(map_builder.finish())
+                }
+                DataType::Decimal128(precision, scale) => {
+                    // Decimal128 stored as REAL in database
+                    // Convert back to i128 scaled value
+                    let scale_factor = 10_i128.pow(*scale as u32);
+                    let values: Vec<Option<i128>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Real(f) => {
+                                // Convert float to scaled integer
+                                let scaled = (f * scale_factor as f64).round() as i128;
+                                Some(scaled)
+                            }
+                            TursoValue::Integer(i) => {
+                                // If stored as integer, scale it
+                                Some(*i as i128 * scale_factor)
+                            }
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(
+                        Decimal128Array::from(values)
+                            .with_precision_and_scale(*precision, *scale)
+                            .map_err(|e| {
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("Invalid decimal128 precision/scale: {}", e),
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?,
+                    )
+                }
+                DataType::Decimal256(precision, scale) => {
+                    // Decimal256 stored as REAL in database
+                    // Convert back to i256 scaled value
+                    use arrow::datatypes::i256;
+                    let scale_factor = 10_i128.pow(*scale as u32);
+                    let values: Vec<Option<i256>> = rows
+                        .iter()
+                        .map(|row| match &row[col_idx] {
+                            TursoValue::Real(f) => {
+                                // Convert float to scaled integer
+                                let scaled = (f * scale_factor as f64).round() as i128;
+                                Some(i256::from_i128(scaled))
+                            }
+                            TursoValue::Integer(i) => {
+                                // If stored as integer, scale it
+                                let scaled = *i as i128 * scale_factor;
+                                Some(i256::from_i128(scaled))
+                            }
+                            TursoValue::Null => None,
+                            _ => None,
+                        })
+                        .collect();
+                    Arc::new(
+                        Decimal256Array::from(values)
+                            .with_precision_and_scale(*precision, *scale)
+                            .map_err(|e| {
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("Invalid decimal256 precision/scale: {}", e),
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?,
+                    )
+                }
                 _ => {
                     // Default to string representation for unsupported types
                     let values: Vec<Option<String>> = rows
@@ -1029,6 +1348,113 @@ impl TursoDataSink {
                     ScalarValue::TimestampSecond(Some(v), _) => TursoValue::Integer(v * 1000),
                     ScalarValue::Date32(Some(v)) => TursoValue::Integer(i64::from(v)),
                     ScalarValue::Date64(Some(v)) => TursoValue::Integer(v),
+                    ScalarValue::Time32Second(Some(v))
+                    | ScalarValue::Time32Millisecond(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::Time64Microsecond(Some(v))
+                    | ScalarValue::Time64Nanosecond(Some(v)) => TursoValue::Integer(v),
+                    ScalarValue::DurationSecond(Some(v))
+                    | ScalarValue::DurationMillisecond(Some(v))
+                    | ScalarValue::DurationMicrosecond(Some(v))
+                    | ScalarValue::DurationNanosecond(Some(v)) => TursoValue::Integer(v),
+                    ScalarValue::IntervalYearMonth(Some(v)) => TursoValue::Integer(i64::from(v)),
+                    ScalarValue::IntervalDayTime(Some(v)) => {
+                        // IntervalDayTime has days (i32) and milliseconds (i32)
+                        // Pack into i64: upper 32 bits = days, lower 32 bits = milliseconds
+                        let packed =
+                            ((v.days as i64) << 32) | (v.milliseconds as i64 & 0xFFFF_FFFF);
+                        TursoValue::Integer(packed)
+                    }
+                    ScalarValue::IntervalMonthDayNano(Some(v)) => {
+                        // IntervalMonthDayNano has 3 fields - serialize as JSON
+                        let json = serde_json::json!({
+                            "months": v.months,
+                            "days": v.days,
+                            "nanoseconds": v.nanoseconds
+                        });
+                        TursoValue::Text(json.to_string())
+                    }
+                    ScalarValue::Decimal128(Some(v), _, scale) => {
+                        // Convert decimal to float for storage as REAL
+                        let scale_factor = 10_f64.powi(scale as i32);
+                        TursoValue::Real(v as f64 / scale_factor)
+                    }
+                    ScalarValue::Decimal256(Some(v), _, scale) => {
+                        // Convert decimal256 to float for storage as REAL
+                        // i256 doesn't have direct conversion to i128, so use string conversion
+                        let scale_factor = 10_f64.powi(scale as i32);
+                        let v_str = format!("{}", v);
+                        let v_f64 = v_str.parse::<f64>().unwrap_or(0.0);
+                        TursoValue::Real(v_f64 / scale_factor)
+                    }
+                    ScalarValue::List(list_arr) => {
+                        // Serialize list as JSON
+                        use arrow::array::Array;
+                        let mut json_values = Vec::new();
+                        for i in 0..list_arr.len() {
+                            if list_arr.is_null(i) {
+                                json_values.push(serde_json::Value::Null);
+                            } else {
+                                let elem = ScalarValue::try_from_array(list_arr.as_ref(), i)?;
+                                match elem {
+                                    ScalarValue::Int32(Some(v)) => {
+                                        json_values.push(serde_json::Value::from(v))
+                                    }
+                                    ScalarValue::Int64(Some(v)) => {
+                                        json_values.push(serde_json::Value::from(v))
+                                    }
+                                    ScalarValue::Utf8(Some(v)) => {
+                                        json_values.push(serde_json::Value::from(v))
+                                    }
+                                    _ => json_values.push(serde_json::Value::Null),
+                                }
+                            }
+                        }
+                        TursoValue::Text(serde_json::to_string(&json_values).unwrap_or_default())
+                    }
+                    ScalarValue::Map(map_arr) => {
+                        // Map is a StructArray with "entries" containing keys and values
+                        // Serialize as JSON object
+                        use arrow::array::{Array, MapArray};
+
+                        let map_array = map_arr
+                            .as_ref()
+                            .as_any()
+                            .downcast_ref::<MapArray>()
+                            .ok_or_else(|| {
+                                datafusion::error::DataFusionError::Internal(
+                                    "Expected MapArray".to_string(),
+                                )
+                            })?;
+
+                        let mut json_map = serde_json::Map::new();
+
+                        // Get keys and values from the map
+                        let keys = map_array.keys();
+                        let values = map_array.values();
+
+                        for i in 0..keys.len() {
+                            if !keys.is_null(i) && !values.is_null(i) {
+                                // Extract key as string
+                                let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
+                                let key_str = match key_scalar {
+                                    ScalarValue::Utf8(Some(k)) => k,
+                                    _ => continue, // Skip non-string keys
+                                };
+
+                                // Extract value as int
+                                let val_scalar = ScalarValue::try_from_array(values.as_ref(), i)?;
+                                let val_json = match val_scalar {
+                                    ScalarValue::Int32(Some(v)) => serde_json::Value::from(v),
+                                    ScalarValue::Int64(Some(v)) => serde_json::Value::from(v),
+                                    _ => serde_json::Value::Null,
+                                };
+
+                                json_map.insert(key_str, val_json);
+                            }
+                        }
+
+                        TursoValue::Text(serde_json::to_string(&json_map).unwrap_or_default())
+                    }
                     _ => TursoValue::Null,
                 };
                 values.push(turso_value);
@@ -1398,10 +1824,20 @@ impl DataAccelerator for TursoAccelerator {
                 DataType::Binary | DataType::LargeBinary => "BLOB",
                 // Boolean maps to INTEGER (0/1)
                 DataType::Boolean => "INTEGER",
-                // Timestamp types map to INTEGER (Unix timestamp in milliseconds)
-                DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => "INTEGER",
+                // Temporal types map to INTEGER
+                DataType::Timestamp(_, _)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Duration(_)
+                | DataType::Interval(_) => "INTEGER",
                 // Decimal types map to REAL
                 DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "REAL",
+                // Complex types (List, Struct, etc.) map to TEXT (JSON serialized)
+                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                    "TEXT"
+                }
                 // Default to TEXT for unsupported types (serialized as JSON or string)
                 _ => "TEXT",
             };

@@ -83,14 +83,14 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "append")]
         Commands::Run(TestCommands::Append(args)) => {
-            Box::pin(commands::append::run(&args)).await?;
+            commands::append::run(&args).await?;
         }
         #[cfg(feature = "append")]
         Commands::Export(TestCommands::Append(args)) => {
             commands::env_export(&args.common).await?;
         }
         Commands::Run(TestCommands::Search(args)) => {
-            Box::pin(commands::search::run(&args)).await?;
+            commands::search::run(&args).await?;
         }
     }
 

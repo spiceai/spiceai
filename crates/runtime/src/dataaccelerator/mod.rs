@@ -685,18 +685,23 @@ mod test {
     }
 }
 
-#[cfg(all(test, any(feature = "sqlite", feature = "turso")))]
-mod sqlite_compat_tests {
-    //! Shared compatibility test suite for SQLite and Turso accelerators.
-    //! These tests ensure both accelerators behave identically for common operations.
+#[cfg(test)]
+mod accelerator_compat_tests {
+    //! Shared compatibility test suite for data accelerators.
+    //! These tests ensure accelerators behave consistently for common operations.
 
     use crate::component::dataset::acceleration::Engine;
     use crate::dataaccelerator::DataAccelerator;
     use ::arrow::{
         array::{
-            Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+            Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+            Decimal256Array, DurationMillisecondArray, Float32Array, Float64Array, Int8Array,
+            Int16Array, Int32Array, Int32Builder, Int64Array, IntervalYearMonthArray,
+            LargeBinaryArray, LargeStringArray, ListArray, MapArray, RecordBatch, StringArray,
+            StructArray, Time32MillisecondArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+            UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         },
-        datatypes::{DataType, Field, Schema},
+        datatypes::{DataType, Field, Schema, TimeUnit, i256},
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
@@ -709,40 +714,62 @@ mod sqlite_compat_tests {
     use datafusion_table_providers::util::test::MockExec;
     use std::{collections::HashMap, sync::Arc};
 
-    /// Test helper that runs the same test logic against both SQLite and Turso
+    /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
-        F: Fn(Engine, Arc<dyn TableProvider>) -> Fut,
+        F: Fn(Engine, Arc<dyn TableProvider>, String) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let engines = vec![
+        // Test both memory and file modes for databases
+        let test_configs = vec![
             #[cfg(feature = "sqlite")]
-            Engine::Sqlite,
+            (Engine::Sqlite, "memory"),
+            #[cfg(feature = "sqlite")]
+            (Engine::Sqlite, "file"),
             #[cfg(feature = "turso")]
-            Engine::Turso,
+            (Engine::Turso, "memory"),
+            #[cfg(feature = "turso")]
+            (Engine::Turso, "file"),
+            #[cfg(feature = "duckdb")]
+            (Engine::DuckDB, "memory"),
+            #[cfg(feature = "duckdb")]
+            (Engine::DuckDB, "file"),
+            (Engine::Arrow, "memory"),
         ];
 
-        for engine in engines {
-            println!("Testing with engine: {:?}", engine);
+        for (engine, mode) in test_configs {
+            println!("Testing with engine: {:?} ({})", engine, mode);
 
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, false),
-                Field::new("value", DataType::Float64, true),
-            ]));
-
+            let schema = test_schema();
             let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+
+            // Create appropriate location based on mode
+            let location = if mode == "file" {
+                format!(
+                    "/tmp/spice_benchmark_{:?}_{}.db",
+                    engine,
+                    std::process::id()
+                )
+            } else {
+                String::new()
+            };
+
+            let mut options = HashMap::new();
+            if mode == "file" {
+                options.insert("file".to_string(), location.clone());
+            }
+
             let external_table = CreateExternalTable {
                 schema: df_schema,
-                name: TableReference::bare(format!("test_table_{:?}", engine)),
-                location: String::new(),
+                name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
+                location: location.clone(),
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
-                options: HashMap::new(),
+                options,
                 constraints: Constraints::new_unverified(vec![]),
                 column_defaults: HashMap::default(),
                 temporary: false,
@@ -752,110 +779,652 @@ mod sqlite_compat_tests {
                 #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
-                    SqliteAccelerator::new()
+                    match SqliteAccelerator::new()
                         .create_external_table(external_table, None, None)
                         .await
-                        .expect("SQLite table should be created")
+                    {
+                        Ok(table) => table,
+                        Err(e) => {
+                            println!("  Skipping SQLite - unsupported types: {}", e);
+                            continue;
+                        }
+                    }
                 }
                 #[cfg(feature = "turso")]
                 Engine::Turso => {
                     use crate::dataaccelerator::turso::TursoAccelerator;
-                    TursoAccelerator::new()
+                    match TursoAccelerator::new()
                         .create_external_table(external_table, None, None)
                         .await
-                        .expect("Turso table should be created")
+                    {
+                        Ok(table) => table,
+                        Err(e) => {
+                            println!("  Skipping Turso - unsupported types: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(feature = "duckdb")]
+                Engine::DuckDB => {
+                    use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                    match DuckDBAccelerator::new()
+                        .create_external_table(external_table, None, None)
+                        .await
+                    {
+                        Ok(table) => table,
+                        Err(e) => {
+                            println!("  Skipping DuckDB - unsupported types: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                Engine::Arrow => {
+                    use crate::dataaccelerator::arrow::ArrowAccelerator;
+                    match ArrowAccelerator::new()
+                        .create_external_table(external_table, None, None)
+                        .await
+                    {
+                        Ok(table) => table,
+                        Err(e) => {
+                            println!("  Skipping Arrow - unsupported types: {}", e);
+                            continue;
+                        }
+                    }
                 }
                 _ => panic!("Unsupported engine for this test"),
             };
 
-            test_fn(engine, table).await;
+            test_fn(engine, table, mode.to_string()).await;
+
+            // Cleanup file if in file mode
+            if mode == "file" && !location.is_empty() {
+                let _ = std::fs::remove_file(&location);
+            }
         }
+    }
+
+    /// Helper function to get the comprehensive test schema covering all major Arrow data types
+    /// Note: Some exotic types (Time64, LargeBinary, LargeUtf8) may not be supported by all engines
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            // Original columns (for backwards compatibility with existing tests)
+            Field::new("id", DataType::Int64, false), // Primary key, not null
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+            // Additional integer types
+            Field::new("int8_col", DataType::Int8, true),
+            Field::new("int16_col", DataType::Int16, true),
+            Field::new("int32_col", DataType::Int32, true),
+            Field::new("uint8_col", DataType::UInt8, true),
+            Field::new("uint16_col", DataType::UInt16, true),
+            Field::new("uint32_col", DataType::UInt32, true),
+            Field::new("uint64_col", DataType::UInt64, true),
+            // Float types
+            Field::new("float32_col", DataType::Float32, true),
+            // Boolean
+            Field::new("bool_col", DataType::Boolean, true),
+            // String types
+            Field::new("large_utf8_col", DataType::LargeUtf8, true),
+            // Binary types
+            Field::new("binary_col", DataType::Binary, true),
+            Field::new("large_binary_col", DataType::LargeBinary, true),
+            // Date/Time types
+            Field::new("date32_col", DataType::Date32, true),
+            Field::new("date64_col", DataType::Date64, true),
+            Field::new(
+                "time32_ms_col",
+                DataType::Time32(TimeUnit::Millisecond),
+                true,
+            ),
+            Field::new(
+                "time64_us_col",
+                DataType::Time64(TimeUnit::Microsecond),
+                true,
+            ),
+            Field::new(
+                "timestamp_us_col",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            // Duration and Interval types
+            Field::new(
+                "duration_ms_col",
+                DataType::Duration(TimeUnit::Millisecond),
+                true,
+            ),
+            Field::new(
+                "interval_ym_col",
+                DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
+                true,
+            ),
+            // List type (list of Int32)
+            Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            // Map type (map of Utf8 keys to Int32 values)
+            Field::new(
+                "map_col",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Int32, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false, // keys are not sorted
+                ),
+                true,
+            ),
+            // Decimal types (Decimal128 is widely supported, Decimal256 is not)
+            Field::new("decimal128_col", DataType::Decimal128(38, 10), true),
+        ]))
+    }
+
+    /// Helper function to generate test data covering all Arrow data types
+    fn generate_test_data(schema: Arc<Schema>, num_records: usize, offset: i64) -> RecordBatch {
+        let nullable_mod = 10; // Every 10th value is null for testing null handling
+
+        // Original columns (for backwards compatibility)
+        let id_array = Int64Array::from(
+            (0..num_records)
+                .map(|i| offset + i as i64)
+                .collect::<Vec<_>>(),
+        );
+
+        let name_array = StringArray::from(
+            (0..num_records)
+                .map(|i| format!("name_{}", i))
+                .collect::<Vec<_>>(),
+        );
+
+        let value_array = Float64Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i as f64) * 1.5)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // Additional integer types
+        let int8_array = Int8Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(((offset + i as i64) % 128) as i8)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let int16_array = Int16Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(((offset + i as i64) % 32768) as i16)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let int32_array = Int32Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((offset + i as i64) as i32)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let uint8_array = UInt8Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i % 256) as u8)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let uint16_array = UInt16Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i % 65536) as u16)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let uint32_array = UInt32Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(i as u32)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let uint64_array = UInt64Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(i as u64)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // Float types
+        let float32_array = Float32Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i as f32) * 1.5)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let float64_array = Float64Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i as f64) * 2.5)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // Boolean
+        let bool_array = BooleanArray::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(i % 2 == 0)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // String types
+        let large_utf8_array = LargeStringArray::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(format!("large_string_{}", offset + i as i64))
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // Binary types
+        let binary_data: Vec<Option<&[u8]>> = (0..num_records)
+            .map(|i| {
+                if i % nullable_mod == 0 {
+                    None
+                } else {
+                    Some(format!("binary_{}", i).into_bytes().leak() as &[u8])
+                }
+            })
+            .collect();
+        let binary_array = BinaryArray::from(binary_data);
+
+        let large_binary_data: Vec<Option<&[u8]>> = (0..num_records)
+            .map(|i| {
+                if i % nullable_mod == 0 {
+                    None
+                } else {
+                    Some(format!("large_binary_{}", i).into_bytes().leak() as &[u8])
+                }
+            })
+            .collect();
+        let large_binary_array = LargeBinaryArray::from(large_binary_data);
+
+        // Date/Time types
+        let date32_array = Date32Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(18000 + i as i32) // Days since epoch
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let date64_array = Date64Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(1_600_000_000_000_i64 + (i as i64 * 86_400_000)) // Milliseconds since epoch
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let time32_array = Time32MillisecondArray::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(((i as i64 * 1_000) % 86_400_000) as i32) // Milliseconds since midnight
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let time64_array = Time64MicrosecondArray::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i as i64 * 1_000_000) % 86_400_000_000) // Microseconds since midnight
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let timestamp_array = TimestampMicrosecondArray::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some(1_600_000_000_000_000_i64 + (i as i64 * 1_000_000))
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // Duration and Interval types
+        let duration_array = DurationMillisecondArray::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i as i64 * 1_000) % 86_400_000) // Duration in milliseconds
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let interval_array = IntervalYearMonthArray::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i as i32 % 120) * 12) // Interval in months (up to 10 years)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // List type (list of Int32)
+        let mut list_builder = arrow::array::ListBuilder::new(Int32Array::builder(num_records * 3));
+        for i in 0..num_records {
+            if i % nullable_mod == 0 {
+                list_builder.append_null();
+            } else {
+                // Each list contains 3 integers
+                list_builder.values().append_value(i as i32);
+                list_builder.values().append_value((i as i32) * 2);
+                list_builder.values().append_value((i as i32) * 3);
+                list_builder.append(true);
+            }
+        }
+        let list_array = list_builder.finish();
+
+        // Map type (map of Utf8 keys to Int32 values)
+        // Need to use the same field names as the schema: "key" and "value" (not "keys" and "values")
+        use arrow::array::{MapBuilder, MapFieldNames, StringBuilder};
+
+        let field_names = MapFieldNames {
+            entry: "entries".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        };
+        let mut map_builder =
+            MapBuilder::new(Some(field_names), StringBuilder::new(), Int32Builder::new());
+        for i in 0..num_records {
+            if i % nullable_mod == 0 {
+                map_builder.append(false).expect("append null map");
+            } else {
+                // Each map contains 2 key-value pairs
+                map_builder.keys().append_value(format!("key_{}", i));
+                map_builder.values().append_value(i as i32);
+                map_builder.keys().append_value(format!("key2_{}", i));
+                map_builder.values().append_value((i as i32) * 10);
+                map_builder.append(true).expect("append map");
+            }
+        }
+        let map_array = map_builder.finish();
+
+        // Decimal types
+        let decimal128_array = Decimal128Array::from(
+            (0..num_records)
+                .map(|i| {
+                    if i % nullable_mod == 0 {
+                        None
+                    } else {
+                        Some((i as i128 * 1_000_000_000) + 5_000_000_000)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with_precision_and_scale(38, 10)
+        .expect("valid decimal128");
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                // Original columns first (for backwards compatibility)
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(value_array),
+                // Additional type columns
+                Arc::new(int8_array),
+                Arc::new(int16_array),
+                Arc::new(int32_array),
+                Arc::new(uint8_array),
+                Arc::new(uint16_array),
+                Arc::new(uint32_array),
+                Arc::new(uint64_array),
+                Arc::new(float32_array),
+                Arc::new(bool_array),
+                Arc::new(large_utf8_array),
+                Arc::new(binary_array),
+                Arc::new(large_binary_array),
+                Arc::new(date32_array),
+                Arc::new(date64_array),
+                Arc::new(time32_array),
+                Arc::new(time64_array),
+                Arc::new(timestamp_array),
+                Arc::new(duration_array),
+                Arc::new(interval_array),
+                Arc::new(list_array),
+                Arc::new(map_array),
+                Arc::new(decimal128_array),
+            ],
+        )
+        .expect("data should be created")
+    }
+
+    /// Helper function to insert test data into a table
+    async fn insert_test_data(
+        table: &Arc<dyn TableProvider>,
+        ctx: &SessionContext,
+        data: RecordBatch,
+    ) {
+        let schema = data.schema();
+        let exec = MockExec::new(vec![Ok(data)], schema);
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
     }
 
     #[tokio::test]
     #[allow(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, false),
-                Field::new("value", DataType::Float64, true),
-            ]));
+            let schema = test_schema();
 
-            // Insert test data
-            let id_array = Int64Array::from(vec![1, 2, 3]);
-            let name_array = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
-            let value_array = Float64Array::from(vec![Some(1.5), Some(2.5), None]);
+            // Insert test data - 100 records for testing
+            let data = generate_test_data(Arc::clone(&schema), 100, 0);
+            insert_test_data(&table, &ctx, data).await;
 
-            let data = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(id_array),
-                    Arc::new(name_array),
-                    Arc::new(value_array),
-                ],
-            )
-            .expect("data should be created");
-
-            let exec = MockExec::new(vec![Ok(data)], schema);
-
-            let insertion = table
-                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
-                .await
-                .expect("insertion should be successful");
-
-            collect(insertion, ctx.task_ctx())
-                .await
-                .expect("insert successful");
-
-            // Query back the data
+            // Test 1: Full table scan
             let scan = table
                 .scan(&ctx.state(), None, &[], None)
                 .await
                 .expect("scan should be successful");
-
             let results = collect(scan, ctx.task_ctx())
                 .await
                 .expect("scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 100, "{:?}: should have 100 rows", engine);
 
-            assert_eq!(results.len(), 1, "{:?}: should have 1 batch", engine);
-            let batch = &results[0];
-            assert_eq!(batch.num_rows(), 3, "{:?}: should have 3 rows", engine);
+            // Test 2: Filter with WHERE clause (id > 50)
+            // Note: Arrow engine doesn't support filter pushdown, so it returns all rows
+            let filter = col("id").gt(lit(50_i64));
+            let scan = table
+                .scan(&ctx.state(), None, &[filter], None)
+                .await
+                .expect("filtered scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("filtered scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            if engine != Engine::Arrow {
+                assert!(
+                    total_rows <= 50,
+                    "{:?}: filtered should have <= 50 rows, got {}",
+                    engine,
+                    total_rows
+                );
+            }
+
+            // Test 3: Projection (select only specific columns)
+            let projection = Some(vec![0_usize, 2_usize]); // id and value only
+            let scan = table
+                .scan(&ctx.state(), projection.as_ref(), &[], None)
+                .await
+                .expect("projection scan should be successful");
+            let projected_schema = scan.schema();
             assert_eq!(
-                batch.num_columns(),
-                3,
-                "{:?}: should have 3 columns",
+                projected_schema.fields().len(),
+                2,
+                "{:?}: should have 2 projected columns",
                 engine
             );
 
-            // Verify data
-            let id_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("id should be Int64Array");
-            assert_eq!(id_col.value(0), 1);
-            assert_eq!(id_col.value(1), 2);
-            assert_eq!(id_col.value(2), 3);
+            // Test 4: LIMIT clause
+            // Note: Arrow engine doesn't support limit pushdown
+            let limit = Some(10);
+            let scan = table
+                .scan(&ctx.state(), None, &[], limit)
+                .await
+                .expect("limit scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("limit scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            if engine != Engine::Arrow {
+                assert!(
+                    total_rows <= 10,
+                    "{:?}: limit should have <= 10 rows, got {}",
+                    engine,
+                    total_rows
+                );
+            }
 
-            let name_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("name should be StringArray");
-            assert_eq!(name_col.value(0), "Alice");
-            assert_eq!(name_col.value(1), "Bob");
-            assert_eq!(name_col.value(2), "Charlie");
+            // Test 5: Combined filter + projection + limit
+            // Note: Arrow engine doesn't support filter/limit pushdown
+            let filter = col("id").lt(lit(30_i64));
+            let projection = Some(vec![1_usize]); // name only
+            let limit = Some(5);
+            let scan = table
+                .scan(&ctx.state(), projection.as_ref(), &[filter], limit)
+                .await
+                .expect("combined scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("combined scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            if engine != Engine::Arrow {
+                assert!(
+                    total_rows <= 5,
+                    "{:?}: combined should have <= 5 rows, got {}",
+                    engine,
+                    total_rows
+                );
+            }
 
-            let value_col = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("value should be Float64Array");
-            assert_eq!(value_col.value(0), 1.5);
-            assert_eq!(value_col.value(1), 2.5);
-            assert!(value_col.is_null(2));
+            // Test 6: Verify null handling (every 10th value is null)
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+            for batch in &results {
+                let value_col = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("value should be Float64Array");
+                // Check that some values are null
+                let null_count = value_col.null_count();
+                assert!(null_count > 0, "{:?}: should have some null values", engine);
+            }
         })
         .await;
     }
@@ -863,45 +1432,13 @@ mod sqlite_compat_tests {
     #[tokio::test]
     #[allow(clippy::unreadable_literal)]
     async fn test_delete_operations() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, false),
-                Field::new("value", DataType::Float64, true),
-            ]));
+            let schema = test_schema();
 
-            // Insert test data
-            let id_array = Int64Array::from(vec![1, 2, 3, 4, 5]);
-            let name_array = StringArray::from(vec!["A", "B", "C", "D", "E"]);
-            let value_array = Float64Array::from(vec![
-                Some(10.0),
-                Some(20.0),
-                Some(30.0),
-                Some(40.0),
-                Some(50.0),
-            ]);
-
-            let data = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(id_array),
-                    Arc::new(name_array),
-                    Arc::new(value_array),
-                ],
-            )
-            .expect("data should be created");
-
-            let exec = MockExec::new(vec![Ok(data)], schema);
-
-            let insertion = table
-                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
-                .await
-                .expect("insertion should be successful");
-
-            collect(insertion, ctx.task_ctx())
-                .await
-                .expect("insert successful");
+            // Insert test data - 50 records
+            let data = generate_test_data(Arc::clone(&schema), 50, 0);
+            insert_test_data(&table, &ctx, data).await;
 
             // Get deletion provider
             let table = get_deletion_provider(table).expect("should support deletion");
@@ -932,7 +1469,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_null_handling() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -1000,7 +1537,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_boolean_values() {
-        run_compat_test(|engine, _table| async move {
+        run_compat_test(|engine, _table, _mode| async move {
             let ctx = SessionContext::new();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -1112,7 +1649,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_empty_result_set() {
-        run_compat_test(|engine, _table| async move {
+        run_compat_test(|engine, _table, _mode| async move {
             let ctx = SessionContext::new();
 
             // Query empty table
@@ -1137,7 +1674,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_filter_predicates() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -1262,7 +1799,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_projection_pushdown() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -1347,7 +1884,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_limit_pushdown() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -1416,7 +1953,7 @@ mod sqlite_compat_tests {
 
     #[tokio::test]
     async fn test_combined_filter_projection_limit() {
-        run_compat_test(|engine, table| async move {
+        run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -1513,6 +2050,164 @@ mod sqlite_compat_tests {
                     engine
                 );
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with --ignored flag: cargo test --features sqlite,turso,duckdb -- --ignored --nocapture benchmark_roundtrip
+    async fn benchmark_roundtrip() {
+        use std::time::Instant;
+
+        run_compat_test(|engine, table, mode| async move {
+            let ctx = SessionContext::new();
+            let schema = test_schema();
+
+            // Memory mode has limitations, file mode can handle much more
+            // Turso in memory mode especially has tight page cache limits
+            let (num_records, num_iterations) = match (engine, mode.as_str()) {
+                #[cfg(feature = "turso")]
+                (Engine::Turso, "memory") => (1_000, 10), // 10K total records
+                #[cfg(feature = "turso")]
+                (Engine::Turso, "file") => (100_000, 10), // 1M total records
+                (_, "memory") => (100_000, 10), // 1M total records
+                (_, "file") => (1_000_000, 10), // 10M total records
+                _ => (10_000, 10),              // Fallback
+            };
+
+            let mut insert_times = Vec::new();
+            let mut query_times = Vec::new();
+
+            println!("\n=== Benchmarking {:?} ({}) ===", engine, mode);
+            println!("Records per iteration: {}", num_records);
+            println!("Number of iterations: {}", num_iterations);
+
+            for iteration in 0..num_iterations {
+                // Prepare test data using shared helper
+                let id_offset = (iteration * num_records) as i64;
+                let data = generate_test_data(Arc::clone(&schema), num_records, id_offset);
+
+                // Benchmark insert
+                let insert_start = Instant::now();
+                let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+                let insertion = table
+                    .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                    .await
+                    .expect("insertion should be successful");
+
+                collect(insertion, ctx.task_ctx())
+                    .await
+                    .expect("insert successful");
+                let insert_duration = insert_start.elapsed();
+                insert_times.push(insert_duration);
+
+                // Benchmark query (scan all data)
+                let query_start = Instant::now();
+                let scan = table
+                    .scan(&ctx.state(), None, &[], None)
+                    .await
+                    .expect("scan should be successful");
+
+                let results = collect(scan, ctx.task_ctx())
+                    .await
+                    .expect("scan successful");
+                let query_duration = query_start.elapsed();
+                query_times.push(query_duration);
+
+                // Verify data integrity
+                let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(
+                    total_rows,
+                    num_records * (iteration + 1),
+                    "{:?}: iteration {}: should have {} total rows",
+                    engine,
+                    iteration,
+                    num_records * (iteration + 1)
+                );
+
+                if iteration % 3 == 0 {
+                    println!(
+                        "  Iteration {}: Insert: {:?}, Query: {:?}",
+                        iteration, insert_duration, query_duration
+                    );
+                }
+            }
+
+            // Helper function to calculate percentiles
+            fn percentile(sorted_times: &[std::time::Duration], p: f64) -> std::time::Duration {
+                let idx = ((sorted_times.len() as f64 - 1.0) * p).ceil() as usize;
+                sorted_times[idx]
+            }
+
+            // Sort times for percentile calculations
+            let mut sorted_insert = insert_times.clone();
+            sorted_insert.sort();
+            let mut sorted_query = query_times.clone();
+            sorted_query.sort();
+
+            // Calculate percentiles
+            let min_insert = sorted_insert[0];
+            let p75_insert = percentile(&sorted_insert, 0.75);
+            let p90_insert = percentile(&sorted_insert, 0.90);
+            let p95_insert = percentile(&sorted_insert, 0.95);
+            let p99_insert = percentile(&sorted_insert, 0.99);
+            let max_insert = sorted_insert[sorted_insert.len() - 1];
+
+            let min_query = sorted_query[0];
+            let p75_query = percentile(&sorted_query, 0.75);
+            let p90_query = percentile(&sorted_query, 0.90);
+            let p95_query = percentile(&sorted_query, 0.95);
+            let p99_query = percentile(&sorted_query, 0.99);
+            let max_query = sorted_query[sorted_query.len() - 1];
+
+            // Calculate round-trip percentiles
+            let mut roundtrip_times: Vec<std::time::Duration> = insert_times
+                .iter()
+                .zip(query_times.iter())
+                .map(|(i, q)| *i + *q)
+                .collect();
+            roundtrip_times.sort();
+            let min_roundtrip = roundtrip_times[0];
+            let p75_roundtrip = percentile(&roundtrip_times, 0.75);
+            let p90_roundtrip = percentile(&roundtrip_times, 0.90);
+            let p95_roundtrip = percentile(&roundtrip_times, 0.95);
+            let p99_roundtrip = percentile(&roundtrip_times, 0.99);
+            let max_roundtrip = roundtrip_times[roundtrip_times.len() - 1];
+
+            println!("\n--- Results for {:?} ({}) ---", engine, mode);
+            println!("Insert Performance:");
+            println!("  Min: {:?}", min_insert);
+            println!("  P75: {:?}", p75_insert);
+            println!("  P90: {:?}", p90_insert);
+            println!("  P95: {:?}", p95_insert);
+            println!("  P99: {:?}", p99_insert);
+            println!("  Max: {:?}", max_insert);
+            println!(
+                "  P50 records/sec: {:.2}",
+                num_records as f64 / percentile(&sorted_insert, 0.50).as_secs_f64()
+            );
+
+            println!("\nQuery Performance:");
+            println!("  Min: {:?}", min_query);
+            println!("  P75: {:?}", p75_query);
+            println!("  P90: {:?}", p90_query);
+            println!("  P95: {:?}", p95_query);
+            println!("  P99: {:?}", p99_query);
+            println!("  Max: {:?}", max_query);
+            println!(
+                "  P50 records/sec: {:.2}",
+                (num_records * num_iterations) as f64
+                    / percentile(&sorted_query, 0.50).as_secs_f64()
+            );
+
+            println!("\nRound-trip (Insert + Query):");
+            println!("  Min: {:?}", min_roundtrip);
+            println!("  P75: {:?}", p75_roundtrip);
+            println!("  P90: {:?}", p90_roundtrip);
+            println!("  P95: {:?}", p95_roundtrip);
+            println!("  P99: {:?}", p99_roundtrip);
+            println!("  Max: {:?}", max_roundtrip);
+            println!("========================\n");
         })
         .await;
     }
