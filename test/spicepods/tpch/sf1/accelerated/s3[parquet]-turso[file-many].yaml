@@ -24,7 +24,8 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/lineitem.db
+      params:
+        turso_file: .spice/data/lineitem.db
   - from: s3:nation.parquet
     name: nation
     params: *s3_params
@@ -32,7 +33,8 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/nation.db
+      params:
+        turso_file: .spice/data/nation.db
   - from: s3:orders.parquet
     name: orders
     params: *s3_params
@@ -40,7 +42,8 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/orders.db
+      params:
+        turso_file: .spice/data/orders.db
   - from: s3:part.parquet
     name: part
     params: *s3_params
@@ -48,7 +51,8 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/part.db
+      params:
+        turso_file: .spice/data/part.db
   - from: s3:partsupp.parquet
     name: partsupp
     params: *s3_params
@@ -56,7 +60,8 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/partsupp.db
+      params:
+        turso_file: .spice/data/partsupp.db
   - from: s3:region.parquet
     name: region
     params: *s3_params
@@ -64,7 +69,8 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/region.db
+      params:
+        turso_file: .spice/data/region.db
   - from: s3:supplier.parquet
     name: supplier
     params: *s3_params
@@ -72,4 +78,5 @@ datasets:
       enabled: true
       engine: turso
       mode: file
-      turso_file: .spice/data/supplier.db
+      params:
+        turso_file: .spice/data/supplier.db

@@ -218,7 +218,9 @@ impl TursoAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("turso_file"),
+    ParameterSpec::component("turso_file")
+        .description("Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso")
+        .required(false),
     ParameterSpec::component("turso_mvcc")
         .description("Enable Multi-Version Concurrency Control (MVCC) for Turso database")
         .default("disabled")

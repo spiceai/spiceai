@@ -1562,7 +1562,7 @@ mod accelerator_compat_tests {
                 temporary: false,
             };
 
-            let bool_table = match engine {
+            let bool_table: Arc<dyn TableProvider> = match engine {
                 #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
