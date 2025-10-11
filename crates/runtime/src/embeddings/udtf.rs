@@ -63,20 +63,19 @@ use search::{
 };
 use snafu::ResultExt;
 
-#[cfg(feature = "s3_vectors")]
-use search::index::s3_vectors::S3Vector;
-
 use crate::{
     datafusion::DataFusion,
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    request::{AsyncMarker, RequestContext},
     search::util::{
         find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
         to_column_expr,
     },
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
+#[cfg(feature = "s3_vectors")]
+use search::index::s3_vectors::S3Vector;
 
 use search::index::chunking::ChunkedSearchIndex;
 use tokio::sync::RwLock;

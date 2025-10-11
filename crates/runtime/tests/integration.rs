@@ -86,6 +86,8 @@ mod retention;
 mod s3;
 #[cfg(feature = "postgres")]
 mod schema_evolution;
+#[cfg(feature = "snapshots")]
+mod snapshot_integration;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "spark")]
