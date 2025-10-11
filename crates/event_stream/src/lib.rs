@@ -39,7 +39,7 @@ limitations under the License.
 
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, RwLock};
 use tokio::sync::broadcast::{self, Receiver, Sender};
@@ -50,36 +50,6 @@ use tracing_subscriber::layer::{Context, Layer};
 
 #[derive(Debug, Snafu)]
 pub enum TracingError {
-    #[snafu(display("Failed to lock senders map for writing: {}", source))]
-    LockWriteSenders {
-        source: std::sync::PoisonError<
-            std::sync::RwLockWriteGuard<'static, HashMap<Id, Sender<String>>>,
-        >,
-    },
-    #[snafu(display("Failed to lock senders map for reading: {}", source))]
-    LockReadSenders {
-        source: std::sync::PoisonError<
-            std::sync::RwLockReadGuard<'static, HashMap<Id, Sender<String>>>,
-        >,
-    },
-    #[snafu(display("Failed to lock parents map for writing: {}", source))]
-    LockWriteParents {
-        source: std::sync::PoisonError<std::sync::RwLockWriteGuard<'static, HashMap<Id, Id>>>,
-    },
-    #[snafu(display("Failed to lock parents map for reading: {}", source))]
-    LockReadParents {
-        source: std::sync::PoisonError<std::sync::RwLockReadGuard<'static, HashMap<Id, Id>>>,
-    },
-    #[snafu(display("Failed to lock descendants map for writing: {}", source))]
-    LockWriteDescendants {
-        source:
-            std::sync::PoisonError<std::sync::RwLockWriteGuard<'static, HashMap<Id, HashSet<Id>>>>,
-    },
-    #[snafu(display("Failed to lock descendants map for reading: {}", source))]
-    LockReadDescendants {
-        source:
-            std::sync::PoisonError<std::sync::RwLockReadGuard<'static, HashMap<Id, HashSet<Id>>>>,
-    },
     #[snafu(display("Failed to set global subscriber: {}", source))]
     SetSubscriber {
         source: tracing::dispatcher::SetGlobalDefaultError,
@@ -102,7 +72,7 @@ static EVENT_STREAM_STORE: LazyLock<EventStreamStore> = LazyLock::new(EventStrea
 pub fn get_event_stream() -> Result<Pin<Box<dyn Stream<Item = String> + Send>>, TracingError> {
     let current_span = tracing::Span::current();
     let span_id = current_span.id().ok_or(TracingError::NoSpanId)?;
-    let rx = EVENT_STREAM_STORE.get_receiver(span_id)?;
+    let rx = EVENT_STREAM_STORE.get_receiver(span_id);
     let stream = BroadcastStream::new(rx).filter_map(|res| async move { res.ok() });
     Ok(Box::pin(stream))
 }
@@ -121,36 +91,46 @@ impl EventStreamStore {
         }
     }
 
-    fn get_receiver(&'static self, span_id: Id) -> Result<Receiver<String>, TracingError> {
+    fn get_receiver(&'static self, span_id: Id) -> Receiver<String> {
         {
-            let senders = self.senders.read().context(LockReadSendersSnafu)?;
+            let senders = self.senders.read().unwrap_or_else(|e| {
+                tracing::error!("EventStreamStore lock poisoned: {}", e);
+                e.into_inner()
+            });
             if let Some(sender) = senders.get(&span_id) {
-                return Ok(sender.subscribe());
+                return sender.subscribe();
             }
         }
 
         let (tx, rx) = broadcast::channel(16);
-        let mut senders = self.senders.write().context(LockWriteSendersSnafu)?;
+        let mut senders = self.senders.write().unwrap_or_else(|e| {
+            tracing::error!("EventStreamStore lock poisoned: {}", e);
+            e.into_inner()
+        });
         senders.entry(span_id).or_insert(tx);
-        Ok(rx)
+        rx
     }
 
-    fn register_span(
-        &'static self,
-        span_id: &Id,
-        parent_id: Option<Id>,
-    ) -> Result<(), TracingError> {
+    fn register_span(&'static self, span_id: &Id, parent_id: Option<Id>) {
         if let Some(parent) = parent_id {
-            let mut parents = self.parents.write().context(LockWriteParentsSnafu)?;
+            let mut parents = self.parents.write().unwrap_or_else(|e| {
+                tracing::error!("EventStreamStore lock poisoned: {}", e);
+                e.into_inner()
+            });
             parents.insert(span_id.clone(), parent.clone());
         }
-        Ok(())
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn send_event(&'static self, span_id: &Id, event: String) -> Result<(), TracingError> {
-        let senders = self.senders.read().context(LockReadSendersSnafu)?;
-        let parents = self.parents.read().context(LockReadParentsSnafu)?;
+    fn send_event(&'static self, span_id: &Id, event: String) {
+        let senders = self.senders.read().unwrap_or_else(|e| {
+            tracing::error!("EventStreamStore lock poisoned: {}", e);
+            e.into_inner()
+        });
+        let parents = self.parents.read().unwrap_or_else(|e| {
+            tracing::error!("EventStreamStore lock poisoned: {}", e);
+            e.into_inner()
+        });
 
         // Send to the span itself and all ancestors
         let mut current_id = Some(span_id.clone());
@@ -160,17 +140,20 @@ impl EventStreamStore {
             }
             current_id = parents.get(&id).cloned();
         }
-        Ok(())
     }
 
-    fn unregister_span(&'static self, span_id: &Id) -> Result<(), TracingError> {
-        let mut senders = self.senders.write().context(LockWriteSendersSnafu)?;
+    fn unregister_span(&'static self, span_id: &Id) {
+        let mut senders = self.senders.write().unwrap_or_else(|e| {
+            tracing::error!("EventStreamStore lock poisoned: {}", e);
+            e.into_inner()
+        });
         senders.remove(span_id);
 
-        let mut parents = self.parents.write().context(LockWriteParentsSnafu)?;
+        let mut parents = self.parents.write().unwrap_or_else(|e| {
+            tracing::error!("EventStreamStore lock poisoned: {}", e);
+            e.into_inner()
+        });
         parents.remove(span_id);
-
-        Ok(())
     }
 }
 
@@ -192,7 +175,7 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
 {
     fn on_new_span(&self, _attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let parent_id = ctx.span(id).and_then(|s| s.parent().map(|p| p.id()));
-        let _ = EVENT_STREAM_STORE.register_span(id, parent_id);
+        EVENT_STREAM_STORE.register_span(id, parent_id);
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -210,13 +193,13 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
             };
             event.record(&mut visitor);
             if !message.is_empty() {
-                let _ = EVENT_STREAM_STORE.send_event(span_id, message);
+                EVENT_STREAM_STORE.send_event(span_id, message);
             }
         }
     }
 
     fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
-        let _ = EVENT_STREAM_STORE.unregister_span(&id);
+        EVENT_STREAM_STORE.unregister_span(&id);
     }
 }
 

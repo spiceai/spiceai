@@ -24,10 +24,8 @@ use headers_accept::Accept;
 use http::header::CONTENT_TYPE;
 use serde::Deserialize;
 
-use crate::{
-    datafusion::{param_utils, request_context_extension::get_current_datafusion},
-    request::{AsyncMarker, RequestContext},
-};
+use crate::datafusion::{param_utils, request_context_extension::get_current_datafusion};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{ResponseMimeType, sql_to_http_response};
 

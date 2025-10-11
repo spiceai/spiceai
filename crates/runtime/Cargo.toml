@@ -128,6 +128,7 @@ runtime-parameters = { path = "../runtime-parameters" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-table-partition = { path = "../runtime-table-partition" }
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true

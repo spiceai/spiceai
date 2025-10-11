@@ -55,7 +55,6 @@ impl Runtime {
                 Arc::clone(&self)
                     .apply_catalog_diff(current_app, &new_app)
                     .await;
-                #[allow(clippy::large_futures)]
                 Arc::clone(&self)
                     .apply_dataset_diff(current_app, &new_app)
                     .await;

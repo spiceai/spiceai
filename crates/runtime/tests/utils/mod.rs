@@ -31,7 +31,7 @@ use tracing_subscriber::{EnvFilter, Layer, filter, fmt, layer::SubscriberExt};
 use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
-use runtime::request::{Protocol, RequestContext, UserAgent};
+use runtime_request_context::{Protocol, RequestContext, UserAgent};
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
     Arc::new(

@@ -19,7 +19,6 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
-use crate::request::{AsyncMarker, RequestContext};
 use crate::search::search_engine::SearchEngine;
 use crate::{
     Runtime,
@@ -30,6 +29,7 @@ use crate::{
     },
     tools::{SpiceModelTool, utils::parameters},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub struct SearchTool {
     name: String,

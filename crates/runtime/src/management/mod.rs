@@ -55,10 +55,9 @@ use crate::{
         DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,
     },
     dataupdate::{DataUpdate, UpdateType},
-    get_params_with_secrets,
-    secrets::Secrets,
     task_history::DEFAULT_TASK_HISTORY_TABLE,
 };
+use runtime_secrets::{Secrets, get_params_with_secrets};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

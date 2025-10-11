@@ -21,8 +21,9 @@ pub use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use spicepod::component::secret::Secret as SpicepodSecret;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use stores::env::EnvSecretStoreBuilder;
+use tokio::sync::RwLock;
 
 mod lexer;
 pub mod stores;
@@ -232,6 +233,25 @@ pub enum SecretStoreType {
     Kubernetes(String),
     #[cfg(feature = "aws-secrets-manager")]
     AwsSecretsManager(String),
+}
+
+#[allow(clippy::implicit_hasher)]
+pub async fn get_params_with_secrets(
+    secrets: Arc<RwLock<Secrets>>,
+    params: &HashMap<String, String>,
+) -> HashMap<String, SecretString> {
+    let secrets = secrets.read().await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+    // Inject secrets from the user-supplied params.
+    // This will replace any instances of `${ store:key }` with the actual secret value.
+    for (k, v) in params {
+        let secret = secrets.inject_secrets(k, ParamStr(v)).await;
+        params_with_secrets.insert(k.clone(), secret);
+    }
+
+    params_with_secrets
 }
 
 #[allow(clippy::result_large_err)]
