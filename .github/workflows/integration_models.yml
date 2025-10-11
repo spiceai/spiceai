@@ -315,34 +315,6 @@ jobs:
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture local_embeddings_beta_requirements
 
-      - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
-        uses: ./.github/actions/push-snap-changes
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  test-ai-udf-local:
-    name: Test AI UDF in Local Mode
-    needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    permissions: read-all
-    runs-on: [ self-hosted, spiceai-macos ]
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Download test binary
-        uses: actions/download-artifact@v5
-        with:
-          name: ai-integration-test-binary
-          path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
-
       - name: Run AI UDF with local model test
         env:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
