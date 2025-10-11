@@ -47,10 +47,14 @@ use std::ops::ControlFlow;
 
 use datafusion::{
     catalog::Session,
-    datasource::{TableProvider, sink::DataSink},
+    common::SchemaExt,
+    datasource::{
+        TableProvider,
+        sink::{DataSink, DataSinkExec},
+    },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -968,6 +972,33 @@ impl TableProvider for TursoTableProvider {
             filters,
             limit,
         )))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        _overwrite: InsertOp,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Check that the input schema matches the table schema
+        if let Err(e) = self
+            .schema()
+            .logically_equivalent_names_and_types(&input.schema())
+        {
+            return Err(DataFusionError::Execution(format!(
+                "Inserting query must have the same schema as the table. {e}"
+            )));
+        }
+
+        // Create the data sink for INSERT operations
+        let sink = Arc::new(TursoDataSink::new(
+            Arc::clone(&self.pool),
+            self.table_name.clone(),
+            Arc::clone(&self.schema),
+        ));
+
+        // Wrap in DataSinkExec to execute the insertion
+        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 }
 
