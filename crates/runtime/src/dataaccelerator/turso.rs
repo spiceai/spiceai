@@ -44,7 +44,7 @@ limitations under the License.
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
-use data_components::turso::{TursoConnectionPool, TursoExec, TursoTableProvider};
+use data_components::turso::TursoTableProvider;
 use datafusion::{datasource::TableProvider, logical_expr::CreateExternalTable};
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
@@ -111,7 +111,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 // All Turso data components (TursoConnectionPool, TursoTableProvider, TursoExec,
 // TursoDataSink, TursoDeletionSink) are now imported from data_components::turso
 
-// Re-export TursoConnectionPool so it can be used by other runtime modules
+// Re-export for use within the runtime crate
 pub use data_components::turso::TursoConnectionPool;
 
 pub struct TursoAccelerator {
@@ -609,6 +609,7 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use data_components::delete::get_deletion_provider;
+    use data_components::turso::TursoExec;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
