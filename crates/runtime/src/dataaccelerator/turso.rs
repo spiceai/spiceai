@@ -1593,29 +1593,39 @@ impl TursoAccelerator {
         }
     }
 
-    /// Returns the `Turso` file path that would be used for a file-based `Turso` accelerator from this dataset
+    /// Returns the database path for a Turso accelerator.
+    ///
+    /// This function determines the appropriate database path based on the acceleration mode:
+    /// - **Memory mode** (`!is_file_accelerated()`): Returns `":memory:"` for in-memory database
+    /// - **File mode** (`is_file_accelerated()`): Returns a file path, which can be:
+    ///   - User-specified via `turso_file` parameter, or
+    ///   - Auto-generated default path: `{spice_data_dir}/{dataset_name}.turso`
+    ///
+    /// Note: This function will never return `":memory:"` when called with file mode.
     pub fn turso_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
-        // Memory mode uses ":memory:" as the path
+        // Check acceleration mode first
         if !source.is_file_accelerated() {
+            // Memory mode: always use in-memory database
             return Ok(":memory:".to_string());
         }
 
+        // File mode: determine the file path to use
         if let Some(acceleration) = source.acceleration() {
             let acceleration_params = &acceleration.params;
 
-            // Check for remote database parameters (not supported as accelerator)
+            // Remote databases are not supported as accelerators
             if acceleration_params.contains_key("turso_url")
                 || acceleration_params.contains_key("turso_auth_token")
             {
                 return Err(Error::RemoteDatabaseNotSupported);
             }
 
-            // Check if user specified a custom file path
+            // Use custom file path if specified
             if let Some(turso_file) = acceleration_params.get("turso_file") {
                 return Ok(turso_file.clone());
             }
 
-            // Use default path based on dataset name
+            // Generate default file path based on dataset name
             let data_directory = spice_data_base_path();
             let name_str = source.name().to_string().replace('/', "_");
             let file_name = format!("{}.turso", name_str);
@@ -1702,13 +1712,16 @@ impl DataAccelerator for TursoAccelerator {
         self.has_existing_file(source)
     }
 
-    /// Initializes a `Turso` database for the dataset
-    /// Turso supports both file and memory modes
+    /// Initializes a Turso database for the dataset.
+    ///
+    /// Supports two acceleration modes:
+    /// - **Memory mode**: Creates an in-memory database (path = ":memory:")
+    /// - **File mode**: Creates a file-based database at the specified or default path
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Check for remote database parameters early
+        // Reject remote database configurations (not supported as accelerators)
         if let Some(acceleration) = source.acceleration()
             && (acceleration.params.contains_key("turso_url")
                 || acceleration.params.contains_key("turso_auth_token"))
@@ -1718,14 +1731,13 @@ impl DataAccelerator for TursoAccelerator {
 
         let path = self.file_path(source)?;
 
-        // Skip file operations for memory mode
+        // Handle memory mode: no file operations needed
         if path == ":memory:" {
-            // Initialize the in-memory database
             self.get_connection(source).await?;
             return Ok(());
         }
 
-        // File mode initialization
+        // Handle file mode: validate path and setup file-based database
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("turso_file") {
                 make_spice_data_directory()
@@ -1770,13 +1782,16 @@ impl DataAccelerator for TursoAccelerator {
             }
         );
 
-        // Determine the database path (supports both file and memory modes)
+        // Determine the database path
+        // When called with a source (from DataAccelerator trait), turso_file_path returns:
+        //   - ":memory:" for memory mode (!is_file_accelerated())
+        //   - A file path for file mode (is_file_accelerated())
+        // When called without a source (standalone external table), use provided file or memory mode
         let db_path = if let Some(source) = source {
             self.turso_file_path(source)?
         } else if let Some(file) = cmd.options.get("file") {
             file.clone()
         } else {
-            // Default to memory mode if no file specified
             ":memory:".to_string()
         };
 
