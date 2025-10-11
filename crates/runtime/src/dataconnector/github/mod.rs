@@ -22,6 +22,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
 use commits::CommitsTableArgs;
+use projects::ProjectsTableArgs;
 use data_components::graphql::client::UnnestBehavior;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
@@ -66,6 +67,7 @@ use super::{
 mod commits;
 mod issues;
 mod members;
+mod projects;
 mod pull_requests;
 mod rate_limit;
 mod stargazers;
@@ -268,6 +270,12 @@ impl Github {
             None => None,
         };
 
+        let include_commits = dataset
+            .params
+            .get("github_include_commits")
+            .map(|value| value.as_str() == "true")
+            .unwrap_or(false);
+
         Ok(Arc::new(
             GithubFilesTableProvider::new(
                 client,
@@ -276,6 +284,7 @@ impl Github {
                 tree_sha,
                 include,
                 dataset.is_accelerated(),
+                include_commits,
             )
             .await
             .map_err(|e| {
@@ -368,6 +377,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("max_comments_fetched")
         .description("Maximum number of comments to fetch per discussion or review thread.")
         .default("100"),
+    ParameterSpec::component("include_commits")
+        .description("Whether to fetch commit information (created_at, updated_at) for files. Set to 'true' to enable.")
+        .default("false"),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -641,6 +653,34 @@ impl DataConnector for Github {
                 warn_if_provided(pull_request_specific_params, "files", &component);
                 self.create_files_table_provider(owner, repo, parts.next(), dataset)
                     .await
+            }
+            (Some("github.com"), Some(owner), Some(repo), Some("projects")) => {
+                warn_if_provided(pull_request_specific_params, "projects", &component);
+                let table_args = Arc::new(ProjectsTableArgs {
+                    owner: owner.to_string(),
+                    repo: Some(repo.to_string()),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    table_args, 
+                    None, 
+                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                )
+                .await
+            }
+            (Some("github.com"), Some(owner), Some("projects"), None) => {
+                warn_if_provided(pull_request_specific_params, "projects", &component);
+                let table_args = Arc::new(ProjectsTableArgs {
+                    owner: owner.to_string(),
+                    repo: None,
+                    component,
+                });
+                self.create_gql_table_provider(
+                    table_args,
+                    None,
+                    Github::get_health_check_for_org(owner)
+                )
+                .await
             }
             (Some("github.com"), Some(org), Some("members"), None) => {
                 warn_if_provided(pull_request_specific_params, "members", &component);
