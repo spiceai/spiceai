@@ -518,7 +518,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             flight: deserializer.flight,
             shutdown_timeout: deserializer.shutdown_timeout,
             output_level: deserializer.output_level,
-            query: Some(query),
+            query: if query == Query::default() { None } else { Some(query) },
         })
     }
 }
