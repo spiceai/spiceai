@@ -22,6 +22,7 @@ use std::{
 
 pub mod fibonacci_backoff;
 pub use backoff::Error as RetryError;
+pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
 mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};

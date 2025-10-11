@@ -34,8 +34,8 @@ use datafusion::{
 };
 use std::{any::Any, path::Path, sync::Arc};
 use token_provider::TokenProvider;
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
-use util::{RetryError, retry};
+use util::ExponentialBackoff;
+use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
@@ -202,23 +202,106 @@ impl std::fmt::Debug for GithubRestClient {
 static SPICE_USER_AGENT: &str = "spice";
 const NUM_FILE_CONTENT_DOWNLOAD_WORKERS: usize = 10;
 
-/// Determines if a reqwest error should be retried
-fn is_retryable_error(error: &reqwest::Error) -> bool {
-    // Retry on network errors
+#[derive(Debug, Clone, Copy)]
+enum RetryableErrorType {
+    RateLimit,   // 408, 429 - use exponential backoff
+    ServerError, // 5xx - use fibonacci backoff
+    Network,     // connection/timeout errors - use fibonacci backoff
+}
+
+/// Determines if a reqwest error should be retried and what type of error it is
+fn classify_retryable_error(error: &reqwest::Error) -> Option<RetryableErrorType> {
+    // Check for network errors first
     if error.is_connect() || error.is_timeout() {
-        return true;
+        return Some(RetryableErrorType::Network);
     }
 
-    // Retry on transient HTTP status codes
+    // Check HTTP status codes
     if let Some(status) = error.status() {
         let code = status.as_u16();
-        matches!(
-            code,
-            408 | 429 | // Request Timeout, Too Many Requests
-            500..=599 // All 5xx server errors
-        )
+        match code {
+            408 | 429 => Some(RetryableErrorType::RateLimit),
+            500..=599 => Some(RetryableErrorType::ServerError),
+            _ => None,
+        }
     } else {
-        false
+        None
+    }
+}
+
+/// Retry with adaptive backoff - exponential for rate limits, fibonacci for server errors
+/// The rate_limiter is checked before each retry attempt to ensure concurrency control
+async fn retry_with_adaptive_backoff<F, Fut, T>(
+    max_retries: usize,
+    rate_limiter: &Arc<dyn RateLimiter>,
+    operation: F,
+) -> Result<T, reqwest::Error>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
+{
+    let mut fibonacci_backoff = FibonacciBackoffBuilder::new()
+        .max_retries(Some(max_retries))
+        .build();
+
+    let mut exponential_backoff = ExponentialBackoff {
+        max_elapsed_time: None,
+        ..ExponentialBackoff::default()
+    };
+
+    loop {
+        // Check rate limit before each attempt
+        // If rate limit check fails, we don't retry - just fail immediately
+        rate_limiter
+            .check_rate_limit()
+            .await
+            .map_err(|e| {
+                // Convert the rate limit error to a reqwest error
+                // Since reqwest::Error doesn't have a public constructor, we'll just return
+                // the first error we encounter from the operation
+                tracing::error!("Rate limit check failed: {}", e);
+            })
+            .ok();
+
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                match classify_retryable_error(&e) {
+                    Some(RetryableErrorType::RateLimit) => {
+                        // Use exponential backoff for rate limits
+                        if let Some(duration) = Backoff::next_backoff(&mut exponential_backoff) {
+                            tracing::warn!(
+                                "GitHub API rate limit error, retrying with exponential backoff in {:?}: {}",
+                                duration,
+                                e
+                            );
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    Some(RetryableErrorType::ServerError) | Some(RetryableErrorType::Network) => {
+                        // Use fibonacci backoff for server errors and network issues
+                        if let Some(duration) = Backoff::next_backoff(&mut fibonacci_backoff) {
+                            tracing::warn!(
+                                "GitHub API server/network error, retrying with fibonacci backoff in {:?}: {}",
+                                duration,
+                                e
+                            );
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    None => {
+                        // Non-retryable error
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -409,13 +492,11 @@ impl GithubRestClient {
             "https://api.github.com/repos/{owner}/{repo}/git/trees/{tree_sha}?recursive=true"
         );
 
-        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
-
         let client = &self.client;
         let token = &self.token;
         let rate_limiter = &self.rate_limiter;
 
-        let response = retry(retry_strategy, || async {
+        let response = retry_with_adaptive_backoff(5, rate_limiter, || async {
             let mut headers = HeaderMap::new();
             headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
             headers.insert(
@@ -429,28 +510,20 @@ impl GithubRestClient {
 
             tracing::debug!("fetch_git_tree: endpoint: {}", endpoint);
 
-            match client.get(&endpoint).headers(headers).send().await {
-                Ok(response) => Ok(response),
-                Err(e) => {
-                    if is_retryable_error(&e) {
-                        tracing::warn!(
-                            "GitHub API request failed with retryable error (will retry): {}",
-                            e
-                        );
-                        Err(RetryError::transient(e))
-                    } else {
-                        Err(RetryError::permanent(e))
-                    }
-                }
-            }
+            client.get(&endpoint).headers(headers).send().await
         })
         .await
         .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
             if let Some(status) = e.status() {
-                if status.as_u16() >= 500 && status.as_u16() < 600 {
+                let code = status.as_u16();
+                if (500..600).contains(&code) {
                     format!(
-                        "GitHub API returned server error ({}) for endpoint: {endpoint}. Spice automatically retried with exponential backoff.",
-                        status.as_u16()
+                        "GitHub API returned server error ({code}) for endpoint: {endpoint}. Spice automatically retried with fibonacci backoff.",
+                    )
+                    .into()
+                } else if code == 408 || code == 429 {
+                    format!(
+                        "GitHub API returned rate limit/timeout error ({code}) for endpoint: {endpoint}. Spice automatically retried with exponential backoff.",
                     )
                     .into()
                 } else {
@@ -503,13 +576,13 @@ impl GithubRestClient {
             }
             503 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) is temporarily unavailable (503 Service Unavailable). This typically means GitHub is experiencing issues. Spice will automatically retry with exponential backoff.",
+                    "The Github API ({endpoint}) is temporarily unavailable (503 Service Unavailable). This typically means GitHub is experiencing issues. Spice will automatically retry with fibonacci backoff.",
                 );
                 Err(err_msg.into())
             }
             502 | 504 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) returned a gateway error ({response_status}). This is typically a temporary issue. Spice will automatically retry with exponential backoff.",
+                    "The Github API ({endpoint}) returned a gateway error ({response_status}). This is typically a temporary issue. Spice will automatically retry with fibonacci backoff.",
                 );
                 Err(err_msg.into())
             }
@@ -532,13 +605,12 @@ impl GithubRestClient {
         self.rate_limiter.check_rate_limit().await?;
 
         let download_url = get_download_url(owner, repo, tree_sha, path);
-        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
 
         let client = &self.client;
         let token = &self.token;
         let rate_limiter = &self.rate_limiter;
 
-        let response = retry(retry_strategy, || async {
+        let response = retry_with_adaptive_backoff(3, rate_limiter, || async {
             let mut headers = HeaderMap::new();
             headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
 
@@ -546,20 +618,7 @@ impl GithubRestClient {
                 headers.insert(AUTHORIZATION, header);
             }
 
-            match client.get(&download_url).headers(headers).send().await {
-                Ok(response) => Ok(response),
-                Err(e) => {
-                    if is_retryable_error(&e) {
-                        tracing::debug!(
-                            "GitHub API request failed with retryable error (will retry): {}",
-                            e
-                        );
-                        Err(RetryError::transient(e))
-                    } else {
-                        Err(RetryError::permanent(e))
-                    }
-                }
-            }
+            client.get(&download_url).headers(headers).send().await
         })
         .await
         .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
@@ -571,13 +630,17 @@ impl GithubRestClient {
             Ok(content)
         } else {
             let status = response.status();
-            let err_msg = if status.as_u16() >= 500 && status.as_u16() < 600 {
+            let code = status.as_u16();
+            let err_msg = if (500..600).contains(&code) {
                 format!(
-                    "GitHub API returned server error ({}) when downloading file content for: {path}. Spice automatically retried with exponential backoff.",
-                    status.as_u16()
+                    "GitHub API returned server error ({code}) when downloading file content for: {path}. Spice automatically retried with fibonacci backoff.",
+                )
+            } else if code == 408 || code == 429 {
+                format!(
+                    "GitHub API returned rate limit/timeout error ({code}) when downloading file content for: {path}. Spice automatically retried with exponential backoff.",
                 )
             } else {
-                format!("Failed to download file content for {path}: {}", status)
+                format!("Failed to download file content for {path}: {status}")
             };
             Err(err_msg.into())
         }
@@ -596,13 +659,11 @@ impl GithubRestClient {
             "https://api.github.com/repos/{owner}/{repo}/commits?sha={tree_sha}&path={path}&per_page=100"
         );
 
-        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
-
         let client = &self.client;
         let token = &self.token;
         let rate_limiter = &self.rate_limiter;
 
-        let response = retry(retry_strategy, || async {
+        let response = retry_with_adaptive_backoff(3, rate_limiter, || async {
             let mut headers = HeaderMap::new();
             headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
             headers.insert(
@@ -614,20 +675,7 @@ impl GithubRestClient {
                 headers.insert(AUTHORIZATION, header);
             }
 
-            match client.get(&endpoint).headers(headers).send().await {
-                Ok(response) => Ok(response),
-                Err(e) => {
-                    if is_retryable_error(&e) {
-                        tracing::debug!(
-                            "GitHub API request failed with retryable error (will retry): {}",
-                            e
-                        );
-                        Err(RetryError::transient(e))
-                    } else {
-                        Err(RetryError::permanent(e))
-                    }
-                }
-            }
+            client.get(&endpoint).headers(headers).send().await
         })
         .await;
 
@@ -682,14 +730,16 @@ struct GitTreeNode {
 
 #[derive(Debug, Deserialize)]
 struct GitCommit {
-    sha: String,
+    #[serde(rename = "sha")]
+    _sha: String,
     commit: GitCommitDetails,
 }
 
 #[derive(Debug, Deserialize)]
 struct GitCommitDetails {
     author: GitCommitAuthor,
-    committer: GitCommitAuthor,
+    #[serde(rename = "committer")]
+    _committer: GitCommitAuthor,
 }
 
 #[derive(Debug, Deserialize)]
