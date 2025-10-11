@@ -195,19 +195,17 @@ impl TursoTableProvider {
         rows: &[Vec<TursoValue>],
         schema: &SchemaRef,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        use arrow::array::*;
-
-        let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+        let mut columns: Vec<Arc<dyn Array>> = Vec::new();
 
         for (col_idx, field) in schema.fields().iter().enumerate() {
-            let column: Arc<dyn arrow::array::Array> = match field.data_type() {
+            let column: Arc<dyn Array> = match field.data_type() {
                 DataType::Int8 => {
                     let values: Vec<Option<i8>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => i8::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(Int8Array::from(values))
@@ -218,7 +216,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => i16::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(Int16Array::from(values))
@@ -229,7 +227,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => i32::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(Int32Array::from(values))
@@ -240,7 +238,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => Some(*i),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(Int64Array::from(values))
@@ -251,7 +249,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => u8::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(UInt8Array::from(values))
@@ -262,7 +260,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => u16::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(UInt16Array::from(values))
@@ -273,7 +271,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => u32::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(UInt32Array::from(values))
@@ -284,7 +282,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => u64::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(arrow::array::UInt64Array::from(values))
@@ -296,7 +294,7 @@ impl TursoTableProvider {
                             TursoValue::Real(f) => Some(*f),
                             TursoValue::Integer(i) => Some(*i as f64),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(Float64Array::from(values))
@@ -308,7 +306,7 @@ impl TursoTableProvider {
                             TursoValue::Real(f) => Some(*f as f32),
                             TursoValue::Integer(i) => Some(*i as f32),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(arrow::array::Float32Array::from(values))
@@ -319,7 +317,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Text(s) => Some(s.clone()),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(StringArray::from(values))
@@ -330,7 +328,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Text(s) => Some(s.clone()),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(LargeStringArray::from(values))
@@ -341,7 +339,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => Some(*i != 0),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(BooleanArray::from(values))
@@ -352,7 +350,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Blob(b) => Some(b.as_slice()),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(BinaryArray::from(values))
@@ -363,7 +361,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Blob(b) => Some(b.as_slice()),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(LargeBinaryArray::from(values))
@@ -386,7 +384,7 @@ impl TursoTableProvider {
                                 })
                             }
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
 
@@ -416,7 +414,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => i32::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(Date32Array::from(values))
@@ -428,7 +426,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => Some(*i),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(Date64Array::from(values))
@@ -440,7 +438,7 @@ impl TursoTableProvider {
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => i32::try_from(*i).ok(),
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     match unit {
@@ -529,7 +527,7 @@ impl TursoTableProvider {
                                 .map(|row| match &row[col_idx] {
                                     TursoValue::Integer(i) => i32::try_from(*i).ok(),
                                     TursoValue::Null => None,
-                                    _ => None,
+                                    _ => Err(Error::MissingColumnForRow {}),
                                 })
                                 .collect();
                             Arc::new(arrow::array::IntervalYearMonthArray::from(values))
@@ -546,7 +544,7 @@ impl TursoTableProvider {
                                         Some(IntervalDayTime::new(days, milliseconds))
                                     }
                                     TursoValue::Null => None,
-                                    _ => None,
+                                    _ => Err(Error::MissingColumnForRow {}),
                                 })
                                 .collect();
                             Arc::new(arrow::array::IntervalDayTimeArray::from(values))
@@ -572,7 +570,7 @@ impl TursoTableProvider {
                                         )
                                     }
                                     TursoValue::Null => None,
-                                    _ => None,
+                                    _ => Err(Error::MissingColumnForRow {}),
                                 })
                                 .collect();
                             Arc::new(arrow::array::IntervalMonthDayNanoArray::from(values))
@@ -703,7 +701,7 @@ impl TursoTableProvider {
                                 Some(*i as i128 * scale_factor)
                             }
                             TursoValue::Null => None,
-                            _ => None,
+                            _ => Err(Error::MissingColumnForRow {}),
                         })
                         .collect();
                     Arc::new(
@@ -853,7 +851,7 @@ impl TableProvider for TursoTableProvider {
                 Arc::clone(&self.schema),
             )),
             None,
-        )) as _)
+        )))
     }
 }
 
