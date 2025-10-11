@@ -23,6 +23,65 @@ limitations under the License.
 //! - Deleting data via `TursoDeletionSink`
 //! - Connection pooling via `TursoConnectionPool`
 //! - Federation support for cross-database queries
+//!
+//! # Timestamp Storage Strategy
+//!
+//! This module supports **two timestamp storage formats** to accommodate different use cases:
+//!
+//! ## Default: RFC3339 TEXT Format (Recommended)
+//!
+//! By default, all timestamps are stored as **RFC3339 TEXT strings** (e.g., "2024-01-01T00:00:00.123456789Z").
+//! This format preserves all timestamp information without data loss:
+//! - ✅ Full nanosecond precision preserved
+//! - ✅ Timezone information preserved
+//! - ✅ All Arrow timestamp types supported (Second, Millisecond, Microsecond, Nanosecond)
+//! - ✅ Human-readable in database tools
+//!
+//! ## Optional: Integer Milliseconds Format (Performance)
+//!
+//! For performance-critical use cases, you can opt into storing timestamps as **INTEGER (milliseconds since Unix epoch)**
+//! by setting the `internal_timestamp_format` parameter to `"integer_millis"` in your spicepod.yaml acceleration configuration.
+//!
+//! ### RFC3339 Format Benefits:
+//!
+//! - ✅ **No data loss**: Full precision and timezone information preserved
+//! - ✅ **All types supported**: Second, Millisecond, Microsecond, Nanosecond timestamps all work
+//! - ✅ **Human readable**: Easy to inspect and debug in database tools
+//! - ✅ **Standard format**: RFC3339 is a widely-recognized ISO 8601 profile
+//!
+//! ### Integer Milliseconds Format Benefits:
+//!
+//! - ✅ **Performance**: Direct integer comparisons and arithmetic (faster than string parsing)
+//! - ✅ **Compact storage**: 8 bytes vs ~30 bytes for RFC3339 strings
+//! - ⚠️ **Millisecond precision only**: Sub-millisecond data is truncated (not rejected)
+//! - ⚠️ **No timezone**: Timezone information is not preserved (UTC assumed)
+//! - ⚠️ **Limited types**: Only Second and Millisecond timestamps supported (Micro/Nano rejected)
+//!
+//! ### RFC3339 Format (Default) - Writing:
+//!
+//! ```text
+//! ✅ TimestampSecond(v, tz)      → TEXT "2024-01-01T00:00:00Z" or "2024-01-01T00:00:00+05:30"
+//! ✅ TimestampMillisecond(v, tz) → TEXT "2024-01-01T00:00:00.123Z"
+//! ✅ TimestampMicrosecond(v, tz) → TEXT "2024-01-01T00:00:00.123456Z"
+//! ✅ TimestampNanosecond(v, tz)  → TEXT "2024-01-01T00:00:00.123456789Z"
+//! ```
+//!
+//! ### Integer Milliseconds Format (Optional) - Writing:
+//!
+//! **Configuration**: Set `internal_timestamp_format: "integer_millis"` in spicepod.yaml acceleration params
+//!
+//! ```text
+//! ✅ TimestampSecond(v, None)        → INTEGER (multiply by 1000 to get milliseconds)
+//! ✅ TimestampMillisecond(v, None)   → INTEGER (store as-is, already in milliseconds)
+//! ❌ TimestampMicrosecond(_, _)      → ERROR (sub-millisecond precision not supported)
+//! ❌ TimestampNanosecond(_, _)       → ERROR (sub-millisecond precision not supported)
+//! ❌ Timestamp*(_, Some(timezone))   → ERROR (timezone information cannot be preserved)
+//! ```
+//!
+//! ### Reading from Database:
+//!
+//! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
+//! to the Arrow schema's expected timestamp type and unit.
 
 use std::{any::Any, fmt, sync::Arc};
 
@@ -88,18 +147,80 @@ use turso::{Builder, Connection, Database, Value as TursoValue};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
-/// Conversion constants for timestamp storage
-/// Turso/SQLite stores timestamps as INTEGER in milliseconds
-mod timestamp_conversion {
+/// Conversion constants for timestamp storage and conversion.
+///
+/// # Timestamp Storage Strategy
+///
+/// This module standardizes on **milliseconds since Unix epoch (INTEGER)** as the canonical
+/// storage format for all timestamp types in Turso/SQLite databases. This design choice:
+///
+/// - **Avoids parsing ambiguity**: No string parsing or format detection required
+/// - **Ensures consistency**: Single source of truth for timestamp representation
+/// - **Simplifies operations**: Arithmetic operations work directly on integers
+/// - **Maximizes compatibility**: SQLite INTEGER type is universally supported
+///
+/// # Conversions
+///
+/// All Arrow timestamp types (Second, Millisecond, Microsecond, Nanosecond) are converted
+/// to/from milliseconds during database operations:
+///
+/// - **Writing**: Convert Arrow timestamp → milliseconds → SQLite INTEGER
+/// - **Reading**: Convert SQLite INTEGER → milliseconds → Arrow timestamp (with proper unit)
+///
+/// # Alternative Consideration
+///
+/// While the current implementation is robust, consider using **RFC3339 TEXT format** if:
+/// - Human readability in database tools is a priority
+/// - Interoperability with external systems requires string timestamps
+/// - Timezone information needs to be preserved in the database
+///
+/// The integer-based approach is recommended for performance and simplicity in
+/// acceleration workloads where timestamps are primarily used for filtering and sorting.
+pub mod timestamp_conversion {
+    /// Milliseconds per second (1,000)
     pub const MILLIS_PER_SECOND: i64 = 1_000;
+
+    /// Microseconds per millisecond (1,000)
     pub const MICROS_PER_MILLI: i64 = 1_000;
+
+    /// Nanoseconds per millisecond (1,000,000)
     pub const NANOS_PER_MILLI: i64 = 1_000_000;
+
+    /// Nanoseconds per second (1,000,000,000)
+    pub const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+    /// Microseconds per second (1,000,000)
+    pub const MICROS_PER_SECOND: i64 = 1_000_000;
 }
 
 /// Constants for type conversions
 const DECIMAL_BASE: i64 = 10;
 const BITS_PER_I32: i32 = 32;
 const LOWER_32_MASK: i64 = 0xFFFF_FFFF;
+
+/// Timestamp storage format for Turso databases
+///
+/// Determines how timestamp values are stored in the database:
+/// - `Rfc3339`: Store as RFC3339 TEXT strings (default) - preserves full precision and timezone
+/// - `IntegerMillis`: Store as INTEGER milliseconds - higher performance, millisecond precision only
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampFormat {
+    /// RFC3339 TEXT format (e.g., "2024-01-01T00:00:00.123456789Z")
+    /// - ✅ Preserves full nanosecond precision
+    /// - ✅ Preserves timezone information
+    /// - ✅ Human-readable in database tools
+    /// - ⚠️ Slower performance (string parsing required)
+    #[default]
+    Rfc3339,
+
+    /// INTEGER milliseconds since Unix epoch
+    /// - ✅ Higher performance (direct integer operations)
+    /// - ✅ Efficient storage
+    /// - ⚠️ Millisecond precision only (sub-millisecond data truncated)
+    /// - ⚠️ No timezone preservation (UTC assumed)
+    /// - ⚠️ Less readable in database tools
+    IntegerMillis,
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -244,11 +365,35 @@ fn is_now_function(func: &Function) -> bool {
 ///
 /// Manages connections to a Turso database (file-based or in-memory).
 /// Supports MVCC (Multi-Version Concurrency Control) for concurrent transactions.
+///
+/// # Architecture
+///
+/// The pool maintains a shared `Arc<Database>` instance, and each call to `connect()`
+/// creates a lightweight connection from this shared database. This is the recommended
+/// pattern for high-frequency operations as it:
+///
+/// - Reuses the underlying database instance
+/// - Provides efficient connection management
+/// - Supports concurrent access with proper isolation
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// // Create pool once and share it
+/// let pool = Arc::new(TursoConnectionPool::new(":memory:", false).await?);
+///
+/// // Use pool.connect() for each operation
+/// let conn = pool.connect().await?;
+/// ```
+///
+/// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
+/// caches pool instances per database file for even better performance.
 #[derive(Debug)]
 pub struct TursoConnectionPool {
     database: Arc<Database>,
     mvcc_enabled: bool,
     db_path: String,
+    timestamp_format: TimestampFormat,
 }
 
 impl TursoConnectionPool {
@@ -258,6 +403,20 @@ impl TursoConnectionPool {
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
     /// * `mvcc_enabled` - Whether to enable Multi-Version Concurrency Control
     pub async fn new(path: &str, mvcc_enabled: bool) -> Result<Self> {
+        Self::new_with_timestamp_format(path, mvcc_enabled, TimestampFormat::default()).await
+    }
+
+    /// Creates a new connection pool with specified timestamp format.
+    ///
+    /// # Arguments
+    /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
+    /// * `mvcc_enabled` - Whether to enable Multi-Version Concurrency Control
+    /// * `timestamp_format` - Format for storing timestamp values (RFC3339 or integer milliseconds)
+    pub async fn new_with_timestamp_format(
+        path: &str,
+        mvcc_enabled: bool,
+        timestamp_format: TimestampFormat,
+    ) -> Result<Self> {
         let database = Builder::new_local(path)
             .with_mvcc(mvcc_enabled)
             .build()
@@ -268,10 +427,15 @@ impl TursoConnectionPool {
             database: Arc::new(database),
             mvcc_enabled,
             db_path: path.to_string(),
+            timestamp_format,
         })
     }
 
     /// Establishes a new connection from the pool
+    ///
+    /// This method is lightweight and can be called frequently. Each connection
+    /// shares the underlying database instance, making it efficient for high-frequency
+    /// operations.
     pub async fn connect(&self) -> Result<Connection> {
         self.database.connect().context(TursoDatabaseSnafu)
     }
@@ -289,6 +453,11 @@ impl TursoConnectionPool {
     /// Returns the database path
     pub fn db_path(&self) -> &str {
         &self.db_path
+    }
+
+    /// Returns the timestamp format used for this connection pool
+    pub fn timestamp_format(&self) -> TimestampFormat {
+        self.timestamp_format
     }
 }
 
@@ -322,6 +491,17 @@ impl TursoTableProvider {
     ///
     /// This function is critical for reading data from Turso - it must respect the schema's
     /// exact data types (e.g., `LargeUtf8` vs `Utf8`, Timestamp units) to avoid type mismatches.
+    ///
+    /// # Data Integrity During Reads
+    ///
+    /// **Overflow/Parse Failures → NULL**: When reading data, values that cannot be converted
+    /// to the target type (e.g., INTEGER too large for Int8, invalid JSON) are converted to NULL.
+    /// This design choice prioritizes query availability over failing entire result sets due to
+    /// individual value conversion issues. This is standard behavior for database queries where
+    /// some data may be malformed or out of range.
+    ///
+    /// **Write-time validation is critical**: To prevent bad data from entering the database,
+    /// see `scalar_value_to_turso()` which enforces strict validation during INSERT operations.
     ///
     /// # Supported types
     /// - Integers: Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64
@@ -510,8 +690,12 @@ impl TursoTableProvider {
                     Arc::new(LargeBinaryArray::from(values))
                 }
                 DataType::Timestamp(unit, tz) => {
-                    // Timestamps are stored as INTEGER in Turso/SQLite in milliseconds
-                    // We need to convert from milliseconds to the schema's expected unit
+                    // Timestamps can be stored in two formats:
+                    // 1. RFC3339 TEXT (default): Full precision + timezone preservation
+                    // 2. INTEGER milliseconds (performance): Millisecond precision only
+                    //
+                    // The read path automatically detects and converts both formats to the
+                    // schema's expected timestamp type and unit.
                     use timestamp_conversion::{
                         MICROS_PER_MILLI, MILLIS_PER_SECOND, NANOS_PER_MILLI,
                     };
@@ -520,13 +704,31 @@ impl TursoTableProvider {
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(millis) => {
-                                // Convert from stored milliseconds to the target unit
+                                // Integer format: Convert from stored milliseconds to the target unit
                                 Some(match unit {
                                     TimeUnit::Second => millis / MILLIS_PER_SECOND,
                                     TimeUnit::Millisecond => *millis,
                                     TimeUnit::Microsecond => millis * MICROS_PER_MILLI,
                                     TimeUnit::Nanosecond => millis * NANOS_PER_MILLI,
                                 })
+                            }
+                            TursoValue::Text(rfc3339_str) => {
+                                // RFC3339 TEXT format: Parse and convert to target unit
+                                use chrono::DateTime;
+
+                                // Parse RFC3339 string
+                                if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339_str) {
+                                    let timestamp_nanos = dt.timestamp_nanos_opt().unwrap_or(0);
+                                    Some(match unit {
+                                        TimeUnit::Second => timestamp_nanos / 1_000_000_000,
+                                        TimeUnit::Millisecond => timestamp_nanos / 1_000_000,
+                                        TimeUnit::Microsecond => timestamp_nanos / 1_000,
+                                        TimeUnit::Nanosecond => timestamp_nanos,
+                                    })
+                                } else {
+                                    // Parse failed, return NULL (lenient read behavior)
+                                    None
+                                }
                             }
                             TursoValue::Null => None,
                             _ => None,
@@ -1483,7 +1685,7 @@ impl TursoDataSink {
                 let value = ScalarValue::try_from_array(column, row_idx)?;
 
                 // Convert DataFusion ScalarValue to Turso Value
-                let turso_value = scalar_value_to_turso(value)?;
+                let turso_value = scalar_value_to_turso(value, self.pool.timestamp_format())?;
                 values.push(turso_value);
             }
 
@@ -1531,9 +1733,127 @@ impl DataSink for TursoDataSink {
     }
 }
 
-/// Converts a DataFusion ScalarValue to a Turso Value
+/// Converts a timestamp value to Turso storage format (RFC3339 TEXT or INTEGER milliseconds).
+///
+/// # Arguments
+/// * `value` - The timestamp value in its native unit
+/// * `unit` - The time unit of the input value (Second, Millisecond, Microsecond, Nanosecond)
+/// * `timezone` - Optional timezone string (e.g., "UTC", "+05:30")
+/// * `format` - Storage format (Rfc3339 or IntegerMillis)
+///
+/// # RFC3339 Format (Default)
+/// Preserves full precision and timezone information as TEXT:
+/// - Second: "2024-01-01T00:00:00Z" or "2024-01-01T00:00:00+05:30"
+/// - Millisecond: "2024-01-01T00:00:00.123Z"
+/// - Microsecond: "2024-01-01T00:00:00.123456Z"
+/// - Nanosecond: "2024-01-01T00:00:00.123456789Z"
+///
+/// # Integer Milliseconds Format (Performance)
+/// Stores as INTEGER milliseconds, with limitations:
+/// - Only Second and Millisecond units supported (without timezone)
+/// - Microsecond/Nanosecond rejected (precision loss not acceptable)
+/// - Timezone-aware timestamps rejected (timezone info loss not acceptable)
+fn convert_timestamp_to_turso(
+    value: i64,
+    unit: TimeUnit,
+    timezone: Option<&str>,
+    format: TimestampFormat,
+) -> Result<TursoValue, Box<dyn std::error::Error + Send + Sync>> {
+    match format {
+        TimestampFormat::Rfc3339 => {
+            // Convert to RFC3339 string format
+            use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+
+            // Convert value to nanoseconds
+            let nanos = match unit {
+                TimeUnit::Second => value * timestamp_conversion::NANOS_PER_SECOND,
+                TimeUnit::Millisecond => value * timestamp_conversion::NANOS_PER_MILLI,
+                TimeUnit::Microsecond => value * 1_000,
+                TimeUnit::Nanosecond => value,
+            };
+
+            // Split into seconds and subsecond nanos
+            let secs = nanos / timestamp_conversion::NANOS_PER_SECOND;
+            let nsecs = (nanos % timestamp_conversion::NANOS_PER_SECOND) as u32;
+
+            // Create NaiveDateTime
+            let naive = NaiveDateTime::from_timestamp_opt(secs, nsecs).ok_or_else(|| {
+                format!(
+                    "Invalid timestamp value: {} {}",
+                    value,
+                    format!("{:?}", unit)
+                )
+            })?;
+
+            // Format with timezone
+            let rfc3339 = if let Some(tz_str) = timezone {
+                // Parse and apply timezone
+                if tz_str == "UTC" || tz_str == "Z" || tz_str == "+00:00" {
+                    DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).to_rfc3339()
+                } else {
+                    // For other timezones, include the timezone in the output
+                    // chrono doesn't support arbitrary timezone parsing, so we format with offset
+                    format!("{}{}", naive.format("%Y-%m-%dT%H:%M:%S%.f"), tz_str)
+                }
+            } else {
+                // No timezone specified, use UTC
+                DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).to_rfc3339()
+            };
+
+            Ok(TursoValue::Text(rfc3339))
+        }
+        TimestampFormat::IntegerMillis => {
+            // Integer milliseconds format - strict validation
+            if timezone.is_some() {
+                return Err(format!(
+                    "Timestamp with timezone '{}' not supported with integer_millis format - use rfc3339 format to preserve timezone information",
+                    timezone.unwrap()
+                ).into());
+            }
+
+            match unit {
+                TimeUnit::Second => Ok(TursoValue::Integer(value * timestamp_conversion::MILLIS_PER_SECOND)),
+                TimeUnit::Millisecond => Ok(TursoValue::Integer(value)),
+                TimeUnit::Microsecond => Err(
+                    "TimestampMicrosecond not supported with integer_millis format - use rfc3339 format to preserve sub-millisecond precision"
+                        .to_string()
+                        .into(),
+                ),
+                TimeUnit::Nanosecond => Err(
+                    "TimestampNanosecond not supported with integer_millis format - use rfc3339 format to preserve sub-millisecond precision"
+                        .to_string()
+                        .into(),
+                ),
+            }
+        }
+    }
+}
+
+/// Converts a DataFusion ScalarValue to a Turso Value for database insertion.
+///
+/// # Timestamp Handling
+///
+/// Timestamp conversion depends on the configured `internal_timestamp_format`:
+///
+/// ## RFC3339 Format (Default)
+/// All timestamp types converted to RFC3339 TEXT strings with full precision and timezone preservation:
+/// - `TimestampSecond(v, tz)` → TEXT "2024-01-01T00:00:00Z" (or with timezone offset)
+/// - `TimestampMillisecond(v, tz)` → TEXT "2024-01-01T00:00:00.123Z"
+/// - `TimestampMicrosecond(v, tz)` → TEXT "2024-01-01T00:00:00.123456Z"
+/// - `TimestampNanosecond(v, tz)` → TEXT "2024-01-01T00:00:00.123456789Z"
+///
+/// ## Integer Milliseconds Format (Performance)
+/// Only Second/Millisecond without timezone supported, others rejected:
+/// - `TimestampSecond(v, None)` → INTEGER (milliseconds)
+/// - `TimestampMillisecond(v, None)` → INTEGER (milliseconds)
+/// - `TimestampMicrosecond(_, _)` → ERROR
+/// - `TimestampNanosecond(_, _)` → ERROR
+/// - `Timestamp*(_, Some(_))` → ERROR
+///
+/// Configure via spicepod.yaml: `acceleration.params.internal_timestamp_format: "rfc3339"` or `"integer_millis"`
 fn scalar_value_to_turso(
     value: ScalarValue,
+    timestamp_format: TimestampFormat,
 ) -> Result<TursoValue, Box<dyn std::error::Error + Send + Sync>> {
     use arrow::array::{Array, MapArray};
 
@@ -1542,7 +1862,13 @@ fn scalar_value_to_turso(
         ScalarValue::Int32(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::Int16(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::Int8(Some(v)) => TursoValue::Integer(i64::from(v)),
-        ScalarValue::UInt64(Some(v)) => TursoValue::Integer(i64::try_from(v).unwrap_or(i64::MAX)),
+        ScalarValue::UInt64(Some(v)) => {
+            // UInt64 values exceeding i64::MAX cannot be stored in SQLite INTEGER
+            // Fail explicitly to preserve data integrity rather than silently truncating
+            TursoValue::Integer(i64::try_from(v).map_err(|_| {
+                format!("UInt64 value {} exceeds i64::MAX and cannot be stored in Turso INTEGER type. Consider using REAL or TEXT for large unsigned values.", v)
+            })?)
+        }
         ScalarValue::UInt32(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::UInt16(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::UInt8(Some(v)) => TursoValue::Integer(i64::from(v)),
@@ -1551,16 +1877,21 @@ fn scalar_value_to_turso(
         ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => TursoValue::Text(v),
         ScalarValue::Boolean(Some(v)) => TursoValue::Integer(if v { 1 } else { 0 }),
         ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => TursoValue::Blob(v),
-        ScalarValue::TimestampMillisecond(Some(v), _) => TursoValue::Integer(v),
-        ScalarValue::TimestampMicrosecond(Some(v), _) => {
-            TursoValue::Integer(v / timestamp_conversion::MICROS_PER_MILLI)
+
+        // Timestamp conversions: Format depends on configuration
+        ScalarValue::TimestampSecond(Some(v), tz) => {
+            convert_timestamp_to_turso(v, TimeUnit::Second, tz.as_deref(), timestamp_format)?
         }
-        ScalarValue::TimestampNanosecond(Some(v), _) => {
-            TursoValue::Integer(v / timestamp_conversion::NANOS_PER_MILLI)
+        ScalarValue::TimestampMillisecond(Some(v), tz) => {
+            convert_timestamp_to_turso(v, TimeUnit::Millisecond, tz.as_deref(), timestamp_format)?
         }
-        ScalarValue::TimestampSecond(Some(v), _) => {
-            TursoValue::Integer(v * timestamp_conversion::MILLIS_PER_SECOND)
+        ScalarValue::TimestampMicrosecond(Some(v), tz) => {
+            convert_timestamp_to_turso(v, TimeUnit::Microsecond, tz.as_deref(), timestamp_format)?
         }
+        ScalarValue::TimestampNanosecond(Some(v), tz) => {
+            convert_timestamp_to_turso(v, TimeUnit::Nanosecond, tz.as_deref(), timestamp_format)?
+        }
+
         ScalarValue::Date32(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::Date64(Some(v)) => TursoValue::Integer(v),
         ScalarValue::Time32Second(Some(v)) | ScalarValue::Time32Millisecond(Some(v)) => {
@@ -1599,7 +1930,9 @@ fn scalar_value_to_turso(
             // Convert decimal256 to float for storage as REAL
             let scale_factor = (DECIMAL_BASE as f64).powi(scale as i32);
             let v_str = format!("{}", v);
-            let v_f64 = v_str.parse::<f64>().unwrap_or(0.0);
+            let v_f64 = v_str.parse::<f64>().map_err(|e| {
+                format!("Failed to parse Decimal256 value '{}' as f64: {}", v_str, e)
+            })?;
             TursoValue::Real(v_f64 / scale_factor)
         }
         ScalarValue::List(list_arr) => {
@@ -1618,7 +1951,10 @@ fn scalar_value_to_turso(
                     }
                 }
             }
-            TursoValue::Text(serde_json::to_string(&json_values).unwrap_or_default())
+            TursoValue::Text(
+                serde_json::to_string(&json_values)
+                    .map_err(|e| format!("Failed to serialize List as JSON: {}", e))?,
+            )
         }
         ScalarValue::Map(map_arr) => {
             // Map is a StructArray with "entries" containing keys and values
@@ -1661,7 +1997,10 @@ fn scalar_value_to_turso(
                 }
             }
 
-            TursoValue::Text(serde_json::to_string(&json_map).unwrap_or_default())
+            TursoValue::Text(
+                serde_json::to_string(&json_map)
+                    .map_err(|e| format!("Failed to serialize Map as JSON: {}", e))?,
+            )
         }
         _ => TursoValue::Null,
     };

@@ -721,24 +721,35 @@ mod accelerator_compat_tests {
         Fut: std::future::Future<Output = ()>,
     {
         // Test both memory and file modes for databases
+        // For Turso, also test both timestamp formats
         let test_configs = vec![
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "memory"),
+            (Engine::Sqlite, "memory", None),
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "file"),
+            (Engine::Sqlite, "file", None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "memory"),
+            (Engine::Turso, "memory", Some("rfc3339")),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "file"),
+            (Engine::Turso, "file", Some("rfc3339")),
+            #[cfg(feature = "turso")]
+            (Engine::Turso, "memory", Some("integer_millis")),
+            #[cfg(feature = "turso")]
+            (Engine::Turso, "file", Some("integer_millis")),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "memory"),
+            (Engine::DuckDB, "memory", None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "file"),
-            (Engine::Arrow, "memory"),
+            (Engine::DuckDB, "file", None),
+            (Engine::Arrow, "memory", None),
         ];
 
-        for (engine, mode) in test_configs {
-            println!("Testing with engine: {:?} ({})", engine, mode);
+        for (engine, mode, timestamp_format) in test_configs {
+            let mode_label = if let Some(ts_fmt) = timestamp_format {
+                format!("{}, timestamp_format={}", mode, ts_fmt)
+            } else {
+                mode.to_string()
+            };
+
+            println!("Testing with engine: {:?} ({})", engine, mode_label);
 
             let schema = test_schema();
             let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
@@ -746,8 +757,9 @@ mod accelerator_compat_tests {
             // Create appropriate location based on mode
             let location = if mode == "file" {
                 format!(
-                    "/tmp/spice_benchmark_{:?}_{}.db",
+                    "/tmp/spice_benchmark_{:?}_{}_{}.db",
                     engine,
+                    timestamp_format.unwrap_or("default"),
                     std::process::id()
                 )
             } else {
@@ -757,6 +769,11 @@ mod accelerator_compat_tests {
             let mut options = HashMap::new();
             if mode == "file" {
                 options.insert("file".to_string(), location.clone());
+            }
+
+            // Add timestamp_format option for Turso
+            if let Some(ts_fmt) = timestamp_format {
+                options.insert("internal_timestamp_format".to_string(), ts_fmt.to_string());
             }
 
             let external_table = CreateExternalTable {
@@ -834,7 +851,7 @@ mod accelerator_compat_tests {
                 _ => panic!("Unsupported engine for this test"),
             };
 
-            test_fn(engine, table, mode.to_string()).await;
+            test_fn(engine, table, mode_label.clone()).await;
 
             // Cleanup file if in file mode
             if mode == "file" && !location.is_empty() {

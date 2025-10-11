@@ -14,16 +14,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Turso data accelerator for high-performance local caching.
+//!
+//! This module provides acceleration capabilities using Turso (libSQL) as a local database
+//! for caching and accelerating query performance. It supports both in-memory and file-based
+//! acceleration modes.
+//!
+//! # Supported Features
+//!
+//! - **Memory mode**: Fast in-memory database for temporary caching
+//! - **File mode**: Persistent file-based database for durable acceleration
+//! - **MVCC support**: Multi-Version Concurrency Control for concurrent transactions
+//! - **Connection pooling**: Efficient connection management via shared pools
+//!
+//! # Important Limitation: Accelerator Use Case Only
+//!
+//! This accelerator implementation **only supports local Turso databases** (file-based or
+//! in-memory). Remote Turso databases using `turso_url` and `turso_auth_token` are **not
+//! supported** in this accelerator context.
+//!
+//! **This is not a general Turso limitation** - it's specific to the accelerator use case,
+//! where local database access is required for optimal performance and to support
+//! acceleration-specific operations like local caching and fast query execution.
+//!
+//! Remote Turso database support will be available when Turso is implemented as a **data
+//! connector** (for source datasets), where remote access patterns are the primary use case
+//! and local acceleration is not the goal.
+
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
-use data_components::turso::TursoTableProvider;
+use data_components::turso::{TursoConnectionPool, TursoExec, TursoTableProvider};
 use datafusion::{datasource::TableProvider, logical_expr::CreateExternalTable};
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
-use turso::{Builder, Connection};
 
 use crate::{
     component::dataset::acceleration::Engine,
@@ -73,7 +99,9 @@ pub enum Error {
     TursoDatabaseError { source: turso::Error },
 
     #[snafu(display(
-        "Remote Turso databases are not supported when using Turso as a file accelerator. Remote database support (turso_url, turso_auth_token) will be available when Turso is used as a data connector."
+        "Remote Turso databases (turso_url, turso_auth_token) are not supported when using Turso as an accelerator. \
+        This limitation is specific to the accelerator use case, which requires local database access for optimal performance. \
+        Remote Turso database support will be available when Turso is implemented as a data connector for source datasets."
     ))]
     RemoteDatabaseNotSupported,
 }
@@ -129,6 +157,33 @@ impl TursoAccelerator {
         }
     }
 
+    /// Parses the `internal_timestamp_format` parameter from the acceleration configuration
+    /// Returns the timestamp format (default: Rfc3339)
+    fn parse_timestamp_format(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<data_components::turso::TimestampFormat> {
+        if let Some(acceleration) = source.acceleration() {
+            if let Some(format_value) = acceleration.params.get("internal_timestamp_format") {
+                match format_value.as_str() {
+                    "rfc3339" => Ok(data_components::turso::TimestampFormat::Rfc3339),
+                    "integer_millis" => Ok(data_components::turso::TimestampFormat::IntegerMillis),
+                    _ => Err(Error::InvalidConfiguration {
+                        detail: Arc::from(format!(
+                            "Invalid 'internal_timestamp_format' value: '{}'. Expected 'rfc3339' or 'integer_millis'.",
+                            format_value
+                        )),
+                    }),
+                }
+            } else {
+                // Default to RFC3339
+                Ok(data_components::turso::TimestampFormat::Rfc3339)
+            }
+        } else {
+            Ok(data_components::turso::TimestampFormat::Rfc3339)
+        }
+    }
+
     /// Returns the database path for a Turso accelerator.
     ///
     /// This function determines the appropriate database path based on the acceleration mode:
@@ -137,7 +192,23 @@ impl TursoAccelerator {
     ///   - User-specified via `turso_file` parameter, or
     ///   - Auto-generated default path: `{spice_data_dir}/{dataset_name}.turso`
     ///
-    /// Note: This function will never return `":memory:"` when called with file mode.
+    /// # Accelerator-Specific Limitation
+    ///
+    /// Remote Turso databases (using `turso_url` and `turso_auth_token`) are **not supported**
+    /// when using Turso as a **file accelerator**. This is because accelerators require local
+    /// file access for optimal performance and to support acceleration-specific operations.
+    ///
+    /// Remote Turso database support will be available when Turso is implemented as a data
+    /// connector (for source datasets), where remote access patterns are more appropriate.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(String)` - The database path (":memory:" or file path)
+    /// - `Err(Error::RemoteDatabaseNotSupported)` - If remote parameters are provided
+    ///
+    /// # Note
+    ///
+    /// This function will never return `":memory:"` when called with file mode.
     pub fn turso_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         // Check acceleration mode first
         if !source.is_file_accelerated() {
@@ -173,20 +244,6 @@ impl TursoAccelerator {
         }
     }
 
-    /// Returns an existing `Turso` connection for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_connection(&self, source: &dyn AccelerationSource) -> Result<Connection> {
-        let turso_file = self.turso_file_path(source)?;
-        let mvcc_enabled = self.parse_mvcc_enabled(source)?;
-
-        let db = Builder::new_local(&turso_file)
-            .with_mvcc(mvcc_enabled)
-            .build()
-            .await
-            .context(TursoDatabaseSnafu)?;
-
-        db.connect().context(TursoDatabaseSnafu)
-    }
-
     /// Returns the shared connection pool for a `Turso` database
     pub async fn get_shared_pool(
         &self,
@@ -194,22 +251,27 @@ impl TursoAccelerator {
     ) -> Result<Arc<TursoConnectionPool>> {
         let turso_file = self.turso_file_path(source)?;
         let mvcc_enabled = self.parse_mvcc_enabled(source)?;
+        let timestamp_format = self.parse_timestamp_format(source)?;
 
         let mut pools = self.pools.lock().await;
         if let Some(pool) = pools.get(&turso_file) {
             Ok(Arc::clone(pool))
         } else {
             let pool = Arc::new(
-                TursoConnectionPool::new(&turso_file, mvcc_enabled)
-                    .await
-                    .map_err(|e| match e {
-                        data_components::turso::Error::TursoDatabaseError { source } => {
-                            Error::TursoDatabaseError { source }
-                        }
-                        _ => Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        },
-                    })?,
+                TursoConnectionPool::new_with_timestamp_format(
+                    &turso_file,
+                    mvcc_enabled,
+                    timestamp_format,
+                )
+                .await
+                .map_err(|e| match e {
+                    data_components::turso::Error::TursoDatabaseError { source } => {
+                        Error::TursoDatabaseError { source }
+                    }
+                    _ => Error::AccelerationCreationFailed {
+                        source: Box::new(e),
+                    },
+                })?,
             );
             pools.insert(turso_file, Arc::clone(&pool));
             Ok(pool)
@@ -219,14 +281,20 @@ impl TursoAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("turso_file")
-        .description("Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso")
-        .required(false),
+        .description("Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso"),
     ParameterSpec::component("turso_mvcc")
         .description("Enable Multi-Version Concurrency Control (MVCC) for Turso database")
         .default("disabled")
         .one_of(&["enabled", "disabled"]),
-    // Note: turso_url and turso_auth_token are not supported as accelerator parameters
-    // They will be supported when Turso is implemented as a data connector
+    ParameterSpec::component("internal_timestamp_format")
+        .description("Internal timestamp storage format: 'rfc3339' (default, preserves precision/timezone) or 'integer_millis' (performance, millisecond precision only)")
+        .default("rfc3339")
+        .one_of(&["rfc3339", "integer_millis"]),
+    // Note: Remote Turso parameters (turso_url, turso_auth_token) are NOT supported when using
+    // Turso as an accelerator. This limitation is specific to the accelerator use case.
+    // Remote database support will be available when Turso is implemented as a data connector,
+    // where remote access patterns are the primary use case and locally-cached acceleration
+    // is not required.
 ];
 
 #[async_trait]
@@ -266,11 +334,28 @@ impl DataAccelerator for TursoAccelerator {
     /// Supports two acceleration modes:
     /// - **Memory mode**: Creates an in-memory database (path = ":memory:")
     /// - **File mode**: Creates a file-based database at the specified or default path
+    ///
+    /// # Accelerator-Specific Limitation
+    ///
+    /// This method will reject configurations with remote Turso parameters (`turso_url` or
+    /// `turso_auth_token`). This limitation is specific to using Turso as an **accelerator**
+    /// and does not apply to general Turso usage. Accelerators require local database access
+    /// for optimal performance.
+    ///
+    /// Remote Turso databases will be supported when Turso is implemented as a data connector,
+    /// where remote access is the primary use case.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
+    /// parameters are provided in the acceleration configuration.
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
+        // Note: This is an accelerator-specific limitation. Remote databases will be
+        // supported when Turso is used as a data connector.
         if let Some(acceleration) = source.acceleration()
             && (acceleration.params.contains_key("turso_url")
                 || acceleration.params.contains_key("turso_auth_token"))
@@ -282,7 +367,9 @@ impl DataAccelerator for TursoAccelerator {
 
         // Handle memory mode: no file operations needed
         if path == ":memory:" {
-            self.get_connection(source).await?;
+            // Initialize the shared pool to verify connectivity
+            let pool = self.get_shared_pool(source).await?;
+            pool.connect().await?;
             return Ok(());
         }
 
@@ -310,8 +397,9 @@ impl DataAccelerator for TursoAccelerator {
 
             download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
 
-            // Initialize the database file
-            self.get_connection(source).await?;
+            // Initialize the database file using the shared pool
+            let pool = self.get_shared_pool(source).await?;
+            pool.connect().await?;
         }
 
         Ok(())
@@ -863,17 +951,11 @@ mod tests {
             arrow::datatypes::Field::new("value", DataType::Int64, false),
         ]));
 
-        let pool = Arc::new(TursoConnectionPool {
-            database: Arc::new(
-                Builder::new_local(":memory:")
-                    .with_mvcc(true)
-                    .build()
-                    .await
-                    .expect("should create database"),
-            ),
-            mvcc_enabled: true,
-            db_path: ":memory:".to_string(),
-        });
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:", true)
+                .await
+                .expect("should create pool"),
+        );
 
         // Test 1: Full schema (no projection), no filter, no limit
         let exec1 = TursoExec::new(
