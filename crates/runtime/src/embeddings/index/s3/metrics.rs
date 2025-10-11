@@ -21,7 +21,7 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter},
 };
 
-/// A macro to standardise the API-level metrics recorded for each S3Vectors operation.
+/// A macro to standardise the API-level metrics recorded for each `S3Vectors` operation.
 macro_rules! generate_s3vectors_metrics {
     ($prefix:literal, $name:ident) => {
         pub mod $name {
