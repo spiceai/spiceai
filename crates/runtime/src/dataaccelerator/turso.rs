@@ -18,10 +18,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use data_components::turso::TursoTableProvider;
-use datafusion::{
-    datasource::TableProvider,
-    logical_expr::CreateExternalTable,
-};
+use datafusion::{datasource::TableProvider, logical_expr::CreateExternalTable};
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
