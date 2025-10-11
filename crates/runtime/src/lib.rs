@@ -398,6 +398,14 @@ pub enum Error {
         "Failed to infer the worker type for the worker '{name}'. Ensure the worker has a valid configuration, and try again. For details, visit: https://spiceai.org/docs/components/workers"
     ))]
     FailedToInferWorkerType { name: String },
+
+    #[snafu(display(
+        "Dataset {dataset_name}: acceleration is required for full text search. Ensure the dataset has an acceleration configuration, and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    FullTextSearchRequiresAcceleration { dataset_name: String },
+
+    #[snafu(display("Full text search is not supported for views."))]
+    FullTextSearchNotSupportedForView,
 }
 
 const HTTP_SERVER: &str = "http_server";
