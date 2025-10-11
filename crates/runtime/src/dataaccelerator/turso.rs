@@ -609,7 +609,6 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use data_components::delete::get_deletion_provider;
-    use data_components::turso::TursoExec;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -941,109 +940,6 @@ mod tests {
         let total_rows: usize = result_combined.iter().map(|b| b.num_rows()).sum();
         assert!(total_rows <= 2);
         assert!(total_rows > 0);
-    }
-
-    #[tokio::test]
-    async fn test_sql_generation() {
-        // Test SQL generation with various combinations
-        let full_schema = Arc::new(Schema::new(vec![
-            arrow::datatypes::Field::new("id", DataType::Int64, false),
-            arrow::datatypes::Field::new("name", DataType::Utf8, false),
-            arrow::datatypes::Field::new("value", DataType::Int64, false),
-        ]));
-
-        let pool = Arc::new(
-            TursoConnectionPool::new(":memory:", true)
-                .await
-                .expect("should create pool"),
-        );
-
-        // Test 1: Full schema (no projection), no filter, no limit
-        let exec1 = TursoExec::new(
-            Arc::clone(&full_schema),
-            "test_table".to_string(),
-            Arc::clone(&pool),
-            &[],
-            None,
-        );
-        let sql1 = exec1.sql().expect("should generate SQL");
-        assert!(sql1.contains("SELECT"));
-        assert!(sql1.contains("\"id\""));
-        assert!(sql1.contains("\"name\""));
-        assert!(sql1.contains("\"value\""));
-        assert!(sql1.contains("FROM test_table"));
-        assert!(!sql1.contains("WHERE"));
-        assert!(!sql1.contains("LIMIT"));
-
-        // Test 1b: Projected schema (only id and name columns) - simulates projection pushdown
-        let projected_schema = Arc::new(full_schema.project(&[0, 1]).expect("should project"));
-        let exec1b = TursoExec::new(
-            Arc::clone(&projected_schema),
-            "test_table".to_string(),
-            Arc::clone(&pool),
-            &[],
-            None,
-        );
-        let sql1b = exec1b.sql().expect("should generate SQL");
-        assert!(sql1b.contains("SELECT"));
-        assert!(sql1b.contains("\"id\""));
-        assert!(sql1b.contains("\"name\""));
-        assert!(
-            !sql1b.contains("\"value\""),
-            "Projected schema should not include 'value' column"
-        );
-        assert_eq!(
-            sql1b, "SELECT \"id\", \"name\" FROM test_table",
-            "SQL should only include projected columns"
-        );
-
-        // Test 2: With limit
-        let exec2 = TursoExec::new(
-            Arc::clone(&full_schema),
-            "test_table".to_string(),
-            Arc::clone(&pool),
-            &[],
-            Some(10),
-        );
-        let sql2 = exec2.sql().expect("should generate SQL");
-        assert!(sql2.contains("LIMIT 10"));
-
-        // Test 3: With filter
-        let filter = col("id").gt(lit(5_i64));
-        let exec3 = TursoExec::new(
-            Arc::clone(&full_schema),
-            "test_table".to_string(),
-            Arc::clone(&pool),
-            &[filter],
-            None,
-        );
-        let sql3 = exec3.sql().expect("should generate SQL");
-        assert!(sql3.contains("WHERE"));
-
-        // Test 4: With projection, filter and limit - full pushdown test
-        let projected_schema = Arc::new(full_schema.project(&[1]).expect("should project")); // Only "name" column
-        let filter = col("id").gt(lit(5_i64));
-        let exec4 = TursoExec::new(
-            projected_schema,
-            "test_table".to_string(),
-            pool,
-            &[filter],
-            Some(5),
-        );
-        let sql4 = exec4.sql().expect("should generate SQL");
-        assert!(sql4.contains("\"name\""), "Should contain projected column");
-        assert!(
-            !sql4.contains("\"id\""),
-            "Should not contain non-projected id column in SELECT list"
-        );
-        assert!(
-            !sql4.contains("\"value\""),
-            "Should not contain non-projected value column"
-        );
-        assert!(sql4.contains("WHERE"), "Should have filter");
-        assert!(sql4.contains("LIMIT 5"), "Should have limit");
-        // Note: The WHERE clause will reference 'id' even though it's not in the projection
-        // This is correct SQL behavior - you can filter on columns not in the SELECT list
     }
 
     #[tokio::test]

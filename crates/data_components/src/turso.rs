@@ -947,12 +947,31 @@ impl TursoTableProvider {
                         Arc::new(list_builder.finish())
                     }
                 }
-                DataType::Map(_, _sorted) => {
+                DataType::Map(entries_field, _sorted) => {
                     // Map stored as TEXT (JSON serialized)
                     // Reconstruct map arrays from JSON
                     // For now, only support Utf8 keys to Int32 values
+
+                    // Extract field names from the schema's entries field
+                    use arrow::array::MapFieldNames;
+                    let field_names = if let DataType::Struct(fields) = entries_field.data_type() {
+                        if fields.len() >= 2 {
+                            MapFieldNames {
+                                entry: entries_field.name().clone(),
+                                key: fields[0].name().clone(),
+                                value: fields[1].name().clone(),
+                            }
+                        } else {
+                            MapFieldNames::default()
+                        }
+                    } else {
+                        MapFieldNames::default()
+                    };
+
+                    let keys_builder = StringBuilder::new();
+                    let values_builder = Int32Builder::new();
                     let mut map_builder =
-                        MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+                        MapBuilder::new(Some(field_names), keys_builder, values_builder);
 
                     for row in rows {
                         match &row[col_idx] {

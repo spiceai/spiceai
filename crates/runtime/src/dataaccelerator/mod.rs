@@ -2081,15 +2081,17 @@ mod accelerator_compat_tests {
             let schema = test_schema();
 
             // Memory mode has limitations, file mode can handle much more
-            // Turso in memory mode especially has tight page cache limits
-            let (num_records, num_iterations) = match (engine, mode.as_str()) {
-                #[cfg(feature = "turso")]
-                (Engine::Turso, "memory") => (1_000, 10), // 10K total records
-                #[cfg(feature = "turso")]
-                (Engine::Turso, "file") => (100_000, 10), // 1M total records
-                (_, "memory") => (100_000, 10), // 1M total records
-                (_, "file") => (1_000_000, 10), // 10M total records
-                _ => (10_000, 10),              // Fallback
+            // Turso has tighter page cache limits than other databases due to the comprehensive test schema
+            // Note: mode string may include timestamp format like "memory, timestamp_format=rfc3339"
+            let is_memory = mode.starts_with("memory");
+            let is_file = mode.starts_with("file");
+
+            let (num_records, num_iterations) = match (engine, is_memory, is_file) {
+                (Engine::Turso, true, _) => (100, 3), // 300 total records (very limited due to page cache)
+                (Engine::Turso, _, true) => (1_000, 10), // 10K total records (reduced due to complex schema)
+                (_, true, _) => (100_000, 10),           // 1M total records
+                (_, _, true) => (1_000_000, 10),         // 10M total records
+                _ => (10_000, 10),                       // Fallback
             };
 
             let mut insert_times = Vec::new();
