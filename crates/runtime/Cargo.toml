@@ -270,6 +270,7 @@ turso = [
     "dep:tokio-rusqlite",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
+    "data_components/turso",
     "dep:rusqlite",
 ]
 xxhash = ["dep:twox-hash", "cache/xxhash"]

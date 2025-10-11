@@ -85,6 +85,7 @@ tokio-postgres = { workspace = true, features = [
 ], optional = true }
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
+turso = { workspace = true, optional = true }
 twox-hash = { workspace = true, optional = true }
 tracing.workspace = true
 url = "2.5.4"
@@ -128,6 +129,7 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
+turso = ["dep:turso"]
 
 test_hadoop_catalog_docker = []
 
