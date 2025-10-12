@@ -1,19 +1,19 @@
 ---
 source: crates/runtime/tests/models/search.rs
-description: "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+description: "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4"
 snapshot_kind: text
 ---
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Projection: vector_search(qs, Utf8("second")).id, vector_search(qs, Utf8("second")).question, trunc(vector_search(qs, Utf8("second")).score,Int64(3))                                               |
-|               |   Sort: vector_search(qs, Utf8("second")).score DESC NULLS FIRST, fetch=4                                                                                                                           |
+|               |   Sort: vector_search(qs, Utf8("second")).score DESC NULLS FIRST, vector_search(qs, Utf8("second")).id ASC NULLS LAST, fetch=4                                                                      |
 |               |     Projection: vector_search(qs, Utf8("second")).id, vector_search(qs, Utf8("second")).question, trunc(vector_search(qs, Utf8("second")).score, Int64(3)), vector_search(qs, Utf8("second")).score |
 |               |       BytesProcessedNode                                                                                                                                                                            |
 |               |         TableScan: vector_search(qs, Utf8("second")) projection=[id, question, score]                                                                                                               |
 | physical_plan | ProjectionExec: expr=[id@0 as id, question@1 as question, trunc(vector_search(qs, Utf8("second")).score,Int64(3))@2 as trunc(vector_search(qs, Utf8("second")).score,Int64(3))]                     |
-|               |   SortPreservingMergeExec: [score@3 DESC], fetch=4                                                                                                                                                  |
-|               |     SortExec: TopK(fetch=4), expr=[score@3 DESC], preserve_partitioning=[true]                                                                                                                      |
+|               |   SortPreservingMergeExec: [score@3 DESC, id@0 ASC NULLS LAST], fetch=4                                                                                                                             |
+|               |     SortExec: TopK(fetch=4), expr=[score@3 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                 |
 |               |       ProjectionExec: expr=[id@0 as id, question@1 as question, trunc(score@2, 3) as trunc(vector_search(qs, Utf8("second")).score,Int64(3)), score@2 as score]                                     |
 |               |         BytesProcessedExec                                                                                                                                                                          |
 |               |           ProjectionExec: expr=[id@0 as id, question@2 as question, score@1 as score]                                                                                                               |
