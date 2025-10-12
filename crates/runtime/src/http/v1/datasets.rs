@@ -78,6 +78,7 @@ pub struct DatasetResponseItem {
     pub properties: HashMap<String, serde_json::Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct Property {
