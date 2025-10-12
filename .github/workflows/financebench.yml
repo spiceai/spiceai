@@ -178,6 +178,9 @@ jobs:
           SPICEAI_FINANCEBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_FINANCEBENCH_API_KEY}}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          AWS_REGION: "us-east-1"
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
