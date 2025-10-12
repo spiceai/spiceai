@@ -395,6 +395,7 @@ impl ExecutionPlan for IndexerExec {
                 let expected_schema = Arc::clone(&expected_schema);
                 async move {
                     let mut b = batch;
+                    println!("In index-table-scan, we have {} rows", b.num_rows());
 
                     // Each index consumes the record batch and produces a new record batch with
                     // the same schema. The indexes are executed in order, with the output of the

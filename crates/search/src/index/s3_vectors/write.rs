@@ -106,6 +106,11 @@ pub async fn write(
     table: &S3VectorsTable,
     record: RecordBatch,
 ) -> Result<RecordBatch, Error> {
+    tracing::warn!(
+        "I am S3vectors. I am writing {} records to {}",
+        record.num_rows(),
+        table.idx
+    );
     let Some((embedded_column_idx, _)) = record
         .schema()
         .column_with_name(index.embedded_column.as_str())
@@ -124,7 +129,7 @@ pub async fn write(
         Arc::clone(&index.compute_query),
     )
     .await?;
-
+    tracing::warn!("I am S3vectors. I have embedded my vectors",);
     let metadata = extract_and_format_metadata(
         index.name(),
         &index
@@ -171,6 +176,7 @@ pub async fn write(
     let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
 
+    tracing::warn!("I am S3vectors. I am about  to write to s3.");
     table
         .write_data(filtered_embeddings, filtered_primary_key, filtered_metadata)
         .await
@@ -178,6 +184,7 @@ pub async fn write(
             index: index.name().to_string(),
         })?;
 
+    tracing::warn!("I am S3vectors. I have written to s3.");
     // Because of limitations of `DFSchema::logically_equivalent_names_and_types` and its use in
     // `MemTable`, this must be in the same order as outputted by `VectorScanTableProvider`.
     let (schema, arr, _) = updated_record.into_parts();

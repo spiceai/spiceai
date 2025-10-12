@@ -235,6 +235,10 @@ impl SearchIndex for ChunkedSearchIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        tracing::error!(
+            "I am chunkedSearchIndex. I am writing {} rows",
+            record.num_rows()
+        );
         let schema = record.schema();
         let Some((search_field_idx, _)) = schema.column_with_name(self.search_column().as_str())
         else {
@@ -331,12 +335,14 @@ impl SearchIndex for ChunkedSearchIndex {
             .context(WriteFailedConstructRecordBatchSnafu)
             .boxed()?;
 
+        tracing::error!("I am chunkedSearchIndex. I am writing to underlying");
         let inner_rb = self
             .inner
             .write(rb)
             .await
             .context(InnerIndexWriteSnafu)
             .boxed()?;
+        tracing::error!("I am chunkedSearchIndex. I have written to underlying");
 
         // From `inner_rb` we need to get {}_embedding, and {}_offset
         //   then convert them from FixedSizeList() -> List(FixedSizeList())
@@ -384,7 +390,7 @@ impl SearchIndex for ChunkedSearchIndex {
                 fields.push(f);
             }
         }
-
+        tracing::error!("I am chunkedSearchIndex. I am returning...");
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()
     }
 
