@@ -33,6 +33,7 @@ pub static BAGGAGE_HEADER: &str = "baggage";
 /// the empty iterator.
 ///
 /// [W3C Baggage]: https://w3c.github.io/baggage
+#[must_use]
 pub fn from_headers(headers: &HeaderMap) -> BaggageIterator<'_> {
     let Some(baggage) = headers.get(BAGGAGE_HEADER) else {
         return BaggageIterator::Empty(iter::empty());

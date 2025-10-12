@@ -21,9 +21,9 @@ use super::request::SearchRequest;
 use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 use crate::search::FormattingSnafu;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
+use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 

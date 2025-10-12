@@ -70,6 +70,7 @@ jobs:
             });
 
             return filtered;
+
   run-bench:
     name: Run ${{ matrix.target.name }}
     timeout-minutes: 60
@@ -105,6 +106,10 @@ jobs:
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Run ${{ matrix.target.name }}
         run: |

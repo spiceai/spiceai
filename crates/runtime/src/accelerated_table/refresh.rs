@@ -34,7 +34,9 @@ use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
+use runtime_acceleration::snapshot::{
+    SnapshotBehavior, SnapshotManager, metrics as snapshot_metrics,
+};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
@@ -713,7 +715,12 @@ impl Refresher {
                             if let Some(checkpointer) = &checkpointer {
                                 match (checkpointer.checkpoint(&federated_schema).await, snapshot_manager.as_ref()) {
                                     (Ok(()), Some(snapshot_manager)) => {
-                                        if let Err(e) = snapshot_manager.create_snapshot().await {
+                                        if let Err(e) = snapshot_manager
+                                            .create_snapshot(&federated_schema)
+                                            .await
+                                        {
+                                            let dataset_label = dataset_name.to_string();
+                                            snapshot_metrics::record_snapshot_failure(&dataset_label);
                                             tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");
                                         }
                                     }

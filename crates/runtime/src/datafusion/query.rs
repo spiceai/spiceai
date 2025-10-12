@@ -49,12 +49,10 @@ mod tracker;
 use async_stream::stream;
 use futures::StreamExt;
 
-use crate::{
-    datafusion::{
-        DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
-    },
-    request::{AsyncMarker, RequestContext},
+use crate::datafusion::{
+    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
