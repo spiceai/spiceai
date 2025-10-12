@@ -338,7 +338,15 @@ impl DataAccelerator for DuckDBAccelerator {
 
         // Modify the `cmd` by adding options to attach other databases
         if let Some(source) = source {
-            if let Some(temp_directory) = &source.app().runtime.temp_directory.clone() {
+            if let Some(temp_directory) = source
+                .app()
+                .runtime
+                .query
+                .clone()
+                .unwrap_or_default()
+                .temp_directory
+                .clone()
+            {
                 cmd.options
                     .insert("temp_directory".to_string(), temp_directory.to_string());
             }
