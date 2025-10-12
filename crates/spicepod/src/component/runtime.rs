@@ -701,13 +701,6 @@ mod tests {
         let yaml = r"
         ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
-        assert_eq!(
-            runtime.query,
-            Some(Query {
-                spill_compression: None,
-                temp_directory: None,
-                memory_limit: None
-            })
-        );
+        assert_eq!(runtime.query, Some(None),);
     }
 }
