@@ -456,7 +456,7 @@ fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
-/// Filter out zero vectors (all values in the vector are 0.0) and null embeddings
+/// Filter out invalid embeddings: null embeddings, empty vectors, and zero vectors (all values are 0.0)
 #[allow(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -478,6 +478,16 @@ fn filter_zero_vectors(
                     .unwrap_or("unknown");
                 tracing::debug!(
                     "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding is null (source text was null or empty)"
+                );
+                true
+            }
+            Some(embedding) if embedding.is_empty() => {
+                let key_str = primary_keys
+                    .get(i)
+                    .and_then(|k| k.as_ref().map(String::as_str))
+                    .unwrap_or("unknown");
+                tracing::warn!(
+                    "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is empty (zero length)"
                 );
                 true
             }
@@ -685,11 +695,15 @@ mod tests {
         use std::collections::HashMap;
 
         let embeddings = vec![
-            Some(vec![1.0, 2.0]), // Keep
-            Some(vec![0.0, 0.0]), // Filter out (zero vector)
-            None,                 // Filter out (null embedding)
-            Some(vec![3.0, 4.0]), // Keep
-            None,                 // Filter out (null embedding)
+            Some(vec![1.0, 2.0]),      // Keep - valid embedding
+            Some(vec![0.0, 0.0]),      // Filter out - zero vector
+            None,                      // Filter out - null embedding
+            Some(vec![3.0, 4.0]),      // Keep - valid embedding
+            None,                      // Filter out - null embedding
+            Some(vec![]),              // Filter out - empty vector (zero length)
+            Some(vec![0.0, 0.0, 0.0]), // Filter out - zero vector (3D)
+            Some(vec![5.0, 6.0]),      // Keep - valid embedding
+            Some(vec![0.0]),           // Filter out - single zero
         ];
         let keys = vec![
             Some("key1".to_string()),
@@ -697,6 +711,10 @@ mod tests {
             Some("key3".to_string()),
             Some("key4".to_string()),
             Some("key5".to_string()),
+            Some("key6".to_string()),
+            Some("key7".to_string()),
+            Some("key8".to_string()),
+            Some("key9".to_string()),
         ];
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -707,6 +725,10 @@ mod tests {
                 Some(Value::String("c".to_string())),
                 Some(Value::String("d".to_string())),
                 Some(Value::String("e".to_string())),
+                Some(Value::String("f".to_string())),
+                Some(Value::String("g".to_string())),
+                Some(Value::String("h".to_string())),
+                Some(Value::String("i".to_string())),
             ],
         );
 
@@ -714,14 +736,30 @@ mod tests {
             filter_zero_vectors(embeddings, keys, metadata, "test_index");
 
         // Should only keep records with valid non-zero embeddings
-        assert_eq!(filtered_embeddings.len(), 2);
-        assert_eq!(filtered_keys.len(), 2);
-        assert_eq!(filtered_metadata["test"].len(), 2);
+        assert_eq!(filtered_embeddings.len(), 3);
+        assert_eq!(filtered_keys.len(), 3);
+        assert_eq!(filtered_metadata["test"].len(), 3);
 
-        // Check that only non-null, non-zero vectors remain
+        // Check that only non-null, non-zero, non-empty vectors remain
         assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
         assert_eq!(filtered_keys[0], Some("key1".to_string()));
+        assert_eq!(
+            filtered_metadata["test"][0],
+            Some(Value::String("a".to_string()))
+        );
+
         assert_eq!(filtered_embeddings[1], Some(vec![3.0, 4.0]));
         assert_eq!(filtered_keys[1], Some("key4".to_string()));
+        assert_eq!(
+            filtered_metadata["test"][1],
+            Some(Value::String("d".to_string()))
+        );
+
+        assert_eq!(filtered_embeddings[2], Some(vec![5.0, 6.0]));
+        assert_eq!(filtered_keys[2], Some("key8".to_string()));
+        assert_eq!(
+            filtered_metadata["test"][2],
+            Some(Value::String("h".to_string()))
+        );
     }
 }
