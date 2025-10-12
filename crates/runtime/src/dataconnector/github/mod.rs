@@ -313,6 +313,8 @@ fn github_gql_raw_schema_cast(
 
     for (idx, field) in record_batch.schema().fields().iter().enumerate() {
         let column = record_batch.column(idx);
+
+        // Handle lists with single-field structs
         if let DataType::List(inner_field) = field.data_type()
             && let DataType::Struct(struct_fields) = inner_field.data_type()
             && struct_fields.len() == 1
@@ -321,6 +323,37 @@ fn github_gql_raw_schema_cast(
                 arrow_tools::record_batch::to_primitive_type_list(column, field)?;
             fields.push(new_field);
             columns.push(new_column);
+            continue;
+        }
+
+        // Handle top-level structs with a single field (e.g., creator: { creator: "value" })
+        // Extract the inner field value and flatten it
+        if let DataType::Struct(struct_fields) = field.data_type()
+            && struct_fields.len() == 1
+        {
+            let struct_array = column
+                .as_any()
+                .downcast_ref::<arrow::array::StructArray>()
+                .ok_or_else(|| {
+                    format!(
+                        "Expected StructArray for field {}, but got different type",
+                        field.name()
+                    )
+                })?;
+
+            // Get the single inner column
+            let inner_column = struct_array.column(0);
+            let inner_field = &struct_fields[0];
+
+            // Create a new field with the outer name but inner type
+            let new_field = Arc::new(Field::new(
+                field.name(),
+                inner_field.data_type().clone(),
+                field.is_nullable(),
+            ));
+
+            fields.push(new_field);
+            columns.push(Arc::clone(inner_column));
             continue;
         }
 
