@@ -11,7 +11,7 @@ dependencies:
   - evals
 
 snapshots:
-  enabled: false
+  enabled: true
   location: s3://spiceai-public-datasets/financebench/indexes
   bootstrap_on_failure_behavior: warn
 
@@ -49,5 +49,5 @@ datasets:
       enabled: true
       engine: s3_vectors
       params:
-        s3_vectors_bucket: spiceai-financebench-s3-data
+        s3_vectors_bucket: spiceai-financebench-s3-data-5
         s3_vectors_aws_region: us-east-1

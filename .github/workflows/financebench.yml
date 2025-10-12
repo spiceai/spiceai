@@ -5,29 +5,30 @@ on:
   workflow_dispatch:
     inputs:
       model_option:
-        description: 'Which model do you want to test? (Default is ALL)'
+        description: "Which model do you want to test? (Default is ALL)"
         required: false
         type: choice
         options:
-          - 'all'
-          - 'gpt-4o'
-          - 'gpt-4.1'
-          - 'gpt-5'
-          - 'o1'
-          - 'o3-mini'
-          - 'o4-mini'
-        default: 'all'
+          - "all"
+          - "gpt-4o"
+          - "gpt-4.1"
+          - "gpt-5"
+          - "o1"
+          - "o3-mini"
+          - "o4-mini"
+        default: "all"
       search_option:
-        description: 'Which search configuration should be used (Default is embedding)'
+        description: "Which search configuration should be used (Default is embedding)"
         required: false
         type: choice
         options:
-          - 'embedding'
-          - 'hybrid'
-          - 'full_text'
-        default: 'embedding'
+          - "embedding"
+          - "hybrid"
+          - "full_text"
+          - "s3vectors"
+        default: "embedding"
   schedule:
-    - cron: '0 4 * * 2,5' # Every Monday and Thursday at 8pm PST (4am UTC next day)
+    - cron: "0 4 * * 2,5" # Every Monday and Thursday at 8pm PST (4am UTC next day)
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -37,19 +38,19 @@ concurrency:
 jobs:
   build-testoperator:
     name: Build testoperator
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     steps:
       - uses: actions/checkout@v5
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          install_to_system_path: 'false'
-          upload_artifact: 'true'
+          install_to_system_path: "false"
+          upload_artifact: "true"
 
   build-spiced:
     name: Build spiced
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     steps:
       - uses: actions/checkout@v5
 
@@ -132,6 +133,12 @@ jobs:
                     return m;
                 });
               }
+              if (search_option === 's3vectors') {
+                filtered = filtered.map((m) => {
+                    m.spicepod = "./test/spicepods/financebench/embedding[s3vector].yaml";
+                    return m;
+                });
+              }
             }
 
             return filtered;
@@ -142,7 +149,7 @@ jobs:
       - build-testoperator
       - build-spiced
       - setup-matrix
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     strategy:
       fail-fast: false
       max-parallel: 3
