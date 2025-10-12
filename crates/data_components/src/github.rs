@@ -752,6 +752,7 @@ struct GitTreeNode {
 
 #[derive(Debug, Deserialize)]
 struct GitCommit {
+    /// SHA of the commit. Required for deserialization but not used.
     #[serde(rename = "sha")]
     _sha: String,
     commit: GitCommitDetails,
@@ -760,6 +761,7 @@ struct GitCommit {
 #[derive(Debug, Deserialize)]
 struct GitCommitDetails {
     author: GitCommitAuthor,
+    /// Committer information. Required for deserialization but not used.
     #[serde(rename = "committer")]
     _committer: GitCommitAuthor,
 }
