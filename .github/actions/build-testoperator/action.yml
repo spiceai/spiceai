@@ -75,9 +75,9 @@ runs:
       if: inputs.download_from_minio == 'true'
       uses: ./.github/actions/setup-minio
       with:
-        minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-        minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-        minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        minio_endpoint: ${{ inputs.minio_endpoint }}
+        minio_access_key: ${{ inputs.minio_access_key }}
+        minio_secret_key: ${{ inputs.minio_secret_key }}
 
     - name: Download testoperator from MinIO
       if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
