@@ -17,15 +17,15 @@ snapshot_kind: text
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.785
   },
   {
-    "id": 1277,
-    "match": "\\times 2 \\times 2 \\times 2 = 32\\)",
-    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.556
-  },
-  {
     "id": 948,
     "match": "\\times 2 \\times 2 \\times 2 = 32\\)",
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.556
+  },
+  {
+    "id": 1277,
+    "match": "\\times 2 \\times 2 \\times 2 = 32\\)",
+    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.556
   }
 ]

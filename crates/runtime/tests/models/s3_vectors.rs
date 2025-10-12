@@ -153,31 +153,31 @@ mod search {
                 SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_sql_basic",
                     SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_sql_w_question",
                     SearchTestType::Sql(
-                        "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_text_search",
                     SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_text_search_w_embedding",
                     SearchTestType::Sql(
-                        "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) FROM text_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vectors_hybrid_vector_search_text_search_w_answer",
                     SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
             ],
@@ -225,13 +225,13 @@ mod search {
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_vector_search_questions",
                     SearchTestType::Sql(
-                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vectors_multiple_embeddings_vector_search_w_embeddings",
                     SearchTestType::Sql(
-                        "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                        "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(score, 3) FROM vector_search(qs, 'second', question) order by score desc, id LIMIT 4",
                     ),
                 ),
                 ]].concat(),
@@ -271,13 +271,13 @@ mod search {
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_composite_key",
                     SearchTestType::Sql(
-                        "SELECT id, question, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, question, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_filters",
                     SearchTestType::Sql(
-                        "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id > 10 order by score desc LIMIT 4",
+                        "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id > 10 order by score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true
@@ -319,7 +319,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match",
                     SearchTestType::Sql(
-                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
@@ -331,7 +331,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match_and_underlying",
                     SearchTestType::Sql(
-                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true
@@ -373,7 +373,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match",
                     SearchTestType::Sql(
-                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
@@ -387,7 +387,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match_and_underlying",
                     SearchTestType::Sql(
-                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true
@@ -460,13 +460,13 @@ mod search {
                     SearchTestCase::new(
                         "s3vector_metadata_vector_search_sql_projection_metadata",
                         SearchTestType::Sql(
-                            "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                            "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
                         ),
                     ),
                     SearchTestCase::new(
                         "s3vector_metadata_vector_search_sql_filters_metadata",
                         SearchTestType::Sql(
-                            "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                            "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc, id LIMIT 4",
                         ),
                     ),
                 ],
@@ -889,25 +889,25 @@ pub(crate) fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestC
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_basic"),
             SearchTestType::Sql(
-                "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
+                "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4",
             ),
         ),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_projection"),
             SearchTestType::Sql(
-                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
+                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4",
             ),
         ),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_filters"),
             SearchTestType::Sql(
-                "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4",
+                "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', answer) where subject!='math' order by score desc, id LIMIT 4",
             ),
         ),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_no_score"),
             SearchTestType::Sql(
-                "SELECT id, answer FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
+                "SELECT id, answer FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4",
             ),
         ),
         SearchTestCase::new(
@@ -919,7 +919,7 @@ pub(crate) fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestC
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_vectors"),
             SearchTestType::Sql(
-                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4;",
+                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second', answer) order by score, id desc LIMIT 4;",
             ),
         ),
     ]

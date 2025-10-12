@@ -19,16 +19,16 @@ snapshot_kind: text
     "score": 0.785
   },
   {
-    "id": 1277,
-    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "question": "Which base number, when raised to the fifth power, equals thirty-two?",
+    "id": 948,
+    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "question": "What is the fifth root of 32?",
     "subject": "math",
     "score": 0.556
   },
   {
-    "id": 948,
-    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "question": "What is the fifth root of 32?",
+    "id": 1277,
+    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
     "score": 0.556
   }
