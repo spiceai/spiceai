@@ -436,7 +436,7 @@ fn create_embedding_array(
     }
 
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
-    let field = Field::new_list_field(DataType::Float32, false);
+    let field = Field::new_list_field(DataType::Float32, true);
     builder = builder.with_field(field);
 
     for embedding_opt in embedding_vectors {
@@ -447,6 +447,7 @@ fn create_embedding_array(
             );
             builder.append(true);
         } else {
+            // Null embeddings will be filtered out before being written to the S3 index
             builder.values().append_nulls(dimension as usize);
             builder.append(false);
         }
@@ -455,7 +456,7 @@ fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
-/// Filter out zero vectors (all values in the vector are 0.0)
+/// Filter out zero vectors (all values in the vector are 0.0) and null embeddings
 #[allow(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -469,17 +470,31 @@ fn filter_zero_vectors(
 ) {
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
-        if let Some(embedding) = &embeddings[i]
-            && embedding.iter().all(|&x| x == 0.0)
-        {
-            let key_str = primary_keys
-                .get(i)
-                .and_then(|k| k.as_ref().map(String::as_str))
-                .unwrap_or("unknown");
-            tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
-            );
+        let should_skip = match &embeddings[i] {
+            None => {
+                let key_str = primary_keys
+                    .get(i)
+                    .and_then(|k| k.as_ref().map(String::as_str))
+                    .unwrap_or("unknown");
+                tracing::debug!(
+                    "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding is null (source text was null or empty)"
+                );
+                true
+            }
+            Some(embedding) if embedding.iter().all(|&x| x == 0.0) => {
+                let key_str = primary_keys
+                    .get(i)
+                    .and_then(|k| k.as_ref().map(String::as_str))
+                    .unwrap_or("unknown");
+                tracing::warn!(
+                    "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
+                );
+                true
+            }
+            _ => false,
+        };
 
+        if should_skip {
             embeddings.remove(i);
             primary_keys.remove(i);
             for values in metadata.values_mut() {
@@ -508,7 +523,7 @@ mod tests {
 
         // Create embedding array
         let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
-        let field = Field::new_list_field(DataType::Float32, false);
+        let field = Field::new_list_field(DataType::Float32, true);
         builder = builder.with_field(field);
         for embedding_opt in embeddings {
             if let Some(embedding) = embedding_opt {
@@ -527,10 +542,7 @@ mod tests {
             Field::new("text", DataType::Utf8, true),
             Field::new(
                 "text_embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, false)),
-                    dim,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
                 true,
             ),
         ]);
@@ -675,14 +687,16 @@ mod tests {
         let embeddings = vec![
             Some(vec![1.0, 2.0]), // Keep
             Some(vec![0.0, 0.0]), // Filter out (zero vector)
-            None,                 // Keep
+            None,                 // Filter out (null embedding)
             Some(vec![3.0, 4.0]), // Keep
+            None,                 // Filter out (null embedding)
         ];
         let keys = vec![
             Some("key1".to_string()),
             Some("key2".to_string()),
             Some("key3".to_string()),
             Some("key4".to_string()),
+            Some("key5".to_string()),
         ];
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -692,19 +706,22 @@ mod tests {
                 Some(Value::String("b".to_string())),
                 Some(Value::String("c".to_string())),
                 Some(Value::String("d".to_string())),
+                Some(Value::String("e".to_string())),
             ],
         );
 
         let (filtered_embeddings, filtered_keys, filtered_metadata) =
             filter_zero_vectors(embeddings, keys, metadata, "test_index");
 
-        assert_eq!(filtered_embeddings.len(), 3);
-        assert_eq!(filtered_keys.len(), 3);
-        assert_eq!(filtered_metadata["test"].len(), 3);
+        // Should only keep records with valid non-zero embeddings
+        assert_eq!(filtered_embeddings.len(), 2);
+        assert_eq!(filtered_keys.len(), 2);
+        assert_eq!(filtered_metadata["test"].len(), 2);
 
-        // Check that zero vector was filtered out
+        // Check that only non-null, non-zero vectors remain
         assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
-        assert_eq!(filtered_embeddings[1], None);
-        assert_eq!(filtered_embeddings[2], Some(vec![3.0, 4.0]));
+        assert_eq!(filtered_keys[0], Some("key1".to_string()));
+        assert_eq!(filtered_embeddings[1], Some(vec![3.0, 4.0]));
+        assert_eq!(filtered_keys[1], Some("key4".to_string()));
     }
 }
