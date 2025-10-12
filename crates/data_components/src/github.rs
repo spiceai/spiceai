@@ -259,7 +259,7 @@ where
                 // Convert the rate limit error to a reqwest error
                 // Since reqwest::Error doesn't have a public constructor, we'll just return
                 // the first error we encounter from the operation
-                tracing::error!("Rate limit check failed: {}", e);
+                tracing::error!("Rate limit check failed: {e}");
             })
             .ok();
 
