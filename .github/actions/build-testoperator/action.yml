@@ -18,6 +18,18 @@ inputs:
     description: 'Whether to try downloading from MinIO before checking GitHub cache'
     required: false
     default: 'true'
+  minio_endpoint:
+    description: 'MinIO endpoint for sccache'
+    required: false
+    type: string
+  minio_access_key:
+    description: 'MinIO access key for sccache'
+    required: false
+    type: string
+  minio_secret_key:
+    description: 'MinIO secret key for sccache'
+    required: false
+    type: string
 
 outputs:
   cache-hit:
@@ -95,11 +107,37 @@ runs:
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
       uses: spiceai/spiceai/.github/actions/setup-cc@trunk
 
+    - name: Check if sccache can be set up
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true')
+      id: check-sccache
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.minio_endpoint }}" ]; then
+          echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
+          echo "RUSTC_WRAPPER=" >> $GITHUB_OUTPUT
+        else
+          echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up sccache
+      if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true')) && steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
+      uses: spiceai/spiceai/.github/actions/setup-sccache@trunk
+      with:
+        minio_endpoint: ${{ inputs.minio_endpoint }}
+        os: ${{ steps.detect-os.outputs.os }}
+
     - name: Build testoperator
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true')
       shell: bash
       run: |
         cargo build -p testoperator --release --features models
+      env:
+        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_GIT_FETCH_WITH_CLI: true
 
     - name: Save to cache
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true'

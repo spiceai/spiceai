@@ -12,16 +12,16 @@ snapshot_kind: text
     "score": 0.54
   },
   {
-    "id": 1277,
-    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-    "question": "Which base number, when raised to the fifth power, equals thirty-two?",
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
+    "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
     "subject": "math",
     "score": 0.539
   },
   {
-    "id": 189,
-    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
-    "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
+    "id": 1277,
+    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
     "score": 0.539
   },

@@ -6,22 +6,34 @@ snapshot_kind: text
 [
   {
     "id": 612,
-    "match": "\n2",
+    "answer_offset": [
+      48,
+      50
+    ],
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.793
   },
   {
     "id": 349,
-    "match": " is 2.",
+    "answer_offset": [
+      103,
+      109
+    ],
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.785
   },
   {
     "id": 948,
-    "match": "\\times 2 \\times 2 \\times 2 = 32\\)",
+    "answer_offset": [
+      61,
+      94
+    ],
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.556
   },
   {
     "id": 1277,
-    "match": "\\times 2 \\times 2 \\times 2 = 32\\)",
+    "answer_offset": [
+      62,
+      95
+    ],
     "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.556
   }
 ]
