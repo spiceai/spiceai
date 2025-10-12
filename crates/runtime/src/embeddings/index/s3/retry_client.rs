@@ -211,6 +211,7 @@ impl S3Vectors for S3VectorRetryClient {
             {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
+                    SdkError::TimeoutError(_) => Err(RetryError::transient(e)),
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         DeleteIndexError::ServiceUnavailableException(_)
                         | DeleteIndexError::TooManyRequestsException(_) => {
