@@ -1,17 +1,17 @@
 ---
 source: crates/runtime/tests/models/search.rs
-description: "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+description: "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc, id LIMIT 4"
 snapshot_kind: text
 ---
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                                                   |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: score DESC NULLS FIRST, fetch=4                                                                                                                                                                                                                  |
+| logical_plan  | Sort: score DESC NULLS FIRST, vector_search(qs, Utf8("second")).id ASC NULLS LAST, fetch=4                                                                                                                                                             |
 |               |   Projection: vector_search(qs, Utf8("second")).id, vector_search(qs, Utf8("second")).answer, vector_search(qs, Utf8("second")).question, vector_search(qs, Utf8("second")).subject, trunc(vector_search(qs, Utf8("second")).score, Int64(3)) AS score |
 |               |     BytesProcessedNode                                                                                                                                                                                                                                 |
 |               |       TableScan: vector_search(qs, Utf8("second")) projection=[answer, id, question, score, subject]                                                                                                                                                   |
-| physical_plan | SortPreservingMergeExec: [score@4 DESC], fetch=4                                                                                                                                                                                                       |
-|               |   SortExec: TopK(fetch=4), expr=[score@4 DESC], preserve_partitioning=[true]                                                                                                                                                                           |
+| physical_plan | SortPreservingMergeExec: [score@4 DESC, id@0 ASC NULLS LAST], fetch=4                                                                                                                                                                                  |
+|               |   SortExec: TopK(fetch=4), expr=[score@4 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                                                      |
 |               |     ProjectionExec: expr=[id@1 as id, answer@0 as answer, question@2 as question, subject@4 as subject, trunc(score@3, 3) as score]                                                                                                                    |
 |               |       BytesProcessedExec                                                                                                                                                                                                                               |
 |               |         ProjectionExec: expr=[answer@0 as answer, CAST(key@3 AS Int64) as id, question@1 as question, 1 - distance@4 as score, subject@2 as subject]                                                                                                   |
