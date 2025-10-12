@@ -30,7 +30,7 @@ datasets:
     acceleration:
       enabled: true
       engine: duckdb
-      snapshots: disabled
+      snapshots: enabled
       mode: file
       primary_key: location
       refresh_mode: append
