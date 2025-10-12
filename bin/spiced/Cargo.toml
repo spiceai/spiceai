@@ -80,6 +80,7 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
+    "turso",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
