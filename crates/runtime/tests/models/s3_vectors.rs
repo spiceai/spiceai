@@ -286,6 +286,60 @@ mod search {
     }
 
     #[tokio::test]
+    async fn with_chunking_metadata() -> Result<(), anyhow::Error> {
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(vectors_nonfilterable_col(
+                Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                        .with_row_id("id")
+                        .chunking(
+                            EmbeddingChunkConfig::enabled()
+                                .target_chunk_size(64)
+                                .trim_whitespace(true),
+                        ),
+                ),
+            )),
+        );
+        let bucket_name = "spice-ci-tests-s3-vectors-chunking-metadata";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_model_to_vec_embeddings(
+                    "minishlab/potion-base-2M",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            [basic_vector_search_tests("s3vectors_chunking_metadata"),
+                vec![
+                SearchTestCase::new(
+                    "s3vector_chunking_metadata_vector_search_sql_match",
+                    SearchTestType::Sql(
+                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_chunking_metadata_vector_search_sql_offset",
+                    SearchTestType::Sql(
+                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score DESC, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_chunking_metadata_vector_search_sql_match_and_underlying",
+                    SearchTestType::Sql(
+                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                )]].concat(),
+            true
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn with_chunking() -> Result<(), anyhow::Error> {
         let mut ds = get_mega_science_dataset(
             Some("qs"),
@@ -328,6 +382,8 @@ mod search {
                         "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score DESC, id LIMIT 4",
                     ),
                 ),
+                // TODO: This is performing a needless join (since search_field is in vector index, `match` can be computed without base table).
+                // Tracking: `<https://github.com/spiceai/spiceai/issues/7512>`
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match_and_underlying",
                     SearchTestType::Sql(
@@ -779,8 +835,8 @@ async fn delete_index(
     Ok(())
 }
 
-fn vectors_filterable_col(name: &str) -> Column {
-    Column::new(name).with_metadata(
+fn vectors_filterable_col(col: impl Into<Column>) -> Column {
+    col.into().with_metadata(
         [(
             "vectors".to_string(),
             serde_json::Value::String("filterable".to_string()),
@@ -789,8 +845,8 @@ fn vectors_filterable_col(name: &str) -> Column {
     )
 }
 
-fn vectors_nonfilterable_col(name: &str) -> Column {
-    Column::new(name).with_metadata(
+fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
+    col.into().with_metadata(
         [(
             "vectors".to_string(),
             serde_json::Value::String("non-filterable".to_string()),
