@@ -27,6 +27,7 @@ members = [
     "crates/runtime-secrets",
     "crates/runtime-table-partition",
     "crates/runtime-rate-control",
+    "crates/runtime-request-context",
     "crates/s3_vectors",
     "crates/s3_vectors_metadata_filter",
     "crates/search",

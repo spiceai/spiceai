@@ -16,12 +16,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    LogErrors, Runtime,
-    accelerated_table::refresh::RefreshOverrides,
-    component::dataset::Dataset,
-    datafusion::request_context_extension::get_current_datafusion,
-    request::{AsyncMarker, RequestContext},
-    status::ComponentStatus,
+    LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
+    datafusion::request_context_extension::get_current_datafusion, status::ComponentStatus,
 };
 use app::App;
 use axum::{
@@ -32,6 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use datafusion::sql::TableReference;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;

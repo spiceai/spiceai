@@ -414,7 +414,11 @@ impl SearchIndex for ChunkedSearchIndex {
             .fields()
             .iter()
             // group expressions (primary keys) are in output by default.
-            .filter(|f| !pk_names.contains(f.name()) && f.name() != CHUNKED_INDEX_FULL_SEARCH_FIELD)
+            .filter(|f| {
+                !pk_names.contains(f.name())
+                    && f.name() != CHUNKED_INDEX_FULL_SEARCH_FIELD
+                    && *f.name() != self.search_column()
+            })
             .map(|f| {
                 first_value(
                     Expr::Column(Column::new_unqualified(f.name().clone())),
