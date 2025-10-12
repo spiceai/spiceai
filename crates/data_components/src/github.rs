@@ -271,9 +271,7 @@ where
                         // Use exponential backoff for rate limits
                         if let Some(duration) = Backoff::next_backoff(&mut exponential_backoff) {
                             tracing::warn!(
-                                "GitHub API rate limit error, retrying with exponential backoff in {:?}: {}",
-                                duration,
-                                e
+                                "GitHub API rate limit error, retrying with exponential backoff in {duration:?}: {e}"
                             );
                             tokio::time::sleep(duration).await;
                             continue;
