@@ -238,8 +238,11 @@ impl DatasetBuilder {
         })?;
 
         if let Some(acceleration) = self.acceleration.as_mut() {
-            acceleration.snapshots =
-                SnapshotBehavior::from(app.snapshots.clone(), self.acceleration_snapshot);
+            acceleration.snapshots = SnapshotBehavior::from(
+                app.snapshots.clone(),
+                self.acceleration_snapshot,
+                runtime.secrets_weak(),
+            );
         }
 
         let dataset = Dataset {

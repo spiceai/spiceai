@@ -24,7 +24,8 @@ use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use crate::request::{DatabricksAuthExtension, RequestContext};
+use crate::request::DatabricksAuthExtension;
+use runtime_request_context::RequestContext;
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 

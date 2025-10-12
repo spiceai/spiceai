@@ -13,15 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
 use std::{
-    any::{Any, TypeId},
+    any::TypeId,
     collections::HashMap,
     future::Future,
     marker::PhantomData,
     sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
 };
 
+use crate::TraceParent;
 use app::App;
 use http::HeaderMap;
 use opentelemetry::KeyValue;
@@ -29,11 +31,9 @@ use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use crate::{datafusion::DataFusion, http::traceparent::TraceParent};
+use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
-use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
-
-type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
+type Extensions = HashMap<TypeId, Arc<dyn Extension + Send + Sync>>;
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
@@ -44,6 +44,15 @@ pub struct RequestContext {
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
+}
+
+#[async_trait::async_trait]
+pub trait Extension: std::any::Any + Send + Sync {
+    async fn load(&self) {
+        // no-op
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 tokio::task_local! {
@@ -187,26 +196,36 @@ impl RequestContext {
         &self.trace_parent
     }
 
-    pub fn extension<T>(&self) -> Option<Arc<T>>
+    pub fn extension<T>(&self) -> Option<T>
     where
-        T: 'static + Send + Sync + Clone,
+        T: Extension + Clone,
     {
         let extensions = self.extensions.read().ok()?;
         let type_id = TypeId::of::<T>();
         extensions
-            .get(&type_id)
-            .and_then(|arc_any| Arc::clone(arc_any).downcast::<T>().ok())
+            .get(&type_id)?
+            .as_any()
+            .downcast_ref::<T>()
+            .cloned()
     }
 
-    pub fn insert_extension<T: 'static + Send + Sync>(&self, extension: T) {
+    pub fn insert_extension<T: Extension + Send + Sync>(&self, extension: T) {
         if let Ok(mut extensions) = self.extensions.write() {
-            extensions.insert(TypeId::of::<T>(), Arc::new(extension));
+            extensions.insert(extension.type_id(), Arc::new(extension));
         }
     }
 
     pub async fn load_extensions(&self) {
-        if let Some(extension) = self.extension::<DatabricksAuthExtension>() {
-            extension.load_u2m_components().await;
+        // Cannot hold `RwLockReadGuard` across async boundary.
+        let extensions = {
+            let Ok(guard) = self.extensions.read() else {
+                return;
+            };
+            guard.values().cloned().collect::<Vec<_>>()
+        };
+
+        for ext in extensions {
+            ext.load().await;
         }
     }
 }
@@ -231,7 +250,6 @@ pub struct RequestContextBuilder {
     cache_control: CacheControl,
     client_supplied_cache_key: Option<String>,
     app: Option<Arc<App>>,
-    df: Option<Arc<DataFusion>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
     extensions: Extensions,
@@ -246,7 +264,6 @@ impl RequestContextBuilder {
             cache_control: CacheControl::Cache(CacheKeyType::Default),
             client_supplied_cache_key: None,
             app: None,
-            df: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
             extensions: Extensions::default(),
@@ -255,14 +272,15 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
-    pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
-        self.app = app;
+    pub fn with_extension(mut self, extension: impl Extension) -> Self {
+        self.extensions
+            .insert(extension.type_id(), Arc::new(extension));
         self
     }
 
     #[must_use]
-    pub fn with_df_opt(mut self, df: Option<Arc<DataFusion>>) -> Self {
-        self.df = df;
+    pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
+        self.app = app;
         self
     }
 
@@ -289,14 +307,7 @@ impl RequestContextBuilder {
 
         self.baggage.extend(baggage::from_headers(headers));
 
-        let app = self.app.as_ref().map(Arc::clone);
-        let df = self.df.as_ref().map(Arc::clone);
-        if let Some(extension) = DatabricksAuthExtension::from_headers(&app, &df, headers) {
-            self.extensions
-                .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
-        }
-
-        match crate::http::traceparent::extract_trace_parent(headers) {
+        match super::extract_trace_parent(headers) {
             Ok(trace_parent) => {
                 self.trace_parent = trace_parent;
             }
@@ -419,9 +430,9 @@ impl RequestContextBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::request::CacheControl;
-    use crate::request::{CacheKeyType, Protocol, RequestContextBuilder};
     use http::{HeaderMap, HeaderValue};
+
+    use crate::{CacheControl, CacheKeyType, Protocol, RequestContextBuilder};
 
     #[test]
     fn test_bind_client_supplied_cache_key() {

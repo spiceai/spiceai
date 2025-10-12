@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
-use crate::request::RequestContext;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::{
@@ -34,6 +33,7 @@ use datafusion::{
 };
 use datafusion_federation::FederatedPlanNode;
 use futures::{Stream, StreamExt};
+use runtime_request_context::RequestContext;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{

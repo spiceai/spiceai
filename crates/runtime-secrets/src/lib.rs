@@ -21,8 +21,9 @@ pub use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use spicepod::component::secret::Secret as SpicepodSecret;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use stores::env::EnvSecretStoreBuilder;
+use tokio::sync::RwLock;
 
 mod lexer;
 pub mod stores;
@@ -85,6 +86,11 @@ impl Secrets {
     /// Initializes the runtime secrets based on the provided secret store configuration.
     ///
     /// If no secret stores are provided, the default secret store is set to `env`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the `from` field references an unknown store or when a store
+    /// requires (or disallows) a selector and the config is invalid.
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
         self.stores.clear();
 
@@ -152,6 +158,10 @@ impl Secrets {
     }
 
     /// Gets a secret key from the connected secret stores in precedence order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by an underlying secret store implementation.
     pub async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
         for store in self.stores.values() {
             match store.get_secret(key).await {
@@ -223,6 +233,25 @@ pub enum SecretStoreType {
     Kubernetes(String),
     #[cfg(feature = "aws-secrets-manager")]
     AwsSecretsManager(String),
+}
+
+#[allow(clippy::implicit_hasher)]
+pub async fn get_params_with_secrets(
+    secrets: Arc<RwLock<Secrets>>,
+    params: &HashMap<String, String>,
+) -> HashMap<String, SecretString> {
+    let secrets = secrets.read().await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+    // Inject secrets from the user-supplied params.
+    // This will replace any instances of `${ store:key }` with the actual secret value.
+    for (k, v) in params {
+        let secret = secrets.inject_secrets(k, ParamStr(v)).await;
+        params_with_secrets.insert(k.clone(), secret);
+    }
+
+    params_with_secrets
 }
 
 #[allow(clippy::result_large_err)]

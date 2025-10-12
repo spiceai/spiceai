@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::DataFusion;
-use crate::request::RequestContext;
+use runtime_request_context::{Extension, RequestContext};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -43,5 +43,11 @@ pub fn get_current_datafusion(context: &Arc<RequestContext>) -> Arc<DataFusion> 
         df.datafusion()
     } else {
         unreachable!("DataFusionContextExtension is expected to always be available");
+    }
+}
+
+impl Extension for DataFusionContextExtension {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

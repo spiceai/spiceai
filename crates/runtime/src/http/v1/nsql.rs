@@ -18,7 +18,6 @@ use crate::{
     datafusion::request_context_extension::get_current_datafusion,
     http::v1::{ResponseMetadata, ResponseMimeType, run_sql, to_http_response},
     model::LLMChatCompletionsModelStore,
-    request::{AsyncMarker, RequestContext},
     tools::{
         builtin::{
             sample::{
@@ -40,6 +39,7 @@ use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use headers_accept::Accept;
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use itertools::Itertools;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};

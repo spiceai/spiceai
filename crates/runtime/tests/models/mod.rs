@@ -19,7 +19,8 @@ use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{Client, header::HeaderMap};
-use runtime::{Runtime, config::Config, get_params_with_secrets};
+use runtime::{Runtime, config::Config};
+use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
@@ -580,6 +581,9 @@ pub(crate) fn get_local_model(
     model
         .params
         .insert("model_type".to_string(), model_type.into().into());
+    model
+        .params
+        .insert("hf_max_completion_tokens".to_string(), 10.into());
     // Local models don't require HF token for public models like Phi
     model
 }

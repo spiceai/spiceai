@@ -44,6 +44,7 @@ import (
 	rtcontext "github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/display"
 	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
+	"github.com/spiceai/spiceai/bin/spice/pkg/input"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -417,33 +418,32 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 	}()
 
 	for {
-		query, err := line.Prompt("sql> ")
-		if err == liner.ErrPromptAborted {
-			break
-		} else if err == io.EOF {
-			// EOF reached (Ctrl+D or piped input exhausted)
-			break
+		// Multi-line input support: read lines until we get a semicolon or special command
+		queryStr, err := input.ReadMultiLineInput(line, "sql> ")
+		if err == io.EOF {
+			// User pressed Ctrl+D or Ctrl+C on empty prompt
+			fmt.Println()
+			return nil
 		} else if err != nil {
 			slog.Error("reading line", "error", err)
-			break
+			return err
 		}
 
-		query = strings.TrimSpace(query)
-		if query == "" {
+		if queryStr == "" {
 			continue
 		}
 
-		if strings.ToLower(query) == "help" {
+		if strings.ToLower(queryStr) == "help" {
 			fmt.Println("Enter SQL queries to execute against the remote Spice instance.")
 			fmt.Println("Press Ctrl+C to cancel a running query or Ctrl+D to exit.")
 			continue
 		}
 
-		if strings.ToLower(query) == "exit" || strings.ToLower(query) == "quit" {
+		if strings.ToLower(queryStr) == "exit" || strings.ToLower(queryStr) == "quit" {
 			break
 		}
 
-		line.AppendHistory(query)
+		line.AppendHistory(queryStr)
 
 		// Create a cancellable context for this query
 		var queryContext context.Context
@@ -455,7 +455,7 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 		queryMutex.Unlock()
 
 		// Execute query using the provided executor
-		err = executor(queryContext, query)
+		execErr := executor(queryContext, queryStr)
 
 		queryMutex.Lock()
 		isQueryRunning = false
@@ -465,12 +465,12 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 		// Always cancel the context to prevent leak
 		cancel()
 
-		if err != nil {
+		if execErr != nil {
 			if queryCancelled {
 				// Query was cancelled, continue to next prompt
 				continue
 			}
-			fmt.Printf("\033[31mError:\033[0m %v\n", err)
+			fmt.Printf("\033[31mError:\033[0m %v\n", execErr)
 			continue
 		}
 	}

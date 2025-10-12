@@ -93,6 +93,12 @@ impl Column {
     }
 }
 
+impl From<&str> for Column {
+    fn from(value: &str) -> Self {
+        Column::new(value)
+    }
+}
+
 /// Configuration for if and how a dataset's column should be embedded.
 /// Different to [`crate::component::embeddings::ColumnEmbeddingConfig`],
 /// as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`],

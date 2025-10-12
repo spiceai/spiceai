@@ -95,9 +95,6 @@ pub enum Error {
     #[snafu(display("Partitioned DuckDB acceleration only supported for file mode."))]
     FileModeOnly,
 
-    #[snafu(display("Partitioned DuckDB acceleration only supports a single table"))]
-    SingleTable,
-
     #[snafu(display("Unable to read directory: {source}"))]
     UnableToReadDirectory { source: std::io::Error },
 
@@ -242,6 +239,8 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         source: Option<&dyn AccelerationSource>,
         partition_by: Option<PartitionBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        self.is_initialized.store(false, Ordering::Release);
+
         let partition_by = partition_by.context(PartitionByRequiredSnafu)?;
 
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
@@ -249,7 +248,6 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         parameter_validation(source);
 
         let mut table_provider_guard = self.table_provider.lock().await;
-        ensure!(table_provider_guard.is_none(), SingleTableSnafu);
 
         let PartitionBy {
             expressions_hash,

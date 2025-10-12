@@ -17,18 +17,19 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use itertools::Itertools;
+use runtime_secrets::Secrets;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-use crate::secrets::Secrets;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid configuration for {component}. {message}"))]
     InvalidConfigurationNoSource { component: String, message: String },
 }
+
 impl Parameters {
     fn validate_and_format_key(
         all_params: &[ParameterSpec],
@@ -74,6 +75,9 @@ impl Parameters {
         Some(key_to_use.to_string())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when supplied parameters do not satisfy the provided `ParameterSpec`.
     pub async fn try_new(
         component_name: &str,
         params: Vec<(String, SecretString)>,
@@ -256,6 +260,11 @@ impl Parameters {
             .cloned()
             .collect()
     }
+
+    #[must_use]
+    pub fn prefix(&self) -> &'static str {
+        self.prefix
+    }
 }
 
 #[derive(Clone)]
@@ -313,13 +322,14 @@ impl<'a> ParamLookup<'a> {
     #[must_use]
     pub fn expose(self) -> ExposedParamLookup<'a> {
         match self {
-            ParamLookup::Present(s) => {
-                ExposedParamLookup::Present(secrecy::ExposeSecret::expose_secret(s))
-            }
+            ParamLookup::Present(s) => ExposedParamLookup::Present(ExposeSecret::expose_secret(s)),
             ParamLookup::Absent(s) => ExposedParamLookup::Absent(s),
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns the error produced by `f` when the parameter is absent.
     pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a SecretString, E> {
         match self {
             ParamLookup::Present(s) => Ok(s),
@@ -342,6 +352,9 @@ impl<'a> ExposedParamLookup<'a> {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns the error produced by `f` when the parameter is absent.
     pub fn ok_or_else<E>(self, f: impl FnOnce(UserParam) -> E) -> Result<&'a str, E> {
         match self {
             ExposedParamLookup::Present(s) => Ok(s),

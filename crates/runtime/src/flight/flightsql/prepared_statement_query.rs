@@ -49,9 +49,9 @@ use crate::{
         Service, metrics, to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {

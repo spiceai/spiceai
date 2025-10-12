@@ -58,8 +58,8 @@ use runtime::{
         parameters::ConnectorParams,
     },
     parameters::ParameterSpec,
-    request::{AsyncMarker, Protocol, RequestContext},
 };
+use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::{Dataset as SpicepodDataset, ReadyState},

@@ -18,11 +18,11 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
-    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
-    OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
+    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::{
         access::AccessMode,
@@ -32,6 +32,7 @@ use crate::{
             builder::DatasetBuilder,
         },
     },
+    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -77,7 +78,6 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
         let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
-
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
         let mut localpod_datasets = Vec::new();
@@ -252,6 +252,15 @@ impl Runtime {
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        if let Err(err) = validate_dataset(&ds) {
+            let ds_name = &ds.name;
+            metrics::datasets::LOAD_ERROR.add(1, &[]);
+            error_spaced!(spaced_tracer, "{}{err}", "");
+            self.status
+                .update_dataset(ds_name, status::ComponentStatus::Error);
+            return;
+        }
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
@@ -839,6 +848,12 @@ impl Runtime {
             }
         }
 
+        let snapshot_sources: Vec<Arc<dyn AccelerationSource>> = initialized_datasets
+            .iter()
+            .map(|ds| ds.clone_arc())
+            .collect();
+        validate_snapshot_paths(snapshot_sources).await;
+
         initialized_datasets
     }
 
@@ -875,4 +890,15 @@ pub struct RegisterDatasetContext {
     federated_read_table: FederatedTable,
     source: String,
     accelerated_table: Option<Arc<AcceleratedTable>>,
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
+    if ds.has_full_text_column() && !ds.is_accelerated() {
+        return Err(FullTextSearchRequiresAccelerationSnafu {
+            dataset_name: ds.name.to_string(),
+        }
+        .build());
+    }
+    Ok(())
 }
