@@ -78,7 +78,14 @@ pub async fn new_tls_flight_channel(endpoint_str: &str) -> Result<Channel> {
     let tls_prefixes = ["https://", "grpc+tls://"];
     for prefix in &tls_prefixes {
         if endpoint_str.starts_with(prefix) {
-            tls_domain_name = Some(endpoint_str.trim_start_matches(prefix));
+            let domain_with_port = endpoint_str.trim_start_matches(prefix);
+            // Extract just the hostname, removing port if present
+            tls_domain_name = Some(
+                domain_with_port
+                    .split(':')
+                    .next()
+                    .unwrap_or(domain_with_port),
+            );
             break;
         }
     }

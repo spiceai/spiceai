@@ -80,6 +80,7 @@ pub struct DatasetResponseItem {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[allow(dead_code)]
 pub(crate) struct Property {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -109,6 +109,7 @@ rand.workspace = true
 rayon = "1.11.0"
 regex.workspace = true
 reqwest.workspace = true
+reqwest-eventsource = "0.6.0"
 rmcp = { workspace = true, optional = true, features = [
     "client",
     "reqwest",

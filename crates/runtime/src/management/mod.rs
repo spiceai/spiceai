@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod flight_transport;
+mod http_sse_transport;
+mod transport;
+
 const TASK_HISTORY_SINK_REMOTE_TABLE: &str = "runtime.task_history";
 const TASK_HISTORY_SINK_TABLE: &str = "scp.task_history";
 const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 5;
@@ -134,7 +138,53 @@ impl Management {
 
     pub async fn start(&self) -> Result<(), Error> {
         self.start_task_history_export().await?;
+        self.start_spice_connect().await?;
         tracing::info!("Connected to Spice Cloud for management and monitoring");
+        Ok(())
+    }
+
+    async fn start_spice_connect(&self) -> Result<(), Error> {
+        // Determine transport protocol from params, defaulting to Flight
+        let protocol = self
+            .params
+            .get("transport")
+            .and_then(|t| transport::TransportProtocol::from_string(t.expose_secret()))
+            .unwrap_or(transport::TransportProtocol::ArrowFlight); // Default to Flight
+
+        // Get endpoint, either explicit or default for the protocol
+        let endpoint = self.params.get("endpoint").map_or_else(
+            || protocol.default_endpoint().to_string(),
+            |s| s.expose_secret().to_string(),
+        );
+
+        let api_key = self.api_key.expose_secret().to_string();
+        let runtime = Arc::clone(&self.runtime);
+
+        // Create transport based on endpoint
+        let transport =
+            transport::TransportFactory::create(Arc::clone(&runtime), endpoint.clone(), api_key)
+                .await?;
+
+        let actual_protocol = transport.protocol();
+        tracing::info!(
+            "Using {:?} transport for Spice Connect: {}",
+            actual_protocol,
+            endpoint
+        );
+
+        // Start transport connection in background task
+        let _task = self
+            .runtime
+            .start_runtime_task("spice_connect", None, async move {
+                if let Err(e) = transport.start().await {
+                    tracing::error!("Spice Connect transport failed: {e}");
+                }
+                Ok(())
+            })
+            .await;
+
+        tracing::debug!("Started Spice Connect transport");
+
         Ok(())
     }
 

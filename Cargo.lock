@@ -12097,6 +12097,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest",
+ "reqwest-eventsource",
  "rmcp",
  "runtime-acceleration",
  "runtime-auth",
