@@ -139,7 +139,8 @@ async fn test_acceleration_turso_checkpoint() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Helper function to convert libsql query results to Arrow RecordBatches
+/// Helper function to convert libsql query results to Arrow `RecordBatches`
+#[allow(clippy::too_many_lines)]
 async fn query_to_record_batches(
     conn: &Connection,
     query: &str,
@@ -165,7 +166,7 @@ async fn query_to_record_batches(
         .map_err(|e| anyhow!("Failed to fetch row: {}", e))?
     {
         let column_count = row.column_count();
-        let mut row_values = Vec::with_capacity(column_count as usize);
+        let mut row_values = Vec::with_capacity(column_count);
         for i in 0..column_count {
             let value = row
                 .get_value(i)
@@ -209,13 +210,11 @@ async fn query_to_record_batches(
     for i in 0..column_count {
         let field_name = columns
             .get(i)
-            .map(|col| col.name().to_string())
-            .unwrap_or_else(|| format!("column_{}", i));
+            .map_or_else(|| format!("column_{i}"), |col| col.name().to_string());
         let data_type = match &all_rows[0][i] {
-            turso::Value::Null => DataType::Utf8,
             turso::Value::Integer(_) => DataType::Int64,
             turso::Value::Real(_) => DataType::Float64,
-            turso::Value::Text(_) => DataType::Utf8,
+            turso::Value::Null | turso::Value::Text(_) => DataType::Utf8,
             turso::Value::Blob(_) => DataType::Binary,
         };
         fields.push(Field::new(field_name, data_type, true));
@@ -233,7 +232,6 @@ async fn query_to_record_batches(
                     .iter()
                     .map(|row| match &row[col_idx] {
                         turso::Value::Integer(i) => Some(*i),
-                        turso::Value::Null => None,
                         _ => None,
                     })
                     .collect();
@@ -244,7 +242,6 @@ async fn query_to_record_batches(
                     .iter()
                     .map(|row| match &row[col_idx] {
                         turso::Value::Real(f) => Some(*f),
-                        turso::Value::Null => None,
                         _ => None,
                     })
                     .collect();
@@ -255,7 +252,6 @@ async fn query_to_record_batches(
                     .iter()
                     .map(|row| match &row[col_idx] {
                         turso::Value::Text(s) => Some(s.clone()),
-                        turso::Value::Null => None,
                         _ => None,
                     })
                     .collect();
@@ -266,7 +262,6 @@ async fn query_to_record_batches(
                     .iter()
                     .map(|row| match &row[col_idx] {
                         turso::Value::Blob(b) => Some(b.as_slice()),
-                        turso::Value::Null => None,
                         _ => None,
                     })
                     .collect();

@@ -686,6 +686,18 @@ mod test {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::redundant_closure_for_method_calls,
+    clippy::uninlined_format_args,
+    clippy::bool_assert_comparison,
+    clippy::used_underscore_binding,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 mod accelerator_compat_tests {
     //! Shared compatibility test suite for data accelerators.
     //! These tests ensure accelerators behave consistently for common operations.
@@ -695,13 +707,13 @@ mod accelerator_compat_tests {
     use ::arrow::{
         array::{
             Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-            Decimal256Array, DurationMillisecondArray, Float32Array, Float64Array, Int8Array,
-            Int16Array, Int32Array, Int32Builder, Int64Array, IntervalYearMonthArray,
-            LargeBinaryArray, LargeStringArray, ListArray, MapArray, RecordBatch, StringArray,
-            StructArray, Time32MillisecondArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-            UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+            DurationMillisecondArray, Float32Array, Float64Array, Int8Array, Int16Array,
+            Int32Array, Int32Builder, Int64Array, IntervalYearMonthArray, LargeBinaryArray,
+            LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray,
+            Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
+            UInt32Array, UInt64Array,
         },
-        datatypes::{DataType, Field, Schema, TimeUnit, i256},
+        datatypes::{DataType, Field, Schema, TimeUnit},
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
@@ -861,7 +873,7 @@ mod accelerator_compat_tests {
     }
 
     /// Helper function to get the comprehensive test schema covering all major Arrow data types
-    /// Note: Some exotic types (Time64, LargeBinary, LargeUtf8) may not be supported by all engines
+    /// Note: Some exotic types (`Time64`, `LargeBinary`, `LargeUtf8`) may not be supported by all engines
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             // Original columns (for backwards compatibility with existing tests)
@@ -1071,7 +1083,7 @@ mod accelerator_compat_tests {
                 .collect::<Vec<_>>(),
         );
 
-        let float64_array = Float64Array::from(
+        let _float64_array = Float64Array::from(
             (0..num_records)
                 .map(|i| {
                     if i % nullable_mod == 0 {
@@ -2072,7 +2084,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Run with --ignored flag: cargo test --features sqlite,turso,duckdb -- --ignored --nocapture benchmark_roundtrip
+    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::time::Instant;
 

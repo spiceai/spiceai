@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::doc_markdown)]
+
 //! Turso (libSQL) data components for reading, writing, and deleting data.
 //!
 //! This module provides the core table provider, execution plan, and data sink
@@ -436,26 +438,31 @@ impl TursoConnectionPool {
     /// This method is lightweight and can be called frequently. Each connection
     /// shares the underlying database instance, making it efficient for high-frequency
     /// operations.
+    #[allow(clippy::unused_async)]
     pub async fn connect(&self) -> Result<Connection> {
         self.database.connect().context(TursoDatabaseSnafu)
     }
 
     /// Returns true if MVCC (Multi-Version Concurrency Control) is enabled
+    #[must_use]
     pub fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
     }
 
     /// Returns true if this is an in-memory database
+    #[must_use]
     pub fn is_memory_db(&self) -> bool {
         self.db_path == ":memory:"
     }
 
     /// Returns the database path
+    #[must_use]
     pub fn db_path(&self) -> &str {
         &self.db_path
     }
 
     /// Returns the timestamp format used for this connection pool
+    #[must_use]
     pub fn timestamp_format(&self) -> TimestampFormat {
         self.timestamp_format
     }
@@ -479,6 +486,7 @@ impl TursoTableProvider {
     /// * `schema` - Arrow schema defining the table structure
     /// * `table_name` - Name of the table in the Turso database
     /// * `pool` - Connection pool for database access
+    #[must_use]
     pub fn new(schema: SchemaRef, table_name: String, pool: Arc<TursoConnectionPool>) -> Self {
         Self {
             schema,
@@ -514,6 +522,12 @@ impl TursoTableProvider {
     /// - Time: Time32, Time64
     /// - Duration, Interval, Decimal128, Decimal256
     /// - Complex types: List, Map (serialized as JSON)
+    #[allow(
+        clippy::too_many_lines,
+        clippy::match_same_arms,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation
+    )]
     pub fn values_to_record_batch(
         rows: &[Vec<TursoValue>],
         schema: &SchemaRef,
@@ -834,7 +848,6 @@ impl TursoTableProvider {
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Integer(i) => Some(*i),
-                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -855,7 +868,6 @@ impl TursoTableProvider {
                                 .iter()
                                 .map(|row| match &row[col_idx] {
                                     TursoValue::Integer(i) => i32::try_from(*i).ok(),
-                                    TursoValue::Null => None,
                                     _ => None,
                                 })
                                 .collect();
@@ -874,7 +886,6 @@ impl TursoTableProvider {
                                         let milliseconds = (*i & LOWER_32_MASK) as i32;
                                         Some(IntervalDayTime::new(days, milliseconds))
                                     }
-                                    TursoValue::Null => None,
                                     _ => None,
                                 })
                                 .collect();
@@ -888,8 +899,10 @@ impl TursoTableProvider {
                                         // Deserialize from JSON
                                         serde_json::from_str::<serde_json::Value>(s).ok().and_then(
                                             |v| {
-                                                let months = v["months"].as_i64()? as i32;
-                                                let days = v["days"].as_i64()? as i32;
+                                                let months =
+                                                    i32::try_from(v["months"].as_i64()?).ok()?;
+                                                let days =
+                                                    i32::try_from(v["days"].as_i64()?).ok()?;
                                                 let nanoseconds = v["nanoseconds"].as_i64()?;
                                                 Some(IntervalMonthDayNano::new(
                                                     months,
@@ -899,7 +912,6 @@ impl TursoTableProvider {
                                             },
                                         )
                                     }
-                                    TursoValue::Null => None,
                                     _ => None,
                                 })
                                 .collect();
@@ -927,9 +939,6 @@ impl TursoTableProvider {
                                     } else {
                                         list_builder.append_null();
                                     }
-                                }
-                                TursoValue::Null => {
-                                    list_builder.append_null();
                                 }
                                 _ => {
                                     list_builder.append_null();
@@ -984,7 +993,9 @@ impl TursoTableProvider {
                                     for (key, value) in map {
                                         map_builder.keys().append_value(&key);
                                         if let Some(int_val) = value.as_i64() {
-                                            map_builder.values().append_value(int_val as i32);
+                                            #[allow(clippy::cast_possible_truncation)]
+                                            let val = int_val as i32;
+                                            map_builder.values().append_value(val);
                                         } else {
                                             map_builder.values().append_null();
                                         }
@@ -992,7 +1003,7 @@ impl TursoTableProvider {
                                     map_builder.append(true).map_err(|e| {
                                         Box::new(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
-                                            format!("Failed to append map: {}", e),
+                                            format!("Failed to append map: {e}"),
                                         ))
                                             as Box<dyn std::error::Error + Send + Sync>
                                     })?;
@@ -1000,26 +1011,17 @@ impl TursoTableProvider {
                                     map_builder.append(false).map_err(|e| {
                                         Box::new(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
-                                            format!("Failed to append null map: {}", e),
+                                            format!("Failed to append null map: {e}"),
                                         ))
                                             as Box<dyn std::error::Error + Send + Sync>
                                     })?;
                                 }
                             }
-                            TursoValue::Null => {
-                                map_builder.append(false).map_err(|e| {
-                                    Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        format!("Failed to append null map: {}", e),
-                                    ))
-                                        as Box<dyn std::error::Error + Send + Sync>
-                                })?;
-                            }
                             _ => {
                                 map_builder.append(false).map_err(|e| {
                                     Box::new(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
-                                        format!("Failed to append null map: {}", e),
+                                        format!("Failed to append null map: {e}"),
                                     ))
                                         as Box<dyn std::error::Error + Send + Sync>
                                 })?;
@@ -1033,13 +1035,17 @@ impl TursoTableProvider {
                     // Decimal128 stored as REAL in database
                     // Convert back to i128 scaled value
                     const DECIMAL_BASE: i128 = 10;
+                    #[allow(clippy::cast_sign_loss)]
                     let scale_factor = DECIMAL_BASE.pow(*scale as u32);
                     let values: Vec<Option<i128>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Real(f) => {
                                 // Convert float to scaled integer
-                                #[allow(clippy::cast_possible_truncation)]
+                                #[allow(
+                                    clippy::cast_possible_truncation,
+                                    clippy::cast_precision_loss
+                                )]
                                 let scaled = (f * scale_factor as f64).round() as i128;
                                 Some(scaled)
                             }
@@ -1047,7 +1053,6 @@ impl TursoTableProvider {
                                 // If stored as integer, scale it
                                 Some(i128::from(*i) * scale_factor)
                             }
-                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -1057,7 +1062,7 @@ impl TursoTableProvider {
                             .map_err(|e| {
                                 Box::new(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
-                                    format!("Invalid decimal128 precision/scale: {}", e),
+                                    format!("Invalid decimal128 precision/scale: {e}"),
                                 ))
                                     as Box<dyn std::error::Error + Send + Sync>
                             })?,
@@ -1067,13 +1072,17 @@ impl TursoTableProvider {
                     // Decimal256 stored as REAL in database
                     // Convert back to i256 scaled value
                     const DECIMAL_BASE: i128 = 10;
+                    #[allow(clippy::cast_sign_loss)]
                     let scale_factor = DECIMAL_BASE.pow(*scale as u32);
                     let values: Vec<Option<i256>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Real(f) => {
                                 // Convert float to scaled integer
-                                #[allow(clippy::cast_possible_truncation)]
+                                #[allow(
+                                    clippy::cast_possible_truncation,
+                                    clippy::cast_precision_loss
+                                )]
                                 let scaled = (f * scale_factor as f64).round() as i128;
                                 Some(i256::from_i128(scaled))
                             }
@@ -1082,7 +1091,6 @@ impl TursoTableProvider {
                                 let scaled = i128::from(*i) * scale_factor;
                                 Some(i256::from_i128(scaled))
                             }
-                            TursoValue::Null => None,
                             _ => None,
                         })
                         .collect();
@@ -1092,7 +1100,7 @@ impl TursoTableProvider {
                             .map_err(|e| {
                                 Box::new(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
-                                    format!("Invalid decimal256 precision/scale: {}", e),
+                                    format!("Invalid decimal256 precision/scale: {e}"),
                                 ))
                                     as Box<dyn std::error::Error + Send + Sync>
                             })?,
@@ -1121,13 +1129,13 @@ impl TursoTableProvider {
 
     /// Returns AST analyzer rules for Turso-specific SQL transformations
     ///
-    /// Turso uses SQLite dialect which doesn't support INTERVAL literals.
-    /// This analyzer transforms INTERVAL expressions to SQLite-compatible datetime() calls.
+    /// Turso uses `SQLite` dialect which doesn't support INTERVAL literals.
+    /// This analyzer transforms INTERVAL expressions to SQLite-compatible `datetime()` calls.
     ///
     /// Examples:
     /// - `NOW() - INTERVAL '1' DAY` → `datetime('now', '-1 day')`
     /// - `timestamp + INTERVAL '5' HOUR` → `datetime(timestamp, '+5 hours')`
-    fn turso_ast_analyzer(&self) -> AstAnalyzerRule {
+    fn turso_ast_analyzer() -> AstAnalyzerRule {
         Box::new(|mut ast| {
             // Transform INTERVAL expressions to SQLite datetime() calls
             transform_intervals(&mut ast);
@@ -1136,7 +1144,7 @@ impl TursoTableProvider {
     }
 }
 
-/// Transforms INTERVAL expressions in a SQL statement to SQLite-compatible datetime() calls
+/// Transforms INTERVAL expressions in a SQL statement to SQLite-compatible `datetime()` calls
 fn transform_intervals(statement: &mut datafusion::sql::sqlparser::ast::Statement) {
     let mut transformer = IntervalTransformer;
     let _ = statement.visit(&mut transformer);
@@ -1244,25 +1252,23 @@ impl DeletionTableProvider for TursoTableProvider {
 // Federation support for Turso
 impl TursoTableProvider {
     /// Creates a federated table source for cross-database queries
-    fn create_federated_table_source(
-        self: Arc<Self>,
-    ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
+    fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = TableReference::bare(self.table_name.clone());
         let schema = Arc::clone(&self.schema);
         let fed_provider = Arc::new(SQLFederationProvider::new(self));
 
-        Ok(Arc::new(SQLTableSource::new_with_schema(
+        Arc::new(SQLTableSource::new_with_schema(
             fed_provider,
             RemoteTableRef::from(table_name),
             schema,
-        )))
+        ))
     }
 
     /// Creates a federated table provider that supports query federation
     pub fn create_federated_table_provider(
         self: Arc<Self>,
     ) -> DataFusionResult<FederatedTableProviderAdaptor> {
-        let table_source = Self::create_federated_table_source(Arc::clone(&self))?;
+        let table_source = Self::create_federated_table_source(Arc::clone(&self));
         Ok(FederatedTableProviderAdaptor::new_with_provider(
             table_source,
             self,
@@ -1285,7 +1291,7 @@ impl SQLExecutor for TursoTableProvider {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        Some(AstAnalyzer::new(vec![self.turso_ast_analyzer()]))
+        Some(AstAnalyzer::new(vec![Self::turso_ast_analyzer()]))
     }
 
     fn execute(
@@ -1297,42 +1303,40 @@ impl SQLExecutor for TursoTableProvider {
         let query = query.to_string();
         let schema_clone = Arc::clone(&schema);
 
-        let fut =
-            async move {
-                let conn = pool.connect().await.map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to connect to Turso: {}", e))
-                })?;
+        let fut = async move {
+            let conn = pool.connect().await.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to connect to Turso: {e}"))
+            })?;
 
-                let mut rows = conn.query(&query, ()).await.map_err(|e| {
-                    DataFusionError::Execution(format!("Turso query failed: {}", e))
-                })?;
+            let mut rows = conn
+                .query(&query, ())
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Turso query failed: {e}")))?;
 
-                let mut rows_vec: Vec<Vec<TursoValue>> = Vec::new();
-                while let Some(row) = rows.next().await.map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to fetch row: {}", e))
-                })? {
-                    let mut values = Vec::new();
-                    for i in 0..schema_clone.fields().len() {
-                        let value = row.get_value(i).map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to get value at index {}: {}",
-                                i, e
-                            ))
-                        })?;
-                        values.push(value);
-                    }
-                    rows_vec.push(values);
+            let mut rows_vec: Vec<Vec<TursoValue>> = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Failed to fetch row: {e}")))?
+            {
+                let mut values = Vec::new();
+                for i in 0..schema_clone.fields().len() {
+                    let value = row.get_value(i).map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to get value at index {i}: {e}"))
+                    })?;
+                    values.push(value);
                 }
+                rows_vec.push(values);
+            }
 
-                if rows_vec.is_empty() {
-                    return Ok(RecordBatch::new_empty(schema_clone));
-                }
+            if rows_vec.is_empty() {
+                return Ok(RecordBatch::new_empty(schema_clone));
+            }
 
-                TursoTableProvider::values_to_record_batch(&rows_vec, &schema_clone).map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to convert Turso results: {}", e))
-                })
-            };
-
+            TursoTableProvider::values_to_record_batch(&rows_vec, &schema_clone).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to convert Turso results: {e}"))
+            })
+        };
         let stream = futures::stream::once(fut).boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
@@ -1344,31 +1348,33 @@ impl SQLExecutor for TursoTableProvider {
     }
 
     async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
-        let conn = self.pool.connect().await.map_err(|e| {
-            DataFusionError::Execution(format!("Failed to connect to Turso: {}", e))
-        })?;
+        let conn =
+            self.pool.connect().await.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to connect to Turso: {e}"))
+            })?;
 
         // Query the table schema using SQLite's pragma
-        let query = format!("PRAGMA table_info({})", table_name);
-        let mut rows = conn.query(&query, ()).await.map_err(|e| {
-            DataFusionError::Execution(format!("Failed to get table schema: {}", e))
-        })?;
+        let query = format!("PRAGMA table_info({table_name})");
+        let mut rows = conn
+            .query(&query, ())
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get table schema: {e}")))?;
 
         let mut fields = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to fetch schema row: {}", e)))?
+            .map_err(|e| DataFusionError::Execution(format!("Failed to fetch schema row: {e}")))?
         {
             // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
             let col_name = row.get_value(1).map_err(|e| {
-                DataFusionError::Execution(format!("Failed to get column name: {}", e))
+                DataFusionError::Execution(format!("Failed to get column name: {e}"))
             })?;
             let col_type = row.get_value(2).map_err(|e| {
-                DataFusionError::Execution(format!("Failed to get column type: {}", e))
+                DataFusionError::Execution(format!("Failed to get column type: {e}"))
             })?;
             let not_null = row.get_value(3).map_err(|e| {
-                DataFusionError::Execution(format!("Failed to get notnull flag: {}", e))
+                DataFusionError::Execution(format!("Failed to get notnull flag: {e}"))
             })?;
 
             if let (
@@ -1378,10 +1384,8 @@ impl SQLExecutor for TursoTableProvider {
             ) = (&col_name, &col_type, &not_null)
             {
                 let data_type = match col_type.to_uppercase().as_str() {
-                    "INTEGER" => DataType::Int64,
+                    "INTEGER" | "BLOB" => DataType::Int64,
                     "REAL" | "FLOAT" | "DOUBLE" => DataType::Float64,
-                    "TEXT" => DataType::Utf8,
-                    "BLOB" => DataType::Binary,
                     _ => DataType::Utf8,
                 };
                 let nullable = *not_null == 0;
@@ -1391,8 +1395,7 @@ impl SQLExecutor for TursoTableProvider {
 
         if fields.is_empty() {
             return Err(DataFusionError::Execution(format!(
-                "Table '{}' not found or has no columns",
-                table_name
+                "Table '{table_name}' not found or has no columns"
             )));
         }
 
@@ -1422,6 +1425,7 @@ impl TursoExec {
     /// * `pool` - Connection pool
     /// * `filters` - Filter expressions to push down
     /// * `limit` - Optional row limit
+    #[must_use]
     pub fn new(
         schema: SchemaRef,
         table_name: String,
@@ -1487,15 +1491,16 @@ impl TursoExec {
 
 impl DisplayAs for TursoExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        let table_name = &self.table_name;
         let sql = self
             .sql()
-            .unwrap_or_else(|_| format!("SELECT * FROM {}", self.table_name));
-        write!(f, "TursoExec sql={}", sql)
+            .unwrap_or_else(|_| format!("SELECT * FROM {table_name}"));
+        write!(f, "TursoExec sql={sql}")
     }
 }
 
 impl ExecutionPlan for TursoExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "TursoExec"
     }
 
@@ -1591,6 +1596,7 @@ pub struct TursoDeletionSink {
 
 impl TursoDeletionSink {
     /// Creates a new deletion sink
+    #[must_use]
     pub fn new(pool: Arc<TursoConnectionPool>, table_name: String, filters: &[Expr]) -> Self {
         Self {
             pool,
@@ -1645,6 +1651,7 @@ impl DisplayAs for TursoDataSink {
 
 impl TursoDataSink {
     /// Creates a new data sink for INSERT operations
+    #[must_use]
     pub fn new(pool: Arc<TursoConnectionPool>, table_name: String, schema: SchemaRef) -> Self {
         Self {
             pool,
@@ -1673,7 +1680,7 @@ impl TursoDataSink {
             .collect();
 
         let placeholders = (1..=columns.len())
-            .map(|i| format!("?{}", i))
+            .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1758,7 +1765,7 @@ impl DataSink for TursoDataSink {
 /// * `value` - The timestamp value in its native unit
 /// * `unit` - The time unit of the input value (Second, Millisecond, Microsecond, Nanosecond)
 /// * `timezone` - Optional timezone string (e.g., "UTC", "+05:30")
-/// * `format` - Storage format (Rfc3339 or IntegerMillis)
+/// * `format` - Storage format (Rfc3339 or `IntegerMillis`)
 ///
 /// # RFC3339 Format (Default)
 /// Preserves full precision and timezone information as TEXT:
@@ -1781,7 +1788,7 @@ fn convert_timestamp_to_turso(
     match format {
         TimestampFormat::Rfc3339 => {
             // Convert to RFC3339 string format
-            use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+            use chrono::{DateTime, Utc};
 
             // Convert value to nanoseconds
             let nanos = match unit {
@@ -1793,16 +1800,13 @@ fn convert_timestamp_to_turso(
 
             // Split into seconds and subsecond nanos
             let secs = nanos / timestamp_conversion::NANOS_PER_SECOND;
+            #[allow(clippy::cast_sign_loss)]
             let nsecs = (nanos % timestamp_conversion::NANOS_PER_SECOND) as u32;
 
-            // Create NaiveDateTime
-            let naive = NaiveDateTime::from_timestamp_opt(secs, nsecs).ok_or_else(|| {
-                format!(
-                    "Invalid timestamp value: {} {}",
-                    value,
-                    format!("{:?}", unit)
-                )
-            })?;
+            // Create NaiveDateTime using the new DateTime::from_timestamp API
+            let naive = DateTime::from_timestamp(secs, nsecs)
+                .ok_or_else(|| format!("Invalid timestamp value: {value} {unit:?}"))?
+                .naive_utc();
 
             // Format with timezone
             let rfc3339 = if let Some(tz_str) = timezone {
@@ -1823,10 +1827,9 @@ fn convert_timestamp_to_turso(
         }
         TimestampFormat::IntegerMillis => {
             // Integer milliseconds format - strict validation
-            if timezone.is_some() {
+            if let Some(tz) = timezone {
                 return Err(format!(
-                    "Timestamp with timezone '{}' not supported with integer_millis format - use rfc3339 format to preserve timezone information",
-                    timezone.unwrap()
+                    "Timestamp with timezone '{tz}' not supported with integer_millis format - use rfc3339 format to preserve timezone information"
                 ).into());
             }
 
@@ -1848,7 +1851,7 @@ fn convert_timestamp_to_turso(
     }
 }
 
-/// Converts a DataFusion ScalarValue to a Turso Value for database insertion.
+/// Converts a `DataFusion` `ScalarValue` to a Turso Value for database insertion.
 ///
 /// # Timestamp Handling
 ///
@@ -1870,6 +1873,7 @@ fn convert_timestamp_to_turso(
 /// - `Timestamp*(_, Some(_))` → ERROR
 ///
 /// Configure via spicepod.yaml: `acceleration.params.internal_timestamp_format: "rfc3339"` or `"integer_millis"`
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
     timestamp_format: TimestampFormat,
@@ -1885,7 +1889,7 @@ fn scalar_value_to_turso(
             // UInt64 values exceeding i64::MAX cannot be stored in SQLite INTEGER
             // Fail explicitly to preserve data integrity rather than silently truncating
             TursoValue::Integer(i64::try_from(v).map_err(|_| {
-                format!("UInt64 value {} exceeds i64::MAX and cannot be stored in Turso INTEGER type. Consider using REAL or TEXT for large unsigned values.", v)
+                format!("UInt64 value {v} exceeds i64::MAX and cannot be stored in Turso INTEGER type. Consider using REAL or TEXT for large unsigned values.")
             })?)
         }
         ScalarValue::UInt32(Some(v)) => TursoValue::Integer(i64::from(v)),
@@ -1894,7 +1898,7 @@ fn scalar_value_to_turso(
         ScalarValue::Float64(Some(v)) => TursoValue::Real(v),
         ScalarValue::Float32(Some(v)) => TursoValue::Real(f64::from(v)),
         ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => TursoValue::Text(v),
-        ScalarValue::Boolean(Some(v)) => TursoValue::Integer(if v { 1 } else { 0 }),
+        ScalarValue::Boolean(Some(v)) => TursoValue::Integer(i64::from(v)),
         ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => TursoValue::Blob(v),
 
         // Timestamp conversions: Format depends on configuration
@@ -1928,7 +1932,7 @@ fn scalar_value_to_turso(
             // IntervalDayTime has days (i32) and milliseconds (i32)
             // Pack into i64: upper 32 bits = days, lower 32 bits = milliseconds
             let packed =
-                ((v.days as i64) << BITS_PER_I32) | (v.milliseconds as i64 & LOWER_32_MASK);
+                (i64::from(v.days) << BITS_PER_I32) | (i64::from(v.milliseconds) & LOWER_32_MASK);
             TursoValue::Integer(packed)
         }
         ScalarValue::IntervalMonthDayNano(Some(v)) => {
@@ -1942,16 +1946,20 @@ fn scalar_value_to_turso(
         }
         ScalarValue::Decimal128(Some(v), _, scale) => {
             // Convert decimal to float for storage as REAL
-            let scale_factor = (DECIMAL_BASE as f64).powi(scale as i32);
-            TursoValue::Real(v as f64 / scale_factor)
+            #[allow(clippy::cast_precision_loss)]
+            let scale_factor = (DECIMAL_BASE as f64).powi(i32::from(scale));
+            #[allow(clippy::cast_precision_loss)]
+            let v_f64 = v as f64;
+            TursoValue::Real(v_f64 / scale_factor)
         }
         ScalarValue::Decimal256(Some(v), _, scale) => {
             // Convert decimal256 to float for storage as REAL
-            let scale_factor = (DECIMAL_BASE as f64).powi(scale as i32);
-            let v_str = format!("{}", v);
-            let v_f64 = v_str.parse::<f64>().map_err(|e| {
-                format!("Failed to parse Decimal256 value '{}' as f64: {}", v_str, e)
-            })?;
+            #[allow(clippy::cast_precision_loss)]
+            let scale_factor = (DECIMAL_BASE as f64).powi(i32::from(scale));
+            let v_str = format!("{v}");
+            let v_f64 = v_str
+                .parse::<f64>()
+                .map_err(|e| format!("Failed to parse Decimal256 value '{v_str}' as f64: {e}"))?;
             TursoValue::Real(v_f64 / scale_factor)
         }
         ScalarValue::List(list_arr) => {
@@ -1972,7 +1980,7 @@ fn scalar_value_to_turso(
             }
             TursoValue::Text(
                 serde_json::to_string(&json_values)
-                    .map_err(|e| format!("Failed to serialize List as JSON: {}", e))?,
+                    .map_err(|e| format!("Failed to serialize List as JSON: {e}"))?,
             )
         }
         ScalarValue::Map(map_arr) => {
@@ -1999,9 +2007,8 @@ fn scalar_value_to_turso(
                 if !keys.is_null(i) && !values.is_null(i) {
                     // Extract key as string
                     let key_scalar = ScalarValue::try_from_array(keys.as_ref(), i)?;
-                    let key_str = match key_scalar {
-                        ScalarValue::Utf8(Some(k)) => k,
-                        _ => continue, // Skip non-string keys
+                    let ScalarValue::Utf8(Some(key_str)) = key_scalar else {
+                        continue;
                     };
 
                     // Extract value
@@ -2018,7 +2025,7 @@ fn scalar_value_to_turso(
 
             TursoValue::Text(
                 serde_json::to_string(&json_map)
-                    .map_err(|e| format!("Failed to serialize Map as JSON: {}", e))?,
+                    .map_err(|e| format!("Failed to serialize Map as JSON: {e}"))?,
             )
         }
         _ => TursoValue::Null,

@@ -135,7 +135,7 @@ impl TursoAccelerator {
 
     /// Parses the `turso_mvcc` parameter from the acceleration configuration
     /// Returns true if MVCC should be enabled, false otherwise (default: disabled)
-    fn parse_mvcc_enabled(&self, source: &dyn AccelerationSource) -> Result<bool> {
+    fn parse_mvcc_enabled(source: &dyn AccelerationSource) -> Result<bool> {
         if let Some(acceleration) = source.acceleration() {
             if let Some(mvcc_value) = acceleration.params.get("turso_mvcc") {
                 match mvcc_value.as_str() {
@@ -143,8 +143,7 @@ impl TursoAccelerator {
                     "disabled" => Ok(false),
                     _ => Err(Error::InvalidConfiguration {
                         detail: Arc::from(format!(
-                            "Invalid 'turso_mvcc' value: '{}'. Expected 'enabled' or 'disabled'.",
-                            mvcc_value
+                            "Invalid 'turso_mvcc' value: '{mvcc_value}'. Expected 'enabled' or 'disabled'."
                         )),
                     }),
                 }
@@ -160,7 +159,6 @@ impl TursoAccelerator {
     /// Parses the `internal_timestamp_format` parameter from the acceleration configuration
     /// Returns the timestamp format (default: Rfc3339)
     fn parse_timestamp_format(
-        &self,
         source: &dyn AccelerationSource,
     ) -> Result<data_components::turso::TimestampFormat> {
         if let Some(acceleration) = source.acceleration() {
@@ -170,8 +168,7 @@ impl TursoAccelerator {
                     "integer_millis" => Ok(data_components::turso::TimestampFormat::IntegerMillis),
                     _ => Err(Error::InvalidConfiguration {
                         detail: Arc::from(format!(
-                            "Invalid 'internal_timestamp_format' value: '{}'. Expected 'rfc3339' or 'integer_millis'.",
-                            format_value
+                            "Invalid 'internal_timestamp_format' value: '{format_value}'. Expected 'rfc3339' or 'integer_millis'."
                         )),
                     }),
                 }
@@ -235,7 +232,7 @@ impl TursoAccelerator {
             // Generate default file path based on dataset name
             let data_directory = spice_data_base_path();
             let name_str = source.name().to_string().replace('/', "_");
-            let file_name = format!("{}.turso", name_str);
+            let file_name = format!("{name_str}.turso");
             let path = PathBuf::from(data_directory).join(file_name);
 
             Ok(path.to_string_lossy().to_string())
@@ -250,8 +247,8 @@ impl TursoAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<Arc<TursoConnectionPool>> {
         let turso_file = self.turso_file_path(source)?;
-        let mvcc_enabled = self.parse_mvcc_enabled(source)?;
-        let timestamp_format = self.parse_timestamp_format(source)?;
+        let mvcc_enabled = Self::parse_mvcc_enabled(source)?;
+        let timestamp_format = Self::parse_timestamp_format(source)?;
 
         let mut pools = self.pools.lock().await;
         if let Some(pool) = pools.get(&turso_file) {
@@ -406,6 +403,7 @@ impl DataAccelerator for TursoAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
+    #[allow(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -434,7 +432,7 @@ impl DataAccelerator for TursoAccelerator {
 
         // Get MVCC setting
         let mvcc_enabled = if let Some(source) = source {
-            self.parse_mvcc_enabled(source)?
+            Self::parse_mvcc_enabled(source)?
         } else {
             false // Default to disabled for external tables without source
         };
@@ -458,6 +456,7 @@ impl DataAccelerator for TursoAccelerator {
         // Build CREATE TABLE statement from schema
         let mut columns = Vec::new();
         for field in cmd.schema.fields() {
+            #[allow(clippy::match_same_arms)]
             let col_type = match field.data_type() {
                 // Integer types map to SQLite INTEGER
                 DataType::Int64
@@ -538,8 +537,7 @@ impl DataAccelerator for TursoAccelerator {
                     };
 
                     let create_index_sql = format!(
-                        "CREATE {}INDEX IF NOT EXISTS {} ON {} ({})",
-                        unique_clause, index_name, table_name, column_ref_str
+                        "CREATE {unique_clause}INDEX IF NOT EXISTS {index_name} ON {table_name} ({column_ref_str})"
                     );
 
                     conn.execute(&create_index_sql, ()).await.map_err(|e| {
@@ -688,9 +686,9 @@ mod tests {
         let accelerator = TursoAccelerator::new();
         let result = accelerator.init(&dataset).await;
         assert!(result.is_err());
+        let error = result.expect_err("Expected error for remote Turso database");
         assert!(
-            result
-                .unwrap_err()
+            error
                 .to_string()
                 .contains("Remote Turso databases are not supported")
         );
@@ -718,9 +716,9 @@ mod tests {
 
         let result2 = accelerator.init(&dataset2).await;
         assert!(result2.is_err());
+        let error2 = result2.expect_err("Expected error for remote Turso database with auth token");
         assert!(
-            result2
-                .unwrap_err()
+            error2
                 .to_string()
                 .contains("Remote Turso databases are not supported")
         );
@@ -914,7 +912,7 @@ mod tests {
             .expect("query with limit successful");
 
         // Should return at most 2 rows
-        let total_rows: usize = result_with_limit.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = result_with_limit.iter().map(RecordBatch::num_rows).sum();
         assert!(total_rows <= 2);
 
         // Test 4: Combined projection, filter, and limit
@@ -937,7 +935,7 @@ mod tests {
             .expect("combined query successful");
 
         // Should return at most 2 rows with id > 2 (Charlie, David)
-        let total_rows: usize = result_combined.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = result_combined.iter().map(RecordBatch::num_rows).sum();
         assert!(total_rows <= 2);
         assert!(total_rows > 0);
     }
@@ -949,9 +947,9 @@ mod tests {
 
         // Clean up if file exists from previous test
         let _ = std::fs::remove_file(test_path);
-        let _ = std::fs::remove_file(format!("{}-wal", test_path));
-        let _ = std::fs::remove_file(format!("{}-shm", test_path));
-        let _ = std::fs::remove_file(format!("{}-log", test_path));
+        let _ = std::fs::remove_file(format!("{test_path}-wal"));
+        let _ = std::fs::remove_file(format!("{test_path}-shm"));
+        let _ = std::fs::remove_file(format!("{test_path}-log"));
 
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
@@ -1053,9 +1051,9 @@ mod tests {
 
         // Clean up all database files
         let _ = std::fs::remove_file(test_path);
-        let _ = std::fs::remove_file(format!("{}-wal", test_path));
-        let _ = std::fs::remove_file(format!("{}-shm", test_path));
-        let _ = std::fs::remove_file(format!("{}-log", test_path));
+        let _ = std::fs::remove_file(format!("{test_path}-wal"));
+        let _ = std::fs::remove_file(format!("{test_path}-shm"));
+        let _ = std::fs::remove_file(format!("{test_path}-log"));
     }
 
     #[tokio::test]
@@ -1178,6 +1176,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_timestamp_unit_conversion() {
         // Test that timestamps are correctly converted between different units
         // All timestamps are stored as milliseconds in Turso, but should be
@@ -1191,10 +1190,10 @@ mod tests {
 
         // Test value: 2024-01-01 00:00:00 UTC
         // In different units:
-        const TEST_TIMESTAMP_SECONDS: i64 = 1704067200;
-        const TEST_TIMESTAMP_MILLIS: i64 = 1704067200000;
-        const TEST_TIMESTAMP_MICROS: i64 = 1704067200000000;
-        const TEST_TIMESTAMP_NANOS: i64 = 1704067200000000000;
+        const TEST_TIMESTAMP_SECONDS: i64 = 1_704_067_200;
+        const TEST_TIMESTAMP_MILLIS: i64 = 1_704_067_200_000;
+        const TEST_TIMESTAMP_MICROS: i64 = 1_704_067_200_000_000;
+        const TEST_TIMESTAMP_NANOS: i64 = 1_704_067_200_000_000_000;
 
         let ctx = SessionContext::new();
 
