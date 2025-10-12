@@ -71,14 +71,6 @@ runs:
       run: |
         echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
 
-    - name: Install MinIO
-      if: inputs.download_from_minio == 'true'
-      uses: spiceai/spiceai/.github/actions/setup-minio
-      with:
-        minio_endpoint: ${{ inputs.minio_endpoint }}
-        minio_access_key: ${{ inputs.minio_access_key }}
-        minio_secret_key: ${{ inputs.minio_secret_key }}
-
     - name: Download testoperator from MinIO
       if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
       id: minio-download
