@@ -398,29 +398,41 @@ impl GithubRestClient {
                                 DateTime::parse_from_rfc3339(&commits[0].commit.author.date)
                             {
                                 updated_at_builder
-                                    .as_mut()
-                                    .unwrap()
-                                    .append_value(dt.timestamp_millis());
+                                .as_mut()
+                                .expect("updated_at_builder should exist when include_commits is true")
+                                .append_value(dt.timestamp_millis());
                             } else {
-                                updated_at_builder.as_mut().unwrap().append_null();
+                                updated_at_builder.as_mut().expect("updated_at_builder should exist when include_commits is true").append_null();
                             }
 
                             // Last commit is the oldest (created_at)
-                            let last_commit = commits.last().unwrap();
+                            let last_commit = commits
+                                .last()
+                                .expect("commits should not be empty based on match guard");
                             if let Ok(dt) =
                                 DateTime::parse_from_rfc3339(&last_commit.commit.author.date)
                             {
                                 created_at_builder
-                                    .as_mut()
-                                    .unwrap()
-                                    .append_value(dt.timestamp_millis());
+                                .as_mut()
+                                .expect("created_at_builder should exist when include_commits is true")
+                                .append_value(dt.timestamp_millis());
                             } else {
-                                created_at_builder.as_mut().unwrap().append_null();
+                                created_at_builder.as_mut().expect("created_at_builder should exist when include_commits is true").append_null();
                             }
                         }
                         _ => {
-                            created_at_builder.as_mut().unwrap().append_null();
-                            updated_at_builder.as_mut().unwrap().append_null();
+                            created_at_builder
+                                .as_mut()
+                                .expect(
+                                    "created_at_builder should exist when include_commits is true",
+                                )
+                                .append_null();
+                            updated_at_builder
+                                .as_mut()
+                                .expect(
+                                    "updated_at_builder should exist when include_commits is true",
+                                )
+                                .append_null();
                         }
                     }
                 }
@@ -453,21 +465,31 @@ impl GithubRestClient {
         ];
 
         if include_commits {
-            columns.push(Arc::new(created_at_builder.unwrap().finish()));
-            columns.push(Arc::new(updated_at_builder.unwrap().finish()));
+            columns.push(Arc::new(
+                created_at_builder
+                    .expect("created_at_builder should exist when include_commits is true")
+                    .finish(),
+            ));
+            columns.push(Arc::new(
+                updated_at_builder
+                    .expect("updated_at_builder should exist when include_commits is true")
+                    .finish(),
+            ));
         }
 
         if fetch_content {
             let mut content_builder = StringBuilder::new();
 
-            // download content in parallel
+            // download content in parallel using chunks to avoid lifetime issues
             for chunk in tree.chunks(NUM_FILE_CONTENT_DOWNLOAD_WORKERS) {
-                let content_fetch_futures = chunk
+                let download_futures: Vec<_> = chunk
                     .iter()
                     .map(|node| self.fetch_file_content(owner, repo, tree_sha, &node.path))
-                    .collect::<Vec<_>>();
+                    .collect();
 
-                for res in future::join_all(content_fetch_futures).await {
+                let results = future::join_all(download_futures).await;
+
+                for res in results {
                     content_builder.append_value(res.context(GithubApiSnafu)?);
                 }
             }
@@ -681,9 +703,9 @@ impl GithubRestClient {
 
         let response = match response {
             Ok(resp) => resp,
-            Err(_) => {
+            Err(e) => {
                 // Return empty vec on error rather than failing the entire operation
-                tracing::warn!("Failed to fetch commits for file: {path}");
+                tracing::warn!("Failed to fetch commits for file: {path}: {e}");
                 return Ok(Vec::new());
             }
         };
