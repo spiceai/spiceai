@@ -53,8 +53,8 @@ impl GitHubTableArgs for ProjectsTableArgs {
                                     created_at: createdAt
                                     updated_at: updatedAt
                                     closed_at: closedAt
-                                    creator {{
-                                        login
+                                    creator: creator {{
+                                        creator: login
                                     }}
                                 }}
                             }}
@@ -88,8 +88,8 @@ impl GitHubTableArgs for ProjectsTableArgs {
                                         created_at: createdAt
                                         updated_at: updatedAt
                                         closed_at: closedAt
-                                        creator {{
-                                            login
+                                        creator: creator {{
+                                            creator: login
                                         }}
                                     }}
                                 }}
@@ -114,8 +114,8 @@ impl GitHubTableArgs for ProjectsTableArgs {
                                         created_at: createdAt
                                         updated_at: updatedAt
                                         closed_at: closedAt
-                                        creator {{
-                                            login
+                                        creator: creator {{
+                                            creator: login
                                         }}
                                     }}
                                 }}
@@ -134,7 +134,7 @@ impl GitHubTableArgs for ProjectsTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Depth(1),
+            UnnestBehavior::Depth(2),
             Some(gql_schema()),
         )
     }
@@ -228,6 +228,10 @@ mod tests {
             schema.field(10).data_type(),
             &DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)
         );
+
+        // Check creator field (unnested from creator.login)
+        assert_eq!(schema.field(11).name(), "creator");
+        assert_eq!(schema.field(11).data_type(), &DataType::Utf8);
     }
 
     #[test]

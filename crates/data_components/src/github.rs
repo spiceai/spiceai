@@ -245,33 +245,39 @@ where
         .build();
 
     let mut exponential_backoff = ExponentialBackoff {
-        max_elapsed_time: None,
+        max_elapsed_time: Some(std::time::Duration::from_secs(300)), // 5 minutes max total retry time
         ..ExponentialBackoff::default()
     };
 
+    let mut exponential_retry_count = 0_usize;
+
     loop {
         // Check rate limit before each attempt
-        // If rate limit check fails, we don't retry - just fail immediately
-        rate_limiter
-            .check_rate_limit()
-            .await
-            .map_err(|e| {
-                // Convert the rate limit error to a reqwest error
-                // Since reqwest::Error doesn't have a public constructor, we'll just return
-                // the first error we encounter from the operation
-                tracing::error!("Rate limit check failed: {e}");
-            })
-            .ok();
+        // The rate limiter handles waiting based on rate limit info from previous responses
+        // This always returns Ok(()) after waiting if needed
+        rate_limiter.check_rate_limit().await.ok();
 
         match operation().await {
             Ok(result) => return Ok(result),
             Err(e) => {
                 match classify_retryable_error(&e) {
                     Some(RetryableErrorType::RateLimit) => {
-                        // Use exponential backoff for rate limits
+                        // Check if we've exceeded max retries
+                        if exponential_retry_count >= max_retries {
+                            tracing::warn!(
+                                "GitHub API rate limit error, max retries ({max_retries}) exceeded: {e}"
+                            );
+                            return Err(e);
+                        }
+                        exponential_retry_count += 1;
+
+                        // For rate limits, the response headers have been updated in the rate limiter.
+                        // On the next loop iteration, check_rate_limit() will handle the waiting
+                        // based on the retry-after or x-ratelimit-reset header from the response.
+                        // We add a small exponential backoff as additional protection.
                         if let Some(duration) = Backoff::next_backoff(&mut exponential_backoff) {
                             tracing::warn!(
-                                "GitHub API rate limit error, retrying with exponential backoff in {duration:?}: {e}"
+                                "GitHub API rate limit error, will check rate limit and retry (attempt {exponential_retry_count}/{max_retries}): {e}"
                             );
                             tokio::time::sleep(duration).await;
                             continue;
