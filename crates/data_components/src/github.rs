@@ -230,7 +230,7 @@ fn classify_retryable_error(error: &reqwest::Error) -> Option<RetryableErrorType
 }
 
 /// Retry with adaptive backoff - exponential for rate limits, fibonacci for server errors
-/// The rate_limiter is checked before each retry attempt to ensure concurrency control
+/// The `rate_limiter` is checked before each retry attempt to ensure concurrency control
 async fn retry_with_adaptive_backoff<F, Fut, T>(
     max_retries: usize,
     rate_limiter: &Arc<dyn RateLimiter>,
@@ -280,12 +280,11 @@ where
                                 "GitHub API rate limit error, will check rate limit and retry (attempt {exponential_retry_count}/{max_retries}): {e}"
                             );
                             tokio::time::sleep(duration).await;
-                            continue;
                         } else {
                             return Err(e);
                         }
                     }
-                    Some(RetryableErrorType::ServerError) | Some(RetryableErrorType::Network) => {
+                    Some(RetryableErrorType::ServerError | RetryableErrorType::Network) => {
                         // Use fibonacci backoff for server errors and network issues
                         if let Some(duration) = Backoff::next_backoff(&mut fibonacci_backoff) {
                             tracing::warn!(
@@ -294,7 +293,6 @@ where
                                 e
                             );
                             tokio::time::sleep(duration).await;
-                            continue;
                         } else {
                             return Err(e);
                         }
@@ -321,6 +319,9 @@ impl GithubRestClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::missing_panics_doc)]
+    #[allow(clippy::expect_used)]
     pub async fn fetch_files(
         &self,
         owner: &str,

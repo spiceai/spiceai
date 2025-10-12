@@ -22,7 +22,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
 use commits::CommitsTableArgs;
-use projects::ProjectsTableArgs;
 use data_components::graphql::client::UnnestBehavior;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
@@ -47,6 +46,7 @@ use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
 use issues::IssuesTableArgs;
+use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
 use secrecy::ExposeSecret;
@@ -273,8 +273,7 @@ impl Github {
         let include_commits = dataset
             .params
             .get("github_include_commits")
-            .map(|value| value.as_str() == "true")
-            .unwrap_or(false);
+            .is_some_and(|value| value.as_str() == "true");
 
         Ok(Arc::new(
             GithubFilesTableProvider::new(
@@ -662,8 +661,8 @@ impl DataConnector for Github {
                     component,
                 });
                 self.create_gql_table_provider(
-                    table_args, 
-                    None, 
+                    table_args,
+                    None,
                     Github::get_health_check_for_owner_and_repo(owner, repo)
                 )
                 .await
