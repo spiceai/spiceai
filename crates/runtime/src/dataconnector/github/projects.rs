@@ -298,7 +298,7 @@ mod tests {
         assert!(graphql_params.json_pointer.is_none());
         assert!(matches!(
             graphql_params.unnest_behavior,
-            UnnestBehavior::Depth(1)
+            UnnestBehavior::Depth(2)
         ));
         assert!(graphql_params.schema.is_some());
 
