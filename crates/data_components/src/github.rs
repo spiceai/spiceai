@@ -370,33 +370,37 @@ impl GithubRestClient {
             None
         };
 
-        // Fetch commit information for timestamps (in parallel batches) if requested
-        if include_commits {
-            for chunk in tree.chunks(NUM_FILE_CONTENT_DOWNLOAD_WORKERS) {
+        // Process files in chunks, fetching commit information if requested
+        for chunk in tree.chunks(NUM_FILE_CONTENT_DOWNLOAD_WORKERS) {
+            // Fetch commits in parallel for this chunk if requested
+            let commits_results = if include_commits {
                 let commit_fetch_futures = chunk
                     .iter()
                     .map(|node| self.fetch_file_commits(owner, repo, tree_sha, &node.path))
                     .collect::<Vec<_>>();
+                Some(future::join_all(commit_fetch_futures).await)
+            } else {
+                None
+            };
 
-                for (node, commits_result) in chunk
-                    .iter()
-                    .zip(future::join_all(commit_fetch_futures).await)
-                {
-                    name_builder
-                        .append_value(extract_name_from_path(&node.path).unwrap_or_default());
-                    path_builder.append_value(&node.path);
-                    size_builder.append_value(node.size.unwrap_or(0));
-                    sha_builder.append_value(&node.sha);
-                    mode_builder.append_value(&node.mode);
-                    match &node.url {
-                        Some(url) => url_builder.append_value(url),
-                        None => url_builder.append_null(),
-                    }
-                    download_url_builder
-                        .append_value(get_download_url(owner, repo, tree_sha, &node.path));
+            // Build record batch fields for this chunk
+            for (idx, node) in chunk.iter().enumerate() {
+                // Add basic file information (shared between both code paths)
+                name_builder.append_value(extract_name_from_path(&node.path).unwrap_or_default());
+                path_builder.append_value(&node.path);
+                size_builder.append_value(node.size.unwrap_or(0));
+                sha_builder.append_value(&node.sha);
+                mode_builder.append_value(&node.mode);
+                match &node.url {
+                    Some(url) => url_builder.append_value(url),
+                    None => url_builder.append_null(),
+                }
+                download_url_builder
+                    .append_value(get_download_url(owner, repo, tree_sha, &node.path));
 
-                    // Add timestamps from commits
-                    match commits_result {
+                // Add timestamps from commits if we fetched them
+                if let Some(ref results) = commits_results {
+                    match &results[idx] {
                         Ok(commits) if !commits.is_empty() => {
                             // First commit is the most recent (updated_at)
                             if let Ok(dt) =
@@ -441,21 +445,6 @@ impl GithubRestClient {
                         }
                     }
                 }
-            }
-        } else {
-            // If not including commits, just add the basic file information
-            for node in &tree {
-                name_builder.append_value(extract_name_from_path(&node.path).unwrap_or_default());
-                path_builder.append_value(&node.path);
-                size_builder.append_value(node.size.unwrap_or(0));
-                sha_builder.append_value(&node.sha);
-                mode_builder.append_value(&node.mode);
-                match &node.url {
-                    Some(url) => url_builder.append_value(url),
-                    None => url_builder.append_null(),
-                }
-                download_url_builder
-                    .append_value(get_download_url(owner, repo, tree_sha, &node.path));
             }
         }
 
