@@ -21,20 +21,24 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    collections::HashMap,
 };
 
 use async_trait::async_trait;
+use data_components::poly::PolyTableProvider;
 use datafusion::{
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
-    prelude::Expr,
+    prelude::{Expr, SessionContext},
     scalar::ScalarValue,
     sql::unparser::expr_to_sql,
+    arrow::record_batch::RecordBatch,
 };
+use datafusion_datasource::sink::DataSinkExec;
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
-    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    duckdb::{write::DuckDBTableWriter, write_partitioned::{BatchPartitioner, DuckDBPartitionedDataSink}, DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory},
+    sql::db_connection_pool::{duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder}, DbConnectionPool},
 };
 use duckdb::AccessMode;
 use runtime_table_partition::{
@@ -261,7 +265,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
             partition_dir(source),
             cmd,
             expressions_hash,
-        ));
+        ).await);
         let table_provider =
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
 
@@ -282,6 +286,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 
 #[derive(Debug)]
 pub(crate) struct DuckDBPartitionCreator {
+    table_provider: DuckDBTableWriter,
     cmd: CreateExternalTable,
     duckdb_factory: DuckDBTableProviderFactory,
     partition_dir: PathBuf,
@@ -289,14 +294,38 @@ pub(crate) struct DuckDBPartitionCreator {
 }
 
 impl DuckDBPartitionCreator {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         partition_dir: PathBuf,
         cmd: CreateExternalTable,
         expressions_hash: u64,
     ) -> Self {
         let duckdb_factory = create_factory();
 
+        if !partition_dir.is_dir() {
+            create_dir_all(&partition_dir)
+                .await.unwrap();
+        };
+
+        let duckdb_file = format!("{}.db", cmd.name);
+        let duckdb_path = partition_dir.join(&duckdb_file);
+        let duckdb_path = duckdb_path.display().to_string();
+
+        let mut cmd = cmd.clone();
+        cmd.options.insert("open".to_string(), duckdb_path.clone());
+
+        let table_provider = create_table_provider(&duckdb_factory, &cmd)
+            .await
+            .unwrap();
+        let Some(poly_table) = table_provider.as_any().downcast_ref::<PolyTableProvider>() else {
+            unreachable!("DuckDBTableWriter should be returned from PolyTableProvider")
+        };
+
+        let Some(writer) = poly_table.write.as_any().downcast_ref::<DuckDBTableWriter>() else {
+            unreachable!("DuckDBTableWriter should be returned from PolyTableProvider")
+        };
+
         Self {
+            table_provider: writer.clone(),
             cmd,
             duckdb_factory,
             partition_dir,
@@ -322,20 +351,107 @@ impl DuckDBPartitionCreator {
 
         Ok(duckdb_path)
     }
+
+    fn list_existing_partitions(&self) -> Result<Vec<String>, creator::Error> {
+        let mut conn = self.table_provider.pool().connect_sync()
+            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+
+        let conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
+
+        let mut stmt = conn.conn
+            .prepare(&format!(
+                "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_name LIKE '{}_partition_%'",
+                self.cmd.name
+            ))
+            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+        
+        let table_names: Vec<String> = stmt.query_map([], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })
+        .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+
+        let mut partitions = Vec::new();
+        let table_name = &self.cmd.name;
+        
+        // Filter tables that match the partition pattern and extract partition values
+        for name in table_names {
+            // Check if table name follows the partition pattern: {table_name}_partition_{value}
+            if let Some(partition_suffix) = name.strip_prefix(&format!("{}_partition_", table_name)) {
+                partitions.push(partition_suffix.to_string());
+                
+            }
+        }
+        Ok(partitions)
+    }
 }
 
+
+// pub(crate) async fn create_table_writer(
+//     duckdb_factory: &DuckDBTableProviderFactory,
+//     cmd: &CreateExternalTable,
+// ) -> Result<DuckDBTableWriter, Box<dyn std::error::Error + Send + Sync>> {
+//     let ctx = SessionContext::new();
+//     let table_provider = duckdb_factory
+//         .create(&ctx.state(), cmd)
+//         .await
+//         .context(UnableToCreateTableSnafu)
+//         .boxed()?;
+
+//     let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>() else {
+//         unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
+//     };
+
+//     Ok(duckdb_writer)
+// }
+//
 #[async_trait]
 impl PartitionCreator for DuckDBPartitionCreator {
+    
+    async fn insert_partitioned(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        overwrite: datafusion::logical_expr::dml::InsertOp,
+        partitioner: Arc<dyn BatchPartitioner>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, DataFusionError> {
+        // self.table_provider
+        //     .insert_into(state, input, insert_op)
+        //     .await
+
+        let pool = self.table_provider.pool();
+        let table_definition = self.table_provider.table_definition();
+        let schema = self.table_provider.schema();
+
+         Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(DuckDBPartitionedDataSink::new(
+                pool,
+                table_definition,
+                overwrite,
+                None,
+                schema,
+                partitioner,
+            )),
+            None,
+        )) as _)
+    }
+    
     async fn create_partition(
         &self,
         partition_value: ScalarValue,
     ) -> Result<Partition, creator::Error> {
         let mut cmd = self.cmd.clone();
-        let duckdb_path = self
-            .add_open(&mut cmd, &partition_value)
-            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-        tracing::debug!("creating partition at {duckdb_path}");
+        let partition_value_str = encode_pair(&partition_value, self.expressions_hash).unwrap();
+
+        //cmd.options.insert("partition".to_string(), partition_value_str.clone());
+        // let duckdb_path = self
+        //     .add_open(&mut cmd, &partition_value)
+        //     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
+        // tracing::debug!("creating partition at {partition_value}");
 
         let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
             .await
@@ -350,73 +466,45 @@ impl PartitionCreator for DuckDBPartitionCreator {
     }
 
     async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
-        if !self.partition_dir.is_dir() {
-            create_dir_all(&self.partition_dir)
-                .await
-                .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
-            return Ok(vec![]);
-        }
-
-        let mut dir_entries = tokio::fs::read_dir(&self.partition_dir)
-            .await
-            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+        let partition_names = self.list_existing_partitions()?;
 
         let mut partitions = Vec::new();
 
-        while let Some(entry) = dir_entries
-            .next_entry()
-            .await
-            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?
-        {
-            let path = entry.path();
-            if path.is_file() {
-                let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-                if !Self::valid_file_extensions().contains(&extension) {
-                    continue;
-                }
+        let duckdb_file = format!("{}.db", self.cmd.name);
+        let duckdb_path = self.partition_dir.join(&duckdb_file);
+        let duckdb_path = duckdb_path.display().to_string();
 
-                let Some(file_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                    continue;
-                };
+        for partition_suffix in partition_names {
+            if let Ok(partition_value) = partition_suffix.parse::<i32>() {
+                let scalar_value = ScalarValue::Int32(Some(partition_value));
 
-                let partition_value = match decode_pair(file_name) {
-                    Ok((value, partition_by_hash)) => {
-                        if self.expressions_hash != partition_by_hash {
-                            return Err(creator::Error::PartitionByExpressionsChanged);
-                        }
-                        value
-                    }
-                    Err(e) => {
-                        tracing::trace!("Unable to decode ScalarValue: {e}");
-                        continue;
-                    }
-                };
-
+                
+                // Create a partition entry
                 let mut cmd = self.cmd.clone();
-                self.add_open(&mut cmd, &partition_value)
-                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+                cmd.name = format!("{}_partition_{}", self.cmd.name, partition_suffix).into();
+                cmd.options.insert("open".to_string(), duckdb_path.clone());
 
-                let duckdb_path = path.display().to_string();
-                get_pool(&self.duckdb_factory, &duckdb_path)
-                    .await
-                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
-
+                // cmd.options.insert("partition".to_string(), encode_pair(&scalar_value, self.expressions_hash)
+                //     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?);
+                
                 let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
                     .await
                     .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
                 partitions.push(Partition {
-                    partition_value,
+                    partition_value: scalar_value,
                     table_provider,
                 });
             }
+        
         }
 
         tracing::debug!(
             "inferred {} existing partitions from '{}'",
             partitions.len(),
-            self.partition_dir.display().to_string(),
+            self.cmd.name
         );
+
         Ok(partitions)
     }
 

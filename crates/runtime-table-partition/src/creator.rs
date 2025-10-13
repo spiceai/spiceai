@@ -14,16 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    error::DataFusionError, logical_expr::TableProviderFilterPushDown, prelude::Expr,
-    scalar::ScalarValue,
+    error::DataFusionError, logical_expr::TableProviderFilterPushDown, prelude::Expr, scalar::ScalarValue
 };
+use datafusion_table_providers::duckdb::write_partitioned::BatchPartitioner;
 use snafu::prelude::*;
 
 use crate::Partition;
+
 
 pub mod filename;
 
@@ -64,4 +65,12 @@ pub trait PartitionCreator: Debug + Send + Sync {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError>;
+
+    async fn insert_partitioned(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        input: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+        partitioner: Arc<dyn BatchPartitioner>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, DataFusionError>;
 }

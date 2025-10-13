@@ -19,24 +19,51 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableProvider},
-    common::{Constraints, DFSchema},
-    datasource::TableType,
-    error::DataFusionError,
-    logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
-    prelude::Expr,
+    arrow::{array::{Array, UInt64Array}, compute, record_batch::RecordBatch}, catalog::{Session, TableProvider}, common::{Constraints, DFSchema}, datasource::TableType, error::DataFusionError, execution::context::ExecutionProps, logical_expr::{dml::InsertOp, ColumnarValue, TableProviderFilterPushDown}, physical_expr::{create_physical_expr, PhysicalExpr}, physical_plan::{empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec, ExecutionPlan}, prelude::Expr, scalar::ScalarValue
 };
+use datafusion_table_providers::duckdb::write_partitioned::BatchPartitioner;
 use pruning::prune_partition;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::{
-    Partition, creator::PartitionCreator, expression::validate_scalar_compatibility,
-    insert::PartitionerExec,
+    creator::PartitionCreator, expression::validate_scalar_compatibility, insert::partition_batch, Partition
 };
 
 pub mod pruning;
+
+/// Expression-based partitioner that uses a DataFusion expression to partition batches
+pub struct ExpressionPartitioner {
+    physical_expr: Arc<dyn PhysicalExpr>,
+}
+
+// TODO: use DF impl BatchPartitioner {
+impl ExpressionPartitioner {
+    pub fn new(expr: &Expr, schema: SchemaRef) -> Result<Self, DataFusionError> {
+        let df_schema = DFSchema::try_from(schema)?;
+        let execution_props = ExecutionProps::new();
+        let physical_expr = create_physical_expr(expr, &df_schema, &execution_props)?;
+        Ok(Self { physical_expr })
+    }
+}
+
+impl BatchPartitioner for ExpressionPartitioner {
+    fn partition_batch(&self, batch: &RecordBatch) -> Result<HashMap<String, RecordBatch>, DataFusionError> {
+        let partitions = partition_batch(batch, self.physical_expr.as_ref())?;
+    
+        let res = partitions
+            .into_iter()
+            .map(|(partition, (_scalar_value, batch))| (partition, batch))
+            .collect::<HashMap<_, _>>();
+
+       // print only keys
+        // for (key, batch) in &res {
+        //     println!("partition_batch key: {}, num_rows: {}", key, batch.num_rows());
+        // }
+
+        Ok(res)
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -62,6 +89,7 @@ pub struct PartitionTableProvider {
     partition_by: Expr,
     partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
     schema: SchemaRef,
+
 }
 
 impl PartitionTableProvider {
@@ -181,17 +209,47 @@ impl TableProvider for PartitionTableProvider {
 
     async fn insert_into(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Ok(Arc::new(PartitionerExec::new(
-            input,
-            self.partition_by.clone(),
-            Arc::clone(&self.creator),
-            Arc::clone(&self.partitions),
-            insert_op,
+
+        // Create partitioner from the partition_by expression
+        let partitioner = Arc::new(ExpressionPartitioner::new(
+            &self.partition_by,
             Arc::clone(&self.schema),
-        )))
+        )?);
+
+        let result = self.creator
+            .insert_partitioned(state, input, insert_op, partitioner)
+            .await?;
+
+        // After insert, infer partitions again to update the in-memory partition map
+        let updated_partitions = self.creator
+            .infer_existing_partitions()
+            .await
+            .map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "Failed to infer partitions after insert: {err}"
+                ))
+            })?;
+
+        let mut partitions_map = HashMap::new();
+        for p in updated_partitions {
+            partitions_map.insert(p.partition_value.to_string(), p);
+        }
+
+        let mut partitions_lock = self.partitions.write().await;
+        *partitions_lock = partitions_map;
+
+        Ok(result)
+        // Ok(Arc::new(PartitionerExec::new(
+        //     input,
+        //     self.partition_by.clone(),
+        //     Arc::clone(&self.creator),
+        //     Arc::clone(&self.partitions),
+        //     insert_op,
+        //     Arc::clone(&self.schema),
+        // )))
     }
 }
