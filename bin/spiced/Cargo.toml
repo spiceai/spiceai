@@ -55,6 +55,7 @@ cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
+    "alloc-system",
     "duckdb",
     "postgres",
     "sqlite",
