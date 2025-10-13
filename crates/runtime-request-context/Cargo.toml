@@ -25,3 +25,6 @@ http.workspace = true
 runtime-auth = { path = "../runtime-auth" }
 regex.workspace = true
 opentelemetry.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winver = "1.0.0"
