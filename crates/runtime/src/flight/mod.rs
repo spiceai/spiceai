@@ -247,7 +247,7 @@ impl Service {
     }
 }
 
-fn record_batches_to_flight_stream(
+pub(crate) fn record_batches_to_flight_stream(
     record_batches: Vec<RecordBatch>,
 ) -> impl Stream<Item = Result<FlightData, Status>> {
     FlightDataEncoderBuilder::new()
