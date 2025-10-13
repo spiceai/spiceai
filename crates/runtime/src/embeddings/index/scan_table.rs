@@ -183,7 +183,7 @@ impl TableProvider for VectorScanTableProvider {
                 // Any field only present in vector index must be nullable since row may be in `self.table_provider` before `self.vector_index_list`.
                 fields_map.insert(
                     f.name().clone(),
-                    Arc::new(Arc::unwrap_or_clone(Arc::clone(f)).with_nullable(true)),
+                    Arc::new((**f).clone().with_nullable(true)),
                 );
             }
         }
