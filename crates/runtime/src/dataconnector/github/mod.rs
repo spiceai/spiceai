@@ -327,34 +327,38 @@ fn github_gql_raw_schema_cast(
         }
 
         // Handle top-level structs with a single field (e.g., creator: { creator: "value" })
-        // Extract the inner field value and flatten it
+        // Extract the inner field value and flatten it if the inner and outer fields are the same
         if let DataType::Struct(struct_fields) = field.data_type()
             && struct_fields.len() == 1
         {
-            let struct_array = column
-                .as_any()
-                .downcast_ref::<arrow::array::StructArray>()
-                .ok_or_else(|| {
-                    format!(
-                        "Expected StructArray for field {}, but got different type",
-                        field.name()
-                    )
-                })?;
-
-            // Get the single inner column
-            let inner_column = struct_array.column(0);
             let inner_field = &struct_fields[0];
 
-            // Create a new field with the outer name but inner type
-            let new_field = Arc::new(Field::new(
-                field.name(),
-                inner_field.data_type().clone(),
-                field.is_nullable(),
-            ));
+            // Only flatten if the inner field name matches the outer field name
+            if inner_field.name() == field.name() {
+                let struct_array = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::StructArray>()
+                    .ok_or_else(|| {
+                        format!(
+                            "Expected StructArray for field {}, but got different type",
+                            field.name()
+                        )
+                    })?;
 
-            fields.push(new_field);
-            columns.push(Arc::clone(inner_column));
-            continue;
+                // Get the single inner column
+                let inner_column = struct_array.column(0);
+
+                // Create a new field with the outer name but inner type
+                let new_field = Arc::new(Field::new(
+                    field.name(),
+                    inner_field.data_type().clone(),
+                    field.is_nullable(),
+                ));
+
+                fields.push(new_field);
+                columns.push(Arc::clone(inner_column));
+                continue;
+            }
         }
 
         fields.push(Arc::clone(field));
