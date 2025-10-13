@@ -22,6 +22,7 @@ use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Resul
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
+    error::ArrowError,
     json::{ReaderBuilder, reader::infer_json_schema_from_iterator},
 };
 use graphql_parser::query::{
@@ -663,6 +664,16 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
     type Error = super::Error;
 
     fn try_from(query: Arc<str>) -> Result<Self, self::Error> {
+        // Validate query is not empty or whitespace only
+        if query.trim().is_empty() {
+            return Err(super::Error::InvalidGraphQLQuery {
+                message: "Query cannot be empty".to_string(),
+                line: 0,
+                column: 0,
+                query: query.to_string(),
+            });
+        }
+
         // SAFETY: We're transmuting the lifetime to 'static and this is safe because:
         // 1. The reference won't outlive the GraphQLQuery struct and we don't give it out as a static reference
         // 2. The source Arc is kept alive as long as the GraphQLQuery exists
@@ -693,6 +704,10 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
 impl GraphQLQuery {
     #[must_use]
     pub fn with_json_pointer(mut self, json_pointer: Arc<str>) -> Self {
+        // Validate JSON pointer format (should start with / or be empty)
+        if !json_pointer.is_empty() && !json_pointer.starts_with('/') {
+            tracing::warn!("JSON pointer '{}' should start with '/'.", json_pointer);
+        }
         self.json_pointer = Some(json_pointer);
         self
     }
@@ -756,6 +771,18 @@ impl GraphQLClient {
         rate_limiter: Option<Arc<dyn RateLimiter>>,
         semaphore: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
+        // Validate unnest depth to prevent excessive recursion
+        if let UnnestBehavior::Depth(depth) = &unnest_behavior {
+            if *depth > 50 {
+                return Err(Error::InvalidObjectAccess {
+                    message: format!(
+                        "Unnest depth of {} exceeds maximum allowed depth of 50",
+                        depth
+                    ),
+                });
+            }
+        }
+
         let auth = match (token, user, pass) {
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
             (Some(token), _, _) => Some(Auth::Bearer(token)),
@@ -767,7 +794,13 @@ impl GraphQLClient {
             duplicate_behavior: DuplicateBehavior::Error,
         };
 
-        let json_pointer = json_pointer.map(Arc::from);
+        let json_pointer = json_pointer.map(|p| {
+            // Validate JSON pointer format
+            if !p.is_empty() && !p.starts_with('/') {
+                tracing::warn!("JSON pointer '{}' should start with '/'.", p);
+            }
+            Arc::from(p)
+        });
 
         Ok(Self {
             client,
@@ -789,6 +822,21 @@ impl GraphQLClient {
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
     ) -> Result<GraphQLQueryResult> {
+        // Validate cursor if present
+        if let Some(ref cursor_val) = cursor {
+            if cursor_val.is_empty() {
+                tracing::warn!("Empty cursor provided, this may cause unexpected behavior");
+            }
+            if cursor_val.len() > 10000 {
+                return Err(Error::InvalidObjectAccess {
+                    message: format!(
+                        "Cursor is too long ({} bytes). This may indicate a malformed cursor.",
+                        cursor_val.len()
+                    ),
+                });
+            }
+        }
+
         // Check rate limit before executing the query
         if let Some(rate_limiter) = &self.rate_limiter {
             rate_limiter
@@ -800,6 +848,16 @@ impl GraphQLClient {
         }
 
         let query_string = query.to_string(limit, cursor);
+
+        // Validate query string is not empty
+        if query_string.trim().is_empty() {
+            return Err(Error::InvalidGraphQLQuery {
+                message: "Generated query string is empty".to_string(),
+                line: 0,
+                column: 0,
+                query: query_string,
+            });
+        }
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
@@ -835,11 +893,14 @@ impl GraphQLClient {
         let status = response.status();
         let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;
 
+        // Check for errors before processing data
+        handle_http_error(status, &response)?;
+        handle_graphql_query_error(&response, &query_string)?;
+
+        // Custom error checker (e.g., for GitHub rate limits)
         error_checker
             .map(|p| p(&response_headers, &response))
             .transpose()?;
-        handle_http_error(status, &response)?;
-        handle_graphql_query_error(&response, &query_string)?;
 
         let json_pointer = query
             .json_pointer
@@ -847,17 +908,62 @@ impl GraphQLClient {
             .or(self.json_pointer.as_ref())
             .ok_or(Error::NoJsonPointerFound {})?;
 
+        // Validate JSON pointer is not empty
+        if json_pointer.is_empty() {
+            return Err(Error::InvalidJsonPointer {
+                pointer: "JSON pointer cannot be empty".to_string(),
+            });
+        }
+
         let extracted_data = response
             .pointer(json_pointer)
-            .ok_or(Error::InvalidJsonPointer {
-                pointer: json_pointer.to_string(),
+            .ok_or_else(|| {
+                // If we can't find the data at the expected path, check if there are errors in the response
+                let error_msg = if let Some(errors) = response.get("errors") {
+                    format!("GraphQL query failed. Errors: {errors}")
+                } else {
+                    format!("Invalid JSON pointer: '{json_pointer}'. The expected data path was not found in the response.")
+                };
+                Error::InvalidJsonPointer {
+                    pointer: error_msg,
+                }
             })?
             .to_owned();
+
+        // Handle null data explicitly
+        if extracted_data.is_null() {
+            tracing::debug!("Extracted data at pointer '{json_pointer}' is null");
+            return Ok(GraphQLQueryResult {
+                records: vec![],
+                limit_reached: false,
+                schema: schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())),
+                cursor: None,
+            });
+        }
 
         let next_cursor = query
             .pagination_parameters
             .as_ref()
             .and_then(|x| x.get_next_cursor_from_response(&response));
+
+        // Validate next cursor if present
+        if let Some(ref next_cursor_val) = next_cursor {
+            if next_cursor_val.is_empty() {
+                tracing::warn!("Empty cursor returned from pagination, stopping pagination");
+            }
+            // Detect potential infinite loop - same cursor returned
+            if cursor.as_ref() == Some(next_cursor_val) {
+                tracing::warn!(
+                    "Same cursor returned from pagination, stopping to prevent infinite loop"
+                );
+                return Ok(GraphQLQueryResult {
+                    records: vec![],
+                    limit_reached: true,
+                    schema: schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())),
+                    cursor: None,
+                });
+            }
+        }
 
         let mut unwrapped = match extracted_data {
             Value::Array(val) => Ok(val.clone()),
@@ -866,6 +972,17 @@ impl GraphQLClient {
                 message: format!("GraphQL response has unexpected format. Response {response:?}"),
             }),
         }?;
+
+        // Validate we have data to process
+        if unwrapped.is_empty() {
+            tracing::debug!("No data to process after extraction");
+            return Ok(GraphQLQueryResult {
+                records: vec![],
+                limit_reached: false,
+                schema: schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())),
+                cursor: next_cursor,
+            });
+        }
 
         unwrapped = match self.unnest_parameters.behavior {
             UnnestBehavior::Depth(0) => unwrapped,
@@ -879,14 +996,43 @@ impl GraphQLClient {
         let mut res = vec![];
         for v in unwrapped {
             let buf = v.to_string();
-            let batch = ReaderBuilder::new(Arc::clone(&schema))
+
+            // Validate JSON is not too large
+            if buf.len() > 100_000_000 {
+                tracing::warn!(
+                    "JSON object is very large ({} bytes), this may cause memory issues",
+                    buf.len()
+                );
+            }
+
+            let batch_result = ReaderBuilder::new(Arc::clone(&schema))
                 .with_batch_size(1024)
                 .build(Cursor::new(buf.as_bytes()))
                 .context(ArrowInternalSnafu)?
-                .collect::<Result<Vec<_>, _>>()
-                .context(ArrowInternalSnafu)?;
+                .collect::<Result<Vec<_>, _>>();
 
-            res.extend(batch);
+            match batch_result {
+                Ok(batch) => res.extend(batch),
+                Err(e) => {
+                    // Check if there are errors in the original response that might explain the schema mismatch
+                    let error_context = if let Some(errors) = response.get("errors") {
+                        format!(
+                            "The API returned errors: {errors}. This may have caused the data schema to be incomplete or malformed."
+                        )
+                    } else {
+                        format!(
+                            "The response data does not match the expected schema. This may indicate an API error or unexpected response format."
+                        )
+                    };
+
+                    return Err(Error::ArrowInternal {
+                        source: ArrowError::SchemaError(format!(
+                            "Failed to parse response into record batch. {error_context}\n\nOriginal error: {e}\n\nResponse data sample: {}",
+                            serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+                        )),
+                    });
+                }
+            }
         }
 
         let limit_reached = query.limit_reached(limit, res.len());
@@ -913,6 +1059,10 @@ impl GraphQLClient {
 
         // Spawn the task that will fetch and send the GraphQL record batches
         builder.spawn(async move {
+            // Track pagination iterations to prevent infinite loops
+            let mut pagination_count = 0;
+            const MAX_PAGINATION_ITERATIONS: usize = 1000;
+
             let mut result = self
                 .execute(
                     &mut query,
@@ -935,12 +1085,40 @@ impl GraphQLClient {
                 return Ok(());
             }
 
+            let mut previous_cursor: Option<String> = None;
+
             while let Some(next_cursor_val) = result.cursor {
+                pagination_count += 1;
+
+                // Prevent infinite pagination loops
+                if pagination_count > MAX_PAGINATION_ITERATIONS {
+                    tracing::error!(
+                        "Maximum pagination iterations ({}) exceeded, stopping pagination",
+                        MAX_PAGINATION_ITERATIONS
+                    );
+                    return Err(DataFusionError::Execution(format!(
+                        "Maximum pagination iterations ({MAX_PAGINATION_ITERATIONS}) exceeded"
+                    )));
+                }
+
+                // Detect cursor loops
+                if previous_cursor.as_ref() == Some(&next_cursor_val) {
+                    tracing::warn!("Cursor loop detected, stopping pagination");
+                    break;
+                }
+
                 if let Some(p) = query.pagination_parameters.as_ref()
                     && let Some(value) = limit
                 {
                     limit = Some(p.reduce_limit(value));
+
+                    // Stop if limit is exhausted
+                    if limit == Some(0) {
+                        break;
+                    }
                 }
+
+                previous_cursor = Some(next_cursor_val.clone());
 
                 result = self
                     .execute(
@@ -981,6 +1159,12 @@ fn get_json_schema(
 
     if let Some(schema) = client_schema {
         return Ok(Arc::clone(schema));
+    }
+
+    // Handle empty array case
+    if json_iter.is_empty() {
+        tracing::debug!("Cannot infer schema from empty array, using empty schema");
+        return Ok(Arc::new(arrow::datatypes::Schema::empty()));
     }
 
     let schema = infer_json_schema_from_iterator(json_iter.iter().map(Result::Ok))
@@ -1031,12 +1215,42 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
 }
 
 fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
-    let graphql_error = &response["errors"][0];
+    // Check if there are any errors in the response
+    if let Some(errors) = response.get("errors") {
+        if let Some(errors_array) = errors.as_array() {
+            if errors_array.is_empty() {
+                return Ok(());
+            }
+        } else if errors.is_null() {
+            return Ok(());
+        }
+    } else {
+        return Ok(());
+    }
+
+    // Safely access the first error with bounds checking
+    let graphql_error = response
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .and_then(|arr| arr.first())
+        .unwrap_or(&Value::Null);
 
     if !graphql_error.is_null() {
-        let line = graphql_error["locations"][0]["line"].as_u64();
-        let column = graphql_error["locations"][0]["column"].as_u64();
-        let error_type = graphql_error["type"].as_str();
+        let line = graphql_error
+            .get("locations")
+            .and_then(|l| l.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|loc| loc.get("line"))
+            .and_then(|l| l.as_u64());
+
+        let column = graphql_error
+            .get("locations")
+            .and_then(|l| l.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|loc| loc.get("column"))
+            .and_then(|c| c.as_u64());
+
+        let error_type = graphql_error.get("type").and_then(|t| t.as_str());
 
         let location = match (line, column) {
             (Some(line), Some(column)) => Some((
