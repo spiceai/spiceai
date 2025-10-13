@@ -12153,7 +12153,6 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid 1.18.0",
- "winver",
  "workers",
  "x509-certificate",
 ]
@@ -12309,6 +12308,7 @@ dependencies = [
  "tonic",
  "tower 0.5.2",
  "tracing",
+ "winver",
 ]
 
 [[package]]
