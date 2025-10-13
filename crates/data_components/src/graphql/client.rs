@@ -847,7 +847,7 @@ impl GraphQLClient {
                 })?;
         }
 
-        let query_string = query.to_string(limit, cursor);
+        let query_string = query.to_string(limit, cursor.clone());
 
         // Validate query string is not empty
         if query_string.trim().is_empty() {
@@ -891,7 +891,32 @@ impl GraphQLClient {
         }
 
         let status = response.status();
-        let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;
+        
+        // Get the response body as text first, so we can log it if JSON parsing fails
+        let response_text = response.text().await.context(ReqwestInternalSnafu)?;
+        
+        // Try to parse as JSON
+        let response: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                let preview = response_text.chars().take(1000).collect::<String>();
+                tracing::error!(
+                    "Failed to decode response body as JSON.\nHTTP Status: {}\nJSON Parse Error: {}\nResponse body preview (first 1000 chars):\n{}",
+                    status,
+                    e,
+                    preview
+                );
+                Error::JsonDecodeError {
+                    status,
+                    error: e.to_string(),
+                    response_preview: preview,
+                }
+            })?;
+
+        // Log the full response for debugging
+        tracing::trace!(
+            "GraphQL response: {}",
+            serde_json::to_string_pretty(&response).unwrap_or_else(|_| format!("{response:?}"))
+        );
 
         // Check for errors before processing data
         handle_http_error(status, &response)?;
@@ -924,6 +949,7 @@ impl GraphQLClient {
                 } else {
                     format!("Invalid JSON pointer: '{json_pointer}'. The expected data path was not found in the response.")
                 };
+                tracing::error!("Failed to extract data from response. Full response: {}", serde_json::to_string_pretty(&response).unwrap_or_else(|_| format!("{response:?}")));
                 Error::InvalidJsonPointer {
                     pointer: error_msg,
                 }
@@ -1025,11 +1051,16 @@ impl GraphQLClient {
                         )
                     };
 
+                    let sample = serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string());
+                    let error_msg = format!(
+                        "Failed to parse response into record batch. {error_context}\n\nOriginal error: {e}\n\nResponse data sample: {sample}"
+                    );
+
+                    tracing::error!("{}", error_msg);
+                    tracing::debug!("Schema being used: {:?}", schema);
+
                     return Err(Error::ArrowInternal {
-                        source: ArrowError::SchemaError(format!(
-                            "Failed to parse response into record batch. {error_context}\n\nOriginal error: {e}\n\nResponse data sample: {}",
-                            serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
-                        )),
+                        source: ArrowError::SchemaError(error_msg),
                     });
                 }
             }
