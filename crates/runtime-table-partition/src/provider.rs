@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, DFSchema},
+    common::{Constraints, DFSchema, project_schema},
     datasource::TableType,
     error::DataFusionError,
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
@@ -164,7 +164,8 @@ impl TableProvider for PartitionTableProvider {
 
         let plan = match plans {
             plans if plans.is_empty() => {
-                return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))));
+                let projected_schema = project_schema(&self.schema, projection)?;
+                return Ok(Arc::new(EmptyExec::new(projected_schema)));
             }
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())
