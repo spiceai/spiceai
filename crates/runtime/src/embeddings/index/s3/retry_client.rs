@@ -100,6 +100,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | CreateIndexError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         CreateIndexError::AccessDeniedException(_)
                         | CreateIndexError::ConflictException(_)
                         | CreateIndexError::InternalServerException(_)
@@ -143,6 +146,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | CreateVectorBucketError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         CreateVectorBucketError::AccessDeniedException(_)
                         | CreateVectorBucketError::ConflictException(_)
                         | CreateVectorBucketError::InternalServerException(_)
@@ -180,9 +186,13 @@ impl S3Vectors for S3VectorRetryClient {
             match self.client.delete_index(input.clone()).await {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
+                    SdkError::TimeoutError(_) => Err(RetryError::transient(e)),
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         DeleteIndexError::ServiceUnavailableException(_)
                         | DeleteIndexError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         DeleteIndexError::AccessDeniedException(_)
@@ -224,6 +234,9 @@ impl S3Vectors for S3VectorRetryClient {
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         DeleteVectorBucketError::ServiceUnavailableException(_)
                         | DeleteVectorBucketError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         DeleteVectorBucketError::AccessDeniedException(_)
@@ -268,6 +281,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | DeleteVectorBucketPolicyError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         DeleteVectorBucketPolicyError::AccessDeniedException(_)
                         | DeleteVectorBucketPolicyError::InternalServerException(_)
                         | DeleteVectorBucketPolicyError::NotFoundException(_)
@@ -308,6 +324,9 @@ impl S3Vectors for S3VectorRetryClient {
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         DeleteVectorsError::ServiceUnavailableException(_)
                         | DeleteVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         DeleteVectorsError::AccessDeniedException(_)
@@ -355,6 +374,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetIndexError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         GetIndexError::AccessDeniedException(_)
                         | GetIndexError::InternalServerException(_)
                         | GetIndexError::NotFoundException(_)
@@ -395,6 +417,9 @@ impl S3Vectors for S3VectorRetryClient {
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         GetVectorBucketError::ServiceUnavailableException(_)
                         | GetVectorBucketError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         GetVectorBucketError::AccessDeniedException(_)
@@ -439,6 +464,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetVectorBucketPolicyError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         GetVectorBucketPolicyError::AccessDeniedException(_)
                         | GetVectorBucketPolicyError::InternalServerException(_)
                         | GetVectorBucketPolicyError::NotFoundException(_)
@@ -479,6 +507,9 @@ impl S3Vectors for S3VectorRetryClient {
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         GetVectorsError::ServiceUnavailableException(_)
                         | GetVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         GetVectorsError::AccessDeniedException(_)
@@ -527,6 +558,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | ListIndexesError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         ListIndexesError::AccessDeniedException(_)
                         | ListIndexesError::InternalServerException(_)
                         | ListIndexesError::NotFoundException(_)
@@ -569,6 +603,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | ListVectorBucketsError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         ListVectorBucketsError::AccessDeniedException(_)
                         | ListVectorBucketsError::InternalServerException(_)
                         | ListVectorBucketsError::ServiceQuotaExceededException(_)
@@ -608,6 +645,9 @@ impl S3Vectors for S3VectorRetryClient {
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         ListVectorsError::ServiceUnavailableException(_)
                         | ListVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         ListVectorsError::AccessDeniedException(_)
@@ -652,6 +692,9 @@ impl S3Vectors for S3VectorRetryClient {
                         | PutVectorBucketPolicyError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
+                            Err(RetryError::transient(e))
+                        }
                         PutVectorBucketPolicyError::AccessDeniedException(_)
                         | PutVectorBucketPolicyError::InternalServerException(_)
                         | PutVectorBucketPolicyError::NotFoundException(_)
@@ -692,6 +735,9 @@ impl S3Vectors for S3VectorRetryClient {
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         PutVectorsError::ServiceUnavailableException(_)
                         | PutVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         PutVectorsError::AccessDeniedException(_)
@@ -738,6 +784,9 @@ impl S3Vectors for S3VectorRetryClient {
                     SdkError::ServiceError(service_error) => match service_error.err() {
                         QueryVectorsError::ServiceUnavailableException(_)
                         | QueryVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
+                        err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
                         QueryVectorsError::AccessDeniedException(_)

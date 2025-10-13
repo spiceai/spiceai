@@ -147,15 +147,13 @@ impl RuntimeBuilder {
         catalogconnector::register_all().await;
         document_parse::register_all().await;
 
-        let memory_limit = self
+        let query = self
             .app
             .as_ref()
-            .and_then(|app| parse_memory_limit(app.runtime.memory_limit.clone()));
+            .and_then(|app| app.runtime.query.clone())
+            .unwrap_or_default();
 
-        let temp_directory = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.temp_directory.clone());
+        let memory_limit = parse_memory_limit(query.memory_limit.clone());
 
         let dataset_parallelism = self
             .app
@@ -191,7 +189,8 @@ impl RuntimeBuilder {
             Arc::clone(&self.accelerator_engine_registry),
         )
         .memory_limit(memory_limit)
-        .temp_directory(temp_directory)
+        .temp_directory(query.temp_directory)
+        .spill_compression(query.spill_compression)
         .with_task_history(task_history)
         .with_caching(caching);
 
