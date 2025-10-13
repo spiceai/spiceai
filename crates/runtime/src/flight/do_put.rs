@@ -49,7 +49,7 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{
-    Service, flightsql::prepared_statement_query, metrics,
+    Service, flightsql, flightsql::prepared_statement_query, metrics,
     middleware::rate_limit::RateLimiterExtension,
 };
 
@@ -73,11 +73,20 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
-    if let Ok(message) = Any::decode(&*fd.cmd)
-        && let Command::CommandPreparedStatementQuery(query) =
-            Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
-    {
-        return prepared_statement_query::do_put_query(query, streaming_flight).await;
+    if let Ok(message) = Any::decode(&*fd.cmd) {
+        match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
+            Command::CommandPreparedStatementQuery(query) => {
+                return prepared_statement_query::do_put_query(query, streaming_flight).await;
+            }
+            Command::CommandPreparedStatementUpdate(query) => {
+                return flightsql::prepared_statement_update::do_put_update(
+                    query,
+                    streaming_flight,
+                )
+                .await;
+            }
+            _ => {}
+        }
     }
 
     // Check if the request should be rate limited.
