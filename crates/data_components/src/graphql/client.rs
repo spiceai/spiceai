@@ -891,10 +891,10 @@ impl GraphQLClient {
         }
 
         let status = response.status();
-        
+
         // Get the response body as text first, so we can log it if JSON parsing fails
         let response_text = response.text().await.context(ReqwestInternalSnafu)?;
-        
+
         // Try to parse as JSON
         let response: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|e| {
