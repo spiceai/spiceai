@@ -12334,7 +12334,6 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid 1.18.0",
- "winver",
  "workers",
  "x509-certificate",
 ]

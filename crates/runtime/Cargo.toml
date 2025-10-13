@@ -274,6 +274,3 @@ turso = [
     "dep:rusqlite",
 ]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
-
-[target.'cfg(windows)'.dependencies]
-winver = "1.0.0"
