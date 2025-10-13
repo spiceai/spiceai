@@ -12267,7 +12267,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.9.0-unstable"
+version = "1.8.1"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -12291,7 +12291,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.9.0-unstable"
+version = "1.8.1"
 dependencies = [
  "app",
  "async-trait",
