@@ -24,7 +24,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
     prelude::Expr as LogicalExpr,
-    sql::sqlparser::ast::{Expr, Ident},
 };
 
 use futures::StreamExt;

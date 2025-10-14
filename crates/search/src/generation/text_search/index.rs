@@ -368,7 +368,7 @@ impl FullTextDatabaseIndex {
 
         for s in search_fields {
             let mut text_opts = tantivy::schema::TEXT;
-            if store_field.contains(s) {
+            if store_field.contains(s) || primary_key.contains(s) {
                 text_opts = text_opts | tantivy::schema::STORED;
             };
             schema_builder.add_text_field(s, text_opts);
