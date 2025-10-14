@@ -92,6 +92,7 @@ impl Column {
         metadata
     }
 
+    #[must_use]
     pub fn as_vector_metadata(&self) -> Option<MetadataType> {
         let value = self.metadata.get("vectors")?.clone();
         // If it doesn't deserialize to `MetadataType`, not an issue, just not a `MetadataType`.

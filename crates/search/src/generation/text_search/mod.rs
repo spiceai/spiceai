@@ -296,35 +296,7 @@ impl FullTextSearchFieldIndex {
         if !opt_filters.is_empty() {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
-
-        // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
-        let mut keep_search_field = true; //  false;
-        // let cols = self.all_columns();
-        // for proj in addition_projection {
-        //     let is_supported = match proj {
-        //         Expr::Identifier(Ident { value, .. }) => {
-        //             if *value == self.field {
-        //                 keep_search_field = true;
-        //             }
-        //             cols.contains(value)
-        //         }
-        //         _ => false,
-        //     };
-        //     if !is_supported {
-        //         return Err(Error::UnsupportedAdditionalColumnsError)
-        //             .context(GenerationTextSearchSnafu)?;
-        //     }
-        // }
-
-        for pk in &self.primary_key {
-            // keep the field if it is part of the primary key
-            if pk == &self.field {
-                keep_search_field = true;
-                break;
-            }
-        }
-
-        let strm = make_stream(self.clone(), query, keep_search_field, limit);
+        let strm = make_stream(self.clone(), query, limit);
         let mut strm = Box::pin(strm.peekable());
         let schema = match strm.as_mut().peek().await {
             None => Arc::new(Schema::empty()),
@@ -339,11 +311,9 @@ impl FullTextSearchFieldIndex {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
-    /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
     fn search_query_literal(
         &self,
         literal: &str,
-        keep_search_field: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Value>> {
@@ -373,9 +343,7 @@ impl FullTextSearchFieldIndex {
 
                 // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
                 if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
-                    if keep_search_field {
-                        doc_w_col_names.insert(self.field.as_str(), value.clone());
-                    }
+                    doc_w_col_names.insert(self.field.as_str(), value.clone());
                     doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
                 }
 
@@ -527,7 +495,6 @@ impl CandidateGeneration for FullTextSearchCandidate {
 fn make_stream(
     fts: FullTextSearchFieldIndex,
     query: String,
-    keep_search_field: bool,
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
@@ -536,7 +503,7 @@ fn make_stream(
         while remaining_limit > 0 {
             let limit = min(remaining_limit, DEFAULT_BATCH_SIZE);
             let hits = match fts
-                .search_query_literal(query.as_str(), keep_search_field, limit, offset)
+                .search_query_literal(query.as_str(), limit, offset)
                 .map_err(|e| DataFusionError::Internal(e.to_string())) {
                     Ok(h) => h,
                     Err(e) => {yield Err(e); return}
