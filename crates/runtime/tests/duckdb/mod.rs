@@ -516,7 +516,6 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-
             // Test 1: Index scan settings with custom file
             println!("\n=== Test 1: Index Scan Settings with Custom File ===");
             {
