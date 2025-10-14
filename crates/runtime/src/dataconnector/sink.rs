@@ -157,7 +157,10 @@ impl TableProvider for SinkConnector {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(self.schema())))
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &self.schema,
+            projection,
+        )?)))
     }
 
     async fn insert_into(

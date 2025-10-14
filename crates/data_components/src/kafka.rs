@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{any::Any, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
+use datafusion::common::project_schema;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
@@ -568,6 +569,9 @@ impl TableProvider for Kafka {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(self.schema())))
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &self.schema,
+            projection,
+        )?)))
     }
 }
