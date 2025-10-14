@@ -362,7 +362,11 @@ async fn duckdb_regexp() -> Result<(), String> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_duckdb_settings_persist() -> Result<(), String> {
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -377,13 +381,13 @@ async fn test_duckdb_settings_persist() -> Result<(), String> {
             }
 
             // Create a dataset with DuckDB acceleration and custom settings
-            use spicepod::param::Params;
-            use std::collections::HashMap;
-
             let mut accel_params = HashMap::new();
             accel_params.insert(
                 "duckdb_file".to_string(),
-                duckdb_file.to_str().expect("DuckDB file path should be valid UTF-8").to_string(),
+                duckdb_file
+                    .to_str()
+                    .expect("DuckDB file path should be valid UTF-8")
+                    .to_string(),
             );
             accel_params.insert(
                 "duckdb_index_scan_percentage".to_string(),
@@ -464,13 +468,10 @@ async fn test_duckdb_settings_persist() -> Result<(), String> {
                 .ok_or_else(|| "Failed to downcast count column".to_string())?;
             let count = count_col.value(0);
 
-            println!(
-                "✅ Query successful: test_settings table has {} rows",
-                count
-            );
+            println!("✅ Query successful: test_settings table has {count} rows");
 
             if count != 2 {
-                return Err(format!("Expected 2 rows, got {}", count));
+                return Err(format!("Expected 2 rows, got {count}"));
             }
 
             // Shutdown the runtime
@@ -506,13 +507,15 @@ async fn test_duckdb_settings_persist() -> Result<(), String> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_duckdb_all_settings() -> Result<(), String> {
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
-            use spicepod::param::Params;
-            use std::collections::HashMap;
 
             // Test 1: Index scan settings with custom file
             println!("\n=== Test 1: Index Scan Settings with Custom File ===");
@@ -568,7 +571,7 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
                     .map_err(|e| format!("Test 1: Query failed: {e}"))?;
                 let batches: Vec<RecordBatch> = result.data.try_collect().await
                     .map_err(|e| format!("Test 1: Failed to collect: {e}"))?;
-                
+
                 let count_col = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>()
                     .ok_or_else(|| "Test 1: Failed to downcast".to_string())?;
                 assert_eq!(count_col.value(0), 2, "Test 1: Expected 2 rows");
@@ -766,7 +769,7 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
                 runtime_ready_check(&cloned_rt).await;
 
                 let df = cloned_rt.datafusion();
-                
+
                 // Test aggregation
                 let result = df
                     .query_builder("SELECT category, SUM(amount) as total FROM test_combined GROUP BY category ORDER BY category")

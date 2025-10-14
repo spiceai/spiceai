@@ -37,15 +37,15 @@ impl DuckDBSetting for OrderByNonIntegerLiteral {
     }
 }
 
-/// DuckDB setting for configuring the percentage of rows that trigger an index scan.
+/// `DuckDB` setting for configuring the percentage of rows that trigger an index scan.
 ///
 /// The index scan percentage sets a threshold for index scans. If fewer than
-/// MAX(index_scan_max_count, index_scan_percentage * total_row_count) rows match,
+/// `MAX(index_scan_max_count, index_scan_percentage * total_row_count)` rows match,
 /// an index scan is performed instead of a table scan.
 ///
 /// Type: DOUBLE, Default: 0.001
 ///
-/// See: https://duckdb.org/docs/stable/guides/performance/indexing#art-index-scans
+/// See: <https://duckdb.org/docs/stable/guides/performance/indexing#art-index-scans>
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexScanPercentage;
 
@@ -72,8 +72,7 @@ impl DuckDBSetting for IndexScanPercentage {
             source: Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "Invalid index_scan_percentage value '{}'. Must be a number between 0.0 and 1.0. Error: {}",
-                    value, e
+                    "Invalid index_scan_percentage value '{value}'. Must be a number between 0.0 and 1.0. Error: {e}"
                 ),
             )),
         })?;
@@ -83,8 +82,7 @@ impl DuckDBSetting for IndexScanPercentage {
                 source: Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "Invalid index_scan_percentage value '{}'. Must be between 0.0 and 1.0.",
-                        percentage
+                        "Invalid index_scan_percentage value '{percentage}'. Must be between 0.0 and 1.0."
                     ),
                 )),
             });
@@ -94,15 +92,15 @@ impl DuckDBSetting for IndexScanPercentage {
     }
 }
 
-/// DuckDB setting for configuring the maximum number of rows that trigger an index scan.
+/// `DuckDB` setting for configuring the maximum number of rows that trigger an index scan.
 ///
 /// The maximum index scan count sets a threshold for index scans. If fewer than
-/// MAX(index_scan_max_count, index_scan_percentage * total_row_count) rows match,
+/// `MAX(index_scan_max_count, index_scan_percentage * total_row_count)` rows match,
 /// an index scan is performed instead of a table scan.
 ///
 /// Type: UBIGINT, Default: 2048
 ///
-/// See: https://duckdb.org/docs/stable/guides/performance/indexing#art-index-scans
+/// See: <https://duckdb.org/docs/stable/guides/performance/indexing#art-index-scans>
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexScanMaxCount;
 
@@ -129,8 +127,7 @@ impl DuckDBSetting for IndexScanMaxCount {
             source: Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "Invalid index_scan_max_count value '{}'. Must be a non-negative integer. Error: {}",
-                    value, e
+                    "Invalid index_scan_max_count value '{value}'. Must be a non-negative integer. Error: {e}"
                 ),
             )),
         })?;
