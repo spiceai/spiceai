@@ -381,4 +381,50 @@ mod tests {
             Some(&OnConflictBehavior::Drop)
         );
     }
+
+    #[test]
+    fn partition_by_unnamed() -> Result<(), serde_yaml::Error> {
+        let expression = "YEAR(created_at)";
+        let yaml = format!(
+            r#"
+            partition_by:
+              - "{expression}"
+        "#
+        );
+
+        let acceleration: Acceleration = serde_yaml::from_str(&yaml)?;
+
+        assert_eq!(acceleration.partition_by.len(), 1);
+        assert_eq!(acceleration.partition_by[0].name, "expr0");
+        assert_eq!(acceleration.partition_by[0].expression, expression);
+
+        Ok(())
+    }
+
+    #[test]
+    fn partition_by_named() -> Result<(), serde_yaml::Error> {
+        let year_expression = "YEAR(created_at)";
+        let month_expression = "MONTH(created_at)";
+        let day_expression = "DAY(created_at)";
+        let yaml = format!(
+            r#"
+            partition_by:
+              - year: "{year_expression}"
+              - month: "{month_expression}"
+              - day: "{day_expression}"
+        "#
+        );
+
+        let acceleration: Acceleration = serde_yaml::from_str(&yaml)?;
+
+        assert_eq!(acceleration.partition_by.len(), 3);
+        assert_eq!(acceleration.partition_by[0].name, "year");
+        assert_eq!(acceleration.partition_by[0].expression, year_expression);
+        assert_eq!(acceleration.partition_by[1].name, "month");
+        assert_eq!(acceleration.partition_by[1].expression, month_expression);
+        assert_eq!(acceleration.partition_by[2].name, "day");
+        assert_eq!(acceleration.partition_by[2].expression, day_expression);
+
+        Ok(())
+    }
 }
