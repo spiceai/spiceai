@@ -269,8 +269,13 @@ impl AcceleratorEngineRegistry {
         let partition_by = if acceleration_settings.partition_by.is_empty() {
             None
         } else {
+            let partition_by = acceleration_settings
+                .partition_by
+                .iter()
+                .map(|p| p.expression.clone())
+                .collect::<Vec<_>>();
             Some(
-                partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                partition_by_expressions(&partition_by, &ctx, &df_schema)
                     .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?,
             )
         };

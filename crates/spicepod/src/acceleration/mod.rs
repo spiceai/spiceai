@@ -16,7 +16,7 @@ limitations under the License.
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::HashMap, fmt::Display};
 
 use crate::{component::dataset::ReadyState, metric::Metrics, param::Params};
@@ -219,8 +219,12 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partition_by: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_partition_by"
+    )]
+    pub partition_by: Vec<PartitionedBy>,
 
     /// Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.
     ///
@@ -232,6 +236,13 @@ pub struct Acceleration {
     /// `create_only` will only create snapshots, it won't attempt to bootstrap from one.
     #[serde(default, skip_serializing_if = "is_default_snapshot_behavior")]
     pub snapshots: SnapshotBehavior,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct PartitionedBy {
+    pub name: String,
+    pub expression: String,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -276,6 +287,38 @@ impl Default for Acceleration {
             snapshots: SnapshotBehavior::Disabled,
         }
     }
+}
+
+fn deserialize_partition_by<'de, D>(deserializer: D) -> Result<Vec<PartitionedBy>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+
+    let mut result = Vec::new();
+
+    for value in values {
+        match value {
+            serde_json::Value::String(expression) => {
+                let name = format!("expr{i}", i = result.len());
+                let partitioned_by = PartitionedBy { name, expression };
+                result.push(partitioned_by);
+            }
+            serde_json::Value::Object(map) => {
+                // case where {"year": "YEAR(created_at)"}
+                for (name, v) in map {
+                    if let serde_json::Value::String(expression) = v {
+                        let partitioned_by = PartitionedBy { name, expression };
+                        result.push(partitioned_by);
+                        break; // take first string and ignore others
+                    }
+                }
+            }
+            _ => {}
+        };
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
