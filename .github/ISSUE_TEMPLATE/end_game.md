@@ -137,6 +137,7 @@ assignees: ''
      - [ ] [Indexes on Accelerated Data](https://github.com/spiceai/cookbook/blob/trunk/acceleration/indexes/README.md)
      - [ ] [Refresh Data Window](https://github.com/spiceai/cookbook/blob/trunk/refresh-data-window/README.md)
      - [ ] [Cron Dataset Schedules](https://github.com/spiceai/cookbook/blob/trunk/acceleration/cron/README.md)
+     - [ ] [Acceleration Snapshots](https://github.com/spiceai/cookbook/blob/trunk/acceleration/snapshots/README.md)
      - [ ] [Results Caching](https://github.com/spiceai/cookbook/blob/trunk/caching/README.md)
      - [ ] [Encryption in transit via TLS](https://github.com/spiceai/cookbook/blob/trunk/tls/README.md)
      - [ ] [TPC-H Benchmarking](https://github.com/spiceai/cookbook/blob/trunk/tpc-h/README.md)
