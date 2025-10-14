@@ -59,7 +59,7 @@ impl DuckDBSetting for IndexScanPercentage {
     }
 
     fn get_value(&self, options: &std::collections::HashMap<String, String>) -> Option<String> {
-        options.get("index_scan_percentage").cloned()
+        options.get(self.setting_name()).cloned()
     }
 
     fn scope(&self) -> DuckDBSettingScope {
