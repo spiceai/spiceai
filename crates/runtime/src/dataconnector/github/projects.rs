@@ -88,7 +88,7 @@ impl GitHubTableArgs for ProjectsTableArgs {
                                         created_at: createdAt
                                         updated_at: updatedAt
                                         closed_at: closedAt
-                                        creator: creator {{
+                                        creator {{
                                             creator: login
                                         }}
                                     }}
@@ -114,7 +114,7 @@ impl GitHubTableArgs for ProjectsTableArgs {
                                         created_at: createdAt
                                         updated_at: updatedAt
                                         closed_at: closedAt
-                                        creator: creator {{
+                                        creator {{
                                             creator: login
                                         }}
                                     }}
