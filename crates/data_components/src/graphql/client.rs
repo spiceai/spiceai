@@ -913,7 +913,7 @@ impl GraphQLClient {
             })?;
 
         // Log the full response for debugging
-        tracing::trace!(
+        tracing::debug!(
             "GraphQL response: {}",
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| format!("{response:?}"))
         );

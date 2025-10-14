@@ -64,7 +64,7 @@ pub enum Error {
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    
+
     #[snafu(display(
         "Failed to decode response body as JSON. HTTP Status: {status}, Error: {error}\nResponse preview:\n{response_preview}"
     ))]
@@ -73,7 +73,7 @@ pub enum Error {
         error: String,
         response_preview: String,
     },
-    
+
     #[snafu(display(
         "Internal error: {message}. Report a bug at https://github.com/spiceai/spiceai/issues."
     ))]
