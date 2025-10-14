@@ -295,3 +295,4 @@ aws-sdk-sts = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf3194
 aws-smithy-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-runtime" }                           #"1.8.6"
 aws-smithy-runtime-api = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-runtime-api" }                   #"1.8.7"
 aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-types" }                               # "1.3"
+ 
