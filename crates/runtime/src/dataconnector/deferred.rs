@@ -95,10 +95,7 @@ impl TableProvider for DeferredConnector {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(project_schema(
-            &self.schema,
-            projection,
-        )?)))
+        Ok(Arc::new(EmptyExec::new(self.schema())))
     }
 }
 
