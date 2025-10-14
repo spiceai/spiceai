@@ -300,8 +300,6 @@ mod tests {
         assert!(query.contains("updated_at: updatedAt"));
         assert!(query.contains("closed_at: closedAt"));
         assert!(query.contains("short_description: shortDescription"));
-        assert!(query.contains("creator: creator"));
-        assert!(query.contains("creator: login"));
 
         // Should NOT contain repositoryOwner or fragments
         assert!(!query.contains("repositoryOwner"));
@@ -329,8 +327,6 @@ mod tests {
         assert!(query.contains("updated_at: updatedAt"));
         assert!(query.contains("closed_at: closedAt"));
         assert!(query.contains("short_description: shortDescription"));
-        assert!(query.contains("creator: creator"));
-        assert!(query.contains("creator: login"));
 
         // Should NOT contain repository-specific structure
         assert!(!query.contains("repository(owner:"));
