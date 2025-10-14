@@ -106,7 +106,6 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
-                            type: issueType {{ id, name, description, color }}
                         }}
                     }}
                 }}
@@ -139,7 +138,6 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
-                            type: issueType {{ id, name, description, color }}
                         }}
                     }}
                 }}
