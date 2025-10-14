@@ -721,6 +721,96 @@ fn warn_if_provided(
 
 const MAX_COMMENTS_FETCHED: u32 = 100;
 
+/// Parsed GitHub path components
+#[derive(Debug)]
+struct GitHubPathComponents<'a> {
+    owner: &'a str,
+    repo: Option<&'a str>,
+    resource_type: &'a str,
+    remaining: Option<&'a str>,
+}
+
+/// Parse owner, repo, and resource type from the GitHub path
+fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
+    let parts_vec: Vec<&str> = path.split('/').collect();
+
+    match (
+        parts_vec.first(),
+        parts_vec.get(1),
+        parts_vec.get(2),
+        parts_vec.get(3),
+        parts_vec.get(4),
+    ) {
+        // Organization-level resources
+        (Some(&"github.com"), Some(&owner), Some(&"members"), None, None) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: None,
+                resource_type: "members",
+                remaining: None,
+            })
+        }
+        (Some(&"github.com"), Some(&owner), Some(&"projects"), None, None) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: None,
+                resource_type: "projects",
+                remaining: None,
+            })
+        }
+        // Repository-level resources
+        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"pulls"), None) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: Some(repo),
+                resource_type: "pulls",
+                remaining: None,
+            })
+        }
+        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"issues"), None) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: Some(repo),
+                resource_type: "issues",
+                remaining: None,
+            })
+        }
+        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"commits"), None) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: Some(repo),
+                resource_type: "commits",
+                remaining: None,
+            })
+        }
+        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"stargazers"), None) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: Some(repo),
+                resource_type: "stargazers",
+                remaining: None,
+            })
+        }
+        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"projects"), None) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: Some(repo),
+                resource_type: "projects",
+                remaining: None,
+            })
+        }
+        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"files"), remaining) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: Some(repo),
+                resource_type: "files",
+                remaining: remaining.copied(),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
@@ -733,49 +823,10 @@ impl DataConnector for Github {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path().to_string();
-        let mut parts = path.split('/');
 
         // Parse owner, repo, and resource type from the path for validation
-        let parts_vec: Vec<&str> = path.split('/').collect();
-        let (owner, repo, resource_type): (&str, Option<&str>, &str) = match (
-            parts_vec.first(),
-            parts_vec.get(1),
-            parts_vec.get(2),
-            parts_vec.get(3),
-        ) {
-            // Organization-level resources
-            (Some(&"github.com"), Some(&owner), Some(&"members"), None) => (owner, None, "members"),
-            (Some(&"github.com"), Some(&owner), Some(&"projects"), None) => {
-                (owner, None, "projects")
-            }
-            // Repository-level resources
-            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"pulls")) => {
-                (owner, Some(repo), "pulls")
-            }
-            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"issues")) => {
-                (owner, Some(repo), "issues")
-            }
-            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"commits")) => {
-                (owner, Some(repo), "commits")
-            }
-            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"stargazers")) => {
-                (owner, Some(repo), "stargazers")
-            }
-            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"projects")) => {
-                (owner, Some(repo), "projects")
-            }
-            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"files")) => {
-                (owner, Some(repo), "files")
-            }
-            _ => {
-                // If we can't parse owner/repo/resource, skip validation for now and let the later parsing handle the error
-                ("", None, "")
-            }
-        };
-
-        // Validate the installation has access to this specific resource if an installation ID is provided
-        if !owner.is_empty() && !resource_type.is_empty() {
-            self.validate_installation_access(owner, repo, resource_type)
+        if let Some(parsed) = parse_github_path(&path) {
+            self.validate_installation_access(parsed.owner, parsed.repo, parsed.resource_type)
                 .await
                 .map_err(|e| DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
@@ -835,8 +886,17 @@ impl DataConnector for Github {
 
         let component = ConnectorComponent::from(dataset);
 
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
+        // Parse the path and handle based on the resource type
+        let Some(parsed) = parse_github_path(&path) else {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                connector_component: component,
+                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration".into(),
+            });
+        };
+
+        match (parsed.resource_type, parsed.repo) {
+            ("pulls", Some(repo)) => {
                 let max_comments_fetched = match max_comments_fetched.unwrap_or(MAX_COMMENTS_FETCHED) {
                     value if value > MAX_COMMENTS_FETCHED => {
                         tracing::warn!(
@@ -848,7 +908,7 @@ impl DataConnector for Github {
                 };
 
                 let table_args = Arc::new(PullRequestTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
                     component,
@@ -858,30 +918,30 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
+            ("commits", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "commits", &component);
 
                 let table_args = Arc::new(CommitsTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
+            ("issues", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "issues", &component);
 
                 let table_args = Arc::new(IssuesTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
                     component,
@@ -889,83 +949,73 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("stargazers")) => {
+            ("stargazers", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "stargazers", &component);
 
                 let table_args = Arc::new(StargazersTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     component,
                 });
-                self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(owner, repo)).await
+                self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
+            ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
-                self.create_files_table_provider(owner, repo, parts.next(), dataset)
+                self.create_files_table_provider(parsed.owner, repo, parsed.remaining, dataset)
                     .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("projects")) => {
+            ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);
                 let table_args = Arc::new(ProjectsTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: Some(repo.to_string()),
                     component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some("projects"), None) => {
+            ("projects", None) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);
                 let table_args = Arc::new(ProjectsTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: None,
                     component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_org(owner)
+                    Github::get_health_check_for_org(parsed.owner)
                 )
                 .await
             }
-            (Some("github.com"), Some(org), Some("members"), None) => {
+            ("members", None) => {
                 warn_if_provided(pull_request_specific_params, "members", &component);
                 let table_args = Arc::new(MembersTableArgs {
-                    org: org.to_string(),
+                    org: parsed.owner.to_string(),
                     component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     None,
-                    Github::get_health_check_for_org(org)
+                    Github::get_health_check_for_org(parsed.owner)
                 )
                 .await
             }
-            (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
+            (resource_type, _) => {
                 Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
-                    source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
+                    source: format!("Invalid GitHub table type: {resource_type}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
                     connector_component: component,
                 })
             }
-            (_, Some(owner), Some(repo), _) => Err(DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                connector_component: component,
-                source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
-            }),
-            _ => Err(DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                connector_component: component,
-                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration".into(),
-            }),
         }
     }
 }
