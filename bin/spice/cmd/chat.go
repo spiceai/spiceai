@@ -818,7 +818,13 @@ func isEndOfStream(chunk string) bool {
 	return false
 }
 
-// readStdinIfNonInteractive checks if there's piped input and, if so, reads it
+// readStdinIfNonInteractive checks if the input is an interactive shell, and if not, reads the entire input.
+//
+// Returns:
+//
+//	1 The full input content, if non-interactive:
+//	2 true, if stdin is interactive
+//	3. If an error os or io error occurred determining interactivity, or reading input.
 func readStdinIfNonInteractive() (string, bool, error) {
 	stat, err := os.Stdin.Stat()
 	if err != nil {
