@@ -666,6 +666,7 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
     fn try_from(query: Arc<str>) -> Result<Self, self::Error> {
         // Validate query is not empty or whitespace only
         if query.trim().is_empty() {
+            tracing::debug!("GraphQL query validation failed: Query is empty");
             return Err(super::Error::InvalidGraphQLQuery {
                 message: "Query cannot be empty".to_string(),
                 line: 0,
@@ -682,13 +683,15 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
         // This wouldn't be required if Rust had proper support for self-referencing structs.
         let query_ref: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(&query) };
 
-        let ast =
-            parse_query::<String>(query_ref).map_err(|_| super::Error::InvalidGraphQLQuery {
+        let ast = parse_query::<String>(query_ref).map_err(|_| {
+            tracing::debug!("GraphQL query parse failed. Query:\n{query}");
+            super::Error::InvalidGraphQLQuery {
                 message: "Failed to parse GraphQL query".to_string(),
                 line: 0,
                 column: 0,
                 query: query.to_string(),
-            })?;
+            }
+        })?;
 
         let (pagination_parameters, json_pointer) = PaginationParameters::parse(&ast);
 
@@ -851,6 +854,7 @@ impl GraphQLClient {
 
         // Validate query string is not empty
         if query_string.trim().is_empty() {
+            tracing::debug!("GraphQL query validation failed: Generated query string is empty");
             return Err(Error::InvalidGraphQLQuery {
                 message: "Generated query string is empty".to_string(),
                 line: 0,
@@ -1252,6 +1256,25 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             if errors_array.is_empty() {
                 return Ok(());
             }
+
+            // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
+            // returns "Something went wrong while executing your query" instead of a proper
+            // permission error. This appears to be a GitHub API bug where lack of permissions
+            // triggers an internal error rather than returning a proper authorization error.
+            // Check for this before processing other GraphQL errors.
+            for error in errors_array {
+                if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+                    if message.contains("Something went wrong while executing your query") {
+                        tracing::debug!(
+                            "Detected GitHub 'Something went wrong' error, likely a permissions issue: {}",
+                            message
+                        );
+                        return Err(Error::InvalidCredentialsOrPermissions {
+                            message: "GitHub returned an internal error. This may indicate the GitHub App does not have permission to access the requested resource. Verify the app has the required permissions.".to_string(),
+                        });
+                    }
+                }
+            }
         } else if errors.is_null() {
             return Ok(());
         }
@@ -1317,18 +1340,27 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
         }
 
         return match location {
-            Some((line, column)) => Err(Error::InvalidGraphQLQuery {
-                message,
-                line,
-                column,
-                query: format_query_with_context(query, line, column),
-            }),
-            _ => Err(Error::InvalidGraphQLQuery {
-                message,
-                line: 0,
-                column: 0,
-                query: query.to_string(),
-            }),
+            Some((line, column)) => {
+                tracing::debug!(
+                    "GraphQL error at line {line}, column {column}: {message}\nQuery:\n{}",
+                    format_query_with_context(query, line, column)
+                );
+                Err(Error::InvalidGraphQLQuery {
+                    message,
+                    line,
+                    column,
+                    query: format_query_with_context(query, line, column),
+                })
+            }
+            _ => {
+                tracing::debug!("GraphQL error: {message}\nQuery:\n{}", query.to_string());
+                Err(Error::InvalidGraphQLQuery {
+                    message,
+                    line: 0,
+                    column: 0,
+                    query: query.to_string(),
+                })
+            }
         };
     }
     Ok(())

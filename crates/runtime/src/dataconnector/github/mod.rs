@@ -120,6 +120,175 @@ pub trait GitHubTableArgs: Send + Sync {
 }
 
 impl Github {
+    /// Common error handling for validation responses
+    async fn handle_validation_response(
+        response: Result<reqwest::Response, reqwest::Error>,
+        target: &str,
+        resource_type: &str,
+        installation_id: &str,
+    ) -> Result<(), String> {
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(
+                    "GitHub App installation ID '{installation_id}' has access to '{target}'"
+                );
+                Ok(())
+            }
+            Ok(resp)
+                if resp.status().as_u16() == 401
+                    || resp.status().as_u16() == 403
+                    || resp.status().as_u16() == 410 =>
+            {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                tracing::error!(
+                    "GitHub App installation does not have access to '{target}' (HTTP {status}). Response: {body}"
+                );
+                Err(format!(
+                    "GitHub App installation ID '{installation_id}' does not have permission to access '{resource_type}' for '{target}' (HTTP {status}). Verify the GitHub App has the required permissions and is correctly installed into {target}."
+                ))
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                tracing::error!(
+                    "Target '{target}' not found or GitHub App installation does not have access (HTTP 404). Response: {body}"
+                );
+                Err(format!(
+                    "Resource '{target}' not found or GitHub App installation ID '{installation_id}' does not have access to it."
+                ))
+            }
+            Ok(resp) if resp.status().as_u16() == 410 => {
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                tracing::error!(
+                    "GitHub App installation does not have access to '{target}' (HTTP 410 Gone). Response: {body}"
+                );
+                Err(format!(
+                    "GitHub App installation ID '{installation_id}' does not have permission to access '{resource_type}' for '{target}'. Verify the app has the required permissions."
+                ))
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                tracing::error!(
+                    "GitHub App installation validation failed for '{target}' (HTTP {status}). Response: {body}"
+                );
+                Err(format!(
+                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}' (HTTP {status})."
+                ))
+            }
+            Err(e) => {
+                tracing::error!(
+                    "GitHub App installation validation request failed for '{target}': {e}"
+                );
+                Err(format!(
+                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}': {e}"
+                ))
+            }
+        }
+    }
+
+    /// Validates that the GitHub App installation has access to the specified resource type.
+    async fn validate_installation_access(
+        &self,
+        owner: &str,
+        repo: Option<&str>,
+        resource_type: &str,
+    ) -> Result<(), String> {
+        // Check if we're using a GitHub App token provider with an installation ID
+        let installation_id = self.params.get("installation_id").expose().ok();
+
+        // If no installation ID is provided, validation passes
+        let Some(installation_id) = installation_id else {
+            tracing::debug!("No GitHub App installation ID provided, skipping validation");
+            return Ok(());
+        };
+
+        let target = if let Some(repo) = repo {
+            format!("{owner}/{repo}/{resource_type}")
+        } else {
+            format!("{owner}/{resource_type}")
+        };
+
+        tracing::debug!(
+            "Validating GitHub App installation ID '{installation_id}' has access to '{target}'"
+        );
+
+        // If there's an installation ID, we need to validate it by checking if we can get a token
+        // The token provider should already be initialized at this point
+        if let Some(token_provider) = &self.token {
+            // Try to get a token - this will fail if the installation ID is invalid
+            let token = token_provider.get_token();
+            if token.is_empty() {
+                return Err(format!(
+                    "Failed to authenticate with GitHub App installation ID '{installation_id}'. The installation ID may be invalid or the app may not be installed."
+                ));
+            }
+
+            // Validate that the installation has access to the target repository or organization
+            let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
+                return Ok(()); // If no endpoint, skip this validation
+            };
+
+            let client = reqwest::Client::new();
+
+            // Check if the installation has access to this specific resource type
+            let validation_url = if let Some(repo) = repo {
+                // For repository resources, try to access a specific resource endpoint
+                match resource_type {
+                    "issues" => format!("{endpoint}/repos/{owner}/{repo}/issues?per_page=1"),
+                    "pulls" => format!("{endpoint}/repos/{owner}/{repo}/pulls?per_page=1"),
+                    "commits" => format!("{endpoint}/repos/{owner}/{repo}/commits?per_page=1"),
+                    "stargazers" => {
+                        format!("{endpoint}/repos/{owner}/{repo}/stargazers?per_page=1")
+                    }
+                    "files" => format!("{endpoint}/repos/{owner}/{repo}/git/trees/HEAD"),
+                    // Projects validation is handled during query execution via error_checker
+                    // since classic projects API is deprecated and returns HTTP 410
+                    "projects" => return Ok(()),
+                    _ => format!("{endpoint}/repos/{owner}/{repo}"),
+                }
+            } else {
+                // For organization resources
+                match resource_type {
+                    "members" => format!("{endpoint}/orgs/{owner}/members?per_page=1"),
+                    // Projects validation is handled during query execution via error_checker
+                    // since classic projects API is deprecated and returns HTTP 410
+                    "projects" => return Ok(()),
+                    _ => format!("{endpoint}/orgs/{owner}"),
+                }
+            };
+
+            let response = client
+                .get(&validation_url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "spice")
+                .send()
+                .await;
+
+            Self::handle_validation_response(response, &target, resource_type, installation_id)
+                .await
+        } else {
+            // No token provider but installation_id was provided - this is a configuration error
+            Err(format!(
+                "GitHub App installation ID '{installation_id}' provided but no token could be generated. Verify 'client_id' and 'private_key' are configured."
+            ))
+        }
+    }
+
     pub(crate) fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
@@ -566,6 +735,55 @@ impl DataConnector for Github {
         let path = dataset.path().to_string();
         let mut parts = path.split('/');
 
+        // Parse owner, repo, and resource type from the path for validation
+        let parts_vec: Vec<&str> = path.split('/').collect();
+        let (owner, repo, resource_type): (&str, Option<&str>, &str) = match (
+            parts_vec.get(0),
+            parts_vec.get(1),
+            parts_vec.get(2),
+            parts_vec.get(3),
+        ) {
+            // Organization-level resources
+            (Some(&"github.com"), Some(&owner), Some(&"members"), None) => (owner, None, "members"),
+            (Some(&"github.com"), Some(&owner), Some(&"projects"), None) => {
+                (owner, None, "projects")
+            }
+            // Repository-level resources
+            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"pulls")) => {
+                (owner, Some(repo), "pulls")
+            }
+            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"issues")) => {
+                (owner, Some(repo), "issues")
+            }
+            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"commits")) => {
+                (owner, Some(repo), "commits")
+            }
+            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"stargazers")) => {
+                (owner, Some(repo), "stargazers")
+            }
+            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"projects")) => {
+                (owner, Some(repo), "projects")
+            }
+            (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"files")) => {
+                (owner, Some(repo), "files")
+            }
+            _ => {
+                // If we can't parse owner/repo/resource, skip validation for now and let the later parsing handle the error
+                ("", None, "")
+            }
+        };
+
+        // Validate the installation has access to this specific resource if an installation ID is provided
+        if !owner.is_empty() && !resource_type.is_empty() {
+            self.validate_installation_access(owner, repo, resource_type)
+                .await
+                .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "github".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
+                })?;
+        }
+
         let query_mode = dataset
             .params
             .get("github_query_mode")
@@ -698,8 +916,8 @@ impl DataConnector for Github {
                     component,
                 });
                 self.create_gql_table_provider(
-                    table_args,
-                    None,
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
                     Github::get_health_check_for_owner_and_repo(owner, repo)
                 )
                 .await
@@ -712,8 +930,8 @@ impl DataConnector for Github {
                     component,
                 });
                 self.create_gql_table_provider(
-                    table_args,
-                    None,
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
                     Github::get_health_check_for_org(owner)
                 )
                 .await

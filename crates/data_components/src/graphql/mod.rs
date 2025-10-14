@@ -79,17 +79,7 @@ pub enum Error {
     ))]
     InternalError { message: String },
 
-    #[snafu(display(
-        "GraphQL Query Error:
-Details:
-- Error: {message}
-- Location: Line {line}, Column {column}
-- Query:
-
-{query}
-
-Verify the syntax of your GraphQL query."
-    ))]
+    #[snafu(display("Server returned an error: {message}"))]
     InvalidGraphQLQuery {
         message: String,
         line: usize,
