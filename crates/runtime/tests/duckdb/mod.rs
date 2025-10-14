@@ -383,7 +383,7 @@ async fn test_duckdb_settings_persist() -> Result<(), String> {
             let mut accel_params = HashMap::new();
             accel_params.insert(
                 "duckdb_file".to_string(),
-                duckdb_file.to_str().unwrap().to_string(),
+                duckdb_file.to_str().expect("DuckDB file path should be valid UTF-8").to_string(),
             );
             accel_params.insert(
                 "duckdb_index_scan_percentage".to_string(),
@@ -526,7 +526,7 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
                 }
 
                 let mut accel_params = HashMap::new();
-                accel_params.insert("duckdb_file".to_string(), duckdb_file.to_str().unwrap().to_string());
+                accel_params.insert("duckdb_file".to_string(), duckdb_file.to_str().expect("DuckDB file path should be valid UTF-8").to_string());
                 accel_params.insert("duckdb_index_scan_percentage".to_string(), "0.05".to_string());
                 accel_params.insert("duckdb_index_scan_max_count".to_string(), "5000".to_string());
 
@@ -731,7 +731,7 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
                 }
 
                 let mut accel_params = HashMap::new();
-                accel_params.insert("duckdb_file".to_string(), duckdb_file.to_str().unwrap().to_string());
+                accel_params.insert("duckdb_file".to_string(), duckdb_file.to_str().expect("DuckDB file path should be valid UTF-8").to_string());
                 accel_params.insert("duckdb_memory_limit".to_string(), "256MB".to_string());
                 accel_params.insert("duckdb_index_scan_percentage".to_string(), "0.10".to_string());
                 accel_params.insert("duckdb_index_scan_max_count".to_string(), "1000".to_string());
