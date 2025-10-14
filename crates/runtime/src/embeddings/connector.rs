@@ -49,7 +49,6 @@ use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 #[cfg(feature = "s3_vectors")]
 use spicepod::component::embeddings::EmbeddingChunkConfig;
-use spicepod::semantic::Column;
 use spicepod::semantic::MetadataType;
 use spicepod::vector::VectorStore;
 use std::any::Any;
