@@ -39,9 +39,9 @@ impl DuckDBSetting for OrderByNonIntegerLiteral {
 
 /// `DuckDB` setting for configuring the percentage of rows that trigger an index scan.
 ///
-/// The index scan percentage sets a threshold for index scans. If fewer than
-/// `MAX(index_scan_max_count, index_scan_percentage * total_row_count)` rows match,
-/// an index scan is performed instead of a table scan.
+/// The index scan percentage sets a threshold for index scans. An index scan is performed
+/// instead of a table scan when the number of matching rows is less than the maximum of
+/// `index_scan_max_count` and `index_scan_percentage × total_row_count`.
 ///
 /// Type: DOUBLE, Default: 0.001
 ///
@@ -94,9 +94,9 @@ impl DuckDBSetting for IndexScanPercentage {
 
 /// `DuckDB` setting for configuring the maximum number of rows that trigger an index scan.
 ///
-/// The maximum index scan count sets a threshold for index scans. If fewer than
-/// `MAX(index_scan_max_count, index_scan_percentage * total_row_count)` rows match,
-/// an index scan is performed instead of a table scan.
+/// The maximum index scan count sets a threshold for index scans. An index scan is performed
+/// instead of a table scan when the number of matching rows is less than the maximum of
+/// `index_scan_max_count` and `index_scan_percentage × total_row_count`.
 ///
 /// Type: UBIGINT, Default: 2048
 ///

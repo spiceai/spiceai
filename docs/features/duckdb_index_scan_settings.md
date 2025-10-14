@@ -14,7 +14,7 @@ These parameters control when ART (Adaptive Radix Tree) index scans are used for
 
 ### `duckdb_index_scan_percentage`
 
-The index scan percentage sets a threshold for index scans. If fewer than `MAX(index_scan_max_count, index_scan_percentage * total_row_count)` rows match, an index scan is performed instead of a table scan.
+The index scan percentage sets a threshold for index scans. An index scan is performed instead of a table scan when the number of matching rows is less than the maximum of `index_scan_max_count` and `index_scan_percentage × total_row_count`.
 
 **Type:** DOUBLE (0.0 to 1.0, representing 0% to 100%)  
 **Default:** 0.001 (0.1%)  
@@ -36,7 +36,7 @@ datasets:
 
 ### `duckdb_index_scan_max_count`
 
-The maximum index scan count sets a threshold for index scans. If fewer than `MAX(index_scan_max_count, index_scan_percentage * total_row_count)` rows match, an index scan is performed instead of a table scan.
+The maximum index scan count sets a threshold for index scans. An index scan is performed instead of a table scan when the number of matching rows is less than the maximum of `index_scan_max_count` and `index_scan_percentage × total_row_count`.
 
 **Type:** UBIGINT (non-negative integer)  
 **Default:** 2048  
@@ -76,4 +76,4 @@ datasets:
 ## References
 
 For more information about DuckDB ART index scans, see:
-https://duckdb.org/docs/stable/guides/performance/indexing#art-index-scans
+<https://duckdb.org/docs/stable/guides/performance/indexing#art-index-scans>
