@@ -738,7 +738,7 @@ impl DataConnector for Github {
         // Parse owner, repo, and resource type from the path for validation
         let parts_vec: Vec<&str> = path.split('/').collect();
         let (owner, repo, resource_type): (&str, Option<&str>, &str) = match (
-            parts_vec.get(0),
+            parts_vec.first(),
             parts_vec.get(1),
             parts_vec.get(2),
             parts_vec.get(3),

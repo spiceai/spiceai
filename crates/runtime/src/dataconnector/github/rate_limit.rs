@@ -168,7 +168,8 @@ impl RateLimiter for GitHubRateLimiter {
                             tokio::time::sleep(wait_duration).await;
                         }
                     } else {
-                        let usage_percent = (primary.used as f64 / primary.limit as f64) * 100.0;
+                        let usage_percent =
+                            (f64::from(primary.used) / f64::from(primary.limit)) * 100.0;
                         if usage_percent >= 80.0 {
                             tracing::warn!(
                                 "GitHub API rate limit warning: {}/{} remaining ({:.1}% used). Reset at {}. Resource: {}",

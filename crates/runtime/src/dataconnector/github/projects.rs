@@ -34,7 +34,7 @@ pub struct ProjectsTableArgs {
 impl GraphQLContext for ProjectsTableArgs {
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(
-            |_headers: &HeaderMap<HeaderValue>, response: &Value| {
+            |headers: &HeaderMap<HeaderValue>, response: &Value| {
                 // Trace the response for debugging
                 tracing::trace!(
                     "GitHub Projects GraphQL response: {}",
@@ -43,7 +43,7 @@ impl GraphQLContext for ProjectsTableArgs {
                 );
 
                 // First check standard GitHub errors (rate limits, etc.)
-                data_components::github::error_checker(_headers, response)?;
+                data_components::github::error_checker(headers, response)?;
 
                 // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
                 // returns "Something went wrong while executing your query" instead of a proper

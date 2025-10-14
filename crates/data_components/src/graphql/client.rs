@@ -775,15 +775,12 @@ impl GraphQLClient {
         semaphore: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
         // Validate unnest depth to prevent excessive recursion
-        if let UnnestBehavior::Depth(depth) = &unnest_behavior {
-            if *depth > 50 {
-                return Err(Error::InvalidObjectAccess {
-                    message: format!(
-                        "Unnest depth of {} exceeds maximum allowed depth of 50",
-                        depth
-                    ),
-                });
-            }
+        if let UnnestBehavior::Depth(depth) = &unnest_behavior
+            && *depth > 50
+        {
+            return Err(Error::InvalidObjectAccess {
+                message: format!("Unnest depth of {depth} exceeds maximum allowed depth of 50"),
+            });
         }
 
         let auth = match (token, user, pass) {
@@ -817,6 +814,7 @@ impl GraphQLClient {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
         query: &mut GraphQLQuery,
@@ -1050,9 +1048,7 @@ impl GraphQLClient {
                             "The API returned errors: {errors}. This may have caused the data schema to be incomplete or malformed."
                         )
                     } else {
-                        format!(
-                            "The response data does not match the expected schema. This may indicate an API error or unexpected response format."
-                        )
+                        "The response data does not match the expected schema. This may indicate an API error or unexpected response format.".to_string()
                     };
 
                     let sample = serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string());
@@ -1089,6 +1085,7 @@ impl GraphQLClient {
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
     ) -> SendableRecordBatchStream {
+        const MAX_PAGINATION_ITERATIONS: usize = 1000;
         let mut builder = RecordBatchReceiverStream::builder(table_schema, 2);
         let tx = builder.tx();
 
@@ -1096,7 +1093,6 @@ impl GraphQLClient {
         builder.spawn(async move {
             // Track pagination iterations to prevent infinite loops
             let mut pagination_count = 0;
-            const MAX_PAGINATION_ITERATIONS: usize = 1000;
 
             let mut result = self
                 .execute(
@@ -1285,16 +1281,16 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             // triggers an internal error rather than returning a proper authorization error.
             // Check for this before processing other GraphQL errors.
             for error in errors_array {
-                if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
-                    if message.contains("Something went wrong while executing your query") {
-                        tracing::debug!(
-                            "Detected GitHub 'Something went wrong' error, likely a permissions issue: {}",
-                            message
-                        );
-                        return Err(Error::InvalidCredentialsOrPermissions {
-                            message: "GitHub returned an internal error. This may indicate the GitHub App does not have permission to access the requested resource. Verify the app has the required permissions.".to_string(),
-                        });
-                    }
+                if let Some(message) = error.get("message").and_then(|m| m.as_str())
+                    && message.contains("Something went wrong while executing your query")
+                {
+                    tracing::debug!(
+                        "Detected GitHub 'Something went wrong' error, likely a permissions issue: {}",
+                        message
+                    );
+                    return Err(Error::InvalidCredentialsOrPermissions {
+                        message: "GitHub returned an internal error. This may indicate the GitHub App does not have permission to access the requested resource. Verify the app has the required permissions.".to_string(),
+                    });
                 }
             }
         } else if errors.is_null() {
@@ -1317,14 +1313,14 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             .and_then(|l| l.as_array())
             .and_then(|arr| arr.first())
             .and_then(|loc| loc.get("line"))
-            .and_then(|l| l.as_u64());
+            .and_then(serde_json::Value::as_u64);
 
         let column = graphql_error
             .get("locations")
             .and_then(|l| l.as_array())
             .and_then(|arr| arr.first())
             .and_then(|loc| loc.get("column"))
-            .and_then(|c| c.as_u64());
+            .and_then(serde_json::Value::as_u64);
 
         let error_type = graphql_error.get("type").and_then(|t| t.as_str());
 
@@ -1361,28 +1357,25 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             }
         }
 
-        return match location {
-            Some((line, column)) => {
-                tracing::debug!(
-                    "GraphQL error at line {line}, column {column}: {message}\nQuery:\n{}",
-                    format_query_with_context(query, line, column)
-                );
-                Err(Error::InvalidGraphQLQuery {
-                    message,
-                    line,
-                    column,
-                    query: format_query_with_context(query, line, column),
-                })
-            }
-            _ => {
-                tracing::debug!("GraphQL error: {message}\nQuery:\n{}", query.to_string());
-                Err(Error::InvalidGraphQLQuery {
-                    message,
-                    line: 0,
-                    column: 0,
-                    query: query.to_string(),
-                })
-            }
+        return if let Some((line, column)) = location {
+            tracing::debug!(
+                "GraphQL error at line {line}, column {column}: {message}\nQuery:\n{}",
+                format_query_with_context(query, line, column)
+            );
+            Err(Error::InvalidGraphQLQuery {
+                message,
+                line,
+                column,
+                query: format_query_with_context(query, line, column),
+            })
+        } else {
+            tracing::debug!("GraphQL error: {message}\nQuery:\n{}", query.to_string());
+            Err(Error::InvalidGraphQLQuery {
+                message,
+                line: 0,
+                column: 0,
+                query: query.to_string(),
+            })
         };
     }
     Ok(())
