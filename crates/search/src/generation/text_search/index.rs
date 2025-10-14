@@ -369,7 +369,7 @@ impl FullTextDatabaseIndex {
             let mut text_opts = tantivy::schema::TEXT;
             if store_field.contains(s) || primary_key.contains(s) {
                 text_opts = text_opts | tantivy::schema::STORED;
-            };
+            }
             schema_builder.add_text_field(s, text_opts);
         }
 
@@ -379,7 +379,7 @@ impl FullTextDatabaseIndex {
                 && let Some((_, field)) = schema.column_with_name(f)
             {
                 Self::add_to_tantivy_schema(&mut schema_builder, field)?;
-            };
+            }
         }
 
         Ok(schema_builder.build())
