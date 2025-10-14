@@ -51,8 +51,6 @@ pub struct FullTextDatabaseIndex {
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
     pub index: Arc<RwLock<tantivy::Index>>,
-    /// FTS indexes don't have additional metadata columns beyond primary keys and search fields
-    pub metadata_columns: MetadataColumns,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -118,13 +116,11 @@ impl FullTextDatabaseIndex {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
 
-        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks);
         Ok(Self {
             base_table: inner,
             search_fields,
             index: Arc::new(RwLock::new(index)),
             primary_key: pks,
-            metadata_columns,
         })
     }
 
@@ -156,32 +152,6 @@ impl FullTextDatabaseIndex {
         Ok(pks)
     }
 
-    /// Get all [`Field`]s in Tantivy [`tantivy::Index`] that are in base table, and not primary keys.
-    /// These are non-filterable [`MetadataColumn`]s, since we can retrieve the data
-    /// from the [`tantivy::Index`] without access to the base [`TableProvider`].
-    fn derive_metadata_columns(
-        base_table: &Arc<dyn TableProvider>,
-        index: &tantivy::Index,
-        primary_key: &[String],
-    ) -> MetadataColumns {
-        let base_schema = base_table.schema();
-
-        index
-            .schema()
-            .fields()
-            .filter_map(|(_, fe)| {
-                let name = fe.name();
-                if primary_key.contains(&name.to_string()) {
-                    return None;
-                }
-
-                let (_, f) = base_schema.column_with_name(name)?;
-                Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
-            })
-            .collect::<Vec<_>>()
-            .into()
-    }
-
     pub fn full_text_search_field_index(
         &self,
         search_field: &str,
@@ -195,7 +165,6 @@ impl FullTextDatabaseIndex {
             &index_read,
             search_field.to_string(),
             self.primary_key.clone(),
-            Some(self.metadata_columns.all_names()),
         )?;
         search_index.add_type_hints(&self.underlying_table().schema());
         Ok(search_index)
@@ -309,7 +278,6 @@ impl FullTextDatabaseIndex {
             primary_key: self.primary_key.clone(),
             index: Arc::clone(&self.index),
             base_table,
-            metadata_columns: self.metadata_columns.clone(),
         }
     }
 
@@ -414,10 +382,6 @@ impl SearchIndex for FullTextDatabaseIndex {
                     .map(|(_, field)| (*field).clone())
             })
             .collect()
-    }
-
-    fn metadata_columns(&self) -> &MetadataColumns {
-        &self.metadata_columns
     }
 
     async fn write(

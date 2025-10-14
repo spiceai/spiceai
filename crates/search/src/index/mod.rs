@@ -41,10 +41,6 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
     fn primary_fields(&self) -> Vec<Field>;
 
-    /// The additional columns available in the [`SearchIndex`].
-    /// For FTS indexes, this may return empty metadata columns.
-    fn metadata_columns(&self) -> &MetadataColumns;
-
     /// Update the index based on a [`RecordBatch`] from the underlying table.
     async fn write(
         &self,

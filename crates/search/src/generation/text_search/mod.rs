@@ -158,7 +158,6 @@ impl std::fmt::Debug for FullTextSearchFieldIndex {
             .field("schema", &self.search_schema)
             .field("field", &self.field)
             .field("primary_key", &self.primary_key)
-            .field("additional_columns", &self.additional_columns)
             .field("type_hints", &self.type_hints)
             .finish_non_exhaustive()
     }
@@ -175,10 +174,6 @@ pub struct FullTextSearchFieldIndex {
     pub field: String,
     pub primary_key: Vec<String>,
 
-    /// If provided, will only consider columns in [`Index`] that are in `field`, `primary_key` or `additional_columns`.
-    /// This allows for the reuse of a generic `Index` in search.
-    pub additional_columns: Option<Vec<String>>,
-
     /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
     /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
     /// For columns present, use the associated [`arrow::datatypes::Field`].
@@ -186,12 +181,7 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    pub fn try_new(
-        index: &Index,
-        field: String,
-        primary_key: Vec<String>,
-        additional_columns: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn try_new(index: &Index, field: String, primary_key: Vec<String>) -> Result<Self> {
         let fts = Self {
             search_schema: index.schema(),
             reader: index
@@ -203,7 +193,6 @@ impl FullTextSearchFieldIndex {
             tokenizer_manager: index.tokenizers().clone(),
             field,
             primary_key,
-            additional_columns,
             type_hints: HashMap::from([(
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
                 Arc::new(Field::new(
@@ -274,14 +263,6 @@ impl FullTextSearchFieldIndex {
         self.type_hints.get(name)
     }
 
-    #[must_use]
-    pub fn additional_columns(&self) -> Vec<String> {
-        self.all_columns()
-            .into_iter()
-            .filter(|name| !self.in_base_cols(name))
-            .collect()
-    }
-
     fn in_base_cols(&self, name: &String) -> bool {
         *name == self.field || self.primary_key.contains(name)
     }
@@ -291,18 +272,10 @@ impl FullTextSearchFieldIndex {
         self.search_schema
             .fields()
             .filter_map(|(_, f)| {
-                let name = f.name().to_string();
-                if self.in_base_cols(&name) {
-                    Some(name)
-                } else if self
-                    // Filter based on [`self.additional_columns`].
-                    .additional_columns
-                    .as_ref()
-                    .is_some_and(|cols| !cols.contains(&name))
-                {
-                    None
+                if f.is_stored() {
+                    Some(f.name().to_string())
                 } else {
-                    Some(name)
+                    None
                 }
             })
             .collect()
@@ -704,13 +677,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_basic_index() {
-        let fts = FullTextSearchFieldIndex::try_new(
-            &create_basic_index(),
-            "body".to_string(),
-            vec![],
-            None,
-        )
-        .expect("failed to create FullTextSearch");
+        let fts =
+            FullTextSearchFieldIndex::try_new(&create_basic_index(), "body".to_string(), vec![])
+                .expect("failed to create FullTextSearch");
 
         let candidate: FullTextSearchCandidate = fts.into();
 

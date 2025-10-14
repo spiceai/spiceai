@@ -279,10 +279,6 @@ pub mod tests {
             self.primary_columns.clone()
         }
 
-        fn metadata_columns(&self) -> &MetadataColumns {
-            &self.metadata
-        }
-
         async fn write(
             &self,
             record: RecordBatch,
