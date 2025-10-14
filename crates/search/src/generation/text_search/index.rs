@@ -27,7 +27,7 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
-use tantivy::schema::DocParsingError;
+use tantivy::schema::{DocParsingError, SchemaBuilder};
 use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::RwLock;
 
@@ -99,10 +99,15 @@ impl FullTextDatabaseIndex {
         search_fields: Vec<String>,
         primary_key_override: Option<Vec<String>>,
         directory: Option<PathBuf>,
+        store_field: &[String],
     ) -> Result<Self, super::Error> {
         let pks = Self::validate_primary_key(&inner, primary_key_override).await?;
-        let tantivy_schema =
-            Self::create_tantivy_schema(&inner, search_fields.as_slice(), pks.as_slice())?;
+        let tantivy_schema = Self::create_tantivy_schema(
+            &inner,
+            search_fields.as_slice(),
+            pks.as_slice(),
+            store_field,
+        )?;
 
         let index = if let Some(path) = &directory {
             match tantivy::Index::create_in_dir(path, tantivy_schema) {
@@ -281,10 +286,67 @@ impl FullTextDatabaseIndex {
         }
     }
 
+    // Adds the Arrow [`Field`] as a stored and indexed field.
+    //
+    // Note: for Utf8, does not tokenize.
+    fn add_to_tantivy_schema(
+        schema_builder: &mut SchemaBuilder,
+        field: &Field,
+    ) -> Result<(), super::Error> {
+        match field.data_type() {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                schema_builder.add_f64_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                schema_builder.add_u64_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                schema_builder.add_i64_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            DataType::Boolean => {
+                schema_builder.add_bool_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                // [`tantivy::schema::STRING`] means we won't tokenize, important for primary key lookup via [`TermQuery`].
+                schema_builder.add_text_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::STRING,
+                );
+            }
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+                schema_builder.add_bytes_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            dt => {
+                return Err(super::Error::PrimaryKeyInvalidType {
+                    data_type: dt.clone(),
+                    column: field.name().clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn create_tantivy_schema(
         base_table: &Arc<dyn TableProvider>,
         search_fields: &[String],
         primary_key: &[String],
+        store_field: &[String],
     ) -> Result<tantivy::schema::Schema, super::Error> {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
@@ -296,52 +358,7 @@ impl FullTextDatabaseIndex {
             let Some((_, field)) = schema.column_with_name(p) else {
                 return Err(super::Error::PrimaryKeyNotFound { column: p.clone() });
             };
-            match field.data_type() {
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    schema_builder.add_f64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    schema_builder.add_u64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    schema_builder.add_i64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::Boolean => {
-                    schema_builder.add_bool_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                    // [`tantivy::schema::STRING`] means we won't tokenize, important for primary key lookup via [`TermQuery`].
-                    schema_builder.add_text_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::STRING,
-                    );
-                }
-                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                    schema_builder.add_bytes_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                dt => {
-                    return Err(super::Error::PrimaryKeyInvalidType {
-                        data_type: dt.clone(),
-                        column: p.clone(),
-                    });
-                }
-            }
+            Self::add_to_tantivy_schema(&mut schema_builder, field)?;
         }
 
         // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
@@ -350,8 +367,22 @@ impl FullTextDatabaseIndex {
         }
 
         for s in search_fields {
-            schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
+            let mut text_opts = tantivy::schema::TEXT;
+            if store_field.contains(s) {
+                text_opts = text_opts | tantivy::schema::STORED;
+            };
+            schema_builder.add_text_field(s, text_opts);
         }
+
+        for f in store_field {
+            if !primary_key.contains(f)
+                && !search_fields.contains(f)
+                && let Some((_, field)) = schema.column_with_name(f)
+            {
+                Self::add_to_tantivy_schema(&mut schema_builder, field)?;
+            };
+        }
+
         Ok(schema_builder.build())
     }
 
@@ -470,7 +501,7 @@ mod tests {
         let search_fields = vec!["content".to_string()];
         let primary_key = Some(vec!["id".to_string()]);
 
-        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key, None)
+        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key, None, &[])
             .await
             .expect("Failed to create index");
 

@@ -214,14 +214,6 @@ impl FullTextSearchFieldIndex {
             }
         }
 
-        // Ensure that the index has the field to search on.
-        if !cols.contains(&fts.field) {
-            return Err(Error::TextSearchIndexMissingColummn {
-                missing: fts.field.clone(),
-                index_columns: cols,
-            });
-        }
-
         Ok(fts)
     }
 
@@ -306,23 +298,23 @@ impl FullTextSearchFieldIndex {
         }
 
         // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
-        let mut keep_search_field = false;
-        let cols = self.all_columns();
-        for proj in addition_projection {
-            let is_supported = match proj {
-                Expr::Identifier(Ident { value, .. }) => {
-                    if *value == self.field {
-                        keep_search_field = true;
-                    }
-                    cols.contains(value)
-                }
-                _ => false,
-            };
-            if !is_supported {
-                return Err(Error::UnsupportedAdditionalColumnsError)
-                    .context(GenerationTextSearchSnafu)?;
-            }
-        }
+        let mut keep_search_field = true; //  false;
+        // let cols = self.all_columns();
+        // for proj in addition_projection {
+        //     let is_supported = match proj {
+        //         Expr::Identifier(Ident { value, .. }) => {
+        //             if *value == self.field {
+        //                 keep_search_field = true;
+        //             }
+        //             cols.contains(value)
+        //         }
+        //         _ => false,
+        //     };
+        //     if !is_supported {
+        //         return Err(Error::UnsupportedAdditionalColumnsError)
+        //             .context(GenerationTextSearchSnafu)?;
+        //     }
+        // }
 
         for pk in &self.primary_key {
             // keep the field if it is part of the primary key

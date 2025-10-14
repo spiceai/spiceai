@@ -91,6 +91,12 @@ impl Column {
         }
         metadata
     }
+
+    pub fn as_vector_metadata(&self) -> Option<MetadataType> {
+        let value = self.metadata.get("vectors")?.clone();
+        // If it doesn't deserialize to `MetadataType`, not an issue, just not a `MetadataType`.
+        serde_json::from_value(value).ok()
+    }
 }
 
 impl From<&str> for Column {
@@ -268,6 +274,14 @@ impl FullTextSearchConfig {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MetadataType {
+    #[serde(rename = "non-filterable")]
+    NonFilterable,
+    #[serde(rename = "filterable")]
+    Filterable,
 }
 
 #[cfg(test)]
