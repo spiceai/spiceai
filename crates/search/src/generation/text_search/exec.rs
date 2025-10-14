@@ -121,7 +121,7 @@ impl ExecutionPlan for FullTextSearchExec {
         let s = stream! {
           // TODO: Support filters.
             match idx
-                .search(query, &[], &[], limit)
+                .search(query, &[], limit)
                 .await
                 .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
                 Ok(mut stream) => {

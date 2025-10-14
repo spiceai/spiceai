@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::metadata::MetadataColumns;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;

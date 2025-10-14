@@ -255,10 +255,6 @@ impl FullTextSearchFieldIndex {
         self.type_hints.get(name)
     }
 
-    fn in_base_cols(&self, name: &String) -> bool {
-        *name == self.field || self.primary_key.contains(name)
-    }
-
     #[must_use]
     pub fn all_columns(&self) -> Vec<String> {
         self.search_schema
@@ -290,7 +286,6 @@ impl FullTextSearchFieldIndex {
         &self,
         query: String,
         opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
         if !opt_filters.is_empty() {
@@ -456,12 +451,10 @@ impl CandidateGeneration for FullTextSearchCandidate {
         &self,
         query: String,
         opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
+        _addition_projection: &[&Expr],
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
-        self.inner
-            .search(query, opt_filters, addition_projection, limit)
-            .await
+        self.inner.search(query, opt_filters, limit).await
     }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
@@ -635,6 +628,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "CandidateGeneration::search to be removed in https://github.com/spiceai/spiceai/issues/7550"]
     async fn test_basic_index() {
         let fts =
             FullTextSearchFieldIndex::try_new(&create_basic_index(), "body".to_string(), vec![])

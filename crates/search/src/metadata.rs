@@ -39,6 +39,7 @@ impl MetadataColumn {
         }
     }
 
+    #[must_use]
     pub fn type_display(&self) -> &'static str {
         match self {
             MetadataColumn::Filterable(_) => "filterable",

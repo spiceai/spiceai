@@ -18,7 +18,6 @@ use std::cmp::min;
 use std::slice;
 use std::{any::Any, collections::HashSet, path::PathBuf, sync::Arc};
 
-use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
 use async_trait::async_trait;
