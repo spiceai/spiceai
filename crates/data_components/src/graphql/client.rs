@@ -1243,6 +1243,28 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                     "The API failed with status code {status}. Verify the provided credentials have the necessary permissions."
                 ),
             }),
+            StatusCode::GATEWAY_TIMEOUT | StatusCode::REQUEST_TIMEOUT => {
+                Err(Error::InvalidReqwestStatus {
+                    status,
+                    message: format!(
+                        "The API request timed out (HTTP {status}). This is often a transient issue. The data refresh will be retried automatically. If the problem persists, consider reducing query complexity or page size. Details: {message}"
+                    ),
+                })
+            }
+            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
+                Err(Error::InvalidReqwestStatus {
+                    status,
+                    message: format!(
+                        "The API service is temporarily unavailable (HTTP {status}). This is often a transient issue. The data refresh will be retried automatically. Details: {message}"
+                    ),
+                })
+            }
+            _ if status.is_server_error() => Err(Error::InvalidReqwestStatus {
+                status,
+                message: format!(
+                    "The API server returned an error (HTTP {status}). This may be a transient issue. The data refresh will be retried automatically. Details: {message}"
+                ),
+            }),
             _ => Err(Error::InvalidReqwestStatus { status, message }),
         };
     }

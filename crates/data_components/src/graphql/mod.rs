@@ -66,7 +66,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to decode response body as JSON. HTTP Status: {status}, Error: {error}\nResponse preview:\n{response_preview}"
+        "The API returned an invalid response (HTTP {status}). This may indicate a temporary server issue. The data refresh will be retried automatically. If the problem persists, contact support. Technical details: {error}"
     ))]
     JsonDecodeError {
         status: reqwest::StatusCode,
