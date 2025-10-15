@@ -106,7 +106,10 @@ impl DuckDBAccelerator {
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
                 .with_dialect(new_duckdb_dialect())
                 .with_settings_registry(
-                    DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
+                    DuckDBSettingsRegistry::new()
+                        .with_setting(Box::new(OrderByNonIntegerLiteral))
+                        .with_setting(Box::new(settings::IndexScanPercentage))
+                        .with_setting(Box::new(settings::IndexScanMaxCount)),
                 ),
         }
     }
@@ -169,7 +172,8 @@ impl DuckDBAccelerator {
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
+                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
+                    .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
                     .await
@@ -182,7 +186,8 @@ impl DuckDBAccelerator {
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
+                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
+                    .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
                     .await
@@ -251,6 +256,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
     ParameterSpec::component("preserve_insertion_order"),
+    ParameterSpec::component("index_scan_percentage"),
+    ParameterSpec::component("index_scan_max_count"),
 ];
 
 #[async_trait]

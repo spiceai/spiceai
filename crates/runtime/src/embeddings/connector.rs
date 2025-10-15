@@ -49,6 +49,7 @@ use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 #[cfg(feature = "s3_vectors")]
 use spicepod::component::embeddings::EmbeddingChunkConfig;
+use spicepod::semantic::MetadataType;
 use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::collections::HashMap;
@@ -413,26 +414,22 @@ impl EmbeddingConnector {
                 dataset_columns
                     .iter()
                     .find(|&c| c.name == column)
-                    .and_then(|c| match c.metadata.get("vectors") {
-                        Some(serde_json::Value::String(v)) if v == "non-filterable" => {
+                    .and_then(|c| match c.as_vector_metadata() {
+                        Some(MetadataType::NonFilterable) => {
                             Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
                         }
-                        Some(serde_json::Value::String(v)) if v == "filterable" => {
+                        Some(MetadataType::Filterable) => {
                             Some(MetadataColumn::Filterable(Arc::new(f.clone())))
                         }
                         _ => None,
                     });
 
             for col in ChunkedSearchIndex::additional_metadata(column, search_metadata) {
-                let vectors_val = match col {
-                    MetadataColumn::Filterable(_) => "filterable",
-                    MetadataColumn::NonFilterable(_) => "non-filterable",
-                };
                 dataset_columns.push(
                     spicepod::semantic::Column::new(col.name()).with_metadata(
                         [(
                             "vectors".to_string(),
-                            serde_json::Value::String(vectors_val.to_string()),
+                            serde_json::Value::String(col.type_display().to_string()),
                         )]
                         .into(),
                     ),
