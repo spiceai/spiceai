@@ -48,7 +48,6 @@ pub mod tests {
     use search::{generation::util::append_fields, index::SearchIndex};
     use search::{
         index::VectorIndex,
-        metadata::{MetadataColumn, MetadataColumns},
     };
     use snafu::ResultExt;
 
@@ -185,25 +184,6 @@ pub mod tests {
     impl PretendVectorIndex {
         #[must_use]
         pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
-            let primary_key_names: Vec<_> =
-                primary_columns.iter().map(|f| f.name().clone()).collect();
-            let cols = schema
-                .fields()
-                .iter()
-                .filter_map(|f| {
-                    if primary_key_names.contains(f.name())
-                        || *f.name() == embedding_col!(embedded_column)
-                    {
-                        return None;
-                    }
-                    if f.metadata().get("filterable") == Some(&"true".to_string()) {
-                        Some(MetadataColumn::Filterable(Arc::clone(f)))
-                    } else {
-                        Some(MetadataColumn::NonFilterable(Arc::clone(f)))
-                    }
-                })
-                .collect::<Vec<_>>();
-
             Self {
                 embedded_column,
                 primary_columns,

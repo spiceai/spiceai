@@ -1,1 +1,2 @@
 allow-expect-in-tests = true
+future-size-threshold = 44593
