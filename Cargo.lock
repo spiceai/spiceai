@@ -12348,6 +12348,7 @@ dependencies = [
  "serde",
  "serde_qs 1.0.0-rc.3",
  "snafu",
+ "spicepod",
  "tokio",
  "tokio-stream",
  "tracing",
