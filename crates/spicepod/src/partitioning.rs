@@ -63,41 +63,55 @@ mod tests {
 
     use serde_yaml::from_str;
 
+    #[allow(clippy::struct_excessive_bools)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+    #[serde(deny_unknown_fields)]
+    pub struct Test {
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "deserialize_partition_by"
+        )]
+        pub partition_by: Vec<PartitionedBy>,
+    }
     #[test]
     fn deserialize_partition_by_unnamed() -> Result<(), serde_yaml::Error> {
         let yaml = r#"
-- "YEAR(created_at)"
-- "MONTH(created_at)"
-- "DAY(created_at)"
+partition_by:
+  - "YEAR(created_at)"
+  - "MONTH(created_at)"
+  - "DAY(created_at)"
 "#;
-        let result: Vec<PartitionedBy> = from_str(yaml)?;
+        let result: Test = from_str(yaml)?;
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].name, "expr0");
-        assert_eq!(result[0].expression, "YEAR(created_at)");
-        assert_eq!(result[1].name, "expr1");
-        assert_eq!(result[1].expression, "MONTH(created_at)");
-        assert_eq!(result[2].name, "expr2");
-        assert_eq!(result[2].expression, "DAY(created_at)");
+        assert_eq!(result.partition_by.len(), 3);
+        assert_eq!(result.partition_by[0].name, "expr0");
+        assert_eq!(result.partition_by[0].expression, "YEAR(created_at)");
+        assert_eq!(result.partition_by[1].name, "expr1");
+        assert_eq!(result.partition_by[1].expression, "MONTH(created_at)");
+        assert_eq!(result.partition_by[2].name, "expr2");
+        assert_eq!(result.partition_by[2].expression, "DAY(created_at)");
         Ok(())
     }
 
     #[test]
     fn deserialize_partition_by_named() -> Result<(), serde_yaml::Error> {
         let yaml = r#"
-- year: "YEAR(created_at)"
-- month: "MONTH(created_at)"
-- day: "DAY(created_at)"
+partition_by:
+  - year: "YEAR(created_at)"
+  - month: "MONTH(created_at)"
+  - day: "DAY(created_at)"
 "#;
-        let result: Vec<PartitionedBy> = from_str(yaml)?;
+        let result: Test = from_str(yaml)?;
 
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].name, "year");
-        assert_eq!(result[0].expression, "YEAR(created_at)");
-        assert_eq!(result[1].name, "month");
-        assert_eq!(result[1].expression, "MONTH(created_at)");
-        assert_eq!(result[2].name, "day");
-        assert_eq!(result[2].expression, "DAY(created_at)");
+        assert_eq!(result.partition_by.len(), 3);
+        assert_eq!(result.partition_by[0].name, "year");
+        assert_eq!(result.partition_by[0].expression, "YEAR(created_at)");
+        assert_eq!(result.partition_by[1].name, "month");
+        assert_eq!(result.partition_by[1].expression, "MONTH(created_at)");
+        assert_eq!(result.partition_by[2].name, "day");
+        assert_eq!(result.partition_by[2].expression, "DAY(created_at)");
         Ok(())
     }
 }
