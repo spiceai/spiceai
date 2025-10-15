@@ -26,7 +26,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints, DFSchema},
+    common::{Constraint, Constraints, DFSchema, project_schema},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::Expr,
@@ -131,10 +131,13 @@ impl TableProvider for DebeziumKafka {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &self.schema,
+            projection,
+        )?)))
     }
 }
