@@ -7,10 +7,12 @@ on:
         description: 'The previous release tag to compare against (e.g. v1.4.0)'
         type: string
         required: true
+        default: 'v1.4.0'
       release_branch:
         description: 'The release branch (or prep branch) to compare against (e.g. release/1.5 or pease/release-1.5-prep)'
         type: string
         required: true
+        default: 'release/1.5'
 
 jobs:
   generate:

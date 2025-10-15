@@ -26,22 +26,11 @@ def main():
         "--repo", f"{owner}/{repo}"
     ]))
 
-    branch_prs = json.loads(subprocess.check_output([
-        "gh", "pr", "list", "--state", "merged", "--base", release_branch,
-        "--limit", "10000", "--json", "number,mergeCommit,author",
-        "--repo", f"{owner}/{repo}"
-    ]))
-
     # Build PR mappings: commit_hash -> (pr_number, username)
     pr_mapping = {}
     for pr in trunk_prs:
         commit_hash = pr['mergeCommit']['oid']
         pr_mapping[commit_hash] = (pr['number'], pr['author']['login'])
-
-    for pr in branch_prs:
-        commit_hash = pr['mergeCommit']['oid']
-        if commit_hash not in pr_mapping:
-            pr_mapping[commit_hash] = (pr['number'], pr['author']['login'])
 
     print("Generating patch-ids for trunk commits...", file=sys.stderr)
 
@@ -78,10 +67,6 @@ def main():
         pr_info = None
         if trunk_hash:
             pr_info = pr_mapping.get(trunk_hash)
-
-        if not pr_info:
-            # Fallback: check if release commit itself is in PR mapping
-            pr_info = pr_mapping.get(release_hash)
 
         subject = run_git(f"git log --format=%s -n 1 {release_hash}")
 
