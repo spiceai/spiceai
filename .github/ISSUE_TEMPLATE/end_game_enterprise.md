@@ -149,16 +149,5 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
 
 ## Post-Release Validation and Housekeeping
 
-- [ ] Notify the team to verify [customer fixes](https://github.com/orgs/spicehq/projects/53)(if any):
-
-  ```md
-  :rocket: **Enterprise release complete!** Please confirm enterprise customer fixes have been merged and resolved.
-
-  1. [Constraint violation check is improved to control behavior when violations occur within a batch](https://github.com/spicehq/customer-twilio/issues/77). DRI: @phillipleblanc
-  2. ..
-  ```
-
-```
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
-```
