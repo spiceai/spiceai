@@ -181,7 +181,6 @@ pub mod tests {
         embedded_column: String,
         primary_columns: Vec<Field>,
         schema: Schema,
-        metadata: MetadataColumns,
     }
     impl PretendVectorIndex {
         #[must_use]
@@ -209,7 +208,6 @@ pub mod tests {
                 embedded_column,
                 primary_columns,
                 schema,
-                metadata: MetadataColumns::from(cols),
             }
         }
     }
