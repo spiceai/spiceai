@@ -58,7 +58,7 @@ impl ChunkedNonIndexVectorGeneration {
         embedding_column: &str,
     ) -> Self {
         Self {
-            table_provider: Arc::clone(&table_provider),
+            table_provider: Arc::clone(table_provider),
             tbl: tbl.clone(),
             model,
             embed: Arc::clone(embed),

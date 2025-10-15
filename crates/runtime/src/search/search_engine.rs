@@ -42,7 +42,7 @@ use crate::search::{
         get_primary_keys_with_overrides,
     },
 };
-use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
+use crate::datafusion::DataFusion;
 use arrow::array::RecordBatch;
 use async_stream::stream;
 use cache::key::{CacheKey, RawCacheKey, SearchKey};
@@ -64,7 +64,6 @@ use search::{
     pipeline::SearchPipeline,
 };
 use snafu::ResultExt;
-use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
 use super::types::VectorSearchResult;
@@ -178,7 +177,7 @@ impl SearchEngine {
             Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
                 &table_provider,
                 tbl,
-                &embed_udf,
+                embed_udf,
                 model_name,
                 primary_keys.to_vec(),
                 embedding_column,

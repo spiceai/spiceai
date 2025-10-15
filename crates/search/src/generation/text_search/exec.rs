@@ -54,7 +54,7 @@ impl FullTextSearchExec {
         };
 
         Ok(Self {
-            index: Arc::clone(&index),
+            index: Arc::clone(index),
             query,
             filters,
             limit,
@@ -113,7 +113,7 @@ impl ExecutionPlan for FullTextSearchExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let idx = self.index.clone();
+        let idx = Arc::clone(&self.index);
         let schema = self.schema();
         let limit = self.limit;
         let query = self.query.clone();

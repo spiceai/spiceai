@@ -58,6 +58,10 @@ impl Error {
         matches!(self, Error::CandidateAggregationError { source } if source.is_user_error())
     }
 }
+
+/// [`QueryEngine`] defines the minimal interface needed to execute [`LogicalPlan`].
+///
+/// This allows extensibility beyond [`SessionContext::execute_logical_plan`] then [`DataFrame::execute_stream`].
 #[async_trait::async_trait]
 pub trait QueryEngine: Send + Sync {
     async fn run(&self, plan: LogicalPlan) -> Result<SendableRecordBatchStream, DataFusionError>;
