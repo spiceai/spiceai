@@ -23,8 +23,10 @@ use std::{
     },
 };
 
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
+    common::DFSchema,
     datasource::TableProvider,
     error::DataFusionError,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
@@ -41,7 +43,9 @@ use runtime_table_partition::{
     Partition,
     creator::{
         self, PartitionCreator,
-        filename::{self, decode_pair, encode_pair, to_hive_partition_dir},
+        filename::{
+            self, decode_pair, discover_hive_partitions, encode_pair, to_hive_partition_dir,
+        },
     },
     expression::PartitionedBy,
     provider::PartitionTableProvider,
@@ -259,6 +263,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
             partition_dir(source),
             cmd,
             partition_by_first,
+            Arc::clone(&schema),
         ));
         let table_provider =
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
@@ -284,6 +289,7 @@ pub(crate) struct DuckDBPartitionCreator {
     duckdb_factory: DuckDBTableProviderFactory,
     partition_dir: PathBuf,
     partition_by: PartitionedBy,
+    schema: SchemaRef,
     expressions_hash: u64,
 }
 
@@ -292,6 +298,7 @@ impl DuckDBPartitionCreator {
         partition_dir: PathBuf,
         cmd: CreateExternalTable,
         partition_by: PartitionedBy,
+        schema: SchemaRef,
     ) -> Self {
         let duckdb_factory = create_factory();
 
@@ -301,6 +308,7 @@ impl DuckDBPartitionCreator {
             partition_dir,
             partition_by,
             expressions_hash: 0,
+            schema,
         }
     }
 
@@ -364,42 +372,38 @@ impl PartitionCreator for DuckDBPartitionCreator {
             .await
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
-        let mut partitions = Vec::new();
+        let schema = DFSchema::try_from(Arc::clone(&self.schema)).unwrap();
+        let hive_partitions =
+            discover_hive_partitions(&schema, &self.partition_dir, &[self.partition_by.clone()])
+                .unwrap();
 
-        while let Some(entry) = dir_entries
-            .next_entry()
-            .await
-            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?
-        {
-            let path = entry.path();
-            if path.is_file() {
-                let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-                if !Self::valid_file_extensions().contains(&extension) {
-                    continue;
-                }
-
-                let Some(file_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                    continue;
-                };
-
-                let mut cmd = self.cmd.clone();
-                // self.add_open(&mut cmd, &partition_value)
-                //     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
-
-                // let duckdb_path = path.display().to_string();
-                // get_pool(&self.duckdb_factory, &duckdb_path)
-                //     .await
-                //     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
-
-                // let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
-                //     .await
-                //     .map_err(|e| creator::Error::InferringPartitions { source: e })?;
-
-                // partitions.push(Partition {
-                //     partition_value,
-                //     table_provider,
-                // });
+        let mut partitions = Vec::with_capacity(hive_partitions.len());
+        for (mut keys, path) in hive_partitions {
+            if keys.len() != 1 {
+                continue;
             }
+
+            let Some(partition_value) = keys.pop() else {
+                continue;
+            };
+
+            let mut cmd = self.cmd.clone();
+            self.add_open(&mut cmd, &partition_value)
+                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
+            let duckdb_path = path.display().to_string();
+            get_pool(&self.duckdb_factory, &duckdb_path)
+                .await
+                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
+            let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
+                .await
+                .map_err(|e| creator::Error::InferringPartitions { source: e })?;
+
+            partitions.push(Partition {
+                partition_value,
+                table_provider,
+            });
         }
 
         tracing::debug!(

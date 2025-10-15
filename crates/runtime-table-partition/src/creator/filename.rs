@@ -31,7 +31,8 @@ use std::path::{Path, PathBuf};
 use arrow_schema::{DataType, TimeUnit};
 use datafusion::{
     common::{ExprSchema, HashMap},
-    logical_expr::ExprSchemable,
+    logical_expr::{ExprSchemable, expr::Alias},
+    prelude::Expr,
     scalar::ScalarValue,
 };
 use serde::{Deserialize, Serialize};
@@ -92,7 +93,7 @@ pub fn discover_hive_partitions(
     schema: &dyn ExprSchema,
     base_dir: &Path,
     partitioned_by: &[PartitionedBy],
-) -> Result<Vec<(Vec<(PartitionedBy, ScalarValue)>, PathBuf)>, Error> {
+) -> Result<Vec<(Vec<ScalarValue>, PathBuf)>, Error> {
     let mut results = Vec::new();
 
     let partition_map: HashMap<String, &PartitionedBy> =
@@ -114,8 +115,8 @@ fn discover_partitions_recursive(
     schema: &dyn ExprSchema,
     current_dir: &Path,
     partition_map: &HashMap<String, &PartitionedBy>,
-    results: &mut Vec<(Vec<(PartitionedBy, ScalarValue)>, PathBuf)>,
-    current_partitions: Vec<(PartitionedBy, ScalarValue)>,
+    results: &mut Vec<(Vec<ScalarValue>, PathBuf)>,
+    current_partitions: Vec<ScalarValue>,
     base_dir: PathBuf,
 ) -> Result<(), Error> {
     let dir_name = current_dir.file_name().and_then(|n| n.to_str()).unwrap();
@@ -125,7 +126,7 @@ fn discover_partitions_recursive(
     if let Some((partition_name, value_str)) = dir_name.split_once('=') {
         if let Some(partition_def) = partition_map.get(partition_name) {
             let parsed_value = parse_partition_value(schema, partition_def, value_str)?;
-            new_partitions.push(((*partition_def).clone(), parsed_value));
+            new_partitions.push(parsed_value);
         }
     }
 
@@ -171,7 +172,9 @@ fn discover_partitions_recursive(
         for file_path in file_paths {
             results.push((new_partitions.clone(), file_path));
         }
-    } else if !subdirs.is_empty() {
+    }
+
+    if !subdirs.is_empty() {
         for subdir in subdirs {
             discover_partitions_recursive(
                 schema,
@@ -192,7 +195,12 @@ fn parse_partition_value(
     partition_by: &PartitionedBy,
     value_str: &str,
 ) -> Result<ScalarValue, Error> {
-    let data_type = partition_by.expression.get_type(schema).unwrap();
+    let alias = Expr::Alias(Alias::new(
+        partition_by.expression.clone(),
+        Option::<String>::None,
+        &partition_by.name,
+    ));
+    let data_type = alias.get_type(schema).unwrap();
     let scalar_value = match data_type {
         DataType::Boolean => {
             if value_str == "none" {
@@ -542,13 +550,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         for (partitions, path) in results {
-            for (partition_by, key) in partitions {
-                assert!(partition_by.name == "year" || partition_by.name == "month");
-                assert!(
-                    partition_by.expression == lit(2025u64)
-                        || partition_by.expression == lit("october")
-                );
-
+            for key in partitions {
                 match key {
                     ScalarValue::UInt64(Some(2025u64)) => {}
                     ScalarValue::Utf8(Some(val)) if val == "october" => {}
