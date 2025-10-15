@@ -45,10 +45,8 @@ pub mod tests {
     };
     use datafusion_expr::{LogicalPlan, TableScan};
     use runtime_datafusion_index::Index;
+    use search::index::VectorIndex;
     use search::{generation::util::append_fields, index::SearchIndex};
-    use search::{
-        index::VectorIndex,
-    };
     use snafu::ResultExt;
 
     use crate::embedding_col;
