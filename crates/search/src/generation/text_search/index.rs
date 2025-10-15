@@ -133,7 +133,7 @@ impl FullTextDatabaseIndex {
         primary_key_override: Option<Vec<String>>,
     ) -> Result<Vec<String>, super::Error> {
         // Use 'primary_key_override', fallback to underlying in table.
-        let pks = match (primary_key_override, get_primary_keys(inner).await) {
+        let pks = match (primary_key_override, get_primary_keys(inner)) {
             (Some(pks), _) => pks,
             (None, Ok(pks)) => {
                 if pks.is_empty() {
@@ -432,7 +432,7 @@ impl SearchIndex for FullTextDatabaseIndex {
             LogicalPlanBuilder::scan(
                 self.name(),
                 Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
-                    index: field_index,
+                    index: Arc::new(field_index),
                     query: query.to_string(),
                     pre_limit: None,
                 }))),

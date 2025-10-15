@@ -21,11 +21,18 @@ use super::request::SearchRequest;
 use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::search::FormattingSnafu;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
+use crate::search::{DataFusionSnafu, FormattingSnafu};
+use datafusion::common::DFSchema;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion_expr::sqlparser::ast::Ident;
+use datafusion_expr::{LogicalPlan, ident};
+use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
+use search::pipeline::QueryEngine;
 
 use crate::search::{
     SearchPipelineSnafu,
@@ -45,7 +52,7 @@ use cache::result::search::{CachedAggregationResult, CachedSearchResult};
 use cache::{Sizeable, TabledCacheProvider};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::{TableReference, sqlparser::ast::Expr};
+use datafusion::sql::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -65,7 +72,6 @@ use super::types::VectorSearchResult;
 /// A Component that can perform search operations.
 pub struct SearchEngine {
     pub df: Arc<DataFusion>,
-    embeddings: Arc<RwLock<EmbeddingModelStore>>,
 
     // For tables, explicitly defined primary keys for datasets.
     // Are in [`ResolvedTableReference`] format.
@@ -76,12 +82,10 @@ pub struct SearchEngine {
 impl SearchEngine {
     pub fn new(
         df: Arc<DataFusion>,
-        embeddings: Arc<RwLock<EmbeddingModelStore>>,
         explicit_primary_keys: HashMap<TableReference, Vec<String>>,
     ) -> Self {
         SearchEngine {
             df,
-            embeddings,
             explicit_primary_keys,
         }
     }
@@ -155,6 +159,15 @@ impl SearchEngine {
                 )));
             }
 
+            let state = self.df.ctx.state();
+            let Some(embed_udf) = state.scalar_functions().get(EMBED_UDF_NAME) else {
+                return Err(Error::EmbeddingError {
+                    source: Box::from(format!(
+                        "Vector search on chunked table '{tbl}' requires missing UDF: '{EMBED_UDF_NAME}'",
+                    )),
+                });
+            };
+
             let Some(model_name) = embedding_table.get_embedding_model_used_by(embedding_column)
             else {
                 return Err(Error::CannotVectorSearchDataset {
@@ -162,27 +175,12 @@ impl SearchEngine {
                 });
             };
 
-            let Some(embed) = self
-                .embeddings
-                .read()
-                .await
-                .iter()
-                .find_map(|(name, model)| {
-                    if *name == model_name {
-                        return Some(Arc::clone(model));
-                    }
-                    None
-                })
-            else {
-                return Err(Error::CannotVectorSearchDataset {
-                    data_source: tbl.clone(),
-                });
-            };
             Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
-                &self.df,
+                &table_provider,
                 tbl,
-                &embed,
-                primary_keys,
+                &embed_udf,
+                model_name,
+                primary_keys.to_vec(),
                 embedding_column,
             )))
         }
@@ -313,10 +311,24 @@ impl SearchEngine {
                         generators.append(&mut fts);
                     }
 
-                    let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
+                    // This is actually infalliable
+                    let filters = if let Ok(schm) = DFSchema::try_from(self
+                        .df
+                        .get_table(&tbl)
+                        .await
+                        .ok_or(Error::DataSourcesNotFound {
+                            data_source: vec![tbl.clone()],
+                        })?.schema()) {
+                            let state = self.df.ctx.state();
+                            where_cond.iter().map(|f| state.create_logical_expr(&f.to_string(), &schm)).collect::<Result<_, DataFusionError>>().context(DataFusionSnafu)?
+                    } else {
+                        vec![]
+                    };
+
+                    let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df)))).run(
                         query.clone(),
-                        where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
-                        additional_columns.iter().map(|i| Expr::Identifier(i.clone())).collect(),
+                        filters,
+                        additional_columns.iter().map(|Ident{value,..}| ident(value.clone())).collect(),
                         primary_keys.to_vec(),
                         keywords,
                         *limit
@@ -464,4 +476,29 @@ fn wrap_cache_to_result(
     });
 
     wrapped_results
+}
+
+pub struct DatafusionQueryEngine(Arc<DataFusion>);
+
+#[async_trait::async_trait]
+impl QueryEngine for DatafusionQueryEngine {
+    async fn run(&self, plan: LogicalPlan) -> Result<SendableRecordBatchStream, DataFusionError> {
+        Ok(self
+            .0
+            .query_from_logical_plan(&plan)
+            .run()
+            .await
+            .map_err(|e| {
+                // Either get internal DataFusion error, or wrap as `DataFusionError::External`.
+                match e
+                    .attempt_internal_datafusion_err()
+                    .boxed()
+                    .map_err(DataFusionError::External)
+                {
+                    Ok(e) => e,  // Internal DataFusionError
+                    Err(e) => e, // Constructed `DataFusionError::External`.
+                }
+            })?
+            .data)
+    }
 }

@@ -14,18 +14,23 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::{
-    logical_expr::sqlparser::ast::Expr,
+    catalog::TableProvider,
+    datasource::DefaultTableSource,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
     sql::sqlparser::{
-        ast::{Value, ValueWithSpan},
+        ast::{Expr as SqlExpr, Value, ValueWithSpan},
         dialect::GenericDialect,
         parser::Parser,
         tokenizer::Token,
     },
 };
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, ident, lit};
+use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    VectorSearchGenerationResult,
+    SEARCH_SCORE_COLUMN_NAME, VectorSearchGenerationResult,
     aggregation::{self, AggregationResult, CandidateAggregation, Error as AggregationError},
     generation::{self, CandidateGeneration},
 };
@@ -38,6 +43,11 @@ pub enum Error {
     #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
     CandidateAggregationError { source: aggregation::Error },
 
+    #[snafu(display(
+        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: {source}"
+    ))]
+    SearchRequestConstructionError { source: DataFusionError },
+
     #[snafu(display("An invalid keyword was specified: {keyword}"))]
     InvalidKeyword { keyword: String },
 }
@@ -48,6 +58,10 @@ impl Error {
         matches!(self, Error::CandidateAggregationError { source } if source.is_user_error())
     }
 }
+#[async_trait::async_trait]
+pub trait QueryEngine: Send + Sync {
+    async fn run(&self, plan: LogicalPlan) -> Result<SendableRecordBatchStream, DataFusionError>;
+}
 
 pub struct SearchPipeline<A>
 where
@@ -55,14 +69,20 @@ where
 {
     generators: Vec<Arc<dyn CandidateGeneration>>,
     aggregator: A,
+    engine: Arc<dyn QueryEngine>,
 }
 
 impl<A: CandidateAggregation> SearchPipeline<A> {
     #[must_use]
-    pub fn new(generators: Vec<Arc<dyn CandidateGeneration>>, aggregator: A) -> Self {
+    pub fn new(
+        generators: Vec<Arc<dyn CandidateGeneration>>,
+        aggregator: A,
+        engine: Arc<dyn QueryEngine>,
+    ) -> Self {
         SearchPipeline {
             generators,
             aggregator,
+            engine,
         }
     }
 
@@ -76,7 +96,15 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
         keywords: Vec<String>,
         limit: usize,
     ) -> std::result::Result<Option<AggregationResult>, Error> {
-        let proj_ref: &[&Expr] = &addition_projection.iter().collect::<Vec<_>>();
+        let columns: Vec<_> = [
+            primary_keys.iter().map(|pk| ident(pk.clone())).collect(),
+            addition_projection,
+            vec![ident(SEARCH_SCORE_COLUMN_NAME)],
+        ]
+        .concat()
+        .into_iter()
+        .unique()
+        .collect();
 
         let generation_results: Vec<VectorSearchGenerationResult> =
             futures::future::try_join_all(self.generators.iter().map(|g| async {
@@ -90,19 +118,23 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                 ]
                 .concat();
 
-                let data = g
-                    .search(
-                        query.clone(),
-                        &filters.iter().collect::<Vec<_>>(),
-                        proj_ref,
-                        limit,
-                    )
-                    .await
-                    .context(CandidateGenerationSnafu)?;
+                let lp = construct_logical_plan(
+                    g.search(query.clone())
+                        .context(SearchRequestConstructionSnafu)?,
+                    columns.clone(),
+                    filters,
+                    Some(limit),
+                )
+                .context(SearchRequestConstructionSnafu)?;
 
-                // TODO: Filter results after the fact for filters that aren't supported by [`CandidateGeneration::supports_filter_pushdown`]. https://github.com/spiceai/spiceai/issues/5849
+                let data =
+                    self.engine
+                        .run(lp)
+                        .await
+                        .map_err(|e| Error::CandidateGenerationError {
+                            source: generation::Error::QueryError { source: e },
+                        })?;
 
-                // TODO: Retrieve columns from projection that aren't provided by candidate generator (see [`CandidateGeneration::supports_columns`]) https://github.com/spiceai/spiceai/issues/5850
                 Ok(VectorSearchGenerationResult {
                     data,
                     derived_from: content_col,
@@ -120,6 +152,26 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
             Err(e) => Err(e).context(CandidateAggregationSnafu),
         }
     }
+}
+
+fn construct_logical_plan(
+    tbl: Arc<dyn TableProvider>,
+    columns: Vec<Expr>,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
+) -> Result<LogicalPlan, DataFusionError> {
+    let mut scan =
+        LogicalPlanBuilder::scan("base_table", Arc::new(DefaultTableSource::new(tbl)), None)?;
+
+    if let Some(filter) = filters.into_iter().reduce(Expr::and) {
+        scan = scan.filter(filter)?;
+    }
+    scan.project(columns)?
+        .sort_with_limit(
+            vec![SortExpr::new(ident(SEARCH_SCORE_COLUMN_NAME), false, false)],
+            limit,
+        )?
+        .build()
 }
 
 /// Convert each keyword into an `ILIKE %keyword%` [`Expr`].
@@ -161,7 +213,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         }
     })?;
 
-    let Expr::ILike { expr, pattern, .. } = &ilike_expr else {
+    let SqlExpr::ILike { expr, pattern, .. } = &ilike_expr else {
         tracing::trace!(
             "failed to parse 'keywords' for search. expected ILIKE, but got {ilike_expr:?}"
         );
@@ -171,8 +223,8 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
     };
 
     if let (
-        Expr::Identifier(id),
-        Expr::Value(ValueWithSpan {
+        SqlExpr::Identifier(id),
+        SqlExpr::Value(ValueWithSpan {
             value: Value::SingleQuotedString(v),
             ..
         }),
@@ -218,7 +270,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         });
     }
 
-    Ok(ilike_expr)
+    Ok(ident(target_column).ilike(lit(k)))
 }
 
 #[cfg(test)]

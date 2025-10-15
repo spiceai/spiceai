@@ -20,6 +20,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use datafusion::common::Column;
+use datafusion::error::DataFusionError;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
@@ -133,10 +134,9 @@ pub(crate) async fn get_primary_keys_from_table(
             data_source: vec![table.clone()],
         })?;
 
-    get_primary_keys(&tbl_ref)
-        .await
-        .boxed()
-        .map_err(|e| Error::DataFusionError { source: e })
+    get_primary_keys(&tbl_ref).map_err(|e| Error::DataFusionError {
+        source: DataFusionError::from(e),
+    })
 }
 
 /// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
