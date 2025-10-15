@@ -26,10 +26,14 @@ limitations under the License.
 //! [`SupportedScalarValue`] so that we can derive `Serialize` and `Deserialize`
 //! on variants that have types that can be serialized/deserialized.
 
+use std::path::PathBuf;
+
 use arrow_schema::DataType;
 use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+
+use crate::expression::PartitionedBy;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -41,6 +45,43 @@ pub enum Error {
 
     #[snafu(display("Unsupported scalar value type: {data_type}"))]
     UnsupportedType { data_type: DataType },
+
+    #[snafu(display("Unsupported partition key: {value}"))]
+    UnsupportedPartitionKey { value: ScalarValue },
+}
+
+pub fn to_hive_partition_dir(pairings: &[(PartitionedBy, ScalarValue)]) -> Result<PathBuf, Error> {
+    let mut path = PathBuf::new();
+    for (partitioned_by, key) in pairings {
+        let name = &partitioned_by.name;
+        let key = encode_key(key)?;
+        let part = format!("{name}={key}");
+        path = path.join(part);
+    }
+
+    Ok(path)
+}
+
+fn encode_key(key: &ScalarValue) -> Result<String, Error> {
+    let key = match key {
+        ScalarValue::Boolean(v) => v.map(|v| format!("{v}")),
+        ScalarValue::Int8(v) => v.map(|v| format!("{v}")),
+        ScalarValue::Int16(v) => v.map(|v| format!("{v}")),
+        ScalarValue::Int32(v) => v.map(|v| format!("{v}")),
+        ScalarValue::Int64(v) => v.map(|v| format!("{v}")),
+        ScalarValue::UInt8(v) => v.map(|v| format!("{v}")),
+        ScalarValue::UInt16(v) => v.map(|v| format!("{v}")),
+        ScalarValue::UInt32(v) => v.map(|v| format!("{v}")),
+        ScalarValue::UInt64(v) => v.map(|v| format!("{v}")),
+        ScalarValue::Utf8(v) => v.clone(),
+        value => {
+            return Err(Error::UnsupportedPartitionKey {
+                value: value.clone(),
+            });
+        }
+    };
+
+    Ok(key.unwrap_or("none".to_string()))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -199,9 +240,45 @@ impl TryFrom<SupportedScalarValue> for ScalarValue {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::prelude::col;
+
     use super::*;
 
     const EXPRS_HASH: u64 = 7;
+
+    #[test]
+    fn test_hive_partition_name() -> Result<(), Error> {
+        let partitioned_by = vec![
+            PartitionedBy {
+                name: "year".to_string(),
+                expression: col("year"),
+            },
+            PartitionedBy {
+                name: "month".to_string(),
+                expression: col("month"),
+            },
+            PartitionedBy {
+                name: "day".to_string(),
+                expression: col("day"),
+            },
+        ];
+
+        let keys = vec![
+            ScalarValue::Int32(Some(2025)),
+            ScalarValue::Int32(Some(10)),
+            ScalarValue::Int32(Some(15)),
+        ];
+
+        let pairings = partitioned_by.into_iter().zip(keys).collect::<Vec<_>>();
+        let path = to_hive_partition_dir(&pairings)?;
+
+        let parts = path.iter().collect::<Vec<_>>();
+        for (want, got) in ["year=2025", "month=10", "day=15"].iter().zip(parts) {
+            assert_eq!(*want, got.to_str().expect("to_str"));
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn test_encode_decode_boolean() {

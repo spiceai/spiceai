@@ -41,7 +41,7 @@ use runtime_table_partition::{
     Partition,
     creator::{
         self, PartitionCreator,
-        filename::{self, decode_pair, encode_pair},
+        filename::{self, decode_pair, encode_pair, to_hive_partition_dir},
     },
     expression::PartitionedBy,
     provider::PartitionTableProvider,
@@ -313,10 +313,13 @@ impl DuckDBPartitionCreator {
         cmd: &mut CreateExternalTable,
         partition_value: &ScalarValue,
     ) -> Result<String, filename::Error> {
-        let partition_value_str = encode_pair(partition_value, self.expressions_hash)?;
-
-        let duckdb_file = format!("{partition_value_str}.db");
-        let duckdb_path = self.partition_dir.join(&duckdb_file);
+        let hive_path =
+            to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])?;
+        let duckdb_path = self.partition_dir.join(&hive_path);
+        if !duckdb_path.is_dir() {
+            std::fs::create_dir_all(&duckdb_path).unwrap();
+        }
+        let duckdb_path = duckdb_path.join("data.db");
         let duckdb_path = duckdb_path.display().to_string();
         cmd.options.insert("open".to_string(), duckdb_path.clone());
 
@@ -379,36 +382,23 @@ impl PartitionCreator for DuckDBPartitionCreator {
                     continue;
                 };
 
-                let partition_value = match decode_pair(file_name) {
-                    Ok((value, partition_by_hash)) => {
-                        if self.expressions_hash != partition_by_hash {
-                            return Err(creator::Error::PartitionByExpressionsChanged);
-                        }
-                        value
-                    }
-                    Err(e) => {
-                        tracing::trace!("Unable to decode ScalarValue: {e}");
-                        continue;
-                    }
-                };
-
                 let mut cmd = self.cmd.clone();
-                self.add_open(&mut cmd, &partition_value)
-                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+                // self.add_open(&mut cmd, &partition_value)
+                //     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-                let duckdb_path = path.display().to_string();
-                get_pool(&self.duckdb_factory, &duckdb_path)
-                    .await
-                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+                // let duckdb_path = path.display().to_string();
+                // get_pool(&self.duckdb_factory, &duckdb_path)
+                //     .await
+                //     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-                let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
-                    .await
-                    .map_err(|e| creator::Error::InferringPartitions { source: e })?;
+                // let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
+                //     .await
+                //     .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
-                partitions.push(Partition {
-                    partition_value,
-                    table_provider,
-                });
+                // partitions.push(Partition {
+                //     partition_value,
+                //     table_provider,
+                // });
             }
         }
 
