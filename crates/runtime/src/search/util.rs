@@ -344,6 +344,7 @@ mod tests {
                 vec!["search_field".to_string()],
                 vec![].into(),
                 None,
+                &[],
             )
             .await
             .expect("cannot make full text table"),
