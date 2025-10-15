@@ -77,12 +77,22 @@ static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>
 
 const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
 
-#[derive(Debug)]
 pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
     rate_limiter: Arc<GitHubRateLimiter>,
     semaphore: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for Github {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Github")
+            .field("params", &self.params)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("rate_limiter", &self.rate_limiter)
+            .field("semaphore", &"<Semaphore>")
+            .finish()
+    }
 }
 
 pub struct GitHubTableGraphQLParams {
