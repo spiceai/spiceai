@@ -18,7 +18,10 @@ limitations under the License.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::param::Params;
+use crate::{
+    param::Params,
+    partitioning::{PartitionedBy, deserialize_partition_by},
+};
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,8 +34,12 @@ pub struct VectorStore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partition_by: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_partition_by"
+    )]
+    pub partition_by: Vec<PartitionedBy>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
