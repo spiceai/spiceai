@@ -18,7 +18,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
-use spicepod::semantic::IndexStore;
+use spicepod::semantic::{IndexStore, MetadataType};
 use std::any::Any;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -103,11 +103,23 @@ impl FullTextConnector {
             None
         };
 
+        let store_fields = dataset
+            .columns
+            .iter()
+            .filter_map(|c| {
+                if let Some(MetadataType::NonFilterable) = c.as_vector_metadata() {
+                    return Some(c.name.clone());
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+
         let index = FullTextDatabaseIndex::try_new(
             Arc::clone(&inner_table_provider),
             search_fields.clone(),
             Some(primary_key),
             directory,
+            &store_fields,
         )
         .await
         .map_err(|e| DataConnectorError::InvalidConfiguration {
