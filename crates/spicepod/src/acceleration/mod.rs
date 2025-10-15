@@ -16,10 +16,15 @@ limitations under the License.
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display};
 
-use crate::{component::dataset::ReadyState, metric::Metrics, param::Params};
+use crate::{
+    component::dataset::ReadyState,
+    metric::Metrics,
+    param::Params,
+    partitioning::{PartitionedBy, deserialize_partition_by},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -238,13 +243,6 @@ pub struct Acceleration {
     pub snapshots: SnapshotBehavior,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct PartitionedBy {
-    pub name: String,
-    pub expression: String,
-}
-
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !b
@@ -287,38 +285,6 @@ impl Default for Acceleration {
             snapshots: SnapshotBehavior::Disabled,
         }
     }
-}
-
-fn deserialize_partition_by<'de, D>(deserializer: D) -> Result<Vec<PartitionedBy>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
-
-    let mut result = Vec::new();
-
-    for value in values {
-        match value {
-            serde_json::Value::String(expression) => {
-                let name = format!("expr{i}", i = result.len());
-                let partitioned_by = PartitionedBy { name, expression };
-                result.push(partitioned_by);
-            }
-            serde_json::Value::Object(map) => {
-                // case where {"year": "YEAR(created_at)"}
-                for (name, v) in map {
-                    if let serde_json::Value::String(expression) = v {
-                        let partitioned_by = PartitionedBy { name, expression };
-                        result.push(partitioned_by);
-                        break; // take first string and ignore others
-                    }
-                }
-            }
-            _ => {}
-        };
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -380,51 +346,5 @@ mod tests {
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)
         );
-    }
-
-    #[test]
-    fn partition_by_unnamed() -> Result<(), serde_yaml::Error> {
-        let expression = "YEAR(created_at)";
-        let yaml = format!(
-            r#"
-            partition_by:
-              - "{expression}"
-        "#
-        );
-
-        let acceleration: Acceleration = serde_yaml::from_str(&yaml)?;
-
-        assert_eq!(acceleration.partition_by.len(), 1);
-        assert_eq!(acceleration.partition_by[0].name, "expr0");
-        assert_eq!(acceleration.partition_by[0].expression, expression);
-
-        Ok(())
-    }
-
-    #[test]
-    fn partition_by_named() -> Result<(), serde_yaml::Error> {
-        let year_expression = "YEAR(created_at)";
-        let month_expression = "MONTH(created_at)";
-        let day_expression = "DAY(created_at)";
-        let yaml = format!(
-            r#"
-            partition_by:
-              - year: "{year_expression}"
-              - month: "{month_expression}"
-              - day: "{day_expression}"
-        "#
-        );
-
-        let acceleration: Acceleration = serde_yaml::from_str(&yaml)?;
-
-        assert_eq!(acceleration.partition_by.len(), 3);
-        assert_eq!(acceleration.partition_by[0].name, "year");
-        assert_eq!(acceleration.partition_by[0].expression, year_expression);
-        assert_eq!(acceleration.partition_by[1].name, "month");
-        assert_eq!(acceleration.partition_by[1].expression, month_expression);
-        assert_eq!(acceleration.partition_by[2].name, "day");
-        assert_eq!(acceleration.partition_by[2].expression, day_expression);
-
-        Ok(())
     }
 }
