@@ -26,7 +26,11 @@ limitations under the License.
 //! [`SupportedScalarValue`] so that we can derive `Serialize` and `Deserialize`
 //! on variants that have types that can be serialized/deserialized.
 
-use std::path::{Path, PathBuf};
+use std::{
+    num::ParseIntError,
+    path::{Path, PathBuf},
+    str::ParseBoolError,
+};
 
 use arrow_schema::{DataType, TimeUnit};
 use datafusion::{
@@ -53,6 +57,16 @@ pub enum Error {
 
     #[snafu(display("Unsupported partition key: {value}"))]
     UnsupportedPartitionKey { value: ScalarValue },
+
+    #[snafu(display("Failed to parse partition key: {source}"))]
+    Parsing {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed while discovering partitions: {source}"))]
+    Discovering {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub fn to_hive_partition_dir(pairings: &[(PartitionedBy, ScalarValue)]) -> Result<PathBuf, Error> {
@@ -119,7 +133,9 @@ fn discover_partitions_recursive(
     current_partitions: Vec<ScalarValue>,
     base_dir: PathBuf,
 ) -> Result<(), Error> {
-    let dir_name = current_dir.file_name().and_then(|n| n.to_str()).unwrap();
+    let Some(dir_name) = current_dir.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
 
     let mut new_partitions = current_partitions.clone();
 
@@ -130,15 +146,18 @@ fn discover_partitions_recursive(
         }
     }
 
-    let entries = std::fs::read_dir(current_dir).unwrap();
+    let entries =
+        std::fs::read_dir(current_dir).map_err(|e| Error::Discovering { source: e.into() })?;
 
     let mut has_files = false;
     let mut subdirs = Vec::new();
 
     for entry in entries {
-        let entry = entry.unwrap();
+        let entry = entry.map_err(|e| Error::Discovering { source: e.into() })?;
 
-        let metadata = entry.metadata().unwrap();
+        let metadata = entry
+            .metadata()
+            .map_err(|e| Error::Discovering { source: e.into() })?;
 
         if metadata.is_dir() {
             subdirs.push(entry.path());
@@ -149,7 +168,7 @@ fn discover_partitions_recursive(
 
     if has_files {
         let file_paths = std::fs::read_dir(current_dir)
-            .unwrap()
+            .map_err(|e| Error::Discovering { source: e.into() })?
             .filter_map(|entry| {
                 let entry = match entry {
                     Ok(e) => e,
@@ -200,13 +219,17 @@ fn parse_partition_value(
         Option::<String>::None,
         &partition_by.name,
     ));
-    let data_type = alias.get_type(schema).unwrap();
+    let data_type = alias
+        .get_type(schema)
+        .map_err(|e| Error::Parsing { source: e.into() })?;
     let scalar_value = match data_type {
         DataType::Boolean => {
             if value_str == "none" {
                 ScalarValue::Boolean(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseBoolError| Error::Parsing { source: e.into() })?;
                 ScalarValue::Boolean(Some(b))
             }
         }
@@ -214,7 +237,9 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int8(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::Int8(Some(b))
             }
         }
@@ -222,7 +247,9 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int16(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::Int16(Some(b))
             }
         }
@@ -230,7 +257,9 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int32(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::Int32(Some(b))
             }
         }
@@ -238,7 +267,9 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int64(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::Int64(Some(b))
             }
         }
@@ -246,7 +277,9 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt8(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::UInt8(Some(b))
             }
         }
@@ -254,7 +287,9 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt16(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::UInt16(Some(b))
             }
         }
@@ -262,7 +297,9 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt32(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::UInt32(Some(b))
             }
         }
@@ -270,30 +307,51 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt64(None)
             } else {
-                let b = value_str.parse().unwrap();
+                let b = value_str
+                    .parse()
+                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
                 ScalarValue::UInt64(Some(b))
             }
         }
         DataType::Timestamp(t, _) => match t {
-            TimeUnit::Second => {
-                ScalarValue::TimestampSecond(Some(value_str.parse().unwrap()), None)
-            }
-            TimeUnit::Millisecond => {
-                ScalarValue::TimestampMillisecond(Some(value_str.parse().unwrap()), None)
-            }
-            TimeUnit::Microsecond => {
-                ScalarValue::TimestampMicrosecond(Some(value_str.parse().unwrap()), None)
-            }
-            TimeUnit::Nanosecond => {
-                ScalarValue::TimestampNanosecond(Some(value_str.parse().unwrap()), None)
-            }
+            TimeUnit::Second => ScalarValue::TimestampSecond(
+                Some(
+                    value_str
+                        .parse()
+                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
+                ),
+                None,
+            ),
+            TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(
+                Some(
+                    value_str
+                        .parse()
+                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
+                ),
+                None,
+            ),
+            TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(
+                Some(
+                    value_str
+                        .parse()
+                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
+                ),
+                None,
+            ),
+            TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(
+                Some(
+                    value_str
+                        .parse()
+                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
+                ),
+                None,
+            ),
         },
         DataType::Utf8 => {
             if value_str == "none" {
                 ScalarValue::Utf8(None)
             } else {
-                let b = value_str.parse().unwrap();
-                ScalarValue::Utf8(Some(b))
+                ScalarValue::Utf8(Some(value_str.to_string()))
             }
         }
         data_type => return Err(Error::UnsupportedType { data_type }),

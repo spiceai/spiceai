@@ -320,12 +320,13 @@ impl DuckDBPartitionCreator {
         &self,
         cmd: &mut CreateExternalTable,
         partition_value: &ScalarValue,
-    ) -> Result<String, filename::Error> {
+    ) -> Result<String, creator::Error> {
         let hive_path =
             to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])?;
         let duckdb_path = self.partition_dir.join(&hive_path);
         if !duckdb_path.is_dir() {
-            std::fs::create_dir_all(&duckdb_path).unwrap();
+            std::fs::create_dir_all(&duckdb_path)
+                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
         }
         let duckdb_path = duckdb_path.join("data.db");
         let duckdb_path = duckdb_path.display().to_string();
@@ -372,10 +373,11 @@ impl PartitionCreator for DuckDBPartitionCreator {
             .await
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
-        let schema = DFSchema::try_from(Arc::clone(&self.schema)).unwrap();
+        let schema = DFSchema::try_from(Arc::clone(&self.schema))
+            .map_err(|e| creator::Error::InferringPartitions { source: e })?;
         let hive_partitions =
             discover_hive_partitions(&schema, &self.partition_dir, &[self.partition_by.clone()])
-                .unwrap();
+                .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
         let mut partitions = Vec::with_capacity(hive_partitions.len());
         for (mut keys, path) in hive_partitions {
