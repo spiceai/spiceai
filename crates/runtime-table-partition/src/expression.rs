@@ -51,7 +51,7 @@ pub enum Error {
 
 pub type ValidationResult = Result<(), Error>;
 
-#[derive(Debug)]
+#[derive(Clone, PartialEq, PartialOrd, Eq, Debug, Hash)]
 pub struct PartitionedBy {
     pub name: String,
     pub expression: Expr,

@@ -109,7 +109,9 @@ pub enum Error {
     #[snafu(display("Partitioned DuckDB expected an AccelerationSource"))]
     ExpectedAccelerationSource,
 
-    #[snafu(display("Partition by expressions are required for Partitioned DuckDB acceleration"))]
+    #[snafu(display(
+        "A single partition by expression is required for Partitioned DuckDB acceleration"
+    ))]
     PartitionByRequired,
 
     #[snafu(display("Unable to create partition: {source}"))]
@@ -241,7 +243,10 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         self.is_initialized.store(false, Ordering::Release);
 
-        ensure!(partition_by.len() > 0, PartitionByRequiredSnafu);
+        let partition_by_first = partition_by
+            .first()
+            .context(PartitionByRequiredSnafu)?
+            .clone();
 
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
@@ -249,14 +254,11 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 
         let mut table_provider_guard = self.table_provider.lock().await;
 
-        let expressions_hash = 0;
-        let partition_by = partition_by.into_iter().map(|p| p.expression).collect();
-
         let schema = Arc::new(cmd.schema.as_arrow().clone());
         let creator = Arc::new(DuckDBPartitionCreator::new(
             partition_dir(source),
             cmd,
-            expressions_hash,
+            partition_by_first,
         ));
         let table_provider =
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
@@ -281,6 +283,7 @@ pub(crate) struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     duckdb_factory: DuckDBTableProviderFactory,
     partition_dir: PathBuf,
+    partition_by: PartitionedBy,
     expressions_hash: u64,
 }
 
@@ -288,7 +291,7 @@ impl DuckDBPartitionCreator {
     pub(crate) fn new(
         partition_dir: PathBuf,
         cmd: CreateExternalTable,
-        expressions_hash: u64,
+        partition_by: PartitionedBy,
     ) -> Self {
         let duckdb_factory = create_factory();
 
@@ -296,7 +299,8 @@ impl DuckDBPartitionCreator {
             cmd,
             duckdb_factory,
             partition_dir,
-            expressions_hash,
+            partition_by,
+            expressions_hash: 0,
         }
     }
 
