@@ -14,18 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Create filenames from [`ScalarValue`]s and infer [`ScalarValue`]s from
-//! filenames.
-//!
-//! `serde_qs` crate is used to serialize/deserialize [`ScalarValue`]s into
-//! [`String`]s that are URL encoded. This is helpful because we get the
-//! encoding and decoding functionality and special characters are escaped
-//! making them filesystem compatible.
-//!
-//! A subset of the [`ScalarValue`] variants are copied into a new type
-//! [`SupportedScalarValue`] so that we can derive `Serialize` and `Deserialize`
-//! on variants that have types that can be serialized/deserialized.
-
 use std::{
     num::ParseIntError,
     path::{Path, PathBuf},
@@ -39,19 +27,12 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
-use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::expression::PartitionedBy;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to serialize: {source}"))]
-    Serialize { source: serde_qs::Error },
-
-    #[snafu(display("Failed to deserialize: {source}"))]
-    Deserialize { source: serde_qs::Error },
-
     #[snafu(display("Unsupported scalar value type: {data_type}"))]
     UnsupportedType { data_type: DataType },
 
@@ -207,6 +188,17 @@ fn discover_partitions_recursive(
     Ok(())
 }
 
+macro_rules! parse_numeric_scalar {
+    ($value_str:expr, $scalar_type:ident, $parse_type:ty) => {
+        if $value_str == "none" {
+            ScalarValue::$scalar_type(None)
+        } else {
+            let parsed: $parse_type = $value_str.parse()?;
+            ScalarValue::$scalar_type(Some(parsed))
+        }
+    };
+}
+
 fn parse_partition_value(
     schema: &dyn ExprSchema,
     partition_by: &PartitionedBy,
@@ -229,70 +221,14 @@ fn parse_partition_value(
                 ScalarValue::Boolean(Some(b))
             }
         }
-        DataType::Int8 => {
-            if value_str == "none" {
-                ScalarValue::Int8(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::Int8(Some(b))
-            }
-        }
-        DataType::Int16 => {
-            if value_str == "none" {
-                ScalarValue::Int16(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::Int16(Some(b))
-            }
-        }
-        DataType::Int32 => {
-            if value_str == "none" {
-                ScalarValue::Int32(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::Int32(Some(b))
-            }
-        }
-        DataType::Int64 => {
-            if value_str == "none" {
-                ScalarValue::Int64(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::Int64(Some(b))
-            }
-        }
-        DataType::UInt8 => {
-            if value_str == "none" {
-                ScalarValue::UInt8(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::UInt8(Some(b))
-            }
-        }
-        DataType::UInt16 => {
-            if value_str == "none" {
-                ScalarValue::UInt16(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::UInt16(Some(b))
-            }
-        }
-        DataType::UInt32 => {
-            if value_str == "none" {
-                ScalarValue::UInt32(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::UInt32(Some(b))
-            }
-        }
-        DataType::UInt64 => {
-            if value_str == "none" {
-                ScalarValue::UInt64(None)
-            } else {
-                let b = value_str.parse()?;
-                ScalarValue::UInt64(Some(b))
-            }
-        }
+        DataType::Int8 => parse_numeric_scalar!(value_str, Int8, i8),
+        DataType::Int16 => parse_numeric_scalar!(value_str, Int16, i16),
+        DataType::Int32 => parse_numeric_scalar!(value_str, Int32, i32),
+        DataType::Int64 => parse_numeric_scalar!(value_str, Int64, i64),
+        DataType::UInt8 => parse_numeric_scalar!(value_str, UInt8, u8),
+        DataType::UInt16 => parse_numeric_scalar!(value_str, UInt16, u16),
+        DataType::UInt32 => parse_numeric_scalar!(value_str, UInt32, u32),
+        DataType::UInt64 => parse_numeric_scalar!(value_str, UInt64, u64),
         DataType::Timestamp(t, _) => match t {
             TimeUnit::Second => ScalarValue::TimestampSecond(Some(value_str.parse()?), None),
             TimeUnit::Millisecond => {
@@ -331,127 +267,6 @@ impl From<ParseBoolError> for Error {
         Self::Parsing {
             source: value.into(),
         }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-enum SupportedScalarValue {
-    Boolean(Option<bool>),
-    Int8(Option<i8>),
-    Int16(Option<i16>),
-    Int32(Option<i32>),
-    Int64(Option<i64>),
-    UInt8(Option<u8>),
-    UInt16(Option<u16>),
-    UInt32(Option<u32>),
-    UInt64(Option<u64>),
-    Utf8(Option<String>),
-    Utf8View(Option<String>),
-    LargeUtf8(Option<String>),
-    Date32(Option<i32>),
-    Date64(Option<i64>),
-    Time32Second(Option<i32>),
-    Time32Millisecond(Option<i32>),
-    Time64Microsecond(Option<i64>),
-    Time64Nanosecond(Option<i64>),
-    TimestampSecond(Option<i64>, Option<String>),
-    TimestampMillisecond(Option<i64>, Option<String>),
-    TimestampMicrosecond(Option<i64>, Option<String>),
-    TimestampNanosecond(Option<i64>, Option<String>),
-    IntervalYearMonth(Option<i32>),
-}
-
-impl TryFrom<ScalarValue> for SupportedScalarValue {
-    type Error = Error;
-
-    fn try_from(value: ScalarValue) -> Result<Self, Self::Error> {
-        Ok(match value {
-            ScalarValue::Boolean(maybe_value) => Self::Boolean(maybe_value),
-            ScalarValue::Int8(maybe_value) => Self::Int8(maybe_value),
-            ScalarValue::Int16(maybe_value) => Self::Int16(maybe_value),
-            ScalarValue::Int32(maybe_value) => Self::Int32(maybe_value),
-            ScalarValue::Int64(maybe_value) => Self::Int64(maybe_value),
-            ScalarValue::UInt8(maybe_value) => Self::UInt8(maybe_value),
-            ScalarValue::UInt16(maybe_value) => Self::UInt16(maybe_value),
-            ScalarValue::UInt32(maybe_value) => Self::UInt32(maybe_value),
-            ScalarValue::UInt64(maybe_value) => Self::UInt64(maybe_value),
-            ScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
-            ScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
-            ScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
-            ScalarValue::Date32(maybe_value) => Self::Date32(maybe_value),
-            ScalarValue::Date64(maybe_value) => Self::Date64(maybe_value),
-            ScalarValue::Time32Second(maybe_value) => Self::Time32Second(maybe_value),
-            ScalarValue::Time32Millisecond(maybe_value) => Self::Time32Millisecond(maybe_value),
-            ScalarValue::Time64Microsecond(maybe_value) => Self::Time64Microsecond(maybe_value),
-            ScalarValue::Time64Nanosecond(maybe_value) => Self::Time64Nanosecond(maybe_value),
-            ScalarValue::TimestampSecond(maybe_value, maybe_str) => {
-                Self::TimestampSecond(maybe_value, maybe_str.map(|s| s.to_string()))
-            }
-            ScalarValue::TimestampMillisecond(maybe_value, maybe_str) => {
-                Self::TimestampMillisecond(maybe_value, maybe_str.map(|s| s.to_string()))
-            }
-            ScalarValue::TimestampMicrosecond(maybe_value, maybe_str) => {
-                Self::TimestampMicrosecond(maybe_value, maybe_str.map(|s| s.to_string()))
-            }
-            ScalarValue::TimestampNanosecond(maybe_value, maybe_str) => {
-                Self::TimestampNanosecond(maybe_value, maybe_str.map(|s| s.to_string()))
-            }
-            ScalarValue::IntervalYearMonth(maybe_value) => Self::IntervalYearMonth(maybe_value),
-            _ => {
-                return UnsupportedTypeSnafu {
-                    data_type: value.data_type(),
-                }
-                .fail();
-            }
-        })
-    }
-}
-
-impl TryFrom<SupportedScalarValue> for ScalarValue {
-    type Error = Error;
-
-    fn try_from(value: SupportedScalarValue) -> Result<Self, Self::Error> {
-        Ok(match value {
-            SupportedScalarValue::Boolean(maybe_value) => Self::Boolean(maybe_value),
-            SupportedScalarValue::Int8(maybe_value) => Self::Int8(maybe_value),
-            SupportedScalarValue::Int16(maybe_value) => Self::Int16(maybe_value),
-            SupportedScalarValue::Int32(maybe_value) => Self::Int32(maybe_value),
-            SupportedScalarValue::Int64(maybe_value) => Self::Int64(maybe_value),
-            SupportedScalarValue::UInt8(maybe_value) => Self::UInt8(maybe_value),
-            SupportedScalarValue::UInt16(maybe_value) => Self::UInt16(maybe_value),
-            SupportedScalarValue::UInt32(maybe_value) => Self::UInt32(maybe_value),
-            SupportedScalarValue::UInt64(maybe_value) => Self::UInt64(maybe_value),
-            SupportedScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
-            SupportedScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
-            SupportedScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
-            SupportedScalarValue::Date32(maybe_value) => Self::Date32(maybe_value),
-            SupportedScalarValue::Date64(maybe_value) => Self::Date64(maybe_value),
-            SupportedScalarValue::Time32Second(maybe_value) => Self::Time32Second(maybe_value),
-            SupportedScalarValue::Time32Millisecond(maybe_value) => {
-                Self::Time32Millisecond(maybe_value)
-            }
-            SupportedScalarValue::Time64Microsecond(maybe_value) => {
-                Self::Time64Microsecond(maybe_value)
-            }
-            SupportedScalarValue::Time64Nanosecond(maybe_value) => {
-                Self::Time64Nanosecond(maybe_value)
-            }
-            SupportedScalarValue::TimestampSecond(maybe_value, maybe_str) => {
-                Self::TimestampSecond(maybe_value, maybe_str.map(Into::into))
-            }
-            SupportedScalarValue::TimestampMillisecond(maybe_value, maybe_str) => {
-                Self::TimestampMillisecond(maybe_value, maybe_str.map(Into::into))
-            }
-            SupportedScalarValue::TimestampMicrosecond(maybe_value, maybe_str) => {
-                Self::TimestampMicrosecond(maybe_value, maybe_str.map(Into::into))
-            }
-            SupportedScalarValue::TimestampNanosecond(maybe_value, maybe_str) => {
-                Self::TimestampNanosecond(maybe_value, maybe_str.map(Into::into))
-            }
-            SupportedScalarValue::IntervalYearMonth(maybe_value) => {
-                Self::IntervalYearMonth(maybe_value)
-            }
-        })
     }
 }
 

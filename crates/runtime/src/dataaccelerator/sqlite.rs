@@ -384,7 +384,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = SqliteAccelerator::new()
-            .create_external_table(external_table, None, None)
+            .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");
 

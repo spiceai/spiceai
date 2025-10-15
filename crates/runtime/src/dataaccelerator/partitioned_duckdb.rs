@@ -43,7 +43,7 @@ use runtime_table_partition::{
     Partition,
     creator::{
         self, PartitionCreator,
-        filename::{self, discover_hive_partitions, to_hive_partition_dir},
+        filename::{discover_hive_partitions, to_hive_partition_dir},
     },
     expression::PartitionedBy,
     provider::PartitionTableProvider,
@@ -288,7 +288,6 @@ pub(crate) struct DuckDBPartitionCreator {
     partition_dir: PathBuf,
     partition_by: PartitionedBy,
     schema: SchemaRef,
-    expressions_hash: u64,
 }
 
 impl DuckDBPartitionCreator {
@@ -305,7 +304,6 @@ impl DuckDBPartitionCreator {
             duckdb_factory,
             partition_dir,
             partition_by,
-            expressions_hash: 0,
             schema,
         }
     }
@@ -320,7 +318,8 @@ impl DuckDBPartitionCreator {
         partition_value: &ScalarValue,
     ) -> Result<String, creator::Error> {
         let hive_path =
-            to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])?;
+            to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])
+                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
         let duckdb_path = self.partition_dir.join(&hive_path);
         if !duckdb_path.is_dir() {
             std::fs::create_dir_all(&duckdb_path)
@@ -367,15 +366,14 @@ impl PartitionCreator for DuckDBPartitionCreator {
             return Ok(vec![]);
         }
 
-        let mut dir_entries = tokio::fs::read_dir(&self.partition_dir)
-            .await
-            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
-
         let schema = DFSchema::try_from(Arc::clone(&self.schema))
-            .map_err(|e| creator::Error::InferringPartitions { source: e })?;
-        let hive_partitions =
-            discover_hive_partitions(&schema, &self.partition_dir, &[self.partition_by.clone()])
-                .map_err(|e| creator::Error::InferringPartitions { source: e })?;
+            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+        let hive_partitions = discover_hive_partitions(
+            &schema,
+            &self.partition_dir,
+            std::slice::from_ref(&self.partition_by),
+        )
+        .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
         let mut partitions = Vec::with_capacity(hive_partitions.len());
         for (mut keys, path) in hive_partitions {
