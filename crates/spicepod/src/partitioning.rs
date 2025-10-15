@@ -51,7 +51,7 @@ where
                 }
             }
             _ => {}
-        };
+        }
     }
 
     Ok(result)

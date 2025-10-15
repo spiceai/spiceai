@@ -43,9 +43,7 @@ use runtime_table_partition::{
     Partition,
     creator::{
         self, PartitionCreator,
-        filename::{
-            self, decode_pair, discover_hive_partitions, encode_pair, to_hive_partition_dir,
-        },
+        filename::{self, discover_hive_partitions, to_hive_partition_dir},
     },
     expression::PartitionedBy,
     provider::PartitionTableProvider,

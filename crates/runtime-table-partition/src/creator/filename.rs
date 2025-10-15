@@ -69,6 +69,10 @@ pub enum Error {
     },
 }
 
+/// Create a hive style partitioned directory.
+///
+/// # Errors
+/// Returns an error for unsupported [`ScalarValue`] partition keys
 pub fn to_hive_partition_dir(pairings: &[(PartitionedBy, ScalarValue)]) -> Result<PathBuf, Error> {
     let mut path = PathBuf::new();
     for (partitioned_by, key) in pairings {
@@ -103,6 +107,11 @@ fn encode_key(key: &ScalarValue) -> Result<String, Error> {
     Ok(key.unwrap_or("none".to_string()))
 }
 
+/// Discover hive style partitions in the `base_dir` recursively.
+///
+/// # Errors
+/// Returns an error if the directory structure cannot be read or parsing
+/// expected [`ScalarValue`]s fails.
 pub fn discover_hive_partitions(
     schema: &dyn ExprSchema,
     base_dir: &Path,
@@ -113,14 +122,7 @@ pub fn discover_hive_partitions(
     let partition_map: HashMap<String, &PartitionedBy> =
         partitioned_by.iter().map(|p| (p.name.clone(), p)).collect();
 
-    discover_partitions_recursive(
-        schema,
-        base_dir,
-        &partition_map,
-        &mut results,
-        Vec::new(),
-        base_dir.to_path_buf(),
-    )?;
+    discover_partitions_recursive(schema, base_dir, &partition_map, &mut results, &[])?;
 
     Ok(results)
 }
@@ -130,20 +132,19 @@ fn discover_partitions_recursive(
     current_dir: &Path,
     partition_map: &HashMap<String, &PartitionedBy>,
     results: &mut Vec<(Vec<ScalarValue>, PathBuf)>,
-    current_partitions: Vec<ScalarValue>,
-    base_dir: PathBuf,
+    current_partitions: &[ScalarValue],
 ) -> Result<(), Error> {
     let Some(dir_name) = current_dir.file_name().and_then(|n| n.to_str()) else {
         return Ok(());
     };
 
-    let mut new_partitions = current_partitions.clone();
+    let mut new_partitions = current_partitions.to_vec();
 
-    if let Some((partition_name, value_str)) = dir_name.split_once('=') {
-        if let Some(partition_def) = partition_map.get(partition_name) {
-            let parsed_value = parse_partition_value(schema, partition_def, value_str)?;
-            new_partitions.push(parsed_value);
-        }
+    if let Some((partition_name, value_str)) = dir_name.split_once('=')
+        && let Some(partition_def) = partition_map.get(partition_name)
+    {
+        let parsed_value = parse_partition_value(schema, partition_def, value_str)?;
+        new_partitions.push(parsed_value);
     }
 
     let entries =
@@ -170,14 +171,12 @@ fn discover_partitions_recursive(
         let file_paths = std::fs::read_dir(current_dir)
             .map_err(|e| Error::Discovering { source: e.into() })?
             .filter_map(|entry| {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => return None,
+                let Ok(entry) = entry else {
+                    return None;
                 };
 
-                let metadata = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => return None,
+                let Ok(metadata) = entry.metadata() else {
+                    return None;
                 };
 
                 if metadata.is_file() {
@@ -200,8 +199,7 @@ fn discover_partitions_recursive(
                 &subdir,
                 partition_map,
                 results,
-                new_partitions.clone(),
-                base_dir.clone(),
+                &new_partitions,
             )?;
         }
     }
@@ -227,9 +225,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Boolean(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseBoolError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::Boolean(Some(b))
             }
         }
@@ -237,9 +233,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int8(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::Int8(Some(b))
             }
         }
@@ -247,9 +241,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int16(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::Int16(Some(b))
             }
         }
@@ -257,9 +249,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int32(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::Int32(Some(b))
             }
         }
@@ -267,9 +257,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::Int64(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::Int64(Some(b))
             }
         }
@@ -277,9 +265,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt8(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::UInt8(Some(b))
             }
         }
@@ -287,9 +273,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt16(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::UInt16(Some(b))
             }
         }
@@ -297,9 +281,7 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt32(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::UInt32(Some(b))
             }
         }
@@ -307,45 +289,21 @@ fn parse_partition_value(
             if value_str == "none" {
                 ScalarValue::UInt64(None)
             } else {
-                let b = value_str
-                    .parse()
-                    .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?;
+                let b = value_str.parse()?;
                 ScalarValue::UInt64(Some(b))
             }
         }
         DataType::Timestamp(t, _) => match t {
-            TimeUnit::Second => ScalarValue::TimestampSecond(
-                Some(
-                    value_str
-                        .parse()
-                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
-                ),
-                None,
-            ),
-            TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(
-                Some(
-                    value_str
-                        .parse()
-                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
-                ),
-                None,
-            ),
-            TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(
-                Some(
-                    value_str
-                        .parse()
-                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
-                ),
-                None,
-            ),
-            TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(
-                Some(
-                    value_str
-                        .parse()
-                        .map_err(|e: ParseIntError| Error::Parsing { source: e.into() })?,
-                ),
-                None,
-            ),
+            TimeUnit::Second => ScalarValue::TimestampSecond(Some(value_str.parse()?), None),
+            TimeUnit::Millisecond => {
+                ScalarValue::TimestampMillisecond(Some(value_str.parse()?), None)
+            }
+            TimeUnit::Microsecond => {
+                ScalarValue::TimestampMicrosecond(Some(value_str.parse()?), None)
+            }
+            TimeUnit::Nanosecond => {
+                ScalarValue::TimestampNanosecond(Some(value_str.parse()?), None)
+            }
         },
         DataType::Utf8 => {
             if value_str == "none" {
@@ -360,37 +318,20 @@ fn parse_partition_value(
     Ok(scalar_value)
 }
 
-#[derive(Serialize, Deserialize)]
-struct SerializablePair {
-    scalar: SupportedScalarValue,
-    exprs_hash: u64,
+impl From<ParseIntError> for Error {
+    fn from(value: ParseIntError) -> Self {
+        Self::Parsing {
+            source: value.into(),
+        }
+    }
 }
 
-/// Encodes a [`ScalarValue`] and a hash of the `partition_by` expressions
-///
-/// # Errors
-/// Returns an error if the [`ScalarValue`] is not supported or cannot be
-/// serialized.
-pub fn encode_pair(scalar: &ScalarValue, exprs_hash: u64) -> Result<String, Error> {
-    let supported_scalar = SupportedScalarValue::try_from(scalar.clone())?;
-    let pair = SerializablePair {
-        scalar: supported_scalar,
-        exprs_hash,
-    };
-    let encoded = serde_qs::to_string(&pair).context(SerializeSnafu)?;
-    Ok(encoded)
-}
-
-/// Decodes a [`String`] back into a [`ScalarValue`] and the hash of the
-/// `partition_by` expressions.
-///
-/// # Errors
-/// Returns an error if the str cannot be deserialized or converted to a
-/// [`ScalarValue`]
-pub fn decode_pair(value: &str) -> Result<(ScalarValue, u64), Error> {
-    let pair: SerializablePair = serde_qs::from_str(value).context(DeserializeSnafu)?;
-    let scalar = ScalarValue::try_from(pair.scalar)?;
-    Ok((scalar, pair.exprs_hash))
+impl From<ParseBoolError> for Error {
+    fn from(value: ParseBoolError) -> Self {
+        Self::Parsing {
+            source: value.into(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -530,8 +471,6 @@ mod tests {
 
     use super::*;
 
-    const EXPRS_HASH: u64 = 7;
-
     #[test]
     fn test_hive_partition_name() -> Result<(), Error> {
         let partitioned_by = vec![
@@ -619,234 +558,5 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    #[test]
-    fn test_encode_decode_boolean() {
-        let values = vec![Some(true), Some(false), None];
-        for value in values {
-            let scalar = ScalarValue::Boolean(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode boolean pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode boolean pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "Boolean value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for boolean {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_int8() {
-        let values = vec![Some(42_i8), Some(-42_i8), None];
-        for value in values {
-            let scalar = ScalarValue::Int8(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int8 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode int8 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "Int8 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for int8 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_int16() {
-        let values = vec![Some(1000_i16), Some(-1000_i16), None];
-        for value in values {
-            let scalar = ScalarValue::Int16(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int16 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode int16 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "Int16 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for int16 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_int32() {
-        let values = vec![Some(100_000_i32), Some(-100_000_i32), None];
-        for value in values {
-            let scalar = ScalarValue::Int32(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int32 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode int32 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "Int32 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for int32 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_int64() {
-        let values = vec![Some(1_000_000_000_i64), Some(-1_000_000_000_i64), None];
-        for value in values {
-            let scalar = ScalarValue::Int64(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int64 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode int64 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "Int64 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for int64 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_uint8() {
-        let values = vec![Some(255_u8), Some(0_u8), None];
-        for value in values {
-            let scalar = ScalarValue::UInt8(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint8 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode uint8 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "UInt8 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for uint8 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_uint16() {
-        let values = vec![Some(65_535_u16), Some(0_u16), None];
-        for value in values {
-            let scalar = ScalarValue::UInt16(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint16 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode uint16 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "UInt16 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for uint16 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_uint32() {
-        let values = vec![Some(4_294_967_295_u32), Some(0_u32), None];
-        for value in values {
-            let scalar = ScalarValue::UInt32(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint32 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode uint32 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "UInt32 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for uint32 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_uint64() {
-        let values = vec![Some(18_446_744_073_709_551_615_u64), Some(0_u64), None];
-        for value in values {
-            let scalar = ScalarValue::UInt64(value);
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint64 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode uint64 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "UInt64 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for uint64 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_utf8() {
-        let values = vec![Some("hello".to_string()), Some(String::new()), None];
-        for value in values {
-            let scalar = ScalarValue::Utf8(value.clone());
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode utf8 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode utf8 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "Utf8 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for utf8 {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_utf8_view() {
-        let values = vec![Some("world".to_string()), Some(String::new()), None];
-        for value in values {
-            let scalar = ScalarValue::Utf8View(value.clone());
-            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode utf8view pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode utf8view pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "Utf8View value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for utf8view {value:?} failed to encode/decode correctly"
-            );
-        }
-    }
-
-    #[test]
-    fn test_encode_decode_large_utf8() {
-        let values = vec![Some("large string".to_string()), Some(String::new()), None];
-        for value in values {
-            let scalar = ScalarValue::LargeUtf8(value.clone());
-            let encoded =
-                encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode large utf8 pair");
-            let (decoded_scalar, decoded_exprs_hash) =
-                decode_pair(&encoded).expect("Failed to decode large utf8 pair");
-            assert_eq!(
-                decoded_scalar, scalar,
-                "LargeUtf8 value {value:?} failed to encode/decode correctly"
-            );
-            assert_eq!(
-                decoded_exprs_hash, EXPRS_HASH,
-                "Exprs hash for large utf8 {value:?} failed to encode/decode correctly"
-            );
-        }
     }
 }
