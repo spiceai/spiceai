@@ -77,8 +77,8 @@ mod tests {
         assert_eq!(result[0].expression, "YEAR(created_at)");
         assert_eq!(result[1].name, "expr1");
         assert_eq!(result[1].expression, "MONTH(created_at)");
-        assert_eq!(result[1].name, "expr2");
-        assert_eq!(result[1].expression, "DAY(created_at)");
+        assert_eq!(result[2].name, "expr2");
+        assert_eq!(result[2].expression, "DAY(created_at)");
         Ok(())
     }
 
