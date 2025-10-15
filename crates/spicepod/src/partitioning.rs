@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct PartitionedBy {
-    pub key: String,
+    pub name: String,
     pub expression: String,
 }
 
@@ -37,20 +37,14 @@ where
         match value {
             serde_json::Value::String(expression) => {
                 let name = format!("expr{i}", i = result.len());
-                let partitioned_by = PartitionedBy {
-                    key: name,
-                    expression,
-                };
+                let partitioned_by = PartitionedBy { name, expression };
                 result.push(partitioned_by);
             }
             serde_json::Value::Object(map) => {
                 // case where {"year": "YEAR(created_at)"}
                 for (name, v) in map {
                     if let serde_json::Value::String(expression) = v {
-                        let partitioned_by = PartitionedBy {
-                            key: name,
-                            expression,
-                        };
+                        let partitioned_by = PartitionedBy { name, expression };
                         result.push(partitioned_by);
                         break; // take first string and ignore others
                     }
@@ -79,11 +73,11 @@ mod tests {
         let result: Vec<PartitionedBy> = from_str(yaml)?;
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].key, "expr0");
+        assert_eq!(result[0].name, "expr0");
         assert_eq!(result[0].expression, "YEAR(created_at)");
-        assert_eq!(result[1].key, "expr1");
+        assert_eq!(result[1].name, "expr1");
         assert_eq!(result[1].expression, "MONTH(created_at)");
-        assert_eq!(result[1].key, "expr2");
+        assert_eq!(result[1].name, "expr2");
         assert_eq!(result[1].expression, "DAY(created_at)");
         Ok(())
     }
@@ -98,11 +92,11 @@ mod tests {
         let result: Vec<PartitionedBy> = from_str(yaml)?;
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].key, "year");
+        assert_eq!(result[0].name, "year");
         assert_eq!(result[0].expression, "YEAR(created_at)");
-        assert_eq!(result[1].key, "month");
+        assert_eq!(result[1].name, "month");
         assert_eq!(result[1].expression, "MONTH(created_at)");
-        assert_eq!(result[2].key, "day");
+        assert_eq!(result[2].name, "day");
         assert_eq!(result[2].expression, "DAY(created_at)");
         Ok(())
     }
