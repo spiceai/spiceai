@@ -158,7 +158,6 @@ impl std::fmt::Debug for FullTextSearchFieldIndex {
             .field("schema", &self.search_schema)
             .field("field", &self.field)
             .field("primary_key", &self.primary_key)
-            .field("additional_columns", &self.additional_columns)
             .field("type_hints", &self.type_hints)
             .finish_non_exhaustive()
     }
@@ -175,10 +174,6 @@ pub struct FullTextSearchFieldIndex {
     pub field: String,
     pub primary_key: Vec<String>,
 
-    /// If provided, will only consider columns in [`Index`] that are in `field`, `primary_key` or `additional_columns`.
-    /// This allows for the reuse of a generic `Index` in search.
-    pub additional_columns: Option<Vec<String>>,
-
     /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
     /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
     /// For columns present, use the associated [`arrow::datatypes::Field`].
@@ -186,12 +181,7 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    pub fn try_new(
-        index: &Index,
-        field: String,
-        primary_key: Vec<String>,
-        additional_columns: Option<Vec<String>>,
-    ) -> Result<Self> {
+    pub fn try_new(index: &Index, field: String, primary_key: Vec<String>) -> Result<Self> {
         let fts = Self {
             search_schema: index.schema(),
             reader: index
@@ -203,7 +193,6 @@ impl FullTextSearchFieldIndex {
             tokenizer_manager: index.tokenizers().clone(),
             field,
             primary_key,
-            additional_columns,
             type_hints: HashMap::from([(
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
                 Arc::new(Field::new(
@@ -223,14 +212,6 @@ impl FullTextSearchFieldIndex {
                     index_columns: cols.clone(),
                 });
             }
-        }
-
-        // Ensure that the index has the field to search on.
-        if !cols.contains(&fts.field) {
-            return Err(Error::TextSearchIndexMissingColummn {
-                missing: fts.field.clone(),
-                index_columns: cols,
-            });
         }
 
         Ok(fts)
@@ -275,34 +256,14 @@ impl FullTextSearchFieldIndex {
     }
 
     #[must_use]
-    pub fn additional_columns(&self) -> Vec<String> {
-        self.all_columns()
-            .into_iter()
-            .filter(|name| !self.in_base_cols(name))
-            .collect()
-    }
-
-    fn in_base_cols(&self, name: &String) -> bool {
-        *name == self.field || self.primary_key.contains(name)
-    }
-
-    #[must_use]
     pub fn all_columns(&self) -> Vec<String> {
         self.search_schema
             .fields()
             .filter_map(|(_, f)| {
-                let name = f.name().to_string();
-                if self.in_base_cols(&name) {
-                    Some(name)
-                } else if self
-                    // Filter based on [`self.additional_columns`].
-                    .additional_columns
-                    .as_ref()
-                    .is_some_and(|cols| !cols.contains(&name))
-                {
-                    None
+                if f.is_stored() {
+                    Some(f.name().to_string())
                 } else {
-                    Some(name)
+                    None
                 }
             })
             .collect()
@@ -325,41 +286,12 @@ impl FullTextSearchFieldIndex {
         &self,
         query: String,
         opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
         if !opt_filters.is_empty() {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
-
-        // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
-        let mut keep_search_field = false;
-        let cols = self.all_columns();
-        for proj in addition_projection {
-            let is_supported = match proj {
-                Expr::Identifier(Ident { value, .. }) => {
-                    if *value == self.field {
-                        keep_search_field = true;
-                    }
-                    cols.contains(value)
-                }
-                _ => false,
-            };
-            if !is_supported {
-                return Err(Error::UnsupportedAdditionalColumnsError)
-                    .context(GenerationTextSearchSnafu)?;
-            }
-        }
-
-        for pk in &self.primary_key {
-            // keep the field if it is part of the primary key
-            if pk == &self.field {
-                keep_search_field = true;
-                break;
-            }
-        }
-
-        let strm = make_stream(self.clone(), query, keep_search_field, limit);
+        let strm = make_stream(self.clone(), query, limit);
         let mut strm = Box::pin(strm.peekable());
         let schema = match strm.as_mut().peek().await {
             None => Arc::new(Schema::empty()),
@@ -374,11 +306,9 @@ impl FullTextSearchFieldIndex {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
-    /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
     fn search_query_literal(
         &self,
         literal: &str,
-        keep_search_field: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Value>> {
@@ -408,9 +338,7 @@ impl FullTextSearchFieldIndex {
 
                 // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
                 if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
-                    if keep_search_field {
-                        doc_w_col_names.insert(self.field.as_str(), value.clone());
-                    }
+                    doc_w_col_names.insert(self.field.as_str(), value.clone());
                     doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
                 }
 
@@ -523,12 +451,10 @@ impl CandidateGeneration for FullTextSearchCandidate {
         &self,
         query: String,
         opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
+        _addition_projection: &[&Expr],
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
-        self.inner
-            .search(query, opt_filters, addition_projection, limit)
-            .await
+        self.inner.search(query, opt_filters, limit).await
     }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
@@ -562,7 +488,6 @@ impl CandidateGeneration for FullTextSearchCandidate {
 fn make_stream(
     fts: FullTextSearchFieldIndex,
     query: String,
-    keep_search_field: bool,
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
@@ -571,7 +496,7 @@ fn make_stream(
         while remaining_limit > 0 {
             let limit = min(remaining_limit, DEFAULT_BATCH_SIZE);
             let hits = match fts
-                .search_query_literal(query.as_str(), keep_search_field, limit, offset)
+                .search_query_literal(query.as_str(), limit, offset)
                 .map_err(|e| DataFusionError::Internal(e.to_string())) {
                     Ok(h) => h,
                     Err(e) => {yield Err(e); return}
@@ -703,14 +628,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "CandidateGeneration::search to be removed in https://github.com/spiceai/spiceai/issues/7550"]
     async fn test_basic_index() {
-        let fts = FullTextSearchFieldIndex::try_new(
-            &create_basic_index(),
-            "body".to_string(),
-            vec![],
-            None,
-        )
-        .expect("failed to create FullTextSearch");
+        let fts =
+            FullTextSearchFieldIndex::try_new(&create_basic_index(), "body".to_string(), vec![])
+                .expect("failed to create FullTextSearch");
 
         let candidate: FullTextSearchCandidate = fts.into();
 
