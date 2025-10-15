@@ -43,7 +43,7 @@ use runtime_table_partition::{
         self, PartitionCreator,
         filename::{self, decode_pair, encode_pair},
     },
-    expression::PartitionBy,
+    expression::PartitionedBy,
     provider::PartitionTableProvider,
 };
 use snafu::{OptionExt, prelude::*};
@@ -237,11 +237,11 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Option<PartitionBy>,
+        partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         self.is_initialized.store(false, Ordering::Release);
 
-        let partition_by = partition_by.context(PartitionByRequiredSnafu)?;
+        ensure!(partition_by.len() > 0, PartitionByRequiredSnafu);
 
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
@@ -249,10 +249,8 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 
         let mut table_provider_guard = self.table_provider.lock().await;
 
-        let PartitionBy {
-            expressions_hash,
-            expressions: partition_by,
-        } = partition_by;
+        let expressions_hash = 0;
+        let partition_by = partition_by.into_iter().map(|p| p.expression).collect();
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());
         let creator = Arc::new(DuckDBPartitionCreator::new(

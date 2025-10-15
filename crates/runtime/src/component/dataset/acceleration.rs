@@ -20,8 +20,9 @@ use datafusion_table_providers::util::{
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
 use spicepod::{
-    acceleration::{self as spicepod_acceleration, PartitionedBy},
+    acceleration::{self as spicepod_acceleration},
     param::Params,
+    partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
