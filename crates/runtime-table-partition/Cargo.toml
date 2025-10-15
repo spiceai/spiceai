@@ -23,3 +23,6 @@ spicepod = { path = "../spicepod" }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
 tokio-stream.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

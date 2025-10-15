@@ -26,10 +26,14 @@ limitations under the License.
 //! [`SupportedScalarValue`] so that we can derive `Serialize` and `Deserialize`
 //! on variants that have types that can be serialized/deserialized.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use arrow_schema::DataType;
-use datafusion::scalar::ScalarValue;
+use arrow_schema::{DataType, TimeUnit};
+use datafusion::{
+    common::{ExprSchema, HashMap},
+    logical_expr::ExprSchemable,
+    scalar::ScalarValue,
+};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
@@ -82,6 +86,212 @@ fn encode_key(key: &ScalarValue) -> Result<String, Error> {
     };
 
     Ok(key.unwrap_or("none".to_string()))
+}
+
+pub fn discover_hive_partitions(
+    schema: &dyn ExprSchema,
+    base_dir: &Path,
+    partitioned_by: &[PartitionedBy],
+) -> Result<Vec<(Vec<(PartitionedBy, ScalarValue)>, PathBuf)>, Error> {
+    let mut results = Vec::new();
+
+    let partition_map: HashMap<String, &PartitionedBy> =
+        partitioned_by.iter().map(|p| (p.name.clone(), p)).collect();
+
+    discover_partitions_recursive(
+        schema,
+        base_dir,
+        &partition_map,
+        &mut results,
+        Vec::new(),
+        base_dir.to_path_buf(),
+    )?;
+
+    Ok(results)
+}
+
+fn discover_partitions_recursive(
+    schema: &dyn ExprSchema,
+    current_dir: &Path,
+    partition_map: &HashMap<String, &PartitionedBy>,
+    results: &mut Vec<(Vec<(PartitionedBy, ScalarValue)>, PathBuf)>,
+    current_partitions: Vec<(PartitionedBy, ScalarValue)>,
+    base_dir: PathBuf,
+) -> Result<(), Error> {
+    let dir_name = current_dir.file_name().and_then(|n| n.to_str()).unwrap();
+
+    let mut new_partitions = current_partitions.clone();
+
+    if let Some((partition_name, value_str)) = dir_name.split_once('=') {
+        if let Some(partition_def) = partition_map.get(partition_name) {
+            let parsed_value = parse_partition_value(schema, partition_def, value_str)?;
+            new_partitions.push(((*partition_def).clone(), parsed_value));
+        }
+    }
+
+    let entries = std::fs::read_dir(current_dir).unwrap();
+
+    let mut has_files = false;
+    let mut subdirs = Vec::new();
+
+    for entry in entries {
+        let entry = entry.unwrap();
+
+        let metadata = entry.metadata().unwrap();
+
+        if metadata.is_dir() {
+            subdirs.push(entry.path());
+        } else {
+            has_files = true;
+        }
+    }
+
+    if has_files {
+        let file_paths = std::fs::read_dir(current_dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => return None,
+                };
+
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => return None,
+                };
+
+                if metadata.is_file() {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for file_path in file_paths {
+            results.push((new_partitions.clone(), file_path));
+        }
+    } else if !subdirs.is_empty() {
+        for subdir in subdirs {
+            discover_partitions_recursive(
+                schema,
+                &subdir,
+                partition_map,
+                results,
+                new_partitions.clone(),
+                base_dir.clone(),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_partition_value(
+    schema: &dyn ExprSchema,
+    partition_by: &PartitionedBy,
+    value_str: &str,
+) -> Result<ScalarValue, Error> {
+    let data_type = partition_by.expression.get_type(schema).unwrap();
+    let scalar_value = match data_type {
+        DataType::Boolean => {
+            if value_str == "none" {
+                ScalarValue::Boolean(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::Boolean(Some(b))
+            }
+        }
+        DataType::Int8 => {
+            if value_str == "none" {
+                ScalarValue::Int8(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::Int8(Some(b))
+            }
+        }
+        DataType::Int16 => {
+            if value_str == "none" {
+                ScalarValue::Int16(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::Int16(Some(b))
+            }
+        }
+        DataType::Int32 => {
+            if value_str == "none" {
+                ScalarValue::Int32(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::Int32(Some(b))
+            }
+        }
+        DataType::Int64 => {
+            if value_str == "none" {
+                ScalarValue::Int64(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::Int64(Some(b))
+            }
+        }
+        DataType::UInt8 => {
+            if value_str == "none" {
+                ScalarValue::UInt8(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::UInt8(Some(b))
+            }
+        }
+        DataType::UInt16 => {
+            if value_str == "none" {
+                ScalarValue::UInt16(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::UInt16(Some(b))
+            }
+        }
+        DataType::UInt32 => {
+            if value_str == "none" {
+                ScalarValue::UInt32(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::UInt32(Some(b))
+            }
+        }
+        DataType::UInt64 => {
+            if value_str == "none" {
+                ScalarValue::UInt64(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::UInt64(Some(b))
+            }
+        }
+        DataType::Timestamp(t, _) => match t {
+            TimeUnit::Second => {
+                ScalarValue::TimestampSecond(Some(value_str.parse().unwrap()), None)
+            }
+            TimeUnit::Millisecond => {
+                ScalarValue::TimestampMillisecond(Some(value_str.parse().unwrap()), None)
+            }
+            TimeUnit::Microsecond => {
+                ScalarValue::TimestampMicrosecond(Some(value_str.parse().unwrap()), None)
+            }
+            TimeUnit::Nanosecond => {
+                ScalarValue::TimestampNanosecond(Some(value_str.parse().unwrap()), None)
+            }
+        },
+        DataType::Utf8 => {
+            if value_str == "none" {
+                ScalarValue::Utf8(None)
+            } else {
+                let b = value_str.parse().unwrap();
+                ScalarValue::Utf8(Some(b))
+            }
+        }
+        data_type => return Err(Error::UnsupportedType { data_type }),
+    };
+
+    Ok(scalar_value)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -240,7 +450,17 @@ impl TryFrom<SupportedScalarValue> for ScalarValue {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::prelude::col;
+    use std::{
+        fs::{self, File},
+        io::Write,
+    };
+
+    use arrow_schema::{Field, Schema};
+    use datafusion::{
+        common::DFSchema,
+        prelude::{col, lit},
+    };
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -275,6 +495,67 @@ mod tests {
         let parts = path.iter().collect::<Vec<_>>();
         for (want, got) in ["year=2025", "month=10", "day=15"].iter().zip(parts) {
             assert_eq!(*want, got.to_str().expect("to_str"));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_discover_hive_partitions_with_multiple_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = TempDir::new()?;
+        let base_path = temp_dir.path();
+
+        let year_dir = base_path.join("year=2025");
+        fs::create_dir_all(&year_dir)?;
+
+        let month_dir = year_dir.join("month=october");
+        fs::create_dir_all(&month_dir)?;
+
+        let file1_path = month_dir.join("file1.parquet");
+        let mut file1 = File::create(&file1_path)?;
+        writeln!(file1, "test data 1")?;
+
+        let file2_path = month_dir.join("file2.parquet");
+        let mut file2 = File::create(&file2_path)?;
+        writeln!(file2, "test data 2")?;
+
+        let partitioned_by = vec![
+            PartitionedBy {
+                name: "year".to_string(),
+                expression: lit(2025u64),
+            },
+            PartitionedBy {
+                name: "month".to_string(),
+                expression: lit("october"),
+            },
+        ];
+
+        let arrow_schema = Schema::new(vec![
+            Field::new("year", DataType::UInt64, false),
+            Field::new("month", DataType::Utf8, false),
+        ]);
+
+        let df_schema = DFSchema::try_from(arrow_schema)?;
+
+        let results = discover_hive_partitions(&df_schema, base_path, &partitioned_by)?;
+
+        assert_eq!(results.len(), 2);
+        for (partitions, path) in results {
+            for (partition_by, key) in partitions {
+                assert!(partition_by.name == "year" || partition_by.name == "month");
+                assert!(
+                    partition_by.expression == lit(2025u64)
+                        || partition_by.expression == lit("october")
+                );
+
+                match key {
+                    ScalarValue::UInt64(Some(2025u64)) => {}
+                    ScalarValue::Utf8(Some(val)) if val == "october" => {}
+                    key => panic!("expected 2025u64 or 'october', got {key:?}"),
+                }
+            }
+            assert!(path == file1_path || path == file2_path);
         }
 
         Ok(())
