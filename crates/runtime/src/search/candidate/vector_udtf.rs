@@ -71,4 +71,12 @@ impl CandidateGeneration for VectorUDTFGeneration {
     fn value_derived_from(&self) -> String {
         self.embedding_column.clone()
     }
+
+    fn value_projection_name(&self) -> String {
+        if self.is_chunked {
+            "match".to_string()
+        } else {
+            self.embedding_column.clone()
+        }
+    }
 }

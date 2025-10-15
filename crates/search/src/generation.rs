@@ -63,13 +63,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub trait CandidateGeneration: Sync + Send {
     /// Generates candidates for a given query term, ordered by decreasing score.
     ///
-    /// [`LogicalPlan`] output [`DFSchema`] expects at least two columns:
-    ///   1. [`super::SEARCH_SCORE_COLUMN_NAME`] column of type [`arrow::array::Float64Array`].
-    ///   2. [`super::SEARCH_VALUE_COLUMN_NAME`] column of type [`arrow::array::StringArray`], [`arrow::array::LargeStringArray`] or [`arrow::array::StringViewArray`].
+    /// [`LogicalPlan`] output [`DFSchema`] expects at least a [`super::SEARCH_SCORE_COLUMN_NAME`] column of type [`arrow::array::Float64Array`].
     ///
     /// Rows in the [`RecordBatch`] must be ordered by [`super::SEARCH_SCORE_COLUMN_NAME`] descendingly.
     fn search(&self, query: String) -> DataFusionResult<Arc<dyn TableProvider>>;
 
     /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
     fn value_derived_from(&self) -> String;
+
+    /// Returns the name of the field in the schema of [`CandidateGeneration::search`] that has the search result match.
+    fn value_projection_name(&self) -> String {
+        self.value_derived_from()
+    }
 }

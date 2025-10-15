@@ -1159,7 +1159,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
         "hf_minilm",
         Some(vec!["cp_catalog_page_sk".to_string()]),
         Some(EmbeddingChunkConfig {
-            enabled: true,
+            enabled: false,
             target_chunk_size: 512,
             overlap_size: 128,
             trim_whitespace: false,

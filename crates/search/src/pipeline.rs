@@ -30,7 +30,7 @@ use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    SEARCH_SCORE_COLUMN_NAME, VectorSearchGenerationResult,
+    SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
     aggregation::{self, AggregationResult, CandidateAggregation, Error as AggregationError},
     generation::{self, CandidateGeneration},
 };
@@ -118,10 +118,13 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                 ]
                 .concat();
 
+                let mut columns = columns.clone();
+                columns.push(ident(g.value_projection_name()).alias(SEARCH_VALUE_COLUMN_NAME));
+
                 let lp = construct_logical_plan(
                     g.search(query.clone())
                         .context(SearchRequestConstructionSnafu)?,
-                    columns.clone(),
+                    columns,
                     filters,
                     Some(limit),
                 )

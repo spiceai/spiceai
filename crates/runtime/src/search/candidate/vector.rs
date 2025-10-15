@@ -304,4 +304,8 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
     fn value_derived_from(&self) -> String {
         self.embedding_column.clone()
     }
+
+    fn value_projection_name(&self) -> String {
+        SEARCH_VALUE_COLUMN_NAME.to_string()
+    }
 }
