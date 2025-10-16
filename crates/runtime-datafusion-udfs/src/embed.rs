@@ -16,13 +16,15 @@ limitations under the License.
 
 //! [`ScalarUDFImpl`] definitions for embedding function.
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef};
 use arrow::array::{ListBuilder, PrimitiveBuilder};
 use arrow::datatypes::Float32Type;
 use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
+use async_trait::async_trait;
 use datafusion::common::cast::{as_large_string_array, as_list_array, as_string_array};
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::async_udf::AsyncScalarUDFImpl;
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
@@ -117,6 +119,30 @@ impl Embed {
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
     }
 
+    async fn embed_single_async(
+        model: &dyn llms::embeddings::Embed,
+        sentence: &str,
+    ) -> DataFusionResult<ArrayRef> {
+        let embedding = model
+            .embed(EmbeddingInput::String(sentence.to_owned()))
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let vector_size = match embedding.first() {
+            Some(embedding) => embedding.len(),
+            _ => unreachable!("Should have at least one embedding"),
+        };
+
+        let mut builder = ListBuilder::with_capacity(
+            PrimitiveBuilder::<Float32Type>::with_capacity(vector_size),
+            1,
+        );
+
+        builder.values().append_slice(&embedding[0]);
+        builder.append(true);
+
+        Ok(Arc::new(builder.finish()))
+    }
+
     fn embed_multiple<'a>(
         model: &dyn llms::embeddings::Embed,
         sentences: impl Iterator<Item = Option<&'a str>>,
@@ -139,6 +165,96 @@ impl Embed {
         builder.append(true);
 
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+
+    async fn embed_multiple_async<'a>(
+        model: &dyn llms::embeddings::Embed,
+        arr: &ArrayRef,
+    ) -> DataFusionResult<ArrayRef> {
+        let sentences: Vec<_> = string_array_iter!(arr)
+            .into_iter()
+            .map(|s| s.map(ToString::to_string))
+            .collect();
+        let mut builder =
+            ListBuilder::new(ListBuilder::new(PrimitiveBuilder::<Float32Type>::new()));
+
+        for maybe_string in sentences {
+            let embedded = match maybe_string {
+                Some(s) => model
+                    .embed(EmbeddingInput::String(s))
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                None => vec![vec![]],
+            };
+
+            builder.values().values().append_slice(&embedded[0]);
+            builder.values().append(!embedded[0].is_empty());
+        }
+
+        builder.append(true);
+
+        Ok(Arc::new(builder.finish()))
+    }
+}
+
+#[async_trait]
+impl AsyncScalarUDFImpl for Embed {
+    async fn invoke_async_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> DataFusionResult<ArrayRef> {
+        if args.args.len() != 2 {
+            return exec_err!(
+                "{EMBED_UDF_NAME} expects exactly two arguments: text and model_name"
+            );
+        }
+
+        let text_arg = &args.args[0];
+        let model_arg = &args.args[1];
+
+        let ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) = model_arg else {
+            return exec_err!("{EMBED_UDF_NAME} unsupported model parameter: {model_arg}");
+        };
+
+        let Ok(model_store) = self.model_store.try_read() else {
+            return exec_err!("{EMBED_UDF_NAME} cannot read model_store");
+        };
+
+        let Some(model) = model_store.get(model_name) else {
+            return exec_err!("{EMBED_UDF_NAME} cannot mount {model_arg}");
+        };
+
+        match text_arg {
+            // An array representing multiple rows
+            ColumnarValue::Array(arr) => {
+                let embeddings = Self::embed_multiple_async(&**model, arr).await?;
+
+                // Unpack the inner list (i.e. as used for single row, multiple input below)
+                let list_array = as_list_array(&*embeddings)?;
+                Ok(Arc::new(list_array.value(0)))
+            }
+            // A single text value
+            ColumnarValue::Scalar(
+                ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)),
+            ) => Self::embed_single_async(&**model, text).await,
+            // Various combinations of single row/multiple input
+            ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
+                let inner_array = arr.value(0);
+                Self::embed_multiple_async(&**model, &inner_array).await
+            }
+            ColumnarValue::Scalar(ScalarValue::List(arr)) => {
+                let inner_array = arr.value(0);
+                Self::embed_multiple_async(&**model, &inner_array).await
+            }
+            ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
+                let inner_array = arr.value(0);
+                Self::embed_multiple_async(&**model, &inner_array).await
+            }
+            unsupported_text_arg @ ColumnarValue::Scalar(_) => {
+                exec_err!("Unsupported text argument: {unsupported_text_arg}")
+            }
+        }
     }
 }
 
