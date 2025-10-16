@@ -16,7 +16,10 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
+use moka::future::FutureExt;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
+use search::generation::util::get_primary_keys;
+use search::index::SearchIndex;
 use snafu::ResultExt;
 use spicepod::semantic::{IndexStore, MetadataType};
 use std::any::Any;
