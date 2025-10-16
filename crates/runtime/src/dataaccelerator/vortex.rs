@@ -573,7 +573,7 @@ impl VortexAccelerator {
         Ok(path_buf)
     }
 
-    async fn create_listing_table(dir_path: &str, schema: Arc<Schema>) -> Result<ListingTable> {
+    fn create_listing_table(dir_path: &str, schema: Arc<Schema>) -> Result<ListingTable> {
         let ctx = SessionContext::new();
         let format = Arc::new(VortexFormat::default());
 
@@ -713,9 +713,8 @@ impl DataAccelerator for VortexAccelerator {
 
         let _ = Self::ensure_directory(&dir_path).boxed()?;
 
-        let listing_table = Self::create_listing_table(&dir_path, Arc::clone(&arrow_schema))
-            .await
-            .boxed()?;
+        let listing_table =
+            Self::create_listing_table(&dir_path, Arc::clone(&arrow_schema)).boxed()?;
 
         // Wrap in VortexTableProvider with custom data sink for efficient streaming writes
         let wrapped_table = VortexTableProvider {
