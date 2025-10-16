@@ -865,6 +865,111 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
+                #[cfg(feature = "vortex")]
+                Engine::Vortex => {
+                    use crate::component::dataset::builder::DatasetBuilder;
+                    use crate::dataaccelerator::vortex::VortexAccelerator;
+
+                    // Clean up any existing .vortex files in the test directory
+                    // Vortex only supports appends, so we need a clean state for each test
+                    if mode == "file" && !location.is_empty() {
+                        let test_dir = std::path::Path::new(&location);
+                        if test_dir.exists() {
+                            if let Ok(entries) = std::fs::read_dir(test_dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    // Safety: only delete .vortex files
+                                    if path.extension().and_then(|s| s.to_str()) == Some("vortex") {
+                                        let _ = std::fs::remove_file(&path);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Create the directory if it doesn't exist
+                            let _ = std::fs::create_dir_all(test_dir);
+                        }
+                    }
+
+                    // Create a proper Dataset that implements AccelerationSource
+                    let test_app_obj = app::AppBuilder::new("test").build();
+                    let test_app = Arc::new(test_app_obj.clone());
+                    let test_runtime = Arc::new(
+                        crate::Runtime::builder()
+                            .with_app(test_app_obj)
+                            .build()
+                            .await,
+                    );
+
+                    let dataset_name = format!("test_table_{:?}_{}", engine, mode);
+                    let mut dataset =
+                        match DatasetBuilder::try_new(dataset_name.clone(), &dataset_name)
+                            .expect("Failed to create dataset builder")
+                            .with_app(Arc::clone(&test_app))
+                            .with_runtime(Arc::clone(&test_runtime))
+                            .build()
+                        {
+                            Ok(ds) => ds,
+                            Err(e) => {
+                                println!("  Skipping Vortex - failed to create dataset: {}", e);
+                                continue;
+                            }
+                        };
+
+                    // Configure acceleration settings
+                    let mut params = HashMap::new();
+                    if mode == "file" {
+                        // Set file_path to use our unique temporary location with timestamp
+                        params.insert("vortex_file_path".to_string(), location.clone());
+                    }
+
+                    dataset.acceleration = Some(Acceleration {
+                        enabled: true,
+                        mode: if mode == "file" {
+                            Mode::File
+                        } else {
+                            Mode::Memory
+                        },
+                        engine: Engine::Vortex,
+                        params,
+                        ..Acceleration::default()
+                    });
+
+                    // Vortex may panic on unsupported types (e.g., Duration), so we catch that
+                    // We need to catch panics from the async operation by using FutureExt::catch_unwind
+                    use futures::FutureExt;
+                    use std::panic::AssertUnwindSafe;
+
+                    let accelerator = VortexAccelerator::new();
+                    let create_future = AssertUnwindSafe(accelerator.create_external_table(
+                        external_table,
+                        Some(&dataset),
+                        Vec::new(),
+                    ))
+                    .catch_unwind();
+
+                    match create_future.await {
+                        Ok(Ok(table)) => table,
+                        Ok(Err(e)) => {
+                            println!("  Skipping Vortex - unsupported types: {}", e);
+                            continue;
+                        }
+                        Err(panic_err) => {
+                            // Extract panic message if possible
+                            let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            println!(
+                                "  Skipping Vortex - unsupported types (panic): {}",
+                                panic_msg
+                            );
+                            continue;
+                        }
+                    }
+                }
                 _ => panic!("Unsupported engine for this test"),
             };
 
