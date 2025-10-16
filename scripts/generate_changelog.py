@@ -63,7 +63,7 @@ def main():
     print()
 
     for release_hash in reversed(release_commits):
-        # Calculate it's patch-id
+        # Calculate its patch-id
         patch_id_output = run_git(f"git show {release_hash} | git patch-id --stable").split()
         if not patch_id_output:
             continue
