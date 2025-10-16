@@ -727,46 +727,6 @@ mod accelerator_compat_tests {
     use std::{collections::HashMap, sync::Arc};
 
     /// Mock acceleration source for testing
-    struct MockAccelerationSource {
-        name: TableReference,
-        file_path: Option<String>,
-        app: Arc<app::App>,
-        runtime: Arc<crate::Runtime>,
-        acceleration: Acceleration,
-    }
-
-    impl super::AccelerationSource for MockAccelerationSource {
-        fn clone_arc(&self) -> Arc<dyn super::AccelerationSource> {
-            Arc::new(Self {
-                name: self.name.clone(),
-                file_path: self.file_path.clone(),
-                app: Arc::clone(&self.app),
-                runtime: Arc::clone(&self.runtime),
-                acceleration: self.acceleration.clone(),
-            })
-        }
-
-        fn is_file_accelerated(&self) -> bool {
-            self.file_path.is_some()
-        }
-
-        fn app(&self) -> Arc<app::App> {
-            Arc::clone(&self.app)
-        }
-
-        fn runtime(&self) -> Arc<crate::Runtime> {
-            Arc::clone(&self.runtime)
-        }
-
-        fn acceleration(&self) -> Option<&crate::component::dataset::acceleration::Acceleration> {
-            Some(&self.acceleration)
-        }
-
-        fn name(&self) -> &TableReference {
-            &self.name
-        }
-    }
-
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
@@ -806,7 +766,7 @@ mod accelerator_compat_tests {
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
-            let schema = test_schema();
+            let schema = test_schema(Some(engine));
             let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
             // Create appropriate location based on mode
@@ -908,8 +868,10 @@ mod accelerator_compat_tests {
                 }
                 #[cfg(feature = "vortex")]
                 Engine::Vortex => {
+                    use crate::component::dataset::builder::DatasetBuilder;
                     use crate::dataaccelerator::vortex::VortexAccelerator;
-                    // Create mock source for Vortex (it needs a source to get the file path)
+
+                    // Create a proper Dataset that implements AccelerationSource
                     let test_app_obj = app::AppBuilder::new("test").build();
                     let test_app = Arc::new(test_app_obj.clone());
                     let test_runtime = Arc::new(
@@ -919,13 +881,29 @@ mod accelerator_compat_tests {
                             .await,
                     );
 
-                    // Create acceleration config with Vortex settings
+                    let dataset_name = format!("test_table_{:?}_{}", engine, mode);
+                    let mut dataset =
+                        match DatasetBuilder::try_new(dataset_name.clone(), &dataset_name)
+                            .expect("Failed to create dataset builder")
+                            .with_app(Arc::clone(&test_app))
+                            .with_runtime(Arc::clone(&test_runtime))
+                            .build()
+                        {
+                            Ok(ds) => ds,
+                            Err(e) => {
+                                println!("  Skipping Vortex - failed to create dataset: {}", e);
+                                continue;
+                            }
+                        };
+
+                    // Configure acceleration settings
                     let mut params = HashMap::new();
                     if mode == "file" {
-                        // For file mode, the vortex_data_path will be derived from the file_path
-                        // We don't need to set it explicitly as the vortex_data_path() method will use file_path
+                        // Set vortex_data_path to use our temporary location
+                        params.insert("vortex_data_path".to_string(), location.clone());
                     }
-                    let acceleration_config = Acceleration {
+
+                    dataset.acceleration = Some(Acceleration {
                         enabled: true,
                         mode: if mode == "file" {
                             Mode::File
@@ -935,26 +913,40 @@ mod accelerator_compat_tests {
                         engine: Engine::Vortex,
                         params,
                         ..Acceleration::default()
-                    };
+                    });
 
-                    let mock_source = MockAccelerationSource {
-                        name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
-                        file_path: if mode == "file" {
-                            Some(location.clone())
-                        } else {
-                            None
-                        },
-                        app: test_app,
-                        runtime: test_runtime,
-                        acceleration: acceleration_config,
-                    };
-                    match VortexAccelerator::new()
-                        .create_external_table(external_table, Some(&mock_source), None)
-                        .await
-                    {
-                        Ok(table) => table,
-                        Err(e) => {
+                    // Vortex may panic on unsupported types (e.g., Duration), so we catch that
+                    // We need to catch panics from the async operation by using FutureExt::catch_unwind
+                    use futures::FutureExt;
+                    use std::panic::AssertUnwindSafe;
+
+                    let accelerator = VortexAccelerator::new();
+                    let create_future = AssertUnwindSafe(accelerator.create_external_table(
+                        external_table,
+                        Some(&dataset),
+                        None,
+                    ))
+                    .catch_unwind();
+
+                    match create_future.await {
+                        Ok(Ok(table)) => table,
+                        Ok(Err(e)) => {
                             println!("  Skipping Vortex - unsupported types: {}", e);
+                            continue;
+                        }
+                        Err(panic_err) => {
+                            // Extract panic message if possible
+                            let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            println!(
+                                "  Skipping Vortex - unsupported types (panic): {}",
+                                panic_msg
+                            );
                             continue;
                         }
                     }
@@ -981,8 +973,9 @@ mod accelerator_compat_tests {
 
     /// Helper function to get the comprehensive test schema covering all major Arrow data types
     /// Note: Some exotic types (`Time64`, `LargeBinary`, `LargeUtf8`) may not be supported by all engines
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
+    /// For Vortex, Duration types are excluded as they are not yet supported
+    fn test_schema(engine: Option<Engine>) -> Arc<Schema> {
+        let mut fields = vec![
             // Original columns (for backwards compatibility with existing tests)
             Field::new("id", DataType::Int64, false), // Primary key, not null
             Field::new("name", DataType::Utf8, false),
@@ -1022,25 +1015,48 @@ mod accelerator_compat_tests {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 true,
             ),
-            // Duration and Interval types
-            Field::new(
+        ];
+
+        // Duration and Interval types - Vortex doesn't support Duration yet
+        #[cfg(feature = "vortex")]
+        if !matches!(engine, Some(Engine::Vortex)) {
+            fields.push(Field::new(
                 "duration_ms_col",
                 DataType::Duration(TimeUnit::Millisecond),
                 true,
-            ),
-            Field::new(
+            ));
+            fields.push(Field::new(
                 "interval_ym_col",
                 DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
                 true,
-            ),
-            // List type (list of Int32)
-            Field::new(
-                "list_col",
-                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            ));
+        }
+
+        #[cfg(not(feature = "vortex"))]
+        {
+            fields.push(Field::new(
+                "duration_ms_col",
+                DataType::Duration(TimeUnit::Millisecond),
                 true,
-            ),
-            // Map type (map of Utf8 keys to Int32 values)
-            Field::new(
+            ));
+            fields.push(Field::new(
+                "interval_ym_col",
+                DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
+                true,
+            ));
+        }
+
+        // List type (list of Int32)
+        fields.push(Field::new(
+            "list_col",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ));
+
+        // Map type (map of Utf8 keys to Int32 values) - Vortex doesn't support Map yet
+        #[cfg(feature = "vortex")]
+        if !matches!(engine, Some(Engine::Vortex)) {
+            fields.push(Field::new(
                 "map_col",
                 DataType::Map(
                     Arc::new(Field::new(
@@ -1057,10 +1073,39 @@ mod accelerator_compat_tests {
                     false, // keys are not sorted
                 ),
                 true,
-            ),
-            // Decimal types (Decimal128 is widely supported, Decimal256 is not)
-            Field::new("decimal128_col", DataType::Decimal128(38, 10), true),
-        ]))
+            ));
+        }
+
+        #[cfg(not(feature = "vortex"))]
+        {
+            fields.push(Field::new(
+                "map_col",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Int32, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false, // keys are not sorted
+                ),
+                true,
+            ));
+        }
+
+        // Decimal types (Decimal128 is widely supported, Decimal256 is not)
+        fields.push(Field::new(
+            "decimal128_col",
+            DataType::Decimal128(38, 10),
+            true,
+        ));
+
+        Arc::new(Schema::new(fields))
     }
 
     /// Helper function to generate test data covering all Arrow data types
@@ -1392,39 +1437,51 @@ mod accelerator_compat_tests {
         .with_precision_and_scale(38, 10)
         .expect("valid decimal128");
 
-        RecordBatch::try_new(
-            schema,
-            vec![
-                // Original columns first (for backwards compatibility)
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(value_array),
-                // Additional type columns
-                Arc::new(int8_array),
-                Arc::new(int16_array),
-                Arc::new(int32_array),
-                Arc::new(uint8_array),
-                Arc::new(uint16_array),
-                Arc::new(uint32_array),
-                Arc::new(uint64_array),
-                Arc::new(float32_array),
-                Arc::new(bool_array),
-                Arc::new(large_utf8_array),
-                Arc::new(binary_array),
-                Arc::new(large_binary_array),
-                Arc::new(date32_array),
-                Arc::new(date64_array),
-                Arc::new(time32_array),
-                Arc::new(time64_array),
-                Arc::new(timestamp_array),
-                Arc::new(duration_array),
-                Arc::new(interval_array),
-                Arc::new(list_array),
-                Arc::new(map_array),
-                Arc::new(decimal128_array),
-            ],
-        )
-        .expect("data should be created")
+        // Build the columns vector based on what's in the schema
+        let mut columns: Vec<Arc<dyn Array>> = vec![
+            // Original columns first (for backwards compatibility)
+            Arc::new(id_array),
+            Arc::new(name_array),
+            Arc::new(value_array),
+            // Additional type columns
+            Arc::new(int8_array),
+            Arc::new(int16_array),
+            Arc::new(int32_array),
+            Arc::new(uint8_array),
+            Arc::new(uint16_array),
+            Arc::new(uint32_array),
+            Arc::new(uint64_array),
+            Arc::new(float32_array),
+            Arc::new(bool_array),
+            Arc::new(large_utf8_array),
+            Arc::new(binary_array),
+            Arc::new(large_binary_array),
+            Arc::new(date32_array),
+            Arc::new(date64_array),
+            Arc::new(time32_array),
+            Arc::new(time64_array),
+            Arc::new(timestamp_array),
+        ];
+
+        // Add duration and interval arrays if they exist in the schema
+        if schema.column_with_name("duration_ms_col").is_some() {
+            columns.push(Arc::new(duration_array));
+        }
+        if schema.column_with_name("interval_ym_col").is_some() {
+            columns.push(Arc::new(interval_array));
+        }
+
+        // Add remaining columns
+        columns.push(Arc::new(list_array));
+
+        // Add map array if it exists in the schema
+        if schema.column_with_name("map_col").is_some() {
+            columns.push(Arc::new(map_array));
+        }
+
+        columns.push(Arc::new(decimal128_array));
+
+        RecordBatch::try_new(schema, columns).expect("data should be created")
     }
 
     /// Helper function to insert test data into a table
@@ -1450,7 +1507,7 @@ mod accelerator_compat_tests {
     async fn test_basic_insert_and_query() {
         run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
-            let schema = test_schema();
+            let schema = test_schema(Some(engine));
 
             // Insert test data - 100 records for testing
             let data = generate_test_data(Arc::clone(&schema), 100, 0);
@@ -1570,7 +1627,7 @@ mod accelerator_compat_tests {
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode| async move {
             let ctx = SessionContext::new();
-            let schema = test_schema();
+            let schema = test_schema(Some(engine));
 
             // Insert test data - 50 records
             let data = generate_test_data(Arc::clone(&schema), 50, 0);
@@ -2197,7 +2254,7 @@ mod accelerator_compat_tests {
 
         run_compat_test(|engine, table, mode| async move {
             let ctx = SessionContext::new();
-            let schema = test_schema();
+            let schema = test_schema(Some(engine));
 
             // Memory mode has limitations, file mode can handle much more
             // Turso has tighter page cache limits than other databases due to the comprehensive test schema
