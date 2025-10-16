@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![cfg(feature = "vortex")]
-
 use arrow::array::*;
 use arrow::datatypes::{DataType, IntervalDayTime};
 use async_trait::async_trait;
@@ -85,11 +83,11 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// Check if a data type is supported by Vortex
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     match data_type {
-        // Vortex has issues with certain timestamp precisions
-        // Only Microsecond timestamps seem to work reliably
-        DataType::Timestamp(unit, _) => matches!(unit, arrow::datatypes::TimeUnit::Microsecond),
-        // Float16 is uncommon and not well supported
-        DataType::Float16 => false,
+        // Vortex requires Microsecond timestamps
+        // We accept all timestamp types and will convert them to Microsecond
+        DataType::Timestamp(_, _) => true,
+        // Float16 will be converted to Float32
+        DataType::Float16 => true,
         // Most other basic types are supported
         DataType::Null
         | DataType::Boolean
@@ -117,12 +115,47 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
 }
 
 /// Filter schema to only include Vortex-supported fields
+/// Converts non-Microsecond timestamps to Microsecond and Float16 to Float32
 fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatypes::Schema {
     let filtered_fields: Vec<_> = schema
         .fields()
         .iter()
-        .filter(|field| is_vortex_supported_type(field.data_type()))
-        .cloned()
+        .filter_map(|field| {
+            if !is_vortex_supported_type(field.data_type()) {
+                return None;
+            }
+            
+            // Convert Float16 to Float32
+            if matches!(field.data_type(), DataType::Float16) {
+                tracing::warn!(
+                    "Converting Float16 field '{}' to Float32 for Vortex compatibility",
+                    field.name()
+                );
+                return Some(Arc::new(arrow::datatypes::Field::new(
+                    field.name(),
+                    DataType::Float32,
+                    field.is_nullable(),
+                )));
+            }
+            
+            // Convert non-Microsecond timestamps to Microsecond
+            if let DataType::Timestamp(unit, tz) = field.data_type() {
+                if !matches!(unit, arrow::datatypes::TimeUnit::Microsecond) {
+                    tracing::warn!(
+                        "Converting timestamp field '{}' from {:?} to Microsecond precision for Vortex compatibility",
+                        field.name(),
+                        unit
+                    );
+                    return Some(Arc::new(arrow::datatypes::Field::new(
+                        field.name(),
+                        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, tz.clone()),
+                        field.is_nullable(),
+                    )));
+                }
+            }
+            
+            Some(field.clone())
+        })
         .collect();
 
     arrow::datatypes::Schema::new(filtered_fields)
@@ -262,8 +295,7 @@ impl DataSink for VortexDataSink {
                     batches.into_iter().next().unwrap()
                 } else {
                     arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(|e| {
-                        datafusion::error::DataFusionError::External(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        datafusion::error::DataFusionError::External(Box::new(std::io::Error::other(
                             format!("Failed to concatenate batches: {}", e),
                         )))
                     })?
@@ -277,8 +309,7 @@ impl DataSink for VortexDataSink {
                     .write(&mut file, vortex_array.to_array_stream())
                     .await
                     .map_err(|e| {
-                        datafusion::error::DataFusionError::External(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        datafusion::error::DataFusionError::External(Box::new(std::io::Error::other(
                             format!("Failed to write Vortex file: {}", e),
                         )))
                     })?;
@@ -322,21 +353,19 @@ impl DataSink for VortexDataSink {
                 file_counter += 1;
 
                 // Wait for oldest task if we've reached parallelism limit
-                if write_tasks.len() >= max_parallel_writes {
-                    if let Some(task) = write_tasks.first_mut() {
-                        match task.await {
-                            Ok(Ok(rows)) => {
-                                tracing::trace!("Vortex: completed write of {} rows", rows);
-                            }
-                            Ok(Err(e)) => return Err(e),
-                            Err(e) => {
-                                return Err(datafusion::error::DataFusionError::External(
-                                    Box::new(e),
-                                ));
-                            }
+                if write_tasks.len() >= max_parallel_writes
+                    && let Some(task) = write_tasks.first_mut()
+                {
+                    match task.await {
+                        Ok(Ok(rows)) => {
+                            tracing::trace!("Vortex: completed write of {} rows", rows);
                         }
-                        write_tasks.remove(0);
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(datafusion::error::DataFusionError::External(Box::new(e)));
+                        }
                     }
+                    write_tasks.remove(0);
                 }
             }
 
@@ -480,8 +509,7 @@ impl VortexAccelerator {
             let dataset_name = source
                 .name()
                 .to_string()
-                .replace('.', "_")
-                .replace('/', "_");
+                .replace(['.', '/'], "_");
 
             // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
             let dir_path = if let Some(custom_path) = acceleration_params.get("file_path") {
@@ -497,7 +525,9 @@ impl VortexAccelerator {
                 Ok(format!("{}/", dir_path))
             }
         } else {
-            unreachable!("Expected dataset to have acceleration parameters, but none were found")
+            Err(Error::AccelerationNotEnabled {
+                dataset: Arc::from(source.name().to_string()),
+            })
         }
     }
 }
@@ -551,6 +581,11 @@ impl DataAccelerator for VortexAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::warn!(
+            "⚠️  Vortex data accelerator is in ALPHA stage and should NOT be used in production. \
+             Data format and API may change without notice."
+        );
+
         if !source.is_file_accelerated() {
             return Ok(());
         }
@@ -638,7 +673,7 @@ impl DataAccelerator for VortexAccelerator {
         }
 
         // Create an initial dummy file inside the directory to initialize the table
-        // This is required because Vortex needs at least EOF_SIZE (8) bytes and ListingTable needs files to scan
+        // This is required because Vortex files must be at least 8 bytes (the EOF marker) and ListingTable needs files to scan.
         let dummy_file_path = path_buf.join("init.vortex");
 
         // Always recreate the dummy file to ensure fresh state
@@ -674,21 +709,20 @@ impl DataAccelerator for VortexAccelerator {
                         DataType::UInt32 => Arc::new(UInt32Array::from(vec![0u32])),
                         DataType::UInt64 => Arc::new(UInt64Array::from(vec![0u64])),
                         DataType::Float16 => {
-                            // Float16 is uncommon, use null for simplicity
-                            Arc::new(NullArray::new(1))
+                            // Float16 is converted to Float32 by filter_schema_for_vortex, so this should never be reached
+                            // This is kept for defensive purposes in case of bugs in type filtering.
+                            tracing::error!("Float16 should have been converted to Float32 by filter_schema_for_vortex - this indicates a bug");
+                            Arc::new(Float32Array::from(vec![0.0f32]))
                         }
                         DataType::Float32 => Arc::new(Float32Array::from(vec![0.0f32])),
                         DataType::Float64 => Arc::new(Float64Array::from(vec![0.0f64])),
-                        DataType::Timestamp(unit, tz) => {
-                            // Vortex only supports Microsecond timestamps reliably
-                            match unit {
-                                arrow::datatypes::TimeUnit::Microsecond => Arc::new(
-                                    TimestampMicrosecondArray::from(vec![0i64])
-                                        .with_timezone_opt(tz.clone()),
-                                ),
-                                // This shouldn't happen since we filter the schema
-                                _ => Arc::new(NullArray::new(1)),
-                            }
+                        DataType::Timestamp(_unit, tz) => {
+                            // All timestamps are converted to Microsecond by filter_schema_for_vortex
+                            // so we always create Microsecond timestamps here
+                            Arc::new(
+                                TimestampMicrosecondArray::from(vec![0i64])
+                                    .with_timezone_opt(tz.clone()),
+                            )
                         }
                         DataType::Date32 => Arc::new(Date32Array::from(vec![0i32])),
                         DataType::Date64 => Arc::new(Date64Array::from(vec![0i64])),
@@ -763,10 +797,10 @@ impl DataAccelerator for VortexAccelerator {
                 .write(&mut file, vortex_array.to_array_stream())
                 .await
                 .map_err(|e| Error::AccelerationCreationFailed {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to write Vortex file: {}", e),
-                    )),
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to write Vortex file: {}",
+                        e
+                    ))),
                 })?;
         }
 
