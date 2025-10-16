@@ -17,31 +17,18 @@ limitations under the License.
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use datafusion::catalog::Session;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::CreateExternalTable;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::metrics::MetricsSet;
-use futures::StreamExt;
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::any::Any;
-use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs::OpenOptions;
-use vortex::ArrayRef;
-use vortex::arrow::FromArrowArray;
-use vortex::file::VortexWriteOptions;
 use vortex_datafusion::VortexFormat;
 
 use super::{AccelerationSource, DataAccelerator};
@@ -157,324 +144,6 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
         .collect();
 
     arrow::datatypes::Schema::new(filtered_fields)
-}
-
-/// Custom data sink for streaming Vortex writes with optimized async I/O
-///
-/// This implementation provides significant performance improvements over the default
-/// `ListingTable` insert mechanism:
-///
-/// 1. **Async I/O**: Uses `tokio::fs::OpenOptions` for non-blocking file operations
-///    instead of synchronous I/O that can block the runtime.
-///
-/// 2. **Context-Aware Parallelism**: Uses `DataFusion`'s `target_partitions` configuration
-///    to determine optimal parallel write concurrency, respecting user settings and system
-///    capabilities (capped at 4 to avoid "too many open files" errors).
-///
-/// 3. **Buffering Strategy**: Accumulates batches up to a configurable target file size
-///    (default 512MB) before writing to disk, reducing the total number of files and
-///    file handle pressure.
-///
-/// 4. **Streaming Processing**: Processes record batches as they arrive from the stream
-///    without buffering all data in memory, reducing memory pressure during large imports.
-///
-/// 5. **Backpressure Management**: Limits concurrent writes based on `DataFusion` config
-///    to avoid overwhelming the I/O subsystem while maintaining high throughput.
-#[derive(Debug, Clone)]
-struct VortexDataSink {
-    dir_path: String,
-    schema: SchemaRef,
-    target_file_size_bytes: usize,
-}
-
-impl VortexDataSink {
-    fn new(dir_path: String, schema: SchemaRef, target_file_size_bytes: usize) -> Self {
-        Self {
-            dir_path,
-            schema,
-            target_file_size_bytes,
-        }
-    }
-}
-
-impl DisplayAs for VortexDataSink {
-    fn fmt_as(
-        &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut fmt::Formatter,
-    ) -> fmt::Result {
-        write!(f, "VortexDataSink(dir={})", self.dir_path)
-    }
-}
-
-#[async_trait]
-impl DataSink for VortexDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        None
-    }
-
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn write_all(
-        &self,
-        mut data: SendableRecordBatchStream,
-        context: &Arc<datafusion::execution::TaskContext>,
-    ) -> datafusion::error::Result<u64> {
-        let mut total_rows = 0u64;
-        let mut file_counter = 0usize;
-
-        // Get configuration from DataFusion context
-        let session_config = context.session_config();
-
-        // Use target_partitions to determine parallel write concurrency
-        // This respects the user's configured parallelism settings
-        let target_partitions = session_config.target_partitions();
-        let max_parallel_writes = target_partitions.clamp(1, 4);
-
-        // Get batch size from config if available, otherwise use default
-        let batch_size = session_config.batch_size();
-
-        tracing::trace!(
-            "Vortex: using {} parallel writes, batch_size={}, target_partitions={}, target_file_size={}MB",
-            max_parallel_writes,
-            batch_size,
-            target_partitions,
-            self.target_file_size_bytes / (1024 * 1024)
-        );
-
-        // Buffer to accumulate batches before writing
-        let target_file_size_bytes = self.target_file_size_bytes;
-        let mut buffered_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
-        let mut buffered_size_bytes: usize = 0;
-
-        // Helper function to write buffered batches to a file
-        let write_buffered_batches = |batches: Vec<arrow::record_batch::RecordBatch>,
-                                      dir_path: String,
-                                      counter: usize|
-         -> tokio::task::JoinHandle<
-            datafusion::error::Result<u64>,
-        > {
-            tokio::spawn(async move {
-                if batches.is_empty() {
-                    return Ok(0);
-                }
-
-                let total_batch_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-
-                // Generate unique filename
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?
-                    .as_millis();
-                let filename = format!("data_{timestamp}_{counter}_rows_{total_batch_rows}.vortex");
-
-                let file_path = PathBuf::from(&dir_path).join(&filename);
-
-                // Open file for writing with async I/O
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&file_path)
-                    .await
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-
-                // Concatenate all batches into a single batch if schema matches
-                let combined_batch = if batches.len() == 1 {
-                    batches.into_iter().next().ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(
-                            "Missing record batch for Vortex write".to_string(),
-                        )
-                    })?
-                } else {
-                    arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(|e| {
-                        datafusion::error::DataFusionError::External(Box::new(
-                            std::io::Error::other(format!("Failed to concatenate batches: {}", e)),
-                        ))
-                    })?
-                };
-
-                // Convert Arrow RecordBatch to Vortex Array
-                let vortex_array = ArrayRef::from_arrow(&combined_batch, false);
-
-                // Write using async I/O with VortexWriteOptions
-                VortexWriteOptions::default()
-                    .write(&mut file, vortex_array.to_array_stream())
-                    .await
-                    .map_err(|e| {
-                        datafusion::error::DataFusionError::External(Box::new(
-                            std::io::Error::other(format!("Failed to write Vortex file: {}", e)),
-                        ))
-                    })?;
-
-                tracing::debug!(
-                    "Vortex: wrote file {} with {} rows to {}",
-                    filename,
-                    total_batch_rows,
-                    dir_path
-                );
-
-                Ok(total_batch_rows)
-            })
-        };
-
-        let mut write_tasks = Vec::new();
-
-        // Process batches and buffer them until reaching target size
-        while let Some(batch_result) = data.next().await {
-            let batch = batch_result?;
-            let num_rows = batch.num_rows();
-
-            if num_rows == 0 {
-                continue;
-            }
-
-            // Calculate approximate size of this batch
-            let batch_size = batch.get_array_memory_size();
-            buffered_batches.push(batch);
-            buffered_size_bytes += batch_size;
-            total_rows += num_rows as u64;
-
-            // Write when buffer reaches target size
-            if buffered_size_bytes >= target_file_size_bytes {
-                let batches_to_write = std::mem::take(&mut buffered_batches);
-                buffered_size_bytes = 0;
-
-                let write_task =
-                    write_buffered_batches(batches_to_write, self.dir_path.clone(), file_counter);
-                write_tasks.push(write_task);
-                file_counter += 1;
-
-                // Wait for oldest task if we've reached parallelism limit
-                if write_tasks.len() >= max_parallel_writes
-                    && let Some(task) = write_tasks.first_mut()
-                {
-                    match task.await {
-                        Ok(Ok(rows)) => {
-                            tracing::trace!("Vortex: completed write of {} rows", rows);
-                        }
-                        Ok(Err(e)) => return Err(e),
-                        Err(e) => {
-                            return Err(datafusion::error::DataFusionError::External(Box::new(e)));
-                        }
-                    }
-                    write_tasks.remove(0);
-                }
-            }
-
-            // Log progress periodically
-            if total_rows % 100_000 == 0 {
-                tracing::trace!(
-                    "Vortex: processed {} rows ({} files written, {} MB buffered)",
-                    total_rows,
-                    file_counter,
-                    buffered_size_bytes / (1024 * 1024)
-                );
-            }
-        }
-
-        // Write any remaining buffered batches
-        if !buffered_batches.is_empty() {
-            let write_task =
-                write_buffered_batches(buffered_batches, self.dir_path.clone(), file_counter);
-            write_tasks.push(write_task);
-            file_counter += 1;
-        }
-
-        // Wait for all remaining write tasks to complete
-        for task in write_tasks {
-            match task.await {
-                Ok(Ok(rows)) => {
-                    tracing::trace!("Vortex: completed write of {} rows", rows);
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(datafusion::error::DataFusionError::External(Box::new(e))),
-            }
-        }
-
-        tracing::info!(
-            "Vortex: completed writing {} files, {} total rows to {}",
-            file_counter,
-            total_rows,
-            self.dir_path
-        );
-
-        Ok(total_rows)
-    }
-}
-
-/// Wrapper around `ListingTable` that uses custom `VortexDataSink` for efficient streaming writes.
-/// This is required for better performance with async I/O and to handle append operations properly.
-#[derive(Debug)]
-struct VortexTableProvider {
-    inner: Arc<ListingTable>,
-    dir_path: String,
-    target_file_size_bytes: usize,
-}
-
-#[async_trait]
-impl TableProvider for VortexTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> arrow::datatypes::SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> datafusion::logical_expr::TableType {
-        self.inner.table_type()
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[datafusion::prelude::Expr],
-        limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
-
-    async fn insert_into(
-        &self,
-        _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // Log warnings for unsupported operations
-        match overwrite {
-            InsertOp::Append => {}
-            InsertOp::Overwrite => {
-                tracing::warn!(
-                    "Vortex does not support overwrite operations yet, using append instead"
-                );
-            }
-            InsertOp::Replace => {
-                tracing::warn!(
-                    "Vortex does not support replace operations yet, using append instead"
-                );
-            }
-        }
-
-        // Use custom VortexDataSink for efficient async streaming writes
-        let sink = Arc::new(VortexDataSink::new(
-            self.dir_path.clone(),
-            self.schema(),
-            self.target_file_size_bytes,
-        ));
-
-        Ok(Arc::new(DataSinkExec::new(
-            input, sink, None, // No count schema
-        )))
-    }
 }
 
 pub struct VortexAccelerator {
@@ -701,7 +370,7 @@ impl DataAccelerator for VortexAccelerator {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        let (dir_path, target_file_size_bytes) = self.resolve_storage_config(source).boxed()?;
+        let (dir_path, _target_file_size_bytes) = self.resolve_storage_config(source).boxed()?;
 
         let (arrow_schema, filtered_count) = Self::filtered_arrow_schema(&cmd);
 
@@ -716,14 +385,7 @@ impl DataAccelerator for VortexAccelerator {
         let listing_table =
             Self::create_listing_table(&dir_path, Arc::clone(&arrow_schema)).boxed()?;
 
-        // Wrap in VortexTableProvider with custom data sink for efficient streaming writes
-        let wrapped_table = VortexTableProvider {
-            inner: Arc::new(listing_table),
-            dir_path: dir_path.clone(),
-            target_file_size_bytes,
-        };
-
-        Ok(Arc::new(wrapped_table))
+        Ok(Arc::new(listing_table))
     }
 
     fn prefix(&self) -> &'static str {

@@ -390,9 +390,9 @@ impl FileFormat for VortexFormat {
         conf: FileSinkConfig,
         order_requirements: Option<LexRequirement>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if conf.insert_op != InsertOp::Append {
-            return not_impl_err!("Overwrites are not implemented yet for Vortex");
-        }
+        // if conf.insert_op != InsertOp::Append {
+        //     return not_impl_err!("Overwrites are not implemented yet for Vortex");
+        // }
 
         let schema = conf.output_schema().clone();
         let sink = Arc::new(VortexSink::new(conf, schema));
