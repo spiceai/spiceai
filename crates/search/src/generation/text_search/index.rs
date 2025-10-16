@@ -134,9 +134,9 @@ impl FullTextDatabaseIndex {
     ) -> Result<Vec<String>, super::Error> {
         // Use 'primary_key_override', fallback to underlying in table.
         let pks = match (primary_key_override, get_primary_keys(inner).await) {
-            (Some(pks), _) if !pks.is_empty() => pks,
-            (_, Ok(pks)) if !pks.is_empty() => pks,
-            (None, Err(e)) => {
+            // LHS takes precedence.
+            (Some(pks), _) | (_, Ok(pks)) if !pks.is_empty() => pks,
+            (_, Err(e)) => {
                 return Err(super::Error::FailedToRetrievePrimaryKey { source: e });
             }
             _ => return Err(super::Error::NoPrimaryKey),
