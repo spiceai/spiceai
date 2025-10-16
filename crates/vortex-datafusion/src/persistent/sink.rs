@@ -101,9 +101,9 @@ impl FileSink for VortexSink {
         // TODO(adamg):
         // 1. We can probably be better at signaling how much memory we're consuming (potentially when reading too), see ParquetSink::spawn_writer_tasks_and_join.
         while let Some((path, rx)) = file_stream_rx.recv().await {
-            let row_counter = row_counter.clone();
-            let object_store = object_store.clone();
-            let dtype = DType::from_arrow(self.config.output_schema.clone());
+            let row_counter = Arc::clone(&row_counter);
+            let object_store = Arc::clone(&object_store);
+            let dtype = DType::from_arrow(Arc::clone(&self.config.output_schema));
 
             // We need to spawn work because there's a dependency between the different files. If one file has too many batches buffered,
             // the demux task might deadlock itself.

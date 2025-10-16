@@ -301,7 +301,7 @@ impl DataAccelerator for VortexAccelerator {
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
         if !source.is_file_accelerated() {
-            return true; // memory mode Vortex is always initialized
+            return false; // Vortex only supports file mode
         }
 
         // otherwise, we're initialized if the directory exists
@@ -313,7 +313,7 @@ impl DataAccelerator for VortexAccelerator {
     }
 
     /// Initializes a `Vortex` database for the dataset
-    /// If the dataset is not file-accelerated, this is a no-op
+    /// Vortex only supports file mode with directory-based storage
     /// Creates the data directory if it doesn't exist
     async fn init(
         &self,
@@ -325,7 +325,11 @@ impl DataAccelerator for VortexAccelerator {
         );
 
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Vortex data accelerator only supports file mode. Please configure the accelerator with mode: file",
+                ),
+            }));
         }
 
         let dir_path = self.file_path(source)?;
@@ -349,7 +353,7 @@ impl DataAccelerator for VortexAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    /// Vortex only supports file mode and creates an empty file with the given schema.
+    /// Vortex only supports file mode with directory-based storage.
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,

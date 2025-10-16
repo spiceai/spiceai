@@ -66,7 +66,7 @@ impl VortexSource {
             arrow_file_schema: None,
             schema_adapter_factory: None,
             expr_adapter_factory: None,
-            _unused_df_metrics: Default::default(),
+            _unused_df_metrics: ExecutionPlanMetricsSet::default(),
             layout_readers: Arc::new(DashMap::default()),
         }
     }
@@ -109,15 +109,15 @@ impl FileSource for VortexSource {
         // This match is here to support the behavior defined by [`ListingTable`], see https://github.com/apache/datafusion/issues/16800 for more details.
         let (expr_adapter_factory, schema_adapter_factory) = match (expr_adapter, schema_adapter) {
             (Some(expr_adapter), Some(schema_adapter)) => {
-                (Some(expr_adapter.clone()), schema_adapter.clone())
+                (Some(Arc::clone(expr_adapter)), Arc::clone(schema_adapter))
             }
             (Some(expr_adapter), None) => (
-                Some(expr_adapter.clone()),
+                Some(Arc::clone(expr_adapter)),
                 Arc::new(DefaultSchemaAdapterFactory) as _,
             ),
             (None, Some(schema_adapter)) => {
                 // If no `PhysicalExprAdapterFactory` is specified, we only use the provided `SchemaAdapterFactory`
-                (None, schema_adapter.clone())
+                (None, Arc::clone(schema_adapter))
             }
             (None, None) => (
                 Some(Arc::new(DefaultPhysicalExprAdapterFactory) as _),
@@ -134,12 +134,12 @@ impl FileSource for VortexSource {
             expr_adapter_factory,
             schema_adapter_factory,
             partition_fields: base_config.table_partition_cols.clone(),
-            logical_schema: base_config.file_schema.clone(),
+            logical_schema: Arc::clone(&base_config.file_schema),
             file_cache: self.file_cache.clone(),
             batch_size,
             limit: base_config.limit,
             metrics: partition_metrics,
-            layout_readers: self.layout_readers.clone(),
+            layout_readers: Arc::clone(&self.layout_readers),
         };
 
         Arc::new(opener)
@@ -203,7 +203,7 @@ impl FileSource for VortexSource {
             DisplayFormatType::TreeRender => {
                 if let Some(ref predicate) = self.predicate {
                     writeln!(f, "predicate={predicate}")?;
-                };
+                }
             }
         }
         Ok(())
@@ -256,7 +256,7 @@ impl FileSource for VortexSource {
         };
         source.predicate = Some(predicate);
 
-        let pushdown_propagation = if source.predicate.clone().is_some() {
+        let pushdown_propagation = if source.predicate.is_some() {
             FilterPushdownPropagation::with_parent_pushdown_result(
                 filters.iter().map(|f| f.discriminant).collect(),
             )
