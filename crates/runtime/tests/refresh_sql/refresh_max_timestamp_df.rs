@@ -89,7 +89,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, None)
+                .create_external_table(cmd, None, vec![])
                 .await
                 .expect("Failed to create external table");
 
@@ -184,7 +184,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, None)
+                .create_external_table(cmd, None, vec![])
                 .await
                 .expect("Failed to create external table");
 

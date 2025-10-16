@@ -6612,7 +6612,7 @@ dependencies = [
  "rand 0.7.3",
  "serde",
  "serde_json",
- "serde_qs 0.8.5",
+ "serde_qs",
  "serde_urlencoded",
  "url",
 ]
@@ -12346,8 +12346,9 @@ dependencies = [
  "parking_lot 0.12.4",
  "runtime-datafusion-udfs",
  "serde",
- "serde_qs 1.0.0-rc.3",
  "snafu",
+ "spicepod",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -13179,18 +13180,6 @@ dependencies = [
  "percent-encoding",
  "serde",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "serde_qs"
-version = "1.0.0-rc.3"
-source = "git+https://github.com/samscott89/serde_qs.git?rev=f24f916a6420cf500c97fb85dc5e64015fdb6b40#f24f916a6420cf500c97fb85dc5e64015fdb6b40"
-dependencies = [
- "itoa",
- "percent-encoding",
- "ryu",
- "serde",
- "thiserror 2.0.16",
 ]
 
 [[package]]

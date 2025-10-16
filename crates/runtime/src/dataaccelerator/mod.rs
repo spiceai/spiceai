@@ -32,7 +32,7 @@ use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use runtime_table_partition::expression::{PartitionBy, partition_by_expressions};
+use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::path::PathBuf;
@@ -267,12 +267,10 @@ impl AcceleratorEngineRegistry {
             .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
 
         let partition_by = if acceleration_settings.partition_by.is_empty() {
-            None
+            vec![]
         } else {
-            Some(
-                partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
-                    .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?,
-            )
+            partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?
         };
 
         let table_provider = accelerator
@@ -296,7 +294,7 @@ pub trait DataAccelerator: Send + Sync {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Option<PartitionBy>,
+        partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
