@@ -138,6 +138,7 @@ pub enum Engine {
     Sqlite,
     Turso,
     PostgreSQL,
+    Vortex,
 }
 
 impl Display for Engine {
@@ -148,6 +149,7 @@ impl Display for Engine {
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::Turso => write!(f, "turso"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Vortex => write!(f, "vortex"),
         }
     }
 }
@@ -162,6 +164,7 @@ impl TryFrom<&str> for Engine {
             "sqlite" => Ok(Engine::Sqlite),
             "turso" => Ok(Engine::Turso),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "vortex" => Ok(Engine::Vortex),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }

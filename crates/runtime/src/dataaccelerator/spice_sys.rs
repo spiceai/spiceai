@@ -293,7 +293,7 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "turso"))]
         Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
-        Engine::Arrow => UnsupportedEngineSnafu {
+        Engine::Arrow | Engine::Vortex => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }
         .fail(),

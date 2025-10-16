@@ -51,6 +51,8 @@ use self::postgres::PostgresAccelerator;
 use self::sqlite::SqliteAccelerator;
 #[cfg(feature = "turso")]
 use self::turso::TursoAccelerator;
+#[cfg(feature = "vortex")]
+use self::vortex::VortexAccelerator;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
@@ -63,6 +65,8 @@ pub mod postgres;
 pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
+#[cfg(feature = "vortex")]
+pub mod vortex;
 
 mod snapshots;
 pub mod spice_sys;
@@ -154,6 +158,9 @@ impl AcceleratorEngineRegistry {
             .await;
         #[cfg(feature = "turso")]
         self.register_accelerator_engine(Engine::Turso, Arc::new(TursoAccelerator::new()))
+            .await;
+        #[cfg(feature = "vortex")]
+        self.register_accelerator_engine(Engine::Vortex, Arc::new(VortexAccelerator::new()))
             .await;
     }
 

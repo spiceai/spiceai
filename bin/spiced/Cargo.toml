@@ -41,6 +41,7 @@ tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util" }
+vortex = "0.52.1"
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
@@ -81,6 +82,7 @@ default = [
     "mongodb",
     "iceberg-write",
     "turso",
+    "vortex"
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -111,4 +113,5 @@ spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 turso = ["runtime/turso"]
 tpc-extension = ["dep:tpc-extension"]
+vortex = ["runtime/vortex"]
 xxhash = ["runtime/xxhash"]

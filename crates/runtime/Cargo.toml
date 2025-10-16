@@ -172,6 +172,8 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
+vortex-datafusion = { path = "../vortex-datafusion", optional = true }
+vortex = { workspace = true, optional = true }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
@@ -273,4 +275,5 @@ turso = [
     "data_components/turso",
     "dep:rusqlite",
 ]
+vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
