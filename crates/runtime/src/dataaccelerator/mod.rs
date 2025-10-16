@@ -2274,7 +2274,7 @@ mod accelerator_compat_tests {
 
             // Verify List column exists and has correct type
             for batch in &results {
-                if let Some(list_col_idx) = batch.schema().index_of("list_col").ok() {
+                if let Ok(list_col_idx) = batch.schema().index_of("list_col") {
                     let list_col = batch.column(list_col_idx);
                     assert!(
                         matches!(list_col.data_type(), DataType::List(_)),
@@ -2298,7 +2298,7 @@ mod accelerator_compat_tests {
                 }
 
                 // Verify Map column exists and has correct type
-                if let Some(map_col_idx) = batch.schema().index_of("map_col").ok() {
+                if let Ok(map_col_idx) = batch.schema().index_of("map_col") {
                     let map_col = batch.column(map_col_idx);
                     assert!(
                         matches!(map_col.data_type(), DataType::Map(_, _)),
