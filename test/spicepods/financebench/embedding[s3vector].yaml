@@ -50,4 +50,5 @@ datasets:
       engine: s3_vectors
       params:
         s3_vectors_bucket: spiceai-financebench-s3-data
+        s3_vectors_index: financebench-openai-small-1000-200
         s3_vectors_aws_region: us-east-1
