@@ -197,8 +197,9 @@ impl VortexAccelerator {
         }
     }
 
-    /// Returns the `Vortex` data file path that would be used for a file-based `Vortex` accelerator from this dataset
-    pub fn vortex_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+    /// Returns the `Vortex` data directory path that would be used for a file-based `Vortex` accelerator from this dataset.
+    /// Vortex uses a directory-based approach to support append operations.
+    pub fn vortex_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
@@ -213,14 +214,19 @@ impl VortexAccelerator {
                 .replace('.', "_")
                 .replace('/', "_");
 
-            // Use file_path if provided, otherwise use default: spice_data_base_path() + dataset_name.vortex
-            let file_path = if let Some(custom_path) = acceleration_params.get("file_path") {
+            // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
+            let dir_path = if let Some(custom_path) = acceleration_params.get("file_path") {
                 custom_path.clone()
             } else {
-                format!("{}/{}.vortex", spice_data_base_path(), dataset_name)
+                format!("{}/{}", spice_data_base_path(), dataset_name)
             };
 
-            Ok(file_path)
+            // Ensure the path ends with a trailing slash for directory operations
+            if dir_path.ends_with('/') {
+                Ok(dir_path)
+            } else {
+                Ok(format!("{}/", dir_path))
+            }
         } else {
             unreachable!("Expected dataset to have acceleration parameters, but none were found")
         }
@@ -247,7 +253,7 @@ impl DataAccelerator for VortexAccelerator {
     }
 
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
-        self.vortex_file_path(source)
+        self.vortex_data_dir(source)
             .map_err(|err| FilePathError::External {
                 engine: Engine::Vortex,
                 source: err.into(),
@@ -259,9 +265,9 @@ impl DataAccelerator for VortexAccelerator {
             return true; // memory mode Vortex is always initialized
         }
 
-        // otherwise, we're initialized if the file exists
-        if let Ok(file_path) = self.file_path(source) {
-            PathBuf::from(file_path).exists()
+        // otherwise, we're initialized if the directory exists
+        if let Ok(dir_path) = self.file_path(source) {
+            PathBuf::from(dir_path).exists()
         } else {
             false
         }
@@ -269,7 +275,7 @@ impl DataAccelerator for VortexAccelerator {
 
     /// Initializes a `Vortex` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
-    /// Creates the parent directory if it doesn't exist
+    /// Creates the data directory if it doesn't exist
     async fn init(
         &self,
         source: &dyn AccelerationSource,
@@ -278,19 +284,17 @@ impl DataAccelerator for VortexAccelerator {
             return Ok(());
         }
 
-        let file_path = self.file_path(source)?;
+        let dir_path = self.file_path(source)?;
 
         // Ensure the spice data base directory exists
         make_spice_data_directory()
             .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
 
-        // Create the parent directory if it doesn't exist
-        let path_buf = PathBuf::from(&file_path);
-        if let Some(parent) = path_buf.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            }
+        // Create the vortex data directory if it doesn't exist
+        let path_buf = PathBuf::from(&dir_path);
+        if !path_buf.exists() {
+            std::fs::create_dir_all(&path_buf)
+                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -308,8 +312,8 @@ impl DataAccelerator for VortexAccelerator {
         source: Option<&dyn AccelerationSource>,
         _partition_by: Option<PartitionBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        // Vortex only supports file mode
-        let file_path = if let Some(src) = source {
+        // Vortex only supports file mode with directory-based storage
+        let dir_path = if let Some(src) = source {
             self.file_path(src)?
         } else {
             return Err(Error::InvalidConfiguration {
@@ -333,32 +337,31 @@ impl DataAccelerator for VortexAccelerator {
 
         let arrow_schema: SchemaRef = Arc::new(filtered_schema);
 
-        let path_buf = PathBuf::from(&file_path);
+        let path_buf = PathBuf::from(&dir_path);
 
-        // Ensure the parent directory exists
-        if let Some(parent) = path_buf.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            }
+        // Ensure the directory exists
+        if !path_buf.exists() {
+            std::fs::create_dir_all(&path_buf)
+                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
-        // Always delete the existing file if it exists, since we only support append
-        // and need to start fresh with a new dummy file
-        if path_buf.exists() {
-            tokio::fs::remove_file(&path_buf)
+        // Create an initial dummy file inside the directory to initialize the table
+        // This is required because Vortex needs at least EOF_SIZE (8) bytes and ListingTable needs files to scan
+        let dummy_file_path = path_buf.join("init.vortex");
+
+        // Always recreate the dummy file to ensure fresh state
+        if dummy_file_path.exists() {
+            tokio::fs::remove_file(&dummy_file_path)
                 .await
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
-        // Create a Vortex file with 1 row of dummy data
-        // This is required because Vortex needs at least EOF_SIZE (8) bytes
         {
             let mut file = OpenOptions::new()
                 .write(true)
                 .truncate(true)
                 .create(true)
-                .open(&path_buf)
+                .open(&dummy_file_path)
                 .await
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
 
@@ -477,13 +480,18 @@ impl DataAccelerator for VortexAccelerator {
 
         let ctx = SessionContext::new();
         let format = Arc::new(VortexFormat::default());
-        let table_url = ListingTableUrl::parse(path_buf.to_str().ok_or_else(|| {
-            Error::InvalidConfiguration {
-                detail: Arc::from("Path is not valid UTF-8"),
+
+        // Use the directory path with trailing slash for ListingTable
+        let dir_url_str = if dir_path.ends_with('/') {
+            dir_path.clone()
+        } else {
+            format!("{}/", dir_path)
+        };
+
+        let table_url = ListingTableUrl::parse(&dir_url_str).map_err(|e| {
+            Error::AccelerationCreationFailed {
+                source: Box::new(e),
             }
-        })?)
-        .map_err(|e| Error::AccelerationCreationFailed {
-            source: Box::new(e),
         })?;
 
         // Infer schema from the created file
@@ -549,12 +557,12 @@ mod tests {
         });
 
         let accelerator = VortexAccelerator::new();
-        let file_path = accelerator.vortex_file_path(&dataset);
+        let data_dir = accelerator.vortex_data_dir(&dataset);
 
-        assert!(file_path.is_ok());
-        let path = file_path.unwrap();
-        assert!(path.contains("vortex_data_accelerator_test"));
-        assert!(path.ends_with(".vortex"));
+        assert!(data_dir.is_ok());
+        let dir_path = data_dir.unwrap();
+        assert!(dir_path.contains("vortex_data_accelerator_test"));
+        assert!(dir_path.ends_with("/"));
     }
 
     #[tokio::test]
