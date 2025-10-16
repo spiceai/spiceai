@@ -26,7 +26,7 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use vortex_datafusion::persistent::format::VortexFormat;
+use vortex_datafusion::VortexFormat;
 
 use crate::{
     component::dataset::acceleration::Engine,
@@ -259,48 +259,6 @@ impl DataAccelerator for VortexAccelerator {
                     })?;
 
                     Ok(Arc::new(listing_table))
-                }
-                "memory" => {
-                    // Memory mode: Create an empty VortexMemTable
-                    // Note: This creates an empty table. Data will need to be inserted.
-                    use arrow::datatypes::Schema as ArrowSchema;
-                    use vortex::IntoArrayData;
-                    use vortex::array::StructArray;
-                    use vortex::validity::Validity;
-                    use vortex_datafusion::memory::{VortexMemTable, VortexMemTableOptions};
-
-                    // Convert DataFusion schema to Arrow schema
-                    let arrow_schema: ArrowSchema = cmd.schema.as_ref().clone().into();
-
-                    // Create an empty Vortex StructArray with the schema
-                    let field_names: Vec<_> = arrow_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone().into())
-                        .collect();
-
-                    let empty_arrays: Vec<_> = arrow_schema
-                        .fields()
-                        .iter()
-                        .map(|_| PrimitiveArray::from(Vec::<i32>::new()).into_array())
-                        .collect();
-
-                    let struct_array = StructArray::try_new(
-                        field_names.into(),
-                        empty_arrays,
-                        0,
-                        Validity::NonNullable,
-                    )
-                    .map_err(|e| Error::AccelerationCreationFailed {
-                        source: Box::new(e),
-                    })?;
-
-                    let vortex_table = VortexMemTable::new(
-                        struct_array.into_array_data(),
-                        VortexMemTableOptions::default(),
-                    );
-
-                    Ok(Arc::new(vortex_table))
                 }
                 _ => Err(Error::InvalidConfiguration {
                     detail: Arc::from(format!("Invalid mode: {mode}")),
