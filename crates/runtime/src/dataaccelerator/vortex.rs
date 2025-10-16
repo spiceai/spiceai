@@ -850,7 +850,7 @@ impl DataAccelerator for VortexAccelerator {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<PartitionedBy>,
+        partition_by: Vec<RuntimePartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
@@ -859,11 +859,12 @@ impl DataAccelerator for VortexAccelerator {
             }
         );
 
-        let Some(src) = source else {
-            return Err(Box::new(Error::InvalidConfiguration {
+        // Vortex requires a source for file mode with directory-based storage
+        let source = source.ok_or_else(|| {
+            Box::new(Error::InvalidConfiguration {
                 detail: Arc::from("Source required for Vortex accelerator"),
-            }));
-        };
+            }) as Box<dyn std::error::Error + Send + Sync>
+        })?;
 
         let (dir_path, target_file_size_bytes) = self
             .resolve_storage_config(src)
