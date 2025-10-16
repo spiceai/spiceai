@@ -465,7 +465,6 @@ fn parse_json_array(
 
 #[cfg(test)]
 mod tests {
-    
 
     use super::*;
     use arrow::{
