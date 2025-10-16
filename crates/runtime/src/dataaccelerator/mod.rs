@@ -49,6 +49,8 @@ use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
 use self::sqlite::SqliteAccelerator;
+#[cfg(feature = "vortex")]
+use self::vortex::VortexAccelerator;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
@@ -59,6 +61,8 @@ pub mod partitioned_duckdb;
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(feature = "vortex")]
+pub mod vortex;
 
 mod snapshots;
 pub mod spice_sys;
@@ -147,6 +151,9 @@ impl AcceleratorEngineRegistry {
             .await;
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
+            .await;
+        #[cfg(feature = "vortex")]
+        self.register_accelerator_engine(Engine::Vortex, Arc::new(VortexAccelerator::new()))
             .await;
     }
 
