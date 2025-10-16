@@ -1321,23 +1321,23 @@ mod accelerator_compat_tests {
         );
 
         // Binary types
-        let binary_data: Vec<Option<&[u8]>> = (0..num_records)
+        let binary_data: Vec<Option<Vec<u8>>> = (0..num_records)
             .map(|i| {
                 if i % nullable_mod == 0 {
                     None
                 } else {
-                    Some(format!("binary_{}", i).into_bytes().leak() as &[u8])
+                    Some(format!("binary_{}", i).into_bytes())
                 }
             })
             .collect();
         let binary_array = BinaryArray::from(binary_data);
 
-        let large_binary_data: Vec<Option<&[u8]>> = (0..num_records)
+        let large_binary_data: Vec<Option<Vec<u8>>> = (0..num_records)
             .map(|i| {
                 if i % nullable_mod == 0 {
                     None
                 } else {
-                    Some(format!("large_binary_{}", i).into_bytes().leak() as &[u8])
+                    Some(format!("large_binary_{}", i).into_bytes())
                 }
             })
             .collect();
