@@ -114,7 +114,7 @@ pub struct AppBuilder {
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
     management: Option<Management>,
-    snapshots: Option<Snapshots>,
+    pub snapshots: Option<Snapshots>,
 }
 
 impl AppBuilder {
@@ -144,7 +144,9 @@ impl AppBuilder {
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
         self.management.clone_from(&spicepod.management);
-        self.snapshots.clone_from(&spicepod.snapshots);
+        if let Some(ref snapshot) = spicepod.snapshots {
+            self.snapshots = Some(snapshot.clone());
+        };
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());

@@ -48,7 +48,6 @@ pub(crate) async fn get_app_and_start_request(
 
     let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
     let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod.clone());
-
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
             let dependent_spicepod = Spicepod::load(&dependencies_root.join(dependency)).await?;
@@ -65,11 +64,6 @@ pub(crate) async fn get_app_and_start_request(
     } else {
         start_request
     };
-
-    println!(
-        "start_request.temp_dir={:?}",
-        start_request.get_tempdir_path()
-    );
 
     Ok((app, start_request))
 }
