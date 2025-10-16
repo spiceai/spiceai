@@ -16,8 +16,8 @@ The idea behind this script is to:
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: python3 changelog.py <previous_release_tag> <release_branch>")
-        print("Example: python3 changelog.py v1.4.0 release/1.5")
+        print("Usage: python3 generate_changelog.py <previous_release_tag> <release_branch>")
+        print("Example: python3 generate_changelog.py v1.4.0 release/1.5")
         sys.exit(1)
 
     tag = sys.argv[1]
