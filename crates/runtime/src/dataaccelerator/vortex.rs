@@ -32,7 +32,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::any::Any;
-use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
@@ -76,6 +75,52 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Check if a data type is supported by Vortex
+fn is_vortex_supported_type(data_type: &DataType) -> bool {
+    match data_type {
+        // Vortex has issues with certain timestamp precisions
+        // Only Microsecond timestamps seem to work reliably
+        DataType::Timestamp(unit, _) => matches!(unit, arrow::datatypes::TimeUnit::Microsecond),
+        // Float16 is uncommon and not well supported
+        DataType::Float16 => false,
+        // Most other basic types are supported
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => true,
+        // Conservative approach: only allow explicitly supported types
+        _ => false,
+    }
+}
+
+/// Filter schema to only include Vortex-supported fields
+fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatypes::Schema {
+    let filtered_fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .filter(|field| is_vortex_supported_type(field.data_type()))
+        .cloned()
+        .collect();
+
+    arrow::datatypes::Schema::new(filtered_fields)
+}
 
 /// Wrapper around ListingTable that forces InsertOp::Append for all insert operations.
 /// This is required because Vortex doesn't support overwrites yet.
@@ -273,8 +318,20 @@ impl DataAccelerator for VortexAccelerator {
             .into());
         };
 
-        // Convert DFSchema to Arrow Schema
-        let arrow_schema: SchemaRef = Arc::new(cmd.schema.as_ref().clone().into());
+        // Convert DFSchema to Arrow Schema and filter for Vortex-supported types
+        let full_schema: arrow::datatypes::Schema = cmd.schema.as_ref().clone().into();
+        let filtered_schema = filter_schema_for_vortex(&full_schema);
+
+        // Log warning if fields were filtered out
+        let filtered_count = full_schema.fields().len() - filtered_schema.fields().len();
+        if filtered_count > 0 {
+            tracing::warn!(
+                "Filtered out {} unsupported field(s) for Vortex acceleration. Supported types are limited.",
+                filtered_count
+            );
+        }
+
+        let arrow_schema: SchemaRef = Arc::new(filtered_schema);
 
         let path_buf = PathBuf::from(&file_path);
 
@@ -327,10 +384,17 @@ impl DataAccelerator for VortexAccelerator {
                         }
                         DataType::Float32 => Arc::new(Float32Array::from(vec![0.0f32])),
                         DataType::Float64 => Arc::new(Float64Array::from(vec![0.0f64])),
-                        DataType::Timestamp(unit, tz) => Arc::new(
-                            TimestampNanosecondArray::from(vec![0i64])
-                                .with_timezone_opt(tz.clone()),
-                        ),
+                        DataType::Timestamp(unit, tz) => {
+                            // Vortex only supports Microsecond timestamps reliably
+                            match unit {
+                                arrow::datatypes::TimeUnit::Microsecond => Arc::new(
+                                    TimestampMicrosecondArray::from(vec![0i64])
+                                        .with_timezone_opt(tz.clone()),
+                                ),
+                                // This shouldn't happen since we filter the schema
+                                _ => Arc::new(NullArray::new(1)),
+                            }
+                        }
                         DataType::Date32 => Arc::new(Date32Array::from(vec![0i32])),
                         DataType::Date64 => Arc::new(Date64Array::from(vec![0i64])),
                         DataType::Time32(_) => Arc::new(Time32SecondArray::from(vec![0i32])),
