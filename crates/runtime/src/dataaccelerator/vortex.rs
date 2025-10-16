@@ -327,8 +327,9 @@ impl DataAccelerator for VortexAccelerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::acceleration::{Acceleration, Mode};
     use crate::component::dataset::builder::DatasetBuilder;
+    use app::AppBuilder;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -359,5 +360,33 @@ mod tests {
         let path = data_path.unwrap();
         assert!(path.contains("vortex_data_accelerator_test"));
         assert!(path.ends_with('/'));
+    }
+
+    #[tokio::test]
+    async fn test_vortex_memory_mode() {
+        let app = AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset =
+            DatasetBuilder::try_new("vortex_memory_test".to_string(), "vortex_memory_test")
+                .expect("Failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("Failed to build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Vortex,
+            mode: Mode::Memory,
+            ..Default::default()
+        });
+
+        let accelerator = VortexAccelerator::new();
+
+        // Memory mode should always be initialized
+        assert!(accelerator.is_initialized(&dataset));
+
+        // Init should be a no-op for memory mode
+        assert!(accelerator.init(&dataset).await.is_ok());
     }
 }

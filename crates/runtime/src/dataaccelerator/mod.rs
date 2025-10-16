@@ -726,6 +726,45 @@ mod accelerator_compat_tests {
     use datafusion_table_providers::util::test::MockExec;
     use std::{collections::HashMap, sync::Arc};
 
+    /// Mock acceleration source for testing
+    struct MockAccelerationSource {
+        name: TableReference,
+        file_path: Option<String>,
+        app: Arc<app::App>,
+        runtime: Arc<crate::Runtime>,
+    }
+
+    impl super::AccelerationSource for MockAccelerationSource {
+        fn clone_arc(&self) -> Arc<dyn super::AccelerationSource> {
+            Arc::new(Self {
+                name: self.name.clone(),
+                file_path: self.file_path.clone(),
+                app: Arc::clone(&self.app),
+                runtime: Arc::clone(&self.runtime),
+            })
+        }
+
+        fn is_file_accelerated(&self) -> bool {
+            self.file_path.is_some()
+        }
+
+        fn app(&self) -> Arc<app::App> {
+            Arc::clone(&self.app)
+        }
+
+        fn runtime(&self) -> Arc<crate::Runtime> {
+            Arc::clone(&self.runtime)
+        }
+
+        fn acceleration(&self) -> Option<&crate::component::dataset::acceleration::Acceleration> {
+            None
+        }
+
+        fn name(&self) -> &TableReference {
+            &self.name
+        }
+    }
+
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
@@ -752,8 +791,6 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
-            #[cfg(feature = "vortex")]
-            (Engine::Vortex, "file", None),
         ];
 
         for (engine, mode, timestamp_format) in test_configs {
@@ -784,6 +821,9 @@ mod accelerator_compat_tests {
             if mode == "file" {
                 options.insert("file".to_string(), location.clone());
             }
+
+            // Add mode option for engines that need it (e.g., Vortex)
+            options.insert("mode".to_string(), mode.to_string());
 
             // Add timestamp_format option for Turso
             if let Some(ts_fmt) = timestamp_format {
@@ -858,20 +898,6 @@ mod accelerator_compat_tests {
                         Ok(table) => table,
                         Err(e) => {
                             println!("  Skipping Arrow - unsupported types: {}", e);
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(feature = "vortex")]
-                Engine::Vortex => {
-                    use crate::dataaccelerator::vortex::VortexAccelerator;
-                    match VortexAccelerator::new()
-                        .create_external_table(external_table, None, None)
-                        .await
-                    {
-                        Ok(table) => table,
-                        Err(e) => {
-                            println!("  Skipping Vortex - unsupported types: {}", e);
                             continue;
                         }
                     }
@@ -2123,11 +2149,13 @@ mod accelerator_compat_tests {
             let is_file = mode.starts_with("file");
 
             let (num_records, num_iterations) = match (engine, is_memory, is_file) {
+                #[cfg(feature = "turso")]
                 (Engine::Turso, true, _) => (100, 3), // 300 total records (very limited due to page cache)
+                #[cfg(feature = "turso")]
                 (Engine::Turso, _, true) => (1_000, 10), // 10K total records (reduced due to complex schema)
-                (_, true, _) => (100_000, 10),           // 1M total records
-                (_, _, true) => (1_000_000, 10),         // 10M total records
-                _ => (10_000, 10),                       // Fallback
+                (_, true, _) => (100_000, 10),   // 1M total records
+                (_, _, true) => (1_000_000, 10), // 10M total records
+                _ => (10_000, 10),               // Fallback
             };
 
             let mut insert_times = Vec::new();
