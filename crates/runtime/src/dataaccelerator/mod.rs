@@ -958,14 +958,6 @@ mod accelerator_compat_tests {
 
             // Cleanup file if in file mode
             if mode == "file" && !location.is_empty() {
-                #[cfg(feature = "vortex")]
-                if engine == Engine::Vortex {
-                    // Vortex uses directories, not single files
-                    let _ = std::fs::remove_dir_all(&location);
-                } else {
-                    let _ = std::fs::remove_file(&location);
-                }
-                #[cfg(not(feature = "vortex"))]
                 let _ = std::fs::remove_file(&location);
             }
         }

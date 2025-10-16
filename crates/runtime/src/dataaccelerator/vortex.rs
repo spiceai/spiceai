@@ -14,31 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![cfg(feature = "vortex")]
+
+use arrow::array::*;
+use arrow::datatypes::{DataType, IntervalDayTime};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::{
-    datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable, physical_plan::ExecutionPlan,
-};
-use runtime_table_partition::expression::PartitionBy;
-use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
-
+use datafusion::common::arrow::datatypes::SchemaRef;
+use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::CreateExternalTable;
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::ExecutionPlan;
+use runtime_table_partition::expression::PartitionBy;
+use snafu::prelude::*;
+use std::any::Any;
+use std::ffi::OsStr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs::OpenOptions;
+use vortex::ArrayRef;
+use vortex::arrow::FromArrowArray;
+use vortex::file::VortexWriteOptions;
 use vortex_datafusion::VortexFormat;
 
-use crate::{
-    component::dataset::acceleration::Engine,
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
-    make_spice_data_directory,
-    parameters::ParameterSpec,
-    spice_data_base_path,
-};
-
 use super::{AccelerationSource, DataAccelerator};
+use crate::component::dataset::acceleration::Engine;
+use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
+use crate::make_spice_data_directory;
+use crate::parameters::ParameterSpec;
+use crate::spice_data_base_path;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -144,8 +152,8 @@ impl VortexAccelerator {
         }
     }
 
-    /// Returns the `Vortex` data directory path that would be used for a file-based `Vortex` accelerator from this dataset
-    pub fn vortex_data_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+    /// Returns the `Vortex` data file path that would be used for a file-based `Vortex` accelerator from this dataset
+    pub fn vortex_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
@@ -160,20 +168,14 @@ impl VortexAccelerator {
                 .replace('.', "_")
                 .replace('/', "_");
 
-            // Use vortex_data_path if provided, otherwise use default: spice_data_base_path() + dataset_name
-            let data_path =
-                if let Some(vortex_data_path) = acceleration_params.get("vortex_data_path") {
-                    vortex_data_path.clone()
-                } else {
-                    format!("{}/{}", spice_data_base_path(), dataset_name)
-                };
-
-            // Ensure the path ends with a separator for directory operations
-            if data_path.ends_with('/') {
-                Ok(data_path)
+            // Use file_path if provided, otherwise use default: spice_data_base_path() + dataset_name.vortex
+            let file_path = if let Some(custom_path) = acceleration_params.get("file_path") {
+                custom_path.clone()
             } else {
-                Ok(format!("{}/", data_path))
-            }
+                format!("{}/{}.vortex", spice_data_base_path(), dataset_name)
+            };
+
+            Ok(file_path)
         } else {
             unreachable!("Expected dataset to have acceleration parameters, but none were found")
         }
@@ -181,7 +183,7 @@ impl VortexAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("data_path"),
+    ParameterSpec::component("file_path"),
     ParameterSpec::runtime("file_watcher"),
 ];
 
@@ -200,7 +202,7 @@ impl DataAccelerator for VortexAccelerator {
     }
 
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
-        self.vortex_data_path(source)
+        self.vortex_file_path(source)
             .map_err(|err| FilePathError::External {
                 engine: Engine::Vortex,
                 source: err.into(),
@@ -212,9 +214,9 @@ impl DataAccelerator for VortexAccelerator {
             return true; // memory mode Vortex is always initialized
         }
 
-        // otherwise, we're initialized if the data directory exists
-        if let Ok(data_path) = self.file_path(source) {
-            PathBuf::from(data_path).exists()
+        // otherwise, we're initialized if the file exists
+        if let Ok(file_path) = self.file_path(source) {
+            PathBuf::from(file_path).exists()
         } else {
             false
         }
@@ -222,7 +224,7 @@ impl DataAccelerator for VortexAccelerator {
 
     /// Initializes a `Vortex` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
-    /// Creates the data directory if it doesn't exist
+    /// Creates the parent directory if it doesn't exist
     async fn init(
         &self,
         source: &dyn AccelerationSource,
@@ -231,17 +233,19 @@ impl DataAccelerator for VortexAccelerator {
             return Ok(());
         }
 
-        let data_path = self.file_path(source)?;
+        let file_path = self.file_path(source)?;
 
         // Ensure the spice data base directory exists
         make_spice_data_directory()
             .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
 
-        // Create the vortex data directory if it doesn't exist
-        let path_buf = PathBuf::from(&data_path);
-        if !path_buf.exists() {
-            std::fs::create_dir_all(&path_buf)
-                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+        // Create the parent directory if it doesn't exist
+        let path_buf = PathBuf::from(&file_path);
+        if let Some(parent) = path_buf.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+            }
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -252,67 +256,194 @@ impl DataAccelerator for VortexAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    /// Vortex only supports file mode and requires a data directory.
+    /// Vortex only supports file mode and creates an empty file with the given schema.
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         _partition_by: Option<PartitionBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        #[cfg(feature = "vortex")]
-        {
-            // Vortex only supports file mode with a data directory
-            let data_path = if let Some(src) = source {
-                self.file_path(src)?
-            } else {
-                return Err(Error::InvalidConfiguration {
-                    detail: Arc::from("Source required for Vortex accelerator"),
-                }
-                .into());
-            };
+        // Vortex only supports file mode
+        let file_path = if let Some(src) = source {
+            self.file_path(src)?
+        } else {
+            return Err(Error::InvalidConfiguration {
+                detail: Arc::from("Source required for Vortex accelerator"),
+            }
+            .into());
+        };
 
-            // Ensure the data directory exists
-            let path_buf = PathBuf::from(&data_path);
-            if !path_buf.exists() {
-                std::fs::create_dir_all(&path_buf)
+        // Convert DFSchema to Arrow Schema
+        let arrow_schema: SchemaRef = Arc::new(cmd.schema.as_ref().clone().into());
+
+        let path_buf = PathBuf::from(&file_path);
+
+        // Ensure the parent directory exists
+        if let Some(parent) = path_buf.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
             }
+        }
 
-            let ctx = SessionContext::new();
-            let format = Arc::new(VortexFormat::default());
-            let table_url = ListingTableUrl::parse(&data_path).map_err(|e| {
+        // Always delete the existing file if it exists, since we only support append
+        // and need to start fresh with a new dummy file
+        if path_buf.exists() {
+            tokio::fs::remove_file(&path_buf)
+                .await
+                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+        }
+
+        // Create a Vortex file with 1 row of dummy data
+        // This is required because Vortex needs at least EOF_SIZE (8) bytes
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(&path_buf)
+                .await
+                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+
+            // Create arrays with 1 row of dummy data for each field
+            let columns: Vec<Arc<dyn arrow::array::Array>> = arrow_schema
+                .fields()
+                .iter()
+                .map(|field| -> Arc<dyn arrow::array::Array> {
+                    match field.data_type() {
+                        DataType::Null => Arc::new(NullArray::new(1)),
+                        DataType::Boolean => Arc::new(BooleanArray::from(vec![false])),
+                        DataType::Int8 => Arc::new(Int8Array::from(vec![0i8])),
+                        DataType::Int16 => Arc::new(Int16Array::from(vec![0i16])),
+                        DataType::Int32 => Arc::new(Int32Array::from(vec![0i32])),
+                        DataType::Int64 => Arc::new(Int64Array::from(vec![0i64])),
+                        DataType::UInt8 => Arc::new(UInt8Array::from(vec![0u8])),
+                        DataType::UInt16 => Arc::new(UInt16Array::from(vec![0u16])),
+                        DataType::UInt32 => Arc::new(UInt32Array::from(vec![0u32])),
+                        DataType::UInt64 => Arc::new(UInt64Array::from(vec![0u64])),
+                        DataType::Float16 => {
+                            // Float16 is uncommon, use null for simplicity
+                            Arc::new(NullArray::new(1))
+                        }
+                        DataType::Float32 => Arc::new(Float32Array::from(vec![0.0f32])),
+                        DataType::Float64 => Arc::new(Float64Array::from(vec![0.0f64])),
+                        DataType::Timestamp(unit, tz) => Arc::new(
+                            TimestampNanosecondArray::from(vec![0i64])
+                                .with_timezone_opt(tz.clone()),
+                        ),
+                        DataType::Date32 => Arc::new(Date32Array::from(vec![0i32])),
+                        DataType::Date64 => Arc::new(Date64Array::from(vec![0i64])),
+                        DataType::Time32(_) => Arc::new(Time32SecondArray::from(vec![0i32])),
+                        DataType::Time64(_) => Arc::new(Time64NanosecondArray::from(vec![0i64])),
+                        DataType::Duration(_) => {
+                            Arc::new(DurationNanosecondArray::from(vec![0i64]))
+                        }
+                        DataType::Interval(_) => {
+                            Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(0, 0)]))
+                        }
+                        DataType::Binary => Arc::new(BinaryArray::from_vec(vec![b""])),
+                        DataType::FixedSizeBinary(size) => {
+                            Arc::new(FixedSizeBinaryArray::from(vec![
+                                vec![0u8; *size as usize].as_slice(),
+                            ]))
+                        }
+                        DataType::LargeBinary => Arc::new(LargeBinaryArray::from_vec(vec![b""])),
+                        DataType::Utf8 => Arc::new(StringArray::from(vec![""])),
+                        DataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![""])),
+                        DataType::Decimal128(precision, scale) => Arc::new(
+                            Decimal128Array::from(vec![0i128])
+                                .with_precision_and_scale(*precision, *scale)
+                                .unwrap(),
+                        ),
+                        DataType::Decimal256(precision, scale) => Arc::new(
+                            Decimal256Array::from(vec![arrow::datatypes::i256::from_i128(0)])
+                                .with_precision_and_scale(*precision, *scale)
+                                .unwrap(),
+                        ),
+                        DataType::List(field) => {
+                            let value_builder = match field.data_type() {
+                                DataType::Int32 => {
+                                    Box::new(Int32Array::builder(0)) as Box<dyn ArrayBuilder>
+                                }
+                                _ => Box::new(Int32Array::builder(0)) as Box<dyn ArrayBuilder>,
+                            };
+                            let mut builder = ListBuilder::new(value_builder);
+                            builder.append(true);
+                            Arc::new(builder.finish())
+                        }
+                        DataType::Struct(fields) => {
+                            let field_arrays: Vec<Arc<dyn arrow::array::Array>> = fields
+                                .iter()
+                                .map(|_| {
+                                    Arc::new(Int32Array::from(vec![0i32]))
+                                        as Arc<dyn arrow::array::Array>
+                                })
+                                .collect();
+                            Arc::new(StructArray::new(fields.clone(), field_arrays, None))
+                        }
+                        _ => {
+                            // For unsupported types, use a null array
+                            Arc::new(NullArray::new(1))
+                        }
+                    }
+                })
+                .collect();
+
+            // Create the record batch with 1 row
+            let dummy_batch = RecordBatch::try_new(arrow_schema.clone(), columns).map_err(|e| {
                 Error::AccelerationCreationFailed {
                     source: Box::new(e),
                 }
             })?;
 
-            // Use the schema from the command instead of trying to infer from a potentially non-existent file
-            // Convert DFSchema to Arrow Schema
-            let arrow_schema: Arc<arrow::datatypes::Schema> =
-                Arc::new(cmd.schema.as_ref().clone().into());
-            let config = ListingTableConfig::new(table_url)
-                .with_listing_options(
-                    ListingOptions::new(format).with_session_config_options(ctx.state().config()),
-                )
-                .with_schema(arrow_schema);
+            // Convert Arrow RecordBatch to Vortex Array
+            let vortex_array = ArrayRef::from_arrow(&dummy_batch, false);
 
-            let listing_table =
-                ListingTable::try_new(config).map_err(|e| Error::AccelerationCreationFailed {
-                    source: Box::new(e),
+            // Write the dummy batch using VortexWriteOptions
+            VortexWriteOptions::default()
+                .write(&mut file, vortex_array.to_array_stream())
+                .await
+                .map_err(|e| Error::AccelerationCreationFailed {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to write Vortex file: {}", e),
+                    )),
                 })?;
-
-            // Wrap in VortexTableProvider to force InsertOp::Append
-            let wrapped_table = VortexTableProvider {
-                inner: Arc::new(listing_table),
-            };
-
-            Ok(Arc::new(wrapped_table))
         }
 
-        #[cfg(not(feature = "vortex"))]
-        {
-            Err(Error::FeatureNotEnabled.into())
-        }
+        let ctx = SessionContext::new();
+        let format = Arc::new(VortexFormat::default());
+        let table_url = ListingTableUrl::parse(path_buf.to_str().ok_or_else(|| {
+            Error::InvalidConfiguration {
+                detail: Arc::from("Path is not valid UTF-8"),
+            }
+        })?)
+        .map_err(|e| Error::AccelerationCreationFailed {
+            source: Box::new(e),
+        })?;
+
+        // Infer schema from the created file
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(
+                ListingOptions::new(format).with_session_config_options(ctx.state().config()),
+            )
+            .infer_schema(&ctx.state())
+            .await
+            .map_err(|e| Error::AccelerationCreationFailed {
+                source: Box::new(e),
+            })?;
+
+        let listing_table =
+            ListingTable::try_new(config).map_err(|e| Error::AccelerationCreationFailed {
+                source: Box::new(e),
+            })?;
+
+        // Wrap in VortexTableProvider to force InsertOp::Append
+        let wrapped_table = VortexTableProvider {
+            inner: Arc::new(listing_table),
+        };
+
+        Ok(Arc::new(wrapped_table))
     }
 
     fn prefix(&self) -> &'static str {
@@ -333,8 +464,8 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_vortex_data_path_generation() {
-        let app = AppBuilder::new("test").build();
+    async fn test_vortex_file_path_generation() {
+        let app = crate::app::AppBuilder::new("test").build();
         let rt = crate::Runtime::builder().build().await;
 
         let mut dataset = DatasetBuilder::try_new(
@@ -354,12 +485,12 @@ mod tests {
         });
 
         let accelerator = VortexAccelerator::new();
-        let data_path = accelerator.vortex_data_path(&dataset);
+        let file_path = accelerator.vortex_file_path(&dataset);
 
-        assert!(data_path.is_ok());
-        let path = data_path.unwrap();
+        assert!(file_path.is_ok());
+        let path = file_path.unwrap();
         assert!(path.contains("vortex_data_accelerator_test"));
-        assert!(path.ends_with('/'));
+        assert!(path.ends_with(".vortex"));
     }
 
     #[tokio::test]
