@@ -334,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vortex_data_path_generation() {
-        let app = crate::app::AppBuilder::new("test").build();
+        let app = AppBuilder::new("test").build();
         let rt = crate::Runtime::builder().build().await;
 
         let mut dataset = DatasetBuilder::try_new(

@@ -702,7 +702,7 @@ mod accelerator_compat_tests {
     //! Shared compatibility test suite for data accelerators.
     //! These tests ensure accelerators behave consistently for common operations.
 
-    use crate::component::dataset::acceleration::Engine;
+    use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
     use crate::dataaccelerator::DataAccelerator;
     use ::arrow::{
         array::{
@@ -732,6 +732,7 @@ mod accelerator_compat_tests {
         file_path: Option<String>,
         app: Arc<app::App>,
         runtime: Arc<crate::Runtime>,
+        acceleration: Acceleration,
     }
 
     impl super::AccelerationSource for MockAccelerationSource {
@@ -741,6 +742,7 @@ mod accelerator_compat_tests {
                 file_path: self.file_path.clone(),
                 app: Arc::clone(&self.app),
                 runtime: Arc::clone(&self.runtime),
+                acceleration: self.acceleration.clone(),
             })
         }
 
@@ -757,7 +759,7 @@ mod accelerator_compat_tests {
         }
 
         fn acceleration(&self) -> Option<&crate::component::dataset::acceleration::Acceleration> {
-            None
+            Some(&self.acceleration)
         }
 
         fn name(&self) -> &TableReference {
@@ -791,6 +793,8 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
+            #[cfg(feature = "vortex")]
+            (Engine::Vortex, "file", None), // Vortex only supports file mode
         ];
 
         for (engine, mode, timestamp_format) in test_configs {
@@ -898,6 +902,59 @@ mod accelerator_compat_tests {
                         Ok(table) => table,
                         Err(e) => {
                             println!("  Skipping Arrow - unsupported types: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(feature = "vortex")]
+                Engine::Vortex => {
+                    use crate::dataaccelerator::vortex::VortexAccelerator;
+                    // Create mock source for Vortex (it needs a source to get the file path)
+                    let test_app_obj = app::AppBuilder::new("test").build();
+                    let test_app = Arc::new(test_app_obj.clone());
+                    let test_runtime = Arc::new(
+                        crate::Runtime::builder()
+                            .with_app(test_app_obj)
+                            .build()
+                            .await,
+                    );
+
+                    // Create acceleration config with Vortex settings
+                    let mut params = HashMap::new();
+                    if mode == "file" {
+                        // For file mode, the vortex_data_path will be derived from the file_path
+                        // We don't need to set it explicitly as the vortex_data_path() method will use file_path
+                    }
+                    let acceleration_config = Acceleration {
+                        enabled: true,
+                        mode: if mode == "file" {
+                            Mode::File
+                        } else {
+                            Mode::Memory
+                        },
+                        engine: Engine::Vortex,
+                        params,
+                        ..Acceleration::default()
+                    };
+
+                    let mock_source = MockAccelerationSource {
+                        name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
+                        file_path: if mode == "file" {
+                            Some(location.clone())
+                        } else {
+                            None
+                        },
+                        app: test_app,
+                        runtime: test_runtime,
+                        acceleration: acceleration_config,
+                    };
+                    match VortexAccelerator::new()
+                        .create_external_table(external_table, Some(&mock_source), None)
+                        .await
+                    {
+                        Ok(table) => table,
+                        Err(e) => {
+                            println!("  Skipping Vortex - unsupported types: {}", e);
                             continue;
                         }
                     }
