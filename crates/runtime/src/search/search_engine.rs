@@ -492,8 +492,7 @@ impl QueryEngine for DatafusionQueryEngine {
                     .boxed()
                     .map_err(DataFusionError::External)
                 {
-                    Ok(e) => e,  // Internal DataFusionError
-                    Err(e) => e, // Constructed `DataFusionError::External`.
+                    Ok(e) | Err(e) => e,
                 }
             })?
             .data)

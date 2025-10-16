@@ -393,8 +393,9 @@ impl TableFunctionImpl for VectorSearchTableFunc {
                 )));
             };
 
-            // let request_context = RequestContext::current(AsyncMarker::new().await);
-            // telemetry::track_vector_search(&request_context.to_dimensions());
+            // Unsafe: worse case is metric without dimensions.
+            let dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
+            telemetry::track_vector_search(&dimensions);
             let pks = self
                 .explicit_pks
                 .get(&args.tbl)
@@ -639,9 +640,7 @@ fn alias_value_to_match(
     tbl: Arc<dyn TableProvider>,
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
     let bldr = LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(tbl)), None)?;
-    let cols = bldr
-        .schema()
-        .clone()
+    let cols = Arc::clone(bldr.schema())
         .columns()
         .into_iter()
         .map(|c| {

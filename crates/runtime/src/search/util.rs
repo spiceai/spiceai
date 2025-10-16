@@ -313,7 +313,7 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     #[tokio::test]
     async fn test_find_concrete_table_provider_direct_match() {
@@ -324,8 +324,8 @@ mod tests {
         assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
     }
 
-    #[tokio::test]
-    async fn test_find_concrete_table_provider_wrapped_in_full_text() {
+    #[test]
+    fn test_find_concrete_table_provider_wrapped_in_full_text() {
         let base_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(
                 Arc::new(Schema::new(vec![Field::new(
@@ -346,7 +346,6 @@ mod tests {
                 None,
                 &[],
             )
-            .await
             .expect("cannot make full text table"),
         );
 
