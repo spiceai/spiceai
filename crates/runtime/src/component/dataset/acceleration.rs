@@ -137,6 +137,7 @@ pub enum Engine {
     PartitionedDuckDB,
     Sqlite,
     PostgreSQL,
+    Vortex,
 }
 
 impl Display for Engine {
@@ -146,6 +147,7 @@ impl Display for Engine {
             Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Vortex => write!(f, "vortex"),
         }
     }
 }
@@ -159,6 +161,7 @@ impl TryFrom<&str> for Engine {
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "vortex" => Ok(Engine::Vortex),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
