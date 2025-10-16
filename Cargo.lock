@@ -1960,7 +1960,7 @@ checksum = "d89aabfae550a5c44b43ab941844ffcd2e993cb6900b342debf59e9ea74acdb8"
 dependencies = [
  "async-trait",
  "futures-util",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "tokio",
 ]
 
@@ -1971,7 +1971,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "212d8b8e1a22743d9241575c6ba822cf9c8fef34771c86ab7e477a4fbfd254e5"
 dependencies = [
  "futures-util",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "tokio",
 ]
 
@@ -3403,7 +3403,7 @@ dependencies = [
  "crossterm_winapi",
  "libc",
  "mio 0.8.11",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "signal-hook",
  "signal-hook-mio",
  "winapi",
@@ -3712,7 +3712,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "lock_api",
  "once_cell",
- "parking_lot_core 0.9.11",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -3857,7 +3857,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "object_store",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "parquet",
  "rand 0.9.2",
  "regex",
@@ -3891,7 +3891,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "object_store",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "tokio",
 ]
 
@@ -4061,7 +4061,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "object_store",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "parquet",
  "rand 0.9.2",
  "tokio",
@@ -4084,7 +4084,7 @@ dependencies = [
  "futures",
  "log",
  "object_store",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "rand 0.9.2",
  "tempfile",
  "url",
@@ -4239,7 +4239,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-physical-plan",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "paste",
 ]
 
@@ -4375,7 +4375,7 @@ dependencies = [
  "indexmap 2.11.4",
  "itertools 0.14.0",
  "log",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "tokio",
 ]
@@ -4416,7 +4416,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "object_store",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "tokio",
 ]
 
@@ -6093,7 +6093,7 @@ dependencies = [
  "getrandom 0.3.3",
  "hashbrown 0.15.3",
  "nonzero_ext",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "portable-atomic",
  "quanta",
  "rand 0.9.2",
@@ -6115,7 +6115,7 @@ dependencies = [
  "graph-error",
  "http 1.3.1",
  "jsonwebtoken",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "remain",
  "reqwest",
@@ -6553,7 +6553,7 @@ dependencies = [
  "ipconfig",
  "lru-cache",
  "once_cell",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "rand 0.8.5",
  "resolv-conf",
  "smallvec",
@@ -8162,11 +8162,10 @@ dependencies = [
 
 [[package]]
 name = "lock_api"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96936507f153605bddfcda068dd804796c84324ed2510809e5b2a624c81da765"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
- "autocfg",
  "scopeguard",
 ]
 
@@ -8767,7 +8766,7 @@ dependencies = [
  "objc",
  "once_cell",
  "ordered-float 5.0.0",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "radix_trie",
  "rand 0.9.2",
  "rand_distr 0.5.1",
@@ -8932,7 +8931,7 @@ dependencies = [
  "equivalent",
  "event-listener 5.4.0",
  "futures-util",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "portable-atomic",
  "rustc_version",
  "smallvec",
@@ -9839,7 +9838,7 @@ dependencies = [
  "hyper 1.7.0",
  "itertools 0.14.0",
  "md-5",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "quick-xml 0.38.0",
  "rand 0.9.2",
@@ -9942,7 +9941,7 @@ version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 dependencies = [
- "parking_lot_core 0.9.11",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -10392,12 +10391,12 @@ dependencies = [
 
 [[package]]
 name = "parking_lot"
-version = "0.12.4"
+version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70d58bf43669b5795d1576d0641cfb6fbb2057bf629506267a92807158584a13"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
  "lock_api",
- "parking_lot_core 0.9.11",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -10416,15 +10415,15 @@ dependencies = [
 
 [[package]]
 name = "parking_lot_core"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc838d2a56b5b1a6c25f55575dfc605fabb63bb2365f6c2353ef9159aa69e4a5"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.12",
  "smallvec",
- "windows-targets 0.52.6",
+ "windows-link 0.2.0",
 ]
 
 [[package]]
@@ -11065,7 +11064,7 @@ dependencies = [
  "fnv",
  "lazy_static",
  "memchr",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "protobuf",
  "thiserror 1.0.69",
 ]
@@ -11517,7 +11516,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51de85fb3fb6524929c8a2eb85e6b6d363de4e8c48f9e2c2eac4944abc181c93"
 dependencies = [
  "log",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "scheduled-thread-pool",
 ]
 
@@ -12661,7 +12660,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "futures",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "runtime-datafusion-udfs",
  "serde",
  "snafu",
@@ -13114,7 +13113,7 @@ version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3cbc66816425a074528352f5789333ecff06ca41b36b0b0efdfbb29edc391a19"
 dependencies = [
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -13889,7 +13888,7 @@ dependencies = [
  "arrow",
  "arrow-ipc",
  "chrono",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "prost 0.13.5",
  "prost-types 0.13.5",
  "rand 0.8.5",
@@ -14153,7 +14152,7 @@ dependencies = [
  "bitflags 2.9.1",
  "libc",
  "libssh2-sys",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -14232,7 +14231,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
 dependencies = [
  "new_debug_unreachable",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "phf_shared 0.11.3",
  "precomputed-hash",
  "serde",
@@ -15167,7 +15166,7 @@ dependencies = [
  "bstr",
  "fancy-regex 0.13.0",
  "lazy_static",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "regex",
  "rustc-hash 1.1.0",
 ]
@@ -15319,7 +15318,7 @@ dependencies = [
  "io-uring",
  "libc",
  "mio 1.0.4",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "slab",
@@ -15374,7 +15373,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "log",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "phf 0.13.1",
  "pin-project-lite",
@@ -15864,7 +15863,7 @@ dependencies = [
  "nom-language",
  "num-integer",
  "num-traits",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "scan_fmt",
  "smallvec",
  "string-interner",
@@ -16013,7 +16012,7 @@ dependencies = [
  "ipconfig",
  "lru-cache",
  "once_cell",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "rand 0.8.5",
  "resolv-conf",
  "smallvec",
@@ -16670,7 +16669,7 @@ dependencies = [
  "multiversion",
  "num-traits",
  "num_enum",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "paste",
  "pin-project",
  "prost 0.14.1",
@@ -16883,7 +16882,7 @@ dependencies = [
  "arcref",
  "dyn-hash",
  "itertools 0.14.0",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "paste",
  "prost 0.14.1",
  "termtree",
@@ -17047,7 +17046,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "once_cell",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "paste",
  "pco",
  "pin-project-lite",
@@ -17088,7 +17087,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f09bc89d17fa0647ffdb36be8d9cbc80a9b46656f10458776584b8ec408c6aa1"
 dependencies = [
  "getrandom 0.3.3",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "witchcraft-metrics",
 ]
 
@@ -17171,7 +17170,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "sketches-ddsketch",
  "tokio",
  "vortex-array",
@@ -18080,7 +18079,7 @@ checksum = "867a74dec702d742179279ab0b5bcab72ca5858c0c3ccf870bdb5c99f54d675b"
 dependencies = [
  "exponential-decay-histogram",
  "once_cell",
- "parking_lot 0.12.4",
+ "parking_lot 0.12.5",
  "serde",
  "serde-value",
 ]
