@@ -132,7 +132,7 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
             if !is_vortex_supported_type(field.data_type()) {
                 return None;
             }
-            
+
             // Convert Float16 to Float32
             if matches!(field.data_type(), DataType::Float16) {
                 tracing::warn!(
@@ -145,7 +145,7 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
                     field.is_nullable(),
                 )));
             }
-            
+
             // Convert non-Microsecond timestamps to Microsecond
             if let DataType::Timestamp(unit, tz) = field.data_type() {
                 if !matches!(unit, arrow::datatypes::TimeUnit::Microsecond) {
@@ -161,7 +161,7 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
                     )));
                 }
             }
-            
+
             Some(field.clone())
         })
         .collect();
@@ -304,9 +304,9 @@ impl DataSink for VortexDataSink {
                     batches.into_iter().next().unwrap()
                 } else {
                     arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(|e| {
-                        datafusion::error::DataFusionError::External(Box::new(std::io::Error::other(
-                            format!("Failed to concatenate batches: {}", e),
-                        )))
+                        datafusion::error::DataFusionError::External(Box::new(
+                            std::io::Error::other(format!("Failed to concatenate batches: {}", e)),
+                        ))
                     })?
                 };
 
@@ -515,10 +515,7 @@ impl VortexAccelerator {
             let acceleration_params = acceleration.params.clone();
 
             // Get the sanitized dataset name
-            let dataset_name = source
-                .name()
-                .to_string()
-                .replace(['.', '/'], "_");
+            let dataset_name = source.name().to_string().replace(['.', '/'], "_");
 
             // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
             let dir_path = if let Some(custom_path) = acceleration_params.get("file_path") {
