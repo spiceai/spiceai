@@ -32,9 +32,8 @@ use std::sync::Arc;
 use vortex_datafusion::VortexFormat;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::Engine;
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
-use crate::make_spice_data_directory;
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 
@@ -178,7 +177,7 @@ impl VortexAccelerator {
             let dataset_name = source.name().to_string().replace(['.', '/'], "_");
 
             // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
-            let dir_path = if let Some(custom_path) = acceleration_params.get("file_path") {
+            let dir_path = if let Some(custom_path) = acceleration_params.get("vortex_file_path") {
                 custom_path.clone()
             } else {
                 format!("{}/{}", spice_data_base_path(), dataset_name)
@@ -330,10 +329,6 @@ impl DataAccelerator for VortexAccelerator {
 
         let dir_path = self.file_path(source)?;
 
-        // Ensure the spice data base directory exists
-        make_spice_data_directory()
-            .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
         if !path_buf.exists() {
@@ -369,6 +364,15 @@ impl DataAccelerator for VortexAccelerator {
                 detail: Arc::from("Source required for Vortex accelerator"),
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
+
+        if let Some(accel) = source.acceleration()
+            && accel.refresh_mode.unwrap_or(RefreshMode::Full) != RefreshMode::Append
+        {
+            tracing::warn!("Vortex data accelerator only supports `append` refresh mode.");
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from("Vortex data accelerator only supports `append` refresh mode"),
+            }));
+        }
 
         let (dir_path, _target_file_size_bytes) = self.resolve_storage_config(source).boxed()?;
 
