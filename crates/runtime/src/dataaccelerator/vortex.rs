@@ -25,13 +25,19 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::DisplayAs;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::metrics::MetricsSet;
+use futures::StreamExt;
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::any::Any;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
@@ -122,11 +128,178 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
     arrow::datatypes::Schema::new(filtered_fields)
 }
 
-/// Wrapper around ListingTable that forces InsertOp::Append for all insert operations.
-/// This is required because Vortex doesn't support overwrites yet.
+/// Custom data sink for streaming Vortex writes with optimized async I/O
+///
+/// This implementation provides significant performance improvements over the default
+/// ListingTable insert mechanism:
+///
+/// 1. **Async I/O**: Uses `tokio::fs::OpenOptions` for non-blocking file operations
+///    instead of synchronous I/O that can block the runtime.
+///
+/// 2. **Parallel Writes**: Spawns up to MAX_PARALLEL_WRITES concurrent write tasks,
+///    allowing multiple batches to be written simultaneously. This maximizes throughput
+///    by utilizing available I/O bandwidth and CPU cores.
+///
+/// 3. **Streaming Processing**: Processes record batches as they arrive from the stream
+///    without buffering all data in memory, reducing memory pressure during large imports.
+///
+/// 4. **Backpressure Management**: Limits concurrent writes to avoid overwhelming the I/O
+///    subsystem while still maintaining high throughput.
+#[derive(Debug, Clone)]
+struct VortexDataSink {
+    dir_path: String,
+    schema: SchemaRef,
+}
+
+impl VortexDataSink {
+    fn new(dir_path: String, schema: SchemaRef) -> Self {
+        Self { dir_path, schema }
+    }
+}
+
+impl DisplayAs for VortexDataSink {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        write!(f, "VortexDataSink(dir={})", self.dir_path)
+    }
+}
+
+#[async_trait]
+impl DataSink for VortexDataSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::error::Result<u64> {
+        let mut total_rows = 0u64;
+        let mut file_counter = 0usize;
+
+        // Buffer to collect multiple write tasks for parallel execution
+        let mut write_tasks = Vec::new();
+        const MAX_PARALLEL_WRITES: usize = 4; // Limit concurrent writes to avoid overwhelming I/O
+
+        // Process batches in a streaming fashion using async I/O with parallelism
+        while let Some(batch_result) = data.next().await {
+            let batch = batch_result?;
+            let num_rows = batch.num_rows() as u64;
+
+            if num_rows == 0 {
+                continue;
+            }
+
+            // Generate unique filename for this batch
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let filename = format!("data_{}_{}_{}.vortex", timestamp, file_counter, num_rows);
+            file_counter += 1;
+
+            let file_path = PathBuf::from(&self.dir_path).join(&filename);
+            let dir_path_clone = self.dir_path.clone();
+
+            // Spawn write task to run in parallel
+            let write_task = tokio::spawn(async move {
+                // Open file for writing with async I/O
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&file_path)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+                // Convert Arrow RecordBatch to Vortex Array
+                let vortex_array = ArrayRef::from_arrow(&batch, false);
+
+                // Write using async I/O with VortexWriteOptions
+                VortexWriteOptions::default()
+                    .write(&mut file, vortex_array.to_array_stream())
+                    .await
+                    .map_err(|e| {
+                        datafusion::error::DataFusionError::External(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to write Vortex file: {}", e),
+                        )))
+                    })?;
+
+                Ok::<(u64, String), datafusion::error::DataFusionError>((num_rows, dir_path_clone))
+            });
+
+            write_tasks.push(write_task);
+            total_rows += num_rows;
+
+            // Wait for some tasks to complete if we've reached the parallelism limit
+            if write_tasks.len() >= MAX_PARALLEL_WRITES {
+                // Wait for the oldest task to complete
+                if let Some(task) = write_tasks.first_mut() {
+                    match task.await {
+                        Ok(Ok((rows, dir))) => {
+                            tracing::trace!("Vortex: wrote {} rows to {}", rows, dir);
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(datafusion::error::DataFusionError::External(Box::new(e)));
+                        }
+                    }
+                    write_tasks.remove(0);
+                }
+            }
+
+            // Log progress periodically
+            if file_counter % 10 == 0 {
+                tracing::debug!(
+                    "Vortex: queued {} batches, {} total rows to {}",
+                    file_counter,
+                    total_rows,
+                    self.dir_path
+                );
+            }
+        }
+
+        // Wait for all remaining write tasks to complete
+        for task in write_tasks {
+            match task.await {
+                Ok(Ok((rows, dir))) => {
+                    tracing::trace!("Vortex: wrote {} rows to {}", rows, dir);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(datafusion::error::DataFusionError::External(Box::new(e))),
+            }
+        }
+
+        tracing::info!(
+            "Vortex: completed writing {} batches, {} total rows to {}",
+            file_counter,
+            total_rows,
+            self.dir_path
+        );
+
+        Ok(total_rows)
+    }
+}
+
+/// Wrapper around ListingTable that uses custom VortexDataSink for efficient streaming writes.
+/// This is required for better performance with async I/O and to handle append operations properly.
 #[derive(Debug)]
 struct VortexTableProvider {
     inner: Arc<ListingTable>,
+    dir_path: String,
 }
 
 #[async_trait]
@@ -155,27 +328,31 @@ impl TableProvider for VortexTableProvider {
 
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // Force all insert operations to use Append, since Vortex doesn't support overwrites yet
-        let insert_op = match overwrite {
-            InsertOp::Append => InsertOp::Append,
+        // Log warnings for unsupported operations
+        match overwrite {
+            InsertOp::Append => {}
             InsertOp::Overwrite => {
                 tracing::warn!(
                     "Vortex does not support overwrite operations yet, using append instead"
                 );
-                InsertOp::Append
             }
             InsertOp::Replace => {
                 tracing::warn!(
                     "Vortex does not support replace operations yet, using append instead"
                 );
-                InsertOp::Append
             }
         };
-        self.inner.insert_into(state, input, insert_op).await
+
+        // Use custom VortexDataSink for efficient async streaming writes
+        let sink = Arc::new(VortexDataSink::new(self.dir_path.clone(), self.schema()));
+
+        Ok(Arc::new(DataSinkExec::new(
+            input, sink, None, // No count schema
+        )))
     }
 }
 
@@ -510,9 +687,10 @@ impl DataAccelerator for VortexAccelerator {
                 source: Box::new(e),
             })?;
 
-        // Wrap in VortexTableProvider to force InsertOp::Append
+        // Wrap in VortexTableProvider with custom data sink for efficient streaming writes
         let wrapped_table = VortexTableProvider {
             inner: Arc::new(listing_table),
+            dir_path: dir_path.clone(),
         };
 
         Ok(Arc::new(wrapped_table))
