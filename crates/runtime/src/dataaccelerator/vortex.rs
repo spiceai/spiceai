@@ -32,7 +32,7 @@ use std::sync::Arc;
 use vortex_datafusion::VortexFormat;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::Engine;
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
@@ -95,6 +95,7 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
             | DataType::LargeUtf8
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
+            | DataType::List(_)
     )
 }
 
@@ -196,28 +197,11 @@ impl VortexAccelerator {
         }
     }
 
-    fn resolve_storage_config(&self, source: &dyn AccelerationSource) -> Result<(String, usize)> {
-        let path = self
-            .file_path(source)
+    fn resolve_storage_config(&self, source: &dyn AccelerationSource) -> Result<String> {
+        self.file_path(source)
             .map_err(|err| Error::AccelerationCreationFailed {
                 source: Box::new(err),
-            })?;
-
-        let target_file_size_mb = source
-            .acceleration()
-            .and_then(|accel| accel.params.get("target_file_size_mb"))
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(512);
-
-        let target_size_bytes = target_file_size_mb * 1024 * 1024;
-
-        tracing::trace!(
-            "Vortex: configured target file size: {}MB ({}bytes)",
-            target_file_size_mb,
-            target_size_bytes
-        );
-
-        Ok((path, target_size_bytes))
+            })
     }
 
     fn filtered_arrow_schema(cmd: &CreateExternalTable) -> (SchemaRef, usize) {
@@ -272,8 +256,6 @@ impl VortexAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path"),
     ParameterSpec::runtime("file_watcher"),
-    ParameterSpec::runtime("target_file_size_mb")
-        .description("Target size in MB for each Vortex file before flushing (default: 512MB)"),
 ];
 
 #[async_trait]
@@ -324,7 +306,42 @@ impl DataAccelerator for VortexAccelerator {
         );
 
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Vortex data accelerator only supports file mode. Please configure the accelerator with mode: file",
+                ),
+            }));
+        }
+
+        // Validate refresh_mode - only append is supported
+        if let Some(acceleration) = source.acceleration() {
+            if let Some(refresh_mode) = acceleration.refresh_mode
+                && refresh_mode != RefreshMode::Append
+            {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Vortex data accelerator currently only supports append refresh mode, but {refresh_mode:?} was specified. Please set refresh_mode: append"
+                    )),
+                }));
+            }
+
+            // Validate that retention_sql is not specified
+            if acceleration.retention_sql.is_some() {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Vortex data accelerator does not yet support retention_sql. Please remove this configuration",
+                    ),
+                }));
+            }
+
+            // Validate that refresh_append_overlap is not specified
+            if acceleration.refresh_append_overlap.is_some() {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Vortex data accelerator does not yet support refresh_append_overlap. Please remove this configuration",
+                    ),
+                }));
+            }
         }
 
         let dir_path = self.file_path(source)?;
@@ -365,7 +382,7 @@ impl DataAccelerator for VortexAccelerator {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        let (dir_path, _target_file_size_bytes) = self.resolve_storage_config(source).boxed()?;
+        let dir_path = self.resolve_storage_config(source).boxed()?;
 
         let (arrow_schema, filtered_count) = Self::filtered_arrow_schema(&cmd);
 
@@ -430,33 +447,5 @@ mod tests {
         };
         assert!(dir_path.contains("vortex_data_accelerator_test"));
         assert!(dir_path.ends_with('/'));
-    }
-
-    #[tokio::test]
-    async fn test_vortex_memory_mode() {
-        let app = AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-
-        let mut dataset =
-            DatasetBuilder::try_new("vortex_memory_test".to_string(), "vortex_memory_test")
-                .expect("Failed to create builder")
-                .with_app(Arc::new(app))
-                .with_runtime(Arc::new(rt))
-                .build()
-                .expect("Failed to build dataset");
-
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::Vortex,
-            mode: Mode::Memory,
-            ..Default::default()
-        });
-
-        let accelerator = VortexAccelerator::new();
-
-        // Memory mode should always be initialized
-        assert!(accelerator.is_initialized(&dataset));
-
-        // Init should be a no-op for memory mode
-        assert!(accelerator.init(&dataset).await.is_ok());
     }
 }
