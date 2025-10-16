@@ -2340,10 +2340,245 @@ mod accelerator_compat_tests {
         .await;
     }
 
+    // Helper function to format duration in a compact way
+    fn format_duration_compact(d: std::time::Duration) -> String {
+        let micros = d.as_micros();
+        if micros < 1_000 {
+            format!("{}µs", micros)
+        } else if micros < 1_000_000 {
+            format!("{:.2}ms", micros as f64 / 1_000.0)
+        } else {
+            format!("{:.2}s", d.as_secs_f64())
+        }
+    }
+
+    // Helper function to print comparison table
+    fn print_comparison_table(results: &[BenchmarkResults]) {
+        if results.is_empty() {
+            return;
+        }
+
+        println!("\n");
+        println!(
+            "╔════════════════════════════════════════════════════════════════════════════════════════════╗"
+        );
+        println!(
+            "║                          BENCHMARK COMPARISON TABLE                                        ║"
+        );
+        println!(
+            "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+        );
+
+        // Group results by mode for easier comparison
+        let mut by_mode: HashMap<String, Vec<&BenchmarkResults>> = HashMap::new();
+        for result in results {
+            by_mode.entry(result.mode.clone()).or_default().push(result);
+        }
+
+        for (mode, mode_results) in by_mode {
+            println!("║ Mode: {:<84} ║", mode);
+            println!(
+                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+            );
+
+            // Print header with engine names
+            print!("║ {:20}", "Metric");
+            for result in mode_results.iter() {
+                print!(" │ {:>15}", format!("{:?}", result.engine));
+            }
+            println!(" ║");
+            println!(
+                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+            );
+
+            // Print configuration
+            print!("║ {:20}", "Records/iteration");
+            for result in mode_results.iter() {
+                print!(" │ {:>15}", format!("{}", result.num_records));
+            }
+            println!(" ║");
+
+            print!("║ {:20}", "Iterations");
+            for result in mode_results.iter() {
+                print!(" │ {:>15}", format!("{}", result.num_iterations));
+            }
+            println!(" ║");
+            println!(
+                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+            );
+
+            // Insert Performance
+            println!(
+                "║ {:20}                                                                        ║",
+                "INSERT PERFORMANCE"
+            );
+            println!(
+                "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
+            );
+
+            let metrics = vec![
+                ("Min", |r: &BenchmarkResults| {
+                    format_duration_compact(r.min_insert)
+                }),
+                ("P90", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p90_insert)
+                }),
+                ("P95", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p95_insert)
+                }),
+                ("P99", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p99_insert)
+                }),
+                ("P99.9", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p99_9_insert)
+                }),
+                ("Max", |r: &BenchmarkResults| {
+                    format_duration_compact(r.max_insert)
+                }),
+                ("P95 rec/sec", |r: &BenchmarkResults| {
+                    format!("{:.0}", r.p95_insert_rec_per_sec)
+                }),
+            ];
+
+            for (label, formatter) in &metrics {
+                print!("║ {:20}", label);
+                for result in mode_results.iter() {
+                    print!(" │ {:>15}", formatter(result));
+                }
+                println!(" ║");
+            }
+
+            println!(
+                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+            );
+            println!(
+                "║ {:20}                                                                        ║",
+                "QUERY PERFORMANCE"
+            );
+            println!(
+                "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
+            );
+
+            let query_metrics = vec![
+                ("Min", |r: &BenchmarkResults| {
+                    format_duration_compact(r.min_query)
+                }),
+                ("P90", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p90_query)
+                }),
+                ("P95", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p95_query)
+                }),
+                ("P99", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p99_query)
+                }),
+                ("P99.9", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p99_9_query)
+                }),
+                ("Max", |r: &BenchmarkResults| {
+                    format_duration_compact(r.max_query)
+                }),
+                ("P95 rec/sec", |r: &BenchmarkResults| {
+                    format!("{:.0}", r.p95_query_rec_per_sec)
+                }),
+            ];
+
+            for (label, formatter) in &query_metrics {
+                print!("║ {:20}", label);
+                for result in mode_results.iter() {
+                    print!(" │ {:>15}", formatter(result));
+                }
+                println!(" ║");
+            }
+
+            println!(
+                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+            );
+            println!(
+                "║ {:20}                                                                        ║",
+                "ROUNDTRIP (INSERT+QUERY)"
+            );
+            println!(
+                "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
+            );
+
+            let roundtrip_metrics = vec![
+                ("Min", |r: &BenchmarkResults| {
+                    format_duration_compact(r.min_roundtrip)
+                }),
+                ("P90", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p90_roundtrip)
+                }),
+                ("P95", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p95_roundtrip)
+                }),
+                ("P99", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p99_roundtrip)
+                }),
+                ("P99.9", |r: &BenchmarkResults| {
+                    format_duration_compact(r.p99_9_roundtrip)
+                }),
+                ("Max", |r: &BenchmarkResults| {
+                    format_duration_compact(r.max_roundtrip)
+                }),
+            ];
+
+            for (label, formatter) in &roundtrip_metrics {
+                print!("║ {:20}", label);
+                for result in mode_results.iter() {
+                    print!(" │ {:>15}", formatter(result));
+                }
+                println!(" ║");
+            }
+
+            println!(
+                "╚════════════════════════════════════════════════════════════════════════════════════════════╝"
+            );
+            println!();
+        }
+    }
+
+    // Structure to hold benchmark results for comparison
+    #[derive(Debug, Clone)]
+    struct BenchmarkResults {
+        engine: Engine,
+        mode: String,
+        num_records: usize,
+        num_iterations: usize,
+        // Insert metrics
+        min_insert: std::time::Duration,
+        p90_insert: std::time::Duration,
+        p95_insert: std::time::Duration,
+        p99_insert: std::time::Duration,
+        p99_9_insert: std::time::Duration,
+        max_insert: std::time::Duration,
+        p95_insert_rec_per_sec: f64,
+        // Query metrics
+        min_query: std::time::Duration,
+        p90_query: std::time::Duration,
+        p95_query: std::time::Duration,
+        p99_query: std::time::Duration,
+        p99_9_query: std::time::Duration,
+        max_query: std::time::Duration,
+        p95_query_rec_per_sec: f64,
+        // Roundtrip metrics
+        min_roundtrip: std::time::Duration,
+        p90_roundtrip: std::time::Duration,
+        p95_roundtrip: std::time::Duration,
+        p99_roundtrip: std::time::Duration,
+        p99_9_roundtrip: std::time::Duration,
+        max_roundtrip: std::time::Duration,
+    }
+
     #[tokio::test]
     #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,vortex -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
+        use std::sync::Mutex;
         use std::time::Instant;
+
+        // Collect all results for comparison
+        let all_results = Arc::new(Mutex::new(Vec::new()));
+        let all_results_clone = Arc::clone(&all_results);
 
         run_compat_test(|engine, table, mode| async move {
             let ctx = SessionContext::new();
@@ -2440,17 +2675,17 @@ mod accelerator_compat_tests {
 
             // Calculate percentiles
             let min_insert = sorted_insert[0];
-            let p75_insert = percentile(&sorted_insert, 0.75);
             let p90_insert = percentile(&sorted_insert, 0.90);
             let p95_insert = percentile(&sorted_insert, 0.95);
             let p99_insert = percentile(&sorted_insert, 0.99);
+            let p99_9_insert = percentile(&sorted_insert, 0.999);
             let max_insert = sorted_insert[sorted_insert.len() - 1];
 
             let min_query = sorted_query[0];
-            let p75_query = percentile(&sorted_query, 0.75);
             let p90_query = percentile(&sorted_query, 0.90);
             let p95_query = percentile(&sorted_query, 0.95);
             let p99_query = percentile(&sorted_query, 0.99);
+            let p99_9_query = percentile(&sorted_query, 0.999);
             let max_query = sorted_query[sorted_query.len() - 1];
 
             // Calculate round-trip percentiles
@@ -2461,47 +2696,51 @@ mod accelerator_compat_tests {
                 .collect();
             roundtrip_times.sort();
             let min_roundtrip = roundtrip_times[0];
-            let p75_roundtrip = percentile(&roundtrip_times, 0.75);
             let p90_roundtrip = percentile(&roundtrip_times, 0.90);
             let p95_roundtrip = percentile(&roundtrip_times, 0.95);
             let p99_roundtrip = percentile(&roundtrip_times, 0.99);
+            let p99_9_roundtrip = percentile(&roundtrip_times, 0.999);
             let max_roundtrip = roundtrip_times[roundtrip_times.len() - 1];
 
-            println!("\n--- Results for {:?} ({}) ---", engine, mode);
-            println!("Insert Performance:");
-            println!("  Min: {:?}", min_insert);
-            println!("  P75: {:?}", p75_insert);
-            println!("  P90: {:?}", p90_insert);
-            println!("  P95: {:?}", p95_insert);
-            println!("  P99: {:?}", p99_insert);
-            println!("  Max: {:?}", max_insert);
-            println!(
-                "  P95 records/sec: {:.2}",
-                num_records as f64 / percentile(&sorted_insert, 0.95).as_secs_f64()
-            );
+            let p95_insert_rec_per_sec =
+                num_records as f64 / percentile(&sorted_insert, 0.95).as_secs_f64();
+            let p95_query_rec_per_sec = (num_records * num_iterations) as f64
+                / percentile(&sorted_query, 0.95).as_secs_f64();
 
-            println!("\nQuery Performance:");
-            println!("  Min: {:?}", min_query);
-            println!("  P75: {:?}", p75_query);
-            println!("  P90: {:?}", p90_query);
-            println!("  P95: {:?}", p95_query);
-            println!("  P99: {:?}", p99_query);
-            println!("  Max: {:?}", max_query);
-            println!(
-                "  P95 records/sec: {:.2}",
-                (num_records * num_iterations) as f64
-                    / percentile(&sorted_query, 0.95).as_secs_f64()
-            );
+            // Store results for comparison
+            let results = BenchmarkResults {
+                engine,
+                mode: mode.clone(),
+                num_records,
+                num_iterations,
+                min_insert,
+                p90_insert,
+                p95_insert,
+                p99_insert,
+                p99_9_insert,
+                max_insert,
+                p95_insert_rec_per_sec,
+                min_query,
+                p90_query,
+                p95_query,
+                p99_query,
+                p99_9_query,
+                max_query,
+                p95_query_rec_per_sec,
+                min_roundtrip,
+                p90_roundtrip,
+                p95_roundtrip,
+                p99_roundtrip,
+                p99_9_roundtrip,
+                max_roundtrip,
+            };
 
-            println!("\nRound-trip (Insert + Query):");
-            println!("  Min: {:?}", min_roundtrip);
-            println!("  P75: {:?}", p75_roundtrip);
-            println!("  P90: {:?}", p90_roundtrip);
-            println!("  P95: {:?}", p95_roundtrip);
-            println!("  P99: {:?}", p99_roundtrip);
-            println!("  Max: {:?}", max_roundtrip);
-            println!("========================\n");
+            all_results_clone.lock().unwrap().push(results);
         })
         .await;
+
+        // Print comparison table
+        let results = all_results.lock().unwrap();
+        print_comparison_table(&results);
     }
 }
