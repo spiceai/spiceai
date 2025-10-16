@@ -189,32 +189,38 @@ impl DataSink for VortexDataSink {
         let mut total_rows = 0u64;
         let mut file_counter = 0usize;
 
-        // Buffer to collect multiple write tasks for parallel execution
-        let mut write_tasks = Vec::new();
-        const MAX_PARALLEL_WRITES: usize = 4; // Limit concurrent writes to avoid overwhelming I/O
+        // Buffer to accumulate batches before writing
+        // Target 256MB per file to reduce number of files and avoid "too many open files" error
+        const TARGET_FILE_SIZE_BYTES: usize = 256 * 1024 * 1024; // 256MB
+        let mut buffered_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+        let mut buffered_size_bytes: usize = 0;
 
-        // Process batches in a streaming fashion using async I/O with parallelism
-        while let Some(batch_result) = data.next().await {
-            let batch = batch_result?;
-            let num_rows = batch.num_rows() as u64;
+        // Helper function to write buffered batches to a file
+        let write_buffered_batches = |batches: Vec<arrow::record_batch::RecordBatch>,
+                                      dir_path: String,
+                                      counter: usize|
+         -> tokio::task::JoinHandle<
+            datafusion::error::Result<u64>,
+        > {
+            tokio::spawn(async move {
+                if batches.is_empty() {
+                    return Ok(0);
+                }
 
-            if num_rows == 0 {
-                continue;
-            }
+                let total_batch_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
 
-            // Generate unique filename for this batch
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let filename = format!("data_{}_{}_{}.vortex", timestamp, file_counter, num_rows);
-            file_counter += 1;
+                // Generate unique filename
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let filename = format!(
+                    "data_{}_{}_rows_{}.vortex",
+                    timestamp, counter, total_batch_rows
+                );
 
-            let file_path = PathBuf::from(&self.dir_path).join(&filename);
-            let dir_path_clone = self.dir_path.clone();
+                let file_path = PathBuf::from(&dir_path).join(&filename);
 
-            // Spawn write task to run in parallel
-            let write_task = tokio::spawn(async move {
                 // Open file for writing with async I/O
                 let mut file = OpenOptions::new()
                     .write(true)
@@ -224,8 +230,20 @@ impl DataSink for VortexDataSink {
                     .await
                     .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
+                // Concatenate all batches into a single batch if schema matches
+                let combined_batch = if batches.len() == 1 {
+                    batches.into_iter().next().unwrap()
+                } else {
+                    arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(|e| {
+                        datafusion::error::DataFusionError::External(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to concatenate batches: {}", e),
+                        )))
+                    })?
+                };
+
                 // Convert Arrow RecordBatch to Vortex Array
-                let vortex_array = ArrayRef::from_arrow(&batch, false);
+                let vortex_array = ArrayRef::from_arrow(&combined_batch, false);
 
                 // Write using async I/O with VortexWriteOptions
                 VortexWriteOptions::default()
@@ -238,45 +256,88 @@ impl DataSink for VortexDataSink {
                         )))
                     })?;
 
-                Ok::<(u64, String), datafusion::error::DataFusionError>((num_rows, dir_path_clone))
-            });
+                tracing::debug!(
+                    "Vortex: wrote file {} with {} rows to {}",
+                    filename,
+                    total_batch_rows,
+                    dir_path
+                );
 
-            write_tasks.push(write_task);
-            total_rows += num_rows;
+                Ok(total_batch_rows)
+            })
+        };
 
-            // Wait for some tasks to complete if we've reached the parallelism limit
-            if write_tasks.len() >= MAX_PARALLEL_WRITES {
-                // Wait for the oldest task to complete
-                if let Some(task) = write_tasks.first_mut() {
-                    match task.await {
-                        Ok(Ok((rows, dir))) => {
-                            tracing::trace!("Vortex: wrote {} rows to {}", rows, dir);
+        let mut write_tasks = Vec::new();
+        const MAX_PARALLEL_WRITES: usize = 2; // Reduce parallelism to limit open files
+
+        // Process batches and buffer them until reaching target size
+        while let Some(batch_result) = data.next().await {
+            let batch = batch_result?;
+            let num_rows = batch.num_rows();
+
+            if num_rows == 0 {
+                continue;
+            }
+
+            // Calculate approximate size of this batch
+            let batch_size = batch.get_array_memory_size();
+            buffered_batches.push(batch);
+            buffered_size_bytes += batch_size;
+            total_rows += num_rows as u64;
+
+            // Write when buffer reaches target size
+            if buffered_size_bytes >= TARGET_FILE_SIZE_BYTES {
+                let batches_to_write = std::mem::take(&mut buffered_batches);
+                buffered_size_bytes = 0;
+
+                let write_task =
+                    write_buffered_batches(batches_to_write, self.dir_path.clone(), file_counter);
+                write_tasks.push(write_task);
+                file_counter += 1;
+
+                // Wait for oldest task if we've reached parallelism limit
+                if write_tasks.len() >= MAX_PARALLEL_WRITES {
+                    if let Some(task) = write_tasks.first_mut() {
+                        match task.await {
+                            Ok(Ok(rows)) => {
+                                tracing::trace!("Vortex: completed write of {} rows", rows);
+                            }
+                            Ok(Err(e)) => return Err(e),
+                            Err(e) => {
+                                return Err(datafusion::error::DataFusionError::External(
+                                    Box::new(e),
+                                ));
+                            }
                         }
-                        Ok(Err(e)) => return Err(e),
-                        Err(e) => {
-                            return Err(datafusion::error::DataFusionError::External(Box::new(e)));
-                        }
+                        write_tasks.remove(0);
                     }
-                    write_tasks.remove(0);
                 }
             }
 
             // Log progress periodically
-            if file_counter % 10 == 0 {
+            if total_rows % 100_000 == 0 {
                 tracing::debug!(
-                    "Vortex: queued {} batches, {} total rows to {}",
-                    file_counter,
+                    "Vortex: processed {} rows ({} files written, {} MB buffered)",
                     total_rows,
-                    self.dir_path
+                    file_counter,
+                    buffered_size_bytes / (1024 * 1024)
                 );
             }
+        }
+
+        // Write any remaining buffered batches
+        if !buffered_batches.is_empty() {
+            let write_task =
+                write_buffered_batches(buffered_batches, self.dir_path.clone(), file_counter);
+            write_tasks.push(write_task);
+            file_counter += 1;
         }
 
         // Wait for all remaining write tasks to complete
         for task in write_tasks {
             match task.await {
-                Ok(Ok((rows, dir))) => {
-                    tracing::trace!("Vortex: wrote {} rows to {}", rows, dir);
+                Ok(Ok(rows)) => {
+                    tracing::trace!("Vortex: completed write of {} rows", rows);
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(e) => return Err(datafusion::error::DataFusionError::External(Box::new(e))),
@@ -284,7 +345,7 @@ impl DataSink for VortexDataSink {
         }
 
         tracing::info!(
-            "Vortex: completed writing {} batches, {} total rows to {}",
+            "Vortex: completed writing {} files, {} total rows to {}",
             file_counter,
             total_rows,
             self.dir_path
