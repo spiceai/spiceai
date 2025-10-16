@@ -30,7 +30,7 @@ datasets:
     acceleration:
       enabled: true
       engine: duckdb
-      snapshots: enabled
+      snapshots: bootstrap_only
       mode: file
       primary_key: location
       refresh_mode: append
@@ -49,5 +49,6 @@ datasets:
       enabled: true
       engine: s3_vectors
       params:
-        s3_vectors_bucket: spiceai-financebench-s3-data-5
+        s3_vectors_bucket: spiceai-financebench-s3-data
+        s3_vectors_index: financebench-openai-small-1000-200
         s3_vectors_aws_region: us-east-1
