@@ -850,7 +850,7 @@ impl DataAccelerator for VortexAccelerator {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<RuntimePartitionedBy>,
+        partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
