@@ -14,15 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{
-    ArrayBuilder, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-    Decimal256Array, DurationNanosecondArray, FixedSizeBinaryArray, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, LargeBinaryArray,
-    LargeStringArray, ListBuilder, NullArray, StringArray, StructArray, Time32SecondArray,
-    Time64NanosecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
-};
-use arrow::datatypes::{DataType, IntervalDayTime};
+use arrow::datatypes::DataType;
+use arrow_schema::Schema;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -42,9 +35,8 @@ use futures::StreamExt;
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::any::Any;
-use std::convert::TryFrom;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use vortex::ArrayRef;
@@ -581,160 +573,7 @@ impl VortexAccelerator {
         Ok(path_buf)
     }
 
-    async fn recreate_dummy_file(path: &Path, arrow_schema: &SchemaRef) -> Result<()> {
-        let dummy_file_path = path.join("init.vortex");
-
-        if dummy_file_path.exists() {
-            tokio::fs::remove_file(&dummy_file_path)
-                .await
-                .map_err(|err| Error::AccelerationCreationFailed {
-                    source: Box::new(err),
-                })?;
-        }
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&dummy_file_path)
-            .await
-            .map_err(|err| Error::AccelerationCreationFailed {
-                source: Box::new(err),
-            })?;
-
-        let dummy_batch = Self::create_dummy_batch(arrow_schema)?;
-
-        let vortex_array = ArrayRef::from_arrow(&dummy_batch, false);
-
-        VortexWriteOptions::default()
-            .write(&mut file, vortex_array.to_array_stream())
-            .await
-            .map_err(|err| Error::AccelerationCreationFailed {
-                source: Box::new(std::io::Error::other(format!(
-                    "Failed to write Vortex file: {err}"
-                ))),
-            })?;
-
-        Ok(())
-    }
-
-    fn create_dummy_batch(arrow_schema: &SchemaRef) -> Result<arrow::record_batch::RecordBatch> {
-        let columns = Self::dummy_columns(arrow_schema);
-
-        arrow::record_batch::RecordBatch::try_new(Arc::clone(arrow_schema), columns).map_err(
-            |err| Error::AccelerationCreationFailed {
-                source: Box::new(err),
-            },
-        )
-    }
-
-    fn dummy_columns(arrow_schema: &SchemaRef) -> Vec<Arc<dyn arrow::array::Array>> {
-        arrow_schema
-            .fields()
-            .iter()
-            .map(|field| Self::dummy_array_for_type(field.data_type()))
-            .collect()
-    }
-
-    fn dummy_array_for_type(data_type: &DataType) -> Arc<dyn arrow::array::Array> {
-        match data_type {
-            DataType::Boolean => Arc::new(BooleanArray::from(vec![false])),
-            DataType::Int8 => Arc::new(Int8Array::from(vec![0i8])),
-            DataType::Int16 => Arc::new(Int16Array::from(vec![0i16])),
-            DataType::Int32 => Arc::new(Int32Array::from(vec![0i32])),
-            DataType::Int64 => Arc::new(Int64Array::from(vec![0i64])),
-            DataType::UInt8 => Arc::new(UInt8Array::from(vec![0u8])),
-            DataType::UInt16 => Arc::new(UInt16Array::from(vec![0u16])),
-            DataType::UInt32 => Arc::new(UInt32Array::from(vec![0u32])),
-            DataType::UInt64 => Arc::new(UInt64Array::from(vec![0u64])),
-            DataType::Float32 => Arc::new(Float32Array::from(vec![0.0f32])),
-            DataType::Float64 => Arc::new(Float64Array::from(vec![0.0f64])),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, tz) => {
-                Arc::new(TimestampMicrosecondArray::from(vec![0i64]).with_timezone_opt(tz.clone()))
-            }
-            DataType::Date32 => Arc::new(Date32Array::from(vec![0i32])),
-            DataType::Date64 => Arc::new(Date64Array::from(vec![0i64])),
-            DataType::Time32(_) => Arc::new(Time32SecondArray::from(vec![0i32])),
-            DataType::Time64(_) => Arc::new(Time64NanosecondArray::from(vec![0i64])),
-            DataType::Duration(_) => Arc::new(DurationNanosecondArray::from(vec![0i64])),
-            DataType::Interval(_) => {
-                Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(0, 0)]))
-            }
-            DataType::Binary => Arc::new(BinaryArray::from_vec(vec![b""])),
-            DataType::FixedSizeBinary(size) => match usize::try_from(*size) {
-                Ok(size_usize) => {
-                    match FixedSizeBinaryArray::try_from_iter(std::iter::once(vec![
-                        0u8;
-                        size_usize
-                    ])) {
-                        Ok(array) => Arc::new(array),
-                        Err(err) => {
-                            tracing::warn!(
-                                ?err,
-                                "Failed to create FixedSizeBinary dummy value. Falling back to null."
-                            );
-                            Arc::new(NullArray::new(1))
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "Invalid size for FixedSizeBinary dummy value. Falling back to null."
-                    );
-                    Arc::new(NullArray::new(1))
-                }
-            },
-            DataType::LargeBinary => Arc::new(LargeBinaryArray::from_vec(vec![b""])),
-            DataType::Utf8 => Arc::new(StringArray::from(vec![""])),
-            DataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![""])),
-            DataType::Decimal128(precision, scale) => match Decimal128Array::from(vec![0i128])
-                .with_precision_and_scale(*precision, *scale)
-            {
-                Ok(array) => Arc::new(array),
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "Failed to configure Decimal128 dummy value. Falling back to null."
-                    );
-                    Arc::new(NullArray::new(1))
-                }
-            },
-            DataType::Decimal256(precision, scale) => {
-                match Decimal256Array::from(vec![arrow::datatypes::i256::from_i128(0)])
-                    .with_precision_and_scale(*precision, *scale)
-                {
-                    Ok(array) => Arc::new(array),
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            "Failed to configure Decimal256 dummy value. Falling back to null."
-                        );
-                        Arc::new(NullArray::new(1))
-                    }
-                }
-            }
-            DataType::List(field) => {
-                let value_builder = match field.data_type() {
-                    DataType::Int32 => Box::new(Int32Array::builder(0)) as Box<dyn ArrayBuilder>,
-                    _ => Box::new(Int32Array::builder(0)) as Box<dyn ArrayBuilder>,
-                };
-                let mut builder = ListBuilder::new(value_builder);
-                builder.append(true);
-                Arc::new(builder.finish())
-            }
-            DataType::Struct(fields) => {
-                let field_arrays: Vec<Arc<dyn arrow::array::Array>> = fields
-                    .iter()
-                    .map(|_| Arc::new(Int32Array::from(vec![0i32])) as Arc<dyn arrow::array::Array>)
-                    .collect();
-                Arc::new(StructArray::new(fields.clone(), field_arrays, None))
-            }
-            _ => Arc::new(NullArray::new(1)),
-        }
-    }
-
-    async fn create_listing_table(dir_path: &str) -> Result<ListingTable> {
+    async fn create_listing_table(dir_path: &str, schema: Arc<Schema>) -> Result<ListingTable> {
         let ctx = SessionContext::new();
         let format = Arc::new(VortexFormat::default());
 
@@ -754,11 +593,7 @@ impl VortexAccelerator {
             .with_listing_options(
                 ListingOptions::new(format).with_session_config_options(ctx.state().config()),
             )
-            .infer_schema(&ctx.state())
-            .await
-            .map_err(|err| Error::AccelerationCreationFailed {
-                source: Box::new(err),
-            })?;
+            .with_schema(schema);
 
         ListingTable::try_new(config).map_err(|err| Error::AccelerationCreationFailed {
             source: Box::new(err),
@@ -866,9 +701,7 @@ impl DataAccelerator for VortexAccelerator {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        let (dir_path, target_file_size_bytes) = self
-            .resolve_storage_config(source)
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+        let (dir_path, target_file_size_bytes) = self.resolve_storage_config(source).boxed()?;
 
         let (arrow_schema, filtered_count) = Self::filtered_arrow_schema(&cmd);
 
@@ -878,16 +711,11 @@ impl DataAccelerator for VortexAccelerator {
             );
         }
 
-        let path_buf = Self::ensure_directory(&dir_path)
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+        let _ = Self::ensure_directory(&dir_path).boxed()?;
 
-        Self::recreate_dummy_file(path_buf.as_path(), &arrow_schema)
+        let listing_table = Self::create_listing_table(&dir_path, Arc::clone(&arrow_schema))
             .await
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        let listing_table = Self::create_listing_table(&dir_path)
-            .await
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
+            .boxed()?;
 
         // Wrap in VortexTableProvider with custom data sink for efficient streaming writes
         let wrapped_table = VortexTableProvider {
