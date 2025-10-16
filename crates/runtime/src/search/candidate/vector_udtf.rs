@@ -29,7 +29,6 @@ use crate::datafusion::DataFusion;
 pub struct VectorUDTFGeneration {
     df: Arc<DataFusion>,
     tbl: TableReference,
-    primary_keys: Vec<String>,
     embedding_column: String,
     is_chunked: bool,
 }
@@ -38,14 +37,12 @@ impl VectorUDTFGeneration {
     pub fn new(
         df: &Arc<DataFusion>,
         tbl: &TableReference,
-        primary_keys: &[String],
         embedding_column: &str,
         is_chunked: bool,
     ) -> Self {
         Self {
             df: Arc::clone(df),
             tbl: tbl.clone(),
-            primary_keys: primary_keys.to_vec(),
             embedding_column: embedding_column.to_string(),
             is_chunked,
         }

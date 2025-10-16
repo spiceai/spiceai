@@ -20,6 +20,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::{Column, UnnestOptions};
 use datafusion::datasource::{DefaultTableSource, ViewTable};
 use datafusion::error::DataFusionError;
+use datafusion::functions::math::isnan;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::prelude::{array_element, substring};
 use datafusion::sql::TableReference;
@@ -230,13 +231,18 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
 
         let limit = 1000; // TODO
         // First project just the columns we need
-        let mut plan = LogicalPlanBuilder::new(score_table).project(
-            [
-                pks.iter().map(ident).collect(),
-                vec![col("score"), col("offset")],
-            ]
-            .concat(),
-        )?;
+        let mut plan = LogicalPlanBuilder::new(score_table)
+            .project(
+                [
+                    pks.iter().map(ident).collect(),
+                    vec![col("score"), col("offset")],
+                ]
+                .concat(),
+            )?
+            .filter(
+                LogicalExpr::ScalarFunction(ScalarFunction::new_udf(isnan(), vec![ident("score")]))
+                    .is_false(),
+            )?;
 
         // Filter out primary keys from additional columns if duplicated
         let final_additional_columns: Vec<_> = self

@@ -34,6 +34,7 @@ use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestCo
 use search::index::s3_vectors::S3Vector;
 use search::pipeline::QueryEngine;
 
+use crate::datafusion::DataFusion;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::ChunkedNonIndexVectorGeneration,
@@ -42,7 +43,6 @@ use crate::search::{
         get_primary_keys_with_overrides,
     },
 };
-use crate::datafusion::DataFusion;
 use arrow::array::RecordBatch;
 use async_stream::stream;
 use cache::key::{CacheKey, RawCacheKey, SearchKey};
@@ -134,7 +134,6 @@ impl SearchEngine {
             Ok(Arc::new(VectorUDTFGeneration::new(
                 &self.df,
                 tbl,
-                primary_keys,
                 embedding_column,
                 is_chunked,
             )))
@@ -152,7 +151,6 @@ impl SearchEngine {
                 return Ok(Arc::new(VectorUDTFGeneration::new(
                     &self.df,
                     tbl,
-                    primary_keys,
                     embedding_column,
                     false,
                 )));
