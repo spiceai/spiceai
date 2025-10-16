@@ -136,24 +136,33 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
 /// 1. **Async I/O**: Uses `tokio::fs::OpenOptions` for non-blocking file operations
 ///    instead of synchronous I/O that can block the runtime.
 ///
-/// 2. **Parallel Writes**: Spawns up to MAX_PARALLEL_WRITES concurrent write tasks,
-///    allowing multiple batches to be written simultaneously. This maximizes throughput
-///    by utilizing available I/O bandwidth and CPU cores.
+/// 2. **Context-Aware Parallelism**: Uses DataFusion's `target_partitions` configuration
+///    to determine optimal parallel write concurrency, respecting user settings and system
+///    capabilities (capped at 4 to avoid "too many open files" errors).
 ///
-/// 3. **Streaming Processing**: Processes record batches as they arrive from the stream
+/// 3. **Buffering Strategy**: Accumulates batches up to a configurable target file size
+///    (default 512MB) before writing to disk, reducing the total number of files and
+///    file handle pressure.
+///
+/// 4. **Streaming Processing**: Processes record batches as they arrive from the stream
 ///    without buffering all data in memory, reducing memory pressure during large imports.
 ///
-/// 4. **Backpressure Management**: Limits concurrent writes to avoid overwhelming the I/O
-///    subsystem while still maintaining high throughput.
+/// 5. **Backpressure Management**: Limits concurrent writes based on DataFusion config
+///    to avoid overwhelming the I/O subsystem while maintaining high throughput.
 #[derive(Debug, Clone)]
 struct VortexDataSink {
     dir_path: String,
     schema: SchemaRef,
+    target_file_size_bytes: usize,
 }
 
 impl VortexDataSink {
-    fn new(dir_path: String, schema: SchemaRef) -> Self {
-        Self { dir_path, schema }
+    fn new(dir_path: String, schema: SchemaRef, target_file_size_bytes: usize) -> Self {
+        Self {
+            dir_path,
+            schema,
+            target_file_size_bytes,
+        }
     }
 }
 
@@ -184,14 +193,32 @@ impl DataSink for VortexDataSink {
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
-        _context: &Arc<datafusion::execution::TaskContext>,
+        context: &Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<u64> {
         let mut total_rows = 0u64;
         let mut file_counter = 0usize;
 
+        // Get configuration from DataFusion context
+        let session_config = context.session_config();
+
+        // Use target_partitions to determine parallel write concurrency
+        // This respects the user's configured parallelism settings
+        let target_partitions = session_config.target_partitions();
+        let max_parallel_writes = std::cmp::max(1, std::cmp::min(target_partitions, 4));
+
+        // Get batch size from config if available, otherwise use default
+        let batch_size = session_config.batch_size();
+
+        tracing::trace!(
+            "Vortex: using {} parallel writes, batch_size={}, target_partitions={}, target_file_size={}MB",
+            max_parallel_writes,
+            batch_size,
+            target_partitions,
+            self.target_file_size_bytes / (1024 * 1024)
+        );
+
         // Buffer to accumulate batches before writing
-        // Target 256MB per file to reduce number of files and avoid "too many open files" error
-        const TARGET_FILE_SIZE_BYTES: usize = 256 * 1024 * 1024; // 256MB
+        let target_file_size_bytes = self.target_file_size_bytes;
         let mut buffered_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
         let mut buffered_size_bytes: usize = 0;
 
@@ -268,7 +295,6 @@ impl DataSink for VortexDataSink {
         };
 
         let mut write_tasks = Vec::new();
-        const MAX_PARALLEL_WRITES: usize = 2; // Reduce parallelism to limit open files
 
         // Process batches and buffer them until reaching target size
         while let Some(batch_result) = data.next().await {
@@ -286,7 +312,7 @@ impl DataSink for VortexDataSink {
             total_rows += num_rows as u64;
 
             // Write when buffer reaches target size
-            if buffered_size_bytes >= TARGET_FILE_SIZE_BYTES {
+            if buffered_size_bytes >= target_file_size_bytes {
                 let batches_to_write = std::mem::take(&mut buffered_batches);
                 buffered_size_bytes = 0;
 
@@ -296,7 +322,7 @@ impl DataSink for VortexDataSink {
                 file_counter += 1;
 
                 // Wait for oldest task if we've reached parallelism limit
-                if write_tasks.len() >= MAX_PARALLEL_WRITES {
+                if write_tasks.len() >= max_parallel_writes {
                     if let Some(task) = write_tasks.first_mut() {
                         match task.await {
                             Ok(Ok(rows)) => {
@@ -316,7 +342,7 @@ impl DataSink for VortexDataSink {
 
             // Log progress periodically
             if total_rows % 100_000 == 0 {
-                tracing::debug!(
+                tracing::trace!(
                     "Vortex: processed {} rows ({} files written, {} MB buffered)",
                     total_rows,
                     file_counter,
@@ -361,6 +387,7 @@ impl DataSink for VortexDataSink {
 struct VortexTableProvider {
     inner: Arc<ListingTable>,
     dir_path: String,
+    target_file_size_bytes: usize,
 }
 
 #[async_trait]
@@ -409,7 +436,11 @@ impl TableProvider for VortexTableProvider {
         };
 
         // Use custom VortexDataSink for efficient async streaming writes
-        let sink = Arc::new(VortexDataSink::new(self.dir_path.clone(), self.schema()));
+        let sink = Arc::new(VortexDataSink::new(
+            self.dir_path.clone(),
+            self.schema(),
+            self.target_file_size_bytes,
+        ));
 
         Ok(Arc::new(DataSinkExec::new(
             input, sink, None, // No count schema
@@ -474,6 +505,8 @@ impl VortexAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path"),
     ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::runtime("target_file_size_mb")
+        .description("Target size in MB for each Vortex file before flushing (default: 512MB)"),
 ];
 
 #[async_trait]
@@ -551,8 +584,29 @@ impl DataAccelerator for VortexAccelerator {
         _partition_by: Option<PartitionBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         // Vortex only supports file mode with directory-based storage
-        let dir_path = if let Some(src) = source {
-            self.file_path(src)?
+        let (dir_path, target_file_size_bytes) = if let Some(src) = source {
+            let path = self.file_path(src)?;
+
+            // Get target_file_size_mb parameter, default to 512MB
+            let target_file_size_mb = if let Some(accel) = src.acceleration() {
+                accel
+                    .params
+                    .get("target_file_size_mb")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(512)
+            } else {
+                512
+            };
+
+            let target_size_bytes = target_file_size_mb * 1024 * 1024;
+
+            tracing::trace!(
+                "Vortex: configured target file size: {}MB ({}bytes)",
+                target_file_size_mb,
+                target_size_bytes
+            );
+
+            (path, target_size_bytes)
         } else {
             return Err(Error::InvalidConfiguration {
                 detail: Arc::from("Source required for Vortex accelerator"),
@@ -752,6 +806,7 @@ impl DataAccelerator for VortexAccelerator {
         let wrapped_table = VortexTableProvider {
             inner: Arc::new(listing_table),
             dir_path: dir_path.clone(),
+            target_file_size_bytes,
         };
 
         Ok(Arc::new(wrapped_table))
