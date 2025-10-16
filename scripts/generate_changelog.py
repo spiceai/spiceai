@@ -57,10 +57,10 @@ def main():
     print()
 
     for i, release_hash in enumerate(reversed(release_commits)):
-        if i % 50 == 0 and i > 0:
-            print(f"  Processing release commit {i}/{len(release_commits)}", file=sys.stderr)
-
-        patch_id = run_git(f"git show {release_hash} | git patch-id --stable").split()[0]
+        try:
+            patch_id = run_git(f"git show {release_hash} | git patch-id --stable").split()[0]
+        except IndexError:
+           continue
 
         trunk_hash = trunk_patch_to_hash.get(patch_id)
 
