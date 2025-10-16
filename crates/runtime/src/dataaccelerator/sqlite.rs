@@ -24,7 +24,7 @@ use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
-use runtime_table_partition::expression::PartitionBy;
+use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
@@ -252,10 +252,10 @@ impl DataAccelerator for SqliteAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Option<PartitionBy>,
+        partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
-            partition_by.is_none(),
+            partition_by.is_empty(),
             super::InvalidConfigurationSnafu {
                 msg: "Sqlite data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
@@ -384,7 +384,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = SqliteAccelerator::new()
-            .create_external_table(external_table, None, None)
+            .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");
 
