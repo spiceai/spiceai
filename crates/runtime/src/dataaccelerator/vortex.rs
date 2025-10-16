@@ -344,6 +344,24 @@ impl DataAccelerator for VortexAccelerator {
                     }));
                 }
             }
+
+            // Validate that retention_sql is not specified
+            if acceleration.retention_sql.is_some() {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Vortex data accelerator does not yet support retention_sql. Please remove this configuration",
+                    ),
+                }));
+            }
+
+            // Validate that refresh_append_overlap is not specified
+            if acceleration.refresh_append_overlap.is_some() {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Vortex data accelerator does not yet support refresh_append_overlap. Please remove this configuration",
+                    ),
+                }));
+            }
         }
 
         let dir_path = self.file_path(source)?;
