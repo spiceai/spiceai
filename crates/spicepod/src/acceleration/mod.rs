@@ -19,7 +19,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display};
 
-use crate::{component::dataset::ReadyState, metric::Metrics, param::Params};
+use crate::{
+    component::dataset::ReadyState,
+    metric::Metrics,
+    param::Params,
+    partitioning::{PartitionedBy, deserialize_partition_by},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -219,8 +224,12 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partition_by: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_partition_by"
+    )]
+    pub partition_by: Vec<PartitionedBy>,
 
     /// Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.
     ///
