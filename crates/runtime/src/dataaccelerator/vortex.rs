@@ -39,7 +39,7 @@ use datafusion::physical_plan::DisplayAs;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
-use runtime_table_partition::expression::PartitionedBy as RuntimePartitionedBy;
+use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::any::Any;
 use std::convert::TryFrom;
@@ -90,36 +90,34 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Check if a data type is supported by Vortex
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
-    match data_type {
-        // Vortex requires Microsecond timestamps
-        // We accept all timestamp types and will convert them to Microsecond
-        DataType::Timestamp(_, _) => true,
-        // Float16 will be converted to Float32
-        DataType::Float16 => true,
-        // Most other basic types are supported
-        DataType::Null
-        | DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Date32
-        | DataType::Date64
-        | DataType::Binary
-        | DataType::LargeBinary
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Decimal128(_, _)
-        | DataType::Decimal256(_, _) => true,
-        // Conservative approach: treat all other types (including Float16) as unsupported
-        _ => false,
-    }
+    matches!(
+        data_type,
+        // Vortex requires Microsecond timestamps but we accept all timestamp types and convert them.
+        DataType::Timestamp(_, _)
+            // Float16 will be converted to Float32.
+            | DataType::Float16
+            // Most other basic types are supported as-is.
+            | DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
 }
 
 /// Filter schema to only include Vortex-supported fields
@@ -147,22 +145,22 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
             }
 
             // Convert non-Microsecond timestamps to Microsecond
-            if let DataType::Timestamp(unit, tz) = field.data_type() {
-                if !matches!(unit, arrow::datatypes::TimeUnit::Microsecond) {
-                    tracing::warn!(
-                        "Converting timestamp field '{}' from {:?} to Microsecond precision for Vortex compatibility",
-                        field.name(),
-                        unit
-                    );
-                    return Some(Arc::new(arrow::datatypes::Field::new(
-                        field.name(),
-                        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, tz.clone()),
-                        field.is_nullable(),
-                    )));
-                }
+            if let DataType::Timestamp(unit, tz) = field.data_type()
+                && !matches!(unit, arrow::datatypes::TimeUnit::Microsecond)
+            {
+                tracing::warn!(
+                    "Converting timestamp field '{}' from {:?} to Microsecond precision for Vortex compatibility",
+                    field.name(),
+                    unit
+                );
+                return Some(Arc::new(arrow::datatypes::Field::new(
+                    field.name(),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, tz.clone()),
+                    field.is_nullable(),
+                )));
             }
 
-            Some(field.clone())
+            Some(Arc::clone(field))
         })
         .collect();
 
@@ -281,12 +279,9 @@ impl DataSink for VortexDataSink {
                 // Generate unique filename
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?
                     .as_millis();
-                let filename = format!(
-                    "data_{}_{}_rows_{}.vortex",
-                    timestamp, counter, total_batch_rows
-                );
+                let filename = format!("data_{timestamp}_{counter}_rows_{total_batch_rows}.vortex");
 
                 let file_path = PathBuf::from(&dir_path).join(&filename);
 
@@ -301,11 +296,15 @@ impl DataSink for VortexDataSink {
 
                 // Concatenate all batches into a single batch if schema matches
                 let combined_batch = if batches.len() == 1 {
-                    batches.into_iter().next().unwrap()
+                    batches.into_iter().next().ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(
+                            "Missing record batch for Vortex write".to_string(),
+                        )
+                    })?
                 } else {
                     arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(|e| {
                         datafusion::error::DataFusionError::External(Box::new(
-                            std::io::Error::other(format!("Failed to concatenate batches: {}", e)),
+                            std::io::Error::other(format!("Failed to concatenate batches: {e}")),
                         ))
                     })?
                 };
@@ -319,7 +318,7 @@ impl DataSink for VortexDataSink {
                     .await
                     .map_err(|e| {
                         datafusion::error::DataFusionError::External(Box::new(
-                            std::io::Error::other(format!("Failed to write Vortex file: {}", e)),
+                            std::io::Error::other(format!("Failed to write Vortex file: {e}")),
                         ))
                     })?;
 
@@ -471,7 +470,7 @@ impl TableProvider for VortexTableProvider {
                     "Vortex does not support replace operations yet, using append instead"
                 );
             }
-        };
+        }
 
         // Use custom VortexDataSink for efficient async streaming writes
         let sink = Arc::new(VortexDataSink::new(
@@ -851,47 +850,23 @@ impl DataAccelerator for VortexAccelerator {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Option<RuntimePartitionedBy>,
+        partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
-            partition_by.is_none(),
+            partition_by.is_empty(),
             super::InvalidConfigurationSnafu {
                 msg: "Vortex data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
 
-        // Vortex only supports file mode with directory-based storage
-        let (dir_path, target_file_size_bytes) = if let Some(src) = source {
-            let path = self.file_path(src)?;
-
-            // Get target_file_size_mb parameter, default to 512MB
-            let target_file_size_mb = if let Some(accel) = src.acceleration() {
-                accel
-                    .params
-                    .get("target_file_size_mb")
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(512)
-            } else {
-                512
-            };
-
-            let target_size_bytes = target_file_size_mb * 1024 * 1024;
-
-            tracing::trace!(
-                "Vortex: configured target file size: {}MB ({}bytes)",
-                target_file_size_mb,
-                target_size_bytes
-            );
-
-            (path, target_size_bytes)
-        } else {
-            return Err(Error::InvalidConfiguration {
+        let Some(src) = source else {
+            return Err(Box::new(Error::InvalidConfiguration {
                 detail: Arc::from("Source required for Vortex accelerator"),
-            });
+            }));
         };
 
         let (dir_path, target_file_size_bytes) = self
-            .resolve_storage_config(source)
+            .resolve_storage_config(src)
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let (arrow_schema, filtered_count) = Self::filtered_arrow_schema(&cmd);
