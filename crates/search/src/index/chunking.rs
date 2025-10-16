@@ -3,7 +3,7 @@ use std::{any::Any, sync::Arc};
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
     index::{SearchIndex, VectorIndex, embedding_col},
-    metadata::{MetadataColumn, MetadataColumns},
+    metadata::MetadataColumn,
 };
 
 use arrow::{
@@ -188,10 +188,6 @@ impl SearchIndex for ChunkedSearchIndex {
             .into_iter()
             .filter(|pk| pk.name() != CHUNKED_INDEX_CHUNK_KEY)
             .collect::<Vec<_>>()
-    }
-
-    fn metadata_columns(&self) -> &MetadataColumns {
-        self.inner.metadata_columns()
     }
 
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
@@ -492,12 +488,12 @@ impl std::fmt::Debug for ChunkedVectorIndex {
 impl VectorIndex for ChunkedVectorIndex {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         let base_index_table = self.inner.list_table_provider()?;
-        let group_by_pks: Vec<_> = self
+        let primary_key_names: Vec<_> = self
             .inner
             .primary_fields()
             .iter()
             .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
-            .map(|f| Expr::Column(Column::new_unqualified(f.name())))
+            .map(|f| f.name().clone())
             .collect();
 
         // Primary key, offsets and embeddings.
@@ -531,9 +527,9 @@ impl VectorIndex for ChunkedVectorIndex {
             )),
         ];
         aggr_expr.extend(
-            self.inner
-                .metadata_columns()
-                .all_names()
+            base_index_table
+                .schema()
+                .columns()
                 .iter()
                 .filter_map(|c| {
                     if [
@@ -542,24 +538,23 @@ impl VectorIndex for ChunkedVectorIndex {
                         CHUNKED_INDEX_CHUNK_KEY.to_string(),
                         self.search_column(),
                     ]
-                    .contains(c)
+                    .contains(&c.name)
+                        || primary_key_names.contains(&c.name)
                     {
                         return None;
                     }
                     Some(Expr::Alias(Alias::new(
-                        first_value(Expr::Column(Column::new_unqualified(c)), vec![]),
+                        first_value(Expr::Column(c.clone()), vec![]),
                         None::<TableReference>,
-                        c.clone(),
+                        c.name.clone(),
                     )))
                 })
                 .collect::<Vec<_>>(),
         );
 
-        if self
-            .inner
-            .metadata_columns()
-            .all_names()
-            .contains(&CHUNKED_INDEX_FULL_SEARCH_FIELD.to_string())
+        if base_index_table
+            .schema()
+            .has_column_with_unqualified_name(CHUNKED_INDEX_FULL_SEARCH_FIELD)
         {
             aggr_expr.push(Expr::Alias(Alias::new(
                 first_value(
@@ -572,7 +567,15 @@ impl VectorIndex for ChunkedVectorIndex {
         }
 
         Ok(LogicalPlan::Aggregate(
-            Aggregate::try_new(base_index_table.into(), group_by_pks, aggr_expr).boxed()?,
+            Aggregate::try_new(
+                base_index_table.into(),
+                primary_key_names
+                    .into_iter()
+                    .map(|pk| Expr::Column(Column::new_unqualified(pk)))
+                    .collect(),
+                aggr_expr,
+            )
+            .boxed()?,
         ))
     }
 
@@ -628,12 +631,6 @@ impl SearchIndex for ChunkedVectorIndex {
             chunker: Arc::clone(&self.chunker),
         }
         .primary_fields()
-    }
-
-    /// The additional columns available in the [`SearchIndex`].
-    /// For FTS indexes, this may return empty metadata columns.
-    fn metadata_columns(&self) -> &MetadataColumns {
-        self.inner.metadata_columns()
     }
 
     /// Update the index based on a [`RecordBatch`] from the underlying table.

@@ -22,7 +22,7 @@ parser.add_argument('action')
 parser.add_argument('artifact', nargs='+')
 
 def getReleaseByTag(owner, repo, tag):
-    releaseInfo = requests.get(f"{apiHost}/repos/{owner}/{repo}/releases/tags/{tag}")
+    releaseInfo = requests.get(f"{apiHost}/repos/{owner}/{repo}/releases/tags/{tag}", headers=authHeader)
 
     if releaseInfo.status_code == 404:
         return None

@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, DFSchema},
+    common::{Constraints, DFSchema, project_schema},
     datasource::TableType,
     error::DataFusionError,
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
@@ -32,7 +32,9 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::{
-    Partition, creator::PartitionCreator, expression::validate_scalar_compatibility,
+    Partition,
+    creator::PartitionCreator,
+    expression::{PartitionedBy, validate_scalar_compatibility},
     insert::PartitionerExec,
 };
 
@@ -59,7 +61,7 @@ type ScalarValueString = String;
 #[derive(Debug)]
 pub struct PartitionTableProvider {
     creator: Arc<dyn PartitionCreator>,
-    partition_by: Expr,
+    partition_by: PartitionedBy,
     partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
     schema: SchemaRef,
 }
@@ -73,14 +75,13 @@ impl PartitionTableProvider {
     /// validation fails.
     pub async fn new(
         creator: Arc<dyn PartitionCreator>,
-        mut partition_by: Vec<Expr>,
+        mut partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
         let num_partition_by = partition_by.len();
-        ensure!(
-            num_partition_by == 1,
-            PartitionByViolationSnafu { num_partition_by }
-        );
+        let partition_by = partition_by
+            .pop()
+            .context(PartitionByViolationSnafu { num_partition_by })?;
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
         let partitions = creator
@@ -88,14 +89,14 @@ impl PartitionTableProvider {
             .await
             .context(CreatingPartitionSnafu)?;
 
-        let partition_by = partition_by
-            .pop()
-            .context(PartitionByViolationSnafu { num_partition_by })?;
-
         let partitions = partitions
             .into_iter()
             .map(|p| {
-                validate_scalar_compatibility(&partition_by, &p.partition_value, &df_schema)?;
+                validate_scalar_compatibility(
+                    &partition_by.expression,
+                    &p.partition_value,
+                    &df_schema,
+                )?;
                 Ok((p.partition_value.to_string(), p))
             })
             .collect::<Result<HashMap<_, _>, _>>()
@@ -149,7 +150,7 @@ impl TableProvider for PartitionTableProvider {
         for partition in partitions.values() {
             if prune_partition(
                 filters,
-                &self.partition_by,
+                &self.partition_by.expression,
                 &partition.partition_value,
                 &self.schema,
             )? {
@@ -164,7 +165,8 @@ impl TableProvider for PartitionTableProvider {
 
         let plan = match plans {
             plans if plans.is_empty() => {
-                return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))));
+                let projected_schema = project_schema(&self.schema, projection)?;
+                return Ok(Arc::new(EmptyExec::new(projected_schema)));
             }
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())

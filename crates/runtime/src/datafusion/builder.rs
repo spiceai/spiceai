@@ -20,6 +20,15 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use super::{
+    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
+    SPICE_RUNTIME_SCHEMA,
+    extension::{
+        SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule,
+        cache_invalidation::CacheInvalidationOptimizerRule,
+    },
+    schema::SpiceSchemaProvider,
+};
 use crate::{
     dataaccelerator::AcceleratorEngineRegistry,
     datafusion::{
@@ -28,6 +37,7 @@ use crate::{
 };
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
+use datafusion::config::SpillCompression;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -46,18 +56,9 @@ use datafusion::{
 };
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
-
-use super::{
-    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
-    SPICE_RUNTIME_SCHEMA,
-    extension::{
-        SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule,
-        cache_invalidation::CacheInvalidationOptimizerRule,
-    },
-    schema::SpiceSchemaProvider,
-};
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
@@ -96,6 +97,7 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
+    spill_compression: Option<SpillCompression>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -127,6 +129,7 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
             caching: None,
+            spill_compression: None,
         }
     }
 
@@ -145,6 +148,17 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
         self.memory_limit = memory_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
+        self.spill_compression = match spill_compression {
+            Some(SpiceSpillCompression::Zstd) => Some(SpillCompression::Zstd),
+            Some(SpiceSpillCompression::Lz4Frame) => Some(SpillCompression::Lz4Frame),
+            Some(SpiceSpillCompression::Uncompressed) => Some(SpillCompression::Uncompressed),
+            None => None,
+        };
         self
     }
 
@@ -171,8 +185,14 @@ impl DataFusionBuilder {
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
     pub fn build(self) -> DataFusion {
+        let mut config = self.config;
+
+        if let Some(spill_compression) = self.spill_compression {
+            config = config.with_spill_compression(spill_compression);
+        }
+
         let mut state = SessionStateBuilder::new()
-            .with_config(self.config)
+            .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
                 vec![

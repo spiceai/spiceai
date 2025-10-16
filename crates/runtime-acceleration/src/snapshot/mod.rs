@@ -704,8 +704,9 @@ impl SnapshotManager {
                 );
 
                 tracing::info!(
-                    "Snapshot uploaded. dataset={} snapshot={location} size={total_bytes}",
-                    self.dataset_name
+                    "Snapshot uploaded. dataset={} snapshot={location} size={total_bytes} sha={checksum}",
+                    self.dataset_name,
+                    checksum = checksum.as_str(),
                 );
                 Ok(location)
             }
@@ -842,9 +843,10 @@ impl SnapshotManager {
         };
 
         tracing::info!(
-            "Downloading current snapshot. dataset={} snapshot={}",
+            "Downloading current snapshot. dataset={} snapshot={} sha={sha}",
             self.dataset_name,
-            current_entry.snapshot
+            current_entry.snapshot,
+            sha = current_entry.snapshot_checksum.as_str(),
         );
         self.download_snapshot_entry(&current_entry, &dataset_metadata, checkpointer_factory)
             .await
@@ -903,28 +905,32 @@ impl SnapshotManager {
                     | SnapshotDownloadError::SizeMismatch { ref path, .. }
                     | SnapshotDownloadError::UnsupportedChecksumAlgorithm { ref path, .. } => {
                         tracing::warn!(
-                            "Snapshot integrity issue; attempting next available snapshot. dataset={} snapshot={path}",
+                            "Snapshot integrity issue; attempting next available snapshot. dataset={} snapshot={path} sha={sha}",
                             self.dataset_name,
+                            sha = snapshot.snapshot_checksum.as_str(),
                         );
                     }
                     SnapshotDownloadError::SchemaMismatch { .. } => {
                         tracing::warn!(
-                            "Snapshot schema mismatch; attempting next available snapshot. dataset={} snapshot={}",
+                            "Snapshot schema mismatch; attempting next available snapshot. dataset={} snapshot={} sha={sha}",
                             self.dataset_name,
-                            snapshot.snapshot
+                            snapshot.snapshot,
+                            sha = snapshot.snapshot_checksum.as_str(),
                         );
                     }
                     SnapshotDownloadError::InvalidSnapshotUri { ref uri, .. } => {
                         tracing::warn!(
-                            "Snapshot URI invalid; attempting next available snapshot. dataset={} snapshot={uri}",
+                            "Snapshot URI invalid; attempting next available snapshot. dataset={} snapshot={uri} sha={sha}",
                             self.dataset_name,
+                            sha = snapshot.snapshot_checksum.as_str(),
                         );
                     }
                     other => {
                         tracing::warn!(
-                            "Failed to download snapshot while attempting fallback. dataset={} snapshot={} error={other}",
+                            "Failed to download snapshot while attempting fallback. dataset={} snapshot={} sha={sha} error={other}",
                             self.dataset_name,
-                            snapshot.snapshot
+                            snapshot.snapshot,
+                            sha = snapshot.snapshot_checksum.as_str(),
                         );
                         return Err(other);
                     }
@@ -998,10 +1004,11 @@ impl SnapshotManager {
             })?;
 
         tracing::info!(
-            "Downloading snapshot. dataset={} snapshot={} snapshot_id={}",
+            "Downloading snapshot. dataset={} snapshot={} snapshot_id={} sha={sha}",
             self.dataset_name,
             entry.snapshot,
-            entry.snapshot_id
+            entry.snapshot_id,
+            sha = entry.snapshot_checksum.as_str(),
         );
 
         if let Some(parent) = self.local_path.parent() {
@@ -1117,9 +1124,10 @@ impl SnapshotManager {
 
             let local_path_display = self.local_path.display();
             tracing::info!(
-                "Snapshot downloaded to {local_path_display}. dataset={} snapshot={} size={actual_size}",
+                "Snapshot downloaded to {local_path_display}. dataset={} snapshot={} size={actual_size} sha={sha}",
                 self.dataset_name,
-                entry.snapshot
+                entry.snapshot,
+                sha = actual_checksum.as_str(),
             );
             Ok(SnapshotDownloadInfo {
                 schema,
@@ -1128,9 +1136,10 @@ impl SnapshotManager {
             })
         } else {
             tracing::warn!(
-                "Snapshot schema not found. dataset={} snapshot={}",
+                "Snapshot schema not found. dataset={} snapshot={} sha={sha}",
                 self.dataset_name,
-                entry.snapshot
+                entry.snapshot,
+                sha = entry.snapshot_checksum.as_str(),
             );
             Err(SnapshotDownloadError::MissingSchema { path: path_display })
         }

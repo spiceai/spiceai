@@ -47,13 +47,14 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::Partition;
 use crate::creator::PartitionCreator;
+use crate::expression::PartitionedBy;
 
 #[derive(Debug)]
 pub struct PartitionerExec {
     input: Arc<dyn ExecutionPlan>,
     creator: Arc<dyn PartitionCreator>,
     partitions: Arc<RwLock<HashMap<String, Partition>>>,
-    partition_by: Expr,
+    partition_by: PartitionedBy,
     insert_op: InsertOp,
     schema: SchemaRef,
     properties: PlanProperties,
@@ -62,7 +63,7 @@ pub struct PartitionerExec {
 impl PartitionerExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
-        partition_by: Expr,
+        partition_by: PartitionedBy,
         creator: Arc<dyn PartitionCreator>,
         partitions: Arc<RwLock<HashMap<String, Partition>>>,
         insert_op: InsertOp,
@@ -94,9 +95,10 @@ impl DisplayAs for PartitionerExec {
     ) -> std::fmt::Result {
         write!(
             f,
-            "{} (partition_by = {}, insert_op = {})",
+            "{} (partition_by = {} AS {}, insert_op = {})",
             self.name(),
-            self.partition_by,
+            self.partition_by.expression,
+            self.partition_by.name,
             self.insert_op
         )
     }
@@ -157,7 +159,7 @@ impl ExecutionPlan for PartitionerExec {
             let schema = self.schema();
             let row_count_schema = Arc::clone(&row_count_schema);
             let input = Arc::clone(&self.input);
-            let physical_expr = create_physical_expr(&self.partition_by, self.schema())?;
+            let physical_expr = create_physical_expr(&self.partition_by.expression, self.schema())?;
             let creator = Arc::clone(&self.creator);
             let partition_providers = Arc::clone(&self.partitions);
             let insert_op = self.insert_op;

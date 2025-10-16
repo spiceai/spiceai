@@ -95,6 +95,10 @@ impl S3Vector {
             partition_by,
         }
     }
+
+    fn metadata_columns(&self) -> &MetadataColumns {
+        &self.metadata_columns
+    }
 }
 
 #[async_trait]
@@ -105,10 +109,6 @@ impl SearchIndex for S3Vector {
 
     fn primary_fields(&self) -> Vec<Field> {
         self.primary_key.clone()
-    }
-
-    fn metadata_columns(&self) -> &MetadataColumns {
-        &self.metadata_columns
     }
 
     async fn write(

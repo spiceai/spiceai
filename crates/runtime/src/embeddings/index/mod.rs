@@ -45,11 +45,8 @@ pub mod tests {
     };
     use datafusion_expr::{LogicalPlan, TableScan};
     use runtime_datafusion_index::Index;
+    use search::index::VectorIndex;
     use search::{generation::util::append_fields, index::SearchIndex};
-    use search::{
-        index::VectorIndex,
-        metadata::{MetadataColumn, MetadataColumns},
-    };
     use snafu::ResultExt;
 
     use crate::embedding_col;
@@ -181,35 +178,14 @@ pub mod tests {
         embedded_column: String,
         primary_columns: Vec<Field>,
         schema: Schema,
-        metadata: MetadataColumns,
     }
     impl PretendVectorIndex {
         #[must_use]
         pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
-            let primary_key_names: Vec<_> =
-                primary_columns.iter().map(|f| f.name().clone()).collect();
-            let cols = schema
-                .fields()
-                .iter()
-                .filter_map(|f| {
-                    if primary_key_names.contains(f.name())
-                        || *f.name() == embedding_col!(embedded_column)
-                    {
-                        return None;
-                    }
-                    if f.metadata().get("filterable") == Some(&"true".to_string()) {
-                        Some(MetadataColumn::Filterable(Arc::clone(f)))
-                    } else {
-                        Some(MetadataColumn::NonFilterable(Arc::clone(f)))
-                    }
-                })
-                .collect::<Vec<_>>();
-
             Self {
                 embedded_column,
                 primary_columns,
                 schema,
-                metadata: MetadataColumns::from(cols),
             }
         }
     }
@@ -277,10 +253,6 @@ pub mod tests {
 
         fn primary_fields(&self) -> Vec<Field> {
             self.primary_columns.clone()
-        }
-
-        fn metadata_columns(&self) -> &MetadataColumns {
-            &self.metadata
         }
 
         async fn write(
