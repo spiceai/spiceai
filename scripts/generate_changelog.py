@@ -7,6 +7,13 @@ def run_git(cmd):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
     return result.stdout.strip()
 
+"""
+The idea behind this script is to:
+* Find commits that are in current release branch but not in the previous tag
+* Match them to trunk commits using patch-id
+* Find relevant PR
+"""
+
 def main():
     if len(sys.argv) != 3:
         print("Usage: python3 changelog.py <previous_release_tag> <release_branch>")
