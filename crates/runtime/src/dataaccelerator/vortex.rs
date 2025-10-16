@@ -139,7 +139,7 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
                 )));
             }
 
-            Some(field.clone())
+            Some(Arc::clone(field))
         })
         .collect();
 
