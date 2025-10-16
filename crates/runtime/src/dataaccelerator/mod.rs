@@ -992,22 +992,42 @@ mod accelerator_compat_tests {
             // Date/Time types
             Field::new("date32_col", DataType::Date32, true),
             Field::new("date64_col", DataType::Date64, true),
-            Field::new(
+        ];
+
+        // Time32 and Time64 types - Vortex doesn't support these
+        #[cfg(feature = "vortex")]
+        if !matches!(engine, Some(Engine::Vortex)) {
+            fields.push(Field::new(
                 "time32_ms_col",
                 DataType::Time32(TimeUnit::Millisecond),
                 true,
-            ),
-            Field::new(
+            ));
+            fields.push(Field::new(
                 "time64_us_col",
                 DataType::Time64(TimeUnit::Microsecond),
                 true,
-            ),
-            Field::new(
-                "timestamp_us_col",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ));
+        }
+
+        #[cfg(not(feature = "vortex"))]
+        {
+            fields.push(Field::new(
+                "time32_ms_col",
+                DataType::Time32(TimeUnit::Millisecond),
                 true,
-            ),
-        ];
+            ));
+            fields.push(Field::new(
+                "time64_us_col",
+                DataType::Time64(TimeUnit::Microsecond),
+                true,
+            ));
+        }
+
+        fields.push(Field::new(
+            "timestamp_us_col",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ));
 
         // Duration and Interval types - Vortex doesn't support Duration yet
         #[cfg(feature = "vortex")]
@@ -1038,12 +1058,24 @@ mod accelerator_compat_tests {
             ));
         }
 
-        // List type (list of Int32)
-        fields.push(Field::new(
-            "list_col",
-            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-            true,
-        ));
+        // List type (list of Int32) - Vortex doesn't support List yet
+        #[cfg(feature = "vortex")]
+        if !matches!(engine, Some(Engine::Vortex)) {
+            fields.push(Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ));
+        }
+
+        #[cfg(not(feature = "vortex"))]
+        {
+            fields.push(Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ));
+        }
 
         // Map type (map of Utf8 keys to Int32 values) - Vortex doesn't support Map yet
         #[cfg(feature = "vortex")]
@@ -1450,10 +1482,17 @@ mod accelerator_compat_tests {
             Arc::new(large_binary_array),
             Arc::new(date32_array),
             Arc::new(date64_array),
-            Arc::new(time32_array),
-            Arc::new(time64_array),
-            Arc::new(timestamp_array),
         ];
+
+        // Add time arrays if they exist in the schema
+        if schema.column_with_name("time32_ms_col").is_some() {
+            columns.push(Arc::new(time32_array));
+        }
+        if schema.column_with_name("time64_us_col").is_some() {
+            columns.push(Arc::new(time64_array));
+        }
+
+        columns.push(Arc::new(timestamp_array));
 
         // Add duration and interval arrays if they exist in the schema
         if schema.column_with_name("duration_ms_col").is_some() {
@@ -1463,8 +1502,10 @@ mod accelerator_compat_tests {
             columns.push(Arc::new(interval_array));
         }
 
-        // Add remaining columns
-        columns.push(Arc::new(list_array));
+        // Add list array if it exists in the schema
+        if schema.column_with_name("list_col").is_some() {
+            columns.push(Arc::new(list_array));
+        }
 
         // Add map array if it exists in the schema
         if schema.column_with_name("map_col").is_some() {
