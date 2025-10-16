@@ -152,7 +152,7 @@ fn filter_schema_for_vortex(schema: &arrow::datatypes::Schema) -> arrow::datatyp
                 )));
             }
 
-            Some(Arc::clone(field))
+            Some(field.clone())
         })
         .collect();
 
@@ -296,7 +296,7 @@ impl DataSink for VortexDataSink {
                 } else {
                     arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(|e| {
                         datafusion::error::DataFusionError::External(Box::new(
-                            std::io::Error::other(format!("Failed to concatenate batches: {e}")),
+                            std::io::Error::other(format!("Failed to concatenate batches: {}", e)),
                         ))
                     })?
                 };
@@ -310,7 +310,7 @@ impl DataSink for VortexDataSink {
                     .await
                     .map_err(|e| {
                         datafusion::error::DataFusionError::External(Box::new(
-                            std::io::Error::other(format!("Failed to write Vortex file: {e}")),
+                            std::io::Error::other(format!("Failed to write Vortex file: {}", e)),
                         ))
                     })?;
 
