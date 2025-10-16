@@ -1081,24 +1081,11 @@ mod accelerator_compat_tests {
             ));
         }
 
-        // List type (list of Int32) - Vortex doesn't support List yet
-        #[cfg(feature = "vortex")]
-        if !matches!(engine, Some(Engine::Vortex)) {
-            fields.push(Field::new(
-                "list_col",
-                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                true,
-            ));
-        }
-
-        #[cfg(not(feature = "vortex"))]
-        {
-            fields.push(Field::new(
-                "list_col",
-                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                true,
-            ));
-        }
+        fields.push(Field::new(
+            "list_col",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ));
 
         // Map type (map of Utf8 keys to Int32 values) - Vortex doesn't support Map yet
         #[cfg(feature = "vortex")]
@@ -2236,6 +2223,112 @@ mod accelerator_compat_tests {
                     "{:?}: should have 1 column in result",
                     engine
                 );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_complex_types_list_and_map() {
+        run_compat_test(|engine, table, _mode| async move {
+            let ctx = SessionContext::new();
+            let schema = test_schema(Some(engine));
+
+            // Check if List and Map columns exist in the schema
+            let has_list = schema.column_with_name("list_col").is_some();
+            let has_map = schema.column_with_name("map_col").is_some();
+
+            // Vortex supports List but not Map yet
+            if engine == Engine::Vortex {
+                assert!(
+                    has_list,
+                    "{:?}: should have list_col (now supported)",
+                    engine
+                );
+                assert!(
+                    !has_map,
+                    "{:?}: should not have map_col (not yet supported)",
+                    engine
+                );
+            } else {
+                // For other engines, ensure both List and Map are in the schema
+                assert!(has_list, "{:?}: should have list_col in schema", engine);
+                assert!(has_map, "{:?}: should have map_col in schema", engine);
+            }
+
+            // Insert test data with List and Map values
+            let data = generate_test_data(Arc::clone(&schema), 20, 5); // 20 records, every 5th is null
+            insert_test_data(&table, &ctx, data).await;
+
+            // Scan and verify the data
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 20, "{:?}: should have 20 rows", engine);
+
+            // Verify List column exists and has correct type
+            for batch in &results {
+                if let Ok(list_col_idx) = batch.schema().index_of("list_col") {
+                    let list_col = batch.column(list_col_idx);
+                    assert!(
+                        matches!(list_col.data_type(), DataType::List(_)),
+                        "{:?}: list_col should be List type, got {:?}",
+                        engine,
+                        list_col.data_type()
+                    );
+
+                    // Verify we have some null and some non-null values
+                    let null_count = list_col.null_count();
+                    assert!(
+                        null_count > 0,
+                        "{:?}: list_col should have some nulls",
+                        engine
+                    );
+                    assert!(
+                        null_count < total_rows,
+                        "{:?}: list_col should have some non-null values",
+                        engine
+                    );
+                }
+
+                // Verify Map column exists and has correct type
+                if let Ok(map_col_idx) = batch.schema().index_of("map_col") {
+                    let map_col = batch.column(map_col_idx);
+                    assert!(
+                        matches!(map_col.data_type(), DataType::Map(_, _)),
+                        "{:?}: map_col should be Map type, got {:?}",
+                        engine,
+                        map_col.data_type()
+                    );
+
+                    // Verify we have some null and some non-null values
+                    let null_count = map_col.null_count();
+                    assert!(
+                        null_count > 0,
+                        "{:?}: map_col should have some nulls",
+                        engine
+                    );
+                    assert!(
+                        null_count < total_rows,
+                        "{:?}: map_col should have some non-null values",
+                        engine
+                    );
+                }
+            }
+
+            if engine == Engine::Vortex {
+                println!(
+                    "✓ {:?}: List type works correctly (Map not yet supported)",
+                    engine
+                );
+            } else {
+                println!("✓ {:?}: List and Map types work correctly", engine);
             }
         })
         .await;
