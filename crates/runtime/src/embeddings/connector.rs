@@ -463,12 +463,14 @@ fn get_dataset_partition_expressions(
         &dataset.runtime().df.ctx,
         df_schema,
     )
-    .map(|p| p.expressions)
     .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
         dataconnector: dataset.source().to_string(),
         connector_component: dataset.into(),
         source: e.into(),
-    })?;
+    })?
+    .into_iter()
+    .map(|p| p.expression)
+    .collect();
 
     Ok(partition_by)
 }
