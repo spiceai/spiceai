@@ -32,7 +32,7 @@ use std::sync::Arc;
 use vortex_datafusion::VortexFormat;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::Engine;
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::make_spice_data_directory;
 use crate::parameters::ParameterSpec;
@@ -325,7 +325,25 @@ impl DataAccelerator for VortexAccelerator {
         );
 
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Vortex data accelerator only supports file mode. Please configure the accelerator with mode: file",
+                ),
+            }));
+        }
+
+        // Validate refresh_mode - only append is supported
+        if let Some(acceleration) = source.acceleration() {
+            if let Some(refresh_mode) = acceleration.refresh_mode {
+                if refresh_mode != RefreshMode::Append {
+                    return Err(Box::new(Error::InvalidConfiguration {
+                        detail: Arc::from(format!(
+                            "Vortex data accelerator currently only supports append refresh mode, but {:?} was specified. Please set refresh_mode: append",
+                            refresh_mode
+                        )),
+                    }));
+                }
+            }
         }
 
         let dir_path = self.file_path(source)?;
