@@ -365,15 +365,6 @@ impl DataAccelerator for VortexAccelerator {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        if let Some(accel) = source.acceleration()
-            && accel.refresh_mode.unwrap_or(RefreshMode::Full) != RefreshMode::Append
-        {
-            tracing::warn!("Vortex data accelerator only supports `append` refresh mode.");
-            return Err(Box::new(Error::InvalidConfiguration {
-                detail: Arc::from("Vortex data accelerator only supports `append` refresh mode"),
-            }));
-        }
-
         let (dir_path, _target_file_size_bytes) = self.resolve_storage_config(source).boxed()?;
 
         let (arrow_schema, filtered_count) = Self::filtered_arrow_schema(&cmd);
