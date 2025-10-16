@@ -32,7 +32,7 @@ use std::sync::Arc;
 use vortex_datafusion::VortexFormat;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::Engine;
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
