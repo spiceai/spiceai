@@ -23,8 +23,13 @@ use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
+use vortex_datafusion::persistent::format::VortexFormat;
+
 use crate::{
-    component::dataset::acceleration::{Engine, Mode},
+    component::dataset::acceleration::Engine,
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -106,10 +111,11 @@ impl VortexAccelerator {
             }
 
             // Otherwise, use default path pattern
+            let default_dir = spice_data_base_path();
             let data_directory = acceleration_params
                 .get("vortex_data_dir")
                 .map(|s| s.as_str())
-                .unwrap_or(&spice_data_base_path());
+                .unwrap_or(&default_dir);
 
             let dataset_name = source
                 .name()
@@ -209,11 +215,6 @@ impl DataAccelerator for VortexAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(feature = "vortex")]
         {
-            use datafusion::datasource::listing::{
-                ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-            };
-            use vortex_datafusion::persistent::format::VortexFormat;
-
             let mode = cmd
                 .options
                 .get("mode")
@@ -281,9 +282,7 @@ impl DataAccelerator for VortexAccelerator {
                     let empty_arrays: Vec<_> = arrow_schema
                         .fields()
                         .iter()
-                        .map(|_| {
-                            vortex::array::PrimitiveArray::from(Vec::<i32>::new()).into_array()
-                        })
+                        .map(|_| PrimitiveArray::from(Vec::<i32>::new()).into_array())
                         .collect();
 
                     let struct_array = StructArray::try_new(

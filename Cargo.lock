@@ -14013,6 +14013,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "util",
+ "vortex",
 ]
 
 [[package]]
