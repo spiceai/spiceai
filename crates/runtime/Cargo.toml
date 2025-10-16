@@ -266,5 +266,6 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
+turso = []
 vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]

@@ -818,7 +818,7 @@ mod accelerator_compat_tests {
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
-                        .create_external_table(external_table, None, None)
+                        .create_external_table(external_table, None, Vec::new())
                         .await
                     {
                         Ok(table) => table,
@@ -832,7 +832,7 @@ mod accelerator_compat_tests {
                 Engine::Turso => {
                     use crate::dataaccelerator::turso::TursoAccelerator;
                     match TursoAccelerator::new()
-                        .create_external_table(external_table, None, None)
+                        .create_external_table(external_table, None, Vec::new())
                         .await
                     {
                         Ok(table) => table,
@@ -846,7 +846,7 @@ mod accelerator_compat_tests {
                 Engine::DuckDB => {
                     use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, None)
+                        .create_external_table(external_table, None, Vec::new())
                         .await
                     {
                         Ok(table) => table,
@@ -859,7 +859,7 @@ mod accelerator_compat_tests {
                 Engine::Arrow => {
                     use crate::dataaccelerator::arrow::ArrowAccelerator;
                     match ArrowAccelerator::new()
-                        .create_external_table(external_table, None, None)
+                        .create_external_table(external_table, None, Vec::new())
                         .await
                     {
                         Ok(table) => table,
@@ -947,7 +947,7 @@ mod accelerator_compat_tests {
                     let create_future = AssertUnwindSafe(accelerator.create_external_table(
                         external_table,
                         Some(&dataset),
-                        None,
+                        Vec::new(),
                     ))
                     .catch_unwind();
 
@@ -1326,22 +1326,28 @@ mod accelerator_compat_tests {
                 if i % nullable_mod == 0 {
                     None
                 } else {
-                    Some(format!("binary_{}", i).into_bytes())
+                    Some(format!("binary_{i}").into_bytes())
                 }
             })
             .collect();
-        let binary_array = BinaryArray::from(binary_data);
+        let binary_slices: Vec<Option<&[u8]>> =
+            binary_data.iter().map(|value| value.as_deref()).collect();
+        let binary_array = BinaryArray::from(binary_slices);
 
         let large_binary_data: Vec<Option<Vec<u8>>> = (0..num_records)
             .map(|i| {
                 if i % nullable_mod == 0 {
                     None
                 } else {
-                    Some(format!("large_binary_{}", i).into_bytes())
+                    Some(format!("large_binary_{i}").into_bytes())
                 }
             })
             .collect();
-        let large_binary_array = LargeBinaryArray::from(large_binary_data);
+        let large_binary_slices: Vec<Option<&[u8]>> = large_binary_data
+            .iter()
+            .map(|value| value.as_deref())
+            .collect();
+        let large_binary_array = LargeBinaryArray::from(large_binary_slices);
 
         // Date/Time types
         let date32_array = Date32Array::from(
@@ -1780,7 +1786,7 @@ mod accelerator_compat_tests {
                 .expect("value should be Float64Array");
 
             // Vortex has a dummy row at index 0, so the actual data starts at index 1
-            let offset = if engine == Engine::Vortex { 1 } else { 0 };
+            let offset = usize::from(engine == Engine::Vortex);
 
             assert!(
                 !value_col.is_null(offset),
@@ -1836,7 +1842,7 @@ mod accelerator_compat_tests {
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
                     SqliteAccelerator::new()
-                        .create_external_table(external_table, None, None)
+                        .create_external_table(external_table, None, Vec::new())
                         .await
                         .expect("SQLite table should be created")
                 }
@@ -1844,7 +1850,7 @@ mod accelerator_compat_tests {
                 Engine::Turso => {
                     use crate::dataaccelerator::turso::TursoAccelerator;
                     TursoAccelerator::new()
-                        .create_external_table(external_table, None, None)
+                        .create_external_table(external_table, None, Vec::new())
                         .await
                         .expect("Turso table should be created")
                 }
@@ -2358,6 +2364,9 @@ mod accelerator_compat_tests {
             return;
         }
 
+        type MetricFormatter = fn(&BenchmarkResults) -> String;
+        type Metric<'a> = (&'a str, MetricFormatter);
+
         println!("\n");
         println!(
             "╔════════════════════════════════════════════════════════════════════════════════════════════╗"
@@ -2383,7 +2392,7 @@ mod accelerator_compat_tests {
 
             // Print header with engine names
             print!("║ {:20}", "Metric");
-            for result in mode_results.iter() {
+            for result in &mode_results {
                 print!(" │ {:>15}", format!("{:?}", result.engine));
             }
             println!(" ║");
@@ -2393,13 +2402,13 @@ mod accelerator_compat_tests {
 
             // Print configuration
             print!("║ {:20}", "Records/iteration");
-            for result in mode_results.iter() {
+            for result in &mode_results {
                 print!(" │ {:>15}", format!("{}", result.num_records));
             }
             println!(" ║");
 
             print!("║ {:20}", "Iterations");
-            for result in mode_results.iter() {
+            for result in &mode_results {
                 print!(" │ {:>15}", format!("{}", result.num_iterations));
             }
             println!(" ║");
@@ -2416,33 +2425,47 @@ mod accelerator_compat_tests {
                 "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
             );
 
-            let metrics = vec![
-                ("Min", |r: &BenchmarkResults| {
-                    format_duration_compact(r.min_insert)
-                }),
-                ("P90", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p90_insert)
-                }),
-                ("P95", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p95_insert)
-                }),
-                ("P99", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p99_insert)
-                }),
-                ("P99.9", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p99_9_insert)
-                }),
-                ("Max", |r: &BenchmarkResults| {
-                    format_duration_compact(r.max_insert)
-                }),
-                ("P95 rec/sec", |r: &BenchmarkResults| {
-                    format!("{:.0}", r.p95_insert_rec_per_sec)
-                }),
+            let metrics: [Metric<'static>; 7] = [
+                (
+                    "Min",
+                    (|r: &BenchmarkResults| format_duration_compact(r.min_insert))
+                        as MetricFormatter,
+                ),
+                (
+                    "P90",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p90_insert))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p95_insert))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p99_insert))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99.9",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p99_9_insert))
+                        as MetricFormatter,
+                ),
+                (
+                    "Max",
+                    (|r: &BenchmarkResults| format_duration_compact(r.max_insert))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95 rec/sec",
+                    (|r: &BenchmarkResults| format!("{:.0}", r.p95_insert_rec_per_sec))
+                        as MetricFormatter,
+                ),
             ];
 
-            for (label, formatter) in &metrics {
+            for (label, formatter) in metrics {
                 print!("║ {:20}", label);
-                for result in mode_results.iter() {
+                for result in &mode_results {
                     print!(" │ {:>15}", formatter(result));
                 }
                 println!(" ║");
@@ -2459,33 +2482,47 @@ mod accelerator_compat_tests {
                 "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
             );
 
-            let query_metrics = vec![
-                ("Min", |r: &BenchmarkResults| {
-                    format_duration_compact(r.min_query)
-                }),
-                ("P90", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p90_query)
-                }),
-                ("P95", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p95_query)
-                }),
-                ("P99", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p99_query)
-                }),
-                ("P99.9", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p99_9_query)
-                }),
-                ("Max", |r: &BenchmarkResults| {
-                    format_duration_compact(r.max_query)
-                }),
-                ("P95 rec/sec", |r: &BenchmarkResults| {
-                    format!("{:.0}", r.p95_query_rec_per_sec)
-                }),
+            let query_metrics: [Metric<'static>; 7] = [
+                (
+                    "Min",
+                    (|r: &BenchmarkResults| format_duration_compact(r.min_query))
+                        as MetricFormatter,
+                ),
+                (
+                    "P90",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p90_query))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p95_query))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p99_query))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99.9",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p99_9_query))
+                        as MetricFormatter,
+                ),
+                (
+                    "Max",
+                    (|r: &BenchmarkResults| format_duration_compact(r.max_query))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95 rec/sec",
+                    (|r: &BenchmarkResults| format!("{:.0}", r.p95_query_rec_per_sec))
+                        as MetricFormatter,
+                ),
             ];
 
-            for (label, formatter) in &query_metrics {
+            for (label, formatter) in query_metrics {
                 print!("║ {:20}", label);
-                for result in mode_results.iter() {
+                for result in &mode_results {
                     print!(" │ {:>15}", formatter(result));
                 }
                 println!(" ║");
@@ -2502,30 +2539,42 @@ mod accelerator_compat_tests {
                 "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
             );
 
-            let roundtrip_metrics = vec![
-                ("Min", |r: &BenchmarkResults| {
-                    format_duration_compact(r.min_roundtrip)
-                }),
-                ("P90", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p90_roundtrip)
-                }),
-                ("P95", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p95_roundtrip)
-                }),
-                ("P99", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p99_roundtrip)
-                }),
-                ("P99.9", |r: &BenchmarkResults| {
-                    format_duration_compact(r.p99_9_roundtrip)
-                }),
-                ("Max", |r: &BenchmarkResults| {
-                    format_duration_compact(r.max_roundtrip)
-                }),
+            let roundtrip_metrics: [Metric<'static>; 6] = [
+                (
+                    "Min",
+                    (|r: &BenchmarkResults| format_duration_compact(r.min_roundtrip))
+                        as MetricFormatter,
+                ),
+                (
+                    "P90",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p90_roundtrip))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p95_roundtrip))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p99_roundtrip))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99.9",
+                    (|r: &BenchmarkResults| format_duration_compact(r.p99_9_roundtrip))
+                        as MetricFormatter,
+                ),
+                (
+                    "Max",
+                    (|r: &BenchmarkResults| format_duration_compact(r.max_roundtrip))
+                        as MetricFormatter,
+                ),
             ];
 
-            for (label, formatter) in &roundtrip_metrics {
+            for (label, formatter) in roundtrip_metrics {
                 print!("║ {:20}", label);
-                for result in mode_results.iter() {
+                for result in &mode_results {
                     print!(" │ {:>15}", formatter(result));
                 }
                 println!(" ║");
@@ -2578,169 +2627,177 @@ mod accelerator_compat_tests {
 
         // Collect all results for comparison
         let all_results = Arc::new(Mutex::new(Vec::new()));
-        let all_results_clone = Arc::clone(&all_results);
 
-        run_compat_test(|engine, table, mode| async move {
-            let ctx = SessionContext::new();
-            let schema = test_schema(Some(engine));
+        run_compat_test(|engine, table, mode| {
+            let all_results = Arc::clone(&all_results);
+            async move {
+                let ctx = SessionContext::new();
+                let schema = test_schema(Some(engine));
 
-            // Memory mode has limitations, file mode can handle much more
-            // Turso has tighter page cache limits than other databases due to the comprehensive test schema
-            // Note: mode string may include timestamp format like "memory, timestamp_format=rfc3339"
-            let is_memory = mode.starts_with("memory");
-            let is_file = mode.starts_with("file");
+                // Memory mode has limitations, file mode can handle much more
+                // Turso has tighter page cache limits than other databases due to the comprehensive test schema
+                // Note: mode string may include timestamp format like "memory, timestamp_format=rfc3339"
+                let is_memory = mode.starts_with("memory");
+                let is_file = mode.starts_with("file");
 
-            let (num_records, num_iterations) = match (engine, is_memory, is_file) {
-                #[cfg(feature = "turso")]
-                (Engine::Turso, true, _) => (100, 3), // 300 total records (very limited due to page cache)
-                #[cfg(feature = "turso")]
-                (Engine::Turso, _, true) => (1_000, 10), // 10K total records (reduced due to complex schema)
-                (_, true, _) => (100_000, 10),   // 1M total records
-                (_, _, true) => (1_000_000, 10), // 10M total records
-                _ => (10_000, 10),               // Fallback
-            };
-
-            let mut insert_times = Vec::new();
-            let mut query_times = Vec::new();
-
-            println!("\n=== Benchmarking {:?} ({}) ===", engine, mode);
-            println!("Records per iteration: {}", num_records);
-            println!("Number of iterations: {}", num_iterations);
-
-            for iteration in 0..num_iterations {
-                // Prepare test data using shared helper
-                let id_offset = (iteration * num_records) as i64;
-                let data = generate_test_data(Arc::clone(&schema), num_records, id_offset);
-
-                // Benchmark insert
-                let insert_start = Instant::now();
-                let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
-                let insertion = table
-                    .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
-                    .await
-                    .expect("insertion should be successful");
-
-                collect(insertion, ctx.task_ctx())
-                    .await
-                    .expect("insert successful");
-                let insert_duration = insert_start.elapsed();
-                insert_times.push(insert_duration);
-
-                // Benchmark query (scan all data)
-                let query_start = Instant::now();
-                let scan = table
-                    .scan(&ctx.state(), None, &[], None)
-                    .await
-                    .expect("scan should be successful");
-
-                let results = collect(scan, ctx.task_ctx())
-                    .await
-                    .expect("scan successful");
-                let query_duration = query_start.elapsed();
-                query_times.push(query_duration);
-
-                // Verify data integrity
-                let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-                // Vortex has a dummy initialization row, so it will have 1 extra row
-                let expected_rows = if engine == Engine::Vortex {
-                    num_records * (iteration + 1) + 1
-                } else {
-                    num_records * (iteration + 1)
+                let (num_records, num_iterations) = match (engine, is_memory, is_file) {
+                    #[cfg(feature = "turso")]
+                    (Engine::Turso, true, _) => (100, 3), // 300 total records (very limited due to page cache)
+                    #[cfg(feature = "turso")]
+                    (Engine::Turso, _, true) => (1_000, 10), // 10K total records (reduced due to complex schema)
+                    (_, true, _) => (100_000, 10), // 1M total records
+                    (_, _, true) => (1_000_000, 10), // 10M total records
+                    _ => (10_000, 10),             // Fallback
                 };
-                assert_eq!(
-                    total_rows, expected_rows,
-                    "{:?}: iteration {}: should have {} total rows",
-                    engine, iteration, expected_rows
-                );
 
-                if iteration % 3 == 0 {
-                    println!(
-                        "  Iteration {}: Insert: {:?}, Query: {:?}",
-                        iteration, insert_duration, query_duration
+                let mut insert_times = Vec::new();
+                let mut query_times = Vec::new();
+
+                println!("\n=== Benchmarking {:?} ({}) ===", engine, mode);
+                println!("Records per iteration: {}", num_records);
+                println!("Number of iterations: {}", num_iterations);
+
+                for iteration in 0..num_iterations {
+                    // Prepare test data using shared helper
+                    let id_offset = (iteration * num_records) as i64;
+                    let data = generate_test_data(Arc::clone(&schema), num_records, id_offset);
+
+                    // Benchmark insert
+                    let insert_start = Instant::now();
+                    let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+                    let insertion = table
+                        .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                        .await
+                        .expect("insertion should be successful");
+
+                    collect(insertion, ctx.task_ctx())
+                        .await
+                        .expect("insert successful");
+                    let insert_duration = insert_start.elapsed();
+                    insert_times.push(insert_duration);
+
+                    // Benchmark query (scan all data)
+                    let query_start = Instant::now();
+                    let scan = table
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .expect("scan should be successful");
+
+                    let results = collect(scan, ctx.task_ctx())
+                        .await
+                        .expect("scan successful");
+                    let query_duration = query_start.elapsed();
+                    query_times.push(query_duration);
+
+                    // Verify data integrity
+                    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+                    // Vortex has a dummy initialization row, so it will have 1 extra row
+                    let expected_rows = if engine == Engine::Vortex {
+                        num_records * (iteration + 1) + 1
+                    } else {
+                        num_records * (iteration + 1)
+                    };
+                    assert_eq!(
+                        total_rows, expected_rows,
+                        "{:?}: iteration {}: should have {} total rows",
+                        engine, iteration, expected_rows
                     );
+
+                    if iteration % 3 == 0 {
+                        println!(
+                            "  Iteration {}: Insert: {:?}, Query: {:?}",
+                            iteration, insert_duration, query_duration
+                        );
+                    }
+                }
+
+                // Helper function to calculate percentiles
+                fn percentile(sorted_times: &[std::time::Duration], p: f64) -> std::time::Duration {
+                    let idx = ((sorted_times.len() as f64 - 1.0) * p).ceil() as usize;
+                    sorted_times[idx]
+                }
+
+                // Sort times for percentile calculations
+                let mut sorted_insert = insert_times.clone();
+                sorted_insert.sort();
+                let mut sorted_query = query_times.clone();
+                sorted_query.sort();
+
+                // Calculate percentiles
+                let min_insert = sorted_insert[0];
+                let p90_insert = percentile(&sorted_insert, 0.90);
+                let p95_insert = percentile(&sorted_insert, 0.95);
+                let p99_insert = percentile(&sorted_insert, 0.99);
+                let p99_9_insert = percentile(&sorted_insert, 0.999);
+                let max_insert = sorted_insert[sorted_insert.len() - 1];
+
+                let min_query = sorted_query[0];
+                let p90_query = percentile(&sorted_query, 0.90);
+                let p95_query = percentile(&sorted_query, 0.95);
+                let p99_query = percentile(&sorted_query, 0.99);
+                let p99_9_query = percentile(&sorted_query, 0.999);
+                let max_query = sorted_query[sorted_query.len() - 1];
+
+                // Calculate round-trip percentiles
+                let mut roundtrip_times: Vec<std::time::Duration> = insert_times
+                    .iter()
+                    .zip(query_times.iter())
+                    .map(|(i, q)| *i + *q)
+                    .collect();
+                roundtrip_times.sort();
+                let min_roundtrip = roundtrip_times[0];
+                let p90_roundtrip = percentile(&roundtrip_times, 0.90);
+                let p95_roundtrip = percentile(&roundtrip_times, 0.95);
+                let p99_roundtrip = percentile(&roundtrip_times, 0.99);
+                let p99_9_roundtrip = percentile(&roundtrip_times, 0.999);
+                let max_roundtrip = roundtrip_times[roundtrip_times.len() - 1];
+
+                let p95_insert_rec_per_sec =
+                    num_records as f64 / percentile(&sorted_insert, 0.95).as_secs_f64();
+                let p95_query_rec_per_sec = (num_records * num_iterations) as f64
+                    / percentile(&sorted_query, 0.95).as_secs_f64();
+
+                // Store results for comparison
+                let results = BenchmarkResults {
+                    engine,
+                    mode: mode.clone(),
+                    num_records,
+                    num_iterations,
+                    min_insert,
+                    p90_insert,
+                    p95_insert,
+                    p99_insert,
+                    p99_9_insert,
+                    max_insert,
+                    p95_insert_rec_per_sec,
+                    min_query,
+                    p90_query,
+                    p95_query,
+                    p99_query,
+                    p99_9_query,
+                    max_query,
+                    p95_query_rec_per_sec,
+                    min_roundtrip,
+                    p90_roundtrip,
+                    p95_roundtrip,
+                    p99_roundtrip,
+                    p99_9_roundtrip,
+                    max_roundtrip,
+                };
+
+                match all_results.lock() {
+                    Ok(mut guard) => guard.push(results),
+                    Err(poisoned) => panic!("Failed to lock benchmark results: {poisoned}"),
                 }
             }
-
-            // Helper function to calculate percentiles
-            fn percentile(sorted_times: &[std::time::Duration], p: f64) -> std::time::Duration {
-                let idx = ((sorted_times.len() as f64 - 1.0) * p).ceil() as usize;
-                sorted_times[idx]
-            }
-
-            // Sort times for percentile calculations
-            let mut sorted_insert = insert_times.clone();
-            sorted_insert.sort();
-            let mut sorted_query = query_times.clone();
-            sorted_query.sort();
-
-            // Calculate percentiles
-            let min_insert = sorted_insert[0];
-            let p90_insert = percentile(&sorted_insert, 0.90);
-            let p95_insert = percentile(&sorted_insert, 0.95);
-            let p99_insert = percentile(&sorted_insert, 0.99);
-            let p99_9_insert = percentile(&sorted_insert, 0.999);
-            let max_insert = sorted_insert[sorted_insert.len() - 1];
-
-            let min_query = sorted_query[0];
-            let p90_query = percentile(&sorted_query, 0.90);
-            let p95_query = percentile(&sorted_query, 0.95);
-            let p99_query = percentile(&sorted_query, 0.99);
-            let p99_9_query = percentile(&sorted_query, 0.999);
-            let max_query = sorted_query[sorted_query.len() - 1];
-
-            // Calculate round-trip percentiles
-            let mut roundtrip_times: Vec<std::time::Duration> = insert_times
-                .iter()
-                .zip(query_times.iter())
-                .map(|(i, q)| *i + *q)
-                .collect();
-            roundtrip_times.sort();
-            let min_roundtrip = roundtrip_times[0];
-            let p90_roundtrip = percentile(&roundtrip_times, 0.90);
-            let p95_roundtrip = percentile(&roundtrip_times, 0.95);
-            let p99_roundtrip = percentile(&roundtrip_times, 0.99);
-            let p99_9_roundtrip = percentile(&roundtrip_times, 0.999);
-            let max_roundtrip = roundtrip_times[roundtrip_times.len() - 1];
-
-            let p95_insert_rec_per_sec =
-                num_records as f64 / percentile(&sorted_insert, 0.95).as_secs_f64();
-            let p95_query_rec_per_sec = (num_records * num_iterations) as f64
-                / percentile(&sorted_query, 0.95).as_secs_f64();
-
-            // Store results for comparison
-            let results = BenchmarkResults {
-                engine,
-                mode: mode.clone(),
-                num_records,
-                num_iterations,
-                min_insert,
-                p90_insert,
-                p95_insert,
-                p99_insert,
-                p99_9_insert,
-                max_insert,
-                p95_insert_rec_per_sec,
-                min_query,
-                p90_query,
-                p95_query,
-                p99_query,
-                p99_9_query,
-                max_query,
-                p95_query_rec_per_sec,
-                min_roundtrip,
-                p90_roundtrip,
-                p95_roundtrip,
-                p99_roundtrip,
-                p99_9_roundtrip,
-                max_roundtrip,
-            };
-
-            all_results_clone.lock().unwrap().push(results);
         })
         .await;
 
         // Print comparison table
-        let results = all_results.lock().unwrap();
+        let results = match all_results.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => panic!("Failed to lock benchmark results: {poisoned}"),
+        };
         print_comparison_table(&results);
     }
 }

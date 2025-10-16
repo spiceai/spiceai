@@ -867,15 +867,14 @@ impl DataAccelerator for VortexAccelerator {
         })?;
 
         let (dir_path, target_file_size_bytes) = self
-            .resolve_storage_config(src)
+            .resolve_storage_config(source)
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let (arrow_schema, filtered_count) = Self::filtered_arrow_schema(&cmd);
 
         if filtered_count > 0 {
             tracing::warn!(
-                "Filtered out {} unsupported field(s) for Vortex acceleration. Supported types are limited.",
-                filtered_count
+                "Filtered out {filtered_count} unsupported field(s) for Vortex acceleration. Supported types are limited."
             );
         }
 
@@ -941,10 +940,12 @@ mod tests {
         let accelerator = VortexAccelerator::new();
         let data_dir = accelerator.vortex_data_dir(&dataset);
 
-        assert!(data_dir.is_ok());
-        let dir_path = data_dir.unwrap();
+        let dir_path = match data_dir {
+            Ok(path) => path,
+            Err(err) => panic!("Expected Vortex data directory to resolve, but got {err}"),
+        };
         assert!(dir_path.contains("vortex_data_accelerator_test"));
-        assert!(dir_path.ends_with("/"));
+        assert!(dir_path.ends_with('/'));
     }
 
     #[tokio::test]
