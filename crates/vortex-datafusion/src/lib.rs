@@ -3,6 +3,14 @@
 
 //! Connectors to enable [DataFusion](https://docs.rs/datafusion/latest/datafusion/) to read [`Vortex`](https://docs.rs/crate/vortex/latest) data.
 #![deny(missing_docs)]
+#![allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::clone_on_ref_ptr
+)]
+#![allow(unused_imports)]
 use std::fmt::Debug;
 
 use datafusion_common::stats::Precision as DFPrecision;

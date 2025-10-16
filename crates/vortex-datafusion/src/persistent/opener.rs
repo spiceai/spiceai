@@ -456,7 +456,7 @@ mod tests {
         let file2_path = "/path/file2.vortex";
         let batch2 = record_batch!(("a", Int16, vec![Some(-1), Some(-2), Some(-3)])).unwrap();
         let data_size2 = write_arrow_to_vortex(object_store.clone(), file2_path, batch2).await?;
-        let file2 = PartitionedFile::new(file1_path.to_string(), data_size1);
+        let file2 = PartitionedFile::new(file2_path.to_string(), data_size2);
 
         // Table schema has can accommodate both files
         let table_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
