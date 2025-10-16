@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::{
     datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, physical_plan::ExecutionPlan,
 };
 use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
@@ -55,17 +57,6 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "The \"vortex_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."
-    ))]
-    InvalidFileExtension {
-        valid_extensions: String,
-        extension: String,
-    },
-
-    #[snafu(display("The \"vortex_file\" acceleration parameter value is a directory."))]
-    InvalidFileIsDirectory,
-
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
     AccelerationNotEnabled { dataset: Arc<str> },
 
@@ -77,6 +68,63 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Wrapper around ListingTable that forces InsertOp::Append for all insert operations.
+/// This is required because Vortex doesn't support overwrites yet.
+#[derive(Debug)]
+struct VortexTableProvider {
+    inner: Arc<ListingTable>,
+}
+
+#[async_trait]
+impl TableProvider for VortexTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        self.inner.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        overwrite: InsertOp,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Force all insert operations to use Append, since Vortex doesn't support overwrites yet
+        let insert_op = match overwrite {
+            InsertOp::Append => InsertOp::Append,
+            InsertOp::Overwrite => {
+                tracing::warn!(
+                    "Vortex does not support overwrite operations yet, using append instead"
+                );
+                InsertOp::Append
+            }
+            InsertOp::Replace => {
+                tracing::warn!(
+                    "Vortex does not support replace operations yet, using append instead"
+                );
+                InsertOp::Append
+            }
+        };
+        self.inner.insert_into(state, input, insert_op).await
+    }
+}
 
 pub struct VortexAccelerator {
     _marker: std::marker::PhantomData<()>,
@@ -96,8 +144,8 @@ impl VortexAccelerator {
         }
     }
 
-    /// Returns the `Vortex` file path that would be used for a file-based `Vortex` accelerator from this dataset
-    pub fn vortex_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+    /// Returns the `Vortex` data directory path that would be used for a file-based `Vortex` accelerator from this dataset
+    pub fn vortex_data_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
@@ -105,25 +153,27 @@ impl VortexAccelerator {
         } else if let Some(acceleration) = source.acceleration() {
             let acceleration_params = acceleration.params.clone();
 
-            // Check for vortex_file parameter first
-            if let Some(vortex_file) = acceleration_params.get("vortex_file") {
-                return Ok(vortex_file.clone());
-            }
-
-            // Otherwise, use default path pattern
-            let default_dir = spice_data_base_path();
-            let data_directory = acceleration_params
-                .get("vortex_data_dir")
-                .map(|s| s.as_str())
-                .unwrap_or(&default_dir);
-
+            // Get the sanitized dataset name
             let dataset_name = source
                 .name()
                 .to_string()
                 .replace('.', "_")
                 .replace('/', "_");
 
-            Ok(format!("{data_directory}/{dataset_name}_vortex.vortex"))
+            // Use vortex_data_path if provided, otherwise use default: spice_data_base_path() + dataset_name
+            let data_path =
+                if let Some(vortex_data_path) = acceleration_params.get("vortex_data_path") {
+                    vortex_data_path.clone()
+                } else {
+                    format!("{}/{}", spice_data_base_path(), dataset_name)
+                };
+
+            // Ensure the path ends with a separator for directory operations
+            if data_path.ends_with('/') {
+                Ok(data_path)
+            } else {
+                Ok(format!("{}/", data_path))
+            }
         } else {
             unreachable!("Expected dataset to have acceleration parameters, but none were found")
         }
@@ -131,8 +181,7 @@ impl VortexAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("file"),
-    ParameterSpec::component("data_dir"),
+    ParameterSpec::component("data_path"),
     ParameterSpec::runtime("file_watcher"),
 ];
 
@@ -151,7 +200,7 @@ impl DataAccelerator for VortexAccelerator {
     }
 
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
-        self.vortex_file_path(source)
+        self.vortex_data_path(source)
             .map_err(|err| FilePathError::External {
                 engine: Engine::Vortex,
                 source: err.into(),
@@ -163,12 +212,17 @@ impl DataAccelerator for VortexAccelerator {
             return true; // memory mode Vortex is always initialized
         }
 
-        // otherwise, we're initialized if the file exists
-        self.has_existing_file(source)
+        // otherwise, we're initialized if the data directory exists
+        if let Ok(data_path) = self.file_path(source) {
+            PathBuf::from(data_path).exists()
+        } else {
+            false
+        }
     }
 
     /// Initializes a `Vortex` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
+    /// Creates the data directory if it doesn't exist
     async fn init(
         &self,
         source: &dyn AccelerationSource,
@@ -177,36 +231,28 @@ impl DataAccelerator for VortexAccelerator {
             return Ok(());
         }
 
-        let path = self.file_path(source)?;
+        let data_path = self.file_path(source)?;
+
+        // Ensure the spice data base directory exists
+        make_spice_data_directory()
+            .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+
+        // Create the vortex data directory if it doesn't exist
+        let path_buf = PathBuf::from(&data_path);
+        if !path_buf.exists() {
+            std::fs::create_dir_all(&path_buf)
+                .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
+        }
 
         if let Some(acceleration) = source.acceleration() {
-            if !acceleration.params.contains_key("vortex_file") {
-                make_spice_data_directory()
-                    .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
-            }
-
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(acceleration, source, path_buf).await;
         }
 
         Ok(())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
+    /// Vortex only supports file mode and requires a data directory.
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -215,56 +261,52 @@ impl DataAccelerator for VortexAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(feature = "vortex")]
         {
-            let mode = cmd
-                .options
-                .get("mode")
-                .map(|s| s.as_str())
-                .unwrap_or("memory");
-
-            match mode {
-                "file" => {
-                    // File mode: Use ListingTable with VortexFormat
-                    let file_path = if let Some(src) = source {
-                        self.file_path(src)?
-                    } else {
-                        return Err(Error::InvalidConfiguration {
-                            detail: Arc::from("File path required for file mode"),
-                        }
-                        .into());
-                    };
-
-                    let ctx = SessionContext::new();
-                    let format = Arc::new(VortexFormat::default());
-                    let table_url = ListingTableUrl::parse(&file_path).map_err(|e| {
-                        Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        }
-                    })?;
-
-                    let config = ListingTableConfig::new(table_url)
-                        .with_listing_options(
-                            ListingOptions::new(format)
-                                .with_session_config_options(ctx.state().config()),
-                        )
-                        .infer_schema(&ctx.state())
-                        .await
-                        .map_err(|e| Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        })?;
-
-                    let listing_table = ListingTable::try_new(config).map_err(|e| {
-                        Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        }
-                    })?;
-
-                    Ok(Arc::new(listing_table))
+            // Vortex only supports file mode with a data directory
+            let data_path = if let Some(src) = source {
+                self.file_path(src)?
+            } else {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from("Source required for Vortex accelerator"),
                 }
-                _ => Err(Error::InvalidConfiguration {
-                    detail: Arc::from(format!("Invalid mode: {mode}")),
-                }
-                .into()),
+                .into());
+            };
+
+            // Ensure the data directory exists
+            let path_buf = PathBuf::from(&data_path);
+            if !path_buf.exists() {
+                std::fs::create_dir_all(&path_buf)
+                    .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
             }
+
+            let ctx = SessionContext::new();
+            let format = Arc::new(VortexFormat::default());
+            let table_url = ListingTableUrl::parse(&data_path).map_err(|e| {
+                Error::AccelerationCreationFailed {
+                    source: Box::new(e),
+                }
+            })?;
+
+            // Use the schema from the command instead of trying to infer from a potentially non-existent file
+            // Convert DFSchema to Arrow Schema
+            let arrow_schema: Arc<arrow::datatypes::Schema> =
+                Arc::new(cmd.schema.as_ref().clone().into());
+            let config = ListingTableConfig::new(table_url)
+                .with_listing_options(
+                    ListingOptions::new(format).with_session_config_options(ctx.state().config()),
+                )
+                .with_schema(arrow_schema);
+
+            let listing_table =
+                ListingTable::try_new(config).map_err(|e| Error::AccelerationCreationFailed {
+                    source: Box::new(e),
+                })?;
+
+            // Wrap in VortexTableProvider to force InsertOp::Append
+            let wrapped_table = VortexTableProvider {
+                inner: Arc::new(listing_table),
+            };
+
+            Ok(Arc::new(wrapped_table))
         }
 
         #[cfg(not(feature = "vortex"))]
@@ -290,13 +332,13 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_vortex_file_path_generation() {
+    async fn test_vortex_data_path_generation() {
         let app = crate::app::AppBuilder::new("test").build();
         let rt = crate::Runtime::builder().build().await;
 
         let mut dataset = DatasetBuilder::try_new(
-            "vortex_file_accelerator_test".to_string(),
-            "vortex_file_accelerator_test",
+            "vortex_data_accelerator_test".to_string(),
+            "vortex_data_accelerator_test",
         )
         .expect("Failed to create builder")
         .with_app(Arc::new(app))
@@ -311,39 +353,11 @@ mod tests {
         });
 
         let accelerator = VortexAccelerator::new();
-        let file_path = accelerator.vortex_file_path(&dataset);
+        let data_path = accelerator.vortex_data_path(&dataset);
 
-        assert!(file_path.is_ok());
-        let path = file_path.unwrap();
-        assert!(path.contains("vortex_file_accelerator_test"));
-        assert!(path.ends_with(".vortex"));
-    }
-
-    #[tokio::test]
-    async fn test_vortex_memory_mode() {
-        let app = crate::app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-
-        let mut dataset =
-            DatasetBuilder::try_new("vortex_memory_test".to_string(), "vortex_memory_test")
-                .expect("Failed to create builder")
-                .with_app(Arc::new(app))
-                .with_runtime(Arc::new(rt))
-                .build()
-                .expect("Failed to build dataset");
-
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::Vortex,
-            mode: Mode::Memory,
-            ..Default::default()
-        });
-
-        let accelerator = VortexAccelerator::new();
-
-        // Memory mode should always be initialized
-        assert!(accelerator.is_initialized(&dataset));
-
-        // Init should be a no-op for memory mode
-        assert!(accelerator.init(&dataset).await.is_ok());
+        assert!(data_path.is_ok());
+        let path = data_path.unwrap();
+        assert!(path.contains("vortex_data_accelerator_test"));
+        assert!(path.ends_with('/'));
     }
 }

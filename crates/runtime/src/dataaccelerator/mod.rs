@@ -752,6 +752,8 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
+            #[cfg(feature = "vortex")]
+            (Engine::Vortex, "file", None),
         ];
 
         for (engine, mode, timestamp_format) in test_configs {
@@ -860,6 +862,20 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
+                #[cfg(feature = "vortex")]
+                Engine::Vortex => {
+                    use crate::dataaccelerator::vortex::VortexAccelerator;
+                    match VortexAccelerator::new()
+                        .create_external_table(external_table, None, None)
+                        .await
+                    {
+                        Ok(table) => table,
+                        Err(e) => {
+                            println!("  Skipping Vortex - unsupported types: {}", e);
+                            continue;
+                        }
+                    }
+                }
                 _ => panic!("Unsupported engine for this test"),
             };
 
@@ -867,6 +883,14 @@ mod accelerator_compat_tests {
 
             // Cleanup file if in file mode
             if mode == "file" && !location.is_empty() {
+                #[cfg(feature = "vortex")]
+                if engine == Engine::Vortex {
+                    // Vortex uses directories, not single files
+                    let _ = std::fs::remove_dir_all(&location);
+                } else {
+                    let _ = std::fs::remove_file(&location);
+                }
+                #[cfg(not(feature = "vortex"))]
                 let _ = std::fs::remove_file(&location);
             }
         }
@@ -2084,7 +2108,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,vortex -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::time::Instant;
 
