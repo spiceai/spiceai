@@ -616,8 +616,15 @@ impl DataAccelerator for VortexAccelerator {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        _partition_by: Option<PartitionBy>,
+        partition_by: Option<PartitionBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        ensure!(
+            partition_by.is_none(),
+            super::InvalidConfigurationSnafu {
+                msg: "Vortex data accelerator does not support the `partition_by` parameter but it was provided".to_string()
+            }
+        );
+
         // Vortex only supports file mode with directory-based storage
         let (dir_path, target_file_size_bytes) = if let Some(src) = source {
             let path = self.file_path(src)?;
