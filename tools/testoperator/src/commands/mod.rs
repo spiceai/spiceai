@@ -66,6 +66,11 @@ pub(crate) async fn get_app_and_start_request(
         start_request
     };
 
+    println!(
+        "start_request.temp_dir={:?}",
+        start_request.get_tempdir_path()
+    );
+
     Ok((app, start_request))
 }
 
