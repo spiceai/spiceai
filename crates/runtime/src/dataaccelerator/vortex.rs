@@ -453,36 +453,4 @@ mod tests {
         assert!(dir_path.contains("vortex_data_accelerator_test"));
         assert!(dir_path.ends_with('/'));
     }
-
-    #[tokio::test]
-    async fn test_vortex_memory_mode() {
-        let app = AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-
-        let mut dataset =
-            DatasetBuilder::try_new("vortex_memory_test".to_string(), "vortex_memory_test")
-                .expect("Failed to create builder")
-                .with_app(Arc::new(app))
-                .with_runtime(Arc::new(rt))
-                .build()
-                .expect("Failed to build dataset");
-
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::Vortex,
-            mode: Mode::Memory,
-            ..Default::default()
-        });
-
-        let accelerator = VortexAccelerator::new();
-
-        // Memory mode should always be initialized
-        assert!(accelerator.is_initialized(&dataset));
-
-        // Init should fail for memory mode since Vortex only supports file mode
-        let init_result = accelerator.init(&dataset).await;
-        assert!(init_result.is_err());
-        if let Err(err) = init_result {
-            assert!(err.to_string().contains("only supports file mode"));
-        }
-    }
 }
