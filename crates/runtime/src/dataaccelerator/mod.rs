@@ -2408,13 +2408,16 @@ mod accelerator_compat_tests {
 
                 // Verify data integrity
                 let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-                assert_eq!(
-                    total_rows,
-                    num_records * (iteration + 1),
-                    "{:?}: iteration {}: should have {} total rows",
-                    engine,
-                    iteration,
+                // Vortex has a dummy initialization row, so it will have 1 extra row
+                let expected_rows = if engine == Engine::Vortex {
+                    num_records * (iteration + 1) + 1
+                } else {
                     num_records * (iteration + 1)
+                };
+                assert_eq!(
+                    total_rows, expected_rows,
+                    "{:?}: iteration {}: should have {} total rows",
+                    engine, iteration, expected_rows
                 );
 
                 if iteration % 3 == 0 {
@@ -2475,8 +2478,8 @@ mod accelerator_compat_tests {
             println!("  P99: {:?}", p99_insert);
             println!("  Max: {:?}", max_insert);
             println!(
-                "  P50 records/sec: {:.2}",
-                num_records as f64 / percentile(&sorted_insert, 0.50).as_secs_f64()
+                "  P95 records/sec: {:.2}",
+                num_records as f64 / percentile(&sorted_insert, 0.95).as_secs_f64()
             );
 
             println!("\nQuery Performance:");
@@ -2487,9 +2490,9 @@ mod accelerator_compat_tests {
             println!("  P99: {:?}", p99_query);
             println!("  Max: {:?}", max_query);
             println!(
-                "  P50 records/sec: {:.2}",
+                "  P95 records/sec: {:.2}",
                 (num_records * num_iterations) as f64
-                    / percentile(&sorted_query, 0.50).as_secs_f64()
+                    / percentile(&sorted_query, 0.95).as_secs_f64()
             );
 
             println!("\nRound-trip (Insert + Query):");
