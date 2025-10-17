@@ -419,7 +419,7 @@ pub(crate) enum AccelerationRefreshMode {
 pub struct Refresher {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
-    dataset_metrics: Option<Metrics>,
+    metrics: Option<Metrics>,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
@@ -478,7 +478,7 @@ impl Refresher {
             on_complete_notification: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
-            dataset_metrics: None,
+            metrics: None,
         }
     }
 
@@ -522,8 +522,8 @@ impl Refresher {
         self
     }
 
-    pub fn with_dataset_metrics(&mut self, dataset_metrics: Option<Metrics>) -> &mut Self {
-        self.dataset_metrics = dataset_metrics;
+    pub fn with_metrics(&mut self, metrics: Option<Metrics>) -> &mut Self {
+        self.metrics = metrics;
         self
     }
 
@@ -628,8 +628,7 @@ impl Refresher {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
         }
 
-        refresh_task_runner =
-            refresh_task_runner.with_dataset_metrics(self.dataset_metrics.clone());
+        refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -795,7 +794,7 @@ impl Refresher {
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
-                self.dataset_metrics.clone(),
+                self.metrics.clone(),
             )
             .with_disable_federation(self.disable_federation)
             .build(),
@@ -828,7 +827,7 @@ impl Refresher {
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
-                self.dataset_metrics.clone(),
+                self.metrics.clone(),
             )
             .with_disable_federation(self.disable_federation)
             .build(),

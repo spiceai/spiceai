@@ -45,7 +45,7 @@ pub struct RefreshTaskRunnerBuilder {
     accelerator: Arc<dyn TableProvider>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
-    dataset_metrics: Option<Metrics>,
+    metrics: Option<Metrics>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -67,7 +67,7 @@ impl RefreshTaskRunnerBuilder {
             accelerator,
             disable_federation: false,
             semaphore: None,
-            dataset_metrics: None,
+            metrics: None,
         }
     }
 
@@ -85,8 +85,8 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
-    pub fn with_dataset_metrics(mut self, metrics: Option<Metrics>) -> Self {
-        self.dataset_metrics = metrics;
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -98,7 +98,7 @@ impl RefreshTaskRunnerBuilder {
             self.federated,
             self.federated_source,
             self.accelerator,
-            self.dataset_metrics,
+            self.metrics,
         )
         .with_disable_federation(self.disable_federation);
 

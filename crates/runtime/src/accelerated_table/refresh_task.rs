@@ -104,7 +104,7 @@ pub struct RefreshTaskBuilder {
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
-    dataset_metrics: Option<Metrics>,
+    metrics: Option<Metrics>,
 }
 
 impl RefreshTaskBuilder {
@@ -115,7 +115,7 @@ impl RefreshTaskBuilder {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
-        dataset_metrics: Option<Metrics>,
+        metrics: Option<Metrics>,
     ) -> Self {
         Self {
             runtime_status,
@@ -126,7 +126,7 @@ impl RefreshTaskBuilder {
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
             disable_federation: false,
             semaphore: None,
-            dataset_metrics,
+            metrics,
         }
     }
 
@@ -148,6 +148,7 @@ impl RefreshTaskBuilder {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
@@ -157,8 +158,8 @@ impl RefreshTaskBuilder {
             sink: self.sink,
             disable_federation: self.disable_federation,
             semaphore,
-            enabled_dataset_metrics: self
-                .dataset_metrics
+            enabled_metrics: self
+                .metrics
                 .as_ref()
                 .map(spicepod::metric::Metrics::enabled_metrics)
                 .as_deref()
@@ -181,7 +182,7 @@ pub struct RefreshTask {
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Arc<Semaphore>,
-    enabled_dataset_metrics: HashSet<String>,
+    enabled_metrics: HashSet<String>,
 }
 
 impl RefreshTask {
@@ -192,7 +193,7 @@ impl RefreshTask {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
-        dataset_metrics: Option<Metrics>,
+        metrics: Option<Metrics>,
     ) -> RefreshTaskBuilder {
         RefreshTaskBuilder::new(
             runtime_status,
@@ -200,7 +201,7 @@ impl RefreshTask {
             federated,
             federated_source,
             accelerator,
-            dataset_metrics,
+            metrics,
         )
     }
 
@@ -275,12 +276,30 @@ impl RefreshTask {
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
+        println!("enabled_metrics: {:?}", self.enabled_metrics);
+
+        // max_timestamp_before_refresh is needed if at least one of the following metrics is enabled:
+        //  * METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS
+        //  * METRIC_REFRESH_LAG_MS
+        // max_timestamp_after_refresh is needed if at least one of the following metrics is enabled:
+        //  * METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS
+        //  * METRIC_REFRESH_LAG_MS
+        //  * METRIC_INGESTION_LAG_MS
         let (need_max_timestamp_before_refresh, need_max_timestamp_after_refresh) = (
             self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
                 || self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS),
             self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
                 || self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS)
                 || self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS),
+        );
+
+        println!(
+            "need_max_timestamp_before_refresh: {:?}",
+            need_max_timestamp_before_refresh
+        );
+        println!(
+            "need_max_timestamp_after_refresh: {:?}",
+            need_max_timestamp_after_refresh
         );
 
         let max_timestamp_before_refresh_ms = if need_max_timestamp_before_refresh {
@@ -379,12 +398,10 @@ impl RefreshTask {
     }
 
     fn is_metric_enabled(&self, metric_name: &str) -> bool {
-        self.enabled_dataset_metrics.contains(metric_name)
+        self.enabled_metrics.contains(metric_name)
     }
 
-    #[allow(unreachable_code, unused_variables)]
     async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<i64> {
-        return None;
         if refresh.time_column.is_some() {
             match self.timestamp_nanos_for_append_query(refresh).await {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),

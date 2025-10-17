@@ -20,6 +20,7 @@ use super::{
     caching::{Caching, ResultsCache},
     default_true, is_default, is_default_or_none,
 };
+use crate::metric::Metrics;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,9 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<Query>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 impl Runtime {
@@ -465,6 +469,8 @@ pub struct RuntimeDeserializer {
     pub output_level: Option<OutputLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<Query>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 #[allow(deprecated)]
@@ -523,6 +529,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             } else {
                 Some(query)
             },
+            metrics: deserializer.metrics,
         })
     }
 }
