@@ -29,7 +29,8 @@ allow = [
   "Zlib",
   "OpenSSL",
   "0BSD",
-  "bzip2-1.0.6" # https://spdx.org/licenses/bzip2-1.0.6.html
+  "bzip2-1.0.6", # https://spdx.org/licenses/bzip2-1.0.6.html
+  "GPL-2.0-or-later WITH Bison-exception-2.2" # Bison parser generator license with exception
 ]
 private = { ignore = false }
 unused-allowed-license = "deny"
