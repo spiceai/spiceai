@@ -134,7 +134,7 @@ pub fn track_produced_spills(value: u64, dimensions: &[KeyValue]) {
 static QUERY_SPILLED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     TELEMETRY_METER
         .u64_counter("query_spilled_bytes")
-        .with_description("Total size of spilled bytes produced by the query")
+        .with_description("Number of spilled bytes produced by the query")
         .with_unit("By")
         .build()
 });
@@ -147,7 +147,7 @@ pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
 static QUERY_SPILLED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     TELEMETRY_METER
         .u64_counter("query_spilled_rows")
-        .with_description("Total size of spilled rows produced by the query")
+        .with_description("Number of spilled rows produced by the query")
         .with_unit("rows")
         .build()
 });
