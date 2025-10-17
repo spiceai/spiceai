@@ -26,7 +26,7 @@ use spicepod::{
     semantic::{Column, ColumnLevelEmbeddingConfig},
 };
 
-use crate::models::search::{SearchTestCase, SearchTestType};
+use crate::models::search::{SearchTestCase, SearchTestType, vectors_nonfilterable_col};
 
 mod search {
     use crate::{
@@ -34,10 +34,7 @@ mod search {
         models::{
             get_mega_science_dataset,
             hf::{get_huggingface_embeddings, get_model_to_vec_embeddings},
-            s3_vectors::{
-                basic_vector_search_tests, delete_index, vectors_filterable_col,
-                vectors_nonfilterable_col,
-            },
+            s3_vectors::{basic_vector_search_tests, delete_index, vectors_filterable_col},
             search::{
                 SearchTestCase, SearchTestType, run_search_w_explain, vectors_nonfilterable_col,
             },
