@@ -35,6 +35,9 @@ on:
 env:
   FORBIDDEN_LICENSE_CHECK: |
     grep -B 1 -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   license-check-rust:
