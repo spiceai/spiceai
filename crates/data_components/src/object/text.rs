@@ -45,6 +45,8 @@ use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
+use crate::object::filter::{filter_object_meta, valid_object_meta_filter};
+
 use super::ObjectStoreContext;
 use url::Url;
 
@@ -210,6 +212,7 @@ impl TableProvider for ObjectStoreTextTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        tracing::warn!("filters={:?}, limit={:?}", filters, limit);
         let projected_schema = project_schema(&self.schema(), projection)?;
         Ok(Arc::new(ObjectStoreTextExec::new(
             projected_schema,
@@ -224,16 +227,22 @@ impl TableProvider for ObjectStoreTextTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if valid_object_meta_filter(f) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 }
 
 pub struct ObjectStoreTextExec {
     projected_schema: SchemaRef,
-    _filters: Vec<Expr>,
+    filters: Vec<Expr>,
     limit: Option<usize>,
     properties: PlanProperties,
 
@@ -296,6 +305,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
             to_sendable_stream(
                 self.ctx.clone(),
                 self.formatter.clone(),
+                self.filters.clone(),
                 self.limit,
                 self.schema(),
             ),
@@ -313,7 +323,7 @@ impl ObjectStoreTextExec {
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
-            _filters: filters.to_vec(),
+            filters: filters.to_vec(),
             limit,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
@@ -330,6 +340,7 @@ impl ObjectStoreTextExec {
 pub(crate) fn to_sendable_stream(
     ctx: ObjectStoreContext,
     formatter: Option<Arc<dyn DocumentParser>>,
+    filters: Vec<Expr>,
     limit: Option<usize>,
     schema: SchemaRef,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
@@ -340,7 +351,9 @@ pub(crate) fn to_sendable_stream(
         while let Some(item) = object_stream.next().await {
             match item {
                 Ok(object_meta) => {
-
+                    if !filters.iter().all(|f| filter_object_meta(f, &object_meta)) {
+                        continue;
+                    }
                     if !ctx.filename_in_scan(&object_meta) {
                     continue;
                     }
