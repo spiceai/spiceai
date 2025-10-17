@@ -61,6 +61,20 @@ pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
     BYTES_RETURNED.add(bytes, dimensions);
 }
 
+static ROWS_RETURNED: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    TELEMETRY_METER
+        .u64_histogram("query_returned_rows")
+        .with_description("Number of rows returned to query clients.")
+        .with_boundaries(telemetry::ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
+        .with_unit("rows")
+        .build()
+});
+
+pub fn track_rows_returned(rows: u64, dimensions: &[KeyValue]) {
+    telemetry::track_bytes_returned(rows, dimensions);
+    ROWS_RETURNED.record(rows, dimensions);
+}
+
 static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     TELEMETRY_METER
         .f64_histogram("query_duration_ms")
@@ -102,4 +116,43 @@ static AI_INFERENCES_WITH_SPICE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(||
 pub fn track_ai_inferences_with_spice_count(dimensions: &[KeyValue]) {
     telemetry::track_ai_inferences_with_spice_count(dimensions);
     AI_INFERENCES_WITH_SPICE_COUNT.add(1, dimensions);
+}
+
+static QUERY_SPILL_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    TELEMETRY_METER
+        .u64_counter("query_spill_count")
+        .with_description("Number of spills produced")
+        .with_unit("spills")
+        .build()
+});
+
+pub fn track_spill_count(value: u64, dimensions: &[KeyValue]) {
+    telemetry::track_spill_count(value, dimensions);
+    QUERY_SPILL_COUNT.add(value, dimensions);
+}
+
+static QUERY_SPILLED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    TELEMETRY_METER
+        .u64_counter("query_spilled_bytes")
+        .with_description("Total size of spilled bytes produced")
+        .with_unit("By")
+        .build()
+});
+
+pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
+    telemetry::track_spilled_bytes(value, dimensions);
+    QUERY_SPILLED_BYTES.add(value, dimensions);
+}
+
+static QUERY_SPILLED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    TELEMETRY_METER
+        .u64_counter("query_spilled_rows")
+        .with_description("Total size of spilled rows produced")
+        .with_unit("rows")
+        .build()
+});
+
+pub fn track_spilled_rows(value: u64, dimensions: &[KeyValue]) {
+    telemetry::track_spilled_rows(value, dimensions);
+    QUERY_SPILLED_ROWS.add(value, dimensions);
 }

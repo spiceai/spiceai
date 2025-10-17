@@ -28,6 +28,10 @@ pub mod meter;
 pub mod noop;
 pub mod reader;
 
+pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 13] = [
+    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+];
+
 static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("query_executions")
@@ -62,6 +66,19 @@ static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
     BYTES_RETURNED.add(bytes, dimensions);
+}
+
+static ROWS_RETURNED: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("query_returned_rows")
+        .with_description("Number of rows returned to query clients.")
+        .with_boundaries(ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
+        .with_unit("rows")
+        .build()
+});
+
+pub fn track_rows_returned(rows: u64, dimensions: &[KeyValue]) {
+    ROWS_RETURNED.record(rows, dimensions);
 }
 
 static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
@@ -138,4 +155,40 @@ static VECTOR_SEARCHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 pub fn track_vector_search(dimensions: &[KeyValue]) {
     VECTOR_SEARCHES.add(1, dimensions);
+}
+
+static QUERY_SPILL_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("query_spill_count")
+        .with_description("Number of spills produced")
+        .with_unit("spills")
+        .build()
+});
+
+pub fn track_spill_count(value: u64, dimensions: &[KeyValue]) {
+    QUERY_SPILL_COUNT.add(value, dimensions);
+}
+
+static QUERY_SPILLED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("query_spilled_bytes")
+        .with_description("Total size of spilled bytes produced")
+        .with_unit("By")
+        .build()
+});
+
+pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
+    QUERY_SPILLED_BYTES.add(value, dimensions);
+}
+
+static QUERY_SPILLED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("query_spilled_rows")
+        .with_description("Total size of spilled rows produced")
+        .with_unit("rows")
+        .build()
+});
+
+pub fn track_spilled_rows(value: u64, dimensions: &[KeyValue]) {
+    QUERY_SPILLED_ROWS.add(value, dimensions);
 }
