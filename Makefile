@@ -148,7 +148,7 @@ install-with-models-metal-dev:
 	make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal"
 
 install-with-models-metal:
-	make install SPICED_NON_DEFAULT_FEATURES="models,metal,turso"
+	make install SPICED_NON_DEFAULT_FEATURES="models,metal"
 
 install-with-models-cuda:
 	make install SPICED_NON_DEFAULT_FEATURES="models,cuda"
