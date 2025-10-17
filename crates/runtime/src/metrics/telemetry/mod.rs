@@ -71,7 +71,7 @@ static ROWS_RETURNED: LazyLock<Histogram<u64>> = LazyLock::new(|| {
 });
 
 pub fn track_rows_returned(rows: u64, dimensions: &[KeyValue]) {
-    telemetry::track_bytes_returned(rows, dimensions);
+    telemetry::track_rows_returned(rows, dimensions);
     ROWS_RETURNED.record(rows, dimensions);
 }
 
