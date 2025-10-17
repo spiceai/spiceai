@@ -14,11 +14,7 @@ limitations under the License.
 use std::{future::Future, sync::Arc};
 
 use snafu::prelude::*;
-use tokio::{
-    runtime::Handle,
-    sync::{Notify, mpsc},
-    task::JoinSet,
-};
+use tokio::{runtime::Handle, sync::Notify};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -106,39 +102,10 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let (tx, mut rx) = mpsc::channel(1);
-
-    let mut join_set = JoinSet::new();
-
-    join_set.spawn_on(
-        async move {
-            let result = fut.await;
-            let _ = tx.send(result).await;
-            Ok(()) as Result<()>
-        },
-        tokio_handle,
-    );
-
-    let output = rx.recv().await.ok_or(Error::TaskExecution);
-
-    drain_join_set(join_set).await;
-
-    output
-}
-
-/// Waits for all tasks in the JoinSet to complete and reports any errors that
-/// occurred.
-///
-/// If we don't do this, any errors that occur in the task (such as IO errors)
-/// are not reported.
-async fn drain_join_set(mut join_set: JoinSet<Result<()>>) {
-    // retrieve any errors from the tasks
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(())) => {}                                   // task completed successfully
-            Ok(Err(e)) => tracing::debug!("Task failed: {e}"), // task failed
-            Err(e) => tracing::debug!("JoinSet error: {e}"),   // JoinSet error
-        }
+    let join_handle = tokio_handle.spawn(fut);
+    match join_handle.await {
+        Ok(result) => Ok(result),
+        Err(_) => Err(Error::TaskExecution),
     }
 }
 
@@ -148,7 +115,24 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tokio::task::JoinSet;
     use tokio::time::sleep;
+
+    /// Waits for all tasks in the JoinSet to complete and reports any errors that
+    /// occurred.
+    ///
+    /// If we don't do this, any errors that occur in the task (such as IO errors)
+    /// are not reported.
+    async fn drain_join_set(mut join_set: JoinSet<Result<()>>) {
+        // retrieve any errors from the tasks
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(())) => {}                                   // task completed successfully
+                Ok(Err(e)) => tracing::debug!("Task failed: {e}"), // task failed
+                Err(e) => tracing::debug!("JoinSet error: {e}"),   // JoinSet error
+            }
+        }
+    }
 
     #[test]
     fn test_managed_tokio_runtime_creation() {
