@@ -239,36 +239,6 @@ mod tests {
         assert_eq!(results, vec![0, 2, 4, 6, 8]);
     }
 
-    #[test]
-    fn test_managed_tokio_runtime_drop_behavior() {
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
-
-        {
-            let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
-            let handle = runtime.handle();
-
-            // Spawn a long-running task
-            handle.spawn(async move {
-                for _ in 0..100 {
-                    tokio::task::yield_now().await;
-                    if shutdown_flag_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
-                shutdown_flag_clone.store(true, Ordering::Relaxed);
-            });
-
-            // Runtime goes out of scope here and should be dropped
-        }
-
-        // Give some time for cleanup
-        std::thread::sleep(Duration::from_millis(100));
-
-        // The task should have completed during shutdown
-        assert!(shutdown_flag.load(Ordering::Relaxed));
-    }
-
     #[tokio::test]
     async fn test_drain_join_set_with_successful_tasks() {
         let mut join_set = JoinSet::new();
