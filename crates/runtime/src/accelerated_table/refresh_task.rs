@@ -276,8 +276,6 @@ impl RefreshTask {
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
-        println!("enabled_metrics: {:?}", self.enabled_metrics);
-
         // max_timestamp_before_refresh is needed if at least one of the following metrics is enabled:
         //  * METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS
         //  * METRIC_REFRESH_LAG_MS
@@ -291,15 +289,6 @@ impl RefreshTask {
             self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
                 || self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS)
                 || self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS),
-        );
-
-        println!(
-            "need_max_timestamp_before_refresh: {:?}",
-            need_max_timestamp_before_refresh
-        );
-        println!(
-            "need_max_timestamp_after_refresh: {:?}",
-            need_max_timestamp_after_refresh
         );
 
         let max_timestamp_before_refresh_ms = if need_max_timestamp_before_refresh {
