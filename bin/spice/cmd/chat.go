@@ -185,7 +185,7 @@ type ResponseStreamEvent struct {
 	Response       *ResponsesAPIResponse `json:"response,omitempty"`
 }
 
-func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
 	input := messagesToInput(messages)
 
 	// Show spinner if requested
@@ -303,26 +303,28 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 	}
 
-	// Show usage information
-	if usage != (ResponseUsage{}) {
-		// If timeAtCompletion wasn't set, use current time
-		if timeAtCompletion.IsZero() {
-			timeAtCompletion = time.Now()
+	// Show usage information for interactive mode only.
+	if interactiveMode {
+		if usage != (ResponseUsage{}) {
+			// If timeAtCompletion wasn't set, use current time
+			if timeAtCompletion.IsZero() {
+				timeAtCompletion = time.Now()
+			}
+			cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
+				&usage,
+				timeAtFirstToken.Sub(startTime).Abs(),
+				timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+			))
+		} else {
+			cmd.Print("\n\n")
 		}
-		cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
-			&usage,
-			timeAtFirstToken.Sub(startTime).Abs(),
-			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
-		))
-	} else {
-		cmd.Print("\n\n")
 	}
 
 	return messages, nil
 }
 
 // handleChatCompletions handles streaming responses using the Chat Completions API
-func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
 	// Only create these variables if using spinner
 	var done chan bool
 	var doneLoading bool
@@ -404,7 +406,11 @@ func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command
 		}
 
 		token := chatResponse.Choices[0].Delta.Content
-		cmd.Printf("%s", token)
+		if interactiveMode {
+			cmd.Printf("%s", token)
+		} else {
+			fmt.Printf("%s", token)
+		}
 		responseMessage = responseMessage + token
 	}
 
@@ -419,14 +425,17 @@ func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command
 	if responseMessage != "" {
 		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 	}
-	if usage != (Usage{}) {
-		cmd.Printf("\n\n%s\n\n", generateUsageMessage(
-			&usage,
-			timeAtFirstToken.Sub(startTime).Abs(),
-			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
-		))
-	} else {
-		cmd.Print("\n\n")
+	// Show usage information (only if not piped)
+	if interactiveMode {
+		if usage != (Usage{}) {
+			cmd.Printf("\n\n%s\n\n", generateUsageMessage(
+				&usage,
+				timeAtFirstToken.Sub(startTime).Abs(),
+				timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+			))
+		} else {
+			cmd.Print("\n\n")
+		}
 	}
 
 	return messages, nil
@@ -454,6 +463,24 @@ spice chat --model <model> "What is Spice.ai?"
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
+		}
+
+		// Check for piped input
+		stdinInput, isInteractiveMode, err := readStdinIfNonInteractive()
+		if err != nil {
+			slog.Error("failed to read stdin", "error", err)
+			os.Exit(1)
+		}
+
+		// If we have piped input, combine it with any command line argument
+		if !isInteractiveMode {
+			if len(args) > 0 {
+				// Combine piped input with command line argument
+				args[0] = stdinInput + "\n" + args[0]
+			} else {
+				// Use piped input as the message
+				args = []string{stdinInput}
+			}
 		}
 
 		// Check for --endpoint flag for remote HTTP mode
@@ -484,13 +511,13 @@ spice chat --model <model> "What is Spice.ai?"
 			}
 
 			// Use cloud connection - cloud uses HTTPS
-			runRemoteChatREPL(cmd, rtcontext, "https://data.spiceai.io", args)
+			runRemoteChatREPL(cmd, rtcontext, "https://data.spiceai.io", args, isInteractiveMode)
 			return
 		}
 
 		if endpoint != "" {
 			// Remote HTTP mode
-			runRemoteChatREPL(cmd, rtcontext, endpoint, args)
+			runRemoteChatREPL(cmd, rtcontext, endpoint, args, isInteractiveMode)
 			return
 		}
 
@@ -605,11 +632,11 @@ spice chat --model <model> "What is Spice.ai?"
 		// Handler for Chat Completions API - handled by standalone function
 
 		// Main message handler that delegates to the appropriate API handler
-		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
+		getChatResponse := func(messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
 			if useResponsesAPI {
-				return handleResponsesAPI(rtcontext, cmd, model, messages, useSpinner)
+				return handleResponsesAPI(rtcontext, cmd, model, messages, useSpinner, isInteractiveMode)
 			}
-			return handleChatCompletions(rtcontext, cmd, model, messages, useSpinner)
+			return handleChatCompletions(rtcontext, cmd, model, messages, useSpinner, isInteractiveMode)
 		}
 
 		if len(args) > 0 {
@@ -619,7 +646,7 @@ spice chat --model <model> "What is Spice.ai?"
 				{Role: "user", Content: userMessage},
 			}
 
-			_, err = getChatResponse(messages, false)
+			_, err = getChatResponse(messages, false, isInteractiveMode)
 			if err != nil {
 				os.Exit(1)
 			}
@@ -654,7 +681,7 @@ spice chat --model <model> "What is Spice.ai?"
 			line.AppendHistory(message)
 			messages = append(messages, Message{Role: "user", Content: message})
 
-			messages, err = getChatResponse(messages, true)
+			messages, err = getChatResponse(messages, true, false)
 			if err != nil {
 				continue
 			}
@@ -791,7 +818,33 @@ func isEndOfStream(chunk string) bool {
 	return false
 }
 
-func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, httpEndpoint string, args []string) {
+// readStdinIfNonInteractive checks if the input is an interactive shell, and if not, reads the entire input.
+//
+// Returns:
+//
+//	1 The full input content, if non-interactive:
+//	2 true, if stdin is interactive
+//	3. If an error os or io error occurred determining interactivity, or reading input.
+func readStdinIfNonInteractive() (string, bool, error) {
+	stat, err := os.Stdin.Stat()
+	if err != nil {
+		return "", true, err
+	}
+
+	// Check if input is coming from a pipe or file (not a terminal)
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		// Read all input from stdin
+		input, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", false, err
+		}
+		return strings.TrimSpace(string(input)), false, nil
+	}
+
+	return "", true, nil
+}
+
+func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, httpEndpoint string, args []string, interactiveMode bool) {
 	// Get API key from context or environment variable
 	apiKey := os.Getenv("SPICE_API_KEY")
 	if apiKey == "" {
@@ -841,7 +894,7 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 	cmd.Println()
 
 	// Function to send chat request
-	sendChatRequest := func(messages []Message, useSpinner bool) ([]Message, error) {
+	sendChatRequest := func(messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
 		var done chan bool
 		var doneLoading bool
 		if useSpinner {
@@ -989,7 +1042,10 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		if responseMessage != "" {
 			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 		}
-		cmd.Print("\n\n")
+		// Only add newlines if not piped
+		if interactiveMode {
+			cmd.Print("\n\n")
+		}
 
 		return messages, nil
 	}
@@ -998,7 +1054,7 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 	if len(args) > 0 {
 		userMessage := args[0]
 		messages := []Message{{Role: "user", Content: userMessage}}
-		_, err := sendChatRequest(messages, false)
+		_, err := sendChatRequest(messages, false, interactiveMode)
 		if err != nil {
 			slog.Error("chat request failed", "error", err)
 			os.Exit(1)
@@ -1034,7 +1090,7 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		line.AppendHistory(message)
 		messages = append(messages, Message{Role: "user", Content: message})
 
-		messages, err = sendChatRequest(messages, true)
+		messages, err = sendChatRequest(messages, true, false)
 		if err != nil {
 			slog.Error("chat request failed", "error", err)
 			continue
