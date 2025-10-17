@@ -66,6 +66,9 @@ impl Drop for ManagedTokioRuntime {
 }
 
 impl ManagedTokioRuntime {
+    /// # Errors
+    ///
+    /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
     pub fn try_new() -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -79,8 +82,7 @@ impl ManagedTokioRuntime {
             runtime.block_on(async move {
                 notify_shutdown_captured.notified().await;
             });
-            // Note: runtime is dropped here, which will wait for all tasks
-            // to complete
+            // Note: runtime is dropped here
         });
 
         Ok(Self {
@@ -91,12 +93,17 @@ impl ManagedTokioRuntime {
     }
 
     /// Return a handle suitable for spawning tasks
+    #[must_use]
     pub fn handle(&self) -> &Handle {
         &self.handle
     }
 }
 
 /// Spawns a task on the provided Tokio runtime and collects its result.
+///
+/// # Errors
+///
+/// Returns [`Error::TaskExecution`] if the task is cancelled or panics before producing a result.
 pub async fn spawn_task_and_collect_results<F>(fut: F, tokio_handle: &Handle) -> Result<F::Output>
 where
     F: Future + Send + 'static,
@@ -116,7 +123,7 @@ mod tests {
     use tokio::task::JoinSet;
     use tokio::time::sleep;
 
-    /// Waits for all tasks in the JoinSet to complete and reports any errors that
+    /// Waits for all tasks in the `JoinSet` to complete and reports any errors that
     /// occurred.
     ///
     /// If we don't do this, any errors that occur in the task (such as IO errors)
