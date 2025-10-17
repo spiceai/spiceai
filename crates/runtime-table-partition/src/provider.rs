@@ -35,7 +35,7 @@ use crate::{
     Partition,
     creator::PartitionCreator,
     expression::{PartitionedBy, validate_scalar_compatibility},
-    insert::PartitionerExec,
+    insert::{DefaultInsertStrategy, InsertStrategy, PartitionContext},
 };
 
 pub mod pruning;
@@ -64,6 +64,7 @@ pub struct PartitionTableProvider {
     partition_by: PartitionedBy,
     partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
     schema: SchemaRef,
+    insert_strategy: Arc<dyn InsertStrategy>,
 }
 
 impl PartitionTableProvider {
@@ -109,7 +110,24 @@ impl PartitionTableProvider {
             partition_by,
             partitions,
             schema,
+            insert_strategy: Arc::new(DefaultInsertStrategy),
         })
+    }
+
+    /// Creates a new [`PartitionTableProvider`] with a custom data insertion strategy.
+    ///
+    /// # Errors
+    /// This function will return an Error when the `partition_by` expression
+    /// validation fails.
+    pub async fn new_with_insert_strategy(
+        creator: Arc<dyn PartitionCreator>,
+        partition_by: Vec<PartitionedBy>,
+        schema: SchemaRef,
+        insert_strategy: Arc<dyn InsertStrategy>,
+    ) -> Result<Self, Error> {
+        let mut provider = Self::new(creator, partition_by, schema).await?;
+        provider.insert_strategy = insert_strategy;
+        Ok(provider)
     }
 }
 
@@ -187,13 +205,15 @@ impl TableProvider for PartitionTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Ok(Arc::new(PartitionerExec::new(
-            input,
-            self.partition_by.clone(),
-            Arc::clone(&self.creator),
-            Arc::clone(&self.partitions),
-            insert_op,
-            Arc::clone(&self.schema),
-        )))
+        let ctx = PartitionContext {
+            creator: Arc::clone(&self.creator),
+            partition_by: self.partition_by.clone(),
+            partitions: Arc::clone(&self.partitions),
+            schema: Arc::clone(&self.schema),
+        };
+
+        self.insert_strategy
+            .execute_insert(input, insert_op, &ctx)
+            .await
     }
 }

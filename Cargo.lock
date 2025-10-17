@@ -4440,7 +4440,6 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=e751fb367eb29f299683ff5125f8da2f654e0479#e751fb367eb29f299683ff5125f8da2f654e0479"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4483,6 +4482,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
+ "tokio-stream",
  "tracing",
  "trust-dns-resolver",
  "url",

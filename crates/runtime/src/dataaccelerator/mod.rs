@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::dataaccelerator::partitioned_duckdb::tables_mode_partitioning::TablesModePartitionedDuckDBAccelerator;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
@@ -144,6 +145,12 @@ impl AcceleratorEngineRegistry {
         self.register_accelerator_engine(
             Engine::PartitionedDuckDB,
             Arc::new(PartitionedDuckDBAccelerator::new()),
+        )
+        .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(
+            Engine::TableModePartitionedDuckDB,
+            Arc::new(TablesModePartitionedDuckDBAccelerator::new()),
         )
         .await;
         #[cfg(feature = "postgres")]

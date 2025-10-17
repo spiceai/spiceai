@@ -29,6 +29,9 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
+
 use datafusion::{
     arrow::record_batch::RecordBatch,
     error::DataFusionError,
@@ -38,10 +41,7 @@ use datafusion::{
 };
 use futures::stream::StreamExt;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -533,5 +533,77 @@ mod tests {
         }
 
         Ok(())
+    }
+}
+
+/// Strategy for handling custom insertion logic in partition tables
+#[async_trait::async_trait]
+pub trait InsertStrategy: Send + Sync + std::fmt::Debug {
+    /// Handle the insertion with custom logic
+    ///
+    /// # Arguments
+    /// * `input` - The input execution plan
+    /// * `insert_op` - The insert operation (append/overwrite)
+    /// * `context` - Access to partition context (creator, partitions, schema, etc.)
+    ///
+    /// # Returns
+    /// An execution plan that handles the custom insertion
+    async fn execute_insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+        context: &PartitionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>;
+}
+type ScalarValueString = String;
+
+/// Context information for custom insertion handlers
+#[derive(Debug)]
+pub struct PartitionContext {
+    pub creator: Arc<dyn PartitionCreator>,
+    pub partition_by: PartitionedBy,
+    pub partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
+    pub schema: SchemaRef,
+}
+
+/// Default insertion strategy that uses the existing [`PartitionerExec`]
+#[derive(Debug)]
+pub struct DefaultInsertStrategy;
+
+#[async_trait::async_trait]
+impl InsertStrategy for DefaultInsertStrategy {
+    async fn execute_insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+        context: &PartitionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Ok(Arc::new(PartitionerExec::new(
+            input,
+            context.partition_by.clone(),
+            Arc::clone(&context.creator),
+            Arc::clone(&context.partitions),
+            insert_op,
+            Arc::clone(&context.schema),
+        )))
+    }
+}
+
+#[derive(Debug)]
+pub struct DataSinkInsertStrategy {
+    pub sink_config: Box<dyn std::any::Any + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+impl InsertStrategy for DataSinkInsertStrategy {
+    async fn execute_insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+        context: &PartitionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        DefaultInsertStrategy
+            .execute_insert(input, insert_op, context)
+            .await
     }
 }
