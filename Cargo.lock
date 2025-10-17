@@ -14817,7 +14817,6 @@ dependencies = [
  "async-trait",
  "flight_client",
  "hostname 0.4.1",
- "once_cell",
  "opentelemetry 0.27.1",
  "opentelemetry_sdk 0.27.1",
  "otel-arrow",
