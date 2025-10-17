@@ -69,7 +69,7 @@ jobs:
     name: Run Go & Rust Linters
     runs-on: spiceai-dev-runners
     env:
-      GOVER: 1.24.2
+      GOVER: 1.25.3
     needs: check_changes
 
     steps:
@@ -152,7 +152,7 @@ jobs:
     name: Build Go & Rust
     runs-on: spiceai-dev-runners
     env:
-      GOVER: 1.24.2
+      GOVER: 1.25.3
     needs: check_changes
 
     steps:
