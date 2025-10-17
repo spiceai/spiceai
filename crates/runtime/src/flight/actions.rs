@@ -24,15 +24,18 @@ use crate::{
     timing::TimedStream,
 };
 
+use crate::datafusion::app_context_extension::AppContextExtension;
 use arrow_flight::{
     Action, ActionType as FlightActionType,
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 enum ActionType {
     CreatePreparedStatement,
     ClosePreparedStatement,
+    GetAppDefinition,
     Unknown,
 }
 
@@ -41,6 +44,7 @@ impl ActionType {
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
+            "GetAppDefinition" => ActionType::GetAppDefinition,
             _ => ActionType::Unknown,
         }
     }
@@ -49,6 +53,7 @@ impl ActionType {
         match self {
             ActionType::CreatePreparedStatement => "CreatePreparedStatement",
             ActionType::ClosePreparedStatement => "ClosePreparedStatement",
+            ActionType::GetAppDefinition => "GetAppDefinition",
             ActionType::Unknown => "Unknown",
         }
     }
@@ -114,6 +119,20 @@ pub(crate) async fn do_action(
         ActionType::ClosePreparedStatement => {
             tracing::trace!("do_action: ClosePreparedStatement");
             futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
+        }
+        ActionType::GetAppDefinition => {
+            tracing::trace!("do_action: GetAppDefinition");
+            let context = RequestContext::current(AsyncMarker::new().await);
+            let Some(app) = context
+                .extension::<AppContextExtension>()
+                .and_then(|a| a.app())
+            else {
+                unreachable!("Must bind app spec");
+            };
+
+            let bs = serde_json::to_vec(&app).unwrap();
+            let result = arrow_flight::Result::new(bs);
+            futures::stream::iter(vec![Ok(result)])
         }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
     };

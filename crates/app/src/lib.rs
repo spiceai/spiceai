@@ -18,8 +18,8 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use snafu::prelude::*;
 use serde::{Deserialize, Serialize};
+use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
     Spicepod,

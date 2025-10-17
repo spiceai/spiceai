@@ -82,6 +82,7 @@ use util::{RetryError, retry};
 
 pub mod query;
 
+pub mod app_context_extension;
 pub mod builder;
 pub mod dialect;
 pub mod error;
