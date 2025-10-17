@@ -145,7 +145,7 @@ install-with-models-dev:
 
 .PHONY: install-with-models-metal-dev
 install-with-models-metal-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal,turso"
+	make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal"
 
 install-with-models-metal:
 	make install SPICED_NON_DEFAULT_FEATURES="models,metal,turso"
