@@ -38,7 +38,9 @@ mod search {
                 basic_vector_search_tests, delete_index, vectors_filterable_col,
                 vectors_nonfilterable_col,
             },
-            search::{SearchTestCase, SearchTestType, run_search_w_explain},
+            search::{
+                SearchTestCase, SearchTestType, run_search_w_explain, vectors_nonfilterable_col,
+            },
         },
         utils::verify_env_secret_exists,
     };
@@ -840,16 +842,6 @@ fn vectors_filterable_col(col: impl Into<Column>) -> Column {
         [(
             "vectors".to_string(),
             serde_json::Value::String("filterable".to_string()),
-        )]
-        .into(),
-    )
-}
-
-pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
-    col.into().with_metadata(
-        [(
-            "vectors".to_string(),
-            serde_json::Value::String("non-filterable".to_string()),
         )]
         .into(),
     )
