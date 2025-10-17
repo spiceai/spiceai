@@ -39,7 +39,8 @@ use datafusion_datasource::sink::DataSinkExec;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_table_providers::{
     duckdb::{
-        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory, TableDefinition,
+        DuckDB, DuckDBSettingsRegistry, DuckDBTableFactory, DuckDBTableProviderFactory,
+        TableDefinition,
         write::DuckDBTableWriter,
         write_partitioned::{BatchPartitioner, DuckDBPartitionedDataSink},
     },
@@ -237,7 +238,6 @@ struct DuckDBPartitionCreator {
     pool: Arc<DuckDbConnectionPool>,
     cmd: CreateExternalTable,
     table_definition: Arc<TableDefinition>,
-    duckdb_factory: DuckDBTableProviderFactory,
     partition_by: PartitionedBy,
     schema: SchemaRef,
 }
@@ -271,7 +271,6 @@ impl DuckDBPartitionCreator {
             pool,
             cmd,
             table_definition: writer.table_definition(),
-            duckdb_factory,
             partition_by,
             schema,
         })
@@ -331,6 +330,9 @@ impl PartitionCreator for DuckDBPartitionCreator {
         let schema = DFSchema::try_from(Arc::clone(&self.schema))
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
+        let duckdb_table_factory =
+            DuckDBTableFactory::new(Arc::clone(&self.pool)).with_dialect(new_duckdb_dialect());
+
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
         for table in partitioned_tables {
             let Some(partition_expr) = table.strip_suffix(&format!("/{table_name}")) else {
@@ -350,10 +352,8 @@ impl PartitionCreator for DuckDBPartitionCreator {
             let partition_value = parse_partition_value(&schema, &self.partition_by, value_str)
                 .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
-            let mut cmd = self.cmd.clone();
-            // Target table to open, should match partitioned table name
-            cmd.name = table.into();
-            let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
+            let table_provider = duckdb_table_factory
+                .table_provider(table.into())
                 .await
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
