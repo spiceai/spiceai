@@ -36,6 +36,7 @@ use datafusion::{
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
+    prelude::col,
 };
 use datafusion_datasource::metadata::MetadataColumn;
 use document_parse::DocumentParser;
@@ -45,7 +46,7 @@ use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
-use crate::object::filter::{filter_object_meta, valid_object_meta_filter};
+use crate::object::filter::filter_object_meta;
 
 use super::ObjectStoreContext;
 use url::Url;
@@ -212,7 +213,6 @@ impl TableProvider for ObjectStoreTextTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        tracing::warn!("filters={:?}, limit={:?}", filters, limit);
         let projected_schema = project_schema(&self.schema(), projection)?;
         Ok(Arc::new(ObjectStoreTextExec::new(
             projected_schema,
@@ -230,10 +230,10 @@ impl TableProvider for ObjectStoreTextTable {
         Ok(filters
             .iter()
             .map(|f| {
-                if valid_object_meta_filter(f) {
-                    TableProviderFilterPushDown::Exact
-                } else {
+                if f.column_refs().contains(&col("content")) {
                     TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Exact
                 }
             })
             .collect())
@@ -345,38 +345,38 @@ pub(crate) fn to_sendable_stream(
     schema: SchemaRef,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
-        let mut object_stream = ctx.store.list(ctx.prefix.clone().map(Path::from).as_ref());
+        let mut object_stream = ctx.store.list(ctx.prefix.clone().map(Path::from).as_ref()).chunks(128);
         let mut count = 0;
 
-        while let Some(item) = object_stream.next().await {
-            match item {
-                Ok(object_meta) => {
-                    if !filters.iter().all(|f| filter_object_meta(f, &object_meta)) {
+        while let Some(items) = object_stream.next().await {
+
+            match items.into_iter().collect::<Result<Vec<_>, _>>() {
+                Ok(object_metas) => {
+
+                    for object_meta in filter_object_meta(&filters, &object_metas).await? {
+                        if !ctx.filename_in_scan(&object_meta) {
                         continue;
-                    }
-                    if !ctx.filename_in_scan(&object_meta) {
-                    continue;
-                    }
+                        }
 
-                    let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
-                    let bytz = result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+                        let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+                        let bytz = result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), Arc::clone(&schema)) {
-                        Ok(batch) => {
-                            let n = batch.num_rows();
-                            yield Ok(batch);
-                            count += n;
-                        },
-                        Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
+                        match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), Arc::clone(&schema)) {
+                            Ok(batch) => {
+                                let n = batch.num_rows();
+                                yield Ok(batch);
+                                count += n;
+                            },
+                            Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
+                        }
+                        // Early exit on LIMIT clause
+                        if let Some(limit) = limit && count >= limit {
+                                break;
+                        }
                     }
                 },
                 Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
             }
-
-            // Early exit on LIMIT clause
-            if let Some(limit) = limit && count >= limit {
-                    break;
-                }
         }
     }
 }
