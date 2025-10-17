@@ -816,11 +816,11 @@ impl Runtime {
                 #[cfg(feature = "models")]
                 {
                     Arc::clone(&self_clone).load_workers().await;
-                    self_clone.load_eval_scorer().await;
-                    let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
                     if an_eval_exists {
+                        let () = self_clone.verify_evals().await;
                         drop(app_lock);
+                        self_clone.load_eval_scorer().await;
                         if let Err(err) = self_clone.load_eval_tables().await {
                             tracing::warn!("Failed to create internal eval tables: {err}");
                         }
