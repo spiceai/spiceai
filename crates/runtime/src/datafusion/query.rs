@@ -505,7 +505,7 @@ fn attach_physical_plan_metrics_to_stream(
 }
 
 #[derive(Default, Debug)]
-/// USed to collect aggregated metrics from a physical plan.
+/// Used to collect aggregated metrics from a physical plan.
 struct PhysicalPlanMetricsTotals {
     pub produced_spills: u64,
     pub spilled_bytes: u64,
