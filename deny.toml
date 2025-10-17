@@ -30,7 +30,6 @@ allow = [
   "OpenSSL",
   "0BSD",
   "bzip2-1.0.6", # https://spdx.org/licenses/bzip2-1.0.6.html
-  "GPL-2.0-or-later WITH Bison-exception-2.2" # Bison parser generator license with exception
 ]
 private = { ignore = false }
 unused-allowed-license = "deny"
@@ -60,3 +59,8 @@ name = "text-embeddings-backend-candle"
 expression = "Apache-2.0"
 license-files = []
 
+[[licenses.clarify]]
+name = "julian_day_converter"
+version = "0.4.5"
+expression = "GPL-2.0-or-later WITH Bison-exception-2.2"
+license-files = []
