@@ -41,25 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
         with:
-          os: 'darwin'
-
-      - name: Build the testoperator
-        run: |
-          cargo build -p testoperator --release
-
-      - name: make testoperator executable
-        run: |
-          mv target/release/testoperator testoperator
-          chmod +x testoperator
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: testoperator
-          path: testoperator
+          install_to_system_path: 'false'
+          upload_artifact: 'true'
 
   build-spiced:
     name: Build spiced
@@ -168,7 +154,7 @@ jobs:
       - name: Download testoperator
         uses: actions/download-artifact@v5
         with:
-          name: testoperator
+          name: testoperator-darwin
 
       - name: Download spiced
         uses: actions/download-artifact@v5

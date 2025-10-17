@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::models::hf::get_model_to_vec_embeddings;
+use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
+use crate::models::s3_vectors::vectors_nonfilterable_col;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
@@ -975,6 +976,85 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     .await
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
+    let mut ds = get_mega_science_dataset(
+        Some("qs"),
+        Some(
+            Column::new("question")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
+                .with_metadata(
+                    [(
+                        "vectors".to_string(),
+                        Value::String("non-filterable".to_string()),
+                    )]
+                    .into(),
+                ),
+        ),
+        Some(
+            Column::new("answer")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+        ),
+    );
+    ds.columns.push(vectors_nonfilterable_col("subject"));
+
+    run_search_w_explain(
+        AppBuilder::new("search_app")
+            .with_dataset(ds).build(),
+        vec![
+            SearchTestCase::new(
+                "text_search_metadata_basic",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_additional_columns",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_with_where",
+                SearchTestType::Http(json!({
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_answer",
+                SearchTestType::Sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_answer_w_question",
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_question",
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_subject_filter",
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) where subject='math' order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_subject_projection",
+                SearchTestType::Sql("SELECT id, subject, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+            ),
+        ],
+        true
+    )
+    .await
+}
+
 #[cfg(feature = "flightsql")]
 #[tokio::test]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
@@ -1095,8 +1175,8 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 
     let app = AppBuilder::new("cached_search")
         .with_dataset(chunked)
-        .with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-32M",
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
             "hf_minilm",
         ))
         .with_search_cache(cache_config)
@@ -1113,7 +1193,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                 "with_cache_pre_cache",
                 SearchTestType::Http(json!({
                     "text": "new patient",
-                    "limit": 50,
+                    "limit": 100,
                 })),
             ), None, false).await?;
             let duration = start.elapsed();
@@ -1124,7 +1204,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                     "with_cache_post_cache",
                     SearchTestType::Http(json!({
                         "text": "new patient",
-                        "limit": 50,
+                        "limit": 100,
                     })),
                 ), None, false).await?;
                 let duration_cached = start.elapsed();

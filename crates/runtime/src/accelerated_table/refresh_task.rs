@@ -382,7 +382,9 @@ impl RefreshTask {
         self.enabled_dataset_metrics.contains(metric_name)
     }
 
+    #[allow(unreachable_code, unused_variables)]
     async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<i64> {
+        return None;
         if refresh.time_column.is_some() {
             match self.timestamp_nanos_for_append_query(refresh).await {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),

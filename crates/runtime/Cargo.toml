@@ -27,7 +27,6 @@ aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
-aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
@@ -51,7 +50,6 @@ datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
-dotenvy.workspace = true
 duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",
@@ -70,7 +68,7 @@ headers-accept = "0.1.3"
 http.workspace = true
 http-body-util = "0.1.3"
 hyper = "1.7.0"
-hyper-util = { version = "0.1.16", features = ["service"] }
+hyper-util = { version = "0.1.17", features = ["service"] }
 iceberg.workspace = true
 iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
@@ -79,13 +77,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.3", features = [
-    "apple-native",
-    "windows-native",
-    "linux-native",
-], optional = true }
 llms = { path = "../llms" }
-logos.workspace = true
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -132,8 +124,11 @@ runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
+runtime-parameters = { path = "../runtime-parameters" }
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-table-partition = { path = "../runtime-table-partition" }
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
@@ -176,6 +171,8 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
+vortex-datafusion = { path = "../vortex-datafusion", optional = true }
+vortex = { workspace = true, optional = true }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
@@ -208,8 +205,8 @@ rdkafka = { workspace = true, features = ["ssl-vendored"] }
 [features]
 aws-secrets-manager = [
     "dep:aws-config",
-    "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
+    "runtime-secrets/aws-secrets-manager",
 ]
 bedrock = ["dep:aws-config"]
 clickhouse = [
@@ -237,7 +234,7 @@ extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
 imap = ["data_components/imap", "dep:imap"]
-keyring-secret-store = ["dep:keyring"]
+keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
 models = ["model_components/full", "mcp", "dep:strsim", "runtime-datafusion-udfs/models"]
@@ -256,6 +253,7 @@ postgres-write = []
 iceberg-write = []
 s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
+snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",
     "db_connection_pool/snowflake",
@@ -268,7 +266,6 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
+turso = []
+vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
-
-[target.'cfg(windows)'.dependencies]
-winver = "1.0.0"

@@ -13,11 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 use crate::{
     DataFusion,
     datafusion::{is_spice_internal_schema, request_context_extension::get_current_datafusion},
-    request::{AsyncMarker, RequestContext},
 };
 use axum::{
     Json,
@@ -27,6 +25,7 @@ use axum::{
 };
 use error::IcebergResponseError;
 use namespace::{Namespace, NamespacePath};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{self, Deserialize, Serialize};
 
 mod error;

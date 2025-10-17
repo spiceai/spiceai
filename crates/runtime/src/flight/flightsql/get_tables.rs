@@ -20,7 +20,6 @@ use crate::{
         Service, metrics, record_batches_to_flight_stream, to_tonic_err,
         util::set_flightsql_protocol,
     },
-    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
 use arrow_flight::{
@@ -29,6 +28,7 @@ use arrow_flight::{
 use arrow_schema::Schema;
 use arrow_tools::schema::to_source_native_type_name;
 use datafusion::datasource::TableType;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use tonic::{Request, Response, Status};
 
 pub(crate) async fn get_flight_info(

@@ -147,6 +147,97 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  test-ai-udf:
+    name: Test AI UDF
+    needs: build
+    permissions: read-all
+    runs-on: 'spiceai-macos'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Download test binary
+        uses: actions/download-artifact@v5
+        with:
+          name: ai-integration-test-binary
+          path: ./integration_test
+
+      - name: Mark test binary as executable
+        run: |
+          ls -l ./integration_test
+          chmod +x ./integration_test/ai_integration_test
+
+      - name: Set up API Keys
+        run: |
+          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
+          echo 'SPICE_ANTHROPIC_API_KEY="${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}"' >> .env
+          echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' >> .env
+
+      - name: Run AI UDF basic test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
+            echo "Error: Anthropic API key is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_basic
+
+      - name: Run AI UDF with dataset test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
+            echo "Error: Anthropic API key is not defined."
+            exit 1
+          fi
+          if [ -z "$SPICE_SECRET_XAI_API_KEY" ] ; then
+            echo "Error: xAI API key is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_with_dataset
+
+      - name: Run AI UDF LEFT truncate test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
+            echo "Error: Anthropic API key is not defined."
+            exit 1
+          fi
+          if [ -z "$SPICE_SECRET_XAI_API_KEY" ] ; then
+            echo "Error: xAI API key is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_left_truncate
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   test-hf:
     name: Test Huggingface Models
     needs: build
@@ -223,6 +314,17 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture local_embeddings_beta_requirements
+
+      - name: Run AI UDF with local model test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          if [ -z "$SPICE_HF_TOKEN" ] ; then
+            echo "Error: Hugging Face API Token is not defined."
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_with_local_model
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'

@@ -191,7 +191,6 @@ pub async fn handle_eval_run(
 
     update_eval_run_status(Arc::clone(&df), &id, &EvalRunStatus::Running, None).await?;
 
-    #[allow(clippy::large_futures)]
     let (status, err_opt) = match run_eval(
         &id,
         Arc::clone(&llms),

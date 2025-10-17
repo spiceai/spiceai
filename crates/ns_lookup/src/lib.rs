@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use snafu::prelude::*;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 use trust_dns_resolver::AsyncResolver;
 
 #[derive(Debug, Snafu)]
@@ -86,12 +88,19 @@ pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<(
         Ok(ips) => {
             for ip in ips.iter() {
                 let addr = SocketAddr::new(ip, port);
-                if TcpStream::connect_timeout(&addr, Duration::from_secs(30)).is_ok() {
-                    return Ok(());
+                match timeout(Duration::from_secs(30), TcpStream::connect(addr)).await {
+                    Ok(Ok(stream)) => {
+                        drop(stream);
+                        return Ok(());
+                    }
+                    Ok(Err(err)) => {
+                        tracing::debug!("Failed to connect to {addr}: {err}");
+                    }
+                    Err(_) => {
+                        tracing::debug!("Failed to connect to {addr}, connection timed out");
+                    }
                 }
             }
-
-            tracing::debug!("Failed to connect to {host}:{port}, connection timed out");
 
             UnableToConnectSnafu {
                 host: host.to_string(),

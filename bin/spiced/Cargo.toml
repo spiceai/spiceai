@@ -41,6 +41,7 @@ tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util" }
+vortex = "0.52.1"
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
@@ -65,6 +66,7 @@ default = [
     "dremio",
     "clickhouse",
     "sharepoint",
+    "snapshots",
     "snowflake",
     "spark",
     "ftp",
@@ -79,6 +81,8 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
+    "vortex"
+
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -104,7 +108,9 @@ postgres-write = ["runtime/postgres-write"]
 release = []
 sharepoint = ["runtime/sharepoint"]
 snowflake = ["runtime/snowflake"]
+snapshots = ["runtime/snapshots"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
+vortex = ["runtime/vortex"]
 xxhash = ["runtime/xxhash"]

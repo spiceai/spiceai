@@ -66,6 +66,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Validate spicepod files exist
+        run: |
+          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
+            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+
+          if [ ! -f "${{ github.event.inputs.compare_spicepod_path }}" ]; then
+            echo "Error: Compare spicepod file not found at ${{ github.event.inputs.compare_spicepod_path }}"
+            exit 1
+          fi
+          echo "Compare spicepod file found at ${{ github.event.inputs.compare_spicepod_path }}"
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -80,6 +94,10 @@ jobs:
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -172,3 +190,5 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}

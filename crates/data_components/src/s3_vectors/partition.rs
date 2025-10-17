@@ -55,10 +55,10 @@ pub enum Error {
     IncorrectNumPartsInName { num_parts: usize },
     #[snafu(display("The 'partition_by' expression, {expr}, is not supported"))]
     UnsupportedPartitionByExpression { expr: Box<Expr> },
-    #[snafu(display("Index names cannot contain hyphens"))]
-    InvalidIndexNameHyphen,
+    #[snafu(display("Index name, '{index}', cannot contain periods when using 'partition_by'"))]
+    InvalidIndexNamePeriod { index: String },
     #[snafu(display(
-        "Index names are restricted to {INDEX_NAME_MAX_LENGTH} characters, but {index} is {len} characters"
+        "Index names are restricted to {INDEX_NAME_MAX_LENGTH} characters when using 'partition_by', but {index} is {len} characters"
     ))]
     InvalidIndexNameLength { index: String, len: usize },
 }
@@ -184,7 +184,7 @@ fn validate_index(index: &str) -> Result<(), Error> {
             len
         }
     );
-    ensure!(!index.contains('-'), InvalidIndexNameHyphenSnafu);
+    ensure!(!index.contains('.'), InvalidIndexNamePeriodSnafu { index });
 
     Ok(())
 }

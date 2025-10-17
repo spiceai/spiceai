@@ -180,7 +180,11 @@ impl TableProvider for VectorScanTableProvider {
         // Only add if key not in base table (we chose base table over index columns in `scan` afterall).
         for f in self.vector_index_list.schema().fields() {
             if !fields_map.contains_key(f.name()) {
-                fields_map.insert(f.name().clone(), Arc::clone(f));
+                // Any field only present in vector index must be nullable since row may be in `self.table_provider` before `self.vector_index_list`.
+                fields_map.insert(
+                    f.name().clone(),
+                    Arc::new(Arc::unwrap_or_clone(Arc::clone(f)).with_nullable(true)),
+                );
             }
         }
 

@@ -157,10 +157,10 @@ macro_rules! error_spaced {
 /// ```text
 /// sql_query
 ///   └── ai (UDF call)
-///         └── ai_completion (individual row processing)
+///         └── model_call (which emits ai_completion spans)
 /// ```
 ///
-/// Without this tracer, the `ai_completion` spans would not properly parent under `sql_query`.
+/// Without this tracer, the `model_call` and `ai_completion` spans would not properly parent under `sql_query`.
 ///
 /// ## Scope
 ///

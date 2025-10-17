@@ -15,44 +15,40 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v1.8 (October 2025)](https://github.com/spiceai/spiceai/milestone/77)
-
-**Focus:** Hybrid Search.
-
-- **Hybrid Search**:
-  - Boosting and re-ranking for fine-tuned search results.
-- **Search**:
-  - Amazon S3 Vectors cross-index query.
-  - Amazon S3 Vectors chunking support.
-- **Hash Partitioning**: Improved query distribution and performance.
-- **Write Support**:
-  - Write-through caching support for Apache Iceberg.
-- **DataFusion**: Upgrade to v50.
-
 ### [v1.9 (November 2025)](https://github.com/spiceai/spiceai/milestone/78)
 
-**Focus:** Ingestion, Write, and Security.
+**Focus:** Real-Time Ingestion, Write, and Security.
 
-- **Write Support**:
-  - Apache Iceberg write support (expanded).
 - **Search**:
   - Amazon S3 Vectors index spilling.
-- **DuckDB**: Upgrade to v1.4.
-- **DataFusion**: Upgrade to v51.
+  - Full-Text-Search Scalability.
 - **Security**:
   - Authentication improvements.
   - Security hardening.
+- **Data Connectors**:
+  - DynamoDB Streams Data Connector.
+- **Snapshots**:
+  - Resiliency improvements.
+  - Debezium and DynamoDB Streams support.
+- **DataFusion**: Upgrade to v50.
 
-### v1.10 (December 2025)
+### [v1.10 (December 2025)](https://github.com/spiceai/spiceai/milestone/79)
+
+**Focus:** Lakehouse Architecture.
+
+- **DuckDB**: Upgrade to v1.4.x.
+- **DataFusion**: Upgrade to v51.
+
+### v1.1x (H1 2026)
 
 **Focus:** Lakehouse Architecture.
 
 - **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
 - **Write Support**:
+  - Apache Iceberg write support (expanded).
   - PostgreSQL write support (expanded).
   - Spice Cloud write support (expanded).
-
-### v1.1x (H1 2026)
+- **DataFusion**: Upgrade to v52.
 
 **Focus:** Extensibility.
 

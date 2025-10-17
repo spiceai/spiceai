@@ -42,6 +42,7 @@ pub mod extension;
 mod keywords;
 pub mod metric;
 pub mod param;
+pub mod partitioning;
 pub mod reader;
 pub mod semantic;
 pub mod spec;

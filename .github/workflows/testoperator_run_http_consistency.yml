@@ -72,6 +72,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
+            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -86,6 +94,10 @@ jobs:
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Run model http consistency test
         if: ${{ github.event.inputs.model }}
