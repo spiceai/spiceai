@@ -212,15 +212,24 @@ impl Query {
                 t
             });
 
-            let task_ctx = Arc::new(TaskContext::from(&session));
-            let physical_plan = session.create_physical_plan(&plan).await.unwrap();
-
-            let stream = async {
-                let physical_plan = session.create_physical_plan(&plan).await?;
-                execute_stream(Arc::clone(&physical_plan), task_ctx)
+            let physical_plan = match session.create_physical_plan(&plan).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    let error_code = ErrorCode::from(&e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        error_code,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
             };
 
-            let res_stream: SendableRecordBatchStream = match stream.await {
+            let task_ctx = Arc::new(TaskContext::from(&session));
+
+            let res_stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
                 Ok(stream) => stream,
                 Err(e) => {
                     let e = find_datafusion_root(e);
