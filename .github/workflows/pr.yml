@@ -320,5 +320,5 @@ jobs:
             RUST_PROFILE=${{ env.RUST_PROFILE }}
           tags: |
             ghcr.io/spiceai/spiceai-rust:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ github.workflow }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}
