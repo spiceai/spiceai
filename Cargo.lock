@@ -12414,6 +12414,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "runtime-acceleration",
+ "runtime-async",
  "runtime-auth",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -12502,6 +12503,16 @@ dependencies = [
  "tracing",
  "url",
  "util",
+]
+
+[[package]]
+name = "runtime-async"
+version = "1.9.0-unstable"
+dependencies = [
+ "futures",
+ "snafu",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
