@@ -845,7 +845,7 @@ fn vectors_filterable_col(col: impl Into<Column>) -> Column {
     )
 }
 
-fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
+pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
     col.into().with_metadata(
         [(
             "vectors".to_string(),

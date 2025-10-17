@@ -33,7 +33,7 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, exec_err},
+    common::{Constraints, exec_err, project_schema},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -178,19 +178,11 @@ impl TableProvider for S3VectorsListTable {
             })
             .collect();
 
-        let projected_schema = match projection {
-            Some(proj) => {
-                let fields = proj
-                    .iter()
-                    .map(|&i| self.table.schema.field(i).clone())
-                    .collect::<Vec<_>>();
-                Arc::new(Schema::new(fields))
-            }
-            None => Arc::clone(&self.table.schema),
-        };
-
         if index_names.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+            return Ok(Arc::new(EmptyExec::new(project_schema(
+                &self.schema(),
+                projection,
+            )?)));
         }
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -218,7 +210,10 @@ impl TableProvider for S3VectorsListTable {
 
         let union_plan = match index_plans.len() {
             0 => {
-                return Ok(Arc::new(EmptyExec::new(projected_schema)));
+                return Ok(Arc::new(EmptyExec::new(project_schema(
+                    &self.schema(),
+                    projection,
+                )?)));
             }
             1 => return Ok(Arc::clone(&index_plans[0])),
             _ => Arc::new(UnionExec::new(index_plans)),

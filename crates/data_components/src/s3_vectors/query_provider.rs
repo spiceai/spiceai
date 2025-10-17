@@ -30,7 +30,7 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, exec_err},
+    common::{Constraints, exec_err, project_schema},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -190,6 +190,8 @@ impl TableProvider for S3VectorsQueryTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let projected_schema = project_schema(&self.schema(), projection)?;
+
         let query_vector = self
             .compute_vector
             .compute_vector(self.query.as_str())
@@ -260,7 +262,7 @@ impl TableProvider for S3VectorsQueryTable {
             .collect();
 
         if index_names.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(self.schema())));
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -294,7 +296,7 @@ impl TableProvider for S3VectorsQueryTable {
 
         let union_plan = match index_plans.len() {
             0 => {
-                return Ok(Arc::new(EmptyExec::new(self.schema())));
+                return Ok(Arc::new(EmptyExec::new(projected_schema)));
             }
             1 => return Ok(Arc::clone(&index_plans[0])),
             _ => Arc::new(UnionExec::new(index_plans)),

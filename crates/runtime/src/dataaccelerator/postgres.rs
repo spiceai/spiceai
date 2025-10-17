@@ -23,7 +23,7 @@ use datafusion::{
 use datafusion_table_providers::postgres::{
     PostgresTableProviderFactory, write::PostgresTableWriter,
 };
-use runtime_table_partition::expression::PartitionBy;
+use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
@@ -108,10 +108,10 @@ impl DataAccelerator for PostgresAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
-        partition_by: Option<PartitionBy>,
+        partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
-            partition_by.is_none(),
+            partition_by.is_empty(),
             super::InvalidConfigurationSnafu {
                 msg: "Postgres data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }

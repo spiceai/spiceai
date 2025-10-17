@@ -35,6 +35,7 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{arrow, prelude::*};
 use runtime_datafusion_udfs::{bucket, truncate};
+use runtime_table_partition::expression::PartitionedBy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -246,7 +247,10 @@ async fn test_insert_partitioning() -> Result<(), Box<dyn std::error::Error>> {
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = vec![col("region")];
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         partition_by,
@@ -312,7 +316,10 @@ async fn test_explain_plan_filtering() -> Result<(), Box<dyn std::error::Error>>
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = vec![col("region")];
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         partition_by,
@@ -386,10 +393,13 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = Expr::ScalarFunction(ScalarFunction {
-        func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
-        args: vec![lit(4i64), col("id")],
-    });
+    let partition_by = PartitionedBy {
+        name: "bucket_id".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(4i64), col("id")],
+        }),
+    };
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         vec![partition_by.clone()],
@@ -421,7 +431,8 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
 
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
-    let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
+    let physical_expr =
+        create_physical_expr(&partition_by.expression, &df_schema, &execution_props)?;
     let batch_values = physical_expr.evaluate(&batch)?;
     let bucket_values = match batch_values {
         ColumnarValue::Array(array) => array
@@ -505,10 +516,13 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = Expr::ScalarFunction(ScalarFunction {
-        func: Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new())),
-        args: vec![lit(10i64), col("id")],
-    });
+    let partition_by = PartitionedBy {
+        name: "truncate_id".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new())),
+            args: vec![lit(10i64), col("id")],
+        }),
+    };
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         vec![partition_by.clone()],
@@ -540,7 +554,8 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
 
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
-    let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
+    let physical_expr =
+        create_physical_expr(&partition_by.expression, &df_schema, &execution_props)?;
     let batch_values = physical_expr.evaluate(&batch)?;
     let truncated_values = match batch_values {
         ColumnarValue::Array(array) => array
@@ -629,7 +644,10 @@ async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Erro
     let granularities = vec!["year", "month", "day", "hour", "minute", "second"];
 
     for granularity in granularities {
-        let partition_by = date_trunc(lit(granularity), col("timestamp"));
+        let partition_by = PartitionedBy {
+            name: "date_trunc_timestamp".to_string(),
+            expression: date_trunc(lit(granularity), col("timestamp")),
+        };
         let table_provider = PartitionTableProvider::new(
             Arc::clone(&creator) as Arc<dyn PartitionCreator>,
             vec![partition_by.clone()],
