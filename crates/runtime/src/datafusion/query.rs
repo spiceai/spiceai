@@ -468,7 +468,7 @@ fn attach_query_tracker_to_stream(
 }
 
 #[must_use]
-/// Attaches logic to emit metrics from a physical plan to a `SendableRecordBatchStream`.
+/// Attaches logic to a stream which emits metrics from a physical plan.
 fn attach_physical_plan_metrics_to_stream(
     mut stream: SendableRecordBatchStream,
     physical_plan: Arc<dyn ExecutionPlan>,
@@ -484,7 +484,7 @@ fn attach_physical_plan_metrics_to_stream(
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
 
-        crate::metrics::telemetry::track_spill_count(totals.spill_count, &request_context.to_dimensions());
+        crate::metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
         crate::metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
         crate::metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
     };
@@ -497,14 +497,14 @@ fn attach_physical_plan_metrics_to_stream(
 
 #[derive(Default, Debug)]
 struct PhysicalPlanMetricsTotals {
-    pub spill_count: u64,
+    pub produced_spills: u64,
     pub spilled_bytes: u64,
     pub spilled_rows: u64,
 }
 
 fn collect_physical_plan_metrics(plan: &dyn ExecutionPlan, totals: &mut PhysicalPlanMetricsTotals) {
     if let Some(metrics) = plan.metrics() {
-        totals.spill_count += metrics.spill_count().unwrap_or_default() as u64;
+        totals.produced_spills += metrics.spill_count().unwrap_or_default() as u64;
         totals.spilled_bytes += metrics.spilled_bytes().unwrap_or_default() as u64;
         totals.spilled_rows += metrics.spilled_rows().unwrap_or_default() as u64;
     }
@@ -905,7 +905,7 @@ mod tests {
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(plan.as_ref(), &mut totals);
 
-        assert_eq!(totals.spill_count, 20);
+        assert_eq!(totals.produced_spills, 20);
         assert_eq!(totals.spilled_bytes, 0);
         assert_eq!(totals.spilled_rows, 100);
     }
@@ -937,7 +937,7 @@ mod tests {
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(plan.as_ref(), &mut totals);
 
-        assert_eq!(totals.spill_count, 40);
+        assert_eq!(totals.produced_spills, 40);
         assert_eq!(totals.spilled_bytes, 0);
         assert_eq!(totals.spilled_rows, 200);
     }

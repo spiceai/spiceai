@@ -118,17 +118,17 @@ pub fn track_ai_inferences_with_spice_count(dimensions: &[KeyValue]) {
     AI_INFERENCES_WITH_SPICE_COUNT.add(1, dimensions);
 }
 
-static QUERY_SPILL_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+static QUERY_PRODUCED_SPILLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     TELEMETRY_METER
-        .u64_counter("query_spill_count")
+        .u64_counter("query_produced_spills")
         .with_description("Number of spills produced")
         .with_unit("spills")
         .build()
 });
 
-pub fn track_spill_count(value: u64, dimensions: &[KeyValue]) {
-    telemetry::track_spill_count(value, dimensions);
-    QUERY_SPILL_COUNT.add(value, dimensions);
+pub fn track_produced_spills(value: u64, dimensions: &[KeyValue]) {
+    telemetry::track_produced_spills(value, dimensions);
+    QUERY_PRODUCED_SPILLS.add(value, dimensions);
 }
 
 static QUERY_SPILLED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
