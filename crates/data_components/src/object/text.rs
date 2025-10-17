@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, project_schema},
+    common::{Column, Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -230,7 +230,9 @@ impl TableProvider for ObjectStoreTextTable {
         Ok(filters
             .iter()
             .map(|f| {
-                if f.column_refs().contains(&col("content")) {
+                if f.column_refs()
+                    .contains(&Column::from_qualified_name("content"))
+                {
                     TableProviderFilterPushDown::Unsupported
                 } else {
                     TableProviderFilterPushDown::Exact
