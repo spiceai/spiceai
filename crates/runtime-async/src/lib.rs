@@ -112,8 +112,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::task::JoinSet;
     use tokio::time::sleep;
