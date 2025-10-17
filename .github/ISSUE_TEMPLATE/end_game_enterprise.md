@@ -99,10 +99,16 @@ assignees: ''
 Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) run associated with the above create Github release:
 
 - [ ] Ensure the [docker image build](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) is completed and the image [was promoted](https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml) to all stamps and environments
+- [ ] Ask @lukekim, @phillipleblanc, or @ewgenius to add released tag to the `versions` and `default_tag` in [SCP Config in Vercel](https://vercel.com/spice/~/stores/edge-config/ecfg_pbglo8zol8rij7koia8ijd6t2fwe/items) for **dev**.
 - [ ] Deploy the new docker image to several apps in dev [SCP](https://dev.spice.ai/). Confirm upgrade and functionality.
   - [ ] SQL Query
   - [ ] AI Chat
   - [ ] Search
+  - spicehq:
+    - https://dev.spice.ai/spicehq/scp-synthetics-test-app
+    - https://dev.spice.ai/spicehq/scp-synthetics-test-app-stateful
+    - https://dev.spice.ai/spicehq/scp-synthetics-test-app-aws
+- [ ] Ask @lukekim, @phillipleblanc, or @ewgenius to add released tag to the `versions` and `default_tag` in [SCP Config in Vercel](https://vercel.com/spice/~/stores/edge-config/ecfg_pbglo8zol8rij7koia8ijd6t2fwe/items) for **prod**.
 - [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality:
   - [ ] SQL Query
   - [ ] AI Chat
@@ -118,6 +124,9 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
     - https://spice.ai/spicehq/ai-platform
     - https://spice.ai/spicehq/embedding-server
     - https://spice.ai/spicehq/scp-synthetics-test-app
+    - https://spice.ai/spicehq/scp-synthetics-test-app-stateful
+    - https://spice.ai/spicehq/scp-synthetics-test-app-aws
+    - https://spice.ai/spicehq/scp-synthetics-test-app-aws-stateful
   - spiceai:
     - https://spice.ai/spiceai/react
     - https://spice.ai/spiceai/tpch
