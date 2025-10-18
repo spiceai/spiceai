@@ -80,6 +80,8 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use spicepod::metric::Metrics;
+use std::collections::HashSet;
 
 mod changes;
 mod streaming_append;
@@ -102,6 +104,7 @@ pub struct RefreshTaskBuilder {
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
+    metrics: Option<Metrics>,
 }
 
 impl RefreshTaskBuilder {
@@ -112,6 +115,7 @@ impl RefreshTaskBuilder {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
+        metrics: Option<Metrics>,
     ) -> Self {
         Self {
             runtime_status,
@@ -122,6 +126,7 @@ impl RefreshTaskBuilder {
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
             disable_federation: false,
             semaphore: None,
+            metrics,
         }
     }
 
@@ -143,6 +148,7 @@ impl RefreshTaskBuilder {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
@@ -152,6 +158,15 @@ impl RefreshTaskBuilder {
             sink: self.sink,
             disable_federation: self.disable_federation,
             semaphore,
+            enabled_metrics: self
+                .metrics
+                .as_ref()
+                .map(spicepod::metric::Metrics::enabled_metrics)
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -167,6 +182,7 @@ pub struct RefreshTask {
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Arc<Semaphore>,
+    enabled_metrics: HashSet<String>,
 }
 
 impl RefreshTask {
@@ -177,6 +193,7 @@ impl RefreshTask {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
+        metrics: Option<Metrics>,
     ) -> RefreshTaskBuilder {
         RefreshTaskBuilder::new(
             runtime_status,
@@ -184,6 +201,7 @@ impl RefreshTask {
             federated,
             federated_source,
             accelerator,
+            metrics,
         )
     }
 
@@ -258,7 +276,26 @@ impl RefreshTask {
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
-        let max_timestamp_before_refresh_ms = self.get_max_timestamp_before_refresh(refresh).await;
+        // max_timestamp_before_refresh is needed if at least one of the following metrics is enabled:
+        //  * METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS
+        //  * METRIC_REFRESH_LAG_MS
+        // max_timestamp_after_refresh is needed if at least one of the following metrics is enabled:
+        //  * METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS
+        //  * METRIC_REFRESH_LAG_MS
+        //  * METRIC_INGESTION_LAG_MS
+        let (need_max_timestamp_before_refresh, need_max_timestamp_after_refresh) = (
+            self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
+                || self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS),
+            self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
+                || self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS)
+                || self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS),
+        );
+
+        let max_timestamp_before_refresh_ms = if need_max_timestamp_before_refresh {
+            self.get_max_timestamp_before_refresh(refresh).await
+        } else {
+            None
+        };
 
         let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
@@ -294,20 +331,27 @@ impl RefreshTask {
             }
         };
 
-        let source_name = format!(
-            "{} {}",
-            self.component_type(),
-            include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref())
-        );
         let (streaming_data_update, max_timestamp_after_refresh_ms) =
-            with_find_max_timestamp_in_stream(
-                streaming_data_update,
-                self.federated.schema(),
-                refresh.time_column.clone(),
-                refresh.time_format,
-                source_name,
-            )
-            .await;
+            if need_max_timestamp_after_refresh {
+                let source_name = format!(
+                    "{} {}",
+                    self.component_type(),
+                    include_source_to_table_name(
+                        &self.dataset_name,
+                        self.federated_source.as_deref()
+                    )
+                );
+                with_find_max_timestamp_in_stream(
+                    streaming_data_update,
+                    self.federated.schema(),
+                    refresh.time_column.clone(),
+                    refresh.time_format,
+                    source_name,
+                )
+                .await
+            } else {
+                (streaming_data_update, None)
+            };
 
         self.write_streaming_data_update(
             Some(start_time),
@@ -342,9 +386,11 @@ impl RefreshTask {
         Ok(())
     }
 
-    #[allow(unreachable_code, unused_variables)]
+    fn is_metric_enabled(&self, metric_name: &str) -> bool {
+        self.enabled_metrics.contains(metric_name)
+    }
+
     async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<i64> {
-        return None;
         if refresh.time_column.is_some() {
             match self.timestamp_nanos_for_append_query(refresh).await {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
@@ -373,34 +419,48 @@ impl RefreshTask {
         max_timestamp_before_refresh_ms: Option<i64>,
         max_timestamp_after_refresh_ms: Option<Arc<Mutex<Option<i64>>>>,
     ) {
-        if let (Some(max_timestamp_before_refresh_ms), Some(max_timestamp_after_refresh_ms)) = (
-            max_timestamp_before_refresh_ms,
-            max_timestamp_after_refresh_ms,
-        ) {
-            let max_timestamp_after_refresh_ms = {
-                let guard = max_timestamp_after_refresh_ms.lock().await;
+        let max_timestamp_after_refresh_ms_value = match &max_timestamp_after_refresh_ms {
+            Some(arc_mutex) => {
+                let guard = arc_mutex.lock().await;
                 *guard
-            };
+            }
+            None => None,
+        };
 
-            if let Some(max_timestamp_after_refresh_ms) = max_timestamp_after_refresh_ms {
-                #[allow(clippy::cast_possible_truncation)]
-                let current_time_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
+        #[allow(clippy::cast_possible_truncation)]
+        let current_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
 
-                let refresh_lag_ms =
-                    max_timestamp_after_refresh_ms - max_timestamp_before_refresh_ms;
-                let ingestion_lag_ms = current_time_ms - max_timestamp_after_refresh_ms;
+        for label_set in dataset_metrics_label_sets {
+            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
+                && let Some(val) = max_timestamp_before_refresh_ms
+            {
+                metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS.record(val, label_set);
+            }
 
-                for label_set in dataset_metrics_label_sets {
-                    metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS
-                        .record(max_timestamp_before_refresh_ms, label_set);
-                    metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS
-                        .record(max_timestamp_after_refresh_ms, label_set);
-                    metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
-                    metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
-                }
+            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
+                && let Some(val) = max_timestamp_after_refresh_ms_value
+            {
+                metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS.record(val, label_set);
+            }
+
+            if self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS)
+                && let (Some(before), Some(after)) = (
+                    max_timestamp_before_refresh_ms,
+                    max_timestamp_after_refresh_ms_value,
+                )
+            {
+                let refresh_lag_ms = after - before;
+                metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
+            }
+
+            if self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS)
+                && let Some(after) = max_timestamp_after_refresh_ms_value
+            {
+                let ingestion_lag_ms = current_time_ms - after;
+                metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
             }
         }
     }

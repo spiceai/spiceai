@@ -33,7 +33,6 @@ use datafusion::{
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
-use std::sync::atomic::Ordering;
 use std::{fmt::Display, sync::Arc};
 use tokio::time::Instant;
 use tracing::Span;

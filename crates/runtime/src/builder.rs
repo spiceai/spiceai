@@ -155,6 +155,11 @@ impl RuntimeBuilder {
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
 
+        let metrics = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.metrics.clone());
+
         let dataset_parallelism = self
             .app
             .as_ref()
@@ -192,7 +197,8 @@ impl RuntimeBuilder {
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
-        .with_caching(caching);
+        .with_caching(caching)
+        .with_metrics(metrics);
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
