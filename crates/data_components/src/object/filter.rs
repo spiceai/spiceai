@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,77 +15,92 @@ limitations under the License.
 */
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::compute::filter_record_batch;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
-use std::sync::Arc;
+use arrow_array::BooleanArray;
+use datafusion::common::DFSchema;
+use datafusion::logical_expr::ColumnarValue;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use datafusion::{
     error::DataFusionError,
     prelude::{Expr, SessionContext},
 };
-use futures::StreamExt;
 use object_store::ObjectMeta;
 
+static OBJECT_META_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("location", DataType::Utf8, false),
+        Field::new(
+            "last_modified",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("size", DataType::UInt64, false),
+        Field::new("e_tag", DataType::Utf8, true),
+        Field::new("version", DataType::Utf8, true),
+    ]))
+});
+
 /// Filters [`ObjectMeta`]s that satisfy all provided `filter`s.
+///
+/// If `filters` contains any [`Expr`] that is not parseable by [`SessionContext::default`], all [`ObjectMeta`] are returned.
 pub async fn filter_object_meta(
-    filter: &[Expr],
+    filters: &[Expr],
     metas: &[ObjectMeta],
 ) -> Result<Vec<ObjectMeta>, DataFusionError> {
-    let Some(combined_filter) = filter.iter().cloned().reduce(Expr::and) else {
+    let Some(combined_filter) = filters.iter().cloned().reduce(Expr::and) else {
         return Ok(metas.to_vec());
     };
 
-    let ctx = SessionContext::new();
-    ctx.register_batch(
-        "tmp",
-        to_record_batch(metas).map_err(|e| {
-            DataFusionError::ArrowError(
-                Box::new(e),
-                Some("Failed to convert 'ObjectMeta' to arrow".to_string()),
-            )
-        })?,
-    )?;
+    let rb = to_record_batch(metas).map_err(|e| {
+        DataFusionError::ArrowError(
+            Box::new(e),
+            Some("Failed to convert 'ObjectMeta' to arrow".to_string()),
+        )
+    })?;
+    let ctx = SessionContext::default();
 
-    let mut stream = ctx
-        .table("tmp")
-        .await?
-        .filter(combined_filter)?
-        .execute_stream()
-        .await?;
+    let df_schema =
+        DFSchema::from_unqualified_fields(OBJECT_META_SCHEMA.fields().clone(), HashMap::default())?;
 
-    let mut valid_locations = std::collections::HashSet::new();
+    // First evaluate filters as physical expression.
+    let ColumnarValue::Array(arr) = ctx
+        .create_physical_expr(combined_filter, &df_schema)?
+        .evaluate(&rb)?
+    else {
+        return Err(DataFusionError::Internal(
+            "Unexpectedly recieved scalar value for 'location' column".to_string(),
+        ));
+    };
 
-    while let Some(batch_result) = stream.next().await {
-        let rb = batch_result?;
-        if let Some(location_array) = rb.column(0).as_any().downcast_ref::<StringArray>() {
-            for loc_opt in location_array {
-                if let Some(loc) = loc_opt {
-                    valid_locations.insert(loc.to_string());
-                }
-            }
-        };
-    }
+    let Some(bool_arr) = arr.as_any().downcast_ref::<BooleanArray>() else {
+        return Err(DataFusionError::Internal(
+            "Unexpectedly recieved scalar value for 'location' column".to_string(),
+        ));
+    };
+
+    let filtered_rb = filter_record_batch(&rb, bool_arr)?;
+    let valid_locations = filtered_rb
+        .column_by_name("location")
+        .ok_or_else(|| DataFusionError::Internal("location column not found".to_string()))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .map(|s| s.iter().filter_map(|s| s).collect::<HashSet<_>>())
+        .unwrap_or_default();
 
     Ok(metas
         .into_iter()
-        .filter(|m| valid_locations.contains(&m.location.to_string()))
+        .filter(|m| valid_locations.contains(m.location.as_ref()))
         .cloned()
         .collect())
 }
 
 fn to_record_batch(metas: &[ObjectMeta]) -> Result<RecordBatch, ArrowError> {
     RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("location", DataType::Utf8, false),
-            Field::new(
-                "last_modified",
-                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("size", DataType::UInt64, false),
-            Field::new("e_tag", DataType::Utf8, true),
-            Field::new("version", DataType::Utf8, true),
-        ])),
+        Arc::clone(&OBJECT_META_SCHEMA),
         vec![
             // location
             Arc::new(StringArray::from(

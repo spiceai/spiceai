@@ -235,7 +235,7 @@ impl TableProvider for ObjectStoreTextTable {
                 {
                     TableProviderFilterPushDown::Unsupported
                 } else {
-                    TableProviderFilterPushDown::Exact
+                    TableProviderFilterPushDown::Inexact
                 }
             })
             .collect())
