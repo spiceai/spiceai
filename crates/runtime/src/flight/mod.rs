@@ -47,6 +47,7 @@ use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -217,13 +218,15 @@ impl Service {
             ..Default::default()
         };
 
+        let request_context_clone = Arc::clone(&RequestContext::current(AsyncMarker::new().await));
+
         let data_stream = query_result.data;
         let flights_stream = try_stream! {
             yield schema_flight_data;
 
             futures::pin_mut!(data_stream); // needed to use `.next()` on stream
 
-            while let Some(batch_result) = data_stream.next().await {
+            while let Some(batch_result) = Arc::clone(&request_context_clone).scope(data_stream.next()).await {
                 match batch_result {
                     Ok(batch) => {
                         let (dicts, batch_data) = encoder

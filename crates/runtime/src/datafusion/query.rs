@@ -121,6 +121,11 @@ impl Query {
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
+        if request_context.entered_top_level_query() {
+            crate::metrics::telemetry::inc_query_active_count(
+                &request_context.to_protocol_dimensions(),
+            );
+        }
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
@@ -272,6 +277,13 @@ impl Query {
                 final_stream,
                 physical_plan,
                 Arc::clone(&request_context),
+                inner_span.clone(),
+            );
+
+            let final_stream = attach_query_active_count_decrement_to_stream(
+                final_stream,
+                Arc::clone(&request_context),
+                inner_span.clone(),
             );
 
             Ok(QueryResult::new(
@@ -476,12 +488,52 @@ fn attach_query_tracker_to_stream(
     ))
 }
 
+struct QueryCleanupGuard {
+    request_context: Arc<RequestContext>,
+}
+
+impl Drop for QueryCleanupGuard {
+    fn drop(&mut self) {
+        if self.request_context.exited_top_level_query() {
+            crate::metrics::telemetry::dec_query_active_count(
+                &self.request_context.to_protocol_dimensions(),
+            );
+        }
+    }
+}
+
+fn attach_query_active_count_decrement_to_stream(
+    mut stream: SendableRecordBatchStream,
+    request_context: Arc<RequestContext>,
+    span: Span,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+
+    let updated_stream = stream! {
+        // This guard will make sure crate::metrics::telemetry::dec_query_active_count
+        // will always be called, even if an error occurs during stream processing.
+        let _guard = QueryCleanupGuard {
+            request_context: Arc::clone(&request_context),
+        };
+
+        while let Some(batch_result) = stream.next().await {
+            yield batch_result;
+        }
+    };
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        Box::pin(updated_stream.instrument(span)),
+    ))
+}
+
 #[must_use]
 /// Attaches logic to a stream which emits metrics from a physical plan.
 fn attach_physical_plan_metrics_to_stream(
     mut stream: SendableRecordBatchStream,
     physical_plan: Arc<dyn ExecutionPlan>,
     request_context: Arc<RequestContext>,
+    span: Span,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
 
@@ -500,7 +552,7 @@ fn attach_physical_plan_metrics_to_stream(
 
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
-        Box::pin(updated_stream),
+        Box::pin(updated_stream.instrument(span)),
     ))
 }
 
