@@ -67,7 +67,7 @@ pub enum Error {
     UnableToGetElapsedTime { source: std::time::SystemTimeError },
 }
 
-// Bufferring rows allows for much more efficient writes in DuckDB
+// Buffering rows allows for much more efficient writes in DuckDB
 // 122_880 represents DuckDB default size of groups of rows - that are stored together at the storage level.
 const ROWS_PER_PARTITION_BUFFER: usize = 122_880;
 

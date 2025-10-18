@@ -588,22 +588,3 @@ impl InsertStrategy for DefaultInsertStrategy {
         )))
     }
 }
-
-#[derive(Debug)]
-pub struct DataSinkInsertStrategy {
-    pub sink_config: Box<dyn std::any::Any + Send + Sync>,
-}
-
-#[async_trait::async_trait]
-impl InsertStrategy for DataSinkInsertStrategy {
-    async fn execute_insert(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-        context: &PartitionContext,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        DefaultInsertStrategy
-            .execute_insert(input, insert_op, context)
-            .await
-    }
-}
