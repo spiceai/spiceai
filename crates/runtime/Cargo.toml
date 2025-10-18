@@ -121,6 +121,7 @@ rmcp = { workspace = true, optional = true, features = [
 ] }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-async = { path = "../runtime-async" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
