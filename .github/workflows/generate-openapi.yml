@@ -8,6 +8,11 @@ on:
       - 'crates/**'
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
 jobs:
   generate_openapi:
     runs-on: self-hosted

@@ -38,6 +38,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
 jobs:
   build:
     name: Build AWS SDK Integration Test Binary
@@ -46,6 +51,29 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1 # Shallow clone for faster checkout
+
+      # Cache Cargo dependencies
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cache Rust build artifacts
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-aws-sdk-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-aws-sdk-
+            ${{ runner.os }}-rust-
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -97,6 +125,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1 # Shallow clone
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -136,6 +166,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1 # Shallow clone
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

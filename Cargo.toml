@@ -21,6 +21,7 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
+    "crates/runtime-async",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-parameters",
