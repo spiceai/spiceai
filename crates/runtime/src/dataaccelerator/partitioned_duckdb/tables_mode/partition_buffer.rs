@@ -1,0 +1,91 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::collections::HashMap;
+
+use arrow::array::RecordBatch;
+use datafusion::error::DataFusionError;
+use tokio::sync::mpsc::Sender;
+
+pub struct PartitionBuffer {
+    sender: Sender<(String, Vec<RecordBatch>)>,
+    buffers: HashMap<String, Vec<RecordBatch>>,
+    row_counts: HashMap<String, usize>,
+    rows_per_partition_threshold: usize,
+}
+
+impl PartitionBuffer {
+    pub fn new(
+        sender: Sender<(String, Vec<RecordBatch>)>,
+        rows_per_partition_threshold: usize,
+    ) -> Self {
+        Self {
+            sender,
+            buffers: HashMap::new(),
+            row_counts: HashMap::new(),
+            rows_per_partition_threshold,
+        }
+    }
+
+    /// Add a batch to the specified partition buffer. If threshold is reached, flush that partition.
+    pub async fn process_batch(
+        &mut self,
+        partition_id: String,
+        batch: RecordBatch,
+    ) -> datafusion::common::Result<()> {
+        let batch_row_count = batch.num_rows();
+
+        // Add batch to partition buffer
+        self.buffers
+            .entry(partition_id.clone())
+            .or_default()
+            .push(batch);
+
+        // Update row count for this partition
+        let current_rows = self.row_counts.entry(partition_id.clone()).or_default();
+        *current_rows += batch_row_count;
+
+        // Check if we should flush this partition's buffer
+        if *current_rows >= self.rows_per_partition_threshold {
+            self.flush_partition(&partition_id).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush all buffered data for a specific partition
+    async fn flush_partition(&mut self, partition_id: &str) -> datafusion::common::Result<()> {
+        if let Some(partition_batches) = self.buffers.remove(partition_id) {
+            if !partition_batches.is_empty() {
+                self.sender.send((partition_id.to_string(), partition_batches)).await
+                    .map_err(|e| DataFusionError::Execution(format!(
+                        "Unable to send combined RecordBatch for partition {partition_id} to DuckDB writer: {e}"
+                    )))?;
+            }
+            self.row_counts.remove(partition_id);
+        }
+        Ok(())
+    }
+
+    /// Flush all remaining buffered data for all partitions
+    pub async fn flush_all(&mut self) -> datafusion::common::Result<()> {
+        let partition_ids: Vec<String> = self.buffers.keys().cloned().collect();
+        for partition_id in partition_ids {
+            self.flush_partition(&partition_id).await?;
+        }
+        Ok(())
+    }
+}
