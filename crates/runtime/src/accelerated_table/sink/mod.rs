@@ -38,6 +38,13 @@ impl AccelerationSink {
         Self::Table(TableSink::new(table_provider))
     }
 
+    pub fn new_with_retention_sql(
+        table_provider: Arc<dyn TableProvider>,
+        retention_sql: Option<String>,
+    ) -> Self {
+        Self::Table(TableSink::new(table_provider).with_retention_sql(retention_sql))
+    }
+
     // Adds a table provider to the AccelerationSink, converting a TableSink to a MultiSink if necessary
     pub fn add_synchronized_table(&mut self, synchronized_table: SynchronizedTable) {
         match self {
