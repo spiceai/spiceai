@@ -25,10 +25,8 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
-use bytes::Bytes;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
@@ -138,7 +136,9 @@ pub(crate) async fn do_get(
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
             {
-                uint64_array.value(0) as i64
+                #[allow(clippy::cast_possible_wrap)]
+                let value = uint64_array.value(0) as i64;
+                value
             } else {
                 0
             }

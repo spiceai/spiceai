@@ -20,7 +20,6 @@ use arrow::compute::concat_batches;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, PutResult, Ticket,
     decode::{DecodedPayload, FlightDataDecoder},
-    encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightService,
     sql::{self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, ProstMessageExt},
@@ -37,12 +36,12 @@ use datafusion::{
         parser::{Parser, ParserError},
     },
 };
+use futures::{StreamExt, TryStreamExt};
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
@@ -53,23 +52,22 @@ use crate::{
     },
     timing::TimedStream,
 };
-use cache::result::CacheStatus;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Attempts to rewrite SQL to include explicit type casts for parameters.
-/// This helps DataFusion infer parameter types for queries like "SELECT $1 + $2".
-/// 
+/// This helps `DataFusion` infer parameter types for queries like "SELECT $1 + $2".
+///
 /// For each parameter $N, wraps it in a CAST($N AS <type>) based on the schema.
-fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> Result<String, String> {
+fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> String {
     use arrow::datatypes::DataType;
-    
+
     let mut rewritten = sql.to_string();
-    
+
     // For each field in the schema (representing each parameter), replace $N with CAST($N AS type)
     for (idx, field) in schema.fields().iter().enumerate() {
         let param_num = idx + 1;
-        let param_placeholder = format!("${}", param_num);
-        
+        let param_placeholder = format!("${param_num}");
+
         // Determine the SQL type name from Arrow DataType
         let sql_type = match field.data_type() {
             DataType::Int8 => "TINYINT",
@@ -88,35 +86,39 @@ fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> Result<String, 
             DataType::Timestamp(_, _) => "TIMESTAMP",
             _ => {
                 // For unsupported types, skip casting
-                tracing::warn!("Cannot cast parameter ${} with unsupported type: {:?}", param_num, field.data_type());
+                tracing::warn!(
+                    "Cannot cast parameter ${} with unsupported type: {:?}",
+                    param_num,
+                    field.data_type()
+                );
                 continue;
             }
         };
-        
+
         // Replace all occurrences of $N with CAST($N AS type)
         // Use word boundaries to avoid replacing $1 in $10, $11, etc.
-        let cast_expr = format!("CAST({} AS {})", param_placeholder, sql_type);
-        
+        let cast_expr = format!("CAST({param_placeholder} AS {sql_type})");
+
         // Simple replacement - this could be improved with proper SQL parsing
         // but should work for most cases
-        rewritten = rewritten.replace(&format!("{} ", param_placeholder), &format!("{} ", cast_expr));
-        rewritten = rewritten.replace(&format!("{})", param_placeholder), &format!("{})", cast_expr));
-        rewritten = rewritten.replace(&format!("{},", param_placeholder), &format!("{},", cast_expr));
-        
+        rewritten = rewritten.replace(&format!("{param_placeholder} "), &format!("{cast_expr} "));
+        rewritten = rewritten.replace(&format!("{param_placeholder})"), &format!("{cast_expr})"));
+        rewritten = rewritten.replace(&format!("{param_placeholder},"), &format!("{cast_expr},"));
+
         // Handle cases where parameter is at the end of the SQL
         if rewritten.ends_with(&param_placeholder) {
             rewritten = rewritten.trim_end_matches(&param_placeholder).to_string() + &cast_expr;
         }
     }
-    
-    Ok(rewritten)
+
+    rewritten
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
     pub(super) query: String,
     pub(super) parameters: Vec<u8>,
-    /// Parameter schema - stores the Arrow schema of bound parameters from DoPut
+    /// Parameter schema - stores the Arrow schema of bound parameters from `DoPut`
     /// This schema provides type information for each parameter (e.g., Int64, Utf8, etc.)
     /// and is used to create a properly typed logical plan during execution
     pub(super) parameter_schema: Option<Vec<u8>>,
@@ -256,43 +258,45 @@ pub(crate) async fn do_get(
         parameter_schema,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    tracing::info!("do_get: Query: {}, Parameters length: {}", sql, parameters.len());
-    
+    tracing::info!(
+        "do_get: Query: {}, Parameters length: {}",
+        sql,
+        parameters.len()
+    );
+
     let param_values = decode_param_values(&parameters).map_err(error_to_status)?;
-    
+
     tracing::info!("do_get: Decoded parameters: {:?}", param_values);
 
     // If we have parameter schema from DoPut, try to use it to help with type inference
     // by rewriting the SQL to include explicit type casts
     let sql_to_execute = if let Some(schema_bytes) = &parameter_schema {
         tracing::info!("do_get: Have parameter schema, attempting to rewrite SQL with type casts");
-        
+
         // Decode the parameter schema
         let schema = {
             let reader = arrow::ipc::reader::StreamReader::try_new(&schema_bytes[..], None)
                 .map_err(error_to_status)?;
             reader.schema()
         };
-        
+
         tracing::info!("do_get: Parameter schema: {:?}", schema);
-        
+
         // Try to rewrite the SQL with type casts to help DataFusion infer types
-        match rewrite_sql_with_type_casts(&sql, &schema) {
-            Ok(rewritten) => {
-                tracing::info!("do_get: Rewritten SQL: {}", rewritten);
-                Cow::Owned(rewritten)
-            }
-            Err(e) => {
-                tracing::warn!("do_get: Failed to rewrite SQL with type casts: {}. Using original SQL.", e);
-                Cow::Borrowed(sql.as_str())
-            }
-        }
+        let rewritten = rewrite_sql_with_type_casts(&sql, &schema);
+        tracing::info!("do_get: Rewritten SQL: {}", rewritten);
+        Cow::Owned(rewritten)
     } else {
         Cow::Borrowed(sql.as_str())
     };
-    
+
     // Use the standard flow with the (possibly rewritten) SQL
-    let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(datafusion, &sql_to_execute, param_values)).await?;
+    let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
+        datafusion,
+        &sql_to_execute,
+        param_values,
+    ))
+    .await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
@@ -309,13 +313,13 @@ pub(crate) async fn do_put_query(
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
     tracing::info!("do_put_query: Binding parameters to prepared statement");
-    
+
     let streaming_flight = streaming_flight
         .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
     let schema = decode_schema(&mut decoder).await?;
-    
+
     tracing::info!("do_put_query: Parameter schema: {:?}", schema);
 
     let mut parameters = Vec::new();
@@ -474,20 +478,17 @@ impl VisitorMut for ConvertJdbcPlaceholdersVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray};
-    use arrow::datatypes::{Schema, Field, DataType};
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    /// Helper to encode a RecordBatch into Arrow IPC format for parameters
+    /// Helper to encode a `RecordBatch` into Arrow IPC format for parameters
     fn encode_params_to_bytes(batch: &RecordBatch) -> Result<Vec<u8>, arrow::error::ArrowError> {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(
-            Vec::new(),
-            &batch.schema(),
-        )?;
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &batch.schema())?;
         writer.write(batch)?;
         writer.finish()?;
-        Ok(writer.into_inner()?)
+        writer.into_inner()
     }
 
     #[test]
@@ -495,9 +496,11 @@ mod tests {
         // Test that JDBC placeholders are converted to Postgres style
         let query = "SELECT ? + 1 AS result";
         let result = convert_jdbc_parameter_placeholders(query);
-        
+
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "SELECT $1 + 1 AS result");
+        if let Ok(converted) = result {
+            assert_eq!(converted, "SELECT $1 + 1 AS result");
+        }
     }
 
     #[test]
@@ -505,38 +508,57 @@ mod tests {
         // Test multiple placeholders
         let query = "SELECT ? + ? AS sum, ? * ? AS product";
         let result = convert_jdbc_parameter_placeholders(query);
-        
+
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "SELECT $1 + $2 AS sum, $3 * $4 AS product");
+        if let Ok(converted) = result {
+            assert_eq!(converted, "SELECT $1 + $2 AS sum, $3 * $4 AS product");
+        }
     }
-    
+
     #[test]
     fn test_convert_query_with_string_parameters() {
         let query = "SELECT ? || ' ' || ? AS greeting";
         let result = convert_jdbc_parameter_placeholders(query);
-        
+
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "SELECT $1 || ' ' || $2 AS greeting");
+        if let Ok(converted) = result {
+            assert_eq!(converted, "SELECT $1 || ' ' || $2 AS greeting");
+        }
     }
 
     #[tokio::test]
     async fn test_decode_param_values_single_int() {
         // Create a RecordBatch with a single int64 parameter
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("param1", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "param1",
+            DataType::Int64,
+            false,
+        )]));
         let array = Arc::new(Int64Array::from(vec![42]));
-        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        
+        let batch = match RecordBatch::try_new(schema, vec![array]) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to create RecordBatch: {e}"),
+        };
+
         // Encode to bytes
-        let bytes = encode_params_to_bytes(&batch).unwrap();
-        
+        let bytes = match encode_params_to_bytes(&batch) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to encode params: {e}"),
+        };
+
         // Decode
         let result = decode_param_values(&bytes);
-        assert!(result.is_ok(), "Should decode successfully: {:?}", result.err());
-        
-        let params = result.unwrap();
-        assert!(params.is_some(), "Should have parameters");
+        assert!(
+            result.is_ok(),
+            "Should decode successfully: {:?}",
+            result.err()
+        );
+
+        if let Ok(Some(_params)) = result {
+            // Successfully decoded parameters
+        } else {
+            panic!("Expected Some parameters");
+        }
     }
 
     #[tokio::test]
@@ -548,23 +570,36 @@ mod tests {
             Field::new("string_param", DataType::Utf8, false),
             Field::new("bool_param", DataType::Boolean, false),
         ]));
-        
-        let batch = RecordBatch::try_new(
+
+        let batch = match RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![42])),
-                Arc::new(Float64Array::from(vec![3.14])),
+                Arc::new(Float64Array::from(vec![3.5])),
                 Arc::new(StringArray::from(vec!["hello"])),
                 Arc::new(BooleanArray::from(vec![true])),
             ],
-        ).unwrap();
-        
-        let bytes = encode_params_to_bytes(&batch).unwrap();
+        ) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to create RecordBatch: {e}"),
+        };
+
+        let bytes = match encode_params_to_bytes(&batch) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to encode params: {e}"),
+        };
         let result = decode_param_values(&bytes);
-        
-        assert!(result.is_ok(), "Should decode successfully: {:?}", result.err());
-        let params = result.unwrap();
-        assert!(params.is_some(), "Should have parameters");
+
+        assert!(
+            result.is_ok(),
+            "Should decode successfully: {:?}",
+            result.err()
+        );
+        if let Ok(Some(_params)) = result {
+            // Successfully decoded parameters
+        } else {
+            panic!("Expected Some parameters");
+        }
     }
 
     #[tokio::test]
@@ -572,7 +607,9 @@ mod tests {
         // Empty bytes should return None
         let result = decode_param_values(&[]);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "Empty bytes should return None");
+        if let Ok(params) = result {
+            assert!(params.is_none(), "Empty bytes should return None");
+        }
     }
 
     #[tokio::test]
@@ -582,13 +619,19 @@ mod tests {
             parameters: vec![1, 2, 3],
             parameter_schema: None,
         };
-        
+
         // Serialize
-        let bytes = to_stdvec(&stmt).unwrap();
+        let bytes = match to_stdvec(&stmt) {
+            Ok(b) => b,
+            Err(e) => panic!("Failed to serialize: {e}"),
+        };
         assert!(!bytes.is_empty());
-        
+
         // Deserialize
-        let decoded: PreparedStatement = from_bytes(&bytes).unwrap();
+        let decoded: PreparedStatement = match from_bytes(&bytes) {
+            Ok(d) => d,
+            Err(e) => panic!("Failed to deserialize: {e}"),
+        };
         assert_eq!(decoded.query, stmt.query);
         assert_eq!(decoded.parameters, stmt.parameters);
         assert_eq!(decoded.parameter_schema, stmt.parameter_schema);
