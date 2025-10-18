@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 pub mod bytes_processed;
 pub mod cache_invalidation;
+pub mod hash_join_optimization;
 pub mod pass_thru;
 
 #[derive(Default)]

@@ -32,7 +32,11 @@ use super::{
 use crate::{
     dataaccelerator::AcceleratorEngineRegistry,
     datafusion::{
-        SPICE_SCP_SCHEMA, extension::cache_invalidation::CacheInvalidationExtensionPlanner,
+        SPICE_SCP_SCHEMA,
+        extension::{
+            cache_invalidation::CacheInvalidationExtensionPlanner,
+            hash_join_optimization::EmptyHashJoinExecPhysicalOptimization,
+        },
     },
 };
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
@@ -202,6 +206,7 @@ impl DataFusionBuilder {
                 ],
             )))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
 
