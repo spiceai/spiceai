@@ -476,10 +476,10 @@ impl Stream for DriverStream {
 
 impl Drop for DriverStream {
     fn drop(&mut self) {
-        if let Some(handle) = self.driver_handle.take() {
-            if !handle.is_finished() {
-                handle.abort();
-            }
+        if let Some(handle) = self.driver_handle.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
         }
     }
 }

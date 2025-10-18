@@ -110,6 +110,11 @@ pub(crate) fn get_df_default_config() -> SessionConfig {
 }
 
 impl DataFusionBuilder {
+    /// Creates a new `DataFusionBuilder` with the runtime defaults.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a managed Tokio runtime cannot be created. This indicates a bug in the runtime initialization.
     #[must_use]
     pub fn new(
         status: Arc<status::RuntimeStatus>,
