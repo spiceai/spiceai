@@ -266,6 +266,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
+    ParameterSpec::component("partition_mode"),
 ];
 
 #[async_trait]

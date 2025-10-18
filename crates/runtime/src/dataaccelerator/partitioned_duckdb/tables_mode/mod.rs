@@ -110,7 +110,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     }
 
     fn name(&self) -> &'static str {
-        "partitioned_duckdb(tables_mode)"
+        "partitioned_duckdb"
     }
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
@@ -393,7 +393,7 @@ async fn get_pool(
     duckdb_path: &str,
 ) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
     let pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
-        .with_max_size(Some(10))
+        .with_max_size(Some(20))
         .with_min_idle(Some(10));
     Ok(Arc::new(
         duckdb_factory
