@@ -367,6 +367,16 @@ pub(crate) async fn run_search_w_explain(
         .await
 }
 
+pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
+    col.into().with_metadata(
+        [(
+            "vectors".to_string(),
+            serde_json::Value::String("non-filterable".to_string()),
+        )]
+        .into(),
+    )
+}
+
 #[tokio::test]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let ds = get_mega_science_dataset(

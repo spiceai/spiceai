@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, project_schema},
+    common::{Constraint, Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -55,6 +55,7 @@ pub struct ObjectStoreTextTable {
     document_formatter: Option<Arc<dyn DocumentParser>>,
 
     metadata_columns: Vec<MetadataColumn>,
+    constraints: Constraints,
 }
 
 impl std::fmt::Debug for ObjectStoreTextTable {
@@ -77,11 +78,14 @@ impl ObjectStoreTextTable {
             ctx: ObjectStoreContext::try_new(store, url, extension)?,
             document_formatter,
             metadata_columns: metadata_columns.unwrap_or_default(),
+
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
         })
     }
 
     #[must_use]
     pub fn base_table_schema() -> Schema {
+        // Order is important. [`ObjectStoreTextTable`].constraints expects `location` first.
         Schema::new(vec![
             Field::new("location", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
@@ -183,6 +187,10 @@ impl TableProvider for ObjectStoreTextTable {
         self
     }
 
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(&self.constraints)
+    }
+
     fn schema(&self) -> SchemaRef {
         let mut base_field = Self::base_table_schema()
             .fields()
@@ -193,10 +201,6 @@ impl TableProvider for ObjectStoreTextTable {
         base_field.extend(self.metadata_columns.iter().map(|c| Arc::new(c.field())));
 
         Arc::new(Schema::new(base_field))
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        None
     }
 
     fn table_type(&self) -> TableType {
