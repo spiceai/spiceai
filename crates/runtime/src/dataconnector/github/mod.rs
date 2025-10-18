@@ -173,18 +173,6 @@ impl Github {
                     "Resource '{target}' not found or GitHub App installation ID '{installation_id}' does not have access to it."
                 ))
             }
-            Ok(resp) if resp.status().as_u16() == 410 => {
-                let body = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unable to read response body".to_string());
-                tracing::error!(
-                    "GitHub App installation does not have access to '{target}' (HTTP 410 Gone). Response: {body}"
-                );
-                Err(format!(
-                    "GitHub App installation ID '{installation_id}' does not have permission to access '{resource_type}' for '{target}'. Verify the app has the required permissions."
-                ))
-            }
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp
