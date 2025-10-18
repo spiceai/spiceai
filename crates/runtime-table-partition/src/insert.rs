@@ -48,6 +48,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::Partition;
 use crate::creator::PartitionCreator;
 use crate::expression::PartitionedBy;
+use crate::provider::ScalarValueString;
 
 #[derive(Debug)]
 pub struct PartitionerExec {
@@ -555,7 +556,6 @@ pub trait InsertStrategy: Send + Sync + std::fmt::Debug {
         context: &PartitionContext,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>;
 }
-type ScalarValueString = String;
 
 /// Context information for custom insertion handlers
 #[derive(Debug)]

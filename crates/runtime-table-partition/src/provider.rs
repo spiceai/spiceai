@@ -56,7 +56,7 @@ pub enum Error {
     InvalidPartitionExpression,
 }
 
-type ScalarValueString = String;
+pub(crate) type ScalarValueString = String;
 
 #[derive(Debug)]
 pub struct PartitionTableProvider {
