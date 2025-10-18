@@ -124,7 +124,7 @@ impl DataSink for DuckDBPartitionedDataSink {
                         batch_rx,
                         on_conflict.as_ref(),
                         on_commit_transaction,
-                        schema,
+                        &schema,
                     )
                     .inspect_err(|err| {
                         tracing::error!("Error during insert overwrite: {}", err);
@@ -242,7 +242,7 @@ fn insert_overwrite(
     batch_rx: Receiver<(String, Vec<RecordBatch>)>,
     on_conflict: Option<&OnConflict>,
     mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
-    schema: SchemaRef,
+    schema: &SchemaRef,
 ) -> datafusion::common::Result<u64> {
     let cloned_pool = Arc::clone(&pool);
     let mut db_conn = pool
@@ -258,76 +258,15 @@ fn insert_overwrite(
         .context(UnableToBeginTransactionSnafu)
         .map_err(to_retriable_data_write_error)?;
 
-    let new_table = TableManager::new(Arc::clone(table_definition))
-        .with_internal(true)
-        .map_err(to_retriable_data_write_error)?;
-
-    new_table
-        .create_table(Arc::clone(&pool), &tx)
-        .map_err(to_retriable_data_write_error)?;
-
-    let existing_tables = new_table
-        .list_other_internal_tables(&tx)
-        .map_err(to_retriable_data_write_error)?;
-    let base_table = new_table
-        .base_table(&tx)
-        .map_err(to_retriable_data_write_error)?;
-    let last_table = match (existing_tables.last(), base_table.as_ref()) {
-        (Some(internal_table), Some(base_table)) => {
-            return Err(DataFusionError::Execution(format!(
-                "Failed to insert data for DuckDB - both an internal table and definition base table were found.\nManual table migration is required - delete the table '{internal_table}' or '{base_table}' and try again.",
-                internal_table = internal_table.0.table_name(),
-                base_table = base_table.table_name()
-            )));
-        }
-        (Some((table, _)), None) | (None, Some(table)) => Some(table),
-        (None, None) => None,
-    };
-
-    if let Some(last_table) = last_table {
-        let should_have_indexes = !last_table.indexes_vec().is_empty();
-        let has_indexes = !last_table
-            .current_indexes(&tx)
-            .map_err(to_retriable_data_write_error)?
-            .is_empty();
-        let is_empty_table = last_table
-            .get_row_count(&tx)
-            .map_err(to_retriable_data_write_error)?
-            == 0;
-        let should_apply_indexes = should_have_indexes && !has_indexes && is_empty_table;
-
-        if !should_apply_indexes {
-            // compare indexes and primary keys
-            let primary_keys_match = new_table
-                .verify_primary_keys_match(last_table, &tx)
-                .map_err(to_retriable_data_write_error)?;
-            let indexes_match = new_table
-                .verify_indexes_match(last_table, &tx)
-                .map_err(to_retriable_data_write_error)?;
-
-            if !primary_keys_match {
-                return Err(DataFusionError::Execution(
-                    "Primary keys do not match between the new table and the existing table.\nEnsure primary key configuration is the same as the existing table, or manually migrate the table."
-                        .to_string(),
-                ));
-            }
-
-            if !indexes_match {
-                return Err(DataFusionError::Execution(
-                    "Indexes do not match between the new table and the existing table.\nEnsure index configuration is the same as the existing table, or manually migrate the table.".to_string(),
-                ));
-            }
-        }
-    }
-
-    tracing::debug!("Initial load for {}", new_table.table_name());
-    let num_rows = write_to_tables(
+    tracing::debug!("Initial load for {}", table_definition.name());
+    let (num_rows, tables) = write_to_tables(
         table_definition,
         &tx,
         &schema,
         batch_rx,
         on_conflict,
         &cloned_pool,
+        true,
     )
     .map_err(to_retriable_data_write_error)?;
 
@@ -335,15 +274,11 @@ fn insert_overwrite(
         .try_recv()
         .map_err(to_retriable_data_write_error)?;
 
-    if let Some(base_table) = base_table {
-        base_table
-            .delete_table(&tx)
+    for new_table in &tables {
+        new_table
+            .create_view(&tx)
             .map_err(to_retriable_data_write_error)?;
     }
-
-    new_table
-        .create_view(&tx)
-        .map_err(to_retriable_data_write_error)?;
 
     tx.commit()
         .context(UnableToCommitTransactionSnafu)
@@ -351,7 +286,7 @@ fn insert_overwrite(
 
     tracing::debug!(
         "Load for table {table_name} complete, applying constraints and indexes.",
-        table_name = new_table.table_name()
+        table_name = table_definition.name()
     );
 
     let tx = duckdb_conn
@@ -360,16 +295,12 @@ fn insert_overwrite(
         .context(UnableToBeginTransactionSnafu)
         .map_err(to_datafusion_error)?;
 
-    for (table, _) in existing_tables {
-        table
-            .delete_table(&tx)
+    // Apply constraints and indexes.
+    for new_table in &tables {
+        new_table
+            .create_indexes(&tx)
             .map_err(to_retriable_data_write_error)?;
     }
-
-    // Apply constraints and indexes.
-    new_table
-        .create_indexes(&tx)
-        .map_err(to_retriable_data_write_error)?;
 
     tx.commit()
         .context(UnableToCommitTransactionSnafu)
@@ -385,12 +316,13 @@ fn write_to_tables(
     mut data_batches: Receiver<(String, Vec<RecordBatch>)>,
     on_conflict: Option<&OnConflict>,
     pool: &Arc<DuckDbConnectionPool>,
-) -> datafusion::common::Result<u64> {
+    with_internal: bool,
+) -> datafusion::common::Result<(u64, Vec<Arc<TableManager>>)> {
     let mut total_rows = 0u64;
 
     let start_main = SystemTime::now();
 
-    // Track which partitions have already been created to avoid duplicate table creation
+    // Track which partitions have already been created to avoid duplicate table creation and return back
     let mut created_partitions: HashMap<String, Arc<TableManager>> = HashMap::new();
 
     tracing::debug!(
@@ -399,11 +331,10 @@ fn write_to_tables(
     );
 
     while let Some((partition, batch)) = data_batches.blocking_recv() {
-        // let num_rows_in_batches  = batch.iter().map(|b| b.num_rows()).sum::<usize>();
         let start = SystemTime::now();
         let batch_size_mb = batch
             .iter()
-            .map(|b| b.get_array_memory_size())
+            .map(arrow::array::RecordBatch::get_array_memory_size)
             .sum::<usize>()
             / (1024 * 1024);
 
@@ -415,26 +346,30 @@ fn write_to_tables(
             let partition_table_name = format!("{partition}/{}", table_definition.name());
             let partition_table_def = Arc::new(TableDefinition::new(
                 RelationName::new(partition_table_name.clone()),
-                Arc::clone(&schema),
+                Arc::clone(schema),
             ));
 
             let partition_table = Arc::new(
                 TableManager::new(partition_table_def)
-                    .with_internal(false)
+                    .with_internal(with_internal)
                     .map_err(table_providers_duckdb_to_datafusion_error)?,
             );
 
             partition_table
-                .create_table(pool.clone(), tx)
+                .create_table(Arc::clone(&pool), tx)
                 .map_err(table_providers_duckdb_to_datafusion_error)?;
 
             created_partitions.insert(partition.clone(), Arc::clone(&partition_table));
             partition_table
         };
 
-        // Write this partition's data
-        let rows_written =
-            write_data_chunk_to_table(&partition_table, tx, schema.clone(), batch, on_conflict)?;
+        let rows_written = write_data_chunk_to_table(
+            &partition_table,
+            tx,
+            Arc::clone(&schema),
+            batch,
+            on_conflict,
+        )?;
 
         total_rows += rows_written;
 
@@ -466,7 +401,7 @@ fn write_to_tables(
         total_elapsed
     );
 
-    Ok(total_rows)
+    Ok((total_rows, created_partitions.into_values().collect()))
 }
 
 fn write_data_chunk_to_table(
