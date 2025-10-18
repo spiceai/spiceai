@@ -72,6 +72,7 @@ use itertools::Itertools;
 use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
 use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -318,6 +319,7 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    metrics: Option<Metrics>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1082,6 +1084,10 @@ impl DataFusion {
 
         if let Some(semaphore) = &self.acceleration_refresh_semaphore {
             accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
+        }
+
+        if let Some(metrics) = &self.metrics {
+            accelerated_table_builder.metrics(metrics.clone());
         }
 
         if refresh_mode == RefreshMode::Changes {
