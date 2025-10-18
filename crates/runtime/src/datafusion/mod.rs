@@ -1797,7 +1797,7 @@ impl DataFusion {
         }
     }
 
-    fn bind_scheduler_state(
+    pub fn bind_scheduler_state(
         &self,
         state: Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>,
     ) -> Result<()> {

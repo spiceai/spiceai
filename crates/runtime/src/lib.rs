@@ -41,12 +41,20 @@ use crate::{
 };
 
 use ::datafusion::error::DataFusionError;
+use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::{TableReference, sqlparser};
+use ballista_core::extension::SessionConfigExt;
 use app::App;
+use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
+use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::config::SchedulerConfig;
+use ballista_scheduler::scheduler_process;
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
@@ -63,7 +71,9 @@ use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
+use tokio::net::TcpListener;
 
+use runtime_object_store::registry::default_runtime_env;
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
@@ -97,7 +107,13 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+use crate::Error::FailedToStartClusterScheduler;
 use crate::config::ClusterConfig;
+use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
+use crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec;
+use crate::datafusion::cluster::config::SpiceClusterConfig;
+use crate::datafusion::cluster::physical_plan::optimizer::expand_file_scan::ExpandFileScanOptimizer;
+use crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdown;
 pub use runtime_parameters as parameters;
 
 pub mod podswatcher;
@@ -409,6 +425,18 @@ pub enum Error {
 
     #[snafu(display("Full text search is not supported for views."))]
     FullTextSearchNotSupportedForView,
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Failed to start Ballista scheduler: {source}"))]
+    FailedToStartClusterScheduler {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Failed to start or register Ballista executor: {source}"))]
+    FailedToStartClusterExecutor {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -560,6 +588,250 @@ impl Runtime {
         }
 
         None
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn start_cluster_scheduler(self: Arc<Self>) -> Result<()> {
+        let bind_addr = self.cluster_config.scheduler_uri.clone();
+
+        let mut scheduler_config = SchedulerConfig::default();
+
+        scheduler_config.bind_host = bind_addr
+            .authority()
+            .map(|a| a.host())
+            .expect("Must define host")
+            .to_string();
+        scheduler_config.bind_port = bind_addr
+            .authority()
+            .and_then(|a| a.port_to_u16().ok().and_then(|o| o))
+            .expect("Must define port");
+        scheduler_config.override_logical_codec =
+            Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(&self)));
+        scheduler_config.override_physical_codec = Some(
+            SpicePhysicalCodec::new_codec(Arc::clone(&self)).map_err(|e| {
+                FailedToStartClusterScheduler {
+                    source: Box::new(e),
+                }
+            })?,
+        );
+
+        scheduler_config.grpc_server_max_decoding_message_size = u32::MAX;
+        scheduler_config.grpc_server_max_encoding_message_size = u32::MAX;
+
+        // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
+        let current_context = Arc::clone(&self.df.ctx);
+        let runtime_handle = Arc::clone(&self);
+
+        scheduler_config.override_session_builder = Some(Arc::new(move |_cfg| {
+            let cfg = current_context
+                .copied_config()
+                .with_option_extension(SpiceClusterConfig::default());
+
+            Ok(
+                SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
+                    .with_config(cfg)
+                    .with_runtime_env(default_runtime_env())
+                    .with_physical_optimizer_rule(ExpandFileScanOptimizer::new(Arc::clone(
+                        &runtime_handle.df,
+                    )))
+                    .with_physical_optimizer_rule(UnionProjectionPushdown::new())
+                    .build(),
+            )
+        }));
+
+        let cluster = BallistaCluster::new_from_config(&scheduler_config)
+            .await
+            .map_err(|e| FailedToStartClusterScheduler {
+                source: Box::new(e),
+            })?;
+
+        self.status
+            .update_cluster("scheduler", ComponentStatus::Ready);
+
+        tracing::info!(
+            "Starting Ballista scheduler with gRPC and REST API on {}",
+            bind_addr
+        );
+
+        let Some(socket_addr) = bind_addr
+            .authority()
+            .and_then(|a| a.socket_addrs(50050).ok())
+            .into_iter()
+            .flatten()
+            .next()
+        else {
+            return Err(FailedToStartClusterScheduler {
+                source: "Unable to resolve bind address".into(),
+            });
+        };
+
+        // gRPC + REST API
+        let scheduler = scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
+            cluster,
+            scheduler_config.into(),
+        )
+        .await
+        .map_err(|e| FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
+        self.df
+            .bind_scheduler_state(Arc::clone(&scheduler.state))
+            .map_err(|e| FailedToStartClusterScheduler {
+                source: Box::new(e),
+            })?;
+
+        scheduler_process::start_grpc_service(socket_addr, scheduler)
+            .await
+            .map_err(|e| FailedToStartClusterScheduler {
+                source: Box::new(e),
+            })
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn start_cluster_executor(self: Arc<Self>) -> Result<()> {
+        let mut executor_config = ExecutorProcessConfig::default();
+
+        executor_config.override_logical_codec = Some(SpiceLogicalCodec::new_codec());
+        executor_config.override_physical_codec = Some(
+            SpicePhysicalCodec::new_codec(Arc::clone(&self)).map_err(|e| {
+                Error::FailedToStartClusterExecutor {
+                    source: Box::new(e),
+                }
+            })?,
+        );
+        executor_config.grpc_max_encoding_message_size = u32::MAX;
+        executor_config.grpc_max_decoding_message_size = u32::MAX;
+
+        // Set up executor runtime, and initialize AWS SDK (since there are no datasets here to do so)
+        let _bind_aws_creds = aws_sdk_credential_bridge::initialize_sdk_config().await;
+        let runtime_handle = Arc::clone(&self);
+        executor_config.override_runtime_producer = Some(Arc::new(move |_cfg| {
+            Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env()))
+        }));
+        executor_config.override_config_producer = Some(Arc::new(move || {
+            SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
+        }));
+
+        // executor_config.work_dir = self
+        //     .app
+        //     .read()
+        //     .await
+        //     .as_ref()
+        //     .and_then(|a| a.runtime.temp_directory.clone());
+
+        self.cluster_config
+            .scheduler_uri
+            .authority()
+            .map(|a| a.host())
+            .iter()
+            .for_each(|h| {
+                executor_config.scheduler_host = (*h).to_string();
+            });
+
+        self.cluster_config
+            .scheduler_uri
+            .authority()
+            .and_then(|a| a.port_to_u16().ok())
+            .iter()
+            .flatten()
+            .for_each(|h| {
+                executor_config.scheduler_port = *h;
+            });
+
+        let default_grpc_binding = TcpListener::bind("0.0.0.0:50050")
+            .await
+            .and_then(|l| l.local_addr())
+            .map_err(|e| Error::FailedToStartClusterExecutor {
+                source: Box::new(e),
+            });
+
+        // Ask the TCP stack for a free port by trying to bind ::0
+        // It's not important which port this binds to, since the endpoint information is sent
+        // during registration
+        let dynamic_grpc_binding = TcpListener::bind("0.0.0.0:0")
+            .await
+            .and_then(|l| l.local_addr())
+            .map_err(|e| Error::FailedToStartClusterExecutor {
+                source: Box::new(e),
+            });
+
+        let bindable_addr = default_grpc_binding.or(dynamic_grpc_binding)?;
+
+        executor_config.port = bindable_addr.port();
+        executor_config.bind_host = bindable_addr.ip().to_string();
+
+        tracing::info!(
+            "Joining cluster ({}) as an executor (at: {})",
+            self.cluster_config.scheduler_uri,
+            bindable_addr
+        );
+
+        self.status
+            .update_cluster("executor", ComponentStatus::Ready);
+
+        self.executor_bind_app("grpc://localhost:50051".to_string())
+            .await?;
+
+        start_executor_process(Arc::new(executor_config))
+            .await
+            .map_err(|e| Error::FailedToStartClusterExecutor {
+                source: Box::new(e),
+            })
+    }
+
+    async fn executor_bind_app(
+        self: &Arc<Self>,
+        scheduler_flight_url: impl Into<Arc<str>>,
+    ) -> Result<()> {
+        let flight_client = flight_client::FlightClient::try_new(
+            scheduler_flight_url.into(),
+            flight_client::Credentials::anonymous(),
+            None,
+        )
+        .await
+        .map_err(|e| Error::FailedToStartClusterExecutor {
+            source: Box::new(e),
+        })?;
+
+        let action = arrow_flight::Action {
+            r#type: "GetAppDefinition".to_string(),
+            body: bytes::Bytes::new(),
+        };
+
+        let response = flight_client
+            .client()
+            .clone()
+            .do_action(action)
+            .await
+            .map_err(|e| Error::FailedToStartClusterExecutor {
+                source: format!("Failed to call GetAppDefinition: {}", e).into(),
+            })?;
+
+        let mut stream = response.into_inner();
+        if let Some(result) =
+            stream
+                .message()
+                .await
+                .map_err(|e| Error::FailedToStartClusterExecutor {
+                    source: Box::new(e),
+                })?
+        {
+            let app_def: App = serde_json::from_slice(&result.body).map_err(|e| {
+                Error::FailedToStartClusterExecutor {
+                    source: format!("Failed to deserialize app definition: {}", e).into(),
+                }
+            })?;
+
+            *self.app.write().await = Some(Arc::new(app_def));
+        };
+
+        Arc::clone(&self).load_catalogs().await;
+        self.load_embeddings().await;
+        Arc::clone(&self).load_models().await;
+        Arc::clone(&self).load_tools().await;
+
+        Ok(())
     }
 
     /// Starts the HTTP, Flight, OpenTelemetry and Metrics servers all listening on the ports specified in the given `Config`.

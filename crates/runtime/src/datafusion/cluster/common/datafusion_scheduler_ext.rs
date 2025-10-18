@@ -4,9 +4,9 @@ use ballista_scheduler::state::SchedulerState;
 use datafusion::common::{DataFusionError, Result, exec_err};
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use std::sync::Arc;
 use std::time::Duration;
-use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use tokio::runtime::Handle;
 use tokio::task;
 
@@ -25,9 +25,7 @@ pub trait DataFusionSchedulerExtensions<T: 'static + AsLogicalPlan, U: 'static +
     }
 }
 
-impl DataFusionSchedulerExtensions<LogicalPlanNode, PhysicalPlanNode>
-    for DataFusion
-{
+impl DataFusionSchedulerExtensions<LogicalPlanNode, PhysicalPlanNode> for DataFusion {
     fn scheduler_state(&self) -> Result<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>> {
         let state = self
             .scheduler_state
