@@ -122,9 +122,9 @@ impl DataFusionBuilder {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let Ok(tokio_runtime) = ManagedTokioRuntime::try_new() else {
-            panic!("Failed to create managed tokio runtime for DataFusion. This is a bug.");
-        };
+        let tokio_runtime = ManagedTokioRuntime::try_new().unwrap_or_else(|err| {
+            panic!("Failed to create managed tokio runtime for DataFusion: {err}. This is a bug.");
+        });
 
         Self {
             config: df_config,
