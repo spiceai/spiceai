@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
-
 use ::cache::{
     get_logical_plan_input_tables,
     key::CacheKey,
@@ -35,6 +33,8 @@ use datafusion::{
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
+use std::sync::atomic::Ordering;
+use std::{fmt::Display, sync::Arc};
 use tokio::time::Instant;
 use tracing::Span;
 use tracing_futures::Instrument;
@@ -47,12 +47,12 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
-use async_stream::stream;
-use futures::StreamExt;
-
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use async_stream::stream;
+use futures::StreamExt;
+use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -121,11 +121,6 @@ impl Query {
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
-        if request_context.entered_top_level_query() {
-            crate::metrics::telemetry::inc_query_active_count(
-                &request_context.to_protocol_dimensions(),
-            );
-        }
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
@@ -280,7 +275,7 @@ impl Query {
                 inner_span.clone(),
             );
 
-            let final_stream = attach_query_active_count_decrement_to_stream(
+            let final_stream = attach_query_active_guard_to_stream(
                 final_stream,
                 Arc::clone(&request_context),
                 inner_span.clone(),
@@ -488,33 +483,48 @@ fn attach_query_tracker_to_stream(
     ))
 }
 
-struct QueryCleanupGuard {
+/// This guard guarantees:
+///  * If we incremented, we will decrement.
+///  * Decrement will be called with the same dimensions.
+pub struct QueryActiveGuard {
     request_context: Arc<RequestContext>,
+    dimensions: Vec<KeyValue>,
+    active: bool,
 }
 
-impl Drop for QueryCleanupGuard {
-    fn drop(&mut self) {
-        if self.request_context.exited_top_level_query() {
-            crate::metrics::telemetry::dec_query_active_count(
-                &self.request_context.to_protocol_dimensions(),
-            );
+impl QueryActiveGuard {
+    pub fn new(request_context: Arc<RequestContext>) -> Self {
+        let dimensions = request_context.to_protocol_dimensions();
+
+        let active = request_context.entered_top_level_query();
+        if active {
+            crate::metrics::telemetry::inc_query_active_count(&dimensions);
+        }
+
+        Self {
+            request_context,
+            dimensions,
+            active,
         }
     }
 }
 
-fn attach_query_active_count_decrement_to_stream(
+impl Drop for QueryActiveGuard {
+    fn drop(&mut self) {
+        if self.active && self.request_context.exited_top_level_query() {
+            crate::metrics::telemetry::dec_query_active_count(&self.dimensions);
+        }
+    }
+}
+
+fn attach_query_active_guard_to_stream(
     mut stream: SendableRecordBatchStream,
     request_context: Arc<RequestContext>,
     span: Span,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
-
     let updated_stream = stream! {
-        // This guard will make sure crate::metrics::telemetry::dec_query_active_count
-        // will always be called, even if an error occurs during stream processing.
-        let _guard = QueryCleanupGuard {
-            request_context: Arc::clone(&request_context),
-        };
+        let _guard = QueryActiveGuard::new(Arc::clone(&request_context));
 
         while let Some(batch_result) = stream.next().await {
             yield batch_result;

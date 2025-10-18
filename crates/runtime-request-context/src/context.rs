@@ -46,7 +46,7 @@ pub struct RequestContext {
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
-    nested_query_level: AtomicI16, // tracks number of nested queries. Should only be called by Query
+    pub nested_query_level: AtomicI16, // tracks number of nested queries. Should only be called by Query
 }
 
 #[async_trait::async_trait]
