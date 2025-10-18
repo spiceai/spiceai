@@ -4299,6 +4299,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-optimizer-rules"
+version = "1.9.0-unstable"
+
+[[package]]
 name = "datafusion-physical-expr"
 version = "49.0.2"
 source = "git+https://github.com/spiceai/datafusion.git?rev=5897255853b7f2b60aa29fe640ae238ec6288a7c#5897255853b7f2b60aa29fe640ae238ec6288a7c"

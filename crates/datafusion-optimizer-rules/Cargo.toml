@@ -1,0 +1,13 @@
+[package]
+name = "datafusion-optimizer-rules"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+datafusion-expr.workspace = true

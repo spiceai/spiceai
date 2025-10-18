@@ -32,11 +32,7 @@ use super::{
 use crate::{
     dataaccelerator::AcceleratorEngineRegistry,
     datafusion::{
-        SPICE_SCP_SCHEMA,
-        extension::{
-            cache_invalidation::CacheInvalidationExtensionPlanner,
-            hash_join_optimization::EmptyHashJoinExecPhysicalOptimization,
-        },
+        SPICE_SCP_SCHEMA, extension::cache_invalidation::CacheInvalidationExtensionPlanner,
     },
 };
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
