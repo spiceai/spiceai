@@ -47,13 +47,11 @@ static QUERY_ACTIVE_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
 
 pub fn inc_query_active_count(dimensions: &[KeyValue]) {
     telemetry::inc_query_active_count(dimensions);
-    println!("inc_query_active_count: {:?}", dimensions);
     QUERY_ACTIVE_COUNT.add(1, dimensions);
 }
 
 pub fn dec_query_active_count(dimensions: &[KeyValue]) {
     telemetry::dec_query_active_count(dimensions);
-    println!("dec_query_active_count: {:?}", dimensions);
     QUERY_ACTIVE_COUNT.add(-1, dimensions);
 }
 
