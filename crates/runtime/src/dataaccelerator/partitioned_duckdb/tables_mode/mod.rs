@@ -285,14 +285,13 @@ impl DuckDBPartitionCreator {
         // collect all views and table names following format '/<table-name>', for example expr0=17/my_table
         let mut stmt = conn
             .conn
-            .prepare(&format!(
-                "SELECT table_name FROM information_schema.tables WHERE table_name LIKE '%/{}'",
-                self.cmd.name
-            ))
+            .prepare("SELECT table_name FROM information_schema.tables WHERE table_name LIKE ?")
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
+        let pattern = format!("%/{}", self.cmd.name);
+
         let table_names: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([&pattern], |row| row.get::<_, String>(0))
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
