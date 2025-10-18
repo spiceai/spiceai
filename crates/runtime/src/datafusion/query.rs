@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use ::cache::{
     get_logical_plan_input_tables,
@@ -47,13 +52,14 @@ mod metrics;
 mod tracker;
 
 use async_stream::stream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -152,11 +158,6 @@ impl Query {
         };
 
         let driver_handle = runtime_handle.spawn(driver_task);
-        tokio::spawn(async move {
-            if let Err(err) = driver_handle.await {
-                tracing::error!("Query driver task failed: {err}");
-            }
-        });
 
         let (cache_status, schema) = match result_rx.await {
             Ok(Ok((cache_status, schema))) => (cache_status, schema),
@@ -170,8 +171,8 @@ impl Query {
             }
         };
 
-        let adapter =
-            RecordBatchStreamAdapter::new(schema, Box::pin(ReceiverStream::new(batch_rx)));
+        let driver_stream = DriverStream::new(batch_rx, driver_handle);
+        let adapter = RecordBatchStreamAdapter::new(schema, Box::pin(driver_stream));
 
         let stream: SendableRecordBatchStream = Box::pin(adapter);
 
@@ -441,6 +442,46 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
     };
 
     Ok(maybe_schema)
+}
+
+struct DriverStream {
+    receiver: ReceiverStream<Result<RecordBatch, DataFusionError>>,
+    driver_handle: Option<JoinHandle<()>>,
+}
+
+impl DriverStream {
+    fn new(
+        receiver: tokio::sync::mpsc::Receiver<Result<RecordBatch, DataFusionError>>,
+        driver_handle: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            receiver: ReceiverStream::new(receiver),
+            driver_handle: Some(driver_handle),
+        }
+    }
+}
+
+impl Stream for DriverStream {
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.receiver).poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.receiver.size_hint()
+    }
+}
+
+impl Drop for DriverStream {
+    fn drop(&mut self) {
+        if let Some(handle) = self.driver_handle.take() {
+            if !handle.is_finished() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 #[must_use]
