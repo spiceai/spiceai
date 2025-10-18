@@ -26,17 +26,21 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, JoinType},
+    common::{Column, Constraints, JoinType, exec_datafusion_err},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
+    execution::{SessionState, SessionStateBuilder},
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
+    prelude::SessionContext,
     sql::TableReference,
 };
-use datafusion_expr::{LogicalPlanBuilder, ident};
+use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, ident};
 
 use itertools::Itertools;
 use search::index::VectorIndex;
+
+use crate::datafusion::extension::hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
@@ -193,6 +197,13 @@ impl TableProvider for VectorScanTableProvider {
         Arc::new(Schema::new(fields))
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        self.table_provider.supports_filters_pushdown(filters)
+    }
+
     fn constraints(&self) -> Option<&Constraints> {
         self.table_provider.constraints()
     }
@@ -305,8 +316,23 @@ impl TableProvider for VectorScanTableProvider {
             )?
             .limit(0, limit)?;
 
-        state.create_physical_plan(&join.build()?).await
+        match with_join_optimization(state) {
+            Some(state) => state.create_physical_plan(&join.build()?).await,
+            None => state.create_physical_plan(&join.build()?).await,
+        }
     }
+}
+
+/// Attempts to add [`EmptyHashJoinExecPhysicalOptimization`] to a given [`Session`].
+/// Datafusion does not propagate [`SessionState::physical_optimizers`] into [`TableProvider::scan`].
+fn with_join_optimization(state: &dyn Session) -> Option<Arc<dyn Session>> {
+    Some(Arc::new(
+        SessionStateBuilder::new_from_existing(
+            state.as_any().downcast_ref::<SessionState>()?.clone(),
+        )
+        .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+        .build(),
+    ) as Arc<dyn Session>)
 }
 
 #[cfg(test)]

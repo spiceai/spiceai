@@ -1,0 +1,73 @@
+use std::sync::Arc;
+
+use datafusion::{
+    common::{
+        stats::Precision,
+        tree_node::{Transformed, TransformedResult, TreeNode},
+    },
+    config::ConfigOptions,
+    error::DataFusionError,
+    physical_optimizer::PhysicalOptimizerRule,
+    physical_plan::{ExecutionPlan, empty::EmptyExec, joins::HashJoinExec},
+};
+use datafusion_expr::JoinType;
+
+#[derive(Debug)]
+pub struct EmptyHashJoinExecPhysicalOptimization {}
+
+impl PhysicalOptimizerRule for EmptyHashJoinExecPhysicalOptimization {
+    fn optimize(
+        &self,
+        plan: std::sync::Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        plan.transform_down(|plan| {
+            let Some(join_exec) = plan.as_any().downcast_ref::<HashJoinExec>() else {
+                return Ok(Transformed::no(plan));
+            };
+
+            let is_empty = match join_exec.join_type {
+                JoinType::Left | JoinType::RightSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+                    guaranteed_empty(join_exec.left())
+                }
+                JoinType::Right
+                | JoinType::LeftSemi
+                | JoinType::RightAnti
+                | JoinType::RightMark => guaranteed_empty(join_exec.right()),
+                JoinType::Inner => {
+                    guaranteed_empty(join_exec.left()) || guaranteed_empty(join_exec.right())
+                }
+                JoinType::Full => {
+                    guaranteed_empty(join_exec.left()) && guaranteed_empty(join_exec.right())
+                }
+            };
+
+            if !is_empty {
+                return Ok(Transformed::no(plan));
+            }
+
+            Ok(Transformed::yes(Arc::new(EmptyExec::new(
+                join_exec.schema(),
+            ))))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "EmptyHashJoinExecPhysicalOptimization"
+    }
+
+    fn schema_check(&self) -> bool {
+        false
+    }
+}
+
+fn guaranteed_empty(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let Ok(stats) = plan.partition_statistics(None) else {
+        return false;
+    };
+    match stats.num_rows {
+        Precision::Exact(n) => n == 0,
+        _ => false,
+    }
+}
