@@ -60,7 +60,7 @@ use crate::{
     datafusion::dialect::new_duckdb_dialect, parameters::ParameterSpec, spice_data_base_path,
 };
 
-pub mod tables_mode_partitioning;
+pub mod tables_mode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuckDBPartitionMode {

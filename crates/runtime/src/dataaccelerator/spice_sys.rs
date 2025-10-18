@@ -200,7 +200,7 @@ async fn acceleration_connection(
         }
         #[cfg(feature = "duckdb")]
         Engine::TableModePartitionedDuckDB => {
-            use crate::dataaccelerator::partitioned_duckdb::tables_mode_partitioning::TablesModePartitionedDuckDBAccelerator;
+            use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
 
             let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
                 .await
