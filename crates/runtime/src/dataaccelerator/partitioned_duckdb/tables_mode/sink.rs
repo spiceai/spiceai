@@ -282,6 +282,17 @@ fn insert_overwrite(
         new_table
             .create_view(&tx)
             .map_err(to_retriable_data_write_error)?;
+
+        // Delete old internal tables for this partitioned table
+        new_table
+            .list_other_internal_tables(&tx)
+            .map_err(to_retriable_data_write_error)?
+            .into_iter()
+            .try_for_each(|(old_table, _)| {
+                old_table
+                    .delete_table(&tx)
+                    .map_err(to_retriable_data_write_error)
+            })?;
     }
 
     tx.commit()
