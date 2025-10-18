@@ -46,8 +46,8 @@ use crate::dataaccelerator::partitioned_duckdb::tables_mode::partition_buffer::P
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError {
+    #[snafu(display("Failed to connect to database: {source}"))]
+    DbConnectionPool {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -125,11 +125,15 @@ impl DataSink for DuckDBPartitionedDataSink {
                         on_conflict.as_ref(),
                         on_commit_transaction,
                         &schema,
-                    )
-                    .inspect_err(|err| {
-                        tracing::error!("Error during insert overwrite: {}", err);
-                    })?,
-                    InsertOp::Append | InsertOp::Replace => 0,
+                    )?,
+                    InsertOp::Append | InsertOp::Replace => insert_append(
+                        pool,
+                        &table_definition,
+                        batch_rx,
+                        on_conflict.as_ref(),
+                        on_commit_transaction,
+                        &schema,
+                    )?,
                 };
 
                 Ok(num_rows)
@@ -262,7 +266,7 @@ fn insert_overwrite(
     let (num_rows, tables) = write_to_tables(
         table_definition,
         &tx,
-        &schema,
+        schema,
         batch_rx,
         on_conflict,
         &cloned_pool,
@@ -301,6 +305,55 @@ fn insert_overwrite(
             .create_indexes(&tx)
             .map_err(to_retriable_data_write_error)?;
     }
+
+    tx.commit()
+        .context(UnableToCommitTransactionSnafu)
+        .map_err(to_retriable_data_write_error)?;
+
+    Ok(num_rows)
+}
+
+fn insert_append(
+    pool: Arc<DuckDbConnectionPool>,
+    table_definition: &Arc<TableDefinition>,
+    batch_rx: Receiver<(String, Vec<RecordBatch>)>,
+    on_conflict: Option<&OnConflict>,
+    mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
+    schema: &SchemaRef,
+) -> datafusion::common::Result<u64> {
+    let cloned_pool = Arc::clone(&pool);
+    let mut db_conn = pool
+        .connect_sync()
+        .context(DbConnectionPoolSnafu)
+        .map_err(to_retriable_data_write_error)?;
+
+    let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_retriable_data_write_error)?;
+
+    let tx = duckdb_conn
+        .conn
+        .transaction()
+        .context(UnableToBeginTransactionSnafu)
+        .map_err(to_retriable_data_write_error)?;
+
+    tracing::debug!(
+        "Append load for {table_name}",
+        table_name = table_definition.name()
+    );
+
+    let (num_rows, _) = write_to_tables(
+        table_definition,
+        &tx,
+        schema,
+        batch_rx,
+        on_conflict,
+        &cloned_pool,
+        false,
+    )
+    .map_err(to_retriable_data_write_error)?;
+
+    on_commit_transaction
+        .try_recv()
+        .map_err(to_retriable_data_write_error)?;
 
     tx.commit()
         .context(UnableToCommitTransactionSnafu)
@@ -356,7 +409,7 @@ fn write_to_tables(
             );
 
             partition_table
-                .create_table(Arc::clone(&pool), tx)
+                .create_table(Arc::clone(pool), tx)
                 .map_err(table_providers_duckdb_to_datafusion_error)?;
 
             created_partitions.insert(partition.clone(), Arc::clone(&partition_table));
@@ -366,7 +419,7 @@ fn write_to_tables(
         let rows_written = write_data_chunk_to_table(
             &partition_table,
             tx,
-            Arc::clone(&schema),
+            Arc::clone(schema),
             batch,
             on_conflict,
         )?;

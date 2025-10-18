@@ -126,14 +126,13 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             &ctx.partition_by,
         )?);
 
-        // Create the DataSinkExec for the actual insertion
         let data_sink_exec = Arc::new(DataSinkExec::new(
             input,
             Arc::new(DuckDBPartitionedDataSink::new(
                 Arc::clone(&self.pool),
                 Arc::clone(&self.table_definition),
                 insert_op,
-                None, // on_conflict - TODO
+                None,
                 schema,
                 partitioner,
             )),
