@@ -46,9 +46,11 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::create_view_table;
 use crate::{status, view};
 
+use crate::config::ClusterConfig;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
+use ballista_scheduler::state::SchedulerState;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -67,6 +69,7 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
@@ -84,6 +87,8 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod dialect;
 pub mod error;
 pub mod extension;
@@ -231,6 +236,10 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    UnableToLockWritableSchedulerHandle {},
+
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
     ))]
@@ -319,6 +328,8 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    pub cluster_config: Arc<ClusterConfig>,
+    pub scheduler_state: RwLock<Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1784,6 +1795,18 @@ impl DataFusion {
                 catalog_provider.schema(schema)
             }
         }
+    }
+
+    fn bind_scheduler_state(
+        &self,
+        state: Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>,
+    ) -> Result<()> {
+        let mut scheduler_state = self
+            .scheduler_state
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
+        *scheduler_state = Some(state);
+        Ok(())
     }
 }
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
+use crate::config::ClusterConfig;
 use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
@@ -54,6 +55,7 @@ pub struct RuntimeBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
+    cluster_config: ClusterConfig,
 }
 
 impl RuntimeBuilder {
@@ -71,6 +73,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
+            cluster_config: ClusterConfig::default(),
         }
     }
 
@@ -81,6 +84,11 @@ impl RuntimeBuilder {
 
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
+        self
+    }
+
+    pub fn with_cluster_config(mut self, config: ClusterConfig) -> Self {
+        self.cluster_config = config;
         self
     }
 
@@ -183,6 +191,7 @@ impl RuntimeBuilder {
         }
 
         let caching = Runtime::init_caching(Some(&caching_config));
+        let cluster_config = Arc::new(self.cluster_config);
 
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
@@ -192,7 +201,8 @@ impl RuntimeBuilder {
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
-        .with_caching(caching);
+        .with_caching(caching)
+        .with_cluster_config(Arc::clone(&cluster_config));
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
@@ -263,6 +273,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            cluster_config: Arc::clone(&cluster_config),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

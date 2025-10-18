@@ -29,6 +29,7 @@ use super::{
     },
     schema::SpiceSchemaProvider,
 };
+use crate::config::ClusterConfig;
 use crate::{
     dataaccelerator::AcceleratorEngineRegistry,
     datafusion::{
@@ -98,6 +99,7 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
+    cluster_config: Arc<ClusterConfig>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -130,6 +132,7 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
+            cluster_config: Arc::new(ClusterConfig::default()),
         }
     }
 
@@ -142,6 +145,12 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_caching(mut self, caching: Arc<Caching>) -> Self {
         self.caching = Some(caching);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
+        self.cluster_config = config;
         self
     }
 
@@ -194,13 +203,10 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
-            .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
-                vec![
-                    Arc::new(FederatedPlanner::new()),
-                    Arc::new(SpiceExtensionPlanner::new()),
-                    Arc::new(CacheInvalidationExtensionPlanner::new()),
-                ],
-            )))
+            .with_query_planner(Arc::new(
+                SpiceQueryPlanner::new()
+                    .with_extension_planners(SpiceQueryPlanner::default_extension_planners()),
+            ))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
@@ -281,6 +287,8 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            cluster_config: self.cluster_config,
+            scheduler_state: RwLock::new(None),
         }
     }
 }

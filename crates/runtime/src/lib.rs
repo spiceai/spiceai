@@ -20,6 +20,7 @@ use ::tools::rename::with_name;
 use async_stream::stream;
 use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -96,7 +97,9 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+use crate::config::ClusterConfig;
 pub use runtime_parameters as parameters;
+
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
@@ -454,6 +457,13 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+    cluster_config: Arc<ClusterConfig>,
+}
+
+impl Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Runtime {self:p}")
+    }
 }
 
 impl Runtime {
