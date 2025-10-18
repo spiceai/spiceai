@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
-use crate::models::s3_vectors::vectors_nonfilterable_col;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
@@ -366,6 +365,16 @@ pub(crate) async fn run_search_w_explain(
             Ok(())
         })
         .await
+}
+
+pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
+    col.into().with_metadata(
+        [(
+            "vectors".to_string(),
+            serde_json::Value::String("non-filterable".to_string()),
+        )]
+        .into(),
+    )
 }
 
 #[tokio::test]
