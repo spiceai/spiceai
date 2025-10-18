@@ -14,9 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow_array::RecordBatch;
-use datafusion::error::DataFusionError;
-use datafusion::prelude::{Expr, SessionContext};
+use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::error::ArrowError;
+use std::sync::Arc;
+
+use datafusion::{
+    error::DataFusionError,
+    prelude::{Expr, SessionContext},
+};
 use futures::StreamExt;
 use object_store::ObjectMeta;
 
@@ -30,7 +36,15 @@ pub async fn filter_object_meta(
     };
 
     let ctx = SessionContext::new();
-    ctx.register_batch("tmp", to_record_batch(metas))?;
+    ctx.register_batch(
+        "tmp",
+        to_record_batch(metas).map_err(|e| {
+            DataFusionError::ArrowError(
+                Box::new(e),
+                Some("Failed to convert 'ObjectMeta' to arrow".to_string()),
+            )
+        })?,
+    )?;
 
     let mut stream = ctx
         .table("tmp")
@@ -59,65 +73,55 @@ pub async fn filter_object_meta(
         .collect())
 }
 
-use arrow::array::{ArrayRef, StringArray, TimestampMillisecondArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use std::sync::Arc;
-
-fn to_record_batch(metas: &[ObjectMeta]) -> RecordBatch {
-    // Define the schema
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("location", DataType::Utf8, false),
-        Field::new(
-            "last_modified",
-            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new("size", DataType::UInt64, false),
-        Field::new("e_tag", DataType::Utf8, true),
-        Field::new("version", DataType::Utf8, true),
-    ]));
-
-    // Build arrays from the metadata
-    let location_array = StringArray::from(
-        metas
-            .iter()
-            .map(|meta| meta.location.as_ref())
-            .collect::<Vec<_>>(),
-    );
-
-    let last_modified_array = TimestampMillisecondArray::from(
-        metas
-            .iter()
-            .map(|meta| meta.last_modified.timestamp_millis())
-            .collect::<Vec<_>>(),
-    )
-    .with_timezone("UTC");
-
-    let size_array = UInt64Array::from(metas.iter().map(|meta| meta.size).collect::<Vec<_>>());
-
-    let e_tag_array = StringArray::from(
-        metas
-            .iter()
-            .map(|meta| meta.e_tag.as_deref())
-            .collect::<Vec<_>>(),
-    );
-
-    let version_array = StringArray::from(
-        metas
-            .iter()
-            .map(|meta| meta.version.as_deref())
-            .collect::<Vec<_>>(),
-    );
-
+fn to_record_batch(metas: &[ObjectMeta]) -> Result<RecordBatch, ArrowError> {
     RecordBatch::try_new(
-        schema,
+        Arc::new(Schema::new(vec![
+            Field::new("location", DataType::Utf8, false),
+            Field::new(
+                "last_modified",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("size", DataType::UInt64, false),
+            Field::new("e_tag", DataType::Utf8, true),
+            Field::new("version", DataType::Utf8, true),
+        ])),
         vec![
-            Arc::new(location_array) as ArrayRef,
-            Arc::new(last_modified_array) as ArrayRef,
-            Arc::new(size_array) as ArrayRef,
-            Arc::new(e_tag_array) as ArrayRef,
-            Arc::new(version_array) as ArrayRef,
+            // location
+            Arc::new(StringArray::from(
+                metas
+                    .iter()
+                    .map(|meta| meta.location.as_ref())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            // last_modified
+            Arc::new(
+                TimestampMillisecondArray::from(
+                    metas
+                        .iter()
+                        .map(|meta| meta.last_modified.timestamp_millis())
+                        .collect::<Vec<_>>(),
+                )
+                .with_timezone("UTC"),
+            ) as ArrayRef,
+            // size
+            Arc::new(UInt64Array::from(
+                metas.iter().map(|meta| meta.size).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            // etag
+            Arc::new(StringArray::from(
+                metas
+                    .iter()
+                    .map(|meta| meta.e_tag.as_deref())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            // version
+            Arc::new(StringArray::from(
+                metas
+                    .iter()
+                    .map(|meta| meta.version.as_deref())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
         ],
     )
-    .expect("Failed to create RecordBatch")
 }
