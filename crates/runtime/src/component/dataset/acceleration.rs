@@ -26,6 +26,7 @@ use spicepod::{
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
+#[cfg(feature = "duckdb")]
 use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 
 pub mod constraints;
@@ -382,16 +383,17 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let mut params = acceleration.params.clone();
 
-        let engine =
-            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
-                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
-                    match get_duckdb_partition_mode(&params) {
-                        DuckDBPartitionMode::Tables => Engine::TableModePartitionedDuckDB,
-                        DuckDBPartitionMode::Files => Engine::PartitionedDuckDB,
-                    }
+        let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
+        let engine = match Engine::try_from(engine_str)? {
+            #[cfg(feature = "duckdb")]
+            Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                match get_duckdb_partition_mode(&params) {
+                    DuckDBPartitionMode::Tables => Engine::TableModePartitionedDuckDB,
+                    DuckDBPartitionMode::Files => Engine::PartitionedDuckDB,
                 }
-                engine => engine,
-            };
+            }
+            engine => engine,
+        };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(

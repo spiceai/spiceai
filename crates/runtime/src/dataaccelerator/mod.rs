@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
-use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
@@ -45,7 +44,7 @@ use self::arrow::ArrowAccelerator;
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
+use self::partitioned_duckdb::{PartitionedDuckDBAccelerator, tables_mode::TablesModePartitionedDuckDBAccelerator};
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
