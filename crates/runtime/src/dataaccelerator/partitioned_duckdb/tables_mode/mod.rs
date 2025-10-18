@@ -322,8 +322,9 @@ impl PartitionCreator for DuckDBPartitionCreator {
         let schema = DFSchema::try_from(Arc::clone(&self.schema))
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
-        let duckdb_table_factory =
-            DuckDBTableFactory::new(Arc::clone(&self.pool)).with_dialect(new_duckdb_dialect());
+        let duckdb_table_factory = DuckDBTableFactory::new(Arc::clone(&self.pool))
+            .with_dialect(new_duckdb_dialect())
+            .with_schema(Arc::clone(&self.schema));
 
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
         for table in partitioned_tables {
