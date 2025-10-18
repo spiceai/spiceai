@@ -53,6 +53,8 @@ use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
@@ -116,9 +118,68 @@ impl Query {
     /// # Panics
     ///
     /// Panics when running under test if no cache key is computed for the query.
-    #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
+        let runtime_handle = self.df.tokio_runtime().clone();
+
+        let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
+        let (result_tx, result_rx) = oneshot::channel::<Result<(CacheStatus, SchemaRef), Error>>();
+
+        let request_context_clone = Arc::clone(&request_context);
+        let driver_task = async move {
+            match self.run_internal(request_context_clone).await {
+                Ok(query_result) => {
+                    let schema = query_result.data.schema();
+                    let cache_status = query_result.cache_status;
+
+                    if result_tx.send(Ok((cache_status, schema))).is_err() {
+                        return;
+                    }
+
+                    let mut stream = query_result.data;
+                    while let Some(batch) = stream.next().await {
+                        if batch_tx.send(batch).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    if result_tx.send(Err(err)).is_err() {
+                        tracing::debug!("Failed to send query result; receiver dropped");
+                    }
+                }
+            }
+        };
+
+        let driver_handle = runtime_handle.spawn(driver_task);
+        tokio::spawn(async move {
+            if let Err(err) = driver_handle.await {
+                tracing::error!("Query driver task failed: {err}");
+            }
+        });
+
+        let (cache_status, schema) = match result_rx.await {
+            Ok(Ok((cache_status, schema))) => (cache_status, schema),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                return Err(Error::UnableToExecuteQuery {
+                    source: DataFusionError::Execution(
+                        "Query driver task ended unexpectedly".to_string(),
+                    ),
+                });
+            }
+        };
+
+        let adapter =
+            RecordBatchStreamAdapter::new(schema, Box::pin(ReceiverStream::new(batch_rx)));
+
+        let stream: SendableRecordBatchStream = Box::pin(adapter);
+
+        Ok(QueryResult::new(stream, cache_status))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);

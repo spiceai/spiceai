@@ -70,6 +70,7 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
+use runtime_async::ManagedTokioRuntime;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
@@ -318,6 +319,8 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+
+    tokio_runtime: ManagedTokioRuntime,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -571,6 +574,11 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    #[must_use]
+    pub fn tokio_runtime(&self) -> &tokio::runtime::Handle {
+        self.tokio_runtime.handle()
     }
 
     async fn get_table_provider(

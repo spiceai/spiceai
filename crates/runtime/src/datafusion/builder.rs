@@ -55,6 +55,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use runtime_async::ManagedTokioRuntime;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use std::sync::LazyLock;
@@ -98,6 +99,7 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
+    tokio_runtime: ManagedTokioRuntime,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -120,6 +122,10 @@ impl DataFusionBuilder {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
+        let Ok(tokio_runtime) = ManagedTokioRuntime::try_new() else {
+            panic!("Failed to create managed tokio runtime for DataFusion. This is a bug.");
+        };
+
         Self {
             config: df_config,
             status,
@@ -130,6 +136,7 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
+            tokio_runtime,
         }
     }
 
@@ -281,6 +288,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            tokio_runtime: self.tokio_runtime,
         }
     }
 }
