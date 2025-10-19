@@ -161,7 +161,7 @@ impl TryFrom<&str> for Engine {
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
-            "pepper" => Ok(Engine::Pepper),
+            "pepper" | "vortex" => Ok(Engine::Pepper),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
