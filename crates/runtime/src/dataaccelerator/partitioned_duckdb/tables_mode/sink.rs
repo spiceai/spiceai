@@ -510,3 +510,343 @@ fn table_providers_duckdb_to_datafusion_error(
 ) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::RecordBatchStream;
+    use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::prelude::col;
+    use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+    use runtime_table_partition::expression::PartitionedBy;
+
+    fn get_mem_duckdb() -> Arc<DuckDbConnectionPool> {
+        Arc::new(
+            DuckDbConnectionPool::new_memory().expect("to get a memory duckdb connection pool"),
+        )
+    }
+
+    fn get_test_table_definition() -> Arc<TableDefinition> {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
+        ]));
+
+        Arc::new(TableDefinition::new(
+            RelationName::new("test_table"),
+            schema,
+        ))
+    }
+
+    fn verify_state_after_write(
+        tx: &duckdb::Transaction,
+        table_definition: &Arc<TableDefinition>,
+        target_partitions: &[&str],
+        expected_rows_per_partition: i64,
+        should_have_internal_tables: bool,
+    ) {
+        for partition in target_partitions {
+            let partition_table_name = format!("{partition}/{}", table_definition.name());
+
+            let partitioned_table_definition = TableDefinition::new(
+                RelationName::new(partition_table_name),
+                Arc::clone(&table_definition.schema()),
+            );
+
+            // Verify that partitioned tables were created (one for each region)
+            let mut internal_tables = partitioned_table_definition
+                .list_internal_tables(tx)
+                .expect("to list internal tables");
+
+            if should_have_internal_tables {
+                assert_eq!(
+                    internal_tables.len(),
+                    1,
+                    "Expected partitioned internal table to be created"
+                );
+                let table_name = internal_tables.pop().expect("should have a table").0;
+
+                // Verify that data was written to a partitioned table
+                let rows = tx
+                    .query_row(
+                        &format!("SELECT COUNT(1) FROM \"{table_name}\"",),
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("to get count");
+                assert_eq!(
+                    rows, expected_rows_per_partition,
+                    "Expected {expected_rows_per_partition} rows in partitioned table"
+                );
+            } else {
+                assert_eq!(
+                    internal_tables.len(),
+                    0,
+                    "Expected no internal tables for append mode"
+                );
+            }
+
+            // Verify a view was created for partitioned table
+            let view_rows = tx
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(1) FROM \"{view_name}\"",
+                        view_name = partitioned_table_definition.name()
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("to get count");
+
+            assert_eq!(
+                view_rows, expected_rows_per_partition,
+                "Expected view to have {expected_rows_per_partition} rows from a partitioned table"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_overwrite() {
+        // Test scenario:
+        // 1. Write to a table with overwrite mode without a previous table
+        // 2. Write to the same table again with overwrite mode, simulating an existing table
+        // Expected behavior: Data sink creates partitioned tables, writes data to them, and creates views, old internal tables are deleted
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_test_table_definition();
+
+        // Create partitioner by name - partition by "region" column
+        let partitioned_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let partitioner = Arc::new(
+            BatchPartitioner::new(
+                &partitioned_by.expression,
+                table_definition.schema(),
+                &partitioned_by,
+            )
+            .expect("should create partitioner"),
+        );
+
+        let duckdb_sink = DuckDBPartitionedDataSink::new(
+            Arc::clone(&pool),
+            Arc::clone(&table_definition),
+            InsertOp::Overwrite,
+            None,
+            table_definition.schema(),
+            partitioner,
+        );
+        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+
+        // Test data with two different regions to create two partitions
+        // id, region
+        // 1, "us-east-1"
+        // 2, "us-west-1"
+        // 3, "us-east-1"
+        // 4, "us-west-1"
+        let batches = vec![
+            RecordBatch::try_new(
+                Arc::clone(&table_definition.schema()),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                    ])),
+                ],
+            )
+            .expect("should create a record batch"),
+        ];
+
+        let stream: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches, table_definition.schema(), None).expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all");
+
+        let mut conn = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+        let tx = duckdb.conn.transaction().expect("to begin transaction");
+
+        verify_state_after_write(
+            &tx,
+            &table_definition,
+            &["region=us-east-1", "region=us-west-1"],
+            2,
+            true,
+        );
+
+        tx.rollback().expect("to rollback");
+
+        // Simulate writing again with overwrite mode, which should delete old internal tables
+        // Second batch has 1 row per partition (2 total rows)
+        let batches2 = vec![
+            RecordBatch::try_new(
+                Arc::clone(&table_definition.schema()),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                    ])),
+                ],
+            )
+            .expect("should create a record batch"),
+        ];
+
+        let stream2: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches2, table_definition.schema(), None)
+                .expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream2, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all");
+
+        let mut conn2 = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb2 = DuckDB::duckdb_conn(&mut conn2).expect("to get duckdb conn");
+        let tx2 = duckdb2.conn.transaction().expect("to begin transaction");
+
+        verify_state_after_write(
+            &tx2,
+            &table_definition,
+            &["region=us-east-1", "region=us-west-1"],
+            1,
+            true,
+        );
+
+        tx2.rollback().expect("to rollback");
+    }
+
+    #[tokio::test]
+    async fn test_write_append() {
+        // Test scenario:
+        // 1. Write to a table with append mode without a previous table
+        // 2. Write to the same table again with append mode, simulating an existing table
+        // Expected behavior: Data sink creates partitioned tables, writes data to them
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_test_table_definition();
+
+        // Create partitioner by name - partition by "region" column
+        let partitioned_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let partitioner = Arc::new(
+            BatchPartitioner::new(
+                &partitioned_by.expression,
+                table_definition.schema(),
+                &partitioned_by,
+            )
+            .expect("should create partitioner"),
+        );
+
+        let duckdb_sink = DuckDBPartitionedDataSink::new(
+            Arc::clone(&pool),
+            Arc::clone(&table_definition),
+            InsertOp::Append,
+            None,
+            table_definition.schema(),
+            partitioner,
+        );
+        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+
+        // Test data with two different regions to create two partitions
+        // id, region
+        // 1, "us-east-1"
+        // 2, "us-west-1"
+        // 3, "us-east-1"
+        // 4, "us-west-1"
+        let batches = vec![
+            RecordBatch::try_new(
+                Arc::clone(&table_definition.schema()),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                    ])),
+                ],
+            )
+            .expect("should create a record batch"),
+        ];
+
+        let stream: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches, table_definition.schema(), None).expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all");
+
+        let mut conn = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+        let tx = duckdb.conn.transaction().expect("to begin transaction");
+
+        verify_state_after_write(
+            &tx,
+            &table_definition,
+            &["region=us-east-1", "region=us-west-1"],
+            2,
+            false,
+        );
+
+        tx.rollback().expect("to rollback");
+
+        // Simulate writing again with append mode, which should append data to existing tables
+        // Second batch has 1 row per partition (2 total rows)
+        let batches2 = vec![
+            RecordBatch::try_new(
+                Arc::clone(&table_definition.schema()),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(5), Some(6)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                    ])),
+                ],
+            )
+            .expect("should create a record batch"),
+        ];
+
+        let stream2: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches2, table_definition.schema(), None)
+                .expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream2, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all");
+
+        let mut conn2 = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb2 = DuckDB::duckdb_conn(&mut conn2).expect("to get duckdb conn");
+        let tx2 = duckdb2.conn.transaction().expect("to begin transaction");
+
+        // After append, each partition should have 3 rows (2 from first batch + 1 from second batch)
+        verify_state_after_write(
+            &tx2,
+            &table_definition,
+            &["region=us-east-1", "region=us-west-1"],
+            3,
+            false,
+        );
+
+        tx2.rollback().expect("to rollback");
+    }
+}
