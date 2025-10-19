@@ -511,7 +511,8 @@ impl QueryActiveGuard {
 
 impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
-        if self.active && self.request_context.exited_top_level_query() {
+        let exited = self.request_context.exited_top_level_query();
+        if self.active && exited {
             crate::metrics::telemetry::dec_query_active_count(&self.dimensions);
         }
     }
