@@ -146,6 +146,7 @@ impl RequestContext {
         REQUEST_CONTEXT.scope(self, f).await
     }
 
+    /// Wraps provided stream with the current request context.
     pub fn scope_stream<S>(self: Arc<Self>, stream: S) -> impl Stream<Item = S::Item>
     where
         S: Stream,

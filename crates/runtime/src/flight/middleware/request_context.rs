@@ -93,23 +93,12 @@ where
                 .build(),
         );
 
-        println!(
-            "RequestContextMiddleware.call - outside: {:?}",
-            request_context.id()
-        );
-
         req.extensions_mut()
             .insert::<Arc<dyn AuthRequestContext + Send + Sync>>(
                 Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>
             );
 
         Box::pin(Arc::clone(&request_context).scope(async move {
-            let request_context = (RequestContext::current(AsyncMarker::new().await));
-            println!(
-                "RequestContextMiddleware.call - inside: {:?}",
-                request_context.id()
-            );
-
             request_context.load_extensions().await;
             inner.call(req).await
         }))
