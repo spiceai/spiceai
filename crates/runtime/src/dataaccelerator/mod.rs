@@ -45,7 +45,7 @@ use self::arrow::ArrowAccelerator;
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
-#[cfg(feature = "vortex")]
+#[cfg(feature = "pepper")]
 use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
@@ -57,7 +57,7 @@ pub mod arrow;
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(feature = "vortex")]
+#[cfg(feature = "pepper")]
 pub mod pepper;
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -152,7 +152,7 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
             .await;
-        #[cfg(feature = "vortex")]
+        #[cfg(feature = "pepper")]
         self.register_accelerator_engine(Engine::Pepper, Arc::new(PepperAccelerator::new()))
             .await;
     }
@@ -775,7 +775,7 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
-            #[cfg(feature = "vortex")]
+            #[cfg(feature = "pepper")]
             (Engine::Pepper, "file", None), // Vortex only supports file mode
         ];
 
@@ -896,7 +896,7 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                #[cfg(feature = "vortex")]
+                #[cfg(feature = "pepper")]
                 Engine::Pepper => {
                     use crate::component::dataset::builder::DatasetBuilder;
                     use crate::dataaccelerator::pepper::PepperAccelerator;
@@ -2107,12 +2107,10 @@ mod accelerator_compat_tests {
                             .await
                             .expect("Arrow table should be created")
                     }
-                    #[cfg(feature = "vortex")]
+                    #[cfg(feature = "pepper")]
                     Engine::Pepper => {
                         use crate::component::dataset::builder::DatasetBuilder;
-                        use crate::dataaccelerator::pepper::PepperAccelerator;
-
-                        // Clean up any existing files and metadata
+                        use crate::dataaccelerator::pepper::PepperAccelerator; // Clean up any existing files and metadata
                         if _mode == "file" && !location.is_empty() {
                             let test_dir = std::path::Path::new(&location);
                             if test_dir.exists() {
@@ -2960,7 +2958,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,vortex -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,pepper -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::sync::Mutex;
         use std::time::Instant;
