@@ -725,84 +725,51 @@ struct GitHubPathComponents<'a> {
     owner: &'a str,
     repo: Option<&'a str>,
     resource_type: &'a str,
-    remaining: Option<&'a str>,
+    remaining: Option<String>,
 }
 
 /// Parse owner, repo, and resource type from the GitHub path
 fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
-    let parts_vec: Vec<&str> = path.split('/').collect();
+    // Strip prefix and split into segments
+    let path_without_prefix = path.strip_prefix("github.com/")?;
+    let segments: Vec<&str> = path_without_prefix.split('/').collect();
 
-    match (
-        parts_vec.first(),
-        parts_vec.get(1),
-        parts_vec.get(2),
-        parts_vec.get(3),
-        parts_vec.get(4),
-    ) {
-        // Organization-level resources
-        (Some(&"github.com"), Some(&owner), Some(&"members"), None, None) => {
+    // Organization-level resources (2 segments: owner/resource_type)
+    const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
+
+    // Repository-level resources (3+ segments: owner/repo/resource_type[/...])
+    const REPO_LEVEL_RESOURCES: &[&str] = &[
+        "pulls",
+        "issues",
+        "commits",
+        "stargazers",
+        "projects",
+        "files",
+    ];
+
+    match segments.as_slice() {
+        // Organization-level: github.com/owner/resource_type
+        [owner, resource_type] if ORG_LEVEL_RESOURCES.contains(resource_type) => {
             Some(GitHubPathComponents {
                 owner,
                 repo: None,
-                resource_type: "members",
+                resource_type,
                 remaining: None,
             })
         }
-        (Some(&"github.com"), Some(&owner), Some(&"projects"), None, None) => {
-            Some(GitHubPathComponents {
-                owner,
-                repo: None,
-                resource_type: "projects",
-                remaining: None,
-            })
-        }
-        // Repository-level resources
-        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"pulls"), None) => {
+        // Repository-level: github.com/owner/repo/resource_type or github.com/owner/repo/resource_type/...
+        [owner, repo, resource_type, remaining @ ..]
+            if REPO_LEVEL_RESOURCES.contains(resource_type) =>
+        {
             Some(GitHubPathComponents {
                 owner,
                 repo: Some(repo),
-                resource_type: "pulls",
-                remaining: None,
-            })
-        }
-        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"issues"), None) => {
-            Some(GitHubPathComponents {
-                owner,
-                repo: Some(repo),
-                resource_type: "issues",
-                remaining: None,
-            })
-        }
-        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"commits"), None) => {
-            Some(GitHubPathComponents {
-                owner,
-                repo: Some(repo),
-                resource_type: "commits",
-                remaining: None,
-            })
-        }
-        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"stargazers"), None) => {
-            Some(GitHubPathComponents {
-                owner,
-                repo: Some(repo),
-                resource_type: "stargazers",
-                remaining: None,
-            })
-        }
-        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"projects"), None) => {
-            Some(GitHubPathComponents {
-                owner,
-                repo: Some(repo),
-                resource_type: "projects",
-                remaining: None,
-            })
-        }
-        (Some(&"github.com"), Some(&owner), Some(&repo), Some(&"files"), remaining) => {
-            Some(GitHubPathComponents {
-                owner,
-                repo: Some(repo),
-                resource_type: "files",
-                remaining: remaining.copied(),
+                resource_type,
+                remaining: if remaining.is_empty() {
+                    None
+                } else {
+                    Some(remaining.join("/"))
+                },
             })
         }
         _ => None,
@@ -963,8 +930,13 @@ impl DataConnector for Github {
             }
             ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
-                self.create_files_table_provider(parsed.owner, repo, parsed.remaining, dataset)
-                    .await
+                self.create_files_table_provider(
+                    parsed.owner,
+                    repo,
+                    parsed.remaining.as_deref(),
+                    dataset,
+                )
+                .await
             }
             ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);

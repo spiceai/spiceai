@@ -22,7 +22,6 @@ use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Resul
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
-    error::ArrowError,
     json::{ReaderBuilder, reader::infer_json_schema_from_iterator},
 };
 use graphql_parser::query::{
@@ -984,9 +983,10 @@ impl GraphQLClient {
                 tracing::warn!(
                     "Same cursor returned from pagination, stopping to prevent infinite loop"
                 );
+                // Use limit_reached: false for loop protection exits, not data limit exhaustion
                 return Ok(GraphQLQueryResult {
                     records: vec![],
-                    limit_reached: true,
+                    limit_reached: false,
                     schema: schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())),
                     cursor: None,
                 });
@@ -1059,9 +1059,8 @@ impl GraphQLClient {
                     tracing::error!("{}", error_msg);
                     tracing::debug!("Schema being used: {:?}", schema);
 
-                    return Err(Error::ArrowInternal {
-                        source: ArrowError::SchemaError(error_msg),
-                    });
+                    // Preserve the original ArrowError to maintain error classification
+                    return Err(Error::ArrowInternal { source: e });
                 }
             }
         }
