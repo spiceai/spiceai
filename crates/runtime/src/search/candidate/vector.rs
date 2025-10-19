@@ -229,7 +229,6 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
         let (pks, score_table, additional_table) =
             self.score_cte_sql(&self.table_provider, query, &[])?;
 
-        let limit = 1000; // TODO
         // First project just the columns we need
         let mut plan = LogicalPlanBuilder::new(score_table)
             .project(
@@ -271,7 +270,6 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             .alias("rank")?
             .filter(col("chunk_rank").eq(lit(1)))?
             .sort(vec![col("rank.score").sort(false, false)])?
-            .limit(0, Some(limit))?
             .join(
                 additional_table,
                 JoinType::Left,

@@ -308,7 +308,7 @@ impl SearchEngine {
                         generators.append(&mut fts);
                     }
 
-                    // This is actually infalliable
+                    // This is actually infallible
                     let filters = if let Ok(schm) = DFSchema::try_from(self
                         .df
                         .get_table(&tbl)

@@ -277,7 +277,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         });
     }
 
-    Ok(ident(target_column).ilike(lit(k)))
+    Ok(ident(target_column).ilike(lit(format!("%{}%", k.to_lowercase()))))
 }
 
 #[cfg(test)]
