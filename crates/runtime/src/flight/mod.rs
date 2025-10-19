@@ -218,15 +218,13 @@ impl Service {
             ..Default::default()
         };
 
-        let request_context_clone = Arc::clone(&RequestContext::current(AsyncMarker::new().await));
-
         let data_stream = query_result.data;
         let flights_stream = try_stream! {
             yield schema_flight_data;
 
             futures::pin_mut!(data_stream); // needed to use `.next()` on stream
 
-            while let Some(batch_result) = Arc::clone(&request_context_clone).scope(data_stream.next()).await {
+            while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
                     Ok(batch) => {
                         let (dicts, batch_data) = encoder
