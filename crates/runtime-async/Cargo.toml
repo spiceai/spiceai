@@ -1,0 +1,15 @@
+[package]
+description = "Manage multiple Tokio runtimes for use in the Spice.ai OSS runtime"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "runtime-async"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+tracing.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+snafu.workspace = true
