@@ -56,7 +56,7 @@ impl GraphQLContext for ProjectsTableArgs {
                             if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
                                 tracing::debug!("Checking error message: {}", message);
                                 if message
-                                    .contains("Something went wrong while executing your query on")
+                                    .contains("Something went wrong while executing your query")
                                 {
                                     tracing::error!(
                                         "Detected GitHub permission error for projects access"
