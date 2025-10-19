@@ -401,3 +401,187 @@ async fn get_pool(
             .await?,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Runtime;
+    use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataaccelerator::DataAccelerator;
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use datafusion::{
+        common::{Constraints, TableReference, ToDFSchema},
+        execution::context::SessionContext,
+        logical_expr::{CreateExternalTable, col, dml::InsertOp},
+        physical_plan::collect,
+    };
+    use datafusion_table_providers::util::test::MockExec;
+    use runtime_table_partition::expression::PartitionedBy;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_tables_mode_partitioned_duckdb_accelerator() {
+        // Ensure no previous database version exists
+        let test_db_path = "./test_table.db";
+        if std::path::Path::new(test_db_path).exists() {
+            std::fs::remove_file(test_db_path).expect("Failed to remove existing test database");
+        }
+
+        // Create app and runtime
+        let app = app::AppBuilder::new("test_partitioned_duckdb").build();
+        let rt = Runtime::builder().build().await;
+
+        // Create dataset with partitioned DuckDB acceleration
+        let mut dataset = DatasetBuilder::try_new("test_source".to_string(), "test_table")
+            .expect("Failed to create dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::TableModePartitionedDuckDB,
+            mode: Mode::File,
+            enabled: true,
+            params: {
+                let mut params = HashMap::new();
+                params.insert("duckdb_file".to_string(), test_db_path.to_string());
+                params
+            },
+            ..Default::default()
+        });
+
+        // Create schema matching the sink test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("test_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let partitioned_by = vec![PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        }];
+
+        let accelerator = TablesModePartitionedDuckDBAccelerator::new();
+
+        let table = accelerator
+            .create_external_table(external_table, Some(&dataset), partitioned_by)
+            .await
+            .expect("accelerated table created");
+
+        let test_data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+                Arc::new(StringArray::from(vec![
+                    Some("us-east-1"),
+                    Some("us-west-1"),
+                    Some("us-east-1"),
+                    Some("us-west-1"),
+                ])),
+            ],
+        )
+        .expect("test data should be created");
+
+        // Create DataFusion context and insert data using MockExec
+        let ctx = SessionContext::new();
+        let exec = Arc::new(MockExec::new(vec![Ok(test_data)], Arc::clone(&schema)));
+
+        let insertion = table
+            .insert_into(&ctx.state(), exec, InsertOp::Overwrite)
+            .await
+            .expect("insertion plan created");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insertion successful");
+
+        // Verify insertion result
+        assert!(!result.is_empty());
+
+        ctx.register_table("test_table", Arc::clone(&table))
+            .expect("table registration successful");
+
+        // Test 1: Show all data
+        // The order of partitions in SELECT * is not deterministic so we don't snapshot explain
+        run_query_and_snapshot(
+            &ctx,
+            "SELECT * FROM test_table order by id",
+            "select_all",
+            false,
+        )
+        .await
+        .expect("select all query successful");
+
+        // Test 2: Filter by existing region = 'us-east-1'
+        run_query_and_snapshot(
+            &ctx,
+            "SELECT * FROM test_table WHERE region = 'us-east-1'",
+            "filter_us_east",
+            true,
+        )
+        .await
+        .expect("east region query successful");
+
+        // Test 3: Filter by non-existent region
+        run_query_and_snapshot(
+            &ctx,
+            "SELECT * FROM test_table WHERE region = 'eu-central-1'",
+            "filter_nonexistent",
+            true,
+        )
+        .await
+        .expect("non-existent region query successful");
+
+        // cleanup
+        std::fs::remove_file(test_db_path).expect("file should be removed");
+    }
+
+    async fn run_query_and_snapshot(
+        ctx: &SessionContext,
+        query_string: impl AsRef<str>,
+        test_name: &str,
+        snapshot_explain: bool,
+    ) -> anyhow::Result<()> {
+        let query_string = query_string.as_ref();
+
+        if snapshot_explain {
+            // Execute EXPLAIN query and snapshot the result
+            let explain_result = ctx.sql(&format!("EXPLAIN {query_string}")).await?;
+            let explain_batches = explain_result.collect().await?;
+            let explain_pretty = arrow::util::pretty::pretty_format_batches(&explain_batches)?;
+            insta::assert_snapshot!(format!("{test_name}_explain"), explain_pretty);
+        }
+
+        // Execute actual query and snapshot the result
+        let query_result = ctx.sql(query_string).await?;
+        let result_batches = query_result.collect().await?;
+        let result_pretty = arrow::util::pretty::pretty_format_batches(&result_batches)?;
+        insta::assert_snapshot!(format!("{test_name}_result"), result_pretty);
+
+        Ok(())
+    }
+}
