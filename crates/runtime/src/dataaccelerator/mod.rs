@@ -743,10 +743,6 @@ mod accelerator_compat_tests {
             }
         }
 
-        fn data_path(&self) -> &str {
-            &self.data_path
-        }
-
         fn metadata_dir(&self) -> String {
             format!("{}/metadata", self.data_path)
         }
@@ -1527,16 +1523,16 @@ mod accelerator_compat_tests {
         RecordBatch::try_new(schema, columns).expect("data should be created")
     }
 
-    /// Transform RecordBatch to match a target schema by converting unsupported types to strings
+    /// Transform `RecordBatch` to match a target schema by converting unsupported types to strings
     /// This is needed for engines like Vortex that convert unsupported types to Utf8
     fn transform_batch_to_schema(
-        batch: RecordBatch,
+        batch: &RecordBatch,
         target_schema: SchemaRef,
     ) -> Result<RecordBatch, arrow::error::ArrowError> {
         let source_schema = batch.schema();
         let mut new_columns: Vec<ArrayRef> = Vec::new();
 
-        for (i, target_field) in target_schema.fields().iter().enumerate() {
+        for target_field in target_schema.fields() {
             // Find the corresponding source field by name
             let source_field_idx = source_schema
                 .fields()
@@ -1571,31 +1567,48 @@ mod accelerator_compat_tests {
                         // Convert the value to string representation
                         let string_value = match source_type {
                             DataType::Time32(TimeUnit::Millisecond) => {
-                                let arr = source_array
+                                let Some(arr) = source_array
                                     .as_any()
                                     .downcast_ref::<Time32MillisecondArray>()
-                                    .unwrap();
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to Time32MillisecondArray".to_string(),
+                                    ));
+                                };
                                 format!("{}", arr.value(row_idx))
                             }
                             DataType::Time64(TimeUnit::Microsecond) => {
-                                let arr = source_array
+                                let Some(arr) = source_array
                                     .as_any()
                                     .downcast_ref::<Time64MicrosecondArray>()
-                                    .unwrap();
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to Time64MicrosecondArray".to_string(),
+                                    ));
+                                };
                                 format!("{}", arr.value(row_idx))
                             }
                             DataType::Duration(TimeUnit::Millisecond) => {
-                                let arr = source_array
+                                let Some(arr) = source_array
                                     .as_any()
                                     .downcast_ref::<DurationMillisecondArray>()
-                                    .unwrap();
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to DurationMillisecondArray"
+                                            .to_string(),
+                                    ));
+                                };
                                 format!("{}ms", arr.value(row_idx))
                             }
                             DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth) => {
-                                let arr = source_array
+                                let Some(arr) = source_array
                                     .as_any()
                                     .downcast_ref::<IntervalYearMonthArray>()
-                                    .unwrap();
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to IntervalYearMonthArray".to_string(),
+                                    ));
+                                };
                                 format!("{} months", arr.value(row_idx))
                             }
                             DataType::Map(_, _) => {
@@ -1640,11 +1653,11 @@ mod accelerator_compat_tests {
 
         // Transform the data to match the table schema if needed
         // (e.g., for Vortex which converts unsupported types to strings)
-        let transformed_data = if data.schema() != table_schema {
-            transform_batch_to_schema(data, Arc::clone(&table_schema))
-                .expect("data transformation should succeed")
-        } else {
+        let transformed_data = if data.schema() == table_schema {
             data
+        } else {
+            transform_batch_to_schema(&data, Arc::clone(&table_schema))
+                .expect("data transformation should succeed")
         };
 
         let schema = transformed_data.schema();
@@ -1949,11 +1962,11 @@ mod accelerator_compat_tests {
 
             // Transform data to match table schema if needed (e.g., for Vortex type conversions)
             let table_schema = table.schema();
-            let transformed_data = if data.schema() != table_schema {
-                transform_batch_to_schema(data, Arc::clone(&table_schema))
-                    .expect("data transformation should succeed")
-            } else {
+            let transformed_data = if data.schema() == table_schema {
                 data
+            } else {
+                transform_batch_to_schema(&data, Arc::clone(&table_schema))
+                    .expect("data transformation should succeed")
             };
 
             let exec = MockExec::new(vec![Ok(transformed_data)], Arc::clone(&table_schema));
@@ -2634,30 +2647,30 @@ mod accelerator_compat_tests {
                 }
 
                 // Verify Map column exists and has correct type (only for non-Vortex engines)
-                if engine != Engine::Pepper {
-                    if let Ok(map_col_idx) = batch.schema().index_of("map_col") {
-                        let map_col = batch.column(map_col_idx);
+                if engine != Engine::Pepper
+                    && let Ok(map_col_idx) = batch.schema().index_of("map_col")
+                {
+                    let map_col = batch.column(map_col_idx);
 
-                        assert!(
-                            matches!(map_col.data_type(), DataType::Map(_, _)),
-                            "{:?}: map_col should be Map type, got {:?}",
-                            engine,
-                            map_col.data_type()
-                        );
+                    assert!(
+                        matches!(map_col.data_type(), DataType::Map(_, _)),
+                        "{:?}: map_col should be Map type, got {:?}",
+                        engine,
+                        map_col.data_type()
+                    );
 
-                        // Verify we have some null and some non-null values
-                        let null_count = map_col.null_count();
-                        assert!(
-                            null_count > 0,
-                            "{:?}: map_col should have some nulls",
-                            engine
-                        );
-                        assert!(
-                            null_count < total_rows,
-                            "{:?}: map_col should have some non-null values",
-                            engine
-                        );
-                    }
+                    // Verify we have some null and some non-null values
+                    let null_count = map_col.null_count();
+                    assert!(
+                        null_count > 0,
+                        "{:?}: map_col should have some nulls",
+                        engine
+                    );
+                    assert!(
+                        null_count < total_rows,
+                        "{:?}: map_col should have some non-null values",
+                        engine
+                    );
                 }
             }
 

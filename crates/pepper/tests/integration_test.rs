@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary directory for the test
     let temp_dir = TempDir::new()?;
@@ -81,7 +82,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
 
     // === ROUND 1: First insert ===
     println!("\n--- Round 1: Initial insert ---");
-    
+
     // 7. Insert first batch of test data using SQL
     ctx.sql("INSERT INTO test_table VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
         .await?
@@ -92,9 +93,12 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     // 8. Query the data back
     let df = ctx.sql("SELECT * FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 3, "Expected 3 rows after first insert");
-    println!("✓ Query returned {} rows", total_rows);
+    println!("✓ Query returned {total_rows} rows");
 
     // 9. Verify the data from first batch
     // Collect all rows across batches (in case data is split)
@@ -111,7 +115,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("Expected StringArray");
-        
+
         for i in 0..batch.num_rows() {
             all_ids.push(id_array.value(i));
             all_names.push(name_array.value(i).to_string());
@@ -127,22 +131,35 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
         .sql("SELECT * FROM test_table WHERE id > 1 ORDER BY id")
         .await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 2, "Expected 2 rows after filtering (id > 1)");
     println!("✓ Filter query successful (2 rows with id > 1)");
 
     // 11. Test limit
     let df = ctx.sql("SELECT * FROM test_table LIMIT 2").await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 2, "Expected 2 rows after limit");
     println!("✓ Limit query successful (2 rows)");
 
     // 12. Test projection
     let df = ctx.sql("SELECT name FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_cols: usize = if !results.is_empty() { results[0].num_columns() } else { 0 };
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_cols: usize = if results.is_empty() {
+        0
+    } else {
+        results[0].num_columns()
+    };
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_cols, 1, "Expected 1 column in projection");
     assert_eq!(total_rows, 3, "Expected 3 rows in projection");
     println!("✓ Projection query successful (1 column, 3 rows)");
@@ -164,14 +181,17 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     // 15. Query all data back
     let df = ctx.sql("SELECT * FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 5, "Expected 5 rows total");
-    println!("✓ Query returned {} rows total", total_rows);
+    println!("✓ Query returned {total_rows} rows total");
 
     // 16. Verify all data is present
     let df = ctx.sql("SELECT * FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    
+
     // Collect all rows across batches
     let mut all_ids = Vec::new();
     let mut all_names = Vec::new();
@@ -186,7 +206,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("Expected StringArray");
-        
+
         for i in 0..batch.num_rows() {
             all_ids.push(id_array.value(i));
             all_names.push(name_array.value(i).to_string());
@@ -202,22 +222,37 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
         .sql("SELECT * FROM test_table WHERE id >= 3 ORDER BY id")
         .await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 3, "Expected 3 rows after filtering (id >= 3)");
     println!("✓ Filter query successful (round 2)");
 
     // 18. Test limit on combined data
-    let df = ctx.sql("SELECT * FROM test_table ORDER BY id LIMIT 3").await?;
+    let df = ctx
+        .sql("SELECT * FROM test_table ORDER BY id LIMIT 3")
+        .await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 3, "Expected 3 rows after limit");
     println!("✓ Limit query successful (round 2: 3 rows)");
 
     // 19. Test projection on combined data
     let df = ctx.sql("SELECT id FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_cols: usize = if !results.is_empty() { results[0].num_columns() } else { 0 };
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_cols: usize = if results.is_empty() {
+        0
+    } else {
+        results[0].num_columns()
+    };
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_cols, 1, "Expected 1 column in projection");
     assert_eq!(total_rows, 5, "Expected 5 rows in projection");
     println!("✓ Projection query successful (round 2: 1 column, 5 rows)");

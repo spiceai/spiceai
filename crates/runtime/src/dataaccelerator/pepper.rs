@@ -19,10 +19,6 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
-use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::CreateExternalTable;
 use datafusion_table_providers::UnsupportedTypeAction;
 use runtime_table_partition::expression::PartitionedBy;
@@ -30,7 +26,6 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
-use vortex_datafusion::VortexFormat;
 
 use super::{AccelerationSource, DataAccelerator};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
@@ -106,7 +101,7 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
     )
 }
 
-/// Transform schema according to unsupported_type_action policy
+/// Transform schema according to `unsupported_type_action` policy
 /// Always converts Float16 to Float32 and normalizes timestamps to Microsecond (these are compatible transformations)
 /// Handles truly unsupported types according to the action: String (convert to Utf8) or Error (return error)
 fn transform_schema_for_vortex(
@@ -116,7 +111,7 @@ fn transform_schema_for_vortex(
     let mut unsupported_fields = Vec::new();
     let mut transformed_fields = Vec::new();
 
-    for field in schema.fields().iter() {
+    for field in schema.fields() {
         let data_type = field.data_type();
 
         // Always convert Float16 to Float32 (compatible transformation that Vortex can handle)
@@ -134,24 +129,27 @@ fn transform_schema_for_vortex(
         }
 
         // Always convert non-Microsecond timestamps to Microsecond (compatible transformation)
-        if let DataType::Timestamp(unit, tz) = data_type {
-            if !matches!(unit, arrow::datatypes::TimeUnit::Microsecond) {
-                tracing::debug!(
-                    "Converting timestamp field '{}' from {:?} to Microsecond precision for Vortex compatibility",
-                    field.name(),
-                    unit
-                );
-                transformed_fields.push(Arc::new(arrow::datatypes::Field::new(
-                    field.name(),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, tz.clone()),
-                    field.is_nullable(),
-                )));
-                continue;
-            }
+        if let DataType::Timestamp(unit, tz) = data_type
+            && !matches!(unit, arrow::datatypes::TimeUnit::Microsecond)
+        {
+            tracing::debug!(
+                "Converting timestamp field '{}' from {:?} to Microsecond precision for Vortex compatibility",
+                field.name(),
+                unit
+            );
+            transformed_fields.push(Arc::new(arrow::datatypes::Field::new(
+                field.name(),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, tz.clone()),
+                field.is_nullable(),
+            )));
+            continue;
         }
 
         // Handle truly unsupported types (those that Vortex cannot handle natively)
-        if !is_vortex_supported_type(data_type) {
+        if is_vortex_supported_type(data_type) {
+            // Supported type, keep as-is
+            transformed_fields.push(Arc::clone(field));
+        } else {
             match unsupported_type_action {
                 UnsupportedTypeAction::String => {
                     tracing::warn!(
@@ -186,9 +184,6 @@ fn transform_schema_for_vortex(
                     transformed_fields.push(Arc::clone(field));
                 }
             }
-        } else {
-            // Supported type, keep as-is
-            transformed_fields.push(Arc::clone(field));
         }
     }
 
@@ -262,19 +257,19 @@ impl PepperAccelerator {
 
     fn get_unsupported_type_action(source: &dyn AccelerationSource) -> UnsupportedTypeAction {
         // Check if unsupported_type_action is specified in acceleration params
-        if let Some(acceleration) = source.acceleration() {
-            if let Some(action_str) = acceleration.params.get("unsupported_type_action") {
-                match action_str.to_lowercase().as_str() {
-                    "error" => return UnsupportedTypeAction::Error,
-                    "warn" => return UnsupportedTypeAction::Warn,
-                    "ignore" => return UnsupportedTypeAction::Ignore,
-                    "string" => return UnsupportedTypeAction::String,
-                    _ => {
-                        tracing::warn!(
-                            "Invalid unsupported_type_action value '{}', defaulting to 'error'",
-                            action_str
-                        );
-                    }
+        if let Some(acceleration) = source.acceleration()
+            && let Some(action_str) = acceleration.params.get("unsupported_type_action")
+        {
+            match action_str.to_lowercase().as_str() {
+                "error" => return UnsupportedTypeAction::Error,
+                "warn" => return UnsupportedTypeAction::Warn,
+                "ignore" => return UnsupportedTypeAction::Ignore,
+                "string" => return UnsupportedTypeAction::String,
+                _ => {
+                    tracing::warn!(
+                        "Invalid unsupported_type_action value '{}', defaulting to 'error'",
+                        action_str
+                    );
                 }
             }
         }
@@ -334,8 +329,7 @@ impl PepperAccelerator {
         })?;
 
         let catalog = Arc::new(PepperCatalog::new(format!(
-            "sqlite://{}/pepper.db",
-            metadata_dir
+            "sqlite://{metadata_dir}/pepper.db"
         )));
 
         // Initialize the catalog (creates tables if needed)
@@ -348,7 +342,7 @@ impl PepperAccelerator {
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
-            schema: schema.clone(),
+            schema: Arc::<arrow_schema::Schema>::clone(&schema),
             primary_key: vec![], // No PK by default, can be set by caller
             base_path: dir_path.to_string(),
         };
