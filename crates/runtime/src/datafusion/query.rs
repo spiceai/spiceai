@@ -483,8 +483,9 @@ fn attach_query_tracker_to_stream(
 }
 
 /// This guard guarantees:
-///  * If we incremented, we will decrement.
-///  * Decrement will be called with the same dimensions.
+///  * If we incremented nested query count, we will decrement. And vice versa.
+///  * If we incremented active query count, we will decrement. And vice versa.
+///  * Active query count decrement will be called with the same dimensions as increment.
 pub struct QueryActiveGuard {
     request_context: Arc<RequestContext>,
     dimensions: Vec<KeyValue>,
