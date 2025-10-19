@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, Statistics, project_schema, stats::Precision},
+    common::{Column, Constraint, Constraints, Statistics, project_schema, stats::Precision},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
