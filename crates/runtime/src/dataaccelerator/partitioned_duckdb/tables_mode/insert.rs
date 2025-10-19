@@ -34,6 +34,7 @@ use datafusion_datasource::sink::DataSinkExec;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_table_providers::{
     duckdb::TableDefinition, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
+    util::on_conflict::OnConflict,
 };
 use futures::StreamExt;
 use runtime_table_partition::{
@@ -51,14 +52,20 @@ use crate::{
 pub struct DuckDBPartitionedInsertStrategy {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl DuckDBPartitionedInsertStrategy {
     #[must_use]
-    pub fn new(pool: Arc<DuckDbConnectionPool>, table_definition: Arc<TableDefinition>) -> Self {
+    pub fn new(
+        pool: Arc<DuckDbConnectionPool>,
+        table_definition: Arc<TableDefinition>,
+        on_conflict: Option<OnConflict>,
+    ) -> Self {
         Self {
             pool,
             table_definition,
+            on_conflict,
         }
     }
 
@@ -132,7 +139,7 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
                 Arc::clone(&self.pool),
                 Arc::clone(&self.table_definition),
                 insert_op,
-                None,
+                self.on_conflict.clone(),
                 schema,
                 partitioner,
             )),

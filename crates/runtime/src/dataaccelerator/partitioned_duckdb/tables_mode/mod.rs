@@ -40,6 +40,7 @@ use datafusion_table_providers::{
         TableDefinition, write::DuckDBTableWriter,
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    util::on_conflict::OnConflict,
 };
 use duckdb::AccessMode;
 use runtime_table_partition::{
@@ -205,6 +206,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         let insert_strategy = Arc::new(DuckDBPartitionedInsertStrategy::new(
             self.get_shared_pool(source).await?,
             creator.table_definition(),
+            creator.on_conflict().cloned(),
         ));
 
         let table_provider = Arc::new(
@@ -240,6 +242,7 @@ struct DuckDBPartitionCreator {
     pool: Arc<DuckDbConnectionPool>,
     cmd: CreateExternalTable,
     table_definition: Arc<TableDefinition>,
+    on_conflict: Option<OnConflict>,
     partition_by: PartitionedBy,
     schema: SchemaRef,
 }
@@ -253,6 +256,8 @@ impl DuckDBPartitionCreator {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let duckdb_factory = create_factory();
 
+        // We use the DuckDB factory to create a table provider in order to extract
+        // target table definition and on_conflict settings that will be used directly for each partition.
         let table_provider = create_table_provider(&duckdb_factory, &cmd)
             .await
             .map_err(|e| format!("Failed to create table provider: {e}"))?;
@@ -273,6 +278,7 @@ impl DuckDBPartitionCreator {
             pool,
             cmd,
             table_definition: writer.table_definition(),
+            on_conflict: writer.on_conflict().cloned(),
             partition_by,
             schema,
         })
@@ -280,6 +286,10 @@ impl DuckDBPartitionCreator {
 
     pub(crate) fn table_definition(&self) -> Arc<TableDefinition> {
         Arc::clone(&self.table_definition)
+    }
+
+    pub fn on_conflict(&self) -> Option<&OnConflict> {
+        self.on_conflict.as_ref()
     }
 
     fn list_partitioned_tables(&self) -> Result<Vec<String>, creator::Error> {
