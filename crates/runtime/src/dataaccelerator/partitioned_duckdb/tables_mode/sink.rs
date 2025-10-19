@@ -28,6 +28,7 @@ use datafusion_table_providers::duckdb::{
     DuckDB, RelationName, TableDefinition, TableManager, ViewCreator,
 };
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, to_retriable_data_write_error,
@@ -65,6 +66,11 @@ pub enum Error {
 
     #[snafu(display("Failed to get elapsed time: {source}"))]
     UnableToGetElapsedTime { source: std::time::SystemTimeError },
+
+    #[snafu(display("Constraint Violation: {source}"))]
+    ConstraintViolation {
+        source: datafusion_table_providers::util::constraints::Error,
+    },
 }
 
 // Buffering rows allows for much more efficient writes in `DuckDB`
@@ -100,6 +106,7 @@ impl DataSink for DuckDBPartitionedDataSink {
         &self.schema
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
@@ -149,13 +156,37 @@ impl DataSink for DuckDBPartitionedDataSink {
 
         let partitioner = Arc::clone(&self.partitioner);
 
+        let upsert_options = self
+            .on_conflict
+            .as_ref()
+            .map_or_else(UpsertOptions::default, |conflict| {
+                conflict.get_upsert_options()
+            });
+
         while let Some(batch) = data.next().await {
             let batch = batch.map_err(check_and_mark_retriable_error)?;
 
             let batches = partitioner.partition_batch(&batch)?;
 
             for (partition_name, batch) in batches {
-                if let Err(send_error) = partition_buffer.process_batch(partition_name, batch).await
+                let partition_batches = if let Some(constraints) =
+                    self.table_definition.constraints()
+                {
+                    datafusion_table_providers::util::constraints::validate_batch_with_constraints(
+                        vec![batch],
+                        constraints,
+                        &upsert_options,
+                    )
+                    .await
+                    .context(ConstraintViolationSnafu)
+                    .map_err(to_datafusion_error)?
+                } else {
+                    vec![batch]
+                };
+
+                if let Err(send_error) = partition_buffer
+                    .process(partition_name, partition_batches)
+                    .await
                 {
                     match duckdb_write_handle.await {
                         Err(join_error) => {
@@ -210,6 +241,32 @@ impl DataSink for DuckDBPartitionedDataSink {
             ))),
         }
     }
+}
+
+/// Creates a new `TableDefinition` for a partition based on an existing table definition.
+///
+/// This helper function creates a new table definition with the specified name while
+/// copying over indexes and constraints from the original table definition.
+fn create_partition_table_definition(
+    base_table_definition: &TableDefinition,
+    partition_table_name: String,
+) -> Arc<TableDefinition> {
+    let mut partition_table_def = TableDefinition::new(
+        RelationName::new(partition_table_name),
+        base_table_definition.schema(),
+    );
+
+    // Copy indexes and constraints from the original table definition
+    let indexes = base_table_definition.indexes();
+    if !indexes.is_empty() {
+        partition_table_def = partition_table_def.with_indexes(indexes.to_vec());
+    }
+
+    if let Some(constraints) = base_table_definition.constraints() {
+        partition_table_def = partition_table_def.with_constraints(constraints.clone());
+    }
+
+    Arc::new(partition_table_def)
 }
 
 impl DuckDBPartitionedDataSink {
@@ -375,6 +432,8 @@ fn insert_append(
         .context(UnableToCommitTransactionSnafu)
         .map_err(to_retriable_data_write_error)?;
 
+    // apply indexes
+
     Ok(num_rows)
 }
 
@@ -413,10 +472,8 @@ fn write_to_tables(
         } else {
             // Create new partition table
             let partition_table_name = format!("{partition}/{}", table_definition.name());
-            let partition_table_def = Arc::new(TableDefinition::new(
-                RelationName::new(partition_table_name.clone()),
-                Arc::clone(schema),
-            ));
+            let partition_table_def =
+                create_partition_table_definition(table_definition, partition_table_name);
 
             let partition_table = Arc::new(
                 TableManager::new(partition_table_def)

@@ -45,23 +45,26 @@ impl PartitionBuffer {
         }
     }
 
-    /// Add a batch to the specified partition buffer. If threshold is reached, flush that partition.
-    pub async fn process_batch(
+    /// Add batches to the specified partition buffer. If threshold is reached, flush that partition.
+    pub async fn process(
         &mut self,
         partition_id: String,
-        batch: RecordBatch,
+        batches: Vec<RecordBatch>,
     ) -> datafusion::common::Result<()> {
-        let batch_row_count = batch.num_rows();
+        let total_batch_rows: usize = batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
 
-        // Add batch to partition buffer
+        // Add all batches to partition buffer
         self.buffers
             .entry(partition_id.clone())
             .or_default()
-            .push(batch);
+            .extend(batches);
 
         // Update row count for this partition
         let current_rows = self.row_counts.entry(partition_id.clone()).or_default();
-        *current_rows += batch_row_count;
+        *current_rows += total_batch_rows;
 
         // Check if we should flush this partition's buffer
         if *current_rows >= self.rows_per_partition_threshold {
