@@ -46,9 +46,6 @@ pub(crate) async fn handle(
         Command::CommandPreparedStatementQuery(command) => {
             Box::pin(flightsql::prepared_statement_query::do_get(command)).await
         }
-        Command::CommandPreparedStatementUpdate(command) => {
-            Box::pin(flightsql::prepared_statement_update::do_get(command)).await
-        }
         Command::CommandGetCatalogs(command) => flightsql::get_catalogs::do_get(command).await,
         Command::CommandGetDbSchemas(command) => flightsql::get_schemas::do_get(command).await,
         Command::CommandGetTables(command) => flightsql::get_tables::do_get(command).await,
