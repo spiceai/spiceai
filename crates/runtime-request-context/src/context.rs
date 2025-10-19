@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 use crate::TraceParent;
 use app::App;
 use http::HeaderMap;
@@ -22,6 +23,7 @@ use opentelemetry::KeyValue;
 use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
+use std::sync::atomic::Ordering;
 use std::{
     any::TypeId,
     collections::HashMap,
@@ -32,8 +34,6 @@ use std::{
         atomic::{AtomicI16, AtomicU8},
     },
 };
-
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
 type Extensions = HashMap<TypeId, Arc<dyn Extension + Send + Sync>>;
 
@@ -238,15 +238,11 @@ impl RequestContext {
     }
 
     pub fn entered_top_level_query(&self) -> bool {
-        self.nested_query_level
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            == 0
+        self.nested_query_level.fetch_add(1, Ordering::Relaxed) == 0
     }
 
     pub fn exited_top_level_query(&self) -> bool {
-        self.nested_query_level
-            .fetch_add(-1, std::sync::atomic::Ordering::SeqCst)
-            == 1
+        self.nested_query_level.fetch_add(-1, Ordering::Relaxed) == 1
     }
 }
 
