@@ -224,18 +224,12 @@ impl Service {
             ..Default::default()
         };
 
-        // let request_context = RequestContext::current(AsyncMarker::new().await);
-        // println!("sql_to_flight_stream: {:?}", request_context.id());
-
         let data_stream = query_result.data;
 
         let flights_stream = try_stream! {
             yield schema_flight_data;
 
             futures::pin_mut!(data_stream); // needed to use `.next()` on stream
-
-            let request_context = RequestContext::current(AsyncMarker::new().await);
-            println!("stream - outside: {:?}", request_context.id());
 
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {

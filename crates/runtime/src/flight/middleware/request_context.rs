@@ -26,7 +26,7 @@ use crate::{
     model::ModelContextExtension,
 };
 use app::App;
-use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
+use runtime_request_context::{Protocol, RequestContext};
 
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};

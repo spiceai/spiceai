@@ -21,7 +21,6 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use opentelemetry::KeyValue;
-use rand::Rng;
 use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
@@ -46,7 +45,6 @@ pub struct RequestContext {
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
-    id: i32,
 }
 
 #[async_trait::async_trait]
@@ -428,8 +426,6 @@ impl RequestContextBuilder {
             cache_control => cache_control,
         };
 
-        let mut rng = rand::thread_rng();
-
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
@@ -438,7 +434,6 @@ impl RequestContextBuilder {
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
-            id: rng.random_range(100..=10000),
         }
     }
 
