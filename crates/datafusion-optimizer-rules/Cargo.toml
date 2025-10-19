@@ -11,3 +11,14 @@ version.workspace = true
 [dependencies]
 datafusion.workspace = true
 datafusion-expr.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+futures.workspace = true
+cache = { path = "../cache" }
+
+[dev-dependencies]
+arrow.workspace = true
+insta.workspace = true
+spicepod = { path = "../spicepod" }
+tokio.workspace = true

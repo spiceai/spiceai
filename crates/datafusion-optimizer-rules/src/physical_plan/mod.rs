@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod logical_plan;
-pub mod pass_thru;
-pub mod physical_plan;
+//! General [`datafusion::physical_optimizer::PhysicalOptimizerRule`] not in [`datafusion`] by default.
+
+pub mod hash_join_optimization;
+pub use hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;

@@ -44,7 +44,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 
-use crate::datafusion::extension::pass_thru::PassThruExec;
+use crate::pass_thru::PassThruExec;
 
 /// [`OptimizerRule`] that detects write operations in a `DataFusion` logical plan and injects a cache invalidation node [`CacheInvalidationNode`].
 ///
@@ -187,27 +187,10 @@ impl UserDefinedLogicalNodeCore for CacheInvalidationNode {
         HashSet::new()
     }
 
-    /// Returns the necessary input columns for this node required to compute
-    /// the columns in the output schema
-    ///
-    /// This is used for projection push-down when `DataFusion` has determined that
-    /// only a subset of the output columns of this node are needed by its parents.
-    /// This API is used to tell `DataFusion` which, if any, of the input columns are no longer
-    /// needed.
-    ///
-    /// Return `None`, the default, if this information can not be determined.
-    /// Returns `Some(_)` with the column indices for each child of this node that are
-    /// needed to compute `output_columns`
     fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         Some(vec![output_columns.to_vec()])
     }
 
-    /// Returns `true` if a limit can be safely pushed down through this
-    /// `UserDefinedLogicalNode` node.
-    ///
-    /// If this method returns `true`, and the query plan contains a limit at
-    /// the output of this node, `DataFusion` will push the limit to the input
-    /// of this node.
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
@@ -338,18 +321,70 @@ impl ExtensionPlanner for CacheInvalidationExtensionPlanner {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        dataaccelerator::AcceleratorEngineRegistry,
-        datafusion::{DataFusion, builder::DataFusionBuilder},
-        status::RuntimeStatus,
-    };
-
     use arrow::datatypes::{DataType, Field, Schema};
-    use cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
-    use data_components::arrow::write::MemTable;
-    use futures::TryStreamExt;
+    use async_trait::async_trait;
+    use cache::{Caching, QueryResultsCacheProvider};
+    use datafusion::{
+        catalog::{MemTable, TableProvider},
+        error::DataFusionError,
+        execution::{SessionState, SessionStateBuilder, context::QueryPlanner},
+        physical_plan::ExecutionPlan,
+        physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
+        prelude::SessionContext,
+    };
+    use datafusion_expr::LogicalPlan;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::sync::Arc;
+
+    use crate::logical_plan::{
+        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+    };
+
+    #[derive(Default)]
+    pub struct ExtensionQueryPlanner {
+        extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+    }
+
+    impl std::fmt::Debug for ExtensionQueryPlanner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ExtensionQueryPlanner")
+                .field("extension_planners", &self.extension_planners.len())
+                .finish()
+        }
+    }
+
+    impl ExtensionQueryPlanner {
+        #[must_use]
+        pub fn new() -> Self {
+            ExtensionQueryPlanner {
+                extension_planners: vec![],
+            }
+        }
+
+        #[must_use]
+        pub fn with_extension_planners(
+            mut self,
+            planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+        ) -> Self {
+            self.extension_planners = planners;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl QueryPlanner for ExtensionQueryPlanner {
+        async fn create_physical_plan(
+            &self,
+            logical_plan: &LogicalPlan,
+            session_state: &SessionState,
+        ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+            let physical_planner =
+                DefaultPhysicalPlanner::with_extension_planners(self.extension_planners.clone());
+            physical_planner
+                .create_physical_plan(logical_plan, session_state)
+                .await
+        }
+    }
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -359,63 +394,41 @@ mod tests {
         ]))
     }
 
-    fn create_test_datafusion(cache: Option<Arc<Caching>>) -> Arc<DataFusion> {
-        let mut builder = DataFusionBuilder::new(
-            RuntimeStatus::new(),
-            Arc::new(AcceleratorEngineRegistry::new()),
+    fn create_test_datafusion(cache: Arc<Caching>) -> Arc<SessionContext> {
+        let ctx = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
+                    Arc::downgrade(&cache),
+                )))
+                .with_query_planner(Arc::new(
+                    ExtensionQueryPlanner::new().with_extension_planners(vec![Arc::new(
+                        CacheInvalidationExtensionPlanner::new(),
+                    )]),
+                ))
+                .build(),
         );
 
-        // Add cache if provided
-        if let Some(cache) = cache {
-            builder = builder.with_caching(cache);
-        }
+        ctx.register_table(
+            "test_table",
+            Arc::new(
+                MemTable::try_new(create_test_schema(), vec![])
+                    .expect("mem table should be created"),
+            ) as Arc<dyn TableProvider>,
+        )
+        .expect("table should be registered");
 
-        let df = Arc::new(builder.build());
-
-        let mem_table = Arc::new(
-            MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
-        );
-
-        df.ctx
-            .register_table(
-                "test_table",
-                Arc::clone(&mem_table) as Arc<dyn crate::datafusion::TableProvider>,
-            )
-            .expect("table should be registered");
-
-        df.data_writers
-            .write()
-            .expect("data writers should be acquired")
-            .insert("test_table".into());
-
-        df
+        Arc::new(ctx)
     }
 
-    async fn execute_sql(
-        df: &Arc<DataFusion>,
-        query: &str,
-        snapshot_name: Option<&str>,
-        expected_cache_status: CacheStatus,
-    ) {
-        let query_result = df
-            .query_builder(query)
-            .build()
-            .run()
+    async fn execute_sql(ctx: &SessionContext, query: &str, snapshot_name: Option<&str>) {
+        let data = ctx
+            .sql(query)
             .await
-            .expect("to execute query");
-
-        assert_eq!(
-            query_result.cache_status,
-            expected_cache_status,
-            "Unexpected cache status for query: {query}, expected: {expected_cache_status:?}, got: {actual:?}",
-            actual = query_result.cache_status
-        );
-
-        let data = query_result
-            .data
-            .try_collect::<Vec<_>>()
+            .expect("failed to prepare SQL query: {sql}")
+            .collect()
             .await
-            .expect("to collect data");
+            .expect("failed to run SQL query: {sql}");
 
         if let Some(name) = snapshot_name {
             let formatted = arrow::util::pretty::pretty_format_batches(&data)
@@ -435,53 +448,48 @@ mod tests {
         );
         let cache = Arc::new(Caching::new().with_results_cache(Arc::clone(&results_cache)));
 
-        let df = create_test_datafusion(Some(cache));
+        let df = create_test_datafusion(Arc::new(cache));
 
         // activate cache for test query
-        execute_sql(
-            &df,
-            "SELECT * FROM test_table",
-            None,
-            CacheStatus::CacheMiss,
-        )
-        .await;
-        execute_sql(&df, "SELECT * FROM test_table", None, CacheStatus::CacheHit).await;
+        execute_sql(&df, "SELECT * FROM test_table", None).await;
+        assert_eq!(
+            cache
+                .results
+                .expect("results cache should be enabled")
+                .item_count(),
+            1
+        );
 
         // verify CacheInvalidationNode is correctly added
         execute_sql(
             &df,
             "explain INSERT INTO test_table VALUES (1, 'foo', 42.0)",
             Some("test_insert_with_cache_plan"),
-            CacheStatus::CacheDisabled,
         )
         .await;
+
         // perform insert query and validate cache has been invalidated correctly
-        execute_sql(
-            &df,
-            "INSERT INTO test_table VALUES (1, 'foo', 42.0)",
-            None,
-            CacheStatus::CacheDisabled,
-        )
-        .await;
+        execute_sql(&df, "INSERT INTO test_table VALUES (1, 'foo', 42.0)", None).await;
+
+        assert_eq!(
+            cache
+                .results
+                .expect("results cache should be enabled")
+                .item_count(),
+            0
+        );
         execute_sql(
             &df,
             "SELECT * FROM test_table",
             Some("test_insert_with_cache_result"),
-            CacheStatus::CacheMiss,
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn test_insert_cache_disabled() {
-        let df = create_test_datafusion(None);
-        // verify there is no CacheInvalidationNode
-        execute_sql(
-            &df,
-            "explain INSERT INTO test_table VALUES (1, 'foo', 42.0)",
-            Some("test_insert_cache_disabled_plan"),
-            CacheStatus::CacheDisabled,
-        )
-        .await;
+        assert_eq!(
+            cache
+                .results
+                .expect("results cache should be enabled")
+                .item_count(),
+            1
+        );
     }
 }

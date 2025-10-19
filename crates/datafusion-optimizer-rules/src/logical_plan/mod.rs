@@ -14,6 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod logical_plan;
-pub mod pass_thru;
-pub mod physical_plan;
+pub mod cache_invalidation;
+pub use cache_invalidation::CacheInvalidationExtensionPlanner;

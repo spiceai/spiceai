@@ -4301,6 +4301,19 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer-rules"
 version = "1.9.0-unstable"
+dependencies = [
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "cache",
+ "datafusion",
+ "datafusion-expr",
+ "futures",
+ "insta",
+ "spicepod",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "datafusion-physical-expr"
@@ -12358,6 +12371,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions-json",
+ "datafusion-optimizer-rules",
  "datafusion-table-providers",
  "db_connection_pool",
  "dirs",

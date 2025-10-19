@@ -26,21 +26,19 @@ use async_trait::async_trait;
 
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraints, JoinType, exec_datafusion_err},
+    common::{Column, Constraints, JoinType},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SessionState, SessionStateBuilder},
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
-    prelude::SessionContext,
     sql::TableReference,
 };
 use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, ident};
 
+use datafusion_optimizer_rules::physical_plan::EmptyHashJoinExecPhysicalOptimization;
 use itertools::Itertools;
 use search::index::VectorIndex;
-
-use crate::datafusion::extension::hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
