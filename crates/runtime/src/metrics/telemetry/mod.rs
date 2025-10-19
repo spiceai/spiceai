@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::time::Duration;
 
-use super::{Counter, LazyLock, Meter, global};
-use opentelemetry::metrics::UpDownCounter;
-use opentelemetry::{KeyValue, metrics::Histogram};
+use super::{Counter, Histogram, LazyLock, Meter, UpDownCounter, global};
+use opentelemetry::KeyValue;
 
 pub(crate) static TELEMETRY_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("telemetry"));
 
