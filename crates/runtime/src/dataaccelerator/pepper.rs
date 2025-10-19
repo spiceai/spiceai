@@ -362,7 +362,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("unsupported_type_action")
-        .description("How to handle data types not natively supported by Vortex (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
+        .description("How to handle data types not natively supported by Pepper (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
 ];
 
