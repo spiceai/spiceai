@@ -242,10 +242,6 @@ impl RequestContext {
             ext.load().await;
         }
     }
-
-    pub fn id(&self) -> String {
-        format!("{:?} - {:?}", self.id, self.protocol())
-    }
 }
 
 impl AuthRequestContext for RequestContext {
