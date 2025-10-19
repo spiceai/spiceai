@@ -31,7 +31,7 @@ limitations under the License.
 //!
 //! # Virtual Files Concept
 //!
-//! A initial design principle in Pepper is that "files" are **virtual files** - they are not
+//! An initial design principle in Pepper is that "files" are **virtual files** - they are not
 //! single physical files, but rather Vortex `ListingTables` at unique directories. Each
 //! `DataFile` entry in the catalog represents:
 //!
