@@ -40,9 +40,6 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
-use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::DisplayFormatType;
-use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
@@ -591,18 +588,6 @@ pub async fn get_data(
             // If the refresh SQL defines a subset of columns to fetch, computed columns such as embeddings
             // are not included automatically, so we verify their presence and add them manually if needed.
             plan = include_computed_columns(plan, &table_provider.schema())?;
-
-            let physical = ctx
-                .state()
-                .create_physical_plan(&plan)
-                .await
-                .expect("JEdaie");
-
-            tracing::warn!("This is the logical plan: {}", plan.display_indent());
-            tracing::warn!(
-                "This is the physical plan: {}",
-                DisplayableExecutionPlan::new(physical.as_ref()).indent(true)
-            );
 
             DataFrame::new(session, plan)
         }

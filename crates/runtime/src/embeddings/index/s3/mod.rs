@@ -166,7 +166,7 @@ async fn try_vector_table(
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
     let client_timeout = string_from_params(&params, "client_timeout")
-        .map(|t| fundu::parse_duration(t))
+        .map(fundu::parse_duration)
         .transpose()
         .map_err(|_| {
             Box::from(format!(
