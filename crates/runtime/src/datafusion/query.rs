@@ -21,16 +21,17 @@ use ::cache::{
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-};
+use arrow::{array::RecordBatch, datatypes::Schema};
 use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
-    common::ParamValues, error::DataFusionError, execution::SendableRecordBatchStream,
-    logical_expr::LogicalPlan, physical_plan::stream::RecordBatchStreamAdapter, prelude::DataFrame,
+    common::ParamValues,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
+    execution::TaskContext,
+    logical_expr::LogicalPlan,
+    physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -211,11 +212,7 @@ impl Query {
                 t
             });
 
-            let df = DataFrame::new(session, *plan);
-
-            let df_schema: SchemaRef = Arc::clone(df.schema().inner());
-
-            let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
+            let physical_plan = match session.create_physical_plan(&plan).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     let e = find_datafusion_root(e);
@@ -230,9 +227,27 @@ impl Query {
                 }
             };
 
+            let task_ctx = Arc::new(TaskContext::from(&session));
+
+            let res_stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    let error_code = ErrorCode::from(&e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        error_code,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+            };
+
+            let plan_schema = Arc::clone(plan.schema().inner());
             let res_schema = res_stream.schema();
 
-            if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
+            if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
                 handle_error!(
                     tracker,
                     &request_context,
@@ -252,6 +267,12 @@ impl Query {
             } else {
                 res_stream
             };
+
+            let final_stream = attach_physical_plan_metrics_to_stream(
+                final_stream,
+                physical_plan,
+                Arc::clone(&request_context),
+            );
 
             Ok(QueryResult::new(
                 attach_query_tracker_to_stream(
@@ -386,7 +407,7 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
 /// Attaches a query tracker to a stream of record batches.
 ///
 /// Processes a stream of record batches, updating the query tracker
-/// with the number of records returned and saving query details at the end.
+/// with the number of records/bytes returned and saving query details at the end.
 ///
 /// Note: If an error occurs during stream processing, the query tracker
 /// is finalized with error details, and further streaming is terminated.
@@ -441,6 +462,7 @@ fn attach_query_tracker_to_stream(
         }
 
         crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
+        crate::metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
 
         tracker
             .schema(schema_copy)
@@ -452,6 +474,54 @@ fn attach_query_tracker_to_stream(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+#[must_use]
+/// Attaches logic to a stream which emits metrics from a physical plan.
+fn attach_physical_plan_metrics_to_stream(
+    mut stream: SendableRecordBatchStream,
+    physical_plan: Arc<dyn ExecutionPlan>,
+    request_context: Arc<RequestContext>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+
+    let updated_stream = stream! {
+        while let Some(batch_result) = stream.next().await {
+            yield batch_result;
+        }
+
+        let mut totals = PhysicalPlanMetricsTotals::default();
+        collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
+
+        crate::metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
+        crate::metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
+        crate::metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+    };
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        Box::pin(updated_stream),
+    ))
+}
+
+#[derive(Default, Debug)]
+/// Used to collect aggregated metrics from a physical plan.
+struct PhysicalPlanMetricsTotals {
+    pub produced_spills: u64,
+    pub spilled_bytes: u64,
+    pub spilled_rows: u64,
+}
+
+fn collect_physical_plan_metrics(plan: &dyn ExecutionPlan, totals: &mut PhysicalPlanMetricsTotals) {
+    if let Some(metrics) = plan.metrics() {
+        totals.produced_spills += metrics.spill_count().unwrap_or_default() as u64;
+        totals.spilled_bytes += metrics.spilled_bytes().unwrap_or_default() as u64;
+        totals.spilled_rows += metrics.spilled_rows().unwrap_or_default() as u64;
+    }
+
+    for child in plan.children() {
+        collect_physical_plan_metrics(child.as_ref(), totals);
+    }
 }
 
 pub fn write_to_json_string(
@@ -470,8 +540,14 @@ pub fn write_to_json_string(
 mod tests {
     use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
     use arrow::array::Int64Array;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
+    use std::any::Any;
+    use std::fmt::{Debug, Formatter};
 
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
@@ -752,5 +828,127 @@ mod tests {
             param_names,
             vec!["$1", "$2", "$10", "another_param", "non_numeric_param"]
         );
+    }
+
+    struct TestExecutionPlan {
+        metrics: Option<MetricsSet>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        properties: PlanProperties,
+    }
+
+    impl TestExecutionPlan {
+        fn new(metrics: Option<MetricsSet>, children: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+            Self {
+                metrics,
+                children,
+                properties: PlanProperties::new(
+                    EquivalenceProperties::new(Arc::new(Schema::empty())),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Final,
+                    Boundedness::Bounded,
+                ),
+            }
+        }
+    }
+
+    impl Debug for TestExecutionPlan {
+        fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
+            todo!()
+        }
+    }
+
+    impl DisplayAs for TestExecutionPlan {
+        fn fmt_as(&self, _t: DisplayFormatType, _f: &mut Formatter) -> std::fmt::Result {
+            todo!()
+        }
+    }
+
+    impl ExecutionPlan for TestExecutionPlan {
+        fn name(&self) -> &'static str {
+            "TestExecutionPlan"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &PlanProperties {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.children.iter().collect()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            self.metrics.clone()
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::common::Result<SendableRecordBatchStream> {
+            todo!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_physical_plan_metrics_no_children() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics_set).spill_count(1).add(13);
+        MetricBuilder::new(&metrics_set).spill_count(2).add(7);
+        MetricBuilder::new(&metrics_set).spilled_rows(2).add(100);
+
+        let plan = Arc::new(TestExecutionPlan::new(
+            Some(metrics_set.clone_inner()),
+            vec![],
+        )) as Arc<dyn ExecutionPlan>;
+
+        let mut totals = PhysicalPlanMetricsTotals::default();
+        collect_physical_plan_metrics(plan.as_ref(), &mut totals);
+
+        assert_eq!(totals.produced_spills, 20);
+        assert_eq!(totals.spilled_bytes, 0);
+        assert_eq!(totals.spilled_rows, 100);
+    }
+
+    #[tokio::test]
+    async fn test_collect_physical_plan_metrics_with_children() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics_set).spill_count(1).add(13);
+        MetricBuilder::new(&metrics_set).spill_count(2).add(7);
+        MetricBuilder::new(&metrics_set).spilled_rows(2).add(100);
+
+        let child1 = Arc::new(TestExecutionPlan::new(
+            Some(metrics_set.clone_inner()),
+            vec![],
+        )) as Arc<dyn ExecutionPlan>;
+
+        let child2 = Arc::new(TestExecutionPlan::new(None, vec![])) as Arc<dyn ExecutionPlan>;
+
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics_set).spill_count(1).add(13);
+        MetricBuilder::new(&metrics_set).spill_count(2).add(7);
+        MetricBuilder::new(&metrics_set).spilled_rows(2).add(100);
+
+        let plan = Arc::new(TestExecutionPlan::new(
+            Some(metrics_set.clone_inner()),
+            vec![child1, child2],
+        )) as Arc<dyn ExecutionPlan>;
+
+        let mut totals = PhysicalPlanMetricsTotals::default();
+        collect_physical_plan_metrics(plan.as_ref(), &mut totals);
+
+        assert_eq!(totals.produced_spills, 40);
+        assert_eq!(totals.spilled_bytes, 0);
+        assert_eq!(totals.spilled_rows, 200);
     }
 }
