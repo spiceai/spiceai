@@ -298,6 +298,7 @@ impl DataFusionBuilder {
             task_history_enabled: self.task_history_enabled,
             cluster_config: self.cluster_config,
             scheduler_state: RwLock::new(None),
+            scheduler_server: RwLock::new(None),
             metrics: self.metrics,
         }
     }

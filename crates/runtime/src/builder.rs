@@ -207,7 +207,7 @@ impl RuntimeBuilder {
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
         .with_caching(caching)
-        .with_cluster_config(Arc::clone(&cluster_config));
+        .with_cluster_config(Arc::clone(&cluster_config))
         .with_metrics(metrics);
 
         if let Some(dataset_parallelism) = dataset_parallelism {

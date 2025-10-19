@@ -50,6 +50,7 @@ use crate::config::ClusterConfig;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
+use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::state::SchedulerState;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
@@ -331,6 +332,7 @@ pub struct DataFusion {
     pub(crate) task_history_enabled: bool,
     pub cluster_config: Arc<ClusterConfig>,
     pub scheduler_state: RwLock<Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>>>,
+    pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     metrics: Option<Metrics>,
 }
 
@@ -1812,6 +1814,18 @@ impl DataFusion {
             .try_write()
             .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
         *scheduler_state = Some(state);
+        Ok(())
+    }
+
+    pub fn bind_scheduler_server(
+        &self,
+        server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
+    ) -> Result<()> {
+        let mut scheduler_server = self
+            .scheduler_server
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
+        *scheduler_server = Some(server);
         Ok(())
     }
 }

@@ -44,8 +44,8 @@ use ::datafusion::error::DataFusionError;
 use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::{TableReference, sqlparser};
-use ballista_core::extension::SessionConfigExt;
 use app::App;
+use ballista_core::extension::SessionConfigExt;
 use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::SchedulerConfig;
@@ -108,7 +108,7 @@ mod metrics_server;
 pub mod model;
 mod opentelemetry;
 use crate::Error::FailedToStartClusterScheduler;
-use crate::config::ClusterConfig;
+use crate::config::{ClusterConfig, ClusterMode};
 use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
@@ -591,7 +591,7 @@ impl Runtime {
     }
 
     #[cfg(feature = "cluster")]
-    pub async fn start_cluster_scheduler(self: Arc<Self>) -> Result<()> {
+    pub async fn start_cluster_scheduler(self: &Arc<Self>) -> Result<()> {
         let bind_addr = self.cluster_config.scheduler_uri.clone();
 
         let mut scheduler_config = SchedulerConfig::default();
@@ -681,15 +681,17 @@ impl Runtime {
                 source: Box::new(e),
             })?;
 
-        scheduler_process::start_grpc_service(socket_addr, scheduler)
-            .await
+        self.df
+            .bind_scheduler_server(Arc::new(scheduler))
             .map_err(|e| FailedToStartClusterScheduler {
                 source: Box::new(e),
-            })
+            })?;
+
+        Ok(())
     }
 
     #[cfg(feature = "cluster")]
-    pub async fn start_cluster_executor(self: Arc<Self>) -> Result<()> {
+    pub async fn start_cluster_executor(self: &Arc<Self>) -> Result<()> {
         let mut executor_config = ExecutorProcessConfig::default();
 
         executor_config.override_logical_codec = Some(SpiceLogicalCodec::new_codec());
@@ -891,6 +893,13 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let cloned_endpoint_auth = endpoint_auth.clone();
         let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+
+        #[cfg(feature = "cluster")]
+        match self.cluster_config.mode {
+            Some(ClusterMode::Scheduler) => self.start_cluster_scheduler().await?,
+            Some(ClusterMode::Executor) => self.start_cluster_executor().await?,
+            None => { /* no-op */ }
+        };
 
         let flight_future = self
             .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {

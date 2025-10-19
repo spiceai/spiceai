@@ -103,7 +103,7 @@ pub struct ClusterConfig {
     #[arg(
         long = "cluster_mode",
         value_name = "CLUSTER_MODE",
-        default_value = None,
+        required = false,
         action
     )]
     pub mode: Option<ClusterMode>,
@@ -114,7 +114,7 @@ pub struct ClusterConfig {
     #[arg(
         long = "scheduler_uri",
         value_name = "SCHEDULER_URI",
-        default_value = None,
+        default_value = "spiced://localhost:50051",
         action
     )]
     pub scheduler_uri: Uri<String>,
@@ -122,7 +122,7 @@ pub struct ClusterConfig {
 
 impl Default for ClusterConfig {
     fn default() -> Self {
-        let uri = match Uri::parse("0.0.0.0:50050") {
+        let uri = match Uri::parse("spiced://localhost:50051") {
             Ok(uri) => uri.to_owned(),
             Err(e) => unreachable!("The default URI could not be parsed: {}", e),
         };

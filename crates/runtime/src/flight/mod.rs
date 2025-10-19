@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::auth::EndpointAuth;
+use crate::config::ClusterMode;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
@@ -34,6 +35,7 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use async_stream::try_stream;
+use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use bytes::Bytes;
 use cache::result::CacheStatus;
 use datafusion::common::ParamValues;
@@ -422,13 +424,28 @@ pub async fn start(
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
-    let server = server
+    let mut server = server
         .layer(RequestContextLayer::new(app, rt.datafusion()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
         .layer(auth_layer)
         .add_service(svc);
+
+    if matches!(rt.cluster_config.mode, Some(ClusterMode::Scheduler)) {
+        let Some(scheduler) = rt
+            .df
+            .scheduler_server
+            .read()
+            .ok()
+            .and_then(|r| r.iter().cloned().next())
+        else {
+            unreachable!("Scheduler server not bound");
+        };
+
+        let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
+        server = server.add_service(scheduler_grpc_server);
+    }
 
     if let Some(token) = shutdown_signal {
         server
