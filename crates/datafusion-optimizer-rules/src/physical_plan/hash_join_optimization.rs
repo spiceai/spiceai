@@ -68,7 +68,7 @@ impl PhysicalOptimizerRule for EmptyHashJoinExecPhysicalOptimization {
         .data()
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "EmptyHashJoinExecPhysicalOptimization"
     }
 

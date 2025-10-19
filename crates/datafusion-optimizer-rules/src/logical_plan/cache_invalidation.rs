@@ -448,7 +448,7 @@ mod tests {
         );
         let cache = Arc::new(Caching::new().with_results_cache(Arc::clone(&results_cache)));
 
-        let df = create_test_datafusion(Arc::new(cache));
+        let df = create_test_datafusion(cache);
 
         // activate cache for test query
         execute_sql(&df, "SELECT * FROM test_table", None).await;
