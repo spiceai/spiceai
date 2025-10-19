@@ -26,7 +26,7 @@ use crate::{
     model::ModelContextExtension,
 };
 use app::App;
-use runtime_request_context::{Protocol, RequestContext};
+use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};
@@ -93,12 +93,23 @@ where
                 .build(),
         );
 
+        println!(
+            "RequestContextMiddleware.call - outside: {:?}",
+            request_context.id()
+        );
+
         req.extensions_mut()
             .insert::<Arc<dyn AuthRequestContext + Send + Sync>>(
                 Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>
             );
 
         Box::pin(Arc::clone(&request_context).scope(async move {
+            let request_context = (RequestContext::current(AsyncMarker::new().await));
+            println!(
+                "RequestContextMiddleware.call - inside: {:?}",
+                request_context.id()
+            );
+
             request_context.load_extensions().await;
             inner.call(req).await
         }))

@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
 app = { path = "../app" }
 spicepod = { path = "../spicepod" }
@@ -25,6 +26,7 @@ http.workspace = true
 runtime-auth = { path = "../runtime-auth" }
 regex.workspace = true
 opentelemetry.workspace = true
+rand = "0.9.2"
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

@@ -122,6 +122,8 @@ impl Query {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
+        // println!("query -run: {:?}", request_context.id());
+
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
         if let Some(traceparent) = request_context.trace_parent() {
@@ -460,6 +462,9 @@ fn attach_query_tracker_to_stream(
                 }
             }
         }
+
+        // let request_context = RequestContext::current(AsyncMarker::new().await);
+        // println!("stream - inside: {:?}", request_context.id());
 
         crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
         crate::metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());

@@ -15,6 +15,16 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use crate::TraceParent;
+use app::App;
+use async_stream::stream;
+use futures::{Stream, StreamExt};
+use http::HeaderMap;
+use opentelemetry::KeyValue;
+use rand::Rng;
+use regex::Regex;
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+use spicepod::component::runtime::UserAgentCollection;
 use std::{
     any::TypeId,
     collections::HashMap,
@@ -22,14 +32,6 @@ use std::{
     marker::PhantomData,
     sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
 };
-
-use crate::TraceParent;
-use app::App;
-use http::HeaderMap;
-use opentelemetry::KeyValue;
-use regex::Regex;
-use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
-use spicepod::component::runtime::UserAgentCollection;
 
 use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
@@ -44,6 +46,7 @@ pub struct RequestContext {
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
+    id: i32,
 }
 
 #[async_trait::async_trait]
@@ -143,6 +146,18 @@ impl RequestContext {
         REQUEST_CONTEXT.scope(self, f).await
     }
 
+    pub fn scope_stream<S>(self: Arc<Self>, stream: S) -> impl Stream<Item = S::Item>
+    where
+        S: Stream,
+    {
+        stream! {
+            tokio::pin!(stream);
+            while let Some(item) = self.clone().scope(stream.next()).await {
+                yield item;
+            }
+        }
+    }
+
     /// Retries the provided future from the closure `r` times until it fails or succeeds.
     pub async fn scope_retry<F, Fut, T, E>(self: Arc<Self>, r: u16, f: F) -> Fut::Output
     where
@@ -227,6 +242,10 @@ impl RequestContext {
         for ext in extensions {
             ext.load().await;
         }
+    }
+
+    pub fn id(&self) -> String {
+        format!("{:?} - {:?}", self.id, self.protocol())
     }
 }
 
@@ -408,6 +427,8 @@ impl RequestContextBuilder {
             cache_control => cache_control,
         };
 
+        let mut rng = rand::thread_rng();
+
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
@@ -416,6 +437,7 @@ impl RequestContextBuilder {
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
+            id: rng.random_range(100..=10000),
         }
     }
 
