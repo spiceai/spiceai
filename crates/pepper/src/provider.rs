@@ -43,16 +43,13 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream as DFStream;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::Constraints;
-use datafusion_common::Result as DataFusionResult;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::collect;
-use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
-use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -176,67 +173,37 @@ impl PepperTableProvider {
     /// # Errors
     ///
     /// Returns an error if the data cannot be inserted.
-    #[allow(clippy::too_many_lines)]
     #[allow(clippy::items_after_statements)]
     pub async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
-        // Count rows as we collect the stream
-        let mut row_count = 0u64;
         let schema = stream.schema();
 
-        let batches: Vec<_> = stream
-            .collect::<Vec<DataFusionResult<_>>>()
-            .await
-            .into_iter()
-            .collect::<DataFusionResult<Vec<_>>>()
-            .map_err(|e| super::catalog::CatalogError::InvalidOperation {
-                message: format!("Failed to collect record batches: {e}"),
-            })?;
-
-        for batch in &batches {
-            row_count += batch.num_rows() as u64;
-        }
-
-        if row_count == 0 {
-            return Ok(0);
-        }
-
-        // Create a new stream from the collected batches for insert_into
-        let batch_stream = futures::stream::iter(
-            batches
-                .into_iter()
-                .map(Ok::<_, datafusion_common::DataFusionError>),
-        );
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            Arc::<arrow_schema::Schema>::clone(&schema),
-            batch_stream,
-        );
-        let new_stream: DFStream = Box::pin(stream_adapter);
-
-        // Create a simple execution plan that emits the stream
-        struct StreamExec {
+        // Create a streaming execution plan that forwards batches without buffering
+        // Uses std::sync::Mutex with try_lock() to avoid blocking the async executor
+        struct StreamingExec {
             schema: arrow_schema::SchemaRef,
-            stream: tokio::sync::Mutex<Option<DFStream>>,
+            stream: std::sync::Mutex<Option<DFStream>>,
+            properties: datafusion_physical_plan::PlanProperties,
         }
 
-        impl std::fmt::Debug for StreamExec {
+        impl std::fmt::Debug for StreamingExec {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct("StreamExec").finish()
+                f.debug_struct("StreamingExec").finish()
             }
         }
 
-        impl DisplayAs for StreamExec {
+        impl DisplayAs for StreamingExec {
             fn fmt_as(
                 &self,
                 _t: DisplayFormatType,
                 f: &mut std::fmt::Formatter,
             ) -> std::fmt::Result {
-                write!(f, "StreamExec")
+                write!(f, "StreamingExec")
             }
         }
 
-        impl ExecutionPlan for StreamExec {
+        impl ExecutionPlan for StreamingExec {
             fn name(&self) -> &'static str {
-                "StreamExec"
+                "StreamingExec"
             }
 
             fn as_any(&self) -> &dyn std::any::Any {
@@ -248,7 +215,7 @@ impl PepperTableProvider {
             }
 
             fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
-                unimplemented!("properties not needed for simple insert")
+                &self.properties
             }
 
             fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -267,7 +234,18 @@ impl PepperTableProvider {
                 _partition: usize,
                 _context: Arc<datafusion_execution::TaskContext>,
             ) -> datafusion_common::Result<DFStream> {
-                let stream = self.stream.blocking_lock().take();
+                // Use try_lock() instead of blocking_lock() to avoid blocking the async executor
+                // This is safe because execute() should only be called once per partition
+                let stream = self
+                    .stream
+                    .try_lock()
+                    .map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            "Stream is locked (concurrent access detected)".to_string(),
+                        )
+                    })?
+                    .take();
+
                 stream.ok_or_else(|| {
                     datafusion_common::DataFusionError::Execution(
                         "Stream already consumed".to_string(),
@@ -276,9 +254,23 @@ impl PepperTableProvider {
             }
         }
 
-        let stream_exec = Arc::new(StreamExec {
+        use datafusion_physical_expr::EquivalenceProperties;
+        use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
+        use datafusion_physical_plan::PlanProperties;
+
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::<arrow_schema::Schema>::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Unbounded {
+                requires_infinite_memory: false,
+            },
+        );
+
+        let stream_exec = Arc::new(StreamingExec {
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
-            stream: tokio::sync::Mutex::new(Some(new_stream)),
+            stream: std::sync::Mutex::new(Some(stream)),
+            properties,
         });
 
         // Create a session context for executing the insert
@@ -301,10 +293,36 @@ impl PepperTableProvider {
             }
         })?;
 
-        // The results should contain a single row with the count of inserted rows
-        // but we already counted them ourselves, so we can just return that
+        // The insert plan returns statistics about the insert operation
+        // DataFusion's insert operations typically return a RecordBatch with a count column
+        // indicating the number of rows actually written
+        let row_count: u64 = if results.is_empty() {
+            // No results means no rows were written
+            0
+        } else if results.len() == 1 && results[0].num_columns() == 1 {
+            // Standard DataFusion insert result: single batch with single count column
+            let batch = &results[0];
+            if batch.num_rows() == 1 {
+                // Try to extract the count value from the first column
+                use arrow::array::AsArray;
+                let array = batch.column(0);
+                if let Some(count_array) = array.as_primitive_opt::<arrow::datatypes::UInt64Type>()
+                {
+                    count_array.value(0)
+                } else {
+                    // Fallback: sum all rows in all batches if format is unexpected
+                    results.iter().map(|b| b.num_rows() as u64).sum()
+                }
+            } else {
+                // Multiple rows in result batch - unexpected, use fallback
+                results.iter().map(|b| b.num_rows() as u64).sum()
+            }
+        } else {
+            // Multiple batches or unexpected format - sum rows as fallback
+            results.iter().map(|b| b.num_rows() as u64).sum()
+        };
+
         tracing::debug!("Insert completed, wrote {} rows to Vortex", row_count);
-        tracing::debug!("Insert plan returned {} result batches", results.len());
 
         Ok(row_count)
     }
