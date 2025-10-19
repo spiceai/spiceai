@@ -161,12 +161,8 @@ Pepper implements a subset of the DuckLake v0.3 specification:
 
 ### Implemented
 
-- ✅ Snapshot-based MVCC
 - ✅ Table metadata management
 - ✅ Data file tracking
-- ✅ Delete file tracking (deletion vectors)
-- ✅ Primary key support
-- ✅ Transactional catalog operations
 
 ### Minimal/Simplified
 
