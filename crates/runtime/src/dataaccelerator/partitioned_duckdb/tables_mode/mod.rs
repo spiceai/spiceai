@@ -69,6 +69,9 @@ use crate::{
 
 type Result<T, E = super::Error> = std::result::Result<T, E>;
 
+/// Accelerator for managing `DuckDB` table-based partitioning within a single database file.
+/// This struct coordinates partitioned data storage and access using `DuckDB` tables,
+/// enabling partition management and query execution in a unified database.
 pub(crate) struct TablesModePartitionedDuckDBAccelerator {
     base_accelerator: DuckDBAccelerator,
     duckdb_factory: DuckDBTableProviderFactory,
@@ -226,6 +229,12 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     }
 }
 
+/// Responsible for discovering and managing table-based partitions in `DuckDB` by
+/// encapsulating the logic for creating and handling partitions based on table
+/// definitions and partitioning expressions, interacting with the `DuckDB` connection
+/// pool and external table creation commands to ensure partitions are correctly
+/// discovered, initialized, and managed according to the schema and partitioning
+/// strategy specified.
 #[derive(Debug)]
 struct DuckDBPartitionCreator {
     pool: Arc<DuckDbConnectionPool>,

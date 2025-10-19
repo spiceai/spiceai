@@ -67,11 +67,16 @@ pub enum Error {
     UnableToGetElapsedTime { source: std::time::SystemTimeError },
 }
 
-// Buffering rows allows for much more efficient writes in DuckDB
+// Buffering rows allows for much more efficient writes in `DuckDB`
 // 122_880 represents DuckDB default size of groups of rows - that are stored together at the storage level.
 const ROWS_PER_PARTITION_BUFFER: usize = 122_880;
 
 #[derive(Clone)]
+/// A `DataFusion` sink that writes partitioned data to separate `DuckDB` tables.
+///
+/// This struct implements the `DataSink` trait, buffering and writing incoming record batches
+/// into `DuckDB` tables according to partitioning logic. Each partition is written to its own
+/// `DuckDB` table.
 pub struct DuckDBPartitionedDataSink {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,

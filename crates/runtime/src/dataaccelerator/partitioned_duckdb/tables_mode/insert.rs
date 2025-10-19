@@ -46,7 +46,7 @@ use crate::{
     datafusion::extension::pass_thru::PassThruExec,
 };
 
-/// DuckDB-specific insertion strategy for partitioned tables
+/// Strategy for handling `DuckDB` table-based partition insertions.
 #[derive(Debug)]
 pub struct DuckDBPartitionedInsertStrategy {
     pool: Arc<DuckDbConnectionPool>,
@@ -144,7 +144,13 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
     }
 }
 
-/// Expression-based partitioner that uses a `DataFusion` expression to partition batches
+/// Partitions Arrow `RecordBatch`es into separate tables based on a `DataFusion` expression.
+///
+/// `BatchPartitioner` compiles a `DataFusion` logical expression into a physical expression,
+/// which is then evaluated for each row in a batch to determine its partition key.
+/// The partitioning specification (`PartitionedBy`) provides the partition column name and expression.
+/// The `partition_batch` method uses the physical expression to group rows into partitions,
+/// returning a map from partition identifier (in hive-style format) to the corresponding `RecordBatch`.
 pub(crate) struct BatchPartitioner {
     physical_expr: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
     partitioned_by: PartitionedBy,
@@ -165,8 +171,7 @@ impl BatchPartitioner {
         })
     }
 
-    /// Partition a `RecordBatch` into multiple batches based on partition keys
-    /// Returns a `HashMap` where the key is the partition identifier and the value is the `RecordBatch` for that partition
+    /// Partition a `RecordBatch` into multiple batches based on partition keys, returning a `HashMap` where the key is the partition identifier and the value is the `RecordBatch` for that partition.
     pub fn partition_batch(
         &self,
         batch: &RecordBatch,

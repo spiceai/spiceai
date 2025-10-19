@@ -20,6 +20,11 @@ use arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
 use tokio::sync::mpsc::Sender;
 
+/// Buffers data per partition before flushing them to `DuckDB`.
+///
+/// `PartitionBuffer` accumulates `RecordBatch` for each partition, tracking the number of rows.
+/// When the number of buffered rows for a partition reaches a configured threshold, the buffer is flushed
+/// and the data is sent to `DuckDB` for ingestion. This enables efficient faster writes per partition.
 pub struct PartitionBuffer {
     sender: Sender<(String, Vec<RecordBatch>)>,
     buffers: HashMap<String, Vec<RecordBatch>>,
