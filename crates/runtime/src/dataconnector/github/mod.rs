@@ -719,6 +719,19 @@ fn warn_if_provided(
 
 const MAX_COMMENTS_FETCHED: u32 = 100;
 
+// Organization-level resources (2 segments: owner/resource_type)
+const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
+
+// Repository-level resources (3+ segments: owner/repo/resource_type[/...])
+const REPO_LEVEL_RESOURCES: &[&str] = &[
+    "pulls",
+    "issues",
+    "commits",
+    "stargazers",
+    "projects",
+    "files",
+];
+
 /// Parsed GitHub path components
 #[derive(Debug)]
 struct GitHubPathComponents<'a> {
@@ -733,19 +746,6 @@ fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
     // Strip prefix and split into segments
     let path_without_prefix = path.strip_prefix("github.com/")?;
     let segments: Vec<&str> = path_without_prefix.split('/').collect();
-
-    // Organization-level resources (2 segments: owner/resource_type)
-    const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
-
-    // Repository-level resources (3+ segments: owner/repo/resource_type[/...])
-    const REPO_LEVEL_RESOURCES: &[&str] = &[
-        "pulls",
-        "issues",
-        "commits",
-        "stargazers",
-        "projects",
-        "files",
-    ];
 
     match segments.as_slice() {
         // Organization-level: github.com/owner/resource_type
