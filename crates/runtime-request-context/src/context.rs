@@ -151,7 +151,7 @@ impl RequestContext {
     {
         stream! {
             tokio::pin!(stream);
-            while let Some(item) = self.clone().scope(stream.next()).await {
+            while let Some(item) = Arc::clone(&self).scope(stream.next()).await {
                 yield item;
             }
         }
