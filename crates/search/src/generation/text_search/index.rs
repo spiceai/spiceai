@@ -134,18 +134,13 @@ impl FullTextDatabaseIndex {
         primary_key_override: Option<Vec<String>>,
     ) -> Result<Vec<String>, super::Error> {
         // Use 'primary_key_override', fallback to underlying in table.
-        let pks = match (primary_key_override, get_primary_keys(inner)) {
-            (Some(pks), _) => pks,
-            (None, Ok(pks)) => {
-                if pks.is_empty() {
-                    return Err(super::Error::NoPrimaryKey);
-                }
-
-                pks
-            }
-            (None, Err(e)) => {
+        let pks = match (primary_key_override, get_primary_keys(inner).await) {
+            // LHS takes precedence.
+            (Some(pks), _) | (_, Ok(pks)) if !pks.is_empty() => pks,
+            (_, Err(e)) => {
                 return Err(super::Error::FailedToRetrievePrimaryKey { source: e });
             }
+            _ => return Err(super::Error::NoPrimaryKey),
         };
 
         // INDEX_UNIQUE_FIELD_NAME is a reserved field name.

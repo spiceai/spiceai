@@ -19,7 +19,11 @@ use datafusion_table_providers::util::{
 };
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
-use spicepod::{acceleration as spicepod_acceleration, param::Params};
+use spicepod::{
+    acceleration::{self as spicepod_acceleration},
+    param::Params,
+    partitioning::PartitionedBy,
+};
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 pub mod constraints;
@@ -133,6 +137,7 @@ pub enum Engine {
     PartitionedDuckDB,
     Sqlite,
     PostgreSQL,
+    Vortex,
 }
 
 impl Display for Engine {
@@ -142,6 +147,7 @@ impl Display for Engine {
             Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Vortex => write!(f, "vortex"),
         }
     }
 }
@@ -155,6 +161,7 @@ impl TryFrom<&str> for Engine {
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "vortex" => Ok(Engine::Vortex),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
@@ -298,7 +305,7 @@ pub struct Acceleration {
 
     pub disable_federation: bool,
 
-    pub partition_by: Vec<String>,
+    pub partition_by: Vec<PartitionedBy>,
 
     pub snapshots: SnapshotBehavior,
 }

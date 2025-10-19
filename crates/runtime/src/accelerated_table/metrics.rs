@@ -21,6 +21,13 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
+pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
+    "dataset_acceleration_max_timestamp_before_refresh_ms";
+pub const METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS: &str =
+    "dataset_acceleration_max_timestamp_after_refresh_ms";
+pub const METRIC_REFRESH_LAG_MS: &str = "dataset_acceleration_refresh_lag_ms";
+pub const METRIC_INGESTION_LAG_MS: &str = "dataset_acceleration_ingestion_lag_ms";
+
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
 
 pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -55,28 +62,28 @@ pub(crate) static READY_STATE_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|
 
 pub(crate) static MAX_TIMESTAMP_BEFORE_REFRESH_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
     METER
-        .i64_gauge("dataset_acceleration_max_timestamp_before_refresh_ms")
+        .i64_gauge(METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
         .with_description("Maximum value of the dataset's time_column before the refresh operation, in milliseconds.")
         .build()
 });
 
 pub(crate) static MAX_TIMESTAMP_AFTER_REFRESH_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
     METER
-        .i64_gauge("dataset_acceleration_max_timestamp_after_refresh_ms")
+        .i64_gauge(METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
         .with_description("Maximum value of the dataset's time_column after the refresh operation, in milliseconds.")
         .build()
 });
 
 pub(crate) static REFRESH_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
     METER
-        .i64_gauge("dataset_acceleration_refresh_lag_ms")
+        .i64_gauge(METRIC_REFRESH_LAG_MS)
         .with_description("Difference between the maximum time_column value after and before the refresh operation, in milliseconds.")
         .build()
 });
 
 pub(crate) static INGESTION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
     METER
-        .i64_gauge("dataset_acceleration_ingestion_lag_ms")
+        .i64_gauge(METRIC_INGESTION_LAG_MS)
         .with_description("Lag between the current wall-clock time and the maximum time_column value after the refresh operation, in milliseconds.")
         .build()
 });
