@@ -579,22 +579,6 @@ pub async fn get_data(
                 .build()
                 .map_err(find_datafusion_root)?;
 
-            let physical = ctx
-                .state()
-                .create_physical_plan(&logical_plan)
-                .await
-                .expect("JEdaie");
-
-            tracing::warn!(
-                "This is the logical plan: {}",
-                logical_plan.display_indent()
-            );
-
-            tracing::warn!(
-                "This is the physical plan: {}",
-                DisplayableExecutionPlan::new(physical.as_ref()).indent(true)
-            );
-
             DataFrame::new(ctx.state(), logical_plan)
         }
         Some(sql) => {

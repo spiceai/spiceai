@@ -351,7 +351,6 @@ pub(crate) fn to_sendable_stream(
                     match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), Arc::clone(&schema)) {
                         Ok(batch) => {
                             let n = batch.num_rows();
-                            tracing::error!("[ObjectStoreTextTable] Have this many documents {}", n);
                             yield Ok(batch);
                             count += n;
                         },
