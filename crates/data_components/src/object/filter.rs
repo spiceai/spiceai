@@ -72,13 +72,14 @@ pub async fn filter_object_meta(
         .evaluate(&rb)?
     else {
         return Err(DataFusionError::Internal(
-            "Unexpectedly recieved scalar value for 'location' column".to_string(),
+            "Unexpectedly received scalar value when evaluating object store metadata filters."
+                .to_string(),
         ));
     };
 
     let Some(bool_arr) = arr.as_any().downcast_ref::<BooleanArray>() else {
         return Err(DataFusionError::Internal(
-            "Unexpectedly recieved scalar value for 'location' column".to_string(),
+            "Unexpectedly received non-boolean value when evaluating object store metadata filters.".to_string(),
         ));
     };
 
@@ -88,11 +89,11 @@ pub async fn filter_object_meta(
         .ok_or_else(|| DataFusionError::Internal("location column not found".to_string()))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .map(|s| s.iter().filter_map(|s| s).collect::<HashSet<_>>())
+        .map(|s| s.iter().flatten().collect::<HashSet<_>>())
         .unwrap_or_default();
 
     Ok(metas
-        .into_iter()
+        .iter()
         .filter(|m| valid_locations.contains(m.location.as_ref()))
         .cloned()
         .collect())
@@ -174,7 +175,9 @@ mod tests {
             create_test_meta("file2.txt", Utc::now(), 200, None, None),
         ];
 
-        let result = filter_object_meta(&[], &metas).await.unwrap();
+        let result = filter_object_meta(&[], &metas)
+            .await
+            .expect("could not filter ObjectMeta");
         assert_eq!(result.len(), 2);
     }
 
@@ -183,7 +186,9 @@ mod tests {
         let filters = vec![col("size").gt(lit(100u64))];
         let metas: Vec<ObjectMeta> = vec![];
 
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
         assert_eq!(result.len(), 0);
     }
 
@@ -196,7 +201,9 @@ mod tests {
         ];
 
         let filters = vec![col("size").gt(lit(150u64))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "file2.txt");
@@ -212,7 +219,9 @@ mod tests {
         ];
 
         let filters = vec![col("location").like(lit("data%"))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert!(result[0].location.as_ref().starts_with("data"));
@@ -229,7 +238,9 @@ mod tests {
         ];
 
         let filters = vec![col("size").gt(lit(150u64)), col("size").lt(lit(350u64))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "file2.txt");
@@ -252,7 +263,9 @@ mod tests {
             ScalarValue::TimestampMillisecond(Some(now.timestamp_millis()), Some("UTC".into())),
             None,
         ))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].location.as_ref(), "file3.txt");
@@ -266,7 +279,9 @@ mod tests {
         ];
 
         let filters = vec![col("size").gt(lit(1000u64))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 0);
     }
@@ -280,7 +295,9 @@ mod tests {
         ];
 
         let filters = vec![col("size").gt(lit(50u64))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 3);
     }
@@ -306,7 +323,9 @@ mod tests {
         ];
 
         let filters = vec![col("e_tag").is_not_null()];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "file1.txt");
@@ -322,7 +341,9 @@ mod tests {
         ];
 
         let filters = vec![col("version").is_not_null()];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "file1.txt");
@@ -338,7 +359,9 @@ mod tests {
         ];
 
         let filters = vec![col("size").eq(lit(200u64))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "file2.txt");
@@ -354,7 +377,9 @@ mod tests {
         ];
 
         let filters = vec![col("size").lt(lit(250u64))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "file1.txt");
@@ -374,7 +399,9 @@ mod tests {
             col("location").like(lit("data%")),
             col("size").gt(lit(150u64)),
         ];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "data/file2.txt");
@@ -390,7 +417,9 @@ mod tests {
         ];
 
         let filters = vec![col("size").not_eq(lit(200u64))];
-        let result = filter_object_meta(&filters, &metas).await.unwrap();
+        let result = filter_object_meta(&filters, &metas)
+            .await
+            .expect("could not filter ObjectMeta");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].location.as_ref(), "file1.txt");

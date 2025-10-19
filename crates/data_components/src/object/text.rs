@@ -43,7 +43,7 @@ use futures::Stream;
 use futures::StreamExt;
 use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
 use snafu::ResultExt;
-use std::{any::Any, cmp::min, fmt, sync::Arc};
+use std::{any::Any, fmt, sync::Arc};
 
 use crate::object::filter::filter_object_meta;
 
@@ -95,17 +95,17 @@ impl ObjectStoreTextTable {
     }
 
     fn get_content_value(
-        raw: Bytes,
+        raw: &Bytes,
         formatter: Option<&Arc<dyn DocumentParser>>,
         location: &Path,
     ) -> Result<ArrayRef, ArrowError> {
         let utf8 = match formatter {
             Some(f) => f
-                .parse(&raw)
+                .parse(raw)
                 .and_then(|doc| doc.as_flat_utf8())
                 .boxed()
                 .map_err(|e| format!("Error parsing document {location}: {e}").into()),
-            None => std::str::from_utf8(&raw).boxed().map(ToString::to_string),
+            None => std::str::from_utf8(raw).boxed().map(ToString::to_string),
         }
         .map_err(ArrowError::from_external_error)?;
 
@@ -148,11 +148,10 @@ impl ObjectStoreTextTable {
 
     fn to_record_batch(
         meta: &ObjectMeta,
-        raw: Bytes,
+        raw: &Bytes,
         formatter: Option<&Arc<dyn DocumentParser>>,
         schema: SchemaRef,
     ) -> Result<RecordBatch, ArrowError> {
-        let mut raw_opt = Some(raw);
         let columns = schema
             .fields()
             .iter()
@@ -160,11 +159,7 @@ impl ObjectStoreTextTable {
                 "location" => {
                     Ok(Arc::new(StringArray::from(vec![meta.location.to_string()])) as ArrayRef)
                 }
-                "content" => Self::get_content_value(
-                    raw_opt.take().unwrap_or_default(),
-                    formatter,
-                    &meta.location,
-                ),
+                "content" => Self::get_content_value(raw, formatter, &meta.location),
                 "last_modified" => Ok(Arc::new(
                     TimestampMicrosecondArray::from(vec![meta.last_modified.timestamp_micros()])
                         .with_timezone("UTC"),
@@ -215,7 +210,9 @@ impl TableProvider for ObjectStoreTextTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut object_metas = self.list_and_filter_objects(filters, limit).await?;
-        object_metas.truncate(min(object_metas.len(), limit.unwrap_or(object_metas.len())));
+        if let Some(l) = limit {
+            object_metas.truncate(l);
+        }
 
         let projected_schema = project_schema(&self.schema(), projection)?;
 
@@ -304,16 +301,21 @@ impl ExecutionPlan for ObjectStoreTextExec {
         &self,
         _partition: Option<usize>,
     ) -> Result<Statistics, DataFusionError> {
+        let size = usize::try_from(
+            self.object_metas
+                .iter()
+                .map(|obj| obj.size)
+                .reduce(|a, b| a + b)
+                .unwrap_or_default(),
+        );
+
         // Only one partition.
         Ok(Statistics::new_unknown(&self.schema())
             .with_num_rows(Precision::Exact(self.object_metas.len()))
-            .with_total_byte_size(Precision::Exact(
-                self.object_metas
-                    .iter()
-                    .map(|obj| obj.size as usize)
-                    .reduce(|a, b| a + b)
-                    .unwrap_or_default(),
-            )))
+            .with_total_byte_size(match size {
+                Ok(s) => Precision::Exact(s),
+                Err(_) => Precision::Absent,
+            }))
     }
 
     fn execute(
@@ -372,7 +374,7 @@ pub(crate) fn to_sendable_stream(
                 Bytes::new()
             };
 
-            match ObjectStoreTextTable::to_record_batch(&object_meta, bytz, formatter.as_ref(), Arc::clone(&schema)) {
+            match ObjectStoreTextTable::to_record_batch(object_meta, &bytz, formatter.as_ref(), Arc::clone(&schema)) {
                 Ok(batch) => {
                     yield Ok(batch);
                 },
