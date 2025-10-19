@@ -372,7 +372,8 @@ fn insert_overwrite(
         .context(UnableToBeginTransactionSnafu)
         .map_err(to_datafusion_error)?;
 
-    // Apply constraints and indexes.
+    // Apply constraints and indexes. Since we create new internal tables for each full refresh,
+    // we need to apply indexes after each refresh.
     for new_table in &tables {
         new_table
             .create_indexes(&tx)
@@ -413,7 +414,7 @@ fn insert_append(
         table_name = table_definition.name()
     );
 
-    let (num_rows, _) = write_to_tables(
+    let (num_rows, tables) = write_to_tables(
         table_definition,
         &tx,
         schema,
@@ -432,7 +433,39 @@ fn insert_append(
         .context(UnableToCommitTransactionSnafu)
         .map_err(to_retriable_data_write_error)?;
 
-    // apply indexes
+    tracing::debug!(
+        "Load for table {table_name} complete, applying constraints and indexes.",
+        table_name = table_definition.name()
+    );
+
+    let tx = duckdb_conn
+        .conn
+        .transaction()
+        .context(UnableToBeginTransactionSnafu)
+        .map_err(to_datafusion_error)?;
+
+    // During append refresh, we only need to create indexes on new partition tables,
+    // so we check if the table has any existing indexes and only create indexes if it doesn't have any.
+    for new_table in &tables {
+        let has_indexes = !new_table
+            .current_indexes(&tx)
+            .map_err(to_retriable_data_write_error)?
+            .is_empty();
+
+        // Add logic to verify that existing indexes match required configuration
+        // https://github.com/spiceai/spiceai/issues/7590
+        if has_indexes {
+            continue;
+        }
+
+        new_table
+            .create_indexes(&tx)
+            .map_err(to_retriable_data_write_error)?;
+    }
+
+    tx.commit()
+        .context(UnableToCommitTransactionSnafu)
+        .map_err(to_retriable_data_write_error)?;
 
     Ok(num_rows)
 }
