@@ -45,7 +45,7 @@ pub enum Error {
 
     #[snafu(display("Error occurred interacting with datafusion: {source}"))]
     DataFusionError {
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: datafusion::error::DataFusionError,
     },
 
     #[snafu(display("Error occurred in search pipeline: {source}"))]

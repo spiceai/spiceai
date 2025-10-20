@@ -31,6 +31,7 @@ use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use datafusion::common::exec_err;
+use datafusion::datasource::ViewTable;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
@@ -49,6 +50,9 @@ use datafusion_expr::{
 };
 use futures::FutureExt;
 use itertools::Itertools;
+use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+use search::generation::CandidateGeneration;
+use search::generation::util::get_primary_keys;
 use std::{
     any::Any,
     cmp::min,
@@ -63,6 +67,8 @@ use search::{
 };
 use snafu::ResultExt;
 
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::search::candidate::vector::ChunkedNonIndexVectorGeneration;
 use crate::{
     datafusion::DataFusion,
     embedding_col,
@@ -142,6 +148,8 @@ impl VectorSearchTableFuncArgs {
 pub struct VectorSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
+
+    explicit_pks: HashMap<TableReference, Vec<String>>,
 }
 
 pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
@@ -165,8 +173,8 @@ pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> 
 
 impl VectorSearchTableFunc {
     #[must_use]
-    pub fn new(df: Weak<DataFusion>) -> Self {
-        Self { df }
+    pub fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
+        Self { df, explicit_pks }
     }
 
     fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
@@ -209,6 +217,7 @@ impl VectorSearchTableFunc {
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
             )));
         };
+
         let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
@@ -279,7 +288,9 @@ impl VectorSearchTableFunc {
             }
         };
         Ok(VectorSearchTableFuncArgs {
-            tbl: tbl_ref,
+            tbl: tbl_ref
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .into(),
             query: q.to_string(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
@@ -375,10 +386,34 @@ impl TableFunctionImpl for VectorSearchTableFunc {
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
         if embedding_table_provider.is_chunked(col.as_str()) {
-            return Err(DataFusionError::Plan(format!(
-                "Chunked columns (i.e. '{col}' in '{}') are not yet supported by '{VECTOR_SEARCH_UDTF_NAME}()'",
-                args.tbl.clone()
-            )));
+            let state = df.ctx.state();
+            let Some(embed_udf) = state.scalar_functions().get(EMBED_UDF_NAME) else {
+                return Err(DataFusionError::Plan(format!(
+                    "'{VECTOR_SEARCH_UDTF_NAME}()' requires missing UDF: '{EMBED_UDF_NAME}'",
+                )));
+            };
+
+            // Unsafe: worse case is metric without dimensions.
+            let dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
+            telemetry::track_vector_search(&dimensions);
+            let pks = self
+                .explicit_pks
+                .get(&args.tbl)
+                .cloned()
+                .or_else(|| get_primary_keys(&table_provider).ok());
+
+            let table = ChunkedNonIndexVectorGeneration::new(
+                &table_provider,
+                &args.tbl,
+                embed_udf,
+                embedding_table_provider
+                    .get_embedding_model_used_by(&col)
+                    .unwrap_or_default(),
+                pks.unwrap_or_default(),
+                &col,
+            )
+            .search(args.query)?;
+            return alias_value_to_match(Arc::clone(&table));
         }
 
         Ok(Arc::new(VectorSearchUDTFProvider {
@@ -596,4 +631,25 @@ impl TableProvider for VectorSearchUDTFProvider {
 
         state.create_physical_plan(&final_plan).await
     }
+}
+
+/// Create a new [`TableProvider`] where columns named `value` are aliased to `match`.
+///
+/// This is used in chunked table providers which expose 'value' for [`CandidateGeneration`], but match in [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+fn alias_value_to_match(
+    tbl: Arc<dyn TableProvider>,
+) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    let bldr = LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(tbl)), None)?;
+    let cols = Arc::clone(bldr.schema())
+        .columns()
+        .into_iter()
+        .map(|c| {
+            if c.name() == "value" {
+                Expr::Column(c).alias("match")
+            } else {
+                Expr::Column(c)
+            }
+        })
+        .collect::<Vec<Expr>>();
+    Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
 }
