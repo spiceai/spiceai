@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage, protocol};
+use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 use crate::TraceParent;
 use app::App;
 use http::HeaderMap;
