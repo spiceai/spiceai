@@ -1886,7 +1886,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("scan successful");
 
-            // Vortex may not preserve nulls properly yet, so skip this check for Vortex
+            // Pepper may not preserve nulls properly yet, so skip this check for Pepper
             if engine != Engine::Pepper {
                 for batch in &results {
                     let value_col = batch
