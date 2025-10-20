@@ -144,11 +144,11 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
 
-      - name: Set up make
-        uses: ./.github/actions/setup-make
+      # - name: Set up make
+      #   uses: ./.github/actions/setup-make
 
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
+      # - name: Set up cc
+      #   uses: ./.github/actions/setup-cc
 
       - run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
