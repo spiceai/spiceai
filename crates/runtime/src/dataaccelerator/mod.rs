@@ -48,6 +48,9 @@ use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 use self::partitioned_duckdb::{
     PartitionedDuckDBAccelerator, tables_mode::TablesModePartitionedDuckDBAccelerator,
 };
+use self::partitioned_duckdb::{
+    PartitionedDuckDBAccelerator, tables_mode::TablesModePartitionedDuckDBAccelerator,
+};
 #[cfg(feature = "pepper")]
 use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
