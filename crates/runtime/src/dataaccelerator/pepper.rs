@@ -54,7 +54,7 @@ pub enum Error {
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
     AccelerationNotEnabled { dataset: Arc<str> },
 
-    #[snafu(display("Invalid Vortex acceleration configuration: {detail}"))]
+    #[snafu(display("Invalid Pepper acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
 
     #[snafu(display("Pepper feature not enabled in build"))]
