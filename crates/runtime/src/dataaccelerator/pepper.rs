@@ -408,7 +408,7 @@ impl DataAccelerator for PepperAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::warn!(
+        tracing::info!(
             "⚠️  Pepper data accelerator is in ALPHA stage and should NOT be used in production. \
              Data format and API may change without notice."
         );
