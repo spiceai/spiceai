@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,6 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+//!  [`EmptyHashJoinExecPhysicalOptimization`] removes redundant (empty result) [`HashJoinExec`] from [`ExecutionPlan`]s.
+
 use std::sync::Arc;
 
 use datafusion::{
@@ -27,6 +30,9 @@ use datafusion::{
 };
 use datafusion_expr::JoinType;
 
+/// A [`PhysicalOptimizerRule`] that checks the [`JoinType`] and child [`ExecutionPlan`] of [`HashJoinExec`]s, and if applicable, replaces the entire [`HashJoinExec`] with a [`EmptyExec`].
+///
+/// A [`EmptyExec`] can be used if the associated child [`ExecutionPlan`] is guaranteed to have no rows (using [`ExecutionPlan::partition_statistics`]).
 #[derive(Debug)]
 pub struct EmptyHashJoinExecPhysicalOptimization {}
 
