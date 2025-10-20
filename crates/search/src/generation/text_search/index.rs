@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 use std::cmp::min;
+use std::path::PathBuf;
 use std::slice;
-use std::{any::Any, collections::HashSet, path::PathBuf, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
@@ -93,14 +94,14 @@ impl Index for FullTextDatabaseIndex {
 }
 
 impl FullTextDatabaseIndex {
-    pub async fn try_new(
+    pub fn try_new(
         inner: Arc<dyn TableProvider>,
         search_fields: Vec<String>,
         primary_key_override: Option<Vec<String>>,
         directory: Option<PathBuf>,
         store_field: &[String],
     ) -> Result<Self, super::Error> {
-        let pks = Self::validate_primary_key(&inner, primary_key_override).await?;
+        let pks = Self::validate_primary_key(&inner, primary_key_override)?;
         let tantivy_schema = Self::create_tantivy_schema(
             &inner,
             search_fields.as_slice(),
@@ -108,8 +109,8 @@ impl FullTextDatabaseIndex {
             store_field,
         )?;
 
-        let index = if let Some(path) = &directory {
-            match tantivy::Index::create_in_dir(path, tantivy_schema) {
+        let index = if let Some(path) = directory {
+            match tantivy::Index::create_in_dir(path.clone(), tantivy_schema) {
                 Ok(idx) => idx,
                 Err(TantivyError::IndexAlreadyExists) => {
                     tantivy::index::Index::open_in_dir(path).context(TextSearchIndexingSnafu)?
@@ -128,12 +129,12 @@ impl FullTextDatabaseIndex {
         })
     }
 
-    async fn validate_primary_key(
+    fn validate_primary_key(
         inner: &Arc<dyn TableProvider>,
         primary_key_override: Option<Vec<String>>,
     ) -> Result<Vec<String>, super::Error> {
         // Use 'primary_key_override', fallback to underlying in table.
-        let pks = match (primary_key_override, get_primary_keys(inner).await) {
+        let pks = match (primary_key_override, get_primary_keys(inner)) {
             // LHS takes precedence.
             (Some(pks), _) | (_, Ok(pks)) if !pks.is_empty() => pks,
             (_, Err(e)) => {
@@ -427,7 +428,7 @@ impl SearchIndex for FullTextDatabaseIndex {
             LogicalPlanBuilder::scan(
                 self.name(),
                 Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
-                    index: field_index,
+                    index: Arc::new(field_index),
                     query: query.to_string(),
                     pre_limit: None,
                 }))),
@@ -459,6 +460,7 @@ fn parse_json_array(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use arrow::{
         array::{Int32Array, StringArray},
@@ -496,7 +498,6 @@ mod tests {
         let primary_key = Some(vec!["id".to_string()]);
 
         let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key, None, &[])
-            .await
             .expect("Failed to create index");
 
         let input_batch = RecordBatch::try_new(
