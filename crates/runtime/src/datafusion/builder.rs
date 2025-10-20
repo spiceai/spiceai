@@ -23,10 +23,7 @@ use std::{
 use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
-    extension::{
-        SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule,
-        cache_invalidation::CacheInvalidationOptimizerRule,
-    },
+    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
     schema::SpiceSchemaProvider,
 };
 use crate::config::ClusterConfig;
@@ -36,6 +33,7 @@ use crate::{
         SPICE_SCP_SCHEMA, extension::cache_invalidation::CacheInvalidationExtensionPlanner,
     },
 };
+use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
 use datafusion::config::SpillCompression;
@@ -56,6 +54,12 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_optimizer_rules::{
+    logical_plan::{
+        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+    },
+    physical_plan::EmptyHashJoinExecPhysicalOptimization,
+};
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -217,6 +221,7 @@ impl DataFusionBuilder {
                     .with_extension_planners(SpiceQueryPlanner::default_extension_planners()),
             ))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
 

@@ -1161,7 +1161,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_search_with_cache() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpcds_dataset_w_embeddings(
         "cached_search",

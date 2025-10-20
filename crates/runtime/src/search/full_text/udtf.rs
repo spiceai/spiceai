@@ -49,6 +49,7 @@ use std::any::Any;
 use std::sync::LazyLock;
 use std::sync::{Arc, Weak};
 
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
@@ -229,7 +230,9 @@ impl TextSearchTableFunc {
             }
         };
         Ok(TextSearchTableFuncArgs {
-            tbl: tbl_ref,
+            tbl: tbl_ref
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .into(),
             query: q.to_string(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
