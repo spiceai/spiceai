@@ -18,7 +18,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
-use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     common::DFSchema,
@@ -82,32 +81,45 @@ impl DuckDBPartitionedInsertStrategy {
             let creator = Arc::clone(&creator);
             let partitions_lock = Arc::clone(&partitions_lock);
 
-            let s = stream! {
-                let mut input = input_stream;
-                let mut ok = true;
-                while let Some(item) = input.next().await {
-                    match item {
-                        Ok(b) => yield Ok(b),
-                        Err(e) => { ok = false; yield Err(e); }
-                    }
-                }
-                if ok {
-                    // Re-infer partitions and update context after successful completion
-                    match creator.infer_existing_partitions().await {
-                        Ok(partitions) => {
-                            let partitions_map = partitions
-                                .into_iter()
-                                .map(|p| (p.partition_value.to_string(), p))
-                                .collect::<HashMap<_, _>>();
-                            *partitions_lock.write().await = partitions_map;
+            let output_stream = futures::stream::unfold(
+                (input_stream, creator, partitions_lock, true),
+                |(mut input, creator, partitions_lock, mut success)| async move {
+                    match input.next().await {
+                        Some(Ok(batch)) => {
+                            Some((Ok(batch), (input, creator, partitions_lock, success)))
                         }
-                        Err(e) => {
-                            tracing::warn!("Failed to re-infer partitions after insert: {e}");
+                        Some(Err(e)) => {
+                            success = false;
+                            Some((Err(e), (input, creator, partitions_lock, success)))
+                        }
+                        None => {
+                            // Stream completed - re-infer partitions if successful
+                            if success {
+                                match creator.infer_existing_partitions().await {
+                                    Ok(partitions) => {
+                                        let partitions_map = partitions
+                                            .into_iter()
+                                            .map(|p| (p.partition_value.to_string(), p))
+                                            .collect::<HashMap<_, _>>();
+                                        *partitions_lock.write().await = partitions_map;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to re-infer partitions after insert: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            None
                         }
                     }
-                }
-            };
-            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)) as SendableRecordBatchStream)
+                },
+            );
+
+            Ok(
+                Box::pin(RecordBatchStreamAdapter::new(schema, output_stream))
+                    as SendableRecordBatchStream,
+            )
         };
 
         Arc::new(

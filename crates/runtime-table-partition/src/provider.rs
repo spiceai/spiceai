@@ -114,20 +114,11 @@ impl PartitionTableProvider {
         })
     }
 
-    /// Creates a new [`PartitionTableProvider`] with a custom data insertion strategy.
-    ///
-    /// # Errors
-    /// This function will return an Error when the `partition_by` expression
-    /// validation fails.
-    pub async fn new_with_insert_strategy(
-        creator: Arc<dyn PartitionCreator>,
-        partition_by: Vec<PartitionedBy>,
-        schema: SchemaRef,
-        insert_strategy: Arc<dyn InsertStrategy>,
-    ) -> Result<Self, Error> {
-        let mut provider = Self::new(creator, partition_by, schema).await?;
-        provider.insert_strategy = insert_strategy;
-        Ok(provider)
+    /// Sets a custom data insertion strategy for this [`PartitionTableProvider`].
+    #[must_use]
+    pub fn with_insert_strategy(mut self, insert_strategy: Arc<dyn InsertStrategy>) -> Self {
+        self.insert_strategy = insert_strategy;
+        self
     }
 }
 

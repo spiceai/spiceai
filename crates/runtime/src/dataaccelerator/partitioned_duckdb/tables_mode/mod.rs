@@ -210,13 +210,9 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         ));
 
         let table_provider = Arc::new(
-            PartitionTableProvider::new_with_insert_strategy(
-                creator,
-                partition_by,
-                schema,
-                insert_strategy,
-            )
-            .await?,
+            PartitionTableProvider::new(creator, partition_by, schema)
+                .await?
+                .with_insert_strategy(insert_strategy),
         );
 
         Ok(table_provider as Arc<dyn TableProvider>)

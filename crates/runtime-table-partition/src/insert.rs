@@ -451,6 +451,58 @@ pub fn partition_batch(
     Ok(batches)
 }
 
+/// Strategy for handling custom insertion logic in partition tables
+#[async_trait::async_trait]
+pub trait InsertStrategy: Send + Sync + std::fmt::Debug {
+    /// Handle the insertion with custom logic
+    ///
+    /// # Arguments
+    /// * `input` - The input execution plan
+    /// * `insert_op` - The insert operation (append/overwrite)
+    /// * `context` - Access to partition context (creator, partitions, schema, etc.)
+    ///
+    /// # Returns
+    /// An execution plan that handles the custom insertion
+    async fn execute_insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+        context: &PartitionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>;
+}
+
+/// Context information for custom insertion handlers
+#[derive(Debug)]
+pub struct PartitionContext {
+    pub creator: Arc<dyn PartitionCreator>,
+    pub partition_by: PartitionedBy,
+    pub partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
+    pub schema: SchemaRef,
+}
+
+/// Default insertion strategy that uses the existing [`PartitionerExec`]
+#[derive(Debug)]
+pub struct DefaultInsertStrategy;
+
+#[async_trait::async_trait]
+impl InsertStrategy for DefaultInsertStrategy {
+    async fn execute_insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+        context: &PartitionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Ok(Arc::new(PartitionerExec::new(
+            input,
+            context.partition_by.clone(),
+            Arc::clone(&context.creator),
+            Arc::clone(&context.partitions),
+            insert_op,
+            Arc::clone(&context.schema),
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::{
@@ -534,57 +586,5 @@ mod tests {
         }
 
         Ok(())
-    }
-}
-
-/// Strategy for handling custom insertion logic in partition tables
-#[async_trait::async_trait]
-pub trait InsertStrategy: Send + Sync + std::fmt::Debug {
-    /// Handle the insertion with custom logic
-    ///
-    /// # Arguments
-    /// * `input` - The input execution plan
-    /// * `insert_op` - The insert operation (append/overwrite)
-    /// * `context` - Access to partition context (creator, partitions, schema, etc.)
-    ///
-    /// # Returns
-    /// An execution plan that handles the custom insertion
-    async fn execute_insert(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-        context: &PartitionContext,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>;
-}
-
-/// Context information for custom insertion handlers
-#[derive(Debug)]
-pub struct PartitionContext {
-    pub creator: Arc<dyn PartitionCreator>,
-    pub partition_by: PartitionedBy,
-    pub partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
-    pub schema: SchemaRef,
-}
-
-/// Default insertion strategy that uses the existing [`PartitionerExec`]
-#[derive(Debug)]
-pub struct DefaultInsertStrategy;
-
-#[async_trait::async_trait]
-impl InsertStrategy for DefaultInsertStrategy {
-    async fn execute_insert(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-        context: &PartitionContext,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Ok(Arc::new(PartitionerExec::new(
-            input,
-            context.partition_by.clone(),
-            Arc::clone(&context.creator),
-            Arc::clone(&context.partitions),
-            insert_op,
-            Arc::clone(&context.schema),
-        )))
     }
 }
