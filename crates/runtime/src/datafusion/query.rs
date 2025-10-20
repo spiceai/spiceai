@@ -80,6 +80,19 @@ pub enum Error {
     BindingParameters { source: DataFusionError },
 }
 
+impl Error {
+    // Attempts to return the internal [`DataFusionError`] if present. On error, returns the original error.
+    pub fn attempt_internal_datafusion_err(self) -> Result<DataFusionError, Self> {
+        match self {
+            Self::UnableToExecuteQuery { source }
+            | Self::UnableToCreateMemoryStream { source }
+            | Self::UnableToCollectResults { source }
+            | Self::BindingParameters { source } => Ok(source),
+            e => Err(e),
+        }
+    }
+}
+
 pub enum QueryMethod {
     Plan(Box<LogicalPlan>),
     Text {

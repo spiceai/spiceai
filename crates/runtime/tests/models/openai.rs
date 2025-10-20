@@ -220,7 +220,7 @@ mod search {
         .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_search_column_casing() -> Result<(), anyhow::Error> {
         verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await

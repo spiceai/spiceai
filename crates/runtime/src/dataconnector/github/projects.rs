@@ -18,14 +18,62 @@ use crate::dataconnector::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::client::UnnestBehavior;
+use data_components::graphql::{ErrorChecker, GraphQLContext, client::UnnestBehavior};
+use http::{HeaderMap, HeaderValue};
+use serde_json::Value;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#projectv2
+#[derive(Debug)]
 pub struct ProjectsTableArgs {
     pub owner: String,
     pub repo: Option<String>,
     pub component: ConnectorComponent,
+}
+
+impl GraphQLContext for ProjectsTableArgs {
+    fn error_checker(&self) -> Option<ErrorChecker> {
+        Some(Arc::new(
+            |headers: &HeaderMap<HeaderValue>, response: &Value| {
+                // Trace the response for debugging
+                tracing::trace!(
+                    "GitHub Projects GraphQL response: {}",
+                    serde_json::to_string_pretty(response)
+                        .unwrap_or_else(|_| "Unable to serialize response".to_string())
+                );
+
+                // First check standard GitHub errors (rate limits, etc.)
+                data_components::github::error_checker(headers, response)?;
+
+                // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
+                // returns "Something went wrong while executing your query" instead of a proper
+                // permission error. This appears to be a GitHub API bug where lack of permissions
+                // triggers an internal error rather than returning a proper authorization error.
+                if let Some(errors) = response.get("errors") {
+                    tracing::debug!("GitHub Projects query returned errors: {:?}", errors);
+                    if let Some(errors_array) = errors.as_array() {
+                        for error in errors_array {
+                            if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+                                tracing::debug!("Checking error message: {}", message);
+                                if message
+                                    .contains("Something went wrong while executing your query")
+                                {
+                                    tracing::error!(
+                                        "Detected GitHub permission error for projects access"
+                                    );
+                                    return Err(data_components::graphql::Error::InvalidCredentialsOrPermissions {
+                                    message: "GitHub App does not have permission to access projects. Verify the app has 'Read access to organization projects' or 'Read access to repository projects' permission.".to_string(),
+                                });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+        ))
+    }
 }
 
 impl GitHubTableArgs for ProjectsTableArgs {
@@ -252,6 +300,8 @@ mod tests {
         assert!(query.contains("updated_at: updatedAt"));
         assert!(query.contains("closed_at: closedAt"));
         assert!(query.contains("short_description: shortDescription"));
+        assert!(query.contains("creator: creator"));
+        assert!(query.contains("creator: login"));
 
         // Should NOT contain repositoryOwner or fragments
         assert!(!query.contains("repositoryOwner"));
@@ -279,6 +329,8 @@ mod tests {
         assert!(query.contains("updated_at: updatedAt"));
         assert!(query.contains("closed_at: closedAt"));
         assert!(query.contains("short_description: shortDescription"));
+        assert!(query.contains("creator: creator"));
+        assert!(query.contains("creator: login"));
 
         // Should NOT contain repository-specific structure
         assert!(!query.contains("repository(owner:"));
