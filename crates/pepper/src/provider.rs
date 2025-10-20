@@ -50,6 +50,7 @@ use datafusion_physical_plan::collect;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -174,14 +175,15 @@ impl PepperTableProvider {
     ///
     /// Returns an error if the data cannot be inserted.
     #[allow(clippy::items_after_statements)]
+    #[allow(clippy::too_many_lines)]
     pub async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
         let schema = stream.schema();
 
         // Create a streaming execution plan that forwards batches without buffering
-        // Uses std::sync::Mutex with try_lock() to avoid blocking the async executor
+        // Uses tokio::sync::Mutex to properly handle async context
         struct StreamingExec {
             schema: arrow_schema::SchemaRef,
-            stream: std::sync::Mutex<Option<DFStream>>,
+            stream: tokio::sync::Mutex<Option<DFStream>>,
             properties: datafusion_physical_plan::PlanProperties,
         }
 
@@ -234,23 +236,36 @@ impl PepperTableProvider {
                 _partition: usize,
                 _context: Arc<datafusion_execution::TaskContext>,
             ) -> datafusion_common::Result<DFStream> {
-                // Use try_lock() instead of blocking_lock() to avoid blocking the async executor
-                // This is safe because execute() should only be called once per partition
-                let stream = self
-                    .stream
-                    .try_lock()
-                    .map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            "Stream is locked (concurrent access detected)".to_string(),
-                        )
-                    })?
-                    .take();
+                // Use async-aware RecordBatchStreamAdapter to properly forward the stream
+                let schema = Arc::<arrow_schema::Schema>::clone(&self.schema);
+                let stream_mutex = Arc::new(tokio::sync::Mutex::new(
+                    self.stream
+                        .try_lock()
+                        .map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                "Stream is locked (concurrent access detected)".to_string(),
+                            )
+                        })?
+                        .take()
+                        .ok_or_else(|| {
+                            datafusion_common::DataFusionError::Execution(
+                                "Stream already consumed".to_string(),
+                            )
+                        })?,
+                ));
 
-                stream.ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Stream already consumed".to_string(),
-                    )
-                })
+                use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+                let adapter = RecordBatchStreamAdapter::new(
+                    schema,
+                    async_stream::stream! {
+                        let mut stream = stream_mutex.lock().await;
+                        while let Some(batch) = stream.next().await {
+                            yield batch;
+                        }
+                    },
+                );
+
+                Ok(Box::pin(adapter))
             }
         }
 
@@ -269,7 +284,7 @@ impl PepperTableProvider {
 
         let stream_exec = Arc::new(StreamingExec {
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
-            stream: std::sync::Mutex::new(Some(stream)),
+            stream: tokio::sync::Mutex::new(Some(stream)),
             properties,
         });
 
@@ -434,6 +449,17 @@ impl TableProvider for PepperTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Block overwrite operations until multiple ListingTables are implemented
+        // Overwrite requires atomic replacement of all virtual files, which needs
+        // proper catalog tracking of individual files (not yet implemented)
+        if overwrite == InsertOp::Overwrite {
+            return Err(datafusion_common::DataFusionError::NotImplemented(
+                "INSERT OVERWRITE is not yet supported for Pepper tables. \
+                 Use INSERT INTO for append operations."
+                    .to_string(),
+            ));
+        }
+
         // Delegate to the underlying listing table for Vortex file writing
         // The listing table will use VortexSink to write the data
         // In the future, we would also:

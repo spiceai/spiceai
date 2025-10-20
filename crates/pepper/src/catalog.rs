@@ -71,36 +71,22 @@ pub enum CatalogError {
     },
 
     /// Task join error
-    #[snafu(display("Task join error: {source}"))]
+    #[snafu(transparent)]
     TaskJoin {
         /// The underlying task join error
         source: tokio::task::JoinError,
     },
-}
 
-// Implement From trait for rusqlite::Error
-impl From<rusqlite::Error> for CatalogError {
-    fn from(err: rusqlite::Error) -> Self {
-        CatalogError::Sqlite { source: err }
-    }
-}
-
-// Implement From trait for tokio::task::JoinError
-impl From<tokio::task::JoinError> for CatalogError {
-    fn from(err: tokio::task::JoinError) -> Self {
-        CatalogError::TaskJoin { source: err }
-    }
-}
-
-// Implement From trait for std::io::Error
-impl From<std::io::Error> for CatalogError {
-    fn from(err: std::io::Error) -> Self {
-        CatalogError::Io { source: err }
-    }
+    /// IO error (from `std::io::Error`)
+    #[snafu(transparent)]
+    IoError {
+        /// The underlying IO error  
+        source: std::io::Error,
+    },
 }
 
 /// Result type for catalog operations.
-pub type Result<T, E = CatalogError> = Result<T, E>;
+pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
 /// Trait for metadata catalog operations.
 ///

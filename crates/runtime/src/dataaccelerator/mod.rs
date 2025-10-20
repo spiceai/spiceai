@@ -776,7 +776,7 @@ mod accelerator_compat_tests {
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
             #[cfg(feature = "pepper")]
-            (Engine::Pepper, "file", None), // Vortex only supports file mode
+            (Engine::Pepper, "file", None), // Pepper only supports file mode
         ];
 
         for (engine, mode, timestamp_format) in test_configs {
@@ -1634,9 +1634,19 @@ mod accelerator_compat_tests {
 
                 new_columns.push(Arc::new(builder.finish()) as ArrayRef);
             } else {
-                // For other type mismatches, just use the source column
-                // (this handles compatible conversions like Float16->Float32 that Arrow can handle)
-                new_columns.push(Arc::clone(source_array));
+                // For other type mismatches, use Arrow's cast kernel to handle compatible conversions
+                // (e.g., Float16->Float32, Int32->Int64, etc.)
+                let casted =
+                    arrow::compute::cast(source_array, target_field.data_type()).map_err(|e| {
+                        arrow::error::ArrowError::ComputeError(format!(
+                            "Failed to cast field '{}' from {:?} to {:?}: {}",
+                            target_field.name(),
+                            source_type,
+                            target_field.data_type(),
+                            e
+                        ))
+                    })?;
+                new_columns.push(casted);
             }
         }
 
