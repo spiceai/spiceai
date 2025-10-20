@@ -27,7 +27,7 @@ use ::cache::{
     result::{CacheStatus, query::QueryResult},
 };
 use arrow::{array::RecordBatch, datatypes::Schema};
-use arrow_schema::{Field, SchemaBuilder};
+use arrow_schema::{Field, SchemaBuilder, SchemaRef};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
