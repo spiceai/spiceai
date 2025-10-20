@@ -18,20 +18,12 @@ use std::sync::Arc;
 use crate::search::full_text::udtf::{
     TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc, TextSearchTableFuncArgs,
 };
-use datafusion::common::Column;
-use datafusion::datasource::provider_as_source;
+use datafusion::catalog::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::sqlparser::ast::Expr;
-use datafusion::logical_expr::{LogicalPlanBuilder, SortExpr};
-use datafusion::prelude::{DataFrame, Expr as LogicalExpr};
 
-use datafusion::sql::sqlparser::ast::Ident;
-use datafusion::{execution::SendableRecordBatchStream, sql::TableReference};
-use itertools::Itertools;
+use datafusion::sql::TableReference;
+use search::generation::CandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
-use search::generation::{CandidateGeneration, Error as SearchGenerationError};
-use search::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
-use snafu::ResultExt;
 use tonic::async_trait;
 
 use crate::datafusion::DataFusion;
@@ -50,129 +42,23 @@ impl TextSearchCandidate {
     ) -> Self {
         Self { inner, df, tbl }
     }
-
-    fn construct_udtf_sql_dataframe(
-        &self,
-        query: String,
-        opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
-        limit: usize,
-    ) -> Result<DataFrame, DataFusionError> {
-        let pre_limit = if opt_filters.is_empty() {
-            Some(limit)
-        } else {
-            None
-        };
-        let udtf_args = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
-            tbl: self.tbl.clone(),
-            query,
-            column: Some(self.inner.field.clone()),
-            limit: pre_limit,
-            include_score: Some(true),
-        });
-
-        let udtf_provider = self
-            .df
-            .ctx
-            .table_function(TEXT_SEARCH_UDTF_NAME)?
-            .create_table_provider(udtf_args.as_slice())?;
-
-        let mut udtf = DataFrame::new(
-            self.df.ctx.state(),
-            LogicalPlanBuilder::scan(
-                format!("{TEXT_SEARCH_UDTF_NAME}()"),
-                provider_as_source(udtf_provider),
-                None,
-            )?
-            .build()?,
-        );
-
-        let filters: Vec<LogicalExpr> = opt_filters
-            .iter()
-            .map(|f| {
-                self.df
-                    .ctx
-                    .state()
-                    .create_logical_expr(f.to_string().as_str(), udtf.schema())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if let Some(filter) = filters.iter().cloned().reduce(LogicalExpr::and) {
-            udtf = udtf.filter(filter)?;
-        }
-
-        let projection: Vec<String> = self
-            .inner
-            .primary_key
-            .iter()
-            .cloned()
-            .chain(addition_projection.iter().map(|&e| format!("{e}")))
-            .chain([
-                SEARCH_SCORE_COLUMN_NAME.to_string(),
-                format!("\"{}\" as {SEARCH_VALUE_COLUMN_NAME}", self.inner.field),
-            ])
-            .unique()
-            .collect();
-        let projection_ref = projection.iter().map(String::as_str).collect::<Vec<_>>();
-
-        udtf.select_exprs(&projection_ref)?
-            .sort(vec![SortExpr::new(
-                LogicalExpr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
-                false,
-                false,
-            )])?
-            .limit(0, Some(limit))
-    }
 }
 
 #[async_trait]
 impl CandidateGeneration for TextSearchCandidate {
-    async fn search(
-        &self,
-        query: String,
-        opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
-        limit: usize,
-    ) -> search::generation::Result<SendableRecordBatchStream> {
-        let dataframe = self
-            .construct_udtf_sql_dataframe(query, opt_filters, addition_projection, limit)
-            .boxed()
-            .map_err(|e| SearchGenerationError::InternalError { source: e })?;
-        let query = self.df.query_from_logical_plan(dataframe.logical_plan());
+    fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        let udtf_args = TextSearchTableFunc::to_expr(&TextSearchTableFuncArgs {
+            tbl: self.tbl.clone(),
+            query,
+            column: Some(self.inner.field.clone()),
+            limit: None,
+            include_score: Some(true),
+        });
 
-        tracing::trace!("running SQL: {}", query.display_sql());
-
-        Ok(query
-            .run()
-            .await
-            .boxed()
-            .map_err(|e| SearchGenerationError::InternalError { source: e })?
-            .data)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> search::generation::Result<Vec<bool>> {
-        Ok((0..filters.len()).map(|_| false).collect::<Vec<_>>())
-    }
-
-    /// Whether additional columns of the underlying source can also be retrieved during generation.
-    fn supports_columns(&self, projection: &[&Expr]) -> search::generation::Result<Vec<bool>> {
-        let columns = self.inner.all_columns();
-
-        let cols_found = projection
-            .iter()
-            .map(|expr| {
-                if let Expr::Identifier(Ident { value, .. }) = expr {
-                    columns.contains(value) || value == SEARCH_SCORE_COLUMN_NAME
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        Ok(cols_found)
+        self.df
+            .ctx
+            .table_function(TEXT_SEARCH_UDTF_NAME)?
+            .create_table_provider(udtf_args.as_slice())
     }
 
     /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.

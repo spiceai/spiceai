@@ -9,16 +9,6 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
-      },
-      "primary_key": {
-        "id": 948
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
         "question": "How many groups of 3 are in 18?"
       },
       "primary_key": {
@@ -29,10 +19,10 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 5 are in 25?"
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
       },
       "primary_key": {
-        "id": 464
+        "id": 1277
       },
       "score": 0.01
     },
@@ -42,7 +32,17 @@ snapshot_kind: text
         "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
       },
       "primary_key": {
-        "id": 1277
+        "id": 948
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "How many groups of 5 are in 25?"
+      },
+      "primary_key": {
+        "id": 464
       },
       "score": 0.01
     }
