@@ -94,6 +94,7 @@ impl MockClient {
     }
 
     /// Get the current vector count for an index
+    #[must_use]
     pub fn get_vector_count(&self, index_name: &str) -> usize {
         let data = match self.data.lock() {
             Ok(lock) => lock,
@@ -125,7 +126,7 @@ impl S3Vectors for MockClient {
             .index_arn(format!("arn:aws:s3vectors:::{bucket_name}:{index_name}"))
             .creation_time(DateTime::from_secs(0))
             .build()
-            .unwrap();
+            .map_err(|_| SdkError::construction_failure("build"))?;
 
         bucket_indexes.push(index_summary);
 
@@ -182,11 +183,11 @@ impl S3Vectors for MockClient {
             Err(e) => e.into_inner(),
         };
 
+        let empty = Vec::<IndexSummary>::new();
         let bucket_indexes = data
             .indexes
             .get(bucket_name)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
+            .map_or(empty.as_slice(), Vec::as_slice);
         let index_summary = bucket_indexes
             .iter()
             .find(|idx| idx.index_name() == index_name);
@@ -205,7 +206,7 @@ impl S3Vectors for MockClient {
                     .dimension(384)
                     .distance_metric(DistanceMetric::Cosine)
                     .build()
-                    .expect("Failed to build Index");
+                    .map_err(|_| SdkError::construction_failure("build"))?;
 
                 Ok(GetIndexOutput::builder().index(index_details).build())
             }
@@ -308,7 +309,7 @@ impl S3Vectors for MockClient {
             let service_error = ServiceQuotaExceededException::builder()
                 .message("Vector quota exceeded")
                 .build()
-                .expect("Failed to build ServiceQuotaExceededException");
+                .map_err(|_| SdkError::construction_failure("build"))?;
 
             return Err(SdkError::ServiceError(
                 ServiceError::builder()
@@ -316,7 +317,8 @@ impl S3Vectors for MockClient {
                         service_error,
                     ))
                     .raw(HttpResponse::new(
-                        StatusCode::try_from(402).unwrap(),
+                        StatusCode::try_from(402)
+                            .map_err(|_| SdkError::construction_failure("status code"))?,
                         SdkBody::empty(),
                     ))
                     .build(),

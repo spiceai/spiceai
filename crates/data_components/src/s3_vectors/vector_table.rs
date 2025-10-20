@@ -515,7 +515,6 @@ impl S3VectorsTable {
                                     "S3 Vector index {current_index} reached capacity, spilling to {next_index}",
                                 );
                                 current_index = next_index;
-                                continue; // Retry with the new index
                             }
                             None => {
                                 return Err(Error::InternalError {
@@ -542,7 +541,6 @@ impl S3VectorsTable {
                                 "S3 Vector index {current_index} reached capacity, spilling to {next_index}",
                             );
                             current_index = next_index;
-                            continue; // Retry with the new index
                         }
                         None => {
                             return Err(Error::InternalError {

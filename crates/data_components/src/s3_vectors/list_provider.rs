@@ -1020,7 +1020,8 @@ mod tests {
             distance_metric: DistanceMetric::Cosine,
         };
 
-        let list_table = S3VectorsListTable::new(s3_table, column_name.to_string(), vec![col(column_name)]);
+        let list_table =
+            S3VectorsListTable::new(s3_table, column_name.to_string(), vec![col(column_name)]);
 
         let session_state = SessionContext::new().state();
         let plan = list_table
