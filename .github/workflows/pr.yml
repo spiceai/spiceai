@@ -127,22 +127,22 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
+      # - name: Check if sccache can be set up
+      #   run: |
+      #     if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+      #       echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+      #       echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+      #     else
+      #       echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+      #       echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      #     fi
 
-      - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
+      # - name: Set up sccache
+      #   if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+      #   uses: ./.github/actions/setup-sccache
+      #   with:
+      #     minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+      #     os: 'linux'
 
       # - name: Set up make
       #   uses: ./.github/actions/setup-make
