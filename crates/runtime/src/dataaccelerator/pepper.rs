@@ -401,7 +401,7 @@ impl DataAccelerator for PepperAccelerator {
         }
     }
 
-    /// Initializes a `Vortex` database for the dataset
+    /// Initializes a `Pepper` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
     async fn init(
