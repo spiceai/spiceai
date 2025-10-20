@@ -157,8 +157,8 @@ impl Query {
                     }
 
                     let mut stream = query_result.data;
-                    let rc = Arc::clone(&request_context);
-                    while let Some(batch) = rc.scope(stream.next()).await {
+                    while let Some(batch) = Arc::clone(&request_context).scope(stream.next()).await
+                    {
                         if batch_tx.send(batch).await.is_err() {
                             break;
                         }
