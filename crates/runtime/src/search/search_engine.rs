@@ -23,18 +23,18 @@ use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::DFSchema;
+use datafusion::common::{Column, DFSchema};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_expr::sqlparser::ast::Ident;
-use datafusion_expr::{LogicalPlan, ident};
+use datafusion_expr::{Expr, LogicalPlan, col, ident};
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 use search::pipeline::QueryEngine;
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, resolved_equality};
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::ChunkedNonIndexVectorGeneration,
@@ -317,15 +317,28 @@ impl SearchEngine {
                             data_source: vec![tbl.clone()],
                         })?.schema()) {
                             let state = self.df.ctx.state();
-                            where_cond.iter().map(|f| state.create_logical_expr(&f.to_string(), &schm)).collect::<Result<_, DataFusionError>>().context(DataFusionSnafu)?
+                            if let Some(expr) = where_cond.as_ref().map(|f| state.create_logical_expr(&f.to_string(), &schm)).transpose().context(DataFusionSnafu)? {
+                                let not_for_this_table = expr.column_refs().iter().filter_map(|c| c.relation.as_ref()).any(|rel| !resolved_equality(tbl.clone(), rel.clone()));
+                                if not_for_this_table {
+                                    vec![]
+                                } else {
+                                    vec![expr]
+                                }
+                            } else {
+                                vec![]
+                            }
                     } else {
                         vec![]
                     };
 
-                    let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df)))).run(
+                    // Ensure columns for a specific table aren't used on all tables.
+                    let table_cols: Vec<_> = additional_columns.iter().filter(|&c| c.relation.as_ref().is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone()))).cloned().map(Expr::Column).collect();
+
+                    let pipe = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df))));
+                    let agg_result = pipe.run(
                         query.clone(),
                         filters,
-                        additional_columns.iter().map(|Ident{value,..}| ident(value.clone())).collect(),
+                        table_cols,
                         primary_keys.to_vec(),
                         keywords,
                         *limit
