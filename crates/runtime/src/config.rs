@@ -101,7 +101,7 @@ impl Default for Config {
 pub struct ClusterConfig {
     /// Configure cluster mode role
     #[arg(
-        long = "cluster_mode",
+        long = "cluster-mode",
         value_name = "CLUSTER_MODE",
         required = false,
         action
@@ -112,7 +112,7 @@ pub struct ClusterConfig {
     /// join a cluster, or by schedulers to control their bind
     /// address.
     #[arg(
-        long = "scheduler_uri",
+        long = "scheduler-uri",
         value_name = "SCHEDULER_URI",
         default_value = "spiced://localhost:50051",
         action

@@ -485,6 +485,7 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+    #[cfg(feature = "cluster")]
     cluster_config: Arc<ClusterConfig>,
 }
 
@@ -648,24 +649,8 @@ impl Runtime {
         self.status
             .update_cluster("scheduler", ComponentStatus::Ready);
 
-        tracing::info!(
-            "Starting Ballista scheduler with gRPC and REST API on {}",
-            bind_addr
-        );
+        tracing::info!("Starting Ballista scheduler on {}", bind_addr);
 
-        let Some(socket_addr) = bind_addr
-            .authority()
-            .and_then(|a| a.socket_addrs(50050).ok())
-            .into_iter()
-            .flatten()
-            .next()
-        else {
-            return Err(FailedToStartClusterScheduler {
-                source: "Unable to resolve bind address".into(),
-            });
-        };
-
-        // gRPC + REST API
         let scheduler = scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
             cluster,
             scheduler_config.into(),
@@ -715,12 +700,7 @@ impl Runtime {
             SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
         }));
 
-        // executor_config.work_dir = self
-        //     .app
-        //     .read()
-        //     .await
-        //     .as_ref()
-        //     .and_then(|a| a.runtime.temp_directory.clone());
+        executor_config.work_dir = self.df.temp_directory.clone();
 
         self.cluster_config
             .scheduler_uri
@@ -762,18 +742,13 @@ impl Runtime {
 
         executor_config.port = bindable_addr.port();
         executor_config.bind_host = bindable_addr.ip().to_string();
+        executor_config.external_host = Some(bindable_addr.ip().to_string());
 
-        tracing::info!(
-            "Joining cluster ({}) as an executor (at: {})",
-            self.cluster_config.scheduler_uri,
-            bindable_addr
-        );
+        self.executor_bind_app(self.cluster_config.scheduler_uri.to_string())
+            .await?;
 
         self.status
             .update_cluster("executor", ComponentStatus::Ready);
-
-        self.executor_bind_app("grpc://localhost:50051".to_string())
-            .await?;
 
         start_executor_process(Arc::new(executor_config))
             .await
@@ -852,6 +827,41 @@ impl Runtime {
             .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
+        // Shutdown signal
+        let shutdown_signal_future = async {
+            let graceful_shutdown = async {
+                shutdown_signal().await;
+                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
+                self.shutdown().await;
+                Ok(())
+            };
+            tokio::select! {
+                result = graceful_shutdown => result,
+                () = force_shutdown_signal() => {
+                    tracing::info!("Force shutdown signal received. Terminating immediately.");
+                    // return error to force stop waiting for other tasks and terminate immediately
+                    Err(Error::ForceTerminated)
+                }
+            }
+        };
+
+        #[cfg(feature = "cluster")]
+        let cluster_future = async {
+            match self.cluster_config.mode {
+                Some(ClusterMode::Scheduler) => self.start_cluster_scheduler().await,
+                Some(ClusterMode::Executor) => self.start_cluster_executor().await,
+                None => Ok(()),
+            }
+        };
+
+        #[cfg(not(feature = "cluster"))]
+        let cluster_future = async { Ok(()) };
+
+        #[cfg(feature = "cluster")]
+        if matches!(self.cluster_config.mode, Some(ClusterMode::Executor)) {
+            return tokio::try_join!(shutdown_signal_future, cluster_future,).map(|_| ());
+        }
+
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
@@ -893,13 +903,6 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let cloned_endpoint_auth = endpoint_auth.clone();
         let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
-
-        #[cfg(feature = "cluster")]
-        match self.cluster_config.mode {
-            Some(ClusterMode::Scheduler) => self.start_cluster_scheduler().await?,
-            Some(ClusterMode::Executor) => self.start_cluster_executor().await?,
-            None => { /* no-op */ }
-        };
 
         let flight_future = self
             .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
@@ -963,26 +966,9 @@ impl Runtime {
             })
             .await;
 
-        // Shutdown signal
-        let shutdown_signal_future = async {
-            let graceful_shutdown = async {
-                shutdown_signal().await;
-                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
-                self.shutdown().await;
-                Ok(())
-            };
-            tokio::select! {
-                result = graceful_shutdown => result,
-                () = force_shutdown_signal() => {
-                    tracing::info!("Force shutdown signal received. Terminating immediately.");
-                    // return error to force stop waiting for other tasks and terminate immediately
-                    Err(Error::ForceTerminated)
-                }
-            }
-        };
-
         // wait for all servers to shut down or if any of the servers fail to start
         match tokio::try_join!(
+            cluster_future,
             http_future,
             flight_future,
             metrics_future,

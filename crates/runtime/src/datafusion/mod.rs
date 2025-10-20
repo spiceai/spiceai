@@ -333,6 +333,7 @@ pub struct DataFusion {
     pub cluster_config: Arc<ClusterConfig>,
     pub scheduler_state: RwLock<Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
+    pub temp_directory: Option<String>,
     metrics: Option<Metrics>,
 }
 

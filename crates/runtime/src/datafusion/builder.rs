@@ -27,12 +27,6 @@ use super::{
     schema::SpiceSchemaProvider,
 };
 use crate::config::ClusterConfig;
-use crate::{
-    dataaccelerator::AcceleratorEngineRegistry,
-    datafusion::{
-        SPICE_SCP_SCHEMA, extension::cache_invalidation::CacheInvalidationExtensionPlanner,
-    },
-};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
@@ -54,12 +48,8 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
-use datafusion_optimizer_rules::{
-    logical_plan::{
-        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
-    },
-    physical_plan::EmptyHashJoinExecPhysicalOptimization,
-};
+use datafusion_optimizer_rules::logical_plan::cache_invalidation::CacheInvalidationOptimizerRule;
+use datafusion_optimizer_rules::physical_plan::EmptyHashJoinExecPhysicalOptimization;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -304,6 +294,7 @@ impl DataFusionBuilder {
             cluster_config: self.cluster_config,
             scheduler_state: RwLock::new(None),
             scheduler_server: RwLock::new(None),
+            temp_directory: self.temp_directory.clone(),
             metrics: self.metrics,
         }
     }

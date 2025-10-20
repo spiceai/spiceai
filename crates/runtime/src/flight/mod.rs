@@ -36,6 +36,7 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use async_stream::try_stream;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
+use ballista_executor::flight_service::BallistaFlightService;
 use bytes::Bytes;
 use cache::result::CacheStatus;
 use datafusion::common::ParamValues;
@@ -432,20 +433,31 @@ pub async fn start(
         .layer(auth_layer)
         .add_service(svc);
 
-    if matches!(rt.cluster_config.mode, Some(ClusterMode::Scheduler)) {
-        let Some(scheduler) = rt
-            .df
-            .scheduler_server
-            .read()
-            .ok()
-            .and_then(|r| r.iter().cloned().next())
-        else {
-            unreachable!("Scheduler server not bound");
-        };
+    #[cfg(feature = "cluster")]
+    match rt.cluster_config.mode {
+        Some(ClusterMode::Scheduler) => {
+            let Some(scheduler) = rt
+                .df
+                .scheduler_server
+                .read()
+                .ok()
+                .and_then(|r| r.iter().cloned().next())
+            else {
+                unreachable!("Scheduler server not bound");
+            };
 
-        let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
-        server = server.add_service(scheduler_grpc_server);
-    }
+            let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
+            server = server.add_service(scheduler_grpc_server);
+        }
+        Some(ClusterMode::Executor) => {
+            let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX);
+
+            server = server.add_service(executor_flight);
+        }
+        _ => { /* no-op */ }
+    };
 
     if let Some(token) = shutdown_signal {
         server
