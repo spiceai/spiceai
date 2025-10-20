@@ -60,6 +60,40 @@ use crate::{
     datafusion::dialect::new_duckdb_dialect, parameters::ParameterSpec, spice_data_base_path,
 };
 
+pub mod tables_mode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuckDBPartitionMode {
+    Tables,
+    Files,
+}
+
+impl DuckDBPartitionMode {
+    pub fn parse_str(s: &str) -> Self {
+        match s {
+            "tables" => DuckDBPartitionMode::Tables,
+            "files" => DuckDBPartitionMode::Files,
+            other => {
+                tracing::warn!(
+                    "Unknown `duckdb_partition_mode` '{}', defaulting to 'files' mode.",
+                    other
+                );
+                DuckDBPartitionMode::Files
+            }
+        }
+    }
+}
+
+#[must_use]
+pub fn get_duckdb_partition_mode(params: &Option<spicepod::param::Params>) -> DuckDBPartitionMode {
+    params
+        .as_ref()
+        .and_then(|p| p.as_string_map().get("duckdb_partition_mode").cloned())
+        .map_or(DuckDBPartitionMode::Files, |v| {
+            DuckDBPartitionMode::parse_str(&v)
+        })
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create table: {source}"))]
@@ -102,6 +136,11 @@ pub enum Error {
 
     #[snafu(display("Unable to create checkpointing pool: {source}"))]
     FailedToCreateCheckpointingPool {
+        source: datafusion_table_providers::duckdb::Error,
+    },
+
+    #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
+    FailedToCreateConnectionPool {
         source: datafusion_table_providers::duckdb::Error,
     },
 

@@ -15,6 +15,7 @@ limitations under the License.
 */
 use cache::key::SearchKey;
 use datafusion::common::Column;
+use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;

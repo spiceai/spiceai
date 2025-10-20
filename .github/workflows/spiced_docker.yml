@@ -1,115 +1,163 @@
 name: spiced_docker
 
 on:
-  push:
-    tags:
-      - v*
+  release:
+    types:
+      - edited
   workflow_dispatch:
     inputs:
-      publish:
-        description: Publish the Docker images to the registry
+      release_tag:
+        description: Git tag to source binaries from (for example v1.4.0)
         required: false
-        default: 'false'
+        type: string
+      publish:
+        description: Publish the Docker images to registries
+        required: false
+        type: boolean
+        default: false
       target:
         description: Build docker images for specific target(s)
         required: false
         type: choice
         options:
-          - 'all'
-          - 'amd64'
-          - 'arm64'
-          - 'cuda'
-        default: 'all'
+          - all
+          - amd64
+          - arm64
+          - cuda
+        default: all
 
 jobs:
   setup:
+    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == true) }}
     runs-on: ubuntu-latest
     outputs:
-      rel_version: ${{ steps.set_version.outputs.rel_version }}
+      rel_version: ${{ steps.resolve.outputs.rel_version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      target: ${{ steps.resolve.outputs.target }}
+      run_amd64: ${{ steps.resolve.outputs.run_amd64 }}
+      run_arm64: ${{ steps.resolve.outputs.run_arm64 }}
+      run_cuda: ${{ steps.resolve.outputs.run_cuda }}
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Add REL_VERSION to output
-        id: set_version
+      - name: Resolve release metadata
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          echo "rel_version=${{ env.REL_VERSION }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          event_name="${{ github.event_name }}"
+          if [ "$event_name" = "workflow_dispatch" ]; then
+            target_input="${{ github.event.inputs.target }}"
+            publish_flag="${{ github.event.inputs.publish || 'false' }}"
+            release_tag_input="${{ github.event.inputs.release_tag }}"
+          else
+            target_input="all"
+            publish_flag="true"
+            release_tag_input="${{ github.event.release.tag_name }}"
+          fi
+
+          target_input="${target_input:-all}"
+
+          if [ -z "$release_tag_input" ]; then
+            release_tag_input=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q .tagName)
+          fi
+
+          if [ -z "$release_tag_input" ]; then
+            echo "Failed to resolve release tag" >&2
+            exit 1
+          fi
+
+          if [[ "$release_tag_input" != v* ]]; then
+            release_tag="v${release_tag_input}"
+          else
+            release_tag="$release_tag_input"
+          fi
+
+          rel_version="${release_tag#v}"
+
+          run_amd64=false
+          run_arm64=false
+          run_cuda=false
+          case "$target_input" in
+            all|"")
+              run_amd64=true
+              run_arm64=true
+              run_cuda=true
+              ;;
+            amd64)
+              run_amd64=true
+              ;;
+            arm64)
+              run_arm64=true
+              ;;
+            cuda)
+              run_cuda=true
+              ;;
+            *)
+              echo "Unknown target selection: $target_input" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "rel_version=${rel_version}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish_flag}" >> "$GITHUB_OUTPUT"
+          echo "target=${target_input}" >> "$GITHUB_OUTPUT"
+          echo "run_amd64=${run_amd64}" >> "$GITHUB_OUTPUT"
+          echo "run_arm64=${run_arm64}" >> "$GITHUB_OUTPUT"
+          echo "run_cuda=${run_cuda}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
-    if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'all' }}
     needs: setup
     runs-on: spiceai-dev-runners
     steps:
+      - name: Skip AMD64 build
+        if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
+        run: echo "Skipping AMD64 image build per workflow configuration."
+
       - uses: actions/checkout@v5
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
-          # Enable docker driver for layer caching
           driver-opts: |
             image=moby/buildkit:latest
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "BINARY_VARIANT=default" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
-        name: Build AMD64 ${{ env.IMAGE_TAG }} image
+        name: Package AMD64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile-release
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
+            BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=release
+            GITHUB_REPOSITORY=${{ github.repository }}
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
-      - name: odbc
-        run: |
-          echo "IMAGE_TAG=odbc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,odbc" >> $GITHUB_ENV
-      - *build-amd64-image
       - name: models
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
+          echo "BINARY_VARIANT=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - *build-amd64-image
-      - name: jemalloc
-        run: |
-          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-jemalloc" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: mimalloc
-        run: |
-          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-mimalloc" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: sysalloc
-        run: |
-          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-system" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: models-jemalloc
-        run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: models-mimalloc
-        run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: models-sysalloc
-        run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
-      - *build-amd64-image
+
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -117,14 +165,15 @@ jobs:
           path: /tmp/image-amd64-*.tar
 
   build-arm64:
-    if: ${{ github.event_name == 'push' || inputs.target == 'arm64' || inputs.target == 'all' }}
     needs: setup
-    runs-on: hosted-linux-arm-runner-16-cores
-    env:
-      IMAGE_TAG: default
-      CARGO_FEATURES: release
+    runs-on: hosted-linux-arm-runner
     steps:
+      - name: Skip ARM64 build
+        if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
+        run: echo "Skipping ARM64 image build per workflow configuration."
+
       - uses: actions/checkout@v5
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Install docker
         run: |
@@ -135,145 +184,137 @@ jobs:
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Start Docker service
         run: |
           sudo systemctl start docker
           sudo systemctl status docker
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: chown /var/run/docker.sock to current user
         run: |
           sudo chown $USER /var/run/docker.sock
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
+      - name: default
+        run: |
+          echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "BINARY_VARIANT=default" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
-        name: Build ARM64 ${{ env.IMAGE_TAG }} image
+        name: Package ARM64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile-release
           platforms: linux/arm64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
+            BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=release
+            GITHUB_REPOSITORY=${{ github.repository }}
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
-      - name: odbc
-        run: |
-          echo "IMAGE_TAG=odbc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,odbc" >> $GITHUB_ENV
-      - *build-arm64-image
       - name: models
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
+          echo "BINARY_VARIANT=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - *build-arm64-image
-      - name: jemalloc
-        run: |
-          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-jemalloc" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: mimalloc
-        run: |
-          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-mimalloc" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: sysalloc
-        run: |
-          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-system" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: models-jemalloc
-        run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: models-mimalloc
-        run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: models-sysalloc
-        run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
-      - *build-arm64-image
+
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@v4
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
   build-cuda:
-    if: ${{ github.event_name == 'push' || inputs.target == 'cuda' || inputs.target == 'all' }}
     needs: setup
-    runs-on: 'ubuntu-gpu-t4-4-core'
+    runs-on: 'spiceai-dev-runners'
+    env:
+      CUDA_COMPUTE_CAP: 80
     steps:
+      - name: Skip CUDA build
+        if: ${{ needs.setup.outputs.run_cuda != 'true' }}
+        run: echo "Skipping CUDA image build per workflow configuration."
+
       - uses: actions/checkout@v5
-
-      - name: Install docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ca-certificates curl gnupg lsb-release
-          sudo mkdir -m 0755 -p /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-      - name: Start Docker service
-        run: |
-          sudo systemctl start docker
-          sudo systemctl status docker
-
-      - name: chown /var/run/docker.sock to current user
-        run: |
-          sudo chown $USER /var/run/docker.sock
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
-      - name: Build CUDA models image
+      - name: Configure CUDA models build
+        run: |
+          echo "IMAGE_TAG=models-cuda" >> $GITHUB_ENV
+          echo "BINARY_VARIANT=models-cuda" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
+
+      - name: Package CUDA models image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile-cuda
+          file: Dockerfile-cuda-release
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:models-cuda-amd64,dest=/tmp/images-amd64-cuda.tar
+          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/images-amd64-cuda.tar
           cache-from: type=gha,scope=build-cuda
           cache-to: type=gha,scope=build-cuda,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=release,models,cuda
-            RUST_PROFILE=release
+            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
+            GITHUB_REPOSITORY=${{ github.repository }}
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts
         uses: actions/upload-artifact@v4
         with:
           name: images-amd64-cuda
           path: /tmp/images-amd64-cuda.tar
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
   publish:
+    if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-latest
+    env:
+      REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+      PUBLISH: ${{ needs.setup.outputs.publish }}
+      RUN_AMD64: ${{ needs.setup.outputs.run_amd64 }}
+      RUN_ARM64: ${{ needs.setup.outputs.run_arm64 }}
     steps:
-      - name: Download all artifacts
+      - name: Download AMD64 artifacts
+        if: needs.setup.outputs.run_amd64 == 'true'
         uses: actions/download-artifact@v5
         with:
+          name: images-amd64
           path: /tmp
-          pattern: images-*
-          merge-multiple: true
+
+      - name: Download ARM64 artifacts
+        if: needs.setup.outputs.run_arm64 == 'true'
+        uses: actions/download-artifact@v5
+        with:
+          name: images-arm64
+          path: /tmp
 
       - name: Verify artifacts
         run: |
@@ -287,7 +328,7 @@ jobs:
           docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
       - name: Login to GitHub Package Registry
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        if: needs.setup.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -295,54 +336,58 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to DockerHub
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        if: needs.setup.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Import images and create manifests
-        env:
-          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
-          PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true' }}
         run: |
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
-          variants=("default" "odbc" "models" "jemalloc" "mimalloc" "sysalloc" "models-jemalloc" "models-mimalloc" "models-sysalloc")
+          echo "RUN_AMD64=${RUN_AMD64}"
+          echo "RUN_ARM64=${RUN_ARM64}"
+
+          variants=("default" "models")
           for variant in "${variants[@]}"; do
             suffix=""
             if [ "$variant" != "default" ]; then
               suffix="-${variant}"
             fi
 
-            # Load both architecture images
-            echo "Loading AMD64 image"
-            docker load -i /tmp/image-amd64-${variant}.tar
+            sources=()
 
-            echo "Loading ARM64 image"
-            docker load -i /tmp/image-arm64-${variant}.tar
+            if [ "${RUN_AMD64}" = "true" ] && [ -f "/tmp/image-amd64-${variant}.tar" ]; then
+              echo "Loading AMD64 image for ${variant}"
+              docker load -i /tmp/image-amd64-${variant}.tar
+              docker push localhost:5000/spiceai:${variant}-amd64
+              sources+=("localhost:5000/spiceai:${variant}-amd64")
+            fi
 
-            # Push images to local registry
-            echo "Pushing images to local registry"
-            docker push localhost:5000/spiceai:${variant}-amd64
-            docker push localhost:5000/spiceai:${variant}-arm64
+            if [ "${RUN_ARM64}" = "true" ] && [ -f "/tmp/image-arm64-${variant}.tar" ]; then
+              echo "Loading ARM64 image for ${variant}"
+              docker load -i /tmp/image-arm64-${variant}.tar
+              docker push localhost:5000/spiceai:${variant}-arm64
+              sources+=("localhost:5000/spiceai:${variant}-arm64")
+            fi
+
+            if [ ${#sources[@]} -eq 0 ]; then
+              echo "No images built for variant ${variant}; skipping manifest creation."
+              continue
+            fi
 
             if [[ "${PUBLISH}" == "true" ]]; then
-              # Push to GitHub Container Registry
-              echo "Pushing to GHCR"
+              echo "Publishing ${variant} to GHCR and DockerHub"
               docker buildx imagetools create \
                 -t ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix} \
                 -t ghcr.io/spiceai/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+                "${sources[@]}"
 
-              # Push to DockerHub
-              echo "Pushing to DockerHub"
               docker buildx imagetools create \
                 -t spiceai/spiceai:${REL_VERSION}${suffix} \
                 -t spiceai/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+                "${sources[@]}"
 
               echo "Verifying GHCR image:"
               docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}
@@ -350,27 +395,28 @@ jobs:
               echo "Verifying DockerHub image:"
               docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}${suffix}
             else
-              echo "Skipping push for non-tag build"
-              echo "Creating local manifest for testing:"
+              echo "Skipping registry publish for ${variant}"
               docker buildx imagetools create \
                 -t localhost:5000/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+                "${sources[@]}"
 
               docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
             fi
           done
 
   publish-cuda:
-    if: ${{ github.event_name == 'push' || inputs.target == 'cuda' || inputs.target == 'all' }}
     needs: [setup, build-cuda]
+    if: ${{ needs.setup.outputs.run_cuda == 'true' }}
     runs-on: 'ubuntu-gpu-t4-4-core'
+    env:
+      REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+      PUBLISH: ${{ needs.setup.outputs.publish }}
     steps:
-      - name: Download all artifacts
+      - name: Download CUDA artifacts
         uses: actions/download-artifact@v5
         with:
+          name: images-amd64-cuda
           path: /tmp
-          pattern: images-amd64-cuda
 
       - name: Verify artifacts
         run: |
@@ -384,7 +430,7 @@ jobs:
           docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
       - name: Login to GitHub Package Registry
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        if: needs.setup.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -392,19 +438,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to DockerHub
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        if: needs.setup.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Import images and create manifests
-        env:
-          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
-          PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true' }}
         run: |
-          echo "Handling CUDA models..."
+          if [ ! -f /tmp/images-amd64-cuda.tar ]; then
+            echo "No CUDA artifacts to publish."
+            exit 0
+          fi
 
+          echo "Handling CUDA models..."
           docker load -i /tmp/images-amd64-cuda.tar
           docker push localhost:5000/spiceai:models-cuda-amd64
 
@@ -423,7 +470,7 @@ jobs:
             echo "Verifying CUDA DockerHub image:"
             docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-models-cuda
           else
-            echo "Skipping push for non-tag CUDA build"
+            echo "Skipping push for non-publish CUDA build"
             docker buildx imagetools create \
               -t localhost:5000/spiceai:latest-models-cuda \
               localhost:5000/spiceai:models-cuda-amd64

@@ -27,7 +27,7 @@ use datafusion::common::{DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_expr::sqlparser::ast;
-use datafusion_expr::{Expr, LogicalPlan};
+use datafusion_expr::{Expr, LogicalPlan, ident};
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
