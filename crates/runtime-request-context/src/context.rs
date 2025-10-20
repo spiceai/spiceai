@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
+use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage, protocol};
 use crate::TraceParent;
 use app::App;
 use http::HeaderMap;
@@ -34,6 +34,11 @@ use std::{
         atomic::{AtomicI16, AtomicU8},
     },
 };
+
+static HTTP_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static FLIGHT_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static FLIGHTSQL_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static INTERNAL_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
 
 type Extensions = HashMap<TypeId, Arc<dyn Extension + Send + Sync>>;
 
@@ -175,8 +180,21 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn to_protocol_dimensions(&self) -> Vec<KeyValue> {
-        vec![KeyValue::new("protocol", self.protocol().as_str())]
+    pub fn to_protocol_dimensions(&self) -> &'static [KeyValue] {
+        let protocol = self.protocol();
+        match protocol {
+            Protocol::Http => {
+                HTTP_DIMENSIONS.get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())])
+            }
+            Protocol::Flight => {
+                FLIGHT_DIMENSIONS.get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())])
+            }
+            Protocol::FlightSQL => FLIGHTSQL_DIMENSIONS
+                .get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())]),
+            Protocol::Internal => INTERNAL_DIMENSIONS
+                .get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())]),
+            Protocol::Invalid => &[],
+        }
     }
 
     #[must_use]

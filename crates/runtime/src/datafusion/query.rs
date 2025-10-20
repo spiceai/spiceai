@@ -488,7 +488,7 @@ fn attach_query_tracker_to_stream(
 ///  * Active query count decrement will be called with the same dimensions as increment.
 pub struct QueryActiveGuard {
     request_context: Arc<RequestContext>,
-    dimensions: Vec<KeyValue>,
+    dimensions: &'static [KeyValue],
     active: bool,
 }
 
@@ -513,24 +513,27 @@ impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
         let exited = self.request_context.exited_top_level_query();
         if self.active && exited {
-            crate::metrics::telemetry::dec_query_active_count(&self.dimensions);
+            crate::metrics::telemetry::dec_query_active_count(self.dimensions);
         }
     }
 }
 
 fn attach_query_active_guard_to_stream(
-    mut stream: SendableRecordBatchStream,
+    stream: SendableRecordBatchStream,
     request_context: Arc<RequestContext>,
     span: Span,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
-    let updated_stream = stream! {
-        let _guard = QueryActiveGuard::new(Arc::clone(&request_context));
 
-        while let Some(batch_result) = stream.next().await {
-            yield batch_result;
-        }
-    };
+    let guard = QueryActiveGuard::new(Arc::clone(&request_context));
+
+    let updated_stream =
+        futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
+            stream
+                .next()
+                .await
+                .map(|batch_result| (batch_result, (stream, guard)))
+        });
 
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
