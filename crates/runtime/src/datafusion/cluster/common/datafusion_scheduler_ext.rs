@@ -11,31 +11,25 @@ use tokio::runtime::Handle;
 use tokio::task;
 
 pub trait DataFusionSchedulerExtensions<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
-    fn scheduler_state(&self) -> Result<Arc<SchedulerState<T, U>>>;
+    fn scheduler_state(&self) -> Option<Arc<SchedulerState<T, U>>>;
 
     fn executors(&self) -> Result<Vec<(ExecutorMetadata, Option<Duration>)>> {
-        task::block_in_place(|| {
-            Handle::current().block_on(
-                self.scheduler_state()?
-                    .executor_manager
-                    .get_executor_state(),
-            )
-        })
-        .map_err(|e| DataFusionError::External(Box::new(e)))
+        if let Some(scheduler_state) = self.scheduler_state() {
+            task::block_in_place(|| {
+                Handle::current().block_on(scheduler_state.executor_manager.get_executor_state())
+            })
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+        } else {
+            Ok(vec![])
+        }
     }
 }
 
 impl DataFusionSchedulerExtensions<LogicalPlanNode, PhysicalPlanNode> for DataFusion {
-    fn scheduler_state(&self) -> Result<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>> {
-        let state = self
-            .scheduler_state
+    fn scheduler_state(&self) -> Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>> {
+        self.scheduler_state
             .try_read()
-            .map_err(|_| DataFusionError::External("Unable to read scheduler state".into()))?;
-
-        if let Some(state) = state.as_ref() {
-            Ok(Arc::clone(state))
-        } else {
-            exec_err!("Unable to read scheduler state")
-        }
+            .ok()
+            .and_then(|maybe_state| maybe_state.clone())
     }
 }

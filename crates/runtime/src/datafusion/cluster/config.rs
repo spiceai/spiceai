@@ -5,7 +5,7 @@ config_namespace! {
     pub struct SpiceClusterExecutionConfig {
         /// Target size for file groups. Should be larger than the default row-group size e.g. for formats like Parquet.
         pub file_group_size_bytes: u64, default = 128_000_000
-        pub file_scan_expand_stages: usize, default = 200
+        pub file_scan_expand_max_stages: Option<usize>, default = None
     }
 }
 

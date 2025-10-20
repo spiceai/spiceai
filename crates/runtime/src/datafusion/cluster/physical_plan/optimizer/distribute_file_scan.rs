@@ -1,21 +1,21 @@
 use crate::concrete;
+use crate::datafusion::DataFusion;
 use crate::datafusion::cluster::common::datafusion_scheduler_ext::DataFusionSchedulerExtensions;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
-use crate::datafusion::DataFusion;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{exec_err, Result};
+use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
-use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::Partitioning;
+use datafusion::physical_expr::expressions::col;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_datasource::PartitionedFile;
 use itertools::Itertools;
 use std::cmp::max;
 use std::sync::Arc;
@@ -93,17 +93,15 @@ impl DistributeFileScanOptimizer {
     fn groups_to_stages(
         &self,
         groups: Vec<FileGroup>,
-        desired_stages: usize,
-        task_parallelism: usize,
+        max_stages: Option<usize>,
     ) -> Result<Vec<Vec<FileGroup>>> {
-        // Large reads (when bucketed on byte size) that exceed desired stage count
-        let stage_size: usize = if groups.len() > desired_stages {
-            let at_desired_stages = groups.len() / desired_stages;
-            max(at_desired_stages, task_parallelism)
-        }
-        // Smaller reads: split byte size groups amongst current executor fleet
-        else {
-            groups.len() / max(self.df.executors()?.len(), 2)
+        let stage_size = groups.len() / max(self.df.executors()?.len(), 2);
+        let max_stages = max_stages.unwrap_or(usize::MAX);
+
+        let stage_size = if (groups.len() / stage_size) > max_stages {
+            groups.len() / max_stages
+        } else {
+            stage_size
         };
 
         Ok(groups
@@ -126,8 +124,6 @@ impl DistributeFileScanOptimizer {
         };
 
         let file_group_byte_size = spice_config.execution.file_group_size_bytes;
-        let desired_stages = spice_config.execution.file_scan_expand_stages;
-        let task_partitions = config.execution.target_partitions;
 
         // Get all the partitioned files
         let partitioned_files = file_scan_config
@@ -137,22 +133,18 @@ impl DistributeFileScanOptimizer {
             .collect::<Vec<_>>();
 
         let read_size: u64 = partitioned_files.iter().map(Self::read_size).sum();
-        let core_count = self.df.executors()?.len() * task_partitions;
 
-        // If we don't hit the byte size trigger, splat the task out to all cores
+        // If less than our byte size bucket, skip that step and let `groups_to_stages` distribute
         let file_groups = if read_size <= file_group_byte_size {
-            let group_size = max(partitioned_files.len() / core_count, 1);
-            partitioned_files
-                .into_iter()
-                .chunks(group_size)
-                .into_iter()
-                .map(|g| FileGroup::new(g.collect()))
-                .collect()
+            vec![FileGroup::new(partitioned_files)]
         } else {
             Self::groups_by_byte_size(partitioned_files, file_group_byte_size)
         };
 
-        let stages = self.groups_to_stages(file_groups, desired_stages, task_partitions)?;
+        let stages = self.groups_to_stages(
+            file_groups,
+            spice_config.execution.file_scan_expand_max_stages,
+        )?;
 
         if stages.len() < 2 {
             return Ok(None);
@@ -186,10 +178,9 @@ impl DistributeFileScanOptimizer {
 
         let partitioning = match (exec.output_partitioning(), partition_column) {
             // Preserve input partitioning if compatible with stage split
-            (Partitioning::Hash(exprs, count), _) => Partitioning::Hash(
-                exprs.clone(),
-                max(task_partitions, *count),
-            ),
+            (Partitioning::Hash(exprs, count), _) => {
+                Partitioning::Hash(exprs.clone(), max(task_partitions, *count))
+            }
             // Try to guess alternate partitioning criteria
             (_, Some(partition_column)) => Partitioning::Hash(
                 vec![col(partition_column.name(), schema.as_ref())?],
@@ -201,7 +192,7 @@ impl DistributeFileScanOptimizer {
 
         let new_exec: Arc<dyn ExecutionPlan> = match partitioning {
             hash @ Partitioning::Hash(..) => Arc::new(RepartitionExec::try_new(exec, hash)?),
-            _ => Arc::new(CoalescePartitionsExec::new(exec))
+            _ => Arc::new(CoalescePartitionsExec::new(exec)),
         };
 
         Ok(new_exec)
@@ -255,5 +246,110 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datafusion::cluster::physical_plan::common::search_visitor::SearchVisitor;
+    use crate::{Runtime, RuntimeBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::physical_plan::ArrowSource;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion_datasource::FileRange;
+    use object_store::ObjectMeta;
+    use object_store::path::Path;
+
+    fn create_partitioned_file(path: &str, size: u64, range: Option<FileRange>) -> PartitionedFile {
+        PartitionedFile {
+            object_meta: ObjectMeta {
+                location: Path::from(path),
+                last_modified: Default::default(),
+                size,
+                e_tag: None,
+                version: None,
+            },
+            partition_values: vec![],
+            range,
+            statistics: None,
+            extensions: None,
+            metadata_size_hint: None,
+        }
+    }
+
+    fn create_data_source_exec(files: Vec<PartitionedFile>) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let fsc = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
+            schema,
+            Arc::new(ArrowSource::default()),
+        )
+        .with_file_group(FileGroup::new(files))
+        .build();
+
+        DataSourceExec::from_data_source(fsc)
+    }
+
+    #[tokio::test]
+    async fn test_respects_byte_size_setting() {
+        let runtime: Runtime = RuntimeBuilder::new().build().await;
+        let optimizer = DistributeFileScanOptimizer::new(runtime.datafusion());
+
+        // Default = 128MB per filegroup
+        let files = vec![
+            // Group 1
+            create_partitioned_file("file:///file1.parquet", 50_000_000, None),
+            create_partitioned_file("file:///file2.parquet", 50_000_000, None),
+            // Group 2 (trips `file_group_size_bytes`, is new group)
+            create_partitioned_file("file:///file3.parquet", 29_000_000, None),
+            // Group 3 (too big, new group)
+            create_partitioned_file("file:///file4.parquet", 256_000_000, None),
+            // Group 4 (too big, new group)
+            create_partitioned_file("file:///file5.parquet", 256_000_000, None),
+        ];
+
+        let plan = create_data_source_exec(files);
+
+        let mut config = ConfigOptions::default();
+        config.extensions.insert(SpiceClusterConfig::default());
+
+        let optimized = optimizer.optimize(plan, &config).expect("Must optimize");
+        let groups_after_optimize = SearchVisitor::default()
+            .down(|p| {
+                if concrete!(p, DataSourceExec).is_some() {
+                    Some(Arc::clone(p))
+                } else {
+                    None
+                }
+            })
+            .find(&optimized)
+            .expect("Must search plan")
+            .into_iter()
+            .filter_map(|d| {
+                if let Some(fsc) = concrete!(d, DataSourceExec)
+                    .and_then(|d| d.data_source().as_any().downcast_ref::<FileScanConfig>())
+                {
+                    Some(fsc.file_groups.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        // There should be 4 groups with 5 total files
+        assert_eq!(groups_after_optimize.len(), 4);
+        assert_eq!(
+            groups_after_optimize
+                .into_iter()
+                .map(|g| g.files().len())
+                .sum::<usize>(),
+            5
+        );
     }
 }
