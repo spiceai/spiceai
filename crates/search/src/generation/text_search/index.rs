@@ -136,7 +136,6 @@ impl FullTextDatabaseIndex {
         // Use 'primary_key_override', fallback to underlying in table.
         let pks = match (primary_key_override, get_primary_keys(inner)) {
             // LHS takes precedence.
-            // LHS takes precedence.
             (Some(pks), _) | (_, Ok(pks)) if !pks.is_empty() => pks,
             (_, Err(e)) => {
                 return Err(super::Error::FailedToRetrievePrimaryKey { source: e });
