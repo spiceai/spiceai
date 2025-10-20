@@ -26,6 +26,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
 jobs:
   setup-matrix:
     name: Setup strategy matrix
@@ -70,6 +75,30 @@ jobs:
     runs-on: [self-hosted, spiceai-macos]
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1 # Shallow clone for faster checkout
+
+      # Cache Cargo dependencies
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cache Rust build artifacts
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-llms-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-llms-
+            ${{ runner.os }}-rust-
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

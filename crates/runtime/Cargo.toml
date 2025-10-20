@@ -48,6 +48,7 @@ datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { workspace = true }
+datafusion-optimizer-rules = {path ="../datafusion-optimizer-rules"}
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
@@ -121,6 +122,7 @@ rmcp = { workspace = true, optional = true, features = [
 ] }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-async = { path = "../runtime-async" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }

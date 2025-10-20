@@ -72,7 +72,6 @@ impl SpiceModelTool for SearchTool {
 
             let vs = SearchEngine::new(
                 self.rt.datafusion(),
-                Arc::clone(&self.rt.embeds),
                 parse_explicit_primary_keys(Arc::clone(&self.rt.app)).await,
             );
 

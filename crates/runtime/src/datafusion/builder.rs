@@ -23,18 +23,10 @@ use std::{
 use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
-    extension::{
-        SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule,
-        cache_invalidation::CacheInvalidationOptimizerRule,
-    },
+    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
     schema::SpiceSchemaProvider,
 };
-use crate::{
-    dataaccelerator::AcceleratorEngineRegistry,
-    datafusion::{
-        SPICE_SCP_SCHEMA, extension::cache_invalidation::CacheInvalidationExtensionPlanner,
-    },
-};
+use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
 use datafusion::config::SpillCompression;
@@ -55,8 +47,15 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_optimizer_rules::{
+    logical_plan::{
+        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+    },
+    physical_plan::EmptyHashJoinExecPhysicalOptimization,
+};
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
+use spicepod::metric::Metrics;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
@@ -98,6 +97,7 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
+    metrics: Option<Metrics>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -130,6 +130,7 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
+            metrics: None,
         }
     }
 
@@ -178,6 +179,12 @@ impl DataFusionBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -202,6 +209,7 @@ impl DataFusionBuilder {
                 ],
             )))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
 
@@ -281,6 +289,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            metrics: self.metrics,
         }
     }
 }
