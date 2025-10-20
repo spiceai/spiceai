@@ -90,11 +90,18 @@ async fn create_spill_plan_query(
     limit: Option<usize>,
     query_vector: Vec<f32>,
 ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+    // Use the base name (without spill suffix) as prefix to get all related indexes
+    let base_name = if let Ok(Some(spill)) = SpillIndex::parse(index_name) {
+        spill.base_name
+    } else {
+        index_name.to_string()
+    };
+
     let list_indexes_output = client
         .list_indexes(
             ListIndexesInput::builder()
                 .set_vector_bucket_name(Some(bucket_name.to_string()))
-                .set_prefix(Some(index_name.to_string()))
+                .set_prefix(Some(base_name))
                 .build()
                 .boxed()
                 .map_err(DataFusionError::External)?,
