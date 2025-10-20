@@ -15,7 +15,6 @@ limitations under the License.
 */
 use cache::key::SearchKey;
 use datafusion::common::Column;
-use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -293,13 +292,6 @@ impl SearchRequest {
                         additional_column: c.clone(),
                     });
                 }
-
-                // Standardise on quoting everything (but don't double quote).
-                // Return a vector of quoted identifiers preserving the structure
-                let quoted_idents = idents
-                    .iter()
-                    .map(|ident| sqlparser::ast::Ident::with_quote('"', ident.value.trim_matches('"')))
-                    .collect::<Vec<_>>();
 
                 Ok(Column::from_qualified_name(c))
             })
