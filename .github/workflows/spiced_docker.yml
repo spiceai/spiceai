@@ -150,67 +150,11 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
-      - name: odbc
-        run: |
-          echo "IMAGE_TAG=odbc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=odbc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,odbc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
-
       - name: models
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
           echo "BINARY_VARIANT=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
-
-      - name: jemalloc
-        run: |
-          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-jemalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
-
-      - name: mimalloc
-        run: |
-          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-mimalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
-
-      - name: sysalloc
-        run: |
-          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-system" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
-
-      - name: models-jemalloc
-        run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
-
-      - name: models-mimalloc
-        run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
-
-      - name: models-sysalloc
-        run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - *build-amd64-image
 
@@ -222,7 +166,7 @@ jobs:
 
   build-arm64:
     needs: setup
-    runs-on: hosted-linux-arm-runner-16-cores
+    runs-on: hosted-linux-arm-runner
     steps:
       - name: Skip ARM64 build
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
@@ -260,8 +204,7 @@ jobs:
             image=moby/buildkit:latest
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
-      - &build-arm64-default
-        name: default
+      - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
@@ -284,67 +227,11 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
-      - name: odbc
-        run: |
-          echo "IMAGE_TAG=odbc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=odbc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,odbc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
-
       - name: models
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
           echo "BINARY_VARIANT=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
-
-      - name: jemalloc
-        run: |
-          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-jemalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
-
-      - name: mimalloc
-        run: |
-          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-mimalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
-
-      - name: sysalloc
-        run: |
-          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,alloc-system" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
-
-      - name: models-jemalloc
-        run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
-
-      - name: models-mimalloc
-        run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
-
-      - name: models-sysalloc
-        run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - *build-arm64-image
 
@@ -357,7 +244,7 @@ jobs:
 
   build-cuda:
     needs: setup
-    runs-on: 'ubuntu-gpu-t4-4-core'
+    runs-on: 'spiceai-dev-runners'
     env:
       CUDA_COMPUTE_CAP: 80
     steps:
@@ -484,7 +371,7 @@ jobs:
           echo "RUN_AMD64=${RUN_AMD64}"
           echo "RUN_ARM64=${RUN_ARM64}"
 
-          variants=("default" "odbc" "models" "jemalloc" "mimalloc" "sysalloc" "models-jemalloc" "models-mimalloc" "models-sysalloc")
+          variants=("default" "models")
           for variant in "${variants[@]}"; do
             suffix=""
             if [ "$variant" != "default" ]; then
