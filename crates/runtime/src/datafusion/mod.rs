@@ -46,12 +46,15 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::create_view_table;
 use crate::{status, view};
 
-use crate::config::ClusterConfig;
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterConfig, ballista_scheduler::scheduler_server::SchedulerServer,
+    ballista_scheduler::state::SchedulerState,
+};
+
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
-use ballista_scheduler::scheduler_server::SchedulerServer;
-use ballista_scheduler::state::SchedulerState;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -330,8 +333,11 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    #[cfg(feature = "cluster")]
     pub cluster_config: Arc<ClusterConfig>,
+    #[cfg(feature = "cluster")]
     pub scheduler_state: RwLock<Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>>>,
+    #[cfg(feature = "cluster")]
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub temp_directory: Option<String>,
     metrics: Option<Metrics>,
@@ -1806,6 +1812,7 @@ impl DataFusion {
         }
     }
 
+    #[cfg(feature = "cluster")]
     pub fn bind_scheduler_state(
         &self,
         state: Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>,
@@ -1818,6 +1825,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[cfg(feature = "cluster")]
     pub fn bind_scheduler_server(
         &self,
         server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,

@@ -48,8 +48,15 @@ mod metrics;
 mod tracker;
 
 use async_stream::stream;
-use ballista_core::extension::{SessionConfigExt, SessionStateExt};
-use ballista_core::planner::BallistaQueryPlanner;
+
+#[cfg(feature = "cluster")]
+use {
+    crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
+    crate::datafusion::cluster::config::SpiceClusterConfig,
+    ballista_core::extension::{SessionConfigExt, SessionStateExt},
+    ballista_core::planner::BallistaQueryPlanner,
+};
+
 use datafusion::common::plan_err;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::physical_planner::DefaultPhysicalPlanner;
@@ -58,8 +65,7 @@ use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 use crate::config::ClusterMode;
-use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
-use crate::datafusion::cluster::config::SpiceClusterConfig;
+
 use crate::datafusion::extension::SpiceQueryPlanner;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,

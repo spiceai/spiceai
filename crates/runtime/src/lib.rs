@@ -45,11 +45,23 @@ use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
-use ballista_core::extension::SessionConfigExt;
-use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
-use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::SchedulerConfig;
-use ballista_scheduler::scheduler_process;
+
+#[cfg(feature = "cluster")]
+use {
+    crate::Error::FailedToStartClusterScheduler,
+    crate::config::{ClusterConfig, ClusterMode},
+    crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
+    crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec,
+    crate::datafusion::cluster::config::SpiceClusterConfig,
+    crate::datafusion::cluster::physical_plan::optimizer::expand_file_scan::ExpandFileScanOptimizer,
+    crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdown,
+    ballista_core::extension::SessionConfigExt,
+    ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process},
+    ballista_scheduler::cluster::BallistaCluster,
+    ballista_scheduler::config::SchedulerConfig,
+    ballista_scheduler::scheduler_process,
+};
+
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
@@ -107,15 +119,7 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
-use crate::Error::FailedToStartClusterScheduler;
-use crate::config::{ClusterConfig, ClusterMode};
-use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
-use crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec;
-use crate::datafusion::cluster::config::SpiceClusterConfig;
-use crate::datafusion::cluster::physical_plan::optimizer::expand_file_scan::ExpandFileScanOptimizer;
-use crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdown;
 pub use runtime_parameters as parameters;
-
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
@@ -757,6 +761,7 @@ impl Runtime {
             })
     }
 
+    #[cfg(feature = "cluster")]
     async fn executor_bind_app(
         self: &Arc<Self>,
         scheduler_flight_url: impl Into<Arc<str>>,

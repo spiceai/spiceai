@@ -26,6 +26,7 @@ use super::{
     extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
     schema::SpiceSchemaProvider,
 };
+#[cfg(feature = "cluster")]
 use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{datafusion::extension::SpiceExtensionPlanner, status};
@@ -94,6 +95,7 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
+    #[cfg(feature = "cluster")]
     cluster_config: Arc<ClusterConfig>,
     metrics: Option<Metrics>,
 }
@@ -128,6 +130,7 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
+            #[cfg(feature = "cluster")]
             cluster_config: Arc::new(ClusterConfig::default()),
             metrics: None,
         }
@@ -145,6 +148,7 @@ impl DataFusionBuilder {
         self
     }
 
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
         self.cluster_config = config;
@@ -291,8 +295,11 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            #[cfg(feature = "cluster")]
             cluster_config: self.cluster_config,
+            #[cfg(feature = "cluster")]
             scheduler_state: RwLock::new(None),
+            #[cfg(feature = "cluster")]
             scheduler_server: RwLock::new(None),
             temp_directory: self.temp_directory.clone(),
             metrics: self.metrics,

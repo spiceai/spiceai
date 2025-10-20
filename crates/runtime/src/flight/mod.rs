@@ -14,6 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
+use {
+    ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
+    ballista_executor::flight_service::BallistaFlightService,
+};
+
 use crate::auth::EndpointAuth;
 use crate::config::ClusterMode;
 use crate::datafusion::DataFusion;
@@ -35,8 +41,6 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use async_stream::try_stream;
-use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
-use ballista_executor::flight_service::BallistaFlightService;
 use bytes::Bytes;
 use cache::result::CacheStatus;
 use datafusion::common::ParamValues;

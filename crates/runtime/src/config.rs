@@ -120,6 +120,7 @@ pub struct ClusterConfig {
     pub scheduler_uri: Uri<String>,
 }
 
+#[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
         let uri = match Uri::parse("spiced://localhost:50051") {
