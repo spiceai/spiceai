@@ -80,7 +80,7 @@ impl SpillIndex {
         let sequence = sequence_str
             .parse::<u8>()
             .map_err(|_| Error::InvalidSequenceNumber {
-                sequence_str: sequence_str.to_string(),
+                sequence_str: (*sequence_str).to_string(),
                 name: index_name.to_string(),
             })?;
 
@@ -101,10 +101,10 @@ impl SpillIndex {
 
         // Find the highest existing sequence number
         for spill_name in existing_spills {
-            if let Ok(Some(spill)) = Self::parse(spill_name) {
-                if spill.base_name == base_name {
-                    max_sequence = max_sequence.max(spill.sequence);
-                }
+            if let Ok(Some(spill)) = Self::parse(spill_name)
+                && spill.base_name == base_name
+            {
+                max_sequence = max_sequence.max(spill.sequence);
             }
         }
 
@@ -119,7 +119,7 @@ impl SpillIndex {
     /// Checks if an index name represents a spill index.
     #[must_use]
     pub fn is_spill_index(index_name: &str) -> bool {
-        Self::parse(index_name).map_or(false, |opt| opt.is_some())
+        Self::parse(index_name).is_ok_and(|opt| opt.is_some())
     }
 
     /// Gets all spill index names that belong to the same virtual index.
@@ -131,10 +131,10 @@ impl SpillIndex {
         let mut spill_indexes = Vec::new();
 
         for index_name in all_indexes {
-            if let Ok(Some(spill)) = Self::parse(index_name) {
-                if spill.base_name == base_name {
-                    spill_indexes.push(spill);
-                }
+            if let Ok(Some(spill)) = Self::parse(index_name)
+                && spill.base_name == base_name
+            {
+                spill_indexes.push(spill);
             }
         }
 

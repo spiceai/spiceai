@@ -163,9 +163,10 @@ impl S3VectorIdentifier {
     /// Gets the virtual index name for this identifier, if it's a virtual index.
     #[must_use]
     pub fn index_name(&self) -> Option<&str> {
-        match self {
-            Self::Index { index_name, .. } => Some(index_name),
-            _ => None,
+        if let Self::Index { index_name, .. } = self {
+            Some(index_name)
+        } else {
+            None
         }
     }
 }

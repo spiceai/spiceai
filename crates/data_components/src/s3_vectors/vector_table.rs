@@ -477,9 +477,10 @@ impl S3VectorsTable {
 
     /// Writes a chunk of vectors, handling spilling to additional indexes when capacity is exceeded.
     async fn write_chunk_with_spilling(&self, chunk: &[PutInputVector]) -> Result<()> {
+        const MAX_SPILL_ATTEMPTS: usize = 100; // Prevent infinite loops
+
         let mut current_index = self.idx.clone();
         let mut attempt_count = 0;
-        const MAX_SPILL_ATTEMPTS: usize = 100; // Prevent infinite loops
 
         loop {
             attempt_count += 1;
@@ -508,7 +509,7 @@ impl S3VectorsTable {
                     return Ok(());
                 }
                 Err(SdkError::ServiceError(service_error)) => {
-                    if Self::is_capacity_exceeded_error(&service_error.err()) {
+                    if Self::is_capacity_exceeded_error(service_error.err()) {
                         match self.get_next_spill_index(&current_index).await? {
                             Some(next_index) => {
                                 tracing::info!(
@@ -518,12 +519,9 @@ impl S3VectorsTable {
                             }
                             None => {
                                 return Err(Error::InternalError {
-                                    source: Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!(
-                                            "S3 Vector index {current_index} reached capacity and no more spill indexes available",
-                                        ),
-                                    )),
+                                    source: Box::new(std::io::Error::other(format!(
+                                        "S3 Vector index {current_index} reached capacity and no more spill indexes available",
+                                    ))),
                                 });
                             }
                         }
@@ -544,12 +542,9 @@ impl S3VectorsTable {
                         }
                         None => {
                             return Err(Error::InternalError {
-                                source: Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!(
-                                        "S3 Vector index {current_index} reached capacity and no more spill indexes available",
-                                    ),
-                                )),
+                                source: Box::new(std::io::Error::other(format!(
+                                    "S3 Vector index {current_index} reached capacity and no more spill indexes available",
+                                ))),
                             });
                         }
                     }
@@ -740,20 +735,23 @@ mod tests {
 
     fn create_test_vectors(count: usize) -> Vec<PutInputVector> {
         (0..count)
-            .map(|i| {
+            .filter_map(|i| {
                 PutInputVector::builder()
                     .key(format!("key{i}"))
                     .data(VectorData::Float32(vec![1.0, 2.0, 3.0]))
                     .build()
-                    .unwrap()
+                    .ok()
             })
             .collect()
     }
 
     #[tokio::test]
-    async fn test_write_chunk_without_spilling() {
+    async fn test_write_chunk_without_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
-        let table = create_test_table(mock_client.clone(), "test-index");
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
 
         // Create the bucket and index first
         table
@@ -761,11 +759,9 @@ mod tests {
             .create_vector_bucket(
                 CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
-                    .build()
-                    .unwrap(),
+                    .build()?,
             )
-            .await
-            .unwrap();
+            .await?;
 
         table
             .client
@@ -776,23 +772,26 @@ mod tests {
                     .data_type(S3DataType::Float32)
                     .dimension(3)
                     .distance_metric(DistanceMetric::Cosine)
-                    .build()
-                    .unwrap(),
+                    .build()?,
             )
-            .await
-            .unwrap();
+            .await?;
 
         let vectors = create_test_vectors(5);
         let result = table.write_chunk_with_spilling(&vectors).await;
 
         assert!(result.is_ok());
         assert_eq!(mock_client.get_vector_count("test-index"), 5);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_write_chunk_with_spilling() {
+    async fn test_write_chunk_with_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
-        let table = create_test_table(mock_client.clone(), "test-index");
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
 
         // Set a low quota limit
         mock_client.set_quota_limit("test-index", 3);
@@ -803,11 +802,9 @@ mod tests {
             .create_vector_bucket(
                 CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
-                    .build()
-                    .unwrap(),
+                    .build()?,
             )
-            .await
-            .unwrap();
+            .await?;
 
         table
             .client
@@ -818,11 +815,9 @@ mod tests {
                     .data_type(S3DataType::Float32)
                     .dimension(3)
                     .distance_metric(DistanceMetric::Cosine)
-                    .build()
-                    .unwrap(),
+                    .build()?,
             )
-            .await
-            .unwrap();
+            .await?;
 
         let vectors = create_test_vectors(3);
         let result = table.write_chunk_with_spilling(&vectors).await;
@@ -837,18 +832,23 @@ mod tests {
         assert_eq!(mock_client.get_vector_count("test-index"), 3);
         assert_eq!(mock_client.get_vector_count("test-index.01"), 3);
         assert_eq!(mock_client.get_vector_count("test-index.02"), 3);
+
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_write_chunk_spilling_exhausted() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
-        let table = create_test_table(mock_client.clone(), "test-index");
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
 
         for i in 0..99 {
             let index_name = if i == 0 {
                 "test-index".to_string()
             } else {
-                format!("test-index.{:02}", i)
+                format!("test-index.{i:02}")
             };
             mock_client.set_quota_limit(&index_name, 1);
         }
@@ -891,7 +891,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_next_spill_index_creates_index() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
-        let table = create_test_table(mock_client.clone(), "test-index");
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
 
         table
             .client
@@ -923,16 +926,19 @@ mod tests {
         let next_index = table.get_next_spill_index(&current_index).await?;
 
         assert!(next_index.is_some());
-        let next_index = next_index.unwrap();
-        match next_index {
-            S3VectorIdentifier::Index {
-                bucket_name,
-                index_name,
-            } => {
-                assert_eq!(bucket_name, "test-bucket");
-                assert_eq!(index_name, "test-index.01");
-            }
-            _ => panic!("Expected Index variant"),
+        let Some(next_index) = next_index else {
+            panic!("next index");
+        };
+
+        if let S3VectorIdentifier::Index {
+            bucket_name,
+            index_name,
+        } = next_index
+        {
+            assert_eq!(bucket_name, "test-bucket");
+            assert_eq!(index_name, "test-index.01");
+        } else {
+            panic!("Expected Index variant");
         }
 
         table
@@ -941,8 +947,7 @@ mod tests {
                 GetIndexInput::builder()
                     .vector_bucket_name("test-bucket")
                     .index_name("test-index.01")
-                    .build()
-                    .unwrap(),
+                    .build()?,
             )
             .await?;
 

@@ -77,6 +77,7 @@ impl S3VectorsListTable {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_spill_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -111,7 +112,7 @@ async fn create_spill_plan(
         .collect();
 
     let virtual_index_names =
-        SpillIndex::get_all_indexes_for_virtual_index(&index_name, &all_index_names);
+        SpillIndex::get_all_indexes_for_virtual_index(index_name, &all_index_names);
 
     if virtual_index_names.len() > 1 {
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -147,6 +148,7 @@ async fn create_spill_plan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_partition_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -158,7 +160,7 @@ async fn create_partition_plan(
     state: &dyn Session,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     let prefix =
-        PartitionedIndexName::common_prefix(&index_name, &table.column_name, &table.partition_by)
+        PartitionedIndexName::common_prefix(index_name, &table.column_name, &table.partition_by)
             .map_err(|e| DataFusionError::Plan(e.to_string()))?;
 
     let list_indexes_output = client
@@ -192,7 +194,7 @@ async fn create_partition_plan(
 
             if matches!(
                 partitioned_index_name.belongs_with(
-                    &index_name,
+                    index_name,
                     &table.column_name,
                     &table.partition_by
                 ),
@@ -293,8 +295,8 @@ impl TableProvider for S3VectorsListTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let (_, bucket_name, index_name) = self.table.idx.index_identifier_variables();
 
-        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
-            if let Some(plan) = create_spill_plan(
+        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name)
+            && let Some(plan) = create_spill_plan(
                 &self.table.client,
                 &bucket_name,
                 &index_name,
@@ -303,9 +305,8 @@ impl TableProvider for S3VectorsListTable {
                 limit,
             )
             .await?
-            {
-                return Ok(plan);
-            }
+        {
+            return Ok(plan);
         }
 
         if self.partition_by.is_empty() {
@@ -761,7 +762,7 @@ mod tests {
 
         // Create 2 spill indexes
         for i in 1..=2 {
-            let spill_index_name = format!("{}.{:02}", virtual_index_name, i);
+            let spill_index_name = format!("{virtual_index_name}.{i:02}");
             indexes.push(
                 IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
@@ -847,7 +848,7 @@ mod tests {
 
         // Create 2 spill indexes
         for i in 1..=2 {
-            let spill_index_name = format!("{}.{:02}", virtual_index_name, i);
+            let spill_index_name = format!("{virtual_index_name}.{i:02}");
             indexes.push(
                 IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
@@ -958,7 +959,7 @@ mod tests {
 
             // Spill indexes for this partition
             for j in 1..=2 {
-                let spill_index_name = format!("{}.{:02}", partition_index_name, j);
+                let spill_index_name = format!("{partition_index_name}.{j:02}");
                 indexes.push(
                     IndexSummary::builder()
                         .vector_bucket_name(bucket_name)

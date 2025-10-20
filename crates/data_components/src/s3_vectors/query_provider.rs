@@ -79,6 +79,7 @@ pub struct S3VectorsQueryTable {
     partition_by: Vec<Expr>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_spill_plan_query(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -115,7 +116,7 @@ async fn create_spill_plan_query(
         .collect();
 
     let virtual_index_names =
-        SpillIndex::get_all_indexes_for_virtual_index(&index_name, &all_index_names);
+        SpillIndex::get_all_indexes_for_virtual_index(index_name, &all_index_names);
 
     if virtual_index_names.len() > 1 {
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -173,6 +174,7 @@ async fn create_spill_plan_query(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_partition_plan_query(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -184,7 +186,7 @@ async fn create_partition_plan_query(
     state: &dyn Session,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     let prefix =
-        PartitionedIndexName::common_prefix(&index_name, &table.column_name, &table.partition_by)
+        PartitionedIndexName::common_prefix(index_name, &table.column_name, &table.partition_by)
             .map_err(|e| DataFusionError::Plan(e.to_string()))?;
 
     let list_indexes_output = client
@@ -218,7 +220,7 @@ async fn create_partition_plan_query(
 
             if matches!(
                 partitioned_index_name.belongs_with(
-                    &index_name,
+                    index_name,
                     &table.column_name,
                     &table.partition_by
                 ),
@@ -379,8 +381,8 @@ impl TableProvider for S3VectorsQueryTable {
 
         let (_, bucket_name, index_name) = self.table.idx.index_identifier_variables();
 
-        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
-            if let Some(plan) = create_spill_plan_query(
+        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name)
+            && let Some(plan) = create_spill_plan_query(
                 &self.table.client,
                 &bucket_name,
                 &index_name,
@@ -391,9 +393,8 @@ impl TableProvider for S3VectorsQueryTable {
                 query_vector.clone(),
             )
             .await?
-            {
-                return Ok(plan);
-            }
+        {
+            return Ok(plan);
         }
 
         if self.partition_by.is_empty() {
@@ -749,7 +750,7 @@ mod tests {
 
         // Create 2 spill indexes
         for i in 1..=2 {
-            let spill_index_name = format!("{}.{:02}", virtual_index_name, i);
+            let spill_index_name = format!("{virtual_index_name}.{i:02}");
             indexes.push(
                 IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
@@ -799,7 +800,7 @@ mod tests {
 
         let s3_table = S3VectorsTable {
             client: mock_client,
-            schema: schema.clone(),
+            schema: Arc::clone(&schema),
             constraints: Constraints::default(),
             idx: S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
@@ -865,7 +866,7 @@ mod tests {
 
         // Create 2 spill indexes
         for i in 1..=2 {
-            let spill_index_name = format!("{}.{:02}", virtual_index_name, i);
+            let spill_index_name = format!("{virtual_index_name}.{i:02}");
             indexes.push(
                 IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
@@ -906,7 +907,7 @@ mod tests {
         // Test accessing index through a spill index name
         let s3_table = S3VectorsTable {
             client: mock_client,
-            schema: schema.clone(),
+            schema: Arc::clone(&schema),
             constraints: Constraints::default(),
             idx: S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
@@ -950,6 +951,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn scan_plan_with_partitioned_index_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
         let bucket_name = "test_bucket";
@@ -985,7 +987,7 @@ mod tests {
 
             // Spill indexes for this partition
             for j in 1..=2 {
-                let spill_index_name = format!("{}.{:02}", partition_index_name, j);
+                let spill_index_name = format!("{partition_index_name}.{j:02}");
                 indexes.push(
                     IndexSummary::builder()
                         .vector_bucket_name(bucket_name)
@@ -998,7 +1000,6 @@ mod tests {
             }
         }
 
-        // Add an unrelated index
         indexes.push(
             IndexSummary::builder()
                 .vector_bucket_name(bucket_name)
@@ -1006,7 +1007,7 @@ mod tests {
                 .creation_time(DateTime::from_secs(1))
                 .index_name("another_index")
                 .build()?,
-        );
+        ); // add unrelated index
 
         mock_client
             .data
@@ -1063,7 +1064,6 @@ mod tests {
             .await
             .expect("scan");
 
-        // The plan should be a GlobalLimitExec -> UnionExec
         let limit_plan = plan
             .as_any()
             .downcast_ref::<GlobalLimitExec>()
