@@ -1,21 +1,21 @@
 use crate::concrete;
-use crate::datafusion::DataFusion;
 use crate::datafusion::cluster::common::datafusion_scheduler_ext::DataFusionSchedulerExtensions;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
+use crate::datafusion::DataFusion;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Result, exec_err};
+use datafusion::common::{exec_err, Result};
 use datafusion::config::ConfigOptions;
-use datafusion::physical_expr::Partitioning;
 use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::Partitioning;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion_datasource::PartitionedFile;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource::PartitionedFile;
 use itertools::Itertools;
 use std::cmp::max;
 use std::sync::Arc;
@@ -46,18 +46,19 @@ use std::sync::Arc;
 /// Limits are handled by the default physical pushdown mechanism and are currently
 /// replicated per scan.
 #[derive(Debug)]
-pub struct ExpandFileScanOptimizer {
+pub struct DistributeFileScanOptimizer {
     df: Arc<DataFusion>,
 }
 
-impl ExpandFileScanOptimizer {
+impl DistributeFileScanOptimizer {
     #[must_use]
     pub fn new(df: Arc<DataFusion>) -> Arc<Self> {
-        Arc::new(ExpandFileScanOptimizer { df })
+        Arc::new(DistributeFileScanOptimizer { df })
     }
 }
 
-impl ExpandFileScanOptimizer {
+impl DistributeFileScanOptimizer {
+    /// Bytes read is either the whole file or some part of it
     fn read_size(pf: &PartitionedFile) -> u64 {
         if let Some(range) = pf.range.as_ref() {
             (range.end - range.start) as u64
@@ -66,6 +67,7 @@ impl ExpandFileScanOptimizer {
         }
     }
 
+    /// Emit file groups that are constrained by the target byte size
     fn groups_by_byte_size(
         files: impl IntoIterator<Item = PartitionedFile>,
         partition_byte_size: u64,
@@ -86,18 +88,20 @@ impl ExpandFileScanOptimizer {
         groups.into_iter().map(FileGroup::new).collect()
     }
 
+    /// Group `FileGroup`s into stages based on configurable max count or
+    /// current executor fleet size
     fn groups_to_stages(
         &self,
         groups: Vec<FileGroup>,
         desired_stages: usize,
         task_parallelism: usize,
     ) -> Result<Vec<Vec<FileGroup>>> {
-        // Large reads: bucket into desired shuffle count
+        // Large reads (when bucketed on byte size) that exceed desired stage count
         let stage_size: usize = if groups.len() > desired_stages {
             let at_desired_stages = groups.len() / desired_stages;
             max(at_desired_stages, task_parallelism)
         }
-        // Smaller reads: split work up amongst executors
+        // Smaller reads: split byte size groups amongst current executor fleet
         else {
             groups.len() / max(self.df.executors()?.len(), 2)
         };
@@ -123,9 +127,7 @@ impl ExpandFileScanOptimizer {
 
         let file_group_byte_size = spice_config.execution.file_group_size_bytes;
         let desired_stages = spice_config.execution.file_scan_expand_stages;
-
         let task_partitions = config.execution.target_partitions;
-        let partition_byte_size = file_group_byte_size / task_partitions as u64;
 
         // Get all the partitioned files
         let partitioned_files = file_scan_config
@@ -147,7 +149,7 @@ impl ExpandFileScanOptimizer {
                 .map(|g| FileGroup::new(g.collect()))
                 .collect()
         } else {
-            Self::groups_by_byte_size(partitioned_files, partition_byte_size)
+            Self::groups_by_byte_size(partitioned_files, file_group_byte_size)
         };
 
         let stages = self.groups_to_stages(file_groups, desired_stages, task_partitions)?;
@@ -170,6 +172,8 @@ impl ExpandFileScanOptimizer {
         task_partitions: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = exec.schema();
+
+        // Try to guess a partitioning column
         let partition_column = schema
             .fields
             .iter()
@@ -180,27 +184,31 @@ impl ExpandFileScanOptimizer {
             .next()
             .or_else(|| schema.fields.first());
 
-        // TODO check underlying partitioning
-        // TODO directly emit unresolved shuffle?
-        let partitioning: Arc<dyn ExecutionPlan> = if let Some(partition_column) = partition_column
-        {
-            let re = RepartitionExec::try_new(
-                exec,
-                Partitioning::Hash(
-                    vec![col(partition_column.name(), schema.as_ref())?],
-                    task_partitions,
-                ),
-            )?;
-            Arc::new(re)
-        } else {
-            Arc::new(CoalescePartitionsExec::new(exec))
+        let partitioning = match (exec.output_partitioning(), partition_column) {
+            // Preserve input partitioning if compatible with stage split
+            (Partitioning::Hash(exprs, count), _) => Partitioning::Hash(
+                exprs.clone(),
+                max(task_partitions, *count),
+            ),
+            // Try to guess alternate partitioning criteria
+            (_, Some(partition_column)) => Partitioning::Hash(
+                vec![col(partition_column.name(), schema.as_ref())?],
+                task_partitions,
+            ),
+            // Fallback
+            _ => Partitioning::RoundRobinBatch(task_partitions),
         };
 
-        Ok(partitioning)
+        let new_exec: Arc<dyn ExecutionPlan> = match partitioning {
+            hash @ Partitioning::Hash(..) => Arc::new(RepartitionExec::try_new(exec, hash)?),
+            _ => Arc::new(CoalescePartitionsExec::new(exec))
+        };
+
+        Ok(new_exec)
     }
 }
 
-impl PhysicalOptimizerRule for ExpandFileScanOptimizer {
+impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -242,7 +250,7 @@ impl PhysicalOptimizerRule for ExpandFileScanOptimizer {
     }
 
     fn name(&self) -> &'static str {
-        "ExpandFileScanOptimizer"
+        "DistributeFileScanOptimizer"
     }
 
     fn schema_check(&self) -> bool {

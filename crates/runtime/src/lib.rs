@@ -51,7 +51,7 @@ use {
     crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
     crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec,
     crate::datafusion::cluster::config::SpiceClusterConfig,
-    crate::datafusion::cluster::physical_plan::optimizer::expand_file_scan::ExpandFileScanOptimizer,
+    crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer,
     crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdown,
     ::datafusion::execution::SessionStateBuilder,
     ::datafusion::prelude::SessionConfig,
@@ -636,7 +636,7 @@ impl Runtime {
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env())
-                    .with_physical_optimizer_rule(ExpandFileScanOptimizer::new(Arc::clone(
+                    .with_physical_optimizer_rule(DistributeFileScanOptimizer::new(Arc::clone(
                         &runtime_handle.df,
                     )))
                     .with_physical_optimizer_rule(UnionProjectionPushdown::new())
