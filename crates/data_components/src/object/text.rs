@@ -135,8 +135,7 @@ impl ObjectStoreTextTable {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-            let filtered = filter_object_meta(filters, &metas)
-                .await?
+            let filtered = filter_object_meta(filters, &metas)?
                 .into_iter()
                 .filter(|meta| self.ctx.filename_in_scan(meta))
                 .collect::<Vec<_>>();
