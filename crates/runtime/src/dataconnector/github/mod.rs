@@ -761,14 +761,21 @@ fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
         [owner, repo, resource_type, remaining @ ..]
             if REPO_LEVEL_RESOURCES.contains(resource_type) =>
         {
+            // Filter out empty segments (from trailing slashes) before joining
+            let remaining_filtered: Vec<&str> = remaining
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect();
+
             Some(GitHubPathComponents {
                 owner,
                 repo: Some(repo),
                 resource_type,
-                remaining: if remaining.is_empty() {
+                remaining: if remaining_filtered.is_empty() {
                     None
                 } else {
-                    Some(remaining.join("/"))
+                    Some(remaining_filtered.join("/"))
                 },
             })
         }
