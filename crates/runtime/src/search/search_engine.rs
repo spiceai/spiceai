@@ -314,12 +314,6 @@ impl SearchEngine {
                         .filter(|&c| c.relation.as_ref().is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone())))
                         .cloned()
                         .map(Expr::Column)
-                        // .map(|c| Expr::Column(Column {
-                        //     // Must remove `relation` as candidate generation is just `LogicalPlan`s.
-                        //     relation: None,
-                        //     name: c.name,
-                        //     spans: c.spans
-                        // }))
                         .collect();
 
                     let pipe = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df))));
