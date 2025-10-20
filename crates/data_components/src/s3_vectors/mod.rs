@@ -25,8 +25,9 @@ use std::fmt::{Display, Formatter};
 
 pub mod list_provider;
 pub mod partition;
-pub mod put_vectors_sink;
 pub mod query_provider;
+mod spill;
+pub use spill::{Error as SpillIndexError, SpillIndex};
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};
 mod metadata_column;
@@ -105,6 +106,12 @@ pub enum Error {
     },
     #[snafu(display("S3 vector indexes cannot be listed"))]
     S3VectorListIndexesError { source: ListIndexesError },
+
+    #[snafu(display("Spill index error: {source}"))]
+    SpillIndexError { source: SpillIndexError },
+
+    #[snafu(display("Exceeded maximum spill attempts while writing vectors"))]
+    MaxSpillAttemptsReached,
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -132,6 +139,7 @@ impl Display for S3VectorIdentifier {
 
 impl S3VectorIdentifier {
     /// Return (index arn, bucket name and index name) based on how the vector index is identified.
+    /// For virtual indexes, returns the bucket name and virtual index name for writing operations.
     #[must_use]
     pub fn index_identifier_variables(&self) -> (Option<String>, Option<String>, Option<String>) {
         match self {
@@ -140,6 +148,24 @@ impl S3VectorIdentifier {
                 index_name,
             } => (None, Some(bucket_name.clone()), Some(index_name.clone())),
             Self::IndexArn(arn) => (Some(arn.clone()), None, None),
+        }
+    }
+
+    /// Gets the bucket name for this identifier, if available.
+    #[must_use]
+    pub fn bucket_name(&self) -> Option<&str> {
+        match self {
+            Self::Index { bucket_name, .. } => Some(bucket_name),
+            Self::IndexArn(_) => None,
+        }
+    }
+
+    /// Gets the virtual index name for this identifier, if it's a virtual index.
+    #[must_use]
+    pub fn index_name(&self) -> Option<&str> {
+        match self {
+            Self::Index { index_name, .. } => Some(index_name),
+            _ => None,
         }
     }
 }
