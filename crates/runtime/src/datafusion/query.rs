@@ -511,7 +511,7 @@ impl QueryActiveGuard {
 
         let active = request_context.entered_top_level_query();
         if active {
-            crate::metrics::telemetry::inc_query_active_count(&dimensions);
+            crate::metrics::telemetry::inc_query_active_count(dimensions);
         }
 
         Self {
@@ -533,12 +533,12 @@ impl Drop for QueryActiveGuard {
 
 fn attach_query_active_guard_to_stream(
     stream: SendableRecordBatchStream,
-    request_context: Arc<RequestContext>,
+    request_context: &Arc<RequestContext>,
     span: Span,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
 
-    let guard = QueryActiveGuard::new(Arc::clone(&request_context));
+    let guard = QueryActiveGuard::new(Arc::clone(request_context));
 
     let updated_stream =
         futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
