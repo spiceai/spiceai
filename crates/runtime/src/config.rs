@@ -17,6 +17,9 @@ limitations under the License.
 use clap::ValueEnum;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+#[cfg(feature = "cluster")]
+use url::Url;
+
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Config {
     /// Configure runtime HTTP address.
@@ -111,25 +114,25 @@ pub struct ClusterConfig {
     /// join a cluster, or by schedulers to control their bind
     /// address.
     #[arg(
-        long = "scheduler-uri",
-        value_name = "SCHEDULER_URI",
+        long = "scheduler-url",
+        value_name = "SCHEDULER_URL",
         default_value = "spiced://localhost:50051",
         action
     )]
-    pub scheduler_uri: Uri<String>,
+    pub scheduler_url: Url,
 }
 
 #[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
-        let uri = match Uri::parse("spiced://localhost:50051") {
-            Ok(uri) => uri.to_owned(),
+        let url = match Url::parse("spiced://localhost:50051") {
+            Ok(url) => url.clone(),
             Err(e) => unreachable!("The default URI could not be parsed: {}", e),
         };
 
         Self {
             mode: None,
-            scheduler_uri: uri,
+            scheduler_url: url,
         }
     }
 }
@@ -143,8 +146,8 @@ impl ClusterConfig {
     }
 
     #[must_use]
-    pub fn with_scheduler_uri(mut self, uri: Uri<String>) -> Self {
-        self.scheduler_uri = uri;
+    pub fn with_scheduler_url(mut self, url: Url) -> Self {
+        self.scheduler_url = url;
         self
     }
 }

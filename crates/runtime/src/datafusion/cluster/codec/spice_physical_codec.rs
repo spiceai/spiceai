@@ -71,13 +71,16 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         match exec_params.get("spice.exec.name").and_then(|v| v.as_str()) {
             Some("SchemaCastScanExec") => {
                 let schema = deserialize!(exec_params, "spice.exec.schema", Schema)?;
-                let exec = Arc::new(SchemaCastScanExec::new(inputs[0].clone(), Arc::new(schema)));
+                let exec = Arc::new(SchemaCastScanExec::new(
+                    Arc::clone(&inputs[0]),
+                    Arc::new(schema),
+                ));
 
                 Ok(exec)
             }
             Some("BytesProcessedExec") => {
                 // TODO: Make RequestContext serializable
-                Ok(Arc::new(BytesProcessedExec::new(inputs[0].clone())))
+                Ok(Arc::new(BytesProcessedExec::new(Arc::clone(&inputs[0]))))
             }
             _ => exec_err!("Unsupported spice.exec.name"),
         }
@@ -89,10 +92,10 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
         match node.name() {
             "SchemaCastScanExec" => {
-                let concrete = node
-                    .as_any()
-                    .downcast_ref::<SchemaCastScanExec>()
-                    .expect("Must cast");
+                let Some(concrete) = node.as_any().downcast_ref::<SchemaCastScanExec>() else {
+                    return exec_err!("Unable to serialize plan node");
+                };
+
                 map.insert(
                     "spice.exec.schema",
                     serde_json::to_value(concrete.schema())
@@ -101,10 +104,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
             "BytesProcessedExec" => { /* no-op */ }
             "DataSourceExec" => {
-                let concrete = node
-                    .as_any()
-                    .downcast_ref::<DataSourceExec>()
-                    .expect("Must cast");
+                let Some(concrete) = node.as_any().downcast_ref::<DataSourceExec>() else {
+                    return exec_err!("Unable to serialize plan node");
+                };
 
                 let data_source = concrete.data_source();
 

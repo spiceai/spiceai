@@ -16,6 +16,7 @@ limitations under the License.
 
 #[cfg(feature = "cluster")]
 use {
+    crate::config::ClusterMode,
     ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
     ballista_executor::flight_service::BallistaFlightService,
 };
@@ -445,7 +446,7 @@ pub async fn start(
                 .scheduler_server
                 .read()
                 .ok()
-                .and_then(|r| r.iter().cloned().next())
+                .and_then(|r| r.iter().next().cloned())
             else {
                 unreachable!("Scheduler server not bound");
             };
@@ -461,7 +462,7 @@ pub async fn start(
             server = server.add_service(executor_flight);
         }
         _ => { /* no-op */ }
-    };
+    }
 
     if let Some(token) = shutdown_signal {
         server

@@ -60,11 +60,13 @@ impl SearchVisitor<()> {
 
 impl<T: 'static> SearchVisitor<T> {
     // Builder
+    #[must_use]
     pub fn up(mut self, func: impl FnMut(&Arc<dyn ExecutionPlan>) -> Option<T> + 'static) -> Self {
         self.f_up = Some(Box::new(func));
         self
     }
 
+    #[must_use]
     pub fn down(
         mut self,
         func: impl FnMut(&Arc<dyn ExecutionPlan>) -> Option<T> + 'static,

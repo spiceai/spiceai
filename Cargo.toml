@@ -139,7 +139,6 @@ ballista-scheduler = { version = "49.0.0" }
 ballista-executor = "49.0.0"
 dotenvy = "0.15"
 duckdb = "1.3.2"
-fluent-uri = { version = "0.3.2", features = ["std", "net"] }
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.16"

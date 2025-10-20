@@ -18,7 +18,7 @@ pub struct UnionProjectionPushdown {}
 
 impl UnionProjectionPushdown {
     #[must_use]
-    pub fn new() -> Arc<dyn PhysicalOptimizerRule + Send + Sync> {
+    pub fn new() -> Arc<Self> {
         Arc::new(UnionProjectionPushdown {})
     }
 

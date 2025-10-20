@@ -64,7 +64,6 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
-fluent-uri.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true

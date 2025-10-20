@@ -48,8 +48,10 @@ use crate::{status, view};
 
 #[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterConfig, ballista_scheduler::scheduler_server::SchedulerServer,
+    crate::config::ClusterConfig,
+    ballista_scheduler::scheduler_server::SchedulerServer,
     ballista_scheduler::state::SchedulerState,
+    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
 use arrow::datatypes::{Schema, SchemaRef};

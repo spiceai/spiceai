@@ -53,11 +53,16 @@ use {
     crate::datafusion::cluster::config::SpiceClusterConfig,
     crate::datafusion::cluster::physical_plan::optimizer::expand_file_scan::ExpandFileScanOptimizer,
     crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdown,
+    ::datafusion::execution::SessionStateBuilder,
+    ::datafusion::prelude::SessionConfig,
     ballista_core::extension::SessionConfigExt,
     ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process},
     ballista_scheduler::cluster::BallistaCluster,
     ballista_scheduler::config::SchedulerConfig,
     ballista_scheduler::scheduler_process,
+    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
+    runtime_object_store::registry::default_runtime_env,
+    tokio::net::TcpListener,
 };
 
 use builder::RuntimeBuilder;
@@ -592,23 +597,23 @@ impl Runtime {
 
     #[cfg(feature = "cluster")]
     pub async fn start_cluster_scheduler(self: &Arc<Self>) -> Result<()> {
-        let bind_addr = self.cluster_config.scheduler_uri.clone();
+        let bind_addr = self.cluster_config.scheduler_url.clone();
 
         let mut scheduler_config = SchedulerConfig::default();
 
-        scheduler_config.bind_host = bind_addr
-            .authority()
-            .map(|a| a.host())
-            .expect("Must define host")
-            .to_string();
-        scheduler_config.bind_port = bind_addr
-            .authority()
-            .and_then(|a| a.port_to_u16().ok().and_then(|o| o))
-            .expect("Must define port");
+        bind_addr.host_str().iter().for_each(|h| {
+            scheduler_config.bind_host = (*h).to_string();
+        });
+
+        bind_addr
+            .port()
+            .iter()
+            .for_each(|p| scheduler_config.bind_port = *p);
+
         scheduler_config.override_logical_codec =
-            Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(&self)));
+            Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(self)));
         scheduler_config.override_physical_codec = Some(
-            SpicePhysicalCodec::new_codec(Arc::clone(&self)).map_err(|e| {
+            SpicePhysicalCodec::new_codec(Arc::clone(self)).map_err(|e| {
                 FailedToStartClusterScheduler {
                     source: Box::new(e),
                 }
@@ -620,7 +625,7 @@ impl Runtime {
 
         // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
         let current_context = Arc::clone(&self.df.ctx);
-        let runtime_handle = Arc::clone(&self);
+        let runtime_handle = Arc::clone(self);
 
         scheduler_config.override_session_builder = Some(Arc::new(move |_cfg| {
             let cfg = current_context
@@ -680,7 +685,7 @@ impl Runtime {
 
         executor_config.override_logical_codec = Some(SpiceLogicalCodec::new_codec());
         executor_config.override_physical_codec = Some(
-            SpicePhysicalCodec::new_codec(Arc::clone(&self)).map_err(|e| {
+            SpicePhysicalCodec::new_codec(Arc::clone(self)).map_err(|e| {
                 Error::FailedToStartClusterExecutor {
                     source: Box::new(e),
                 }
@@ -691,7 +696,7 @@ impl Runtime {
 
         // Set up executor runtime, and initialize AWS SDK (since there are no datasets here to do so)
         let _bind_aws_creds = aws_sdk_credential_bridge::initialize_sdk_config().await;
-        let runtime_handle = Arc::clone(&self);
+        let runtime_handle = Arc::clone(self);
         executor_config.override_runtime_producer = Some(Arc::new(move |_cfg| {
             Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env()))
         }));
@@ -702,20 +707,17 @@ impl Runtime {
         executor_config.work_dir = self.df.temp_directory.clone();
 
         self.cluster_config
-            .scheduler_uri
-            .authority()
-            .map(|a| a.host())
+            .scheduler_url
+            .host()
             .iter()
             .for_each(|h| {
                 executor_config.scheduler_host = (*h).to_string();
             });
 
         self.cluster_config
-            .scheduler_uri
-            .authority()
-            .and_then(|a| a.port_to_u16().ok())
+            .scheduler_url
+            .port()
             .iter()
-            .flatten()
             .for_each(|h| {
                 executor_config.scheduler_port = *h;
             });
@@ -743,7 +745,7 @@ impl Runtime {
         executor_config.bind_host = bindable_addr.ip().to_string();
         executor_config.external_host = Some(bindable_addr.ip().to_string());
 
-        self.executor_bind_app(self.cluster_config.scheduler_uri.to_string())
+        self.executor_bind_app(self.cluster_config.scheduler_url.to_string())
             .await?;
 
         self.status
@@ -782,7 +784,7 @@ impl Runtime {
             .do_action(action)
             .await
             .map_err(|e| Error::FailedToStartClusterExecutor {
-                source: format!("Failed to call GetAppDefinition: {}", e).into(),
+                source: format!("Failed to call GetAppDefinition: {e}").into(),
             })?;
 
         let mut stream = response.into_inner();
@@ -796,17 +798,17 @@ impl Runtime {
         {
             let app_def: App = serde_json::from_slice(&result.body).map_err(|e| {
                 Error::FailedToStartClusterExecutor {
-                    source: format!("Failed to deserialize app definition: {}", e).into(),
+                    source: format!("Failed to deserialize app definition: {e}").into(),
                 }
             })?;
 
             *self.app.write().await = Some(Arc::new(app_def));
-        };
+        }
 
-        Arc::clone(&self).load_catalogs().await;
+        Arc::clone(self).load_catalogs().await;
         self.load_embeddings().await;
-        Arc::clone(&self).load_models().await;
-        Arc::clone(&self).load_tools().await;
+        Arc::clone(self).load_models().await;
+        Arc::clone(self).load_tools().await;
 
         Ok(())
     }

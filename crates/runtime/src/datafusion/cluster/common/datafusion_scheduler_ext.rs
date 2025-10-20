@@ -30,11 +30,12 @@ impl DataFusionSchedulerExtensions<LogicalPlanNode, PhysicalPlanNode> for DataFu
         let state = self
             .scheduler_state
             .try_read()
-            .map_err(|e| DataFusionError::External("Unable to read scheduler state".into()))?;
+            .map_err(|_| DataFusionError::External("Unable to read scheduler state".into()))?;
 
-        match state.as_ref() {
-            Some(state) => Ok(Arc::clone(state)),
-            _ => exec_err!("Unable to read scheduler state"),
+        if let Some(state) = state.as_ref() {
+            Ok(Arc::clone(state))
+        } else {
+            exec_err!("Unable to read scheduler state")
         }
     }
 }

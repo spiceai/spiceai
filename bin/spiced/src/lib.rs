@@ -232,7 +232,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     #[cfg(feature = "cluster")]
     {
-        builder = builder.with_cluster_config(args.runtime.cluster.clone())
+        builder = builder.with_cluster_config(args.runtime.cluster.clone());
     };
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {

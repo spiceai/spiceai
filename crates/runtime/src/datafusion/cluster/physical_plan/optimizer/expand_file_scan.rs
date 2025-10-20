@@ -1,7 +1,7 @@
+use crate::concrete;
 use crate::datafusion::DataFusion;
 use crate::datafusion::cluster::common::datafusion_scheduler_ext::DataFusionSchedulerExtensions;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
-use crate::{Runtime, concrete};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -52,7 +52,7 @@ pub struct ExpandFileScanOptimizer {
 
 impl ExpandFileScanOptimizer {
     #[must_use]
-    pub fn new(df: Arc<DataFusion>) -> Arc<dyn PhysicalOptimizerRule + Send + Sync> {
+    pub fn new(df: Arc<DataFusion>) -> Arc<Self> {
         Arc::new(ExpandFileScanOptimizer { df })
     }
 }

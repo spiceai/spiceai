@@ -214,7 +214,7 @@ impl RuntimeBuilder {
 
         #[cfg(feature = "cluster")]
         {
-            df_builder = df_builder.with_cluster_config(cluster_config)
+            df_builder = df_builder.with_cluster_config(Arc::clone(&cluster_config));
         };
 
         if let Some(dataset_parallelism) = dataset_parallelism {

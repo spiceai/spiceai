@@ -51,13 +51,19 @@ use async_stream::stream;
 
 #[cfg(feature = "cluster")]
 use {
+    crate::config::ClusterMode,
     crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
     crate::datafusion::cluster::config::SpiceClusterConfig,
+    crate::datafusion::extension::SpiceQueryPlanner,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
+    datafusion::execution::SessionStateBuilder,
+    datafusion::physical_planner::DefaultPhysicalPlanner,
+    datafusion_proto::protobuf::LogicalPlanNode,
 };
 
 use datafusion::execution::SessionState;
+
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -155,7 +161,7 @@ impl Query {
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
-                self.df.cluster_config.scheduler_uri.to_string(),
+                self.df.cluster_config.scheduler_url.to_string(),
                 cfg.ballista_config(),
                 SpiceLogicalCodec::new_codec(),
                 DefaultPhysicalPlanner::with_extension_planners(
@@ -169,7 +175,7 @@ impl Query {
                     .with_option_extension(SpiceClusterConfig::default()),
             )
             .build()
-            .upgrade_for_ballista(self.df.cluster_config.scheduler_uri.to_string())
+            .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
     }
 
