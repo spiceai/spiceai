@@ -338,6 +338,11 @@ impl ExecutionPlan for BytesProcessedExec {
 
         Ok(Box::pin(stream_adapter))
     }
+
+    // Allow optimizer to push limits through to inputs
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

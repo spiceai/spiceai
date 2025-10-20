@@ -67,7 +67,6 @@ where
 {
     let vsearch = Arc::new(SearchEngine::new(
         Arc::clone(&rt.df),
-        Arc::clone(&rt.embeds),
         parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
     ));
     let app = rt.app.as_ref().read().await;

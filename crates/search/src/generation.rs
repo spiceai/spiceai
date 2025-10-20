@@ -11,10 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use datafusion::error::DataFusionError;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::sqlparser::ast::Expr;
+use datafusion::catalog::TableProvider;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use snafu::Snafu;
 
 #[cfg(feature = "text_search")]
@@ -62,29 +63,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub trait CandidateGeneration: Sync + Send {
     /// Generates candidates for a given query term, ordered by decreasing score.
     ///
-    /// Any filter within `opt_filters` where [`CandidateGeneration::supports_filters_pushdown`] evaluates to [`true`] is expected to be applied. No assumptions are made on other filters.
-    ///
-    /// [`RecordBatch`] expects at least two columns:
-    ///   1. [`super::SEARCH_SCORE_COLUMN_NAME`] column of type [`arrow::array::Float64Array`].
-    ///   2. [`super::SEARCH_VALUE_COLUMN_NAME`] column of type [`arrow::array::StringArray`], [`arrow::array::LargeStringArray`] or [`arrow::array::StringViewArray`].
-    ///
-    ///  Any column in `addition_projection` that evaluates to true in [`CandidateGeneration::supports_columns`] must also be returned. No assumptions are made on other columns.
+    /// [`LogicalPlan`] output [`DFSchema`] expects at least a [`super::SEARCH_SCORE_COLUMN_NAME`] column of type [`arrow::array::Float64Array`].
     ///
     /// Rows in the [`RecordBatch`] must be ordered by [`super::SEARCH_SCORE_COLUMN_NAME`] descendingly.
-    async fn search(
-        &self,
-        query: String,
-        opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
-        limit: usize,
-    ) -> Result<SendableRecordBatchStream>;
-
-    /// Whether candidates can be filtered during generation, i.e. [`CandidateGeneration::search`].
-    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<bool>>;
-
-    /// Whether additional columns of the underlying source can also be retrieved during generation.
-    fn supports_columns(&self, projection: &[&Expr]) -> Result<Vec<bool>>;
+    fn search(&self, query: String) -> DataFusionResult<Arc<dyn TableProvider>>;
 
     /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
     fn value_derived_from(&self) -> String;
+
+    /// Returns the name of the field in the schema of [`CandidateGeneration::search`] that has the search result match.
+    fn value_projection_name(&self) -> String {
+        self.value_derived_from()
+    }
 }

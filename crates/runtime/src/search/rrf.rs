@@ -745,7 +745,7 @@ mod tests {
             .await
             .insert("test_model".to_string(), embedding_model);
 
-        register_udfs(&rt);
+        register_udfs(&rt).await;
         Ok(rt)
     }
 
