@@ -26,8 +26,6 @@ use datafusion::{
 use std::sync::Arc;
 
 pub mod bytes_processed;
-pub mod cache_invalidation;
-pub mod pass_thru;
 
 #[derive(Default)]
 pub struct SpiceQueryPlanner {
@@ -124,7 +122,6 @@ mod tests {
     use futures::TryStreamExt;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::sync::Arc;
-    use tokio::runtime::Handle;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -138,7 +135,6 @@ mod tests {
         let mut builder = DataFusionBuilder::new(
             RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::new()),
-            Handle::current(),
         );
 
         // Add cache if provided
