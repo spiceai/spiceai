@@ -61,7 +61,7 @@ pub enum Error {
     FeatureNotEnabled,
 
     #[snafu(display(
-        "Unsupported data type(s) in schema: {details}. Consider setting 'unsupported_type_action: string' to convert unsupported types to strings, or remove the unsupported columns."
+        "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
     UnsupportedDataTypes { details: String },
 }
