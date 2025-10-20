@@ -253,7 +253,6 @@ impl EmbeddingConnector {
                 vector_store,
                 // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
                 get_primary_keys(&inner_table_provider)
-                    .await
                     .boxed()
                     .map_err(|e| DataConnectorError::UnableToConnectInternal {
                         dataconnector: dataset.source().to_string(),
