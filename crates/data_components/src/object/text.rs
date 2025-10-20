@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints, project_schema},
+    common::{Column, Constraint, Constraints, Statistics, project_schema, stats::Precision},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -44,6 +44,8 @@ use futures::StreamExt;
 use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
+
+use crate::object::filter::filter_object_meta;
 
 use super::ObjectStoreContext;
 use url::Url;
@@ -93,89 +95,81 @@ impl ObjectStoreTextTable {
     }
 
     fn get_content_value(
-        raw: &[Bytes],
+        raw: &Bytes,
         formatter: Option<&Arc<dyn DocumentParser>>,
-        meta_list: &[ObjectMeta],
+        location: &Path,
     ) -> Result<ArrayRef, ArrowError> {
-        let utf8_strings: Result<Vec<_>, ArrowError> = raw
-            .iter()
-            .enumerate()
-            .map(|(idx, bytes)| {
-                let utf8 = match formatter {
-                    Some(f) => f
-                        .parse(bytes)
-                        .and_then(|doc| doc.as_flat_utf8())
-                        .boxed()
-                        .map_err(|e| {
-                            if let Some(meta) = meta_list.get(idx) {
-                                format!("Error parsing document {}: {e}", meta.location).into()
-                            } else {
-                                e
-                            }
-                        }),
-                    None => std::str::from_utf8(bytes).boxed().map(ToString::to_string),
-                };
-                utf8.map_err(ArrowError::from_external_error)
-            })
-            .collect();
+        let utf8 = match formatter {
+            Some(f) => f
+                .parse(raw)
+                .and_then(|doc| doc.as_flat_utf8())
+                .boxed()
+                .map_err(|e| format!("Error parsing document {location}: {e}").into()),
+            None => std::str::from_utf8(raw).boxed().map(ToString::to_string),
+        }
+        .map_err(ArrowError::from_external_error)?;
 
-        Ok(Arc::new(StringArray::from(
-            utf8_strings?.into_iter().collect::<Vec<_>>(),
-        )))
+        Ok(Arc::new(StringArray::from(vec![utf8])))
     }
 
-    fn get_field_value(
-        meta_list: &[ObjectMeta],
-        raw: &[Bytes],
-        field_name: &str,
-        formatter: Option<&Arc<dyn DocumentParser>>,
-    ) -> Result<ArrayRef, ArrowError> {
-        match field_name {
-            "location" => Ok(Arc::new(StringArray::from(
-                meta_list
-                    .iter()
-                    .map(|meta| meta.location.to_string())
-                    .collect::<Vec<_>>(),
-            ))),
-            "content" => Self::get_content_value(raw, formatter, meta_list),
-            "last_modified" => Ok(Arc::new(
-                TimestampMicrosecondArray::from(
-                    meta_list
-                        .iter()
-                        .map(|meta| meta.last_modified.timestamp_micros())
-                        .collect::<Vec<_>>(),
-                )
-                .with_timezone("UTC"),
-            )),
-            "size" => Ok(Arc::new(UInt64Array::from(
-                meta_list.iter().map(|meta| meta.size).collect::<Vec<_>>(),
-            ))),
-            _ => Err(ArrowError::SchemaError(format!(
-                "Unsupported field name: {field_name}",
-            ))),
+    async fn list_and_filter_objects(
+        &self,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Vec<ObjectMeta>> {
+        let mut object_stream = self
+            .ctx
+            .store
+            .list(self.ctx.prefix.clone().map(Path::from).as_ref())
+            .chunks(128);
+
+        let mut all_metas = Vec::new();
+
+        while let Some(items) = object_stream.next().await {
+            if limit.is_some_and(|l| all_metas.len() >= l) {
+                break;
+            }
+
+            let metas = items
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+
+            let filtered = filter_object_meta(filters, &metas)?
+                .into_iter()
+                .filter(|meta| self.ctx.filename_in_scan(meta))
+                .collect::<Vec<_>>();
+            all_metas.extend(filtered);
         }
+
+        Ok(all_metas)
     }
 
     fn to_record_batch(
-        meta_list: &[ObjectMeta],
-        raw: &[Bytes],
+        meta: &ObjectMeta,
+        raw: &Bytes,
         formatter: Option<&Arc<dyn DocumentParser>>,
         schema: SchemaRef,
     ) -> Result<RecordBatch, ArrowError> {
-        if meta_list.len() != raw.len() {
-            return Err(ArrowError::ParseError("Length mismatch".to_string()));
-        }
-
         let columns = schema
             .fields()
             .iter()
-            .map(|field| {
-                let field_name = field.name();
-                Self::get_field_value(meta_list, raw, field_name, formatter).map_err(|e| {
-                    ArrowError::SchemaError(format!("Error getting field {field_name}: {e}"))
-                })
+            .map(|field| match field.name().as_str() {
+                "location" => {
+                    Ok(Arc::new(StringArray::from(vec![meta.location.to_string()])) as ArrayRef)
+                }
+                "content" => Self::get_content_value(raw, formatter, &meta.location),
+                "last_modified" => Ok(Arc::new(
+                    TimestampMicrosecondArray::from(vec![meta.last_modified.timestamp_micros()])
+                        .with_timezone("UTC"),
+                ) as ArrayRef),
+                "size" => Ok(Arc::new(UInt64Array::from(vec![meta.size])) as ArrayRef),
+                _ => Err(ArrowError::SchemaError(format!(
+                    "Unsupported field name: {}",
+                    field.name()
+                ))),
             })
-            .collect::<Result<Vec<_>, ArrowError>>()?;
+            .collect::<Result<Vec<ArrayRef>, ArrowError>>()?;
 
         RecordBatch::try_new(schema, columns)
     }
@@ -214,11 +208,16 @@ impl TableProvider for ObjectStoreTextTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let mut object_metas = self.list_and_filter_objects(filters, limit).await?;
+        if let Some(l) = limit {
+            object_metas.truncate(l);
+        }
+
         let projected_schema = project_schema(&self.schema(), projection)?;
+
         Ok(Arc::new(ObjectStoreTextExec::new(
             projected_schema,
-            filters,
-            limit,
+            object_metas,
             self.ctx.clone(),
             self.document_formatter.clone(),
         )))
@@ -228,17 +227,24 @@ impl TableProvider for ObjectStoreTextTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if f.column_refs()
+                    .contains(&Column::from_qualified_name("content"))
+                {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 }
 
 pub struct ObjectStoreTextExec {
     projected_schema: SchemaRef,
-    _filters: Vec<Expr>,
-    limit: Option<usize>,
+    object_metas: Arc<Vec<ObjectMeta>>,
     properties: PlanProperties,
 
     ctx: ObjectStoreContext,
@@ -290,6 +296,27 @@ impl ExecutionPlan for ObjectStoreTextExec {
         Ok(self)
     }
 
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> Result<Statistics, DataFusionError> {
+        let size = usize::try_from(
+            self.object_metas
+                .iter()
+                .map(|obj| obj.size)
+                .reduce(|a, b| a + b)
+                .unwrap_or_default(),
+        );
+
+        // Only one partition.
+        Ok(Statistics::new_unknown(&self.schema())
+            .with_num_rows(Precision::Exact(self.object_metas.len()))
+            .with_total_byte_size(match size {
+                Ok(s) => Precision::Exact(s),
+                Err(_) => Precision::Absent,
+            }))
+    }
+
     fn execute(
         &self,
         _partition: usize,
@@ -300,7 +327,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
             to_sendable_stream(
                 self.ctx.clone(),
                 self.formatter.clone(),
-                self.limit,
+                Arc::clone(&self.object_metas),
                 self.schema(),
             ),
         )))
@@ -310,15 +337,13 @@ impl ExecutionPlan for ObjectStoreTextExec {
 impl ObjectStoreTextExec {
     pub(crate) fn new(
         projected_schema: SchemaRef,
-        filters: &[Expr],
-        limit: Option<usize>,
+        object_metas: Vec<ObjectMeta>,
         ctx: ObjectStoreContext,
         formatter: Option<Arc<dyn DocumentParser>>,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
-            _filters: filters.to_vec(),
-            limit,
+            object_metas: Arc::new(object_metas),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
@@ -334,40 +359,26 @@ impl ObjectStoreTextExec {
 pub(crate) fn to_sendable_stream(
     ctx: ObjectStoreContext,
     formatter: Option<Arc<dyn DocumentParser>>,
-    limit: Option<usize>,
+    object_metas: Arc<Vec<ObjectMeta>>,
     schema: SchemaRef,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
-        let mut object_stream = ctx.store.list(ctx.prefix.clone().map(Path::from).as_ref());
-        let mut count = 0;
+        for object_meta in object_metas.iter() {
 
-        while let Some(item) = object_stream.next().await {
-            match item {
-                Ok(object_meta) => {
+            // Avoid object-store GET if not in projection
+            let bytz = if schema.column_with_name("content").is_some() {
+            let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+              result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?
+            } else {
+                Bytes::new()
+            };
 
-                    if !ctx.filename_in_scan(&object_meta) {
-                    continue;
-                    }
-
-                    let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
-                    let bytz = result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
-
-                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), Arc::clone(&schema)) {
-                        Ok(batch) => {
-                            let n = batch.num_rows();
-                            yield Ok(batch);
-                            count += n;
-                        },
-                        Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
-                    }
+            match ObjectStoreTextTable::to_record_batch(object_meta, &bytz, formatter.as_ref(), Arc::clone(&schema)) {
+                Ok(batch) => {
+                    yield Ok(batch);
                 },
                 Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
             }
-
-            // Early exit on LIMIT clause
-            if let Some(limit) = limit && count >= limit {
-                    break;
-                }
         }
     }
 }
