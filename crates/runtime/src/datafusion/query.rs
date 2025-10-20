@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     fmt::Display,
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -482,6 +483,7 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
 struct DriverStream {
     receiver: ReceiverStream<Result<RecordBatch, DataFusionError>>,
     driver_handle: Option<JoinHandle<()>>,
+    driver_error: Option<DataFusionError>,
 }
 
 impl DriverStream {
@@ -492,6 +494,7 @@ impl DriverStream {
         Self {
             receiver: ReceiverStream::new(receiver),
             driver_handle: Some(driver_handle),
+            driver_error: None,
         }
     }
 }
@@ -501,6 +504,32 @@ impl Stream for DriverStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        if let Some(handle) = this.driver_handle.as_mut() {
+            match Future::poll(Pin::new(handle), cx) {
+                Poll::Ready(Ok(())) => {
+                    this.driver_handle = None;
+                }
+                Poll::Ready(Err(err)) => {
+                    this.driver_handle = None;
+                    if err.is_panic() {
+                        this.driver_error = Some(DataFusionError::Execution(format!(
+                            "Query driver task panicked: {err}"
+                        )));
+                    } else if !err.is_cancelled() {
+                        this.driver_error = Some(DataFusionError::Execution(format!(
+                            "Query driver task failed: {err}"
+                        )));
+                    }
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if let Some(err) = this.driver_error.take() {
+            return Poll::Ready(Some(Err(err)));
+        }
+
         Pin::new(&mut this.receiver).poll_next(cx)
     }
 
