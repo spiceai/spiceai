@@ -908,7 +908,7 @@ pub(crate) fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestC
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_vectors"),
             SearchTestType::Sql(
-                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second', answer) order by score, id desc LIMIT 4;",
+                "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;",
             ),
         ),
     ]

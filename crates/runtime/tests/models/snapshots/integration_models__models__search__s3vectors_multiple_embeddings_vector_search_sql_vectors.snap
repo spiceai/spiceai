@@ -5,27 +5,27 @@ snapshot_kind: text
 ---
 [
   {
-    "id": 831,
-    "answer": "To find 15 more than -27, add 15 to -27:\n\\[ -27 + 15 = -12 \\]\nThe result is \\(\\boxed{-12}\\).",
+    "id": 468,
+    "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "round(vector_search(qs, Utf8(\"second\"), answer).score,Int64(1))": 0.5
+    "score": 0.54
   },
   {
-    "id": 1152,
-    "answer": "The smallest number in the book is typically $\\boxed{1}$, as counting books usually start from this number.",
+    "id": 1277,
+    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "round(vector_search(qs, Utf8(\"second\"), answer).score,Int64(1))": 0.5
+    "score": 0.539
   },
   {
-    "id": 211,
-    "answer": "\\[\n(2(-3))^2 - (2)^2 = (-6)^2 - 4 = 36 - 4 = \\boxed{32}\n\\]",
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "round(vector_search(qs, Utf8(\"second\"), answer).score,Int64(1))": 0.5
+    "score": 0.539
   },
   {
-    "id": 190,
-    "answer": "Substitute \\( x = -3 \\) into the expression:  \n\\[ 2 - 3(-3)^2 = 2 - 3(9) = 2 - 27 = \\boxed{-25} \\]",
+    "id": 948,
+    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "round(vector_search(qs, Utf8(\"second\"), answer).score,Int64(1))": 0.5
+    "score": 0.528
   }
 ]
