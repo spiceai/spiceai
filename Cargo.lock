@@ -4422,7 +4422,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=50e8a479bcf35ec991753144864617efca0a4038#50e8a479bcf35ec991753144864617efca0a4038"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=0939c87f3183c7b9a3c9251dd6d478e376aa56a4#0939c87f3183c7b9a3c9251dd6d478e376aa56a4"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -11559,9 +11559,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.11.3"
+version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b5288124840bee7b386bc413c487869b360b2b4ec421ea56425128692f2a82c"
+checksum = "843bc0191f75f3e22651ae5f1e72939ab2f72a4bc30fa80a066bd66edefc24d4"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -11571,9 +11571,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.11"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "833eb9ce86d40ef33cb1306d8accf7bc8ec2bfea4355cbdebb3df68b40925cad"
+checksum = "5276caf25ac86c8d810222b3dbb938e512c55c6831a10f3e6ed1c93b84041f1c"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -15043,9 +15043,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-postgres"
-version = "0.7.14"
+version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a156efe7fff213168257853e1dfde202eed5f487522cbbbf7d219941d753d853"
+checksum = "2b40d66d9b2cfe04b628173409368e58247e8eddbbd3b0e6c6ba1d09f20f6c9e"
 dependencies = [
  "async-trait",
  "byteorder",
