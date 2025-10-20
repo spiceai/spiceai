@@ -531,24 +531,6 @@ impl S3VectorsTable {
                         });
                     }
                 }
-                Err(SdkError::ConstructionFailure(_)) => {
-                    // For mock client testing
-                    match self.get_next_spill_index(&current_index).await? {
-                        Some(next_index) => {
-                            tracing::info!(
-                                "S3 Vector index {current_index} reached capacity, spilling to {next_index}",
-                            );
-                            current_index = next_index;
-                        }
-                        None => {
-                            return Err(Error::InternalError {
-                                source: Box::new(std::io::Error::other(format!(
-                                    "S3 Vector index {current_index} reached capacity and no more spill indexes available",
-                                ))),
-                            });
-                        }
-                    }
-                }
                 Err(e) => {
                     return Err(Error::S3VectorPutVectorError {
                         source: e.into_service_error(),
