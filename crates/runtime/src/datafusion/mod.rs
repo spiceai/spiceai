@@ -73,6 +73,7 @@ use query::QueryBuilder;
 use runtime_async::ManagedTokioRuntime;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
 use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -321,6 +322,7 @@ pub struct DataFusion {
     pub(crate) task_history_enabled: bool,
 
     tokio_runtime: ManagedTokioRuntime,
+    metrics: Option<Metrics>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1090,6 +1092,10 @@ impl DataFusion {
 
         if let Some(semaphore) = &self.acceleration_refresh_semaphore {
             accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
+        }
+
+        if let Some(metrics) = &self.metrics {
+            accelerated_table_builder.metrics(metrics.clone());
         }
 
         if refresh_mode == RefreshMode::Changes {
