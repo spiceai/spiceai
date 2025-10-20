@@ -289,7 +289,7 @@ impl Query {
 
             let final_stream = attach_query_active_guard_to_stream(
                 final_stream,
-                Arc::clone(&request_context),
+                &request_context,
                 inner_span.clone(),
             );
 
