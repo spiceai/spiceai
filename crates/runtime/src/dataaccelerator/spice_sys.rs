@@ -141,6 +141,7 @@ pub enum OpenOption {
     OpenExisting,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     open_option: OpenOption,
@@ -197,8 +198,33 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::DuckDB(pool))
         }
+        #[cfg(feature = "duckdb")]
+        Engine::TableModePartitionedDuckDB => {
+            use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
+
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::TableModePartitionedDuckDB,
+                })?;
+            let duckdb_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<TablesModePartitionedDuckDBAccelerator>()
+                .context(DowncastFailedSnafu {
+                    target: "TableModePartitionedDuckDBAccelerator",
+                })?;
+
+            let pool = duckdb_accelerator
+                .get_shared_pool(source)
+                .await
+                .context(PartitionedDuckDbPoolSnafu)?;
+
+            Ok(AccelerationConnection::DuckDB(pool))
+        }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB | Engine::PartitionedDuckDB => DuckDbFeatureNotEnabledSnafu.fail(),
+        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+            DuckDbFeatureNotEnabledSnafu.fail()
+        }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
             let accelerator = get_registered_accelerator(source, acceleration_settings.engine)

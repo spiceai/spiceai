@@ -45,6 +45,9 @@ use self::arrow::ArrowAccelerator;
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
+use self::partitioned_duckdb::{
+    PartitionedDuckDBAccelerator, tables_mode::TablesModePartitionedDuckDBAccelerator,
+};
 #[cfg(feature = "pepper")]
 use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
@@ -144,6 +147,12 @@ impl AcceleratorEngineRegistry {
         self.register_accelerator_engine(
             Engine::PartitionedDuckDB,
             Arc::new(PartitionedDuckDBAccelerator::new()),
+        )
+        .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(
+            Engine::TableModePartitionedDuckDB,
+            Arc::new(TablesModePartitionedDuckDBAccelerator::new()),
         )
         .await;
         #[cfg(feature = "postgres")]
