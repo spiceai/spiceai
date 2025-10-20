@@ -157,7 +157,7 @@ impl Query {
                     }
 
                     let mut stream = query_result.data;
-                    while let Some(batch) = stream.next().await {
+                    while let Some(batch) = request_context.scope(stream.next()).await {
                         if batch_tx.send(batch).await.is_err() {
                             break;
                         }
