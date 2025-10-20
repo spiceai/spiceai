@@ -68,28 +68,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # Cache Rust build artifacts
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-rust-models-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-models-
-            ${{ runner.os }}-rust-
-
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
