@@ -9,7 +9,7 @@ Pepper provides a lakehouse format that enables efficient CRUD operations on col
 - **SQLite Metadata Catalog**: Transactional metadata management following the DuckLake specification
 - **Vortex Data Files**: High-performance columnar storage with compression
 
-**Note**: This initial version of Pepper does not support snapshots, MVCC, or deletion vectors. These features are planned for future releases.
+**Note**: While the codebase includes a snapshot module (`snapshot.rs`) and a `SnapshotManager` API stub, snapshot functionality is not yet implemented or available in this version of Pepper. Similarly, MVCC and deletion vectors are not supported. These features are planned for future releases.
 
 ## Architecture
 
