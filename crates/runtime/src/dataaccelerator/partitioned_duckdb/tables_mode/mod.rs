@@ -114,7 +114,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     }
 
     fn name(&self) -> &'static str {
-        "partitioned_duckdb"
+        "partitioned_duckdb[tables]"
     }
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
