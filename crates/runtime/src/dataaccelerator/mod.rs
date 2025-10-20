@@ -45,12 +45,8 @@ use self::arrow::ArrowAccelerator;
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
-use self::partitioned_duckdb::{
-    PartitionedDuckDBAccelerator, tables_mode::TablesModePartitionedDuckDBAccelerator,
-};
-use self::partitioned_duckdb::{
-    PartitionedDuckDBAccelerator, tables_mode::TablesModePartitionedDuckDBAccelerator,
-};
+#[cfg(feature = "duckdb")]
+use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
 #[cfg(feature = "pepper")]
 use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
@@ -2528,7 +2524,7 @@ mod accelerator_compat_tests {
             let scan = table
                 .scan(&ctx.state(), projection.as_ref(), &[filter], limit)
                 .await
-                .expect("scan should be successful");
+                .expect("combined scan should be successful");
 
             // Verify projected schema
             let projected_schema = scan.schema();
@@ -2547,7 +2543,7 @@ mod accelerator_compat_tests {
 
             let results = collect(scan, ctx.task_ctx())
                 .await
-                .expect("scan successful");
+                .expect("combined scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow doesn't support filter or limit pushdown, so it returns all rows
