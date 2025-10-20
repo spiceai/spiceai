@@ -478,7 +478,7 @@ impl DataAccelerator for PepperAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    /// Vortex only supports file mode and creates an empty file with the given schema.
+    /// Pepper only supports file mode and creates an empty file with the given schema.
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
