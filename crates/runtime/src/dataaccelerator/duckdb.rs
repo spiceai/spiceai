@@ -116,39 +116,7 @@ impl DuckDBAccelerator {
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
     pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
-        if !source.is_file_accelerated() {
-            Err(Error::InvalidConfiguration {
-                detail: Arc::from("Dataset is not file accelerated"),
-            })
-        } else if let Some(acceleration) = source.acceleration().as_ref() {
-            let mut params = acceleration.params.clone();
-            let mut using_duckdb_data_dir = true;
-            let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
-                using_duckdb_data_dir = false;
-                spice_data_base_path()
-            });
-            params.insert("data_directory".to_string(), data_directory);
-
-            if let Some(duckdb_file) = params.remove("duckdb_file") {
-                if using_duckdb_data_dir {
-                    static WARN_ONCE: Once = Once::new();
-                    WARN_ONCE.call_once(|| {
-                        tracing::warn!(
-                            "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
-                        );
-                    });
-                }
-                params.insert("duckdb_open".to_string(), duckdb_file.to_string());
-            }
-
-            self.duckdb_factory
-                .duckdb_file_path("accelerated_duckdb", &mut params)
-                .map_err(|err| Error::InvalidConfiguration {
-                    detail: Arc::from(err.to_string()),
-                })
-        } else {
-            unreachable!("Expected dataset to have acceleration parameters, but none were found")
-        }
+        duckdb_file_path(&self.duckdb_factory, source)
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
@@ -156,7 +124,7 @@ impl DuckDBAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<DuckDbConnectionPool> {
-        let duckdb_file = self.duckdb_file_path(source);
+        let duckdb_file = duckdb_file_path(&self.duckdb_factory, source);
 
         let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
             dataset: source.name().to_string(),
@@ -244,6 +212,46 @@ impl DuckDBAccelerator {
     }
 }
 
+/// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
+pub fn duckdb_file_path(
+    duckdb_factory: &DuckDBTableProviderFactory,
+    source: &dyn AccelerationSource,
+) -> Result<String> {
+    if !source.is_file_accelerated() {
+        Err(Error::InvalidConfiguration {
+            detail: Arc::from("Dataset is not file accelerated"),
+        })
+    } else if let Some(acceleration) = source.acceleration().as_ref() {
+        let mut params = acceleration.params.clone();
+        let mut using_duckdb_data_dir = true;
+        let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
+            using_duckdb_data_dir = false;
+            spice_data_base_path()
+        });
+        params.insert("data_directory".to_string(), data_directory);
+
+        if let Some(duckdb_file) = params.remove("duckdb_file") {
+            if using_duckdb_data_dir {
+                static WARN_ONCE: Once = Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
+                    );
+                });
+            }
+            params.insert("duckdb_open".to_string(), duckdb_file.to_string());
+        }
+
+        duckdb_factory
+            .duckdb_file_path("accelerated_duckdb", &mut params)
+            .map_err(|err| Error::InvalidConfiguration {
+                detail: Arc::from(err.to_string()),
+            })
+    } else {
+        unreachable!("Expected dataset to have acceleration parameters, but none were found")
+    }
+}
+
 impl Default for DuckDBAccelerator {
     fn default() -> Self {
         Self::new()
@@ -258,6 +266,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
+    ParameterSpec::component("partition_mode"),
 ];
 
 #[async_trait]

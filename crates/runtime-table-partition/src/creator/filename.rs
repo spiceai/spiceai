@@ -199,7 +199,21 @@ macro_rules! parse_numeric_scalar {
     };
 }
 
-fn parse_partition_value(
+/// Converts string values from hive-style partition directories (e.g., "year=2025") into
+/// strongly-typed [`ScalarValue`].
+///
+/// # Arguments
+/// * `schema` - Schema context for type resolution
+/// * `partition_by` - Partition definition containing the expression and name
+/// * `value_str` - String value to parse (e.g., "2025", "october", "none")
+///
+/// # Returns
+/// A [`ScalarValue`] of the appropriate type matching the partition's data type
+///
+/// # Errors
+/// Returns `Error::Parsing` if the string cannot be parsed to the expected type,
+/// or `Error::UnsupportedType` if the partition's data type is not supported.
+pub fn parse_partition_value(
     schema: &dyn ExprSchema,
     partition_by: &PartitionedBy,
     value_str: &str,
