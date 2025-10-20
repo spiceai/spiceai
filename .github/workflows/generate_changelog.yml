@@ -4,13 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       previous_release_tag:
-        description: 'The previous release tag to compare against (e.g. v1.4.0)'
+        description: 'The previous release tag to compare against (e.g. v1.8.0)'
         type: string
         required: true
+        default: 'v1.8.0'
       release_branch:
-        description: 'The release branch (or prep branch) to compare against (e.g. release/1.5 or pease/release-1.5-prep)'
+        description: 'The release branch (or prep branch) to compare against (e.g. release/1.8 or pease/release-1.8-prep)'
         type: string
         required: true
+        default: 'release/1.8'
 
 jobs:
   generate:
@@ -29,4 +31,4 @@ jobs:
           PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
           RELEASE_BRANCH: ${{ inputs.release_branch }}
         run: |
-          ./scripts/generate_changelog.sh $PREVIOUS_RELEASE_TAG $RELEASE_BRANCH
+          python3 ./scripts/generate_changelog.py $PREVIOUS_RELEASE_TAG $RELEASE_BRANCH
