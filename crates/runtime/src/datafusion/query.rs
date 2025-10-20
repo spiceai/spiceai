@@ -57,16 +57,11 @@ use {
     ballista_core::planner::BallistaQueryPlanner,
 };
 
-use datafusion::common::plan_err;
-use datafusion::execution::{SessionState, SessionStateBuilder};
-use datafusion::physical_planner::DefaultPhysicalPlanner;
-use datafusion_proto::protobuf::LogicalPlanNode;
+use datafusion::execution::SessionState;
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
-use crate::config::ClusterMode;
 
-use crate::datafusion::extension::SpiceQueryPlanner;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };

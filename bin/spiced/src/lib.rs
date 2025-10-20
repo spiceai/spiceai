@@ -175,6 +175,7 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 

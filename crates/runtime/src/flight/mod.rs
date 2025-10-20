@@ -21,7 +21,6 @@ use {
 };
 
 use crate::auth::EndpointAuth;
-use crate::config::ClusterMode;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
@@ -429,6 +428,7 @@ pub async fn start(
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
+    #[allow(unused_mut)]
     let mut server = server
         .layer(RequestContextLayer::new(app, rt.datafusion()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(

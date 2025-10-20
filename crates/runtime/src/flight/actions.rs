@@ -130,7 +130,7 @@ pub(crate) async fn do_action(
                 unreachable!("Must bind app spec");
             };
 
-            let bs = serde_json::to_vec(&app).unwrap();
+            let bs = serde_json::to_vec(&app).map_err(to_tonic_err)?;
             let result = arrow_flight::Result::new(bs);
             futures::stream::iter(vec![Ok(result)])
         }

@@ -41,8 +41,6 @@ use crate::{
 };
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::execution::SessionStateBuilder;
-use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 
@@ -66,7 +64,6 @@ use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
-use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
@@ -83,9 +80,7 @@ use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
-use tokio::net::TcpListener;
 
-use runtime_object_store::registry::default_runtime_env;
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;

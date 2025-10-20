@@ -73,7 +73,6 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
-use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;

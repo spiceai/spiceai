@@ -28,8 +28,8 @@ use super::{
 };
 #[cfg(feature = "cluster")]
 use crate::config::ClusterConfig;
+use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
-use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
 use datafusion::config::SpillCompression;
 use datafusion::{
@@ -48,7 +48,7 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_federation::sql::federation_analyzer_rule;
 use datafusion_optimizer_rules::logical_plan::cache_invalidation::CacheInvalidationOptimizerRule;
 use datafusion_optimizer_rules::physical_plan::EmptyHashJoinExecPhysicalOptimization;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;

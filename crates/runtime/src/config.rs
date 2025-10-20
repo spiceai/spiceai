@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use clap::ValueEnum;
-use fluent_uri::Uri;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Debug, Clone, clap::Parser)]
