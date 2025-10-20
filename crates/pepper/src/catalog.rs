@@ -64,7 +64,7 @@ pub enum CatalogError {
     },
 
     /// `SQLite` error
-    #[snafu(display("SQLite error: {source}"))]
+    #[snafu(transparent)]
     Sqlite {
         /// The underlying `SQLite` error
         source: rusqlite::Error,
@@ -100,7 +100,7 @@ impl From<std::io::Error> for CatalogError {
 }
 
 /// Result type for catalog operations.
-pub type CatalogResult<T> = Result<T, CatalogError>;
+pub type Result<T, E = CatalogError> = Result<T, E>;
 
 /// Trait for metadata catalog operations.
 ///
