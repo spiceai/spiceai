@@ -12,7 +12,10 @@ limitations under the License.
 */
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
-use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
+use crate::{
+    SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME,
+    generation::text_search::query::FullTextSearchQuery,
+};
 use arrow::{
     array::RecordBatch,
     datatypes::{Field, FieldRef, Schema, SchemaRef},
@@ -22,9 +25,8 @@ use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    error::DataFusionError, execution::SendableRecordBatchStream,
+    catalog::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
-    sql::sqlparser::ast::Ident,
 };
 
 use futures::{Stream, StreamExt};
@@ -447,36 +449,12 @@ pub struct FullTextSearchCandidate {
 
 #[async_trait]
 impl CandidateGeneration for FullTextSearchCandidate {
-    async fn search(
-        &self,
-        query: String,
-        opt_filters: &[&Expr],
-        _addition_projection: &[&Expr],
-        limit: usize,
-    ) -> GenerationResult<SendableRecordBatchStream> {
-        self.inner.search(query, opt_filters, limit).await
-    }
-
-    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
-        Ok((0..filters.len()).map(|_| false).collect::<Vec<_>>())
-    }
-
-    /// Whether additional columns of the underlying source can also be retrieved during generation.
-    fn supports_columns(&self, projection: &[&Expr]) -> GenerationResult<Vec<bool>> {
-        let columns = self.inner.all_columns();
-
-        let cols_found = projection
-            .iter()
-            .map(|expr| {
-                if let Expr::Identifier(Ident { value, .. }) = expr {
-                    columns.contains(value) || value == SEARCH_SCORE_COLUMN_NAME
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        Ok(cols_found)
+    fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        Ok(Arc::new(FullTextSearchQuery {
+            index: Arc::clone(&self.inner),
+            query,
+            pre_limit: None,
+        }))
     }
 
     /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
@@ -538,80 +516,7 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use datafusion::{execution::SendableRecordBatchStream, physical_plan::common::collect};
-    use serde_json::Value;
-    use tantivy::{
-        Index, IndexWriter, doc,
-        schema::{STORED, Schema, TEXT},
-    };
-
-    use crate::{
-        aggregation::write_to_json_string,
-        generation::{
-            CandidateGeneration, Result as GenerationResult,
-            text_search::{FullTextSearchCandidate, FullTextSearchFieldIndex, parse_query_literal},
-        },
-    };
-
-    pub(crate) fn normalise_result(value: &mut serde_json::Value) {
-        if let Value::Array(vv) = value {
-            for v in vv {
-                if let Value::Object(obj) = v {
-                    obj.sort_keys();
-                    if let Some(Value::Number(n)) = obj.get("score")
-                        && let Some(score) = n.as_f64()
-                        && let Some(truncated_score) =
-                            serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
-                    // Keep 2 decimals
-                    {
-                        obj.insert("score".to_string(), Value::Number(truncated_score));
-                    }
-                }
-            }
-        }
-    }
-
-    // Keep in sync with `crate::generation::post_apply::tests::create_table_provider`.
-    pub(crate) fn create_basic_index() -> Index {
-        let mut schema_builder = Schema::builder();
-        let title = schema_builder.add_text_field("title", TEXT | STORED);
-        let body = schema_builder.add_text_field("body", TEXT | STORED);
-        let schema = schema_builder.build();
-
-        let index = Index::create_in_ram(schema);
-        let mut index_writer: IndexWriter = index
-            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
-            .expect("Failed to make index writer");
-        index_writer.add_document(doc!(
-            title => "The Old Man and the Sea",
-            body => "He was an old man who fished alone in a skiff in the Gulf Stream and he had gone \
-              eighty-four days now without taking a fish.",
-        )).expect("failed to add document");
-
-        index_writer.add_document(doc!(
-        title => "Of Mice and Men",
-        body => "A few miles south of Soledad, the Salinas River drops in close to the hillside \
-                bank and runs deep and green. The water is warm too, for it has slipped twinkling \
-                over the yellow sands in the sunlight before reaching the narrow pool. On one \
-                side of the river the golden foothill slopes curve up to the strong and rocky \
-                Gabilan Mountains, but on the valley side the water is lined with fish and trees—willows \
-                fresh and green with every spring, carrying in their lower leaf junctures the \
-                debris of the winter’s flooding; and sycamores with mottled, white, recumbent \
-                limbs and branches that arch over the pool."
-        )).expect("failed to add document");
-
-        index_writer.add_document(doc!(
-        title => "Frankenstein",
-        body => "You will rejoice to hear that no disaster has accompanied the commencement of an \
-                 enterprise which you have regarded with such evil forebodings.  I arrived here \
-                 yesterday, and my first task is to assure my dear sister of my welfare and \
-                 increasing confidence in the success of getting fish."
-        )).expect("failed to add document");
-
-        index_writer.commit().expect("failed to commit documents");
-
-        index
-    }
+    use crate::generation::text_search::parse_query_literal;
 
     #[test]
     fn test_parse_query_literal() {
@@ -625,39 +530,5 @@ pub(crate) mod tests {
             "operators",
             parse_query_literal("How much (in USD) don't I get?")
         );
-    }
-
-    #[tokio::test]
-    #[ignore = "CandidateGeneration::search to be removed in https://github.com/spiceai/spiceai/issues/7550"]
-    async fn test_basic_index() {
-        let fts =
-            FullTextSearchFieldIndex::try_new(&create_basic_index(), "body".to_string(), vec![])
-                .expect("failed to create FullTextSearch");
-
-        let candidate: FullTextSearchCandidate = fts.into();
-
-        let rb_as_value = validate_result(candidate.search("fish".into(), &[], &[], 3).await).await;
-
-        insta::assert_json_snapshot!(rb_as_value);
-    }
-
-    /// Validates the result of a search operation by collecting the [`RecordBatch`] results into a JSON value.
-    pub(crate) async fn validate_result(
-        output: GenerationResult<SendableRecordBatchStream>,
-    ) -> Value {
-        let output = output.expect("failed to execute search");
-        let rbs = collect(output)
-            .await
-            .expect("failed to collect search results");
-
-        let rb_json =
-            write_to_json_string(rbs.as_slice()).expect("failed to write RecordBatch to JSON");
-
-        let mut rb_as_value = serde_json::from_str::<serde_json::Value>(&rb_json)
-            .expect("failed to parse JSON string");
-
-        normalise_result(&mut rb_as_value);
-
-        rb_as_value
     }
 }

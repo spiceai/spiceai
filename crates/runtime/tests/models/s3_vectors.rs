@@ -26,7 +26,7 @@ use spicepod::{
     semantic::{Column, ColumnLevelEmbeddingConfig},
 };
 
-use crate::models::search::{SearchTestCase, SearchTestType};
+use crate::models::search::{SearchTestCase, SearchTestType, vectors_nonfilterable_col};
 
 mod search {
     use crate::{
@@ -34,11 +34,10 @@ mod search {
         models::{
             get_mega_science_dataset,
             hf::{get_huggingface_embeddings, get_model_to_vec_embeddings},
-            s3_vectors::{
-                basic_vector_search_tests, delete_index, vectors_filterable_col,
-                vectors_nonfilterable_col,
+            s3_vectors::{basic_vector_search_tests, delete_index, vectors_filterable_col},
+            search::{
+                SearchTestCase, SearchTestType, run_search_w_explain, vectors_nonfilterable_col,
             },
-            search::{SearchTestCase, SearchTestType, run_search_w_explain},
         },
         utils::verify_env_secret_exists,
     };
@@ -845,16 +844,6 @@ fn vectors_filterable_col(col: impl Into<Column>) -> Column {
     )
 }
 
-pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
-    col.into().with_metadata(
-        [(
-            "vectors".to_string(),
-            serde_json::Value::String("non-filterable".to_string()),
-        )]
-        .into(),
-    )
-}
-
 /// Returns common test cases for vector search on the [`get_mega_science_dataset`] dataset
 ///
 /// Assumes datasets has name `qs` and embedding column is on `answer` column.
@@ -919,7 +908,7 @@ pub(crate) fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestC
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_vectors"),
             SearchTestType::Sql(
-                "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second', answer) order by score, id desc LIMIT 4;",
+                "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;",
             ),
         ),
     ]

@@ -7,6 +7,7 @@ members = [
     "crates/arrow_tools",
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
+    "crates/datafusion-optimizer-rules",
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
@@ -21,6 +22,7 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
+    "crates/runtime-async",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-parameters",
@@ -180,7 +182,7 @@ prometheus = "0.13"
 r2d2 = "0.8.10"
 rand = "0.9.2"
 rdkafka = { version = "0.38.0" }
-regex = "1.11.3"
+regex = "1.12.2"
 reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
 rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "ec71bd9b735c87cc903c33ed643a04bfd661273e" }
 rusqlite = { version = "0.31.0", features = ["bundled-decimal", "chrono"] }
@@ -204,7 +206,7 @@ tiberius = { version = "0.12.3", default-features = false, features = [
     "chrono",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
-tokio-postgres = { version = "0.7.14", features = [
+tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",
     "with-uuid-1",
 ] }

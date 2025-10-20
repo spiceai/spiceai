@@ -1,0 +1,18 @@
+---
+source: crates/runtime/src/datafusion/extension/mod.rs
+expression: formatted
+snapshot_kind: text
+---
++---------------+-----------------------------------------------------------------------------------+
+| plan_type     | plan                                                                              |
++---------------+-----------------------------------------------------------------------------------+
+| logical_plan  | CacheInvalidationNode: table=test_table                                           |
+|               |   Dml: op=[Insert Into] table=[test_table]                                        |
+|               |     Projection: column1 AS id, column2 AS name, column3 AS value                  |
+|               |       Values: (Int32(1) AS Int64(1), Utf8("foo"), Float64(42))                    |
+| physical_plan | CacheInvalidationExec: table=test_table                                           |
+|               |   DataSinkExec: sink=MemoryTable (partitions=1)                                   |
+|               |     ProjectionExec: expr=[column1@0 as id, column2@1 as name, column3@2 as value] |
+|               |       DataSourceExec: partitions=1, partition_sizes=[1]                           |
+|               |                                                                                   |
++---------------+-----------------------------------------------------------------------------------+

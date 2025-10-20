@@ -20,12 +20,13 @@ use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
+use crate::search::util::parse_explicit_primary_keys;
 use datafusion::functions::math::random::RandomFunc;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::ai;
 use runtime_datafusion_udfs::{alias, bucket, cosine_distance, digest_many, embed, truncate};
 
-pub fn register_udfs(runtime: &crate::Runtime) {
+pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
     ctx.register_udf(alias::ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(bucket::Bucket::new().into());
@@ -38,10 +39,16 @@ pub fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(TextSearchTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
-    ctx.register_udf(VectorSearchTableFunc::new(Arc::downgrade(&runtime.df)).into());
+    let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
+    ctx.register_udf(
+        VectorSearchTableFunc::new(Arc::downgrade(&runtime.df), explicit_pks.clone()).into(),
+    );
     ctx.register_udtf(
         VECTOR_SEARCH_UDTF_NAME,
-        Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&runtime.df))),
+        Arc::new(VectorSearchTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            explicit_pks,
+        )),
     );
 
     ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(ctx).into());

@@ -185,7 +185,7 @@ mod search {
 
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[allow(clippy::too_many_lines)]
     async fn huggingface_test_search() -> Result<(), anyhow::Error> {
         let app = AppBuilder::new("text-to-sql")
