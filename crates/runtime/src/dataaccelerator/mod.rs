@@ -923,7 +923,7 @@ mod accelerator_compat_tests {
                     let mut params = HashMap::new();
                     if mode == "file" {
                         // Set file_path to use our unique temporary location with timestamp
-                        params.insert("file_path".to_string(), location.clone());
+                        params.insert("vortex_file_path".to_string(), location.clone());
                     }
 
                     dataset.acceleration = Some(Acceleration {
