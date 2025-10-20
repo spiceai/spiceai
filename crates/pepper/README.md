@@ -61,7 +61,7 @@ Implementations:
 
 Core data structures following the DuckLake specification:
 
-- **`Snapshot`**: Point-in-time view with MVCC semantics
+- **`Snapshot`** _(planned)_: Point-in-time view with MVCC semantics (future work)
 - **`TableMetadata`**: Table schema and configuration
 - **`DataFile`**: Reference to a Vortex data file
 - **`DeleteFile`**: Reference to a deletion vector (Parquet file)
