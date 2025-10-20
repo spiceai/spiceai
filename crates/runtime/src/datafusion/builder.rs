@@ -57,6 +57,7 @@ use datafusion::{
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
+use spicepod::metric::Metrics;
 use std::sync::LazyLock;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
@@ -98,6 +99,7 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
+    metrics: Option<Metrics>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -130,6 +132,7 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
+            metrics: None,
         }
     }
 
@@ -175,6 +178,12 @@ impl DataFusionBuilder {
     ) -> Self {
         self.accelerated_refresh_semaphore =
             Some(Arc::new(Semaphore::new(max_parallel_accelerated_refreshes)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -281,6 +290,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            metrics: self.metrics,
         }
     }
 }

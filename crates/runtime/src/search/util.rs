@@ -342,8 +342,9 @@ mod tests {
             FullTextDatabaseIndex::try_new(
                 Arc::clone(&base_table),
                 vec!["search_field".to_string()],
-                vec![].into(),
+                Some(vec!["search_field".to_string()]),
                 None,
+                &[],
             )
             .await
             .expect("cannot make full text table"),

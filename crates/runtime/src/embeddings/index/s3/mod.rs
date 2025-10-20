@@ -42,6 +42,9 @@ use crate::{
 };
 use retry_client::S3VectorRetryClientBuilder;
 use runtime_secrets::{Secrets, get_params_with_secrets};
+mod client;
+mod metrics;
+use client::S3VectorClient;
 mod retry_client;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
@@ -190,10 +193,11 @@ async fn try_vector_table(
     )
     .await?;
 
-    let s3_vector_client = Client::new(&config);
+    let s3_vector_client = S3VectorClient::new(Client::new(&config));
 
-    let s3_vector_client = Arc::new(S3VectorRetryClientBuilder::new(s3_vector_client).build())
-        as Arc<dyn S3Vectors + Send + Sync>;
+    let s3_vector_client =
+        Arc::new(S3VectorRetryClientBuilder::new(Arc::new(s3_vector_client)).build())
+            as Arc<dyn S3Vectors + Send + Sync>;
 
     let Some(dimension) = embedding_vector_size(embedding_models, model_name).await else {
         return Err(Box::from(
