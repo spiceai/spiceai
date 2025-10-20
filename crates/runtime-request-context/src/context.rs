@@ -149,12 +149,11 @@ impl RequestContext {
     where
         S: Stream,
     {
-        stream! {
-            tokio::pin!(stream);
-            while let Some(item) = Arc::clone(&self).scope(stream.next()).await {
-                yield item;
-            }
-        }
+        let pinned = Box::pin(stream);
+        futures::stream::unfold((pinned, self), |(mut stream, ctx)| {
+            let ctx_clone = Arc::clone(&ctx);
+            ctx_clone.scope(async move { stream.next().await.map(|item| (item, (stream, ctx))) })
+        })
     }
 
     /// Retries the provided future from the closure `r` times until it fails or succeeds.
