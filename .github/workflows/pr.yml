@@ -75,6 +75,42 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Cache Cargo dependencies
+      - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cache Go modules
+      - name: Cache Go modules
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Cache Rust build artifacts
+      - name: Cache Rust build
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-lint-${{ env.RUST_PROFILE }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-lint-${{ env.RUST_PROFILE }}-
+            ${{ runner.os }}-rust-lint-
+
       - name: Set up Go
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/setup-go@v6
@@ -158,6 +194,42 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Cache Cargo dependencies
+      - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cache Go modules
+      - name: Cache Go modules
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # Cache Rust build artifacts
+      - name: Cache Rust build
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-build-${{ env.RUST_PROFILE }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-build-${{ env.RUST_PROFILE }}-
+            ${{ runner.os }}-rust-build-
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -230,6 +302,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Setup Docker Buildx for advanced caching
+      - name: Set up Docker Buildx
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push Docker images
         uses: docker/build-push-action@v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -243,3 +320,5 @@ jobs:
             RUST_PROFILE=${{ env.RUST_PROFILE }}
           tags: |
             ghcr.io/spiceai/spiceai-rust:ci
+          cache-from: type=gha,scope=${{ github.workflow }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}
