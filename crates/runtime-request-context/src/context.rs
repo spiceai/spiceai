@@ -17,7 +17,6 @@ limitations under the License.
 
 use crate::TraceParent;
 use app::App;
-use async_stream::stream;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use opentelemetry::KeyValue;
