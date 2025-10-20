@@ -40,9 +40,6 @@ pub(crate) async fn handle(
         Command::CommandPreparedStatementQuery(handle) => {
             flightsql::prepared_statement_query::get_flight_info(handle, request).await
         }
-        Command::CommandPreparedStatementUpdate(handle) => {
-            flightsql::prepared_statement_update::get_flight_info(handle, request).await
-        }
         Command::CommandGetCatalogs(token) => {
             Ok(flightsql::get_catalogs::get_flight_info(token, request).await)
         }
