@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use meter::METER;
+use opentelemetry::metrics::UpDownCounter;
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
@@ -44,6 +45,24 @@ static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 pub fn track_query_count(dimensions: &[KeyValue]) {
     QUERY_COUNT.add(1, dimensions);
+}
+
+static QUERY_ACTIVE_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    METER
+        .i64_up_down_counter("query_active_count")
+        .with_description(
+            "Number of concurrent top-level queries actively being processed in the runtime.",
+        )
+        .with_unit("queries")
+        .build()
+});
+
+pub fn inc_query_active_count(dimensions: &[KeyValue]) {
+    QUERY_ACTIVE_COUNT.add(1, dimensions);
+}
+
+pub fn dec_query_active_count(dimensions: &[KeyValue]) {
+    QUERY_ACTIVE_COUNT.add(-1, dimensions);
 }
 
 static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {

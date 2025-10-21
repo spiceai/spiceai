@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::time::Duration;
 
-use opentelemetry::{KeyValue, metrics::Histogram};
-
-use super::{Counter, LazyLock, Meter, global};
+use super::{Counter, Histogram, LazyLock, Meter, UpDownCounter, global};
+use opentelemetry::KeyValue;
 
 pub(crate) static TELEMETRY_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("telemetry"));
 
@@ -33,6 +32,26 @@ static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub fn track_query_count(dimensions: &[KeyValue]) {
     telemetry::track_query_count(dimensions);
     QUERY_COUNT.add(1, dimensions);
+}
+
+static QUERY_ACTIVE_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    TELEMETRY_METER
+        .i64_up_down_counter("query_active_count")
+        .with_description(
+            "Number of concurrent top-level queries actively being processed in the runtime.",
+        )
+        .with_unit("queries")
+        .build()
+});
+
+pub fn inc_query_active_count(dimensions: &[KeyValue]) {
+    telemetry::inc_query_active_count(dimensions);
+    QUERY_ACTIVE_COUNT.add(1, dimensions);
+}
+
+pub fn dec_query_active_count(dimensions: &[KeyValue]) {
+    telemetry::dec_query_active_count(dimensions);
+    QUERY_ACTIVE_COUNT.add(-1, dimensions);
 }
 
 static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
