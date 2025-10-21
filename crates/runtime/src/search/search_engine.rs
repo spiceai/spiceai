@@ -23,18 +23,18 @@ use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion_expr::sqlparser::ast::Ident;
-use datafusion_expr::{LogicalPlan, ident};
+use datafusion_expr::sqlparser::ast;
+use datafusion_expr::{Expr, LogicalPlan};
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 use search::pipeline::QueryEngine;
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, resolved_equality};
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::ChunkedNonIndexVectorGeneration,
@@ -308,24 +308,20 @@ impl SearchEngine {
                         generators.append(&mut fts);
                     }
 
-                    // This is actually infallible
-                    let filters = if let Ok(schm) = DFSchema::try_from(self
-                        .df
-                        .get_table(&tbl)
-                        .await
-                        .ok_or(Error::DataSourcesNotFound {
-                            data_source: vec![tbl.clone()],
-                        })?.schema()) {
-                            let state = self.df.ctx.state();
-                            where_cond.iter().map(|f| state.create_logical_expr(&f.to_string(), &schm)).collect::<Result<_, DataFusionError>>().context(DataFusionSnafu)?
-                    } else {
-                        vec![]
-                    };
+                    // Ensure columns for a specific table aren't used on all tables.
+                    let table_cols: Vec<_> = additional_columns
+                        .iter()
+                        .filter(|&c| c.relation.as_ref().is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone())))
+                        .cloned()
+                        .map(Expr::Column)
+                        .collect();
 
-                    let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df)))).run(
+                    let pipe = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df))));
+                    let agg_result = pipe.run(
                         query.clone(),
-                        filters,
-                        additional_columns.iter().map(|Ident{value,..}| ident(value.clone())).collect(),
+                        &tbl,
+                        get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
+                        table_cols,
                         primary_keys.to_vec(),
                         keywords,
                         *limit
@@ -357,6 +353,60 @@ impl SearchEngine {
             }
         }
     }
+}
+
+async fn get_filter_for_table(
+    df: &Arc<DataFusion>,
+    tbl: &TableReference,
+    filter_opt: Option<&ast::Expr>,
+) -> Result<Option<Expr>, super::Error> {
+    let Some(filter) = filter_opt else {
+        return Ok(None);
+    };
+
+    let table = df.get_table(tbl).await.ok_or(Error::DataSourcesNotFound {
+        data_source: vec![tbl.clone()],
+    })?;
+    let schema = DFSchema::try_from_qualified_schema(tbl.clone(), &table.schema())
+        .context(DataFusionSnafu)?;
+
+    match df
+        .ctx
+        .state()
+        .create_logical_expr(&filter.to_string(), &schema)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if is_field_not_found_on_unrelated_table(tbl, &e) => {
+            tracing::debug!(
+                "Ignoring SQL filter ('{}') on table {tbl:?} for search request as its columns do not reference this table",
+                filter
+            );
+            Ok(None)
+        }
+        Err(e) => Err(super::Error::DataFusionError { source: e }),
+    }
+}
+
+/// Checks if the [`DataFusionError`] is about a specific field not being found in a schema (i.e [`SchemaError`]).
+///
+/// Returns true iff the error is of this nature AND the field is unrelated (i.e. an explicit
+/// [`Column::relation`] to a different table) to the provided `tbl`
+fn is_field_not_found_on_unrelated_table(tbl: &TableReference, e: &DataFusionError) -> bool {
+    let DataFusionError::Diagnostic(_, inner) = e else {
+        return false;
+    };
+    let DataFusionError::SchemaError(err, _) = &**inner else {
+        return false;
+    };
+    let SchemaError::FieldNotFound { field, .. } = &**err else {
+        return false;
+    };
+
+    // Unrelated table is only if a different relation is explicit set on the column.
+    !field
+        .relation
+        .as_ref()
+        .is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone()))
 }
 
 fn wrap_cache_to_result(
