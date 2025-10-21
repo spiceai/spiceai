@@ -360,7 +360,7 @@ fn insert_overwrite(
                     .map_err(to_retriable_data_write_error)
             })?;
 
-        // partition still exist so should NOT be deleted
+        // partition still exists so should NOT be deleted
         candidates_to_drop.remove(&new_table.definition_name().to_string());
     }
 
