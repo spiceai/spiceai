@@ -10584,6 +10584,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "datafusion-catalog",
+ "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-physical-expr",
+ "datafusion-physical-plan",
+ "futures",
+ "rusqlite",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid 1.18.0",
+ "vortex-datafusion",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12415,6 +12447,7 @@ dependencies = [
  "otel-arrow",
  "package",
  "paste",
+ "pepper",
  "percent-encoding",
  "pin-project",
  "postcard",
@@ -16779,6 +16812,7 @@ name = "vortex-datafusion"
 version = "0.54.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "arrow-schema",
  "async-trait",
  "chrono",
@@ -16804,6 +16838,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid 1.18.0",
  "vortex",
  "vortex-utils",
  "walkdir",
