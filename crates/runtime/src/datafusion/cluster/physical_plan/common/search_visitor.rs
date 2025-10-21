@@ -11,6 +11,7 @@ macro_rules! concrete {
 }
 
 /// A generalized `TreeNodeVisitor` that collects values from the provided fns during traversal
+#[allow(clippy::type_complexity)]
 pub struct SearchVisitor<T> {
     pub values: Vec<T>,
     pub limit: Option<usize>,

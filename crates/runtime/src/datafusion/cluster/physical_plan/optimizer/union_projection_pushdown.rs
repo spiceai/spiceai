@@ -59,9 +59,9 @@ impl UnionProjectionPushdownOptimizer {
             .filter_map(|p_child| {
                 SearchVisitor::default()
                     .down(move |p| {
-                        if p.children().len() == 1 && concrete!(p, ProjectionExec).is_none() {
-                            Some(Arc::clone(p))
-                        } else if concrete!(p, DataSourceExec).is_some() {
+                        if (p.children().len() == 1 && concrete!(p, ProjectionExec).is_none())
+                            || concrete!(p, DataSourceExec).is_some()
+                        {
                             Some(Arc::clone(p))
                         } else {
                             None
@@ -133,7 +133,7 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
                                 projection,
                                 repartition.output_partitioning().clone(),
                             )?)
-                        } else if let Some(_) = maybe_coalesce {
+                        } else if maybe_coalesce.is_some() {
                             Arc::new(CoalescePartitionsExec::new(projection))
                         } else {
                             projection

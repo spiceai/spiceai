@@ -625,7 +625,6 @@ impl Runtime {
 
         // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
         let current_context = Arc::clone(&self.df.ctx);
-        let runtime_handle = Arc::clone(self);
 
         scheduler_config.override_session_builder = Some(Arc::new(move |_cfg| {
             let cfg = current_context
@@ -679,30 +678,32 @@ impl Runtime {
 
     #[cfg(feature = "cluster")]
     pub async fn start_cluster_executor(self: &Arc<Self>) -> Result<()> {
-        let mut executor_config = ExecutorProcessConfig::default();
+        let runtime_handle = Arc::clone(self);
 
-        executor_config.override_logical_codec = Some(SpiceLogicalCodec::new_codec());
-        executor_config.override_physical_codec = Some(
-            SpicePhysicalCodec::new_codec(Arc::clone(self)).map_err(|e| {
-                Error::FailedToStartClusterExecutor {
-                    source: Box::new(e),
-                }
-            })?,
-        );
-        executor_config.grpc_max_encoding_message_size = u32::MAX;
-        executor_config.grpc_max_decoding_message_size = u32::MAX;
+        let mut executor_config = ExecutorProcessConfig {
+            override_logical_codec: Some(SpiceLogicalCodec::new_codec()),
+            override_physical_codec: Some(
+                SpicePhysicalCodec::new_codec(Arc::clone(self)).map_err(|e| {
+                    Error::FailedToStartClusterExecutor {
+                        source: Box::new(e),
+                    }
+                })?,
+            ),
+            override_runtime_producer: Some(Arc::new(move |_cfg| {
+                Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env()))
+            })),
+            override_config_producer: Some(Arc::new(move || {
+                SessionConfig::new_with_ballista()
+                    .with_option_extension(SpiceClusterConfig::default())
+            })),
+            grpc_max_encoding_message_size: u32::MAX,
+            grpc_max_decoding_message_size: u32::MAX,
+            work_dir: self.df.temp_directory.clone(),
+            ..Default::default()
+        };
 
         // Set up executor runtime, and initialize AWS SDK (since there are no datasets here to do so)
         let _bind_aws_creds = aws_sdk_credential_bridge::initialize_sdk_config().await;
-        let runtime_handle = Arc::clone(self);
-        executor_config.override_runtime_producer = Some(Arc::new(move |_cfg| {
-            Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env()))
-        }));
-        executor_config.override_config_producer = Some(Arc::new(move || {
-            SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
-        }));
-
-        executor_config.work_dir = self.df.temp_directory.clone();
 
         self.cluster_config
             .scheduler_url

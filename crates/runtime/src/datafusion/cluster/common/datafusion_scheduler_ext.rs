@@ -1,7 +1,7 @@
 use crate::datafusion::DataFusion;
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use ballista_scheduler::state::SchedulerState;
-use datafusion::common::{DataFusionError, Result, exec_err};
+use datafusion::common::{DataFusionError, Result};
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
