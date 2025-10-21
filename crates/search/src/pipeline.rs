@@ -94,6 +94,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
     }
 
     /// Runs the search pipeline with the provided parameters.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         query: String,
@@ -131,7 +132,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                 let lp = construct_logical_plan(
                     g.search(query.clone())
                         .context(SearchRequestConstructionSnafu)?,
-                    &tbl,
+                    tbl,
                     columns,
                     filters,
                     Some(limit),
