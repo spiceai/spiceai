@@ -16,16 +16,48 @@ limitations under the License.
 
 use async_trait::async_trait;
 use bytes_processed::{BytesProcessedExec, BytesProcessedNode};
+use data_components::delete::get_deletion_provider;
 use datafusion::{
+    common::tree_node::{TreeNode, TreeNodeRewriter},
     error::Result,
     execution::context::{QueryPlanner, SessionState},
-    logical_expr::{LogicalPlan, UserDefinedLogicalNode},
+    logical_expr::{DmlStatement, Expr, LogicalPlan, UserDefinedLogicalNode, WriteOp},
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
 use std::sync::Arc;
 
 pub mod bytes_processed;
+
+/// Helper to strip table qualifiers from column references in filter expressions.
+/// This is needed because DELETE filter expressions have qualified column names
+/// (e.g., "table.column") but when we apply them during deletion, the columns
+/// are unqualified (e.g., just "column").
+struct UnqualifyColumns;
+
+impl TreeNodeRewriter for UnqualifyColumns {
+    type Node = Expr;
+
+    fn f_up(&mut self, expr: Expr) -> Result<datafusion::common::tree_node::Transformed<Expr>> {
+        Ok(match expr {
+            Expr::Column(col) => {
+                // Strip the table qualifier, keep only the column name
+                datafusion::common::tree_node::Transformed::yes(Expr::Column(
+                    datafusion::common::Column::new_unqualified(col.name),
+                ))
+            }
+            _ => datafusion::common::tree_node::Transformed::no(expr),
+        })
+    }
+}
+
+fn unqualify_filters(filters: Vec<Expr>) -> Result<Vec<Expr>> {
+    let mut unqualifier = UnqualifyColumns;
+    filters
+        .into_iter()
+        .map(|f| f.rewrite(&mut unqualifier).map(|t| t.data))
+        .collect()
+}
 
 #[derive(Default)]
 pub struct SpiceQueryPlanner {
@@ -65,6 +97,139 @@ impl QueryPlanner for SpiceQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Handle DML operations (UPDATE, DELETE) before delegating to DefaultPhysicalPlanner
+        
+        // Handle UPDATE operations  
+        if let LogicalPlan::Dml(stmt @ DmlStatement {
+            table_name,
+            op: WriteOp::Update,
+            input,
+            ..
+        }) = logical_plan
+        {
+            // Get the table provider through the catalog
+            let table_source = session_state
+                .catalog_list()
+                .catalog(table_name.catalog().unwrap_or("datafusion"))
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Catalog '{}' not found",
+                        table_name.catalog().unwrap_or("datafusion")
+                    ))
+                })?
+                .schema(table_name.schema().unwrap_or("public"))
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Schema '{}' not found",
+                        table_name.schema().unwrap_or("public")
+                    ))
+                })?
+                .table(table_name.table())
+                .await?
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Table '{}' not found",
+                        table_name
+                    ))
+                })?;
+            
+            // Check if it supports update
+            if let Some(update_provider) = data_components::update::get_update_provider(table_source) {
+                // Extract filters from the UPDATE statement's input plan
+                let filters = match input.as_ref() {
+                    LogicalPlan::Filter(filter) => vec![filter.predicate.clone()],
+                    _ => vec![],
+                };
+                
+                // Unqualify column references in filters (remove table qualifiers)
+                let unqualified_filters = unqualify_filters(filters)?;
+                
+                // Extract assignments from the DML statement
+                // The input plan contains a Projection with the SET expressions
+                let mut assignment_map = std::collections::HashMap::new();
+                if let LogicalPlan::Projection(projection) = input.as_ref() {
+                    let schema = projection.input.schema();
+                    for (idx, expr) in projection.expr.iter().enumerate() {
+                        if idx < schema.fields().len() {
+                            let field = &schema.fields()[idx];
+                            assignment_map.insert(field.name().clone(), expr.clone());
+                        }
+                    }
+                }
+                
+                // Call update on the update provider - it returns the execution plan
+                return update_provider
+                    .update(session_state, &unqualified_filters, assignment_map)
+                    .await;
+            }
+            
+            return datafusion::common::plan_err!(
+                "Table '{}' does not support UPDATE operations. \
+                Only accelerated tables support UPDATE.",
+                table_name
+            );
+        }
+        
+        // Handle DELETE operations
+        if let LogicalPlan::Dml(DmlStatement {
+            table_name,
+            op: WriteOp::Delete,
+            input,
+            ..
+        }) = logical_plan
+        {
+            // Get the table provider through the catalog
+            let table_source = session_state
+                .catalog_list()
+                .catalog(table_name.catalog().unwrap_or("datafusion"))
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Catalog '{}' not found",
+                        table_name.catalog().unwrap_or("datafusion")
+                    ))
+                })?
+                .schema(table_name.schema().unwrap_or("public"))
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Schema '{}' not found",
+                        table_name.schema().unwrap_or("public")
+                    ))
+                })?
+                .table(table_name.table())
+                .await?
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Table '{}' not found",
+                        table_name
+                    ))
+                })?;
+            
+            // Check if it supports deletion
+            if let Some(deletion_provider) = get_deletion_provider(table_source) {
+                // Extract filters from the DELETE statement's input plan
+                // The input plan contains the filter conditions
+                let filters = match input.as_ref() {
+                    LogicalPlan::Filter(filter) => vec![filter.predicate.clone()],
+                    _ => vec![],
+                };
+                
+                // Unqualify column references in filters (remove table qualifiers)
+                let unqualified_filters = unqualify_filters(filters)?;
+                
+                // Call delete_from on the deletion provider - it returns the execution plan
+                return deletion_provider
+                    .delete_from(session_state, &unqualified_filters)
+                    .await;
+            }
+            
+            return datafusion::common::plan_err!(
+                "Table '{}' does not support DELETE operations. \
+                Only accelerated tables support DELETE.",
+                table_name
+            );
+        }
+        
+        // For all other operations, use the default physical planner
         let physical_planner =
             DefaultPhysicalPlanner::with_extension_planners(self.extension_planners.clone());
         physical_planner

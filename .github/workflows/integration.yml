@@ -63,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Cache Cargo dependencies
       - name: Cache Cargo registry
@@ -76,16 +76,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      # Cache Rust build artifacts
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-rust-integration-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-integration-
-            ${{ runner.os }}-rust-
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -119,14 +109,16 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      # Build the test binary without running tests
-      - name: Build integration test binary
+      # Build the test binaries without running tests
+      - name: Build integration test archives
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
         run: |
+          set -euo pipefail
+
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark,dynamodb,oracle,kafka,mongodb,iceberg-write,snapshots"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
@@ -136,6 +128,10 @@ jobs:
           fi
 
           cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
+          cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
+          cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
+          cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
+          cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
 
       # Upload the test archive as an artifact
       - name: Upload test archive
@@ -145,25 +141,60 @@ jobs:
           path: ./integration.tar.zst
           retention-days: 1
 
+      - name: Upload AWS SDK test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-aws-sdk-test-archive
+          path: ./integration_aws_sdk.tar.zst
+          retention-days: 1
+
+      - name: Upload AWS SDK credential bridge test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-aws-sdk-credential-bridge-test-archive
+          path: ./integration_aws_sdk_credential_bridge.tar.zst
+          retention-days: 1
+
+      - name: Upload partition table test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-partition-table-test-archive
+          path: ./partition_table_test.tar.zst
+          retention-days: 1
+
+      - name: Upload data components test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-data-components-test-archive
+          path: ./data_components_hadoop.tar.zst
+          retention-days: 1
+
   test:
-    name: Integration Tests
+    name: Integration Tests (part ${{ matrix.label }})
     needs: build
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 1
+            partition: 'count:1/3'
+          - label: 2
+            partition: 'count:2/3'
+          - label: 3
+            partition: 'count:3/3'
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-
-      - name: Clean up Disk
-        uses: ./.github/actions/cleanup-disk
 
       - name: Install Oracle ODPI-C
         run: |
@@ -248,15 +279,75 @@ jobs:
           AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
           fi
-      - name: Upload benchmark snapshots to branch
+      - name: Upload integration snapshots artifact
+        id: create_snapshot_archive
         if: github.event.inputs.update_snapshots == 'always'
+        run: |
+          git diff --name-only -- '*.snap' > snapshot-files
+          git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
+          if [ -s snapshot-files ]; then
+            tr '\n' '\0' < snapshot-files > snapshot-files-0
+            tar --null -czf integration-snapshots-part-${{ matrix.label }}.tar.gz --files-from snapshot-files-0
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No snapshot files found"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f snapshot-files snapshot-files-0
+        shell: bash
+      - name: Store integration snapshots artifact
+        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-snapshots-part-${{ matrix.label }}
+          path: integration-snapshots-part-${{ matrix.label }}.tar.gz
+          retention-days: 1
+
+  upload-integration-snapshots:
+    name: Upload Integration Snapshots
+    if: github.event.inputs.update_snapshots == 'always'
+    needs:
+      - test
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Download integration snapshots artifacts
+        id: download_snapshots
+        continue-on-error: true
+        uses: actions/download-artifact@v5
+        with:
+          pattern: integration-snapshots-part-*
+          merge-multiple: true
+          path: integration-snapshots
+
+      - name: Extract snapshots
+        if: steps.download_snapshots.outcome == 'success'
+        run: |
+          shopt -s nullglob
+          for archive in integration-snapshots/*.tar.gz; do
+            tar -xzf "$archive" -C .
+          done
+        shell: bash
+
+      - name: Configure Git
+        if: steps.download_snapshots.outcome == 'success'
         run: |
           git config --global user.name 'Spice Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
+
+      - name: Upload benchmark snapshots to branch
+        if: steps.download_snapshots.outcome == 'success'
+        run: |
           git add '*.snap'
           if git diff --cached --quiet; then
             echo "No changes to commit"
@@ -266,3 +357,170 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No snapshot changes detected
+        if: steps.download_snapshots.outcome != 'success'
+        run: echo "No snapshot artifacts were uploaded; skipping snapshot update."
+
+  test-aws-sdk:
+    name: AWS SDK Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Download AWS SDK test archive
+        uses: actions/download-artifact@v5
+        with:
+          name: integration-aws-sdk-test-archive
+          path: ./integration_aws_sdk_test
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run AWS SDK integration test
+        env:
+          TEST_DATABRICKS_TOKEN: ${{ secrets.NEW_DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_test/integration_aws_sdk.tar.zst
+
+  test-aws-sdk-credential-bridge:
+    name: AWS SDK Credential Bridge Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Download AWS SDK credential bridge test archive
+        uses: actions/download-artifact@v5
+        with:
+          name: integration-aws-sdk-credential-bridge-test-archive
+          path: ./integration_aws_sdk_credential_bridge_test
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run AWS SDK credential bridge integration test
+        env:
+          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
+          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
+          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
+          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
+          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst
+
+  test-data-components:
+    name: Data Components Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Download data components test archive
+        uses: actions/download-artifact@v5
+        with:
+          name: integration-data-components-test-archive
+          path: ./data_components_test
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run data components integration test
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./data_components_test/data_components_hadoop.tar.zst
+
+  test-runtime-partition:
+    name: Partition Table Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Download partition table test archive
+        uses: actions/download-artifact@v5
+        with:
+          name: integration-partition-table-test-archive
+          path: ./partition_table_test
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Use public ECR for forks
+        if: github.repository != 'spiceai/spiceai'
+        run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
+
+      - name: Run partition table integration test
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst

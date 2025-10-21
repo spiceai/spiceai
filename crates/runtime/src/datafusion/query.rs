@@ -14,13 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    fmt::Display,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
     get_logical_plan_input_tables,
@@ -53,16 +47,13 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
-use async_stream::stream;
-use futures::{Stream, StreamExt};
-
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use async_stream::stream;
+use futures::StreamExt;
+use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
@@ -139,64 +130,9 @@ impl Query {
     /// # Panics
     ///
     /// Panics when running under test if no cache key is computed for the query.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        let runtime_handle = self.df.tokio_runtime().clone();
-
-        let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
-        let (result_tx, result_rx) = oneshot::channel::<Result<(CacheStatus, SchemaRef), Error>>();
-
-        let request_context_clone = Arc::clone(&request_context);
-        let driver_task = async move {
-            match self.run_internal(request_context_clone).await {
-                Ok(query_result) => {
-                    let schema = query_result.data.schema();
-                    let cache_status = query_result.cache_status;
-
-                    if result_tx.send(Ok((cache_status, schema))).is_err() {
-                        return;
-                    }
-
-                    let mut stream = query_result.data;
-                    while let Some(batch) = Arc::clone(&request_context).scope(stream.next()).await
-                    {
-                        if batch_tx.send(batch).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(err) => {
-                    if result_tx.send(Err(err)).is_err() {
-                        tracing::debug!("Failed to send query result; receiver dropped");
-                    }
-                }
-            }
-        };
-
-        let driver_handle = runtime_handle.spawn(driver_task);
-
-        let (cache_status, schema) = match result_rx.await {
-            Ok(Ok((cache_status, schema))) => (cache_status, schema),
-            Ok(Err(err)) => return Err(err),
-            Err(_) => {
-                return Err(Error::UnableToExecuteQuery {
-                    source: DataFusionError::Execution(
-                        "Query driver task ended unexpectedly".to_string(),
-                    ),
-                });
-            }
-        };
-
-        let driver_stream = DriverStream::new(batch_rx, driver_handle);
-        let adapter = RecordBatchStreamAdapter::new(schema, Box::pin(driver_stream));
-
-        let stream: SendableRecordBatchStream = Box::pin(adapter);
-
-        Ok(QueryResult::new(stream, cache_status))
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
@@ -478,74 +414,6 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
     };
 
     Ok(maybe_schema)
-}
-
-struct DriverStream {
-    receiver: ReceiverStream<Result<RecordBatch, DataFusionError>>,
-    driver_handle: Option<JoinHandle<()>>,
-    driver_error: Option<DataFusionError>,
-}
-
-impl DriverStream {
-    fn new(
-        receiver: tokio::sync::mpsc::Receiver<Result<RecordBatch, DataFusionError>>,
-        driver_handle: JoinHandle<()>,
-    ) -> Self {
-        Self {
-            receiver: ReceiverStream::new(receiver),
-            driver_handle: Some(driver_handle),
-            driver_error: None,
-        }
-    }
-}
-
-impl Stream for DriverStream {
-    type Item = Result<RecordBatch, DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        if let Some(handle) = this.driver_handle.as_mut() {
-            match Future::poll(Pin::new(handle), cx) {
-                Poll::Ready(Ok(())) => {
-                    this.driver_handle = None;
-                }
-                Poll::Ready(Err(err)) => {
-                    this.driver_handle = None;
-                    if err.is_panic() {
-                        this.driver_error = Some(DataFusionError::Execution(format!(
-                            "Query driver task panicked: {err}"
-                        )));
-                    } else if !err.is_cancelled() {
-                        this.driver_error = Some(DataFusionError::Execution(format!(
-                            "Query driver task failed: {err}"
-                        )));
-                    }
-                }
-                Poll::Pending => {}
-            }
-        }
-
-        if let Some(err) = this.driver_error.take() {
-            return Poll::Ready(Some(Err(err)));
-        }
-
-        Pin::new(&mut this.receiver).poll_next(cx)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.receiver.size_hint()
-    }
-}
-
-impl Drop for DriverStream {
-    fn drop(&mut self) {
-        if let Some(handle) = self.driver_handle.take()
-            && !handle.is_finished()
-        {
-            handle.abort();
-        }
-    }
 }
 
 #[must_use]

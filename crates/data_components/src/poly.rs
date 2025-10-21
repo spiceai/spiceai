@@ -88,6 +88,24 @@ impl DeletionTableProvider for PolyTableProvider {
     }
 }
 
+#[async_trait]
+impl crate::update::UpdateTableProvider for PolyTableProvider {
+    async fn update(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+        assignments: std::collections::HashMap<String, Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if let Some(update_provider) = crate::update::get_update_provider(Arc::clone(&self.write)) {
+            update_provider.update(state, filters, assignments).await
+        } else {
+            Err(datafusion::error::DataFusionError::Plan(
+                "Table does not support UPDATE operations".to_string(),
+            ))
+        }
+    }
+}
+
 impl FederationProvider for PolyTableProvider {
     fn name(&self) -> &'static str {
         "FederationProviderForPolyTableProvider"

@@ -77,6 +77,7 @@ pub mod graphql;
 pub mod imap;
 pub mod object;
 pub mod poly;
+pub mod update;
 
 #[async_trait]
 pub trait Read: Send + Sync {

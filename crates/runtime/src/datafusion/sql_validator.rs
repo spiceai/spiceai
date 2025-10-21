@@ -29,64 +29,99 @@ use crate::datafusion::DataFusion;
 /// Reads (SELECT queries) are allowed on all tables.
 /// INSERT operations are only allowed on datasets that are configured as writable,
 /// and are not allowed on internal Spice tables.
-/// DDL, DML (other than allowed INSERT), COPY, and Statement operations are not permitted.
+/// DELETE operations are only allowed on accelerated tables (data accelerators like Arrow, DuckDB, SQLite, PostgreSQL, Pepper).
+/// DDL, DML (other than allowed INSERT and DELETE), COPY, and Statement operations are not permitted.
 ///
 /// # Returns
 /// * `Ok(())` if the plan is valid
 /// * `Err(DataFusionError)` if the plan contains invalid operations, such as DDL, DML on read-only datasets,
 ///   or INSERT on internal datasets
-pub fn validate_sql_query_operations(
+pub async fn validate_sql_query_operations(
     plan: &LogicalPlan,
     df: &Arc<DataFusion>,
 ) -> Result<(), DataFusionError> {
-    plan.apply_with_subqueries(|node| match node {
-        // Data Definition Language (DDL): CREATE / DROP TABLES / VIEWS / SCHEMAS
-        LogicalPlan::Ddl(ddl) => {
-            plan_err!("Operation is not allowed: {}", ddl.name())
-        }
-        // Data Manipulation Language (DML): Insert / Update / Delete
-        LogicalPlan::Dml(dml) => {
-            if let datafusion::logical_expr::WriteOp::Insert(op) = &dml.op {
-                if op != &datafusion_expr::dml::InsertOp::Append {
-                    return plan_err!("Only Append (`INSERT INTO`) operations are permitted: '{op}' is not allowed");
-                }
+    // First collect all DML operations that need async validation
+    let mut dml_deletes = Vec::new();
+    
+    plan.apply_with_subqueries(|node| {
+        match node {
+            // Data Definition Language (DDL): CREATE / DROP TABLES / VIEWS / SCHEMAS
+            LogicalPlan::Ddl(ddl) => {
+                plan_err!("Operation is not allowed: {}", ddl.name())
+            }
+            // Data Manipulation Language (DML): Insert / Update / Delete
+            LogicalPlan::Dml(dml) => {
+                match &dml.op {
+                    datafusion::logical_expr::WriteOp::Insert(op) => {
+                        if op != &datafusion_expr::dml::InsertOp::Append {
+                            return plan_err!("Only Append (`INSERT INTO`) operations are permitted: '{op}' is not allowed");
+                        }
 
-                if super::is_spice_internal_dataset(&dml.table_name) {
-                    return plan_err!(
-                        "INSERT operations are not allowed on Spice system dataset '{}'.",
-                        dml.table_name
-                    );
-                }
+                        if super::is_spice_internal_dataset(&dml.table_name) {
+                            return plan_err!(
+                                "INSERT operations are not allowed on Spice system dataset '{}'.",
+                                dml.table_name
+                            );
+                        }
 
-                // Check if attempting to write into a catalog. The default catalog name indicates writing to a table registered as a dataset, not via a catalog.
-                if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
-                    if !df.is_catalog_writable(catalog) {
-                        return plan_err!(
-                            "INSERT operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
-                            dml.table_name
-                        );
+                        // Check if attempting to write into a catalog. The default catalog name indicates writing to a table registered as a dataset, not via a catalog.
+                        if let Some(catalog) = dml.table_name.catalog() && catalog != super::SPICE_DEFAULT_CATALOG {
+                            if !df.is_catalog_writable(catalog) {
+                                return plan_err!(
+                                    "INSERT operations are not allowed on read-only catalog table '{}'. Verify the catalog is configured with 'access: read_write' and try again.",
+                                    dml.table_name
+                                );
+                            }
+                            return Ok(TreeNodeRecursion::Continue);
+                        }
+
+                        if df.is_writable(&dml.table_name) {
+                            Ok(TreeNodeRecursion::Continue)
+                        } else {
+                            plan_err!(
+                                "INSERT operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
+                                dml.table_name
+                            )
+                        }
                     }
-                    return Ok(TreeNodeRecursion::Continue);
+                    datafusion::logical_expr::WriteOp::Delete => {
+                        // Collect DELETE operations for async validation
+                        dml_deletes.push(dml.table_name.clone());
+                        Ok(TreeNodeRecursion::Continue)
+                    }
+                    _ => plan_err!("Operation is not allowed: {}", dml.name())
                 }
-
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else {
-                    plan_err!(
-                        "INSERT operations are not allowed on read-only dataset '{}'. Verify the dataset is configured with 'access: read_write' and try again.",
-                        dml.table_name
-                    )
-                }
-            } else { plan_err!("Operation is not allowed: {}", dml.name()) }
+            }
+            LogicalPlan::Copy(_) => {
+                plan_err!("COPY operations are not allowed")
+            }
+            LogicalPlan::Statement(stmt) => {
+                plan_err!("Statements are not allowed: {}", stmt.name())
+            }
+            _ => Ok(TreeNodeRecursion::Continue),
         }
-        LogicalPlan::Copy(_) => {
-            plan_err!("COPY operations are not allowed")
-        }
-        LogicalPlan::Statement(stmt) => {
-            plan_err!("Statements are not allowed: {}", stmt.name())
-        }
-        _ => Ok(TreeNodeRecursion::Continue),
     })?;
+    
+    // Now validate DELETE operations asynchronously
+    for table_name in dml_deletes {
+        if super::is_spice_internal_dataset(&table_name) {
+            return plan_err!(
+                "DELETE operations are not allowed on Spice system dataset '{}'.",
+                table_name
+            );
+        }
+        
+        if !df.is_accelerated(&table_name).await {
+            return plan_err!(
+                "DELETE operations are only allowed on accelerated tables. \
+                The table '{}' is not accelerated. \
+                Consider configuring acceleration for this dataset to enable DELETE operations. \
+                See: https://docs.spiceai.org/components/data-accelerators",
+                table_name
+            );
+        }
+    }
+    
     Ok(())
 }
 
@@ -204,18 +239,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_read_only_query_allowed() {
-        let df = create_test_datafusion();
-
-        let sql = "SELECT * FROM tbl_read_only";
+        let df = Arc::new(create_test_datafusion());
         let plan = df
             .ctx
             .state()
-            .create_logical_plan(sql)
+            .create_logical_plan("SELECT * FROM tbl_read_only")
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
-        assert!(result.is_ok(), "Read-only queries should be allowed");
+        let result = validate_sql_query_operations(&plan, &df).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -231,7 +264,7 @@ mod tests {
             .expect("plan should be created");
 
         // INSERT should be allowed on writable dataset
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(
             result.is_ok(),
             "INSERT should be allowed on writable dataset"
@@ -251,7 +284,7 @@ mod tests {
             .expect("plan should be created");
 
         // INSERT should be allowed on writable dataset
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(
             result.is_ok(),
             "INSERT should be allowed on writable dataset with full reference"
@@ -270,7 +303,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "INSERT should fail on read-only dataset");
     }
 
@@ -286,7 +319,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(
             result.is_err(),
             "INSERT should fail on Spice internal dataset"
@@ -306,7 +339,7 @@ mod tests {
             .expect("plan should be created");
 
         // UPDATE operations should be blocked
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "UPDATE operations should be blocked");
     }
 
@@ -323,7 +356,7 @@ mod tests {
             .expect("plan should be created");
 
         // DELETE operations should be blocked
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "DELETE operations should be blocked");
     }
 
@@ -340,7 +373,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "CREATE TABLE should be blocked");
     }
 
@@ -357,7 +390,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "COPY operations should be blocked");
     }
 
@@ -374,7 +407,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "SET statements should be blocked");
     }
 
@@ -390,7 +423,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_ok(), "Complex read queries should be allowed");
     }
 
@@ -407,7 +440,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_ok(), "Read-only subqueries should be allowed");
     }
 
@@ -423,7 +456,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(
             result.is_ok(),
             "INSERT should be allowed on writable catalog table"
@@ -442,7 +475,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "INSERT should fail on read-only catalog");
     }
 
@@ -458,7 +491,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(result.is_err(), "INSERT OVERWRITE should be blocked");
     }
 
@@ -475,7 +508,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(
             result.is_ok(),
             "INSERT should be allowed on writable dataset in default catalog"
@@ -490,7 +523,7 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        let result = validate_sql_query_operations(&plan, &df);
+        let result = validate_sql_query_operations(&plan, &df).await;
         assert!(
             result.is_err(),
             "INSERT should fail on read-only dataset in default catalog"

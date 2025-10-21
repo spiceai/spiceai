@@ -4453,7 +4453,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=0939c87f3183c7b9a3c9251dd6d478e376aa56a4#0939c87f3183c7b9a3c9251dd6d478e376aa56a4"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=50e8a479bcf35ec991753144864617efca0a4038#50e8a479bcf35ec991753144864617efca0a4038"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4963,7 +4963,7 @@ checksum = "d3a5ccdfd6c5e7e2fea9c5cf256f2a08216047fab19c621c3da64e9ae4a1462d"
 [[package]]
 name = "duckdb"
 version = "1.3.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a731d95e32338780a12f8ff14b5efcc79d2e8822#a731d95e32338780a12f8ff14b5efcc79d2e8822"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=43c12908261bd818510d7520950d2a049d9d2aed#43c12908261bd818510d7520950d2a049d9d2aed"
 dependencies = [
  "arrow",
  "cast",
@@ -7911,7 +7911,7 @@ checksum = "6a82ae493e598baaea5209805c49bbf2ea7de956d50d7da0da1164f9c6d28543"
 [[package]]
 name = "libduckdb-sys"
 version = "1.3.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a731d95e32338780a12f8ff14b5efcc79d2e8822#a731d95e32338780a12f8ff14b5efcc79d2e8822"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=43c12908261bd818510d7520950d2a049d9d2aed#43c12908261bd818510d7520950d2a049d9d2aed"
 dependencies = [
  "cc",
  "flate2",
@@ -10584,6 +10584,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "data_components",
+ "datafusion",
+ "datafusion-catalog",
+ "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-physical-expr",
+ "datafusion-physical-plan",
+ "futures",
+ "runtime",
+ "rusqlite",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid 1.18.0",
+ "vortex-datafusion",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12415,6 +12449,7 @@ dependencies = [
  "otel-arrow",
  "package",
  "paste",
+ "pepper",
  "percent-encoding",
  "pin-project",
  "postcard",
@@ -16779,6 +16814,7 @@ name = "vortex-datafusion"
 version = "0.54.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "arrow-schema",
  "async-trait",
  "chrono",
@@ -16804,6 +16840,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid 1.18.0",
  "vortex",
  "vortex-utils",
  "walkdir",
