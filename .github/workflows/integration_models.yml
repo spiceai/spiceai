@@ -68,32 +68,14 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # Cache Rust build artifacts
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-rust-models-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-models-
-            ${{ runner.os }}-rust-
-
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
           os: 'darwin'
+      
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -102,24 +84,22 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-
           FEATURES="flightsql,models,metal,s3_vectors,kafka"
-           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
-             FEATURES="${FEATURES},bedrock,extended_tests"
-             echo "Including extended_tests"
-           else
-             echo "Excluding extended_tests"
-           fi
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+            FEATURES="${FEATURES},bedrock,extended_tests"
+            echo "Including extended_tests"
+          else
+            echo "Excluding extended_tests"
+          fi
 
-           TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features ${FEATURES} --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
-           cp $TEST_BINARY_PATH ./ai_integration_test
+          cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration.tar.zst
 
-      # Upload the test binary as an artifact
-      - name: Upload test binary
+      # Upload the test archive as an artifact
+      - name: Upload test archive
         uses: actions/upload-artifact@v4
         with:
-          name: ai-integration-test-binary
-          path: ./ai_integration_test
+          name: ai-integration-test-archive
+          path: ./integration.tar.zst
           retention-days: 1
 
   test-openai:
@@ -131,17 +111,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+      
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
 
       - name: Set up Open.ai API Key
         run: |
@@ -156,7 +135,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture openai_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
 
       - name: Run Beta functionality embeddings test
         env:
@@ -167,7 +146,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture openai_embeddings_beta_requirements
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
@@ -184,17 +163,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+      
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
 
       - name: Set up API Keys
         run: |
@@ -216,7 +194,7 @@ jobs:
             echo "Error: Anthropic API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_basic
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
 
       - name: Run AI UDF with dataset test
         env:
@@ -237,7 +215,7 @@ jobs:
             echo "Error: xAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_with_dataset
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_dataset
 
       - name: Run AI UDF LEFT truncate test
         env:
@@ -258,7 +236,7 @@ jobs:
             echo "Error: xAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_left_truncate
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_left_truncate
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
@@ -271,22 +249,21 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
     permissions: read-all
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
 
       - name: Run integration test
         env:
@@ -297,7 +274,7 @@ jobs:
             echo "Error: Hugging Face API Token is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture huggingface_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
 
       - name: Run Beta functionality embedding tests
         env:
@@ -308,7 +285,7 @@ jobs:
             echo "Error: Hugging Face API Token is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture hf_embeddings_beta_requirements
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- hf_embeddings_beta_requirements
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
@@ -320,28 +297,27 @@ jobs:
     name: Test Local Models
     needs: build
     permissions: read-all
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Download test binary
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
 
       - name: Run Beta functionality embedding tests
         env:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture local_embeddings_beta_requirements
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
         env:
@@ -352,7 +328,7 @@ jobs:
             echo "Error: Hugging Face API Token is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture test_ai_udf_with_local_model
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
@@ -365,22 +341,21 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
     permissions: read-all
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Download test binary
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
 
       - name: Run Beta functionality embedding tests
         env:
@@ -388,7 +363,7 @@ jobs:
           AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture bedrock_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
@@ -400,22 +375,21 @@ jobs:
     name: Test Workers
     needs: build
     permissions: read-all
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Download test binary
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
 
       - name: Set up Open.ai API Key
         run: |
@@ -430,7 +404,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture workers
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
@@ -442,22 +416,21 @@ jobs:
     name: Test Search
     needs: build
     permissions: read-all
-    runs-on: [self-hosted, spiceai-macos]
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Download test binary
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
 
       - name: Set up Open.ai API Key
         run: |
@@ -474,7 +447,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture search
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
