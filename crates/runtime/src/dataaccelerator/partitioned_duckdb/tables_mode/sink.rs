@@ -652,7 +652,7 @@ fn drop_partition_view(
         name = view.table_name()
     );
 
-    // first drop internal tables
+    // First drop internal tables
     for (old_table, _) in view
         .list_other_internal_tables(tx)
         .map_err(to_retriable_data_write_error)?
