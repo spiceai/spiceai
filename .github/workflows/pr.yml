@@ -95,6 +95,7 @@ jobs:
           aws-access-key-id: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           aws-secret-access-key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           aws-s3-bucket: spiceai-cache
+          aws-s3-force-path-style: true
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
@@ -113,6 +114,7 @@ jobs:
           aws-access-key-id: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           aws-secret-access-key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           aws-s3-bucket: spiceai-cache
+          aws-s3-force-path-style: true
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
@@ -130,6 +132,7 @@ jobs:
           aws-access-key-id: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           aws-secret-access-key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           aws-s3-bucket: spiceai-cache
+          aws-s3-force-path-style: true
           path: target
           key: ${{ runner.os }}-rust-lint-${{ env.RUST_PROFILE }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
