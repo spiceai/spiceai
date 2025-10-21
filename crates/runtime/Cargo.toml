@@ -152,7 +152,7 @@ tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
-tokio-rustls = "0.26.0"
+tokio-rustls = "0.26.4"
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true

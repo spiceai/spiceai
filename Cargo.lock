@@ -6868,7 +6868,7 @@ dependencies = [
  "rustls-native-certs 0.8.1",
  "rustls-pki-types",
  "tokio",
- "tokio-rustls 0.26.2",
+ "tokio-rustls 0.26.4",
  "tower-service",
  "webpki-roots 1.0.0",
 ]
@@ -9016,7 +9016,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-openssl",
- "tokio-rustls 0.26.2",
+ "tokio-rustls 0.26.4",
  "tokio-util",
  "typed-builder 0.20.1",
  "uuid 1.18.0",
@@ -12012,7 +12012,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
- "tokio-rustls 0.26.2",
+ "tokio-rustls 0.26.4",
  "tokio-util",
  "tower 0.5.2",
  "tower-http",
@@ -12464,7 +12464,7 @@ dependencies = [
  "token_provider",
  "tokio",
  "tokio-rusqlite",
- "tokio-rustls 0.26.2",
+ "tokio-rustls 0.26.4",
  "tokio-stream",
  "tokio-util",
  "tonic",
@@ -15444,9 +15444,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.2"
+version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e727b36a1a0e8b74c376ac2211e40c2c8af09fb4013c60d910495810f008e9b"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls 0.23.31",
  "tokio",
@@ -15594,7 +15594,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "socket2 0.5.10",
  "tokio",
- "tokio-rustls 0.26.2",
+ "tokio-rustls 0.26.4",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
