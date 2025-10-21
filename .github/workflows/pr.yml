@@ -156,7 +156,7 @@ jobs:
           # Check for this branch's cache, or pull from trunk
           if mc ls spice-minio/spiceai-cache/${{ github.ref_name }}/; then
             mc cp --recursive spice-minio/spiceai-cache/${{ github.ref_name }}/target ./target
-          else if mc ls spice-minio/spiceai-cache/trunk/; then
+          elif mc ls spice-minio/spiceai-cache/trunk/; then
             mc cp --recursive spice-minio/spiceai-cache/trunk/target ./target || echo "No trunk cache found"
           fi
 
