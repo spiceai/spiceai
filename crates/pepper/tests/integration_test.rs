@@ -151,17 +151,18 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     // 12. Test projection
     let df = ctx.sql("SELECT name FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_cols: usize = if results.is_empty() {
-        0
-    } else {
-        results[0].num_columns()
-    };
     let total_rows: usize = results
         .iter()
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
-    assert_eq!(total_cols, 1, "Expected 1 column in projection");
     assert_eq!(total_rows, 3, "Expected 3 rows in projection");
+    if !results.is_empty() {
+        assert_eq!(
+            results[0].num_columns(),
+            1,
+            "Expected 1 column in projection"
+        );
+    }
     println!("✓ Projection query successful (1 column, 3 rows)");
 
     // 13. Verify SQLite metastore after first insert
@@ -244,17 +245,18 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     // 19. Test projection on combined data
     let df = ctx.sql("SELECT id FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_cols: usize = if results.is_empty() {
-        0
-    } else {
-        results[0].num_columns()
-    };
     let total_rows: usize = results
         .iter()
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
-    assert_eq!(total_cols, 1, "Expected 1 column in projection");
     assert_eq!(total_rows, 5, "Expected 5 rows in projection");
+    if !results.is_empty() {
+        assert_eq!(
+            results[0].num_columns(),
+            1,
+            "Expected 1 column in projection"
+        );
+    }
     println!("✓ Projection query successful (round 2: 1 column, 5 rows)");
 
     // 20. Verify SQLite metastore after second insert
@@ -372,17 +374,18 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     // 26. Test projection on overwrite data
     let df = ctx.sql("SELECT name FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_cols: usize = if results.is_empty() {
-        0
-    } else {
-        results[0].num_columns()
-    };
     let total_rows: usize = results
         .iter()
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
-    assert_eq!(total_cols, 1, "Expected 1 column in projection");
     assert_eq!(total_rows, 3, "Expected 3 rows in projection");
+    if !results.is_empty() {
+        assert_eq!(
+            results[0].num_columns(),
+            1,
+            "Expected 1 column in projection"
+        );
+    }
     println!("✓ Projection query successful on overwrite data");
 
     // 27. Verify SQLite metastore after overwrite

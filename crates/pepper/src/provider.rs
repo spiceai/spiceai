@@ -295,7 +295,11 @@ impl PepperTableProvider {
         let state = ctx.state();
 
         // Delegate to ListingTable's insert_into to write Vortex files
-        let listing_table = self.listing_table.read().await;
+        // Clone the Arc and drop the lock before awaiting
+        let listing_table = {
+            let guard = self.listing_table.read().await;
+            Arc::clone(&guard)
+        };
         let insert_plan = listing_table
             .insert_into(&state, stream_exec, InsertOp::Append)
             .await
@@ -407,7 +411,11 @@ impl TableProvider for PepperTableProvider {
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // Delegate to the underlying listing table
-        let listing_table = self.listing_table.read().await;
+        // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
+        let listing_table = {
+            let guard = self.listing_table.read().await;
+            Arc::clone(&guard)
+        };
         listing_table.scan(state, projection, filters, limit).await
     }
 
@@ -415,15 +423,18 @@ impl TableProvider for PepperTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        // Try to get a read lock non-blocking
-        // If we can't get it immediately, assume Inexact for all filters
-        match self.listing_table.try_read() {
-            Ok(listing_table) => listing_table.supports_filters_pushdown(filters),
-            Err(_) => {
-                // Lock is held (possibly during an overwrite), be conservative
-                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        // This is a synchronous method called during query planning.
+        // Since we can't use blocking_read from async context, we use try_read with retries.
+        // Query planning should be fast, so a short retry loop is acceptable and better
+        // than returning Inexact (which would degrade query performance).
+        for _ in 0..100 {
+            if let Ok(listing_table) = self.listing_table.try_read() {
+                return listing_table.supports_filters_pushdown(filters);
             }
+            std::hint::spin_loop();
         }
+        // If we can't get the lock after retries, be conservative
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
@@ -441,10 +452,19 @@ impl TableProvider for PepperTableProvider {
         //
         // Note: Statistics are cached by the ListingTable and may not reflect
         // very recent writes until the table metadata is refreshed.
-        match self.listing_table.try_read() {
-            Ok(listing_table) => listing_table.statistics(),
-            Err(_) => None, // Lock is held (possibly during an overwrite)
+        //
+        // This is a synchronous method called during query planning.
+        // Since we can't use blocking_read from async context, we use try_read with retries.
+        // Query planning should be fast, so a short retry loop is acceptable and better
+        // than returning None (which would cause poor optimizer decisions).
+        for _ in 0..100 {
+            if let Ok(listing_table) = self.listing_table.try_read() {
+                return listing_table.statistics();
+            }
+            std::hint::spin_loop();
         }
+        // If we can't get the lock after retries, return None as a last resort
+        None
     }
 
     fn get_table_definition(&self) -> Option<&str> {
@@ -467,10 +487,16 @@ impl TableProvider for PepperTableProvider {
         if overwrite == InsertOp::Overwrite {
             // Create a new subdirectory for the overwrite data
             // Use a timestamp-based name to ensure uniqueness
+            let timestamp = chrono::Utc::now().timestamp_nanos_opt().ok_or_else(|| {
+                datafusion_common::DataFusionError::Execution(
+                    "Failed to get current timestamp for overwrite directory name".to_string(),
+                )
+            })?;
+
             let overwrite_dir = format!(
                 "{}/overwrite_{}/",
                 self.table_metadata.path.trim_end_matches('/'),
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                timestamp
             );
 
             // Create the directory
@@ -508,7 +534,11 @@ impl TableProvider for PepperTableProvider {
         // For regular appends, use the existing listing table with append mode
         // The Vortex ListingTable only supports append mode, so we always use Append
         // even for regular inserts
-        let listing_table = self.listing_table.read().await;
+        // Clone the Arc and drop the lock before awaiting
+        let listing_table = {
+            let guard = self.listing_table.read().await;
+            Arc::clone(&guard)
+        };
         listing_table
             .insert_into(state, input, InsertOp::Append)
             .await
