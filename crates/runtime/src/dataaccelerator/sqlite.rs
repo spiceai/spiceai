@@ -101,7 +101,11 @@ impl SqliteAccelerator {
             sqlite3_auto_extension(Some(sqlite3_decimal_init));
         }
         Self {
-            sqlite_factory: SqliteTableProviderFactory::new().with_decimal_between(true),
+            sqlite_factory: SqliteTableProviderFactory::new()
+                .with_decimal_between(true)
+                // Prepared statements currently map timestamp values incorrectly (see spiceai#7629),
+                // so use the legacy insert path until the upstream fix lands.
+                .with_batch_insert_use_prepared_statements(false),
         }
     }
 
