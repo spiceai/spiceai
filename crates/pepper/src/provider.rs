@@ -54,6 +54,7 @@ use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use vortex_datafusion::VortexFormat;
 
 /// Pepper table provider that reads from Vortex virtual files.
@@ -72,8 +73,9 @@ pub struct PepperTableProvider {
     _catalog: Arc<dyn MetadataCatalog>,
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
-    /// but this `ListingTable` currently scans all of them together
-    listing_table: Arc<ListingTable>,
+    /// but this `ListingTable` currently scans all of them together.
+    /// Wrapped in RwLock to allow updating the listing table on overwrite operations.
+    listing_table: Arc<RwLock<Arc<ListingTable>>>,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -124,7 +126,7 @@ impl PepperTableProvider {
         Ok(Self {
             table_metadata,
             _catalog: catalog,
-            listing_table: Arc::new(listing_table),
+            listing_table: Arc::new(RwLock::new(Arc::new(listing_table))),
         })
     }
 
@@ -293,8 +295,8 @@ impl PepperTableProvider {
         let state = ctx.state();
 
         // Delegate to ListingTable's insert_into to write Vortex files
-        let insert_plan = self
-            .listing_table
+        let listing_table = self.listing_table.read().await;
+        let insert_plan = listing_table
             .insert_into(&state, stream_exec, InsertOp::Append)
             .await
             .map_err(|e| super::catalog::CatalogError::InvalidOperation {
@@ -405,16 +407,23 @@ impl TableProvider for PepperTableProvider {
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // Delegate to the underlying listing table
-        self.listing_table
-            .scan(state, projection, filters, limit)
-            .await
+        let listing_table = self.listing_table.read().await;
+        listing_table.scan(state, projection, filters, limit).await
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        self.listing_table.supports_filters_pushdown(filters)
+        // Try to get a read lock non-blocking
+        // If we can't get it immediately, assume Inexact for all filters
+        match self.listing_table.try_read() {
+            Ok(listing_table) => listing_table.supports_filters_pushdown(filters),
+            Err(_) => {
+                // Lock is held (possibly during an overwrite), be conservative
+                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+            }
+        }
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
@@ -432,7 +441,10 @@ impl TableProvider for PepperTableProvider {
         //
         // Note: Statistics are cached by the ListingTable and may not reflect
         // very recent writes until the table metadata is refreshed.
-        self.listing_table.statistics()
+        match self.listing_table.try_read() {
+            Ok(listing_table) => listing_table.statistics(),
+            Err(_) => None, // Lock is held (possibly during an overwrite)
+        }
     }
 
     fn get_table_definition(&self) -> Option<&str> {
@@ -449,24 +461,56 @@ impl TableProvider for PepperTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Block overwrite operations until multiple ListingTables are implemented
-        // Overwrite requires atomic replacement of all virtual files, which needs
-        // proper catalog tracking of individual files (not yet implemented)
+        // Handle overwrite by creating a new ListingTable with a new subdirectory
+        // This allows us to logically implement overwrite while using append-only
+        // Vortex operations underneath
         if overwrite == InsertOp::Overwrite {
-            return Err(datafusion_common::DataFusionError::NotImplemented(
-                "INSERT OVERWRITE is not yet supported for Pepper tables. \
-                 Use INSERT INTO for append operations."
-                    .to_string(),
-            ));
+            // Create a new subdirectory for the overwrite data
+            // Use a timestamp-based name to ensure uniqueness
+            let overwrite_dir = format!(
+                "{}/overwrite_{}/",
+                self.table_metadata.path.trim_end_matches('/'),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            );
+
+            // Create the directory
+            tokio::fs::create_dir_all(&overwrite_dir)
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+
+            // Create a new ListingTable pointing to the overwrite directory
+            let table_url = ListingTableUrl::parse(&overwrite_dir)
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+
+            let format = Arc::new(VortexFormat::default());
+            let listing_options = ListingOptions::new(format);
+
+            let config = ListingTableConfig::new(table_url)
+                .with_listing_options(listing_options)
+                .with_schema(Arc::clone(&self.table_metadata.schema));
+
+            let new_listing_table = Arc::new(ListingTable::try_new(config)?);
+
+            // Perform the insert using the new listing table with append mode
+            // (Vortex only supports append at the file level)
+            let result = new_listing_table
+                .insert_into(state, input, InsertOp::Append)
+                .await?;
+
+            // Update the provider's listing table to point to the new directory
+            // This ensures subsequent queries will read from the new data
+            let mut listing_table_guard = self.listing_table.write().await;
+            *listing_table_guard = new_listing_table;
+
+            return Ok(result);
         }
 
-        // Delegate to the underlying listing table for Vortex file writing
-        // The listing table will use VortexSink to write the data
-        // In the future, we would also:
-        // 1. Track the written files in the Pepper catalog
-        // 2. Handle primary key constraints if needed
-        self.listing_table
-            .insert_into(state, input, overwrite)
+        // For regular appends, use the existing listing table with append mode
+        // The Vortex ListingTable only supports append mode, so we always use Append
+        // even for regular inserts
+        let listing_table = self.listing_table.read().await;
+        listing_table
+            .insert_into(state, input, InsertOp::Append)
             .await
     }
 }

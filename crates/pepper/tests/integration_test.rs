@@ -261,6 +261,134 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     verify_sqlite_metadata(&db_path, &data_path)?;
     println!("✓ SQLite metastore verification successful (round 2)");
 
+    // === ROUND 3: INSERT OVERWRITE ===
+    println!("\n--- Round 3: INSERT OVERWRITE ---");
+
+    // Count subdirectories before overwrite
+    let entries_before: Vec<_> = std::fs::read_dir(&data_path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    println!(
+        "✓ Subdirectories before overwrite: {}",
+        entries_before.len()
+    );
+
+    // 21. Perform INSERT OVERWRITE - should replace all data with new data
+    ctx.sql("INSERT OVERWRITE test_table VALUES (100, 'Overwrite1'), (200, 'Overwrite2'), (300, 'Overwrite3')")
+        .await?
+        .collect()
+        .await?;
+    println!("✓ INSERT OVERWRITE completed (3 new rows)");
+
+    // Count subdirectories after overwrite - should have created a new one
+    let entries_after: Vec<_> = std::fs::read_dir(&data_path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    println!("✓ Subdirectories after overwrite: {}", entries_after.len());
+
+    // Verify that a new overwrite directory was created
+    assert!(
+        entries_after.len() > entries_before.len(),
+        "Expected new subdirectory to be created for overwrite"
+    );
+    println!("✓ New subdirectory created for overwrite");
+
+    // Verify overwrite directory naming
+    let overwrite_dirs: Vec<_> = std::fs::read_dir(&data_path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir() && e.file_name().to_string_lossy().starts_with("overwrite_"))
+        .collect();
+    assert!(
+        !overwrite_dirs.is_empty(),
+        "Expected at least one directory starting with 'overwrite_'"
+    );
+    println!("✓ Overwrite directory has correct naming pattern");
+
+    // 22. Query and verify only the new data is visible (old data replaced)
+    let df = ctx.sql("SELECT * FROM test_table ORDER BY id").await?;
+    let results = df.collect().await?;
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(
+        total_rows, 3,
+        "Expected 3 rows after overwrite (old data replaced)"
+    );
+    println!("✓ Query returned {total_rows} rows (old data replaced)");
+
+    // 23. Verify the overwrite data content
+    let mut all_ids = Vec::new();
+    let mut all_names = Vec::new();
+    for batch in &results {
+        let id_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array");
+        let name_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray");
+
+        for i in 0..batch.num_rows() {
+            all_ids.push(id_array.value(i));
+            all_names.push(name_array.value(i).to_string());
+        }
+    }
+
+    assert_eq!(all_ids, vec![100, 200, 300]);
+    assert_eq!(all_names, vec!["Overwrite1", "Overwrite2", "Overwrite3"]);
+    println!("✓ Overwrite data verification successful");
+
+    // 24. Verify old data is NOT visible
+    let df = ctx.sql("SELECT * FROM test_table WHERE id < 100").await?;
+    let results = df.collect().await?;
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(
+        total_rows, 0,
+        "Expected 0 rows from old data (should be replaced)"
+    );
+    println!("✓ Old data is not visible after overwrite");
+
+    // 25. Test filtering on overwrite data
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE id >= 200 ORDER BY id")
+        .await?;
+    let results = df.collect().await?;
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(total_rows, 2, "Expected 2 rows after filtering (id >= 200)");
+    println!("✓ Filter query successful on overwrite data");
+
+    // 26. Test projection on overwrite data
+    let df = ctx.sql("SELECT name FROM test_table ORDER BY id").await?;
+    let results = df.collect().await?;
+    let total_cols: usize = if results.is_empty() {
+        0
+    } else {
+        results[0].num_columns()
+    };
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(total_cols, 1, "Expected 1 column in projection");
+    assert_eq!(total_rows, 3, "Expected 3 rows in projection");
+    println!("✓ Projection query successful on overwrite data");
+
+    // 27. Verify SQLite metastore after overwrite
+    verify_sqlite_metadata(&db_path, &data_path)?;
+    println!("✓ SQLite metastore verification successful (round 3)");
+
     println!("\n✅ Basic workflow test passed!");
     Ok(())
 }
