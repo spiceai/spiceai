@@ -15,14 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::{
-    any::TypeId,
-    collections::HashMap,
-    future::Future,
-    marker::PhantomData,
-    sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
-};
-
+use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 use crate::TraceParent;
 use app::App;
 use http::HeaderMap;
@@ -30,8 +23,22 @@ use opentelemetry::KeyValue;
 use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
+use std::sync::atomic::Ordering;
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    future::Future,
+    marker::PhantomData,
+    sync::{
+        Arc, LazyLock, OnceLock, RwLock,
+        atomic::{AtomicI16, AtomicU8},
+    },
+};
 
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
+static HTTP_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static FLIGHT_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static FLIGHTSQL_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static INTERNAL_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
 
 type Extensions = HashMap<TypeId, Arc<dyn Extension + Send + Sync>>;
 
@@ -44,6 +51,7 @@ pub struct RequestContext {
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
+    nested_query_level: AtomicI16,
 }
 
 #[async_trait::async_trait]
@@ -172,6 +180,24 @@ impl RequestContext {
     }
 
     #[must_use]
+    pub fn to_protocol_dimensions(&self) -> &'static [KeyValue] {
+        let protocol = self.protocol();
+        match protocol {
+            Protocol::Http => {
+                HTTP_DIMENSIONS.get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())])
+            }
+            Protocol::Flight => {
+                FLIGHT_DIMENSIONS.get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())])
+            }
+            Protocol::FlightSQL => FLIGHTSQL_DIMENSIONS
+                .get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())]),
+            Protocol::Internal => INTERNAL_DIMENSIONS
+                .get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())]),
+            Protocol::Invalid => &[],
+        }
+    }
+
+    #[must_use]
     pub fn protocol(&self) -> Protocol {
         Protocol::from(self.protocol.load(std::sync::atomic::Ordering::Relaxed))
     }
@@ -227,6 +253,14 @@ impl RequestContext {
         for ext in extensions {
             ext.load().await;
         }
+    }
+
+    pub fn entered_top_level_query(&self) -> bool {
+        self.nested_query_level.fetch_add(1, Ordering::Relaxed) == 0
+    }
+
+    pub fn exited_top_level_query(&self) -> bool {
+        self.nested_query_level.fetch_add(-1, Ordering::Relaxed) == 1
     }
 }
 
@@ -416,6 +450,7 @@ impl RequestContextBuilder {
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
+            nested_query_level: AtomicI16::new(0),
         }
     }
 

@@ -177,6 +177,7 @@ vortex-datafusion = { path = "../vortex-datafusion", optional = true }
 vortex = { workspace = true, optional = true }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
+pepper = { path = "../pepper" }
 
 [dev-dependencies]
 anyhow = "1.0.99"
@@ -269,5 +270,5 @@ sqlite = [
     "dep:rusqlite",
 ]
 turso = []
-vortex = ["dep:vortex-datafusion", "dep:vortex"]
+pepper = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
