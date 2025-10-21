@@ -499,7 +499,7 @@ dependencies = [
  "arrow",
  "chrono",
  "log",
- "odbc-api",
+ "odbc-api 13.1.0",
  "thiserror 2.0.16",
 ]
 
@@ -4516,7 +4516,7 @@ dependencies = [
  "datafusion-table-providers",
  "dyn-clone",
  "futures",
- "odbc-api",
+ "odbc-api 14.3.0",
  "pkcs8 0.10.2",
  "secrecy",
  "serde_json",
@@ -9915,6 +9915,20 @@ name = "odbc-api"
 version = "13.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44e14665455e2817ac5b0dd9f65a3dc97e76e8f85eeac6e4301b7cf9da451884"
+dependencies = [
+ "atoi",
+ "log",
+ "odbc-sys",
+ "thiserror 2.0.16",
+ "widestring",
+ "winit",
+]
+
+[[package]]
+name = "odbc-api"
+version = "14.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0566d76c87be8dac51dbba245287afdbf8d5fe3c7ffb9cf5c73786ee4427f15"
 dependencies = [
  "atoi",
  "log",
@@ -18021,9 +18035,9 @@ checksum = "271414315aff87387382ec3d271b52d7ae78726f5d44ac98b4f4030c91880486"
 
 [[package]]
 name = "winit"
-version = "0.30.11"
+version = "0.30.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4409c10174df8779dc29a4788cac85ed84024ccbc1743b776b21a520ee1aaf4"
+checksum = "c66d4b9ed69c4009f6321f762d6e61ad8a2389cd431b97cb1e146812e9e6c732"
 dependencies = [
  "android-activity",
  "atomic-waker",
