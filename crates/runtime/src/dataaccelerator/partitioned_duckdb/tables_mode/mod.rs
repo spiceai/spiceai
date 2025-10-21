@@ -184,8 +184,6 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
 
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
-        super::parameter_validation(source);
-
         if !cmd.options.contains_key("open") {
             let duckdb_file = duckdb_file_path(&self.duckdb_factory, source)?;
             cmd.options.insert("open".to_string(), duckdb_file);
