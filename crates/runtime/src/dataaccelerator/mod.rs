@@ -44,27 +44,27 @@ use self::arrow::ArrowAccelerator;
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::{
-    PartitionedDuckDBAccelerator, tables_mode::TablesModePartitionedDuckDBAccelerator,
-};
+use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
+#[cfg(feature = "duckdb")]
+use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
+#[cfg(feature = "pepper")]
+use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
 use self::sqlite::SqliteAccelerator;
-#[cfg(feature = "vortex")]
-use self::vortex::VortexAccelerator;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
+#[cfg(feature = "pepper")]
+pub mod pepper;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-#[cfg(feature = "vortex")]
-pub mod vortex;
 
 mod snapshots;
 pub mod spice_sys;
@@ -160,8 +160,8 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
             .await;
-        #[cfg(feature = "vortex")]
-        self.register_accelerator_engine(Engine::Vortex, Arc::new(VortexAccelerator::new()))
+        #[cfg(feature = "pepper")]
+        self.register_accelerator_engine(Engine::Pepper, Arc::new(PepperAccelerator::new()))
             .await;
     }
 
@@ -712,14 +712,14 @@ mod accelerator_compat_tests {
     use crate::dataaccelerator::DataAccelerator;
     use ::arrow::{
         array::{
-            Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+            Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
             DurationMillisecondArray, Float32Array, Float64Array, Int8Array, Int16Array,
             Int32Array, Int32Builder, Int64Array, IntervalYearMonthArray, LargeBinaryArray,
-            LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray,
+            LargeStringArray, RecordBatch, StringArray, StringBuilder, Time32MillisecondArray,
             Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
             UInt32Array, UInt64Array,
         },
-        datatypes::{DataType, Field, Schema, TimeUnit},
+        datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
@@ -731,12 +731,36 @@ mod accelerator_compat_tests {
     };
     use datafusion_table_providers::util::test::MockExec;
     use std::{collections::HashMap, sync::Arc};
+    use tempfile::TempDir;
+
+    /// Helper struct to manage temporary test environment
+    /// Ensures unique data directories per test and proper cleanup
+    struct TestEnvironment {
+        _temp_dir: TempDir,
+        data_path: String,
+    }
+
+    impl TestEnvironment {
+        fn new() -> Self {
+            let temp_dir = TempDir::new().expect("Failed to create temp directory");
+            let data_path = temp_dir.path().to_string_lossy().to_string();
+
+            Self {
+                _temp_dir: temp_dir,
+                data_path,
+            }
+        }
+
+        fn metadata_dir(&self) -> String {
+            format!("{}/metadata", self.data_path)
+        }
+    }
 
     /// Mock acceleration source for testing
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
-        F: Fn(Engine, Arc<dyn TableProvider>, String) -> Fut,
+        F: Fn(Engine, Arc<dyn TableProvider>, String, &TestEnvironment) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         // Test both memory and file modes for databases
@@ -759,11 +783,14 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
-            #[cfg(feature = "vortex")]
-            (Engine::Vortex, "file", None), // Vortex only supports file mode
+            #[cfg(feature = "pepper")]
+            (Engine::Pepper, "file", None), // Pepper only supports file mode
         ];
 
         for (engine, mode, timestamp_format) in test_configs {
+            // Create a unique test environment for this test run
+            let test_env = TestEnvironment::new();
+
             let mode_label = if let Some(ts_fmt) = timestamp_format {
                 format!("{}, timestamp_format={}", mode, ts_fmt)
             } else {
@@ -877,21 +904,21 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                #[cfg(feature = "vortex")]
-                Engine::Vortex => {
+                #[cfg(feature = "pepper")]
+                Engine::Pepper => {
                     use crate::component::dataset::builder::DatasetBuilder;
-                    use crate::dataaccelerator::vortex::VortexAccelerator;
+                    use crate::dataaccelerator::pepper::PepperAccelerator;
 
-                    // Clean up any existing .vortex files in the test directory
-                    // Vortex only supports appends, so we need a clean state for each test
+                    // Clean up any existing .pepper files and Pepper metadata
+                    // Pepper only supports appends, so we need a clean state for each test
                     if mode == "file" && !location.is_empty() {
                         let test_dir = std::path::Path::new(&location);
                         if test_dir.exists() {
                             if let Ok(entries) = std::fs::read_dir(test_dir) {
                                 for entry in entries.flatten() {
                                     let path = entry.path();
-                                    // Safety: only delete .vortex files
-                                    if path.extension().and_then(|s| s.to_str()) == Some("vortex") {
+                                    // Safety: only delete .pepper files
+                                    if path.extension().and_then(|s| s.to_str()) == Some("pepper") {
                                         let _ = std::fs::remove_file(&path);
                                     }
                                 }
@@ -899,6 +926,13 @@ mod accelerator_compat_tests {
                         } else {
                             // Create the directory if it doesn't exist
                             let _ = std::fs::create_dir_all(test_dir);
+                        }
+
+                        // Also clean up Pepper metadata to ensure fresh schema
+                        // Use test environment's metadata directory
+                        let pepper_db_path = format!("{}/pepper.db", test_env.metadata_dir());
+                        if std::path::Path::new(&pepper_db_path).exists() {
+                            let _ = std::fs::remove_file(&pepper_db_path);
                         }
                     }
 
@@ -931,8 +965,13 @@ mod accelerator_compat_tests {
                     let mut params = HashMap::new();
                     if mode == "file" {
                         // Set file_path to use our unique temporary location with timestamp
-                        params.insert("vortex_file_path".to_string(), location.clone());
+                        params.insert("pepper_file_path".to_string(), location.clone());
                     }
+                    // Use test environment's metadata directory for Pepper
+                    params.insert("pepper_metadata_dir".to_string(), test_env.metadata_dir());
+                    // Use 'error' mode for tests to fail on unsupported types
+                    // This matches the new default production behavior
+                    params.insert("unsupported_type_action".to_string(), "error".to_string());
 
                     dataset.acceleration = Some(Acceleration {
                         enabled: true,
@@ -941,7 +980,7 @@ mod accelerator_compat_tests {
                         } else {
                             Mode::Memory
                         },
-                        engine: Engine::Vortex,
+                        engine: Engine::Pepper,
                         params,
                         ..Acceleration::default()
                     });
@@ -951,7 +990,7 @@ mod accelerator_compat_tests {
                     use futures::FutureExt;
                     use std::panic::AssertUnwindSafe;
 
-                    let accelerator = VortexAccelerator::new();
+                    let accelerator = PepperAccelerator::new();
                     let create_future = AssertUnwindSafe(accelerator.create_external_table(
                         external_table,
                         Some(&dataset),
@@ -985,7 +1024,7 @@ mod accelerator_compat_tests {
                 _ => panic!("Unsupported engine for this test"),
             };
 
-            test_fn(engine, table, mode_label.clone()).await;
+            test_fn(engine, table, mode_label.clone(), &test_env).await;
 
             // Cleanup file if in file mode
             if mode == "file" && !location.is_empty() {
@@ -996,7 +1035,7 @@ mod accelerator_compat_tests {
 
     /// Helper function to get the comprehensive test schema covering all major Arrow data types
     /// Note: Some exotic types (`Time64`, `LargeBinary`, `LargeUtf8`) may not be supported by all engines
-    /// For Vortex, Duration types are excluded as they are not yet supported
+    /// For Vortex, Time32, Time64, Duration, Interval, and Map types are excluded as they are not yet supported
     fn test_schema(engine: Option<Engine>) -> Arc<Schema> {
         let mut fields = vec![
             // Original columns (for backwards compatibility with existing tests)
@@ -1025,23 +1064,8 @@ mod accelerator_compat_tests {
             Field::new("date64_col", DataType::Date64, true),
         ];
 
-        // Time32 and Time64 types - Vortex doesn't support these
-        #[cfg(feature = "vortex")]
-        if !matches!(engine, Some(Engine::Vortex)) {
-            fields.push(Field::new(
-                "time32_ms_col",
-                DataType::Time32(TimeUnit::Millisecond),
-                true,
-            ));
-            fields.push(Field::new(
-                "time64_us_col",
-                DataType::Time64(TimeUnit::Microsecond),
-                true,
-            ));
-        }
-
-        #[cfg(not(feature = "vortex"))]
-        {
+        // Skip Time32 and Time64 for Vortex as they're not yet supported
+        if !matches!(engine, Some(Engine::Pepper)) {
             fields.push(Field::new(
                 "time32_ms_col",
                 DataType::Time32(TimeUnit::Millisecond),
@@ -1060,28 +1084,17 @@ mod accelerator_compat_tests {
             true,
         ));
 
-        // Duration and Interval types - Vortex doesn't support Duration yet
-        #[cfg(feature = "vortex")]
-        if !matches!(engine, Some(Engine::Vortex)) {
+        // Skip Duration for Vortex as it's not yet supported
+        if !matches!(engine, Some(Engine::Pepper)) {
             fields.push(Field::new(
                 "duration_ms_col",
                 DataType::Duration(TimeUnit::Millisecond),
-                true,
-            ));
-            fields.push(Field::new(
-                "interval_ym_col",
-                DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
                 true,
             ));
         }
 
-        #[cfg(not(feature = "vortex"))]
-        {
-            fields.push(Field::new(
-                "duration_ms_col",
-                DataType::Duration(TimeUnit::Millisecond),
-                true,
-            ));
+        // Skip Interval for Vortex as it's not yet supported
+        if !matches!(engine, Some(Engine::Pepper)) {
             fields.push(Field::new(
                 "interval_ym_col",
                 DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
@@ -1095,31 +1108,8 @@ mod accelerator_compat_tests {
             true,
         ));
 
-        // Map type (map of Utf8 keys to Int32 values) - Vortex doesn't support Map yet
-        #[cfg(feature = "vortex")]
-        if !matches!(engine, Some(Engine::Vortex)) {
-            fields.push(Field::new(
-                "map_col",
-                DataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        DataType::Struct(
-                            vec![
-                                Field::new("key", DataType::Utf8, false),
-                                Field::new("value", DataType::Int32, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false, // keys are not sorted
-                ),
-                true,
-            ));
-        }
-
-        #[cfg(not(feature = "vortex"))]
-        {
+        // Skip Map type for Vortex as it's not yet supported
+        if !matches!(engine, Some(Engine::Pepper)) {
             fields.push(Field::new(
                 "map_col",
                 DataType::Map(
@@ -1541,14 +1531,155 @@ mod accelerator_compat_tests {
         RecordBatch::try_new(schema, columns).expect("data should be created")
     }
 
+    /// Transform `RecordBatch` to match a target schema by converting unsupported types to strings
+    /// This is needed for engines like Vortex that convert unsupported types to Utf8
+    fn transform_batch_to_schema(
+        batch: &RecordBatch,
+        target_schema: SchemaRef,
+    ) -> Result<RecordBatch, arrow::error::ArrowError> {
+        let source_schema = batch.schema();
+        let mut new_columns: Vec<ArrayRef> = Vec::new();
+
+        for target_field in target_schema.fields() {
+            // Find the corresponding source field by name
+            let source_field_idx = source_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == target_field.name())
+                .ok_or_else(|| {
+                    arrow::error::ArrowError::SchemaError(format!(
+                        "Field '{}' not found in source schema",
+                        target_field.name()
+                    ))
+                })?;
+
+            let source_array = batch.column(source_field_idx);
+            let source_type = source_schema.field(source_field_idx).data_type();
+
+            // If types match, use the column as-is
+            if source_type == target_field.data_type() {
+                new_columns.push(Arc::clone(source_array));
+                continue;
+            }
+
+            // If target is Utf8 and source is not, convert to string
+            if matches!(target_field.data_type(), DataType::Utf8)
+                && !matches!(source_type, DataType::Utf8 | DataType::LargeUtf8)
+            {
+                let mut builder = StringBuilder::new();
+
+                for row_idx in 0..source_array.len() {
+                    if source_array.is_null(row_idx) {
+                        builder.append_null();
+                    } else {
+                        // Convert the value to string representation
+                        let string_value = match source_type {
+                            DataType::Time32(TimeUnit::Millisecond) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<Time32MillisecondArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to Time32MillisecondArray".to_string(),
+                                    ));
+                                };
+                                format!("{}", arr.value(row_idx))
+                            }
+                            DataType::Time64(TimeUnit::Microsecond) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<Time64MicrosecondArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to Time64MicrosecondArray".to_string(),
+                                    ));
+                                };
+                                format!("{}", arr.value(row_idx))
+                            }
+                            DataType::Duration(TimeUnit::Millisecond) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<DurationMillisecondArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to DurationMillisecondArray"
+                                            .to_string(),
+                                    ));
+                                };
+                                format!("{}ms", arr.value(row_idx))
+                            }
+                            DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<IntervalYearMonthArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to IntervalYearMonthArray".to_string(),
+                                    ));
+                                };
+                                format!("{} months", arr.value(row_idx))
+                            }
+                            DataType::Map(_, _) => {
+                                // For Map types, use Arrow's display format
+                                format!(
+                                    "{:?}",
+                                    arrow::util::display::array_value_to_string(
+                                        source_array,
+                                        row_idx
+                                    )
+                                    .unwrap_or_else(|_| "null".to_string())
+                                )
+                            }
+                            _ => {
+                                // Generic conversion using Arrow's display utilities
+                                arrow::util::display::array_value_to_string(source_array, row_idx)
+                                    .unwrap_or_else(|_| "null".to_string())
+                            }
+                        };
+                        builder.append_value(string_value);
+                    }
+                }
+
+                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
+            } else {
+                // For other type mismatches, use Arrow's cast kernel to handle compatible conversions
+                // (e.g., Float16->Float32, Int32->Int64, etc.)
+                let casted =
+                    arrow::compute::cast(source_array, target_field.data_type()).map_err(|e| {
+                        arrow::error::ArrowError::ComputeError(format!(
+                            "Failed to cast field '{}' from {:?} to {:?}: {}",
+                            target_field.name(),
+                            source_type,
+                            target_field.data_type(),
+                            e
+                        ))
+                    })?;
+                new_columns.push(casted);
+            }
+        }
+
+        RecordBatch::try_new(target_schema, new_columns)
+    }
+
     /// Helper function to insert test data into a table
     async fn insert_test_data(
         table: &Arc<dyn TableProvider>,
         ctx: &SessionContext,
         data: RecordBatch,
     ) {
-        let schema = data.schema();
-        let exec = MockExec::new(vec![Ok(data)], schema);
+        let table_schema = table.schema();
+
+        // Transform the data to match the table schema if needed
+        // (e.g., for Vortex which converts unsupported types to strings)
+        let transformed_data = if data.schema() == table_schema {
+            data
+        } else {
+            transform_batch_to_schema(&data, Arc::clone(&table_schema))
+                .expect("data transformation should succeed")
+        };
+
+        let schema = transformed_data.schema();
+        let exec = MockExec::new(vec![Ok(transformed_data)], schema);
         let insertion = table
             .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
             .await
@@ -1560,9 +1691,116 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
+    async fn test_schema_preservation() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            let original_schema = test_schema(Some(engine));
+            let table_schema = table.schema();
+
+            // Verify that the table schema has all fields (count should match)
+            assert_eq!(
+                table_schema.fields().len(),
+                original_schema.fields().len(),
+                "{:?}: Schema field count mismatch. Expected {}, got {}. \
+                 This indicates that the catalog is not preserving all fields correctly.",
+                engine,
+                original_schema.fields().len(),
+                table_schema.fields().len()
+            );
+
+            // Define types that Vortex converts to Utf8 with unsupported_type_action: string
+            let vortex_unsupported_types = [
+                DataType::Time32(TimeUnit::Millisecond),
+                DataType::Time64(TimeUnit::Microsecond),
+                DataType::Duration(TimeUnit::Millisecond),
+                DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth),
+            ];
+
+            // Verify each field matches (or is appropriately converted)
+            for (i, (original_field, table_field)) in original_schema
+                .fields()
+                .iter()
+                .zip(table_schema.fields().iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    original_field.name(),
+                    table_field.name(),
+                    "{:?}: Field {} name mismatch",
+                    engine,
+                    i
+                );
+
+                let original_type = original_field.data_type();
+                let table_type = table_field.data_type();
+
+                // For Vortex, check if unsupported types are converted to Utf8
+                if matches!(engine, Engine::Pepper) {
+                    if vortex_unsupported_types.contains(original_type) {
+                        assert_eq!(
+                            table_type,
+                            &DataType::Utf8,
+                            "{:?}: Field {} ({}) with unsupported type {:?} should be converted to Utf8, got {:?}",
+                            engine,
+                            i,
+                            original_field.name(),
+                            original_type,
+                            table_type
+                        );
+                    } else if matches!(original_type, DataType::Map(_, _)) {
+                        // Map types are also converted to Utf8
+                        assert_eq!(
+                            table_type,
+                            &DataType::Utf8,
+                            "{:?}: Field {} ({}) with Map type should be converted to Utf8, got {:?}",
+                            engine,
+                            i,
+                            original_field.name(),
+                            table_type
+                        );
+                    } else {
+                        // Other types should match exactly (or be compatible conversions like timestamps)
+                        assert_eq!(
+                            original_type,
+                            table_type,
+                            "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
+                            engine,
+                            i,
+                            original_field.name(),
+                            original_type,
+                            table_type
+                        );
+                    }
+                } else {
+                    // For non-Vortex engines, types should match exactly
+                    assert_eq!(
+                        original_type,
+                        table_type,
+                        "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
+                        engine,
+                        i,
+                        original_field.name(),
+                        original_type,
+                        table_type
+                    );
+                }
+
+                assert_eq!(
+                    original_field.is_nullable(),
+                    table_field.is_nullable(),
+                    "{:?}: Field {} ({}) nullable mismatch",
+                    engine,
+                    i,
+                    original_field.name()
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     #[allow(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -1592,7 +1830,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("filtered scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Vortex {
+            if engine != Engine::Arrow && engine != Engine::Pepper {
                 assert!(
                     total_rows <= 50,
                     "{:?}: filtered should have <= 50 rows, got {}",
@@ -1626,7 +1864,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("limit scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Vortex {
+            if engine != Engine::Arrow && engine != Engine::Pepper {
                 assert!(
                     total_rows <= 10,
                     "{:?}: limit should have <= 10 rows, got {}",
@@ -1648,7 +1886,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("combined scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Vortex {
+            if engine != Engine::Arrow && engine != Engine::Pepper {
                 assert!(
                     total_rows <= 5,
                     "{:?}: combined should have <= 5 rows, got {}",
@@ -1666,8 +1904,8 @@ mod accelerator_compat_tests {
                 .await
                 .expect("scan successful");
 
-            // Vortex may not preserve nulls properly yet, so skip this check for Vortex
-            if engine != Engine::Vortex {
+            // Pepper may not preserve nulls properly yet, so skip this check for Pepper
+            if engine != Engine::Pepper {
                 for batch in &results {
                     let value_col = batch
                         .column(2)
@@ -1686,9 +1924,9 @@ mod accelerator_compat_tests {
     #[tokio::test]
     #[allow(clippy::unreadable_literal)]
     async fn test_delete_operations() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
-            if engine == Engine::Arrow || engine == Engine::Vortex {
+            if engine == Engine::Arrow || engine == Engine::Pepper {
                 return;
             }
 
@@ -1733,14 +1971,23 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_null_handling() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
             // Insert 3 records with nulls in the value column
             let data = generate_test_data(Arc::clone(&schema), 3, 0);
 
-            let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+            // Transform data to match table schema if needed (e.g., for Vortex type conversions)
+            let table_schema = table.schema();
+            let transformed_data = if data.schema() == table_schema {
+                data
+            } else {
+                transform_batch_to_schema(&data, Arc::clone(&table_schema))
+                    .expect("data transformation should succeed")
+            };
+
+            let exec = MockExec::new(vec![Ok(transformed_data)], Arc::clone(&table_schema));
 
             let insertion = table
                 .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
@@ -1796,139 +2043,242 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_boolean_values() {
-        run_compat_test(|engine, _table, _mode| async move {
-            let ctx = SessionContext::new();
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, false),
-                Field::new("active", DataType::Boolean, false),
-            ]));
+        run_compat_test(|engine, _table, _mode, test_env| {
+            let metadata_dir = test_env.metadata_dir();
+            async move {
+                let ctx = SessionContext::new();
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("name", DataType::Utf8, false),
+                    Field::new("active", DataType::Boolean, false),
+                ]));
 
-            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
-            let external_table = CreateExternalTable {
-                schema: df_schema,
-                name: TableReference::bare(format!("test_bool_{:?}", engine)),
-                location: String::new(),
-                file_type: String::new(),
-                table_partition_cols: vec![],
-                if_not_exists: true,
-                definition: None,
-                order_exprs: vec![],
-                unbounded: false,
-                options: HashMap::new(),
-                constraints: Constraints::new_unverified(vec![]),
-                column_defaults: HashMap::default(),
-                temporary: false,
-            };
+                let df_schema =
+                    ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
-            let bool_table: Arc<dyn TableProvider> = match engine {
-                #[cfg(feature = "sqlite")]
-                Engine::Sqlite => {
-                    use crate::dataaccelerator::sqlite::SqliteAccelerator;
-                    SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("SQLite table should be created")
+                // Create location for file-based engines
+                let location = if _mode == "file" {
+                    format!(
+                        "/tmp/spice_benchmark_{:?}_boolean_{}_{}.db",
+                        engine,
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("Time went backwards")
+                            .as_nanos()
+                    )
+                } else {
+                    String::new()
+                };
+
+                let mut options = HashMap::new();
+                if _mode == "file" {
+                    options.insert("file".to_string(), location.clone());
                 }
-                #[cfg(feature = "turso")]
-                Engine::Turso => {
-                    use crate::dataaccelerator::turso::TursoAccelerator;
-                    TursoAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("Turso table should be created")
+                options.insert("mode".to_string(), _mode.to_string());
+
+                let external_table = CreateExternalTable {
+                    schema: df_schema,
+                    name: TableReference::bare(format!("test_bool_{:?}", engine)),
+                    location: location.clone(),
+                    file_type: String::new(),
+                    table_partition_cols: vec![],
+                    if_not_exists: true,
+                    definition: None,
+                    order_exprs: vec![],
+                    unbounded: false,
+                    options,
+                    constraints: Constraints::new_unverified(vec![]),
+                    column_defaults: HashMap::default(),
+                    temporary: false,
+                };
+
+                let bool_table: Arc<dyn TableProvider> = match engine {
+                    #[cfg(feature = "sqlite")]
+                    Engine::Sqlite => {
+                        use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                        SqliteAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new())
+                            .await
+                            .expect("SQLite table should be created")
+                    }
+                    #[cfg(feature = "turso")]
+                    Engine::Turso => {
+                        use crate::dataaccelerator::turso::TursoAccelerator;
+                        TursoAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new())
+                            .await
+                            .expect("Turso table should be created")
+                    }
+                    #[cfg(feature = "duckdb")]
+                    Engine::DuckDB => {
+                        use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                        DuckDBAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new())
+                            .await
+                            .expect("DuckDB table should be created")
+                    }
+                    Engine::Arrow => {
+                        use crate::dataaccelerator::arrow::ArrowAccelerator;
+                        ArrowAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new())
+                            .await
+                            .expect("Arrow table should be created")
+                    }
+                    #[cfg(feature = "pepper")]
+                    Engine::Pepper => {
+                        use crate::component::dataset::builder::DatasetBuilder;
+                        use crate::dataaccelerator::pepper::PepperAccelerator; // Clean up any existing files and metadata
+                        if _mode == "file" && !location.is_empty() {
+                            let test_dir = std::path::Path::new(&location);
+                            if test_dir.exists() {
+                                if let Ok(entries) = std::fs::read_dir(test_dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.extension().and_then(|s| s.to_str())
+                                            == Some("pepper")
+                                        {
+                                            let _ = std::fs::remove_file(&path);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let _ = std::fs::create_dir_all(test_dir);
+                            }
+
+                            // Clean up Pepper metadata
+                            // Use test environment's metadata directory
+                            let pepper_db_path = format!("{}/pepper.db", metadata_dir);
+                            if std::path::Path::new(&pepper_db_path).exists() {
+                                let _ = std::fs::remove_file(&pepper_db_path);
+                            }
+                        }
+
+                        let test_app_obj = app::AppBuilder::new("test").build();
+                        let test_app = Arc::new(test_app_obj.clone());
+                        let test_runtime = Arc::new(
+                            crate::Runtime::builder()
+                                .with_app(test_app_obj)
+                                .build()
+                                .await,
+                        );
+
+                        let dataset_name = format!("test_bool_{:?}", engine);
+                        let mut dataset =
+                            match DatasetBuilder::try_new(dataset_name.clone(), &dataset_name)
+                                .expect("Failed to create dataset builder")
+                                .with_app(Arc::clone(&test_app))
+                                .with_runtime(Arc::clone(&test_runtime))
+                                .build()
+                            {
+                                Ok(ds) => ds,
+                                Err(e) => {
+                                    panic!("Failed to create dataset: {}", e);
+                                }
+                            };
+
+                        let mut params = HashMap::new();
+                        if _mode == "file" {
+                            params.insert("pepper_file_path".to_string(), location.clone());
+                        }
+                        // Use test environment's metadata directory for Pepper
+                        params.insert("pepper_metadata_dir".to_string(), metadata_dir.clone());
+                        params.insert("unsupported_type_action".to_string(), "error".to_string());
+
+                        dataset.acceleration = Some(Acceleration {
+                            enabled: true,
+                            mode: if _mode == "file" {
+                                Mode::File
+                            } else {
+                                Mode::Memory
+                            },
+                            engine: Engine::Pepper,
+                            params,
+                            ..Acceleration::default()
+                        });
+
+                        PepperAccelerator::new()
+                            .create_external_table(external_table, Some(&dataset), Vec::new())
+                            .await
+                            .expect("Vortex table should be created")
+                    }
+                    _ => panic!("Unsupported engine: {:?}", engine),
+                };
+
+                // Insert boolean data
+                let id_array = Int64Array::from(vec![1, 2, 3]);
+                let name_array = StringArray::from(vec!["A", "B", "C"]);
+                let bool_array = BooleanArray::from(vec![true, false, true]);
+
+                let data = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(id_array),
+                        Arc::new(name_array),
+                        Arc::new(bool_array),
+                    ],
+                )
+                .expect("data should be created");
+
+                let exec = MockExec::new(vec![Ok(data)], schema);
+
+                let insertion = bool_table
+                    .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                    .await
+                    .expect("insertion should be successful");
+
+                collect(insertion, ctx.task_ctx())
+                    .await
+                    .expect("insert successful");
+
+                // Query and verify boolean values
+                let scan = bool_table
+                    .scan(&ctx.state(), None, &[], None)
+                    .await
+                    .expect("scan should be successful");
+
+                let results = collect(scan, ctx.task_ctx())
+                    .await
+                    .expect("scan successful");
+
+                let batch = &results[0];
+                let bool_col = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("active should be BooleanArray");
+
+                assert_eq!(
+                    bool_col.value(0),
+                    true,
+                    "{:?}: row 0 should be true",
+                    engine
+                );
+                assert_eq!(
+                    bool_col.value(1),
+                    false,
+                    "{:?}: row 1 should be false",
+                    engine
+                );
+                assert_eq!(
+                    bool_col.value(2),
+                    true,
+                    "{:?}: row 2 should be true",
+                    engine
+                );
+
+                // Cleanup
+                if _mode == "file" && !location.is_empty() {
+                    let _ = std::fs::remove_file(&location);
                 }
-                #[cfg(feature = "duckdb")]
-                Engine::DuckDB => {
-                    use crate::dataaccelerator::duckdb::DuckDBAccelerator;
-                    DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("DuckDB table should be created")
-                }
-                Engine::Arrow => {
-                    use crate::dataaccelerator::arrow::ArrowAccelerator;
-                    ArrowAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("Arrow table should be created")
-                }
-                #[cfg(feature = "vortex")]
-                Engine::Vortex => {
-                    // Vortex doesn't work well with this simple test, skip it
-                    return;
-                }
-                _ => panic!("Unsupported engine: {:?}", engine),
-            };
-
-            // Insert boolean data
-            let id_array = Int64Array::from(vec![1, 2, 3]);
-            let name_array = StringArray::from(vec!["A", "B", "C"]);
-            let bool_array = BooleanArray::from(vec![true, false, true]);
-
-            let data = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(id_array),
-                    Arc::new(name_array),
-                    Arc::new(bool_array),
-                ],
-            )
-            .expect("data should be created");
-
-            let exec = MockExec::new(vec![Ok(data)], schema);
-
-            let insertion = bool_table
-                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
-                .await
-                .expect("insertion should be successful");
-
-            collect(insertion, ctx.task_ctx())
-                .await
-                .expect("insert successful");
-
-            // Query and verify boolean values
-            let scan = bool_table
-                .scan(&ctx.state(), None, &[], None)
-                .await
-                .expect("scan should be successful");
-
-            let results = collect(scan, ctx.task_ctx())
-                .await
-                .expect("scan successful");
-
-            let batch = &results[0];
-            let bool_col = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("active should be BooleanArray");
-
-            assert_eq!(
-                bool_col.value(0),
-                true,
-                "{:?}: row 0 should be true",
-                engine
-            );
-            assert_eq!(
-                bool_col.value(1),
-                false,
-                "{:?}: row 1 should be false",
-                engine
-            );
-            assert_eq!(
-                bool_col.value(2),
-                true,
-                "{:?}: row 2 should be true",
-                engine
-            );
+            }
         })
         .await;
     }
 
     #[tokio::test]
     async fn test_empty_result_set() {
-        run_compat_test(|engine, _table, _mode| async move {
+        run_compat_test(|engine, _table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
 
             // Query empty table
@@ -1952,7 +2302,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_filter_predicates() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -1974,7 +2324,7 @@ mod accelerator_compat_tests {
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
                 10
             } else {
                 4
@@ -1999,7 +2349,7 @@ mod accelerator_compat_tests {
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
                 10
             } else {
                 3
@@ -2023,7 +2373,7 @@ mod accelerator_compat_tests {
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
                 10
             } else {
                 1
@@ -2049,7 +2399,7 @@ mod accelerator_compat_tests {
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
                 10
             } else {
                 3
@@ -2065,7 +2415,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_projection_pushdown() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -2124,7 +2474,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_limit_pushdown() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -2158,7 +2508,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_combined_filter_projection_limit() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -2174,7 +2524,7 @@ mod accelerator_compat_tests {
             let scan = table
                 .scan(&ctx.state(), projection.as_ref(), &[filter], limit)
                 .await
-                .expect("scan should be successful");
+                .expect("combined scan should be successful");
 
             // Verify projected schema
             let projected_schema = scan.schema();
@@ -2193,7 +2543,7 @@ mod accelerator_compat_tests {
 
             let results = collect(scan, ctx.task_ctx())
                 .await
-                .expect("scan successful");
+                .expect("combined scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow doesn't support filter or limit pushdown, so it returns all rows
@@ -2206,7 +2556,7 @@ mod accelerator_compat_tests {
                     "{:?}: should have 10 rows (no pushdown)",
                     engine
                 );
-            } else if engine == Engine::Vortex {
+            } else if engine == Engine::Pepper {
                 // Limit pushdown only - id > 3 gives 6 rows, limit 2 gives 2 rows
                 assert_eq!(
                     total_rows, 2,
@@ -2238,24 +2588,31 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_complex_types_list_and_map() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
+            let table_schema = table.schema();
 
-            // Check if List and Map columns exist in the schema
+            // Check if List and Map columns exist in the schemas
             let has_list = schema.column_with_name("list_col").is_some();
             let has_map = schema.column_with_name("map_col").is_some();
+            let table_has_map = table_schema.column_with_name("map_col").is_some();
 
-            // Vortex supports List but not Map yet
-            if engine == Engine::Vortex {
+            // Vortex supports List natively, but Map is excluded from schema
+            if engine == Engine::Pepper {
                 assert!(
                     has_list,
-                    "{:?}: should have list_col (now supported)",
+                    "{:?}: should have list_col (natively supported)",
                     engine
                 );
                 assert!(
                     !has_map,
-                    "{:?}: should not have map_col (not yet supported)",
+                    "{:?}: should not have map_col in source schema (not yet supported)",
+                    engine
+                );
+                assert!(
+                    !table_has_map,
+                    "{:?}: should not have map_col in table schema (not yet supported)",
                     engine
                 );
             } else {
@@ -2305,9 +2662,12 @@ mod accelerator_compat_tests {
                     );
                 }
 
-                // Verify Map column exists and has correct type
-                if let Ok(map_col_idx) = batch.schema().index_of("map_col") {
+                // Verify Map column exists and has correct type (only for non-Vortex engines)
+                if engine != Engine::Pepper
+                    && let Ok(map_col_idx) = batch.schema().index_of("map_col")
+                {
                     let map_col = batch.column(map_col_idx);
+
                     assert!(
                         matches!(map_col.data_type(), DataType::Map(_, _)),
                         "{:?}: map_col should be Map type, got {:?}",
@@ -2330,7 +2690,7 @@ mod accelerator_compat_tests {
                 }
             }
 
-            if engine == Engine::Vortex {
+            if engine == Engine::Pepper {
                 println!(
                     "✓ {:?}: List type works correctly (Map not yet supported)",
                     engine
@@ -2616,7 +2976,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,vortex -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,pepper -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::sync::Mutex;
         use std::time::Instant;
@@ -2624,7 +2984,7 @@ mod accelerator_compat_tests {
         // Collect all results for comparison
         let all_results = Arc::new(Mutex::new(Vec::new()));
 
-        run_compat_test(|engine, table, mode| {
+        run_compat_test(|engine, table, mode, _test_env| {
             let all_results = Arc::clone(&all_results);
             async move {
                 let ctx = SessionContext::new();

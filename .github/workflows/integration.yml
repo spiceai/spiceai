@@ -170,11 +170,21 @@ jobs:
           retention-days: 1
 
   test:
-    name: Integration Tests
+    name: Integration Tests (part ${{ matrix.label }})
     needs: build
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 1
+            partition: 'count:1/3'
+          - label: 2
+            partition: 'count:2/3'
+          - label: 3
+            partition: 'count:3/3'
     steps:
       - uses: actions/checkout@v5
         with:
@@ -185,9 +195,6 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-
-      - name: Clean up Disk
-        uses: ./.github/actions/cleanup-disk
 
       - name: Install Oracle ODPI-C
         run: |
@@ -272,15 +279,75 @@ jobs:
           AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
           fi
-      - name: Upload benchmark snapshots to branch
+      - name: Upload integration snapshots artifact
+        id: create_snapshot_archive
         if: github.event.inputs.update_snapshots == 'always'
+        run: |
+          git diff --name-only -- '*.snap' > snapshot-files
+          git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
+          if [ -s snapshot-files ]; then
+            tr '\n' '\0' < snapshot-files > snapshot-files-0
+            tar --null -czf integration-snapshots-part-${{ matrix.label }}.tar.gz --files-from snapshot-files-0
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No snapshot files found"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f snapshot-files snapshot-files-0
+        shell: bash
+      - name: Store integration snapshots artifact
+        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-snapshots-part-${{ matrix.label }}
+          path: integration-snapshots-part-${{ matrix.label }}.tar.gz
+          retention-days: 1
+
+  upload-integration-snapshots:
+    name: Upload Integration Snapshots
+    if: github.event.inputs.update_snapshots == 'always'
+    needs:
+      - test
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Download integration snapshots artifacts
+        id: download_snapshots
+        continue-on-error: true
+        uses: actions/download-artifact@v5
+        with:
+          pattern: integration-snapshots-part-*
+          merge-multiple: true
+          path: integration-snapshots
+
+      - name: Extract snapshots
+        if: steps.download_snapshots.outcome == 'success'
+        run: |
+          shopt -s nullglob
+          for archive in integration-snapshots/*.tar.gz; do
+            tar -xzf "$archive" -C .
+          done
+        shell: bash
+
+      - name: Configure Git
+        if: steps.download_snapshots.outcome == 'success'
         run: |
           git config --global user.name 'Spice Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
+
+      - name: Upload benchmark snapshots to branch
+        if: steps.download_snapshots.outcome == 'success'
+        run: |
           git add '*.snap'
           if git diff --cached --quiet; then
             echo "No changes to commit"
@@ -290,6 +357,10 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No snapshot changes detected
+        if: steps.download_snapshots.outcome != 'success'
+        run: echo "No snapshot artifacts were uploaded; skipping snapshot update."
 
   test-aws-sdk:
     name: AWS SDK Integration Tests
