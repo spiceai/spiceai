@@ -77,12 +77,22 @@ static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>
 
 const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
 
-#[derive(Debug)]
 pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
     rate_limiter: Arc<GitHubRateLimiter>,
     semaphore: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for Github {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Github")
+            .field("params", &self.params)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("rate_limiter", &self.rate_limiter)
+            .field("semaphore", &"<Semaphore>")
+            .finish()
+    }
 }
 
 pub struct GitHubTableGraphQLParams {
@@ -120,6 +130,163 @@ pub trait GitHubTableArgs: Send + Sync {
 }
 
 impl Github {
+    /// Common error handling for validation responses
+    async fn handle_validation_response(
+        response: Result<reqwest::Response, reqwest::Error>,
+        target: &str,
+        resource_type: &str,
+        installation_id: &str,
+    ) -> Result<(), String> {
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(
+                    "GitHub App installation ID '{installation_id}' has access to '{target}'"
+                );
+                Ok(())
+            }
+            Ok(resp)
+                if resp.status().as_u16() == 401
+                    || resp.status().as_u16() == 403
+                    || resp.status().as_u16() == 410 =>
+            {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                tracing::error!(
+                    "GitHub App installation does not have access to '{target}' (HTTP {status}). Response: {body}"
+                );
+                Err(format!(
+                    "GitHub App installation ID '{installation_id}' does not have permission to access '{resource_type}' for '{target}' (HTTP {status}). Verify the GitHub App has the required permissions and is correctly installed into {target}."
+                ))
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                tracing::error!(
+                    "Target '{target}' not found or GitHub App installation does not have access (HTTP 404). Response: {body}"
+                );
+                Err(format!(
+                    "Resource '{target}' not found or GitHub App installation ID '{installation_id}' does not have access to it."
+                ))
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                tracing::error!(
+                    "GitHub App installation validation failed for '{target}' (HTTP {status}). Response: {body}"
+                );
+                Err(format!(
+                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}' (HTTP {status})."
+                ))
+            }
+            Err(e) => {
+                tracing::error!(
+                    "GitHub App installation validation request failed for '{target}': {e}"
+                );
+                Err(format!(
+                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}': {e}"
+                ))
+            }
+        }
+    }
+
+    /// Validates that the GitHub App installation has access to the specified resource type.
+    async fn validate_installation_access(
+        &self,
+        owner: &str,
+        repo: Option<&str>,
+        resource_type: &str,
+    ) -> Result<(), String> {
+        // Check if we're using a GitHub App token provider with an installation ID
+        let installation_id = self.params.get("installation_id").expose().ok();
+
+        // If no installation ID is provided, validation passes
+        let Some(installation_id) = installation_id else {
+            tracing::debug!("No GitHub App installation ID provided, skipping validation");
+            return Ok(());
+        };
+
+        let target = if let Some(repo) = repo {
+            format!("{owner}/{repo}/{resource_type}")
+        } else {
+            format!("{owner}/{resource_type}")
+        };
+
+        tracing::debug!(
+            "Validating GitHub App installation ID '{installation_id}' has access to '{target}'"
+        );
+
+        // If there's an installation ID, we need to validate it by checking if we can get a token
+        // The token provider should already be initialized at this point
+        if let Some(token_provider) = &self.token {
+            // Try to get a token - this will fail if the installation ID is invalid
+            let token = token_provider.get_token();
+            if token.is_empty() {
+                return Err(format!(
+                    "Failed to authenticate with GitHub App installation ID '{installation_id}'. The installation ID may be invalid or the app may not be installed."
+                ));
+            }
+
+            // Validate that the installation has access to the target repository or organization
+            let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
+                return Ok(()); // If no endpoint, skip this validation
+            };
+
+            let client = reqwest::Client::new();
+
+            // Check if the installation has access to this specific resource type
+            let validation_url = if let Some(repo) = repo {
+                // For repository resources, try to access a specific resource endpoint
+                match resource_type {
+                    "issues" => format!("{endpoint}/repos/{owner}/{repo}/issues?per_page=1"),
+                    "pulls" => format!("{endpoint}/repos/{owner}/{repo}/pulls?per_page=1"),
+                    "commits" => format!("{endpoint}/repos/{owner}/{repo}/commits?per_page=1"),
+                    "stargazers" => {
+                        format!("{endpoint}/repos/{owner}/{repo}/stargazers?per_page=1")
+                    }
+                    "files" => format!("{endpoint}/repos/{owner}/{repo}/git/trees/HEAD"),
+                    // Projects validation is handled during query execution via error_checker
+                    // since classic projects API is deprecated and returns HTTP 410
+                    "projects" => return Ok(()),
+                    _ => format!("{endpoint}/repos/{owner}/{repo}"),
+                }
+            } else {
+                // For organization resources
+                match resource_type {
+                    "members" => format!("{endpoint}/orgs/{owner}/members?per_page=1"),
+                    // Projects validation is handled during query execution via error_checker
+                    // since classic projects API is deprecated and returns HTTP 410
+                    "projects" => return Ok(()),
+                    _ => format!("{endpoint}/orgs/{owner}"),
+                }
+            };
+
+            let response = client
+                .get(&validation_url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "spice")
+                .send()
+                .await;
+
+            Self::handle_validation_response(response, &target, resource_type, installation_id)
+                .await
+        } else {
+            // No token provider but installation_id was provided - this is a configuration error
+            Err(format!(
+                "GitHub App installation ID '{installation_id}' provided but no token could be generated. Verify 'client_id' and 'private_key' are configured."
+            ))
+        }
+    }
+
     pub(crate) fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
@@ -313,6 +480,8 @@ fn github_gql_raw_schema_cast(
 
     for (idx, field) in record_batch.schema().fields().iter().enumerate() {
         let column = record_batch.column(idx);
+
+        // Handle lists with single-field structs
         if let DataType::List(inner_field) = field.data_type()
             && let DataType::Struct(struct_fields) = inner_field.data_type()
             && struct_fields.len() == 1
@@ -322,6 +491,41 @@ fn github_gql_raw_schema_cast(
             fields.push(new_field);
             columns.push(new_column);
             continue;
+        }
+
+        // Handle top-level structs with a single field (e.g., creator: { creator: "value" })
+        // Extract the inner field value and flatten it if the inner and outer fields are the same
+        if let DataType::Struct(struct_fields) = field.data_type()
+            && struct_fields.len() == 1
+        {
+            let inner_field = &struct_fields[0];
+
+            // Only flatten if the inner field name matches the outer field name
+            if inner_field.name() == field.name() {
+                let struct_array = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::StructArray>()
+                    .ok_or_else(|| {
+                        format!(
+                            "Expected StructArray for field {}, but got different type",
+                            field.name()
+                        )
+                    })?;
+
+                // Get the single inner column
+                let inner_column = struct_array.column(0);
+
+                // Create a new field with the outer name but inner type
+                let new_field = Arc::new(Field::new(
+                    field.name(),
+                    inner_field.data_type().clone(),
+                    field.is_nullable(),
+                ));
+
+                fields.push(new_field);
+                columns.push(Arc::clone(inner_column));
+                continue;
+            }
         }
 
         fields.push(Arc::clone(field));
@@ -515,6 +719,70 @@ fn warn_if_provided(
 
 const MAX_COMMENTS_FETCHED: u32 = 100;
 
+// Organization-level resources (2 segments: owner/resource_type)
+const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
+
+// Repository-level resources (3+ segments: owner/repo/resource_type[/...])
+const REPO_LEVEL_RESOURCES: &[&str] = &[
+    "pulls",
+    "issues",
+    "commits",
+    "stargazers",
+    "projects",
+    "files",
+];
+
+/// Parsed GitHub path components
+#[derive(Debug)]
+struct GitHubPathComponents<'a> {
+    owner: &'a str,
+    repo: Option<&'a str>,
+    resource_type: &'a str,
+    remaining: Option<String>,
+}
+
+/// Parse owner, repo, and resource type from the GitHub path
+fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
+    // Strip prefix and split into segments
+    let path_without_prefix = path.strip_prefix("github.com/")?;
+    let segments: Vec<&str> = path_without_prefix.split('/').collect();
+
+    match segments.as_slice() {
+        // Organization-level: github.com/owner/resource_type
+        [owner, resource_type] if ORG_LEVEL_RESOURCES.contains(resource_type) => {
+            Some(GitHubPathComponents {
+                owner,
+                repo: None,
+                resource_type,
+                remaining: None,
+            })
+        }
+        // Repository-level: github.com/owner/repo/resource_type or github.com/owner/repo/resource_type/...
+        [owner, repo, resource_type, remaining @ ..]
+            if REPO_LEVEL_RESOURCES.contains(resource_type) =>
+        {
+            // Filter out empty segments (from trailing slashes) before joining
+            let remaining_filtered: Vec<&str> = remaining
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect();
+
+            Some(GitHubPathComponents {
+                owner,
+                repo: Some(repo),
+                resource_type,
+                remaining: if remaining_filtered.is_empty() {
+                    None
+                } else {
+                    Some(remaining_filtered.join("/"))
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
@@ -527,7 +795,17 @@ impl DataConnector for Github {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path().to_string();
-        let mut parts = path.split('/');
+
+        // Parse owner, repo, and resource type from the path for validation
+        if let Some(parsed) = parse_github_path(&path) {
+            self.validate_installation_access(parsed.owner, parsed.repo, parsed.resource_type)
+                .await
+                .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "github".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
+                })?;
+        }
 
         let query_mode = dataset
             .params
@@ -580,8 +858,17 @@ impl DataConnector for Github {
 
         let component = ConnectorComponent::from(dataset);
 
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
+        // Parse the path and handle based on the resource type
+        let Some(parsed) = parse_github_path(&path) else {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                connector_component: component,
+                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration".into(),
+            });
+        };
+
+        match (parsed.resource_type, parsed.repo) {
+            ("pulls", Some(repo)) => {
                 let max_comments_fetched = match max_comments_fetched.unwrap_or(MAX_COMMENTS_FETCHED) {
                     value if value > MAX_COMMENTS_FETCHED => {
                         tracing::warn!(
@@ -593,7 +880,7 @@ impl DataConnector for Github {
                 };
 
                 let table_args = Arc::new(PullRequestTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
                     component,
@@ -603,30 +890,30 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
+            ("commits", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "commits", &component);
 
                 let table_args = Arc::new(CommitsTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
+            ("issues", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "issues", &component);
 
                 let table_args = Arc::new(IssuesTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
                     component,
@@ -634,83 +921,78 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("stargazers")) => {
+            ("stargazers", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "stargazers", &component);
 
                 let table_args = Arc::new(StargazersTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     component,
                 });
-                self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(owner, repo)).await
+                self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
+            ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
-                self.create_files_table_provider(owner, repo, parts.next(), dataset)
-                    .await
+                self.create_files_table_provider(
+                    parsed.owner,
+                    repo,
+                    parsed.remaining.as_deref(),
+                    dataset,
+                )
+                .await
             }
-            (Some("github.com"), Some(owner), Some(repo), Some("projects")) => {
+            ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);
                 let table_args = Arc::new(ProjectsTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: Some(repo.to_string()),
                     component,
                 });
                 self.create_gql_table_provider(
-                    table_args,
-                    None,
-                    Github::get_health_check_for_owner_and_repo(owner, repo)
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
                 )
                 .await
             }
-            (Some("github.com"), Some(owner), Some("projects"), None) => {
+            ("projects", None) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);
                 let table_args = Arc::new(ProjectsTableArgs {
-                    owner: owner.to_string(),
+                    owner: parsed.owner.to_string(),
                     repo: None,
                     component,
                 });
                 self.create_gql_table_provider(
-                    table_args,
-                    None,
-                    Github::get_health_check_for_org(owner)
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_org(parsed.owner)
                 )
                 .await
             }
-            (Some("github.com"), Some(org), Some("members"), None) => {
+            ("members", None) => {
                 warn_if_provided(pull_request_specific_params, "members", &component);
                 let table_args = Arc::new(MembersTableArgs {
-                    org: org.to_string(),
+                    org: parsed.owner.to_string(),
                     component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     None,
-                    Github::get_health_check_for_org(org)
+                    Github::get_health_check_for_org(parsed.owner)
                 )
                 .await
             }
-            (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
+            (resource_type, _) => {
                 Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
-                    source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
+                    source: format!("Invalid GitHub table type: {resource_type}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
                     connector_component: component,
                 })
             }
-            (_, Some(owner), Some(repo), _) => Err(DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                connector_component: component,
-                source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
-            }),
-            _ => Err(DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                connector_component: component,
-                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration".into(),
-            }),
         }
     }
 }

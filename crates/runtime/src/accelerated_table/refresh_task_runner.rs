@@ -32,9 +32,9 @@ use tokio::{
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use datafusion::{datasource::TableProvider, sql::TableReference};
-
 use super::refresh::Refresh;
+use datafusion::{datasource::TableProvider, sql::TableReference};
+use spicepod::metric::Metrics;
 
 pub struct RefreshTaskRunnerBuilder {
     runtime_status: Arc<status::RuntimeStatus>,
@@ -45,6 +45,7 @@ pub struct RefreshTaskRunnerBuilder {
     accelerator: Arc<dyn TableProvider>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
+    metrics: Option<Metrics>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -66,6 +67,7 @@ impl RefreshTaskRunnerBuilder {
             accelerator,
             disable_federation: false,
             semaphore: None,
+            metrics: None,
         }
     }
 
@@ -83,6 +85,12 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -90,6 +98,7 @@ impl RefreshTaskRunnerBuilder {
             self.federated,
             self.federated_source,
             self.accelerator,
+            self.metrics,
         )
         .with_disable_federation(self.disable_federation);
 

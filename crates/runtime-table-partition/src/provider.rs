@@ -35,7 +35,7 @@ use crate::{
     Partition,
     creator::PartitionCreator,
     expression::{PartitionedBy, validate_scalar_compatibility},
-    insert::PartitionerExec,
+    insert::{DefaultInsertStrategy, InsertStrategy, PartitionContext},
 };
 
 pub mod pruning;
@@ -56,7 +56,7 @@ pub enum Error {
     InvalidPartitionExpression,
 }
 
-type ScalarValueString = String;
+pub(crate) type ScalarValueString = String;
 
 #[derive(Debug)]
 pub struct PartitionTableProvider {
@@ -64,6 +64,7 @@ pub struct PartitionTableProvider {
     partition_by: PartitionedBy,
     partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
     schema: SchemaRef,
+    insert_strategy: Arc<dyn InsertStrategy>,
 }
 
 impl PartitionTableProvider {
@@ -109,7 +110,15 @@ impl PartitionTableProvider {
             partition_by,
             partitions,
             schema,
+            insert_strategy: Arc::new(DefaultInsertStrategy),
         })
+    }
+
+    /// Sets a custom data insertion strategy for this [`PartitionTableProvider`].
+    #[must_use]
+    pub fn with_insert_strategy(mut self, insert_strategy: Arc<dyn InsertStrategy>) -> Self {
+        self.insert_strategy = insert_strategy;
+        self
     }
 }
 
@@ -187,13 +196,15 @@ impl TableProvider for PartitionTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Ok(Arc::new(PartitionerExec::new(
-            input,
-            self.partition_by.clone(),
-            Arc::clone(&self.creator),
-            Arc::clone(&self.partitions),
-            insert_op,
-            Arc::clone(&self.schema),
-        )))
+        let ctx = PartitionContext {
+            creator: Arc::clone(&self.creator),
+            partition_by: self.partition_by.clone(),
+            partitions: Arc::clone(&self.partitions),
+            schema: Arc::clone(&self.schema),
+        };
+
+        self.insert_strategy
+            .execute_insert(input, insert_op, &ctx)
+            .await
     }
 }

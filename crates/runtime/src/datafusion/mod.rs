@@ -72,6 +72,7 @@ use itertools::Itertools;
 use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
 use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -318,6 +319,7 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    metrics: Option<Metrics>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1084,6 +1086,10 @@ impl DataFusion {
             accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
+        if let Some(metrics) = &self.metrics {
+            accelerated_table_builder.metrics(metrics.clone());
+        }
+
         if refresh_mode == RefreshMode::Changes {
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
@@ -1799,6 +1805,10 @@ pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
+pub(crate) fn resolved_equality(a: TableReference, b: TableReference) -> bool {
+    resolve_table_reference(a) == resolve_table_reference(b)
 }
 
 #[must_use]
