@@ -1,60 +1,19 @@
 name: E2E Test CI (models)
 
 on:
-  pull_request_target:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
-      - 'bin/spice/**'
-  push:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
-
-  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - E2E Test CI
+    types:
+      - completed
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,130 +21,63 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
-  build:
-    name: Build ${{ matrix.target.name }} binaries
-    timeout-minutes: 90
-    runs-on: ${{ matrix.target.builder }}
-    env:
-      GOVER: 1.25.3
-      GOOS: ${{ matrix.target.target_os }}
-      GOARCH: ${{ matrix.target.target_arch_go }}
-    strategy:
-      matrix:
-        target:
-          - name: 'Linux x64'
-            builder: 'spiceai-dev-runners'
-            target_os: 'linux'
-            target_arch: 'x86_64'
-          - name: 'macOS aarch64 (Apple Silicon)'
-            builder: 'spiceai-macos'
-            target_os: 'darwin'
-            target_arch: 'aarch64'
+  setup-matrix:
+    name: Setup strategy matrix
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      matrix: ${{ steps.setup.outputs.result }}
     steps:
-      - uses: actions/checkout@v5
+      - name: Set up matrix
+        id: setup
+        uses: actions/github-script@v8
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          script: |
+            const targets = [
+              {
+                name: "Linux x64",
+                runner: "spiceai-dev-runners",
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              },
+              {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: "spiceai-macos",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64"
+              }
+            ];
 
-      - name: Configure Cargo directories (self-hosted macOS)
-        if: matrix.target.builder == 'spiceai-macos'
-        run: |
-          set -euo pipefail
-          cargo_home="${{ runner.temp }}/cargo-${{ github.run_id }}-${{ github.job }}"
-          mkdir -p "$cargo_home/bin"
-          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/trunk' }}
-
-      - name: Set up make
-        if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-cc
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build spiced
-        if: matrix.target.target_os != 'darwin'
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
-
-      - name: Build spiced (macOS)
-        if: matrix.target.target_os == 'darwin'
-        env:
-          # Metal runners do not have `xcrun metal`
-          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
-          MISTRALRS_METAL_PRECOMPILE: 0
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
-
-      - name: Build spice
-        run: make -C bin/spice
-
-      - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows'
-        with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: |
-            spice
-            spiced
+            const parentEvent = context.payload.workflow_run.event;
+            if (parentEvent === "pull_request") {
+              return [targets[0]];
+            }
+            return targets;
 
   test_openai_model:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 5
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - setup-matrix
+    if: ${{ github.event.workflow_run.conclusion == 'success' && needs.setup-matrix.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - name: 'Linux x64'
-            runner: 'spiceai-dev-runners'
-            target_os: 'linux'
-            target_arch: 'x86_64'
-          - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'macos-14'
-            target_os: 'darwin'
-            target_arch: 'aarch64'
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: dawidd6/action-download-artifact@ac66b43f0e6a346234dd65d4d0c8fbb31cb316e5 # v11
         with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: ${{ github.event.workflow_run.id }}
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
@@ -241,7 +133,8 @@ jobs:
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
-      - build
+      - setup-matrix
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -252,10 +145,15 @@ jobs:
             target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: dawidd6/action-download-artifact@ac66b43f0e6a346234dd65d4d0c8fbb31cb316e5 # v11
         with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: ${{ github.event.workflow_run.id }}
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
