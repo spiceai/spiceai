@@ -6,9 +6,15 @@ on:
       - E2E Test CI
     types:
       - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID of the E2E Test CI workflow run to reuse artifacts from'
+        required: true
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.run_id || github.event.workflow_run.id }}
   cancel-in-progress: true
 
 permissions:
@@ -21,16 +27,69 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  resolve-run:
+    name: Resolve parent workflow run
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      event: ${{ steps.resolve.outputs.event }}
+      conclusion: ${{ steps.resolve.outputs.conclusion }}
+      is_pr: ${{ steps.resolve.outputs.is_pr }}
+    steps:
+      - name: Resolve run metadata
+        id: resolve
+        uses: actions/github-script@v8
+        with:
+          script: |
+            let run;
+            if (context.eventName === 'workflow_dispatch') {
+              const inputRunId = core.getInput('run_id', { required: true });
+              const runId = Number(inputRunId);
+              if (!Number.isFinite(runId)) {
+                core.setFailed(`Invalid run_id: ${inputRunId}`);
+                return;
+              }
+              const runResponse = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId,
+              });
+              run = runResponse.data;
+            } else {
+              run = context.payload.workflow_run;
+            }
+
+            if (!run) {
+              core.setFailed('Unable to resolve parent workflow run.');
+              return;
+            }
+
+            if (run.status !== 'completed') {
+              core.setFailed(`Parent workflow run ${run.id} is not completed (status: ${run.status}).`);
+              return;
+            }
+
+            core.setOutput('run_id', String(run.id));
+            core.setOutput('head_sha', run.head_sha);
+            core.setOutput('event', run.event);
+            core.setOutput('conclusion', run.conclusion ?? '');
+            core.setOutput('is_pr', run.event === 'pull_request' ? 'true' : 'false');
+
   setup-matrix:
     name: Setup strategy matrix
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    needs:
+      - resolve-run
+    if: ${{ needs.resolve-run.outputs.conclusion == 'success' }}
     outputs:
       matrix: ${{ steps.setup.outputs.result }}
     steps:
       - name: Set up matrix
         id: setup
         uses: actions/github-script@v8
+        env:
+          IS_PR: ${{ needs.resolve-run.outputs.is_pr }}
         with:
           script: |
             const targets = [
@@ -50,8 +109,8 @@ jobs:
               }
             ];
 
-            const parentEvent = context.payload.workflow_run.event;
-            if (parentEvent === "pull_request") {
+            const isPr = process.env.IS_PR === 'true';
+            if (isPr) {
               return [targets[0]];
             }
             return targets;
@@ -61,8 +120,9 @@ jobs:
     timeout-minutes: 5
     runs-on: ${{ matrix.target.runner }}
     needs:
+      - resolve-run
       - setup-matrix
-    if: ${{ github.event.workflow_run.conclusion == 'success' && needs.setup-matrix.outputs.matrix != '[]' }}
+    if: ${{ needs.resolve-run.outputs.conclusion == 'success' && needs.setup-matrix.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,14 +130,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.resolve-run.outputs.head_sha }}
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: dawidd6/action-download-artifact@ac66b43f0e6a346234dd65d4d0c8fbb31cb316e5 # v11
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          run_id: ${{ github.event.workflow_run.id }}
+          run_id: ${{ needs.resolve-run.outputs.run_id }}
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
@@ -133,8 +193,9 @@ jobs:
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
+      - resolve-run
       - setup-matrix
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ needs.resolve-run.outputs.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -146,14 +207,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.resolve-run.outputs.head_sha }}
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: dawidd6/action-download-artifact@ac66b43f0e6a346234dd65d4d0c8fbb31cb316e5 # v11
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          run_id: ${{ github.event.workflow_run.id }}
+          run_id: ${{ needs.resolve-run.outputs.run_id }}
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
