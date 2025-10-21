@@ -12668,6 +12668,7 @@ name = "runtime-request-context"
 version = "1.9.0-unstable"
 dependencies = [
  "app",
+ "async-stream",
  "async-trait",
  "axum 0.8.4",
  "base64 0.22.1",

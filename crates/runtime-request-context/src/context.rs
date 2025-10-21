@@ -18,6 +18,7 @@ limitations under the License.
 use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 use crate::TraceParent;
 use app::App;
+use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use opentelemetry::KeyValue;
 use regex::Regex;
@@ -149,6 +150,18 @@ impl RequestContext {
         F: Future,
     {
         REQUEST_CONTEXT.scope(self, f).await
+    }
+
+    /// Wraps provided stream with the current request context.
+    pub fn scope_stream<S>(self: Arc<Self>, stream: S) -> impl Stream<Item = S::Item>
+    where
+        S: Stream,
+    {
+        let pinned = Box::pin(stream);
+        futures::stream::unfold((pinned, self), |(mut stream, ctx)| {
+            let ctx_clone = Arc::clone(&ctx);
+            ctx_clone.scope(async move { stream.next().await.map(|item| (item, (stream, ctx))) })
+        })
     }
 
     /// Retries the provided future from the closure `r` times until it fails or succeeds.
