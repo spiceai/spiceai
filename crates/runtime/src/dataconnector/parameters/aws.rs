@@ -191,7 +191,7 @@ impl Validator for AuthValidator {
     }
 }
 
-/// Initiate [`SdkConfig`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
+/// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
 pub fn initiate_config_with_credentials(
