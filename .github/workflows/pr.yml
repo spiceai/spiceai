@@ -141,6 +141,24 @@ jobs:
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
+      
+      - name: Install MinIO
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Pull target cache from minio
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: |
+          # Check for this branch's cache, or pull from trunk
+          if mc ls spice-minio/spiceai-cache/${{ github.ref_name }}/; then
+            mc cp --recursive spice-minio/spiceai-cache/${{ github.ref_name }}/target ./target
+          else
+            mc cp --recursive spice-minio/spiceai-cache/trunk/target ./target || echo "No trunk cache found"
+          fi
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -199,3 +217,8 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
+      
+      - name: Upload target cache to minio
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: |
+          mc cp --recursive --force ./target/ spice-minio/spiceai-cache/${{ github.ref_name }}/target/
