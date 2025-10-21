@@ -103,7 +103,7 @@ impl FullTextDatabaseIndex {
         primary_key_override: Option<Vec<String>>,
         directory: Option<PathBuf>,
     ) -> Result<Self, super::Error> {
-        let pks = Self::validate_primary_key(&inner, primary_key_override).await?;
+        let pks = Self::validate_primary_key(&inner, primary_key_override)?;
         let tantivy_schema =
             Self::create_tantivy_schema(&inner, search_fields.as_slice(), pks.as_slice())?;
 

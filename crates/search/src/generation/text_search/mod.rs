@@ -29,6 +29,7 @@ use datafusion::{
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
 };
 
+use datafusion_expr::sqlparser::ast::Ident;
 use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
