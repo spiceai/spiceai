@@ -15,13 +15,11 @@ limitations under the License.
 */
 use cache::key::SearchKey;
 use datafusion::common::Column;
-use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
-use itertools::Itertools;
 use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
@@ -254,17 +252,6 @@ impl SearchRequest {
                     }
                 };
 
-                // Reconstruct the full identifier string for validation
-                let proj_value = idents.iter().map(|i| i.value.clone()).join(".");
-
-                // Check equality whilst ignoring quotation.
-                if proj_value != c.trim_matches('"') {
-                    tracing::trace!("parsing 'additional_columns' for search failed. Expected {c}, but got {proj_value}");
-                    return Err(Error::InvalidAdditionalColumns {
-                        additional_column: c.clone(),
-                    });
-                }
-
                 let Some(TableWithJoins { relation, .. }) = expr.from.first() else {
                     tracing::trace!("parsing 'additional_columns' for search failed. Expected a table, but got {expr:?}");
                     return Err(super::Error::InvalidAdditionalColumns{
@@ -294,7 +281,20 @@ impl SearchRequest {
                     });
                 }
 
-                Ok(Column::from_qualified_name(c))
+                let col = Column::from_qualified_name(c);
+
+                // Check equality whilst ignoring quotation.
+                let mut parts = col.relation.as_ref().map(|rel| rel.to_vec()).unwrap_or_default();
+                parts.push(col.name.clone());
+                let from_ident: Vec<_> = idents.iter().map(|i| i.value.clone()).collect();
+                if parts != from_ident {
+                    tracing::trace!("parsing 'additional_columns' for search failed. Expected final column {parts:?} to be like parsed AST {from_ident:?}");
+                    return Err(Error::InvalidAdditionalColumns {
+                        additional_column: c.clone(),
+                    });
+                }
+
+                Ok(col)
             })
             .collect::<Result<Vec<Column>>>()
     }
@@ -305,127 +305,130 @@ pub(crate) mod tests {
     use super::*;
     use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr};
 
-    #[test]
-    fn test_parse_additional_columns_basic() {
-        let resp = SearchRequest::parse_additional_columns(&["column".to_string()])
+    fn run_parse_additional_columns(input: Vec<&str>) -> String {
+        let input: Vec<_> = input.iter().map(|s| s.to_string()).collect();
+        let resp = SearchRequest::parse_additional_columns(&input)
             .expect("failed to parse additional columns");
-
-        insta::assert_json_snapshot!(resp, r#""#);
+        format!("{resp:?}")
     }
 
     #[test]
-    fn test_parse_additional_columns_quoted() {
-        let resp = SearchRequest::parse_additional_columns(&["\"quoted_column\"".to_string()])
-            .expect("failed to parse additional columns");
-
-        assert_eq!(resp.len(), 1);
-        assert_eq!(resp[0].len(), 1);
-        assert_eq!(resp[0][0].to_string(), "\"quoted_column\"");
+    fn test_parse_additional_columns_good() {
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["column"]).as_str(),
+            @r#"[Column { relation: None, name: "column" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["\"quoted_column\""]).as_str(),
+            @r#"[Column { relation: None, name: "quoted_column" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["tbl.column"]).as_str(),
+            @r#"[Column { relation: Some(Bare { table: "tbl" }), name: "column" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["schema.tbl.column"]).as_str(),
+            @r#"[Column { relation: Some(Partial { schema: "schema", table: "tbl" }), name: "column" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["catalog.schema.tbl.column"]).as_str(),
+            @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "column" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["catalog.schema.tbl.\"quoted_column\""]).as_str(),
+            @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "quoted_column" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["catalog.schema.tbl.\"quoted.with_dot\""]).as_str(),
+            @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "quoted.with_dot" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["schema.tbl.\"quoted.with_dot\""]).as_str(),
+            @r#"[Column { relation: Some(Partial { schema: "schema", table: "tbl" }), name: "quoted.with_dot" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["tbl.\"quoted.with_dot\""]).as_str(),
+            @r#"[Column { relation: Some(Bare { table: "tbl" }), name: "quoted.with_dot" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["\"quoted.with_dot\""]).as_str(),
+            @r#"[Column { relation: None, name: "quoted.with_dot" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["table.\"column with spaces\""]).as_str(),
+            @r#"[Column { relation: Some(Bare { table: "table" }), name: "column with spaces" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(vec!["schema.\"table with spaces\".column"]).as_str(),
+            @r#"[Column { relation: Some(Partial { schema: "schema", table: "table with spaces" }), name: "column" }]"#
+        );
     }
 
     #[test]
-    fn test_parse_additional_columns_qualified() {
-        let resp = SearchRequest::parse_additional_columns(&["qualified.column".to_string()])
-            .expect("failed to parse additional columns");
-
-        assert_eq!(resp.len(), 1);
-        assert_eq!(resp[0].len(), 2);
-        assert_eq!(resp[0][0].to_string(), "\"qualified\"");
-        assert_eq!(resp[0][1].to_string(), "\"column\"");
-
-        // Test the full path representation
-        let full_path = resp[0]
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(".");
-        assert_eq!(full_path, "\"qualified\".\"column\"");
-    }
-
-    #[test]
-    fn test_parse_additional_columns_quoted_qualified() {
-        let resp = SearchRequest::parse_additional_columns(&[
-            "\"qualified\".\"quoted_column\"".to_string()
-        ])
-        .expect("failed to parse additional columns");
-
-        assert_eq!(resp.len(), 1);
-        assert_eq!(resp[0].len(), 2);
-        assert_eq!(resp[0][0].to_string(), "\"qualified\"");
-        assert_eq!(resp[0][1].to_string(), "\"quoted_column\"");
-
-        // Test the full path representation
-        let full_path = resp[0]
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(".");
-        assert_eq!(full_path, "\"qualified\".\"quoted_column\"");
-    }
-
-    #[test]
-    fn test_parse_additional_columns_multiple() {
-        let resp = SearchRequest::parse_additional_columns(&[
-            "column1".to_string(),
-            "table.column2".to_string(),
-            "\"quoted_column3\"".to_string(),
-        ])
-        .expect("failed to parse additional columns");
-
-        assert_eq!(resp.len(), 3);
-
-        // First column
-        assert_eq!(resp[0].len(), 1);
-        assert_eq!(resp[0][0].to_string(), "\"column1\"");
-
-        // Second column (qualified)
-        assert_eq!(resp[1].len(), 2);
-        assert_eq!(resp[1][0].to_string(), "\"table\"");
-        assert_eq!(resp[1][1].to_string(), "\"column2\"");
-
-        // Third column (quoted)
-        assert_eq!(resp[2].len(), 1);
-        assert_eq!(resp[2][0].to_string(), "\"quoted_column3\"");
-    }
-
-    #[test]
-    fn test_parse_additional_columns_three_part_identifier() {
-        let resp = SearchRequest::parse_additional_columns(&["schema.table.column".to_string()])
-            .expect("failed to parse additional columns");
-
-        assert_eq!(resp.len(), 1);
-        assert_eq!(resp[0].len(), 3);
-        assert_eq!(resp[0][0].to_string(), "\"schema\"");
-        assert_eq!(resp[0][1].to_string(), "\"table\"");
-        assert_eq!(resp[0][2].to_string(), "\"column\"");
-
-        // Test the full path representation
-        let full_path = resp[0]
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(".");
-        assert_eq!(full_path, "\"schema\".\"table\".\"column\"");
-    }
-
-    #[test]
-    fn test_parse_additional_columns_mixed_quoting() {
-        let resp =
-            SearchRequest::parse_additional_columns(&["table.\"column with spaces\"".to_string()])
-                .expect("failed to parse additional columns");
-
-        assert_eq!(resp.len(), 1);
-        assert_eq!(resp[0].len(), 2);
-        assert_eq!(resp[0][0].to_string(), "\"table\"");
-        assert_eq!(resp[0][1].to_string(), "\"column with spaces\"");
-    }
-
-    #[test]
-    fn test_parse_additional_columns_invalid_expressions() {
-        for bad in [vec!["COUNT(*)".to_string()], vec!["col1, col2".to_string()]] {
-            assert!(SearchRequest::parse_additional_columns(bad).is_err());
+    fn test_parse_additional_columns_bad() {
+        for bad in [
+            vec!["COUNT(*)".to_string()],
+            vec!["col1, col2".to_string()],
+            // SQL injection attempts
+            vec!["column; DROP TABLE users".to_string()],
+            vec!["column' OR '1'='1".to_string()],
+            vec!["column--".to_string()],
+            vec!["column); DROP TABLE users; --".to_string()],
+            // Function calls and expressions
+            vec!["SUM(column)".to_string()],
+            vec!["AVG(column)".to_string()],
+            vec!["MAX(column)".to_string()],
+            vec!["column + 1".to_string()],
+            vec!["column * 2".to_string()],
+            vec!["column = 'value'".to_string()],
+            vec!["CASE WHEN column THEN 1 END".to_string()],
+            vec!["CAST(column AS INT)".to_string()],
+            vec!["column::integer".to_string()],
+            // Subqueries
+            vec!["(SELECT * FROM table)".to_string()],
+            vec!["column IN (SELECT id FROM table)".to_string()],
+            // Multiple columns/comma-separated
+            vec!["col1, col2, col3".to_string()],
+            vec!["table.col1, table.col2".to_string()],
+            // Wildcards
+            vec!["*".to_string()],
+            vec!["table.*".to_string()],
+            vec!["schema.table.*".to_string()],
+            // Invalid quoting
+            vec!["'column'".to_string()],
+            vec!["\"unclosed".to_string()],
+            vec!["unclosed\"".to_string()],
+            vec!["column\"".to_string()],
+            vec!["\"column".to_string()],
+            // Special characters and operators
+            vec!["column > 10".to_string()],
+            vec!["column AND other".to_string()],
+            vec!["column OR other".to_string()],
+            vec!["NOT column".to_string()],
+            vec!["column IS NULL".to_string()],
+            vec!["column LIKE '%test%'".to_string()],
+            vec!["column BETWEEN 1 AND 10".to_string()],
+            // Empty or whitespace
+            vec!["".to_string()],
+            vec![" ".to_string()],
+            vec!["  \t\n  ".to_string()],
+            // Too many parts
+            vec!["a.b.c.d.e".to_string()],
+            vec!["catalog.schema.table.column.extra".to_string()],
+            // Parentheses without functions
+            vec!["(column)".to_string()],
+            vec!["table.(column)".to_string()],
+            // Special SQL keywords as unquoted names (context-dependent, but suspicious)
+            vec!["SELECT".to_string()],
+            vec!["FROM".to_string()],
+            vec!["WHERE".to_string()],
+            vec!["table.SELECT".to_string()],
+        ] {
+            assert!(
+                SearchRequest::parse_additional_columns(&bad).is_err(),
+                "'additional_columns'={bad:?} is not allowed"
+            );
         }
-        assert!(SearchRequest::parse_additional_columns(&["COUNT(*)".to_string()]).is_err());
     }
 
     #[test]
