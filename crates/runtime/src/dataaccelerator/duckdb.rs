@@ -267,6 +267,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
     ParameterSpec::runtime("partition_mode"),
+    ParameterSpec::component("partitioned_write_flush_threshold"),
 ];
 
 #[async_trait]
