@@ -1,6 +1,6 @@
 use crate::concrete;
 use crate::datafusion::cluster::common::plan_node_key::PlanNodeKey;
-use crate::datafusion::cluster::physical_plan::common::search_visitor::SearchVisitor;
+use crate::datafusion::cluster::common::search_visitor::SearchVisitor;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;

@@ -269,7 +269,7 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::datafusion::cluster::physical_plan::common::search_visitor::SearchVisitor;
+    use crate::datafusion::cluster::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
