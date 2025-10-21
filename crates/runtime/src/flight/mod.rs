@@ -47,6 +47,7 @@ use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -90,7 +91,8 @@ impl FlightService for Service {
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
         let _start = track_flight_request("do_handshake", None).await;
-        handshake::handle(request.metadata(), self.basic_auth.as_ref()).await
+        let response = handshake::handle(request.metadata(), self.basic_auth.as_ref()).await?;
+        Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 
     async fn list_flights(
@@ -130,7 +132,8 @@ impl FlightService for Service {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let _start = track_flight_request("do_get", None).await;
-        Box::pin(do_get::handle(request)).await
+        let response = Box::pin(do_get::handle(request)).await?;
+        Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 
     async fn do_put(
@@ -138,7 +141,8 @@ impl FlightService for Service {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let _start = track_flight_request("do_put", None).await;
-        do_put::handle(request).await
+        let response = do_put::handle(request).await?;
+        Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 
     async fn do_exchange(
@@ -146,7 +150,8 @@ impl FlightService for Service {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
         let _start = track_flight_request("do_exchange", None).await;
-        do_exchange::handle(self, request).await
+        let response = do_exchange::handle(self, request).await?;
+        Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 
     async fn do_action(
@@ -154,7 +159,8 @@ impl FlightService for Service {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let _start = track_flight_request("do_action", None).await;
-        Box::pin(actions::do_action(request)).await
+        let response = Box::pin(actions::do_action(request)).await?;
+        Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 
     async fn list_actions(
@@ -162,7 +168,8 @@ impl FlightService for Service {
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         let _start = track_flight_request("list_actions", None).await;
-        Ok(actions::list().await)
+        let response = actions::list().await;
+        Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 }
 
@@ -218,6 +225,7 @@ impl Service {
         };
 
         let data_stream = query_result.data;
+
         let flights_stream = try_stream! {
             yield schema_flight_data;
 
@@ -244,6 +252,19 @@ impl Service {
         };
 
         Ok((flights_stream.boxed(), query_result.cache_status))
+    }
+
+    async fn wrap_response_stream_with_scope<S>(
+        response: Response<S>,
+    ) -> Response<BoxStream<'static, S::Item>>
+    where
+        S: Stream + Send + 'static,
+        S::Item: Send + 'static,
+    {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        let (metadata, stream, extensions) = response.into_parts();
+        let scoped_stream = request_context.scope_stream(stream);
+        Response::from_parts(metadata, scoped_stream.boxed(), extensions)
     }
 }
 
