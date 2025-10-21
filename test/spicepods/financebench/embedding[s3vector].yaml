@@ -33,6 +33,8 @@ datasets:
       engine: duckdb
       snapshots: bootstrap_only
       mode: file
+      on_conflict:
+        location: upsert
       primary_key: location
       refresh_mode: append
       params:
