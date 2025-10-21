@@ -81,7 +81,7 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "vortex"
+    "pepper"
 
 ]
 delta_lake = ["runtime/delta_lake"]
@@ -112,5 +112,5 @@ snapshots = ["runtime/snapshots"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
-vortex = ["runtime/vortex"]
+pepper = ["runtime/pepper"]
 xxhash = ["runtime/xxhash"]

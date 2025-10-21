@@ -18,6 +18,7 @@ members = [
     "crates/model_components",
     "crates/ns_lookup",
     "crates/otel-arrow",
+    "crates/pepper",
     "crates/runtime-object-store",
     "crates/package",
     "crates/runtime",
@@ -264,7 +265,7 @@ datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", r
 datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }                                    # spiceai/spiceai-49
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }                                    # spiceai/spiceai-49
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" }                                        # spiceai/spiceai-49
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "e751fb367eb29f299683ff5125f8da2f654e0479" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "50e8a479bcf35ec991753144864617efca0a4038" } # spiceai
 
 # main branch as of 10/01 with datafusion 49.0.2 + distributed explain support
 ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "b96a753186f25cbbc29bd51645b5471bf674f73f"}
@@ -273,7 +274,7 @@ ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "b96a753186f25cbbc29bd51645b5471bf674f73f"}
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "0e5d8bca9b6f76087b88d7554c09a6cc43e87183" } # spiceai-0.14.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a731d95e32338780a12f8ff14b5efcc79d2e8822" } # spiceai-1.3.2
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "43c12908261bd818510d7520950d2a049d9d2aed" } # spiceai-1.3.2
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af725caf5d3e952e349746706e00d0ea5" }
 
