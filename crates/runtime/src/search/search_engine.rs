@@ -320,7 +320,7 @@ impl SearchEngine {
                     let agg_result = pipe.run(
                         query.clone(),
                         &tbl,
-                        get_filter_for_table(&self.df, &tbl, where_cond).await?,
+                        get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
                         table_cols,
                         primary_keys.to_vec(),
                         keywords,
@@ -358,13 +358,13 @@ impl SearchEngine {
 async fn get_filter_for_table(
     df: &Arc<DataFusion>,
     tbl: &TableReference,
-    filter_opt: &Option<ast::Expr>,
+    filter_opt: Option<&ast::Expr>,
 ) -> Result<Option<Expr>, super::Error> {
     let Some(filter) = filter_opt else {
         return Ok(None);
     };
 
-    let table = df.get_table(&tbl).await.ok_or(Error::DataSourcesNotFound {
+    let table = df.get_table(tbl).await.ok_or(Error::DataSourcesNotFound {
         data_source: vec![tbl.clone()],
     })?;
     let schema = DFSchema::try_from_qualified_schema(tbl.clone(), &table.schema())
@@ -376,7 +376,7 @@ async fn get_filter_for_table(
         .create_logical_expr(&filter.to_string(), &schema)
     {
         Ok(f) => Ok(Some(f)),
-        Err(e) if is_field_not_found_on_unrelated_table(&tbl, &e) => {
+        Err(e) if is_field_not_found_on_unrelated_table(tbl, &e) => {
             tracing::debug!(
                 "Ignoring SQL filter ('{}') on table {tbl:?} for search request as its columns do not reference this table",
                 filter

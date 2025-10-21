@@ -15,6 +15,7 @@ limitations under the License.
 */
 use cache::key::SearchKey;
 use datafusion::common::Column;
+use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -284,7 +285,7 @@ impl SearchRequest {
                 let col = Column::from_qualified_name(c);
 
                 // Check equality whilst ignoring quotation.
-                let mut parts = col.relation.as_ref().map(|rel| rel.to_vec()).unwrap_or_default();
+                let mut parts = col.relation.as_ref().map(TableReference::to_vec).unwrap_or_default();
                 parts.push(col.name.clone());
                 let from_ident: Vec<_> = idents.iter().map(|i| i.value.clone()).collect();
                 if parts != from_ident {
@@ -305,8 +306,8 @@ pub(crate) mod tests {
     use super::*;
     use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr};
 
-    fn run_parse_additional_columns(input: Vec<&str>) -> String {
-        let input: Vec<_> = input.iter().map(|s| s.to_string()).collect();
+    fn run_parse_additional_columns(input: &[&str]) -> String {
+        let input: Vec<_> = input.iter().map(|s| (*s).to_string()).collect();
         let resp = SearchRequest::parse_additional_columns(&input)
             .expect("failed to parse additional columns");
         format!("{resp:?}")
@@ -315,51 +316,51 @@ pub(crate) mod tests {
     #[test]
     fn test_parse_additional_columns_good() {
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["column"]).as_str(),
+            run_parse_additional_columns(&["column"]).as_str(),
             @r#"[Column { relation: None, name: "column" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["\"quoted_column\""]).as_str(),
+            run_parse_additional_columns(&["\"quoted_column\""]).as_str(),
             @r#"[Column { relation: None, name: "quoted_column" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["tbl.column"]).as_str(),
+            run_parse_additional_columns(&["tbl.column"]).as_str(),
             @r#"[Column { relation: Some(Bare { table: "tbl" }), name: "column" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["schema.tbl.column"]).as_str(),
+            run_parse_additional_columns(&["schema.tbl.column"]).as_str(),
             @r#"[Column { relation: Some(Partial { schema: "schema", table: "tbl" }), name: "column" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["catalog.schema.tbl.column"]).as_str(),
+            run_parse_additional_columns(&["catalog.schema.tbl.column"]).as_str(),
             @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "column" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["catalog.schema.tbl.\"quoted_column\""]).as_str(),
+            run_parse_additional_columns(&["catalog.schema.tbl.\"quoted_column\""]).as_str(),
             @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "quoted_column" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["catalog.schema.tbl.\"quoted.with_dot\""]).as_str(),
+            run_parse_additional_columns(&["catalog.schema.tbl.\"quoted.with_dot\""]).as_str(),
             @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "quoted.with_dot" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["schema.tbl.\"quoted.with_dot\""]).as_str(),
+            run_parse_additional_columns(&["schema.tbl.\"quoted.with_dot\""]).as_str(),
             @r#"[Column { relation: Some(Partial { schema: "schema", table: "tbl" }), name: "quoted.with_dot" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["tbl.\"quoted.with_dot\""]).as_str(),
+            run_parse_additional_columns(&["tbl.\"quoted.with_dot\""]).as_str(),
             @r#"[Column { relation: Some(Bare { table: "tbl" }), name: "quoted.with_dot" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["\"quoted.with_dot\""]).as_str(),
+            run_parse_additional_columns(&["\"quoted.with_dot\""]).as_str(),
             @r#"[Column { relation: None, name: "quoted.with_dot" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["table.\"column with spaces\""]).as_str(),
+            run_parse_additional_columns(&["table.\"column with spaces\""]).as_str(),
             @r#"[Column { relation: Some(Bare { table: "table" }), name: "column with spaces" }]"#
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(vec!["schema.\"table with spaces\".column"]).as_str(),
+            run_parse_additional_columns(&["schema.\"table with spaces\".column"]).as_str(),
             @r#"[Column { relation: Some(Partial { schema: "schema", table: "table with spaces" }), name: "column" }]"#
         );
     }
@@ -409,7 +410,7 @@ pub(crate) mod tests {
             vec!["column LIKE '%test%'".to_string()],
             vec!["column BETWEEN 1 AND 10".to_string()],
             // Empty or whitespace
-            vec!["".to_string()],
+            vec![String::new()],
             vec![" ".to_string()],
             vec!["  \t\n  ".to_string()],
             // Too many parts
