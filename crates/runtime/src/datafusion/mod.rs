@@ -1807,6 +1807,10 @@ fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
+pub(crate) fn resolved_equality(a: TableReference, b: TableReference) -> bool {
+    resolve_table_reference(a) == resolve_table_reference(b)
+}
+
 #[must_use]
 pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
     catalog == SPICE_DEFAULT_CATALOG

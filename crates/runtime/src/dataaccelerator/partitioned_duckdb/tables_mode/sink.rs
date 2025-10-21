@@ -90,6 +90,7 @@ pub struct DuckDBPartitionedDataSink {
     on_conflict: Option<OnConflict>,
     schema: SchemaRef,
     partitioner: Arc<BatchPartitioner>,
+    rows_per_partition_buffer: Option<usize>,
 }
 
 #[async_trait]
@@ -152,7 +153,10 @@ impl DataSink for DuckDBPartitionedDataSink {
             });
 
         // Buffering rows allows for much more efficient writes in DuckDB
-        let mut partition_buffer = PartitionBuffer::new(batch_tx, ROWS_PER_PARTITION_BUFFER);
+        let buffer_size = self
+            .rows_per_partition_buffer
+            .unwrap_or(ROWS_PER_PARTITION_BUFFER);
+        let mut partition_buffer = PartitionBuffer::new(batch_tx, buffer_size);
 
         let partitioner = Arc::clone(&self.partitioner);
 
@@ -285,7 +289,21 @@ impl DuckDBPartitionedDataSink {
             on_conflict,
             schema,
             partitioner,
+            rows_per_partition_buffer: None,
         }
+    }
+
+    /// Sets a custom buffer size for partition writes.
+    ///
+    /// This overrides the default `ROWS_PER_PARTITION_BUFFER` value to allow for tuning
+    /// write performance based on specific use cases or memory constraints.
+    ///
+    /// # Arguments
+    /// * `rows_per_partition_buffer` - Number of rows to buffer per partition before writing to `DuckDB`
+    #[must_use]
+    pub fn with_rows_per_partition_buffer(mut self, rows_per_partition_buffer: usize) -> Self {
+        self.rows_per_partition_buffer = Some(rows_per_partition_buffer);
+        self
     }
 }
 

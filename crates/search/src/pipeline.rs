@@ -18,11 +18,14 @@ use datafusion::{
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::SendableRecordBatchStream,
-    sql::sqlparser::{
-        ast::{Expr as SqlExpr, Value, ValueWithSpan},
-        dialect::GenericDialect,
-        parser::Parser,
-        tokenizer::Token,
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Expr as SqlExpr, Value, ValueWithSpan},
+            dialect::GenericDialect,
+            parser::Parser,
+            tokenizer::Token,
+        },
     },
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, ident, lit};
@@ -91,10 +94,12 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
     }
 
     /// Runs the search pipeline with the provided parameters.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         query: String,
-        opt_filters: Vec<Expr>,
+        tbl: &TableReference,
+        opt_filter: Option<Expr>,
         addition_projection: Vec<Expr>,
         primary_keys: Vec<String>,
         keywords: Vec<String>,
@@ -116,11 +121,10 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
 
                 // The column name for each `.generator` will be different, and therefore the
                 // keyword filter [`Expr`] must be made differently.
-                let filters = [
-                    prepare_keywords(&keywords.clone(), &content_col)?,
-                    opt_filters.clone(),
-                ]
-                .concat();
+                let mut filters = prepare_keywords(&keywords.clone(), &content_col)?;
+                if let Some(ref f) = opt_filter {
+                    filters.push(f.clone());
+                }
 
                 let mut columns = columns.clone();
                 columns.push(ident(g.value_projection_name()).alias(SEARCH_VALUE_COLUMN_NAME));
@@ -128,6 +132,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                 let lp = construct_logical_plan(
                     g.search(query.clone())
                         .context(SearchRequestConstructionSnafu)?,
+                    tbl,
                     columns,
                     filters,
                     Some(limit),
@@ -163,12 +168,13 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
 
 fn construct_logical_plan(
     tbl: Arc<dyn TableProvider>,
+    name: &TableReference,
     columns: Vec<Expr>,
     filters: Vec<Expr>,
     limit: Option<usize>,
 ) -> Result<LogicalPlan, DataFusionError> {
     let mut scan =
-        LogicalPlanBuilder::scan("base_table", Arc::new(DefaultTableSource::new(tbl)), None)?;
+        LogicalPlanBuilder::scan(name.clone(), Arc::new(DefaultTableSource::new(tbl)), None)?;
 
     if let Some(filter) = filters.into_iter().reduce(Expr::and) {
         scan = scan.filter(filter)?;

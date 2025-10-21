@@ -42,7 +42,9 @@ use runtime_table_partition::{
     insert::{InsertStrategy, PartitionContext, partition_batch},
 };
 
-use crate::dataaccelerator::partitioned_duckdb::tables_mode::sink::DuckDBPartitionedDataSink;
+use crate::dataaccelerator::{
+    AccelerationSource, partitioned_duckdb::tables_mode::sink::DuckDBPartitionedDataSink,
+};
 
 /// Strategy for handling `DuckDB` table-based partition insertions.
 #[derive(Debug)]
@@ -50,6 +52,7 @@ pub struct DuckDBPartitionedInsertStrategy {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
+    rows_per_partition_buffer: Option<usize>,
 }
 
 impl DuckDBPartitionedInsertStrategy {
@@ -58,11 +61,15 @@ impl DuckDBPartitionedInsertStrategy {
         pool: Arc<DuckDbConnectionPool>,
         table_definition: Arc<TableDefinition>,
         on_conflict: Option<OnConflict>,
+        source: &dyn AccelerationSource,
     ) -> Self {
+        let rows_per_partition_buffer = get_rows_per_partition_buffer(source);
+
         Self {
             pool,
             table_definition,
             on_conflict,
+            rows_per_partition_buffer,
         }
     }
 
@@ -127,6 +134,21 @@ impl DuckDBPartitionedInsertStrategy {
     }
 }
 
+fn get_rows_per_partition_buffer(source: &dyn AccelerationSource) -> Option<usize> {
+    source
+        .acceleration()?
+        .params
+        .get("duckdb_partitioned_write_flush_threshold")
+        .and_then(|v| {
+            v.parse::<usize>().ok().or_else(|| {
+                tracing::warn!(
+                    "Invalid `duckdb_partitioned_write_flush_threshold` parameter '{v}': must be a positive integer"
+                );
+                None
+            })
+        })
+}
+
 #[async_trait]
 impl InsertStrategy for DuckDBPartitionedInsertStrategy {
     async fn execute_insert(
@@ -143,18 +165,21 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             &ctx.partition_by,
         )?);
 
-        let data_sink_exec = Arc::new(DataSinkExec::new(
-            input,
-            Arc::new(DuckDBPartitionedDataSink::new(
-                Arc::clone(&self.pool),
-                Arc::clone(&self.table_definition),
-                insert_op,
-                self.on_conflict.clone(),
-                schema,
-                partitioner,
-            )),
-            None,
-        ));
+        let mut data_sink = DuckDBPartitionedDataSink::new(
+            Arc::clone(&self.pool),
+            Arc::clone(&self.table_definition),
+            insert_op,
+            self.on_conflict.clone(),
+            schema,
+            partitioner,
+        );
+
+        // Apply the buffer size configuration if available
+        if let Some(buffer_size) = self.rows_per_partition_buffer {
+            data_sink = data_sink.with_rows_per_partition_buffer(buffer_size);
+        }
+
+        let data_sink_exec = Arc::new(DataSinkExec::new(input, Arc::new(data_sink), None));
 
         // Wrap with PassThruExec to re-infer partitions after completion
         Ok(Self::create_infer_partitions_exec(data_sink_exec, ctx))
