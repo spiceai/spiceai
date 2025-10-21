@@ -75,11 +75,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+
       # Cache Cargo dependencies
       - name: Cache Cargo registry
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        uses: runs-on/cache@v4
         with:
+          aws-endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          aws-region: us-east-1
+          aws-access-key-id: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          aws-s3-bucket: spiceai-cache
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
@@ -90,9 +105,14 @@ jobs:
 
       # Cache Go modules
       - name: Cache Go modules
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        uses: whywaita/actions-cache-s3@v2
         with:
+          aws-endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          aws-region: us-east-1
+          aws-access-key-id: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          aws-s3-bucket: spiceai-cache
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
@@ -102,9 +122,14 @@ jobs:
 
       # Cache Rust build artifacts
       - name: Cache Rust build
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        uses: runs-on/cache@v4
         with:
+          aws-endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          aws-region: us-east-1
+          aws-access-key-id: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          aws-s3-bucket: spiceai-cache
           path: target
           key: ${{ runner.os }}-rust-lint-${{ env.RUST_PROFILE }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
@@ -135,16 +160,6 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
 
       - name: Set up sccache
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
