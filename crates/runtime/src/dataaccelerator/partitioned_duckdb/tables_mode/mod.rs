@@ -205,6 +205,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             self.get_shared_pool(source).await?,
             creator.table_definition(),
             creator.on_conflict().cloned(),
+            source,
         ));
 
         let table_provider = Arc::new(
