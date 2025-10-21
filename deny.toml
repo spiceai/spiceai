@@ -58,9 +58,3 @@ license-files = []
 name = "text-embeddings-backend-candle"
 expression = "Apache-2.0"
 license-files = []
-
-[[licenses.clarify]]
-name = "datafusion-table-providers"
-expression = "Apache-2.0"
-license-files = []
-
