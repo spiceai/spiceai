@@ -18,7 +18,11 @@ use crate::s3_vectors::{
     S3VectorBuildSnafu,
 };
 use arrow_tools::record_batch::replace_column_in_record;
-use std::{collections::HashMap, error::Error as StdError, sync::Arc};
+use std::{
+    collections::HashMap,
+    error::Error as StdError,
+    sync::{Arc, Mutex},
+};
 
 use super::{Error, Result, S3VectorIdentifier, spill::SpillIndex};
 use arrow::{
@@ -48,7 +52,7 @@ use tokio::sync::mpsc::Sender;
 /// An S3 Vector index.
 #[derive(Clone)]
 pub struct S3VectorsTable {
-    pub idx: S3VectorIdentifier,
+    pub idx: Arc<Mutex<S3VectorIdentifier>>,
     pub client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
@@ -115,7 +119,7 @@ impl S3VectorsTable {
                 let schema = Self::compute_schema(index.dimension(), columns.clone());
                 let constraints = Self::primary_key(&schema);
                 Ok(S3VectorTableResult::Table(Self {
-                    idx: id,
+                    idx: Arc::new(Mutex::new(id)),
                     client,
                     schema,
                     constraints,
@@ -464,9 +468,14 @@ impl S3VectorsTable {
             self.write_chunk_with_spilling(chunk).await?;
         }
 
+        let idx = match self.idx.lock() {
+            Ok(i) => i,
+            Err(e) => e.into_inner(),
+        };
+
         tracing::info!(
             "S3 Vectors Index {index_name} updated; records={records}, duration={duration:?}",
-            index_name = self.idx,
+            index_name = &*idx,
             records = vectors.len(),
             duration = start.elapsed()
         );
@@ -478,7 +487,10 @@ impl S3VectorsTable {
     async fn write_chunk_with_spilling(&self, chunk: &[PutInputVector]) -> Result<()> {
         const MAX_SPILL_ATTEMPTS: usize = 100; // Prevent infinite loops
 
-        let mut current_index = self.idx.clone();
+        let mut current_index = match self.idx.lock() {
+            Ok(i) => i,
+            Err(e) => e.into_inner(),
+        };
         let mut attempt_count = 0;
 
         loop {
@@ -514,7 +526,7 @@ impl S3VectorsTable {
                                 tracing::info!(
                                     "S3 Vector index {current_index} reached capacity, spilling to {next_index}",
                                 );
-                                current_index = next_index;
+                                *current_index = next_index;
                             }
                             None => {
                                 return Err(Error::MaxSpillAttemptsReached);
@@ -539,7 +551,7 @@ impl S3VectorsTable {
         matches!(error, PutVectorsError::ServiceQuotaExceededException(_))
     }
 
-async fn get_next_spill_index(
+    async fn get_next_spill_index(
         &self,
         current_index: &S3VectorIdentifier,
     ) -> Result<Option<S3VectorIdentifier>> {
@@ -685,10 +697,10 @@ mod tests {
         index_name: &str,
     ) -> S3VectorsTable {
         S3VectorsTable {
-            idx: S3VectorIdentifier::Index {
+            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
                 bucket_name: "test-bucket".to_string(),
                 index_name: index_name.to_string(),
-            },
+            })),
             client,
             schema: Arc::new(Schema::new(vec![
                 Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
