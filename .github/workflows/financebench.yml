@@ -189,5 +189,5 @@ jobs:
             -z ./test/spicepods/financebench/core \
             -p ${{ matrix.target.spicepod }} \
             --model ${{ matrix.target.name }} \
-            --ready-wait 180 \
+            --ready-wait 240 \
             --metrics
