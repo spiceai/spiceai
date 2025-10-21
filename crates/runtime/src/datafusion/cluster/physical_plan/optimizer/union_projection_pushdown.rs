@@ -117,7 +117,7 @@ impl PhysicalOptimizerRule for UnionProjectionPushdown {
                     )?);
 
                     let maybe_repartition =
-                        SearchVisitor::find_concrete_down::<RepartitionExec>(leaf)?;
+                        SearchVisitor::first_concrete_down::<RepartitionExec>(leaf)?;
 
                     let wrapped: Arc<dyn ExecutionPlan> = if let Some(repartition) =
                         maybe_repartition

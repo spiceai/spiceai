@@ -30,7 +30,23 @@ impl<T> Default for SearchVisitor<T> {
 }
 
 impl SearchVisitor<()> {
-    pub fn find_concrete_down<C: ExecutionPlan + 'static>(
+    pub fn collect_concrete_down<C: ExecutionPlan + 'static>(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+        SearchVisitor::default()
+            .down(Self::arc_if_concrete::<C>)
+            .find(plan)
+    }
+
+    pub fn collect_concrete_up<C: ExecutionPlan + 'static>(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+        SearchVisitor::default()
+            .up(Self::arc_if_concrete::<C>)
+            .find(plan)
+    }
+
+    pub fn first_concrete_down<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         SearchVisitor::default()
@@ -38,7 +54,7 @@ impl SearchVisitor<()> {
             .find_first(plan)
     }
 
-    pub fn find_concrete_up<C: ExecutionPlan + 'static>(
+    pub fn first_concrete_up<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         SearchVisitor::default()

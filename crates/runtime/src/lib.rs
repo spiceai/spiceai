@@ -636,9 +636,7 @@ impl Runtime {
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env())
-                    .with_physical_optimizer_rule(DistributeFileScanOptimizer::new(Arc::clone(
-                        &runtime_handle.df,
-                    )))
+                    .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
                     .with_physical_optimizer_rule(UnionProjectionPushdown::new())
                     .build(),
             )

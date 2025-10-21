@@ -1,5 +1,4 @@
 use crate::concrete;
-use crate::datafusion::DataFusion;
 use crate::datafusion::cluster::common::datafusion_scheduler_ext::DataFusionSchedulerExtensions;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -46,14 +45,12 @@ use std::sync::Arc;
 /// Limits are handled by the default physical pushdown mechanism and are currently
 /// replicated per scan.
 #[derive(Debug)]
-pub struct DistributeFileScanOptimizer {
-    df: Arc<DataFusion>,
-}
+pub struct DistributeFileScanOptimizer {}
 
 impl DistributeFileScanOptimizer {
     #[must_use]
-    pub fn new(df: Arc<DataFusion>) -> Arc<Self> {
-        Arc::new(DistributeFileScanOptimizer { df })
+    pub fn new() -> Arc<Self> {
+        Arc::new(DistributeFileScanOptimizer {})
     }
 }
 
@@ -85,21 +82,35 @@ impl DistributeFileScanOptimizer {
             current_group_size += size;
             groups.last_mut().expect("Must get current group").push(f);
         });
-        groups.into_iter().map(FileGroup::new).collect()
+        groups
+            .into_iter()
+            .filter_map(|files| {
+                if files.is_empty() {
+                    None
+                } else {
+                    Some(FileGroup::new(files))
+                }
+            })
+            .collect()
     }
 
-    /// Group `FileGroup`s into stages based on configurable max count or
-    /// current executor fleet size
+    /// Group `FileGroup`s into stages based on task level parallelism and optional user-defined
+    /// max stages configuration
     fn groups_to_stages(
         &self,
         groups: Vec<FileGroup>,
+        task_partitions: usize,
         max_stages: Option<usize>,
     ) -> Result<Vec<Vec<FileGroup>>> {
-        let stage_size = groups.len() / max(self.df.executors()?.len(), 2);
+        let stage_size = task_partitions * 2;
         let max_stages = max_stages.unwrap_or(usize::MAX);
 
         let stage_size = if (groups.len() / stage_size) > max_stages {
             groups.len() / max_stages
+        }
+        // `UnionExec` requires at least 2 inputs
+        else if (groups.len() / stage_size) < 2 {
+            groups.len() / 2
         } else {
             stage_size
         };
@@ -112,6 +123,8 @@ impl DistributeFileScanOptimizer {
             .collect())
     }
 
+    /// Repartitions a single `FileScanConfig` into many file groups. Bails out if the read is
+    /// smaller than the configured `file_group_size_bytes`
     fn scan_to_stages(
         &self,
         file_scan_config: &FileScanConfig,
@@ -124,6 +137,7 @@ impl DistributeFileScanOptimizer {
         };
 
         let file_group_byte_size = spice_config.execution.file_group_size_bytes;
+        let task_partitions = config.execution.target_partitions;
 
         // Get all the partitioned files
         let partitioned_files = file_scan_config
@@ -143,12 +157,9 @@ impl DistributeFileScanOptimizer {
 
         let stages = self.groups_to_stages(
             file_groups,
+            task_partitions,
             spice_config.execution.file_scan_expand_max_stages,
         )?;
-
-        if stages.len() < 2 {
-            return Ok(None);
-        }
 
         Ok(Some(stages))
     }
@@ -158,7 +169,11 @@ impl DistributeFileScanOptimizer {
     /// - `RepartitionExec` (hash only)
     /// - `SortPreservingMergeExec`
     ///
-    /// So we insert the best kind of stage for the given input schema
+    /// This tries to:
+    /// - Preserve input partitioning if compatible (hash partitioning)
+    ///   - In the case that there are fewer partitions than task parallelism, shard to task parallelism
+    /// - Repartition based on a 'best guess' column value
+    /// - CoalescePartitionsExec if cannot do the above (slow)
     fn with_stage_repartition(
         exec: Arc<dyn ExecutionPlan>,
         task_partitions: usize,
@@ -224,11 +239,13 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
                     let new_scan = FileScanConfigBuilder::from(file_scan_config.clone())
                         .with_file_groups(stage)
                         .build();
-                    let new_data_source_exec: Arc<dyn ExecutionPlan> =
-                        DataSourceExec::from_data_source(new_scan);
+
+                    // Propagate partitioning too
+                    let new_data_source_exec = DataSourceExec::new(Arc::new(new_scan))
+                        .with_partitioning(plan.output_partitioning().clone());
 
                     Self::with_stage_repartition(
-                        new_data_source_exec,
+                        Arc::new(new_data_source_exec),
                         config.execution.target_partitions,
                     )
                 })
@@ -253,13 +270,19 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 mod tests {
     use super::*;
     use crate::datafusion::cluster::physical_plan::common::search_visitor::SearchVisitor;
-    use crate::{Runtime, RuntimeBuilder};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
     use object_store::ObjectMeta;
     use object_store::path::Path;
+    use std::sync::LazyLock;
+
+    static DEFAULT_CONFIG_OPTIONS: LazyLock<ConfigOptions> = LazyLock::new(|| {
+        let mut config = ConfigOptions::default();
+        config.extensions.insert(SpiceClusterConfig::default());
+        config
+    });
 
     fn create_partitioned_file(path: &str, size: u64, range: Option<FileRange>) -> PartitionedFile {
         PartitionedFile {
@@ -278,27 +301,30 @@ mod tests {
         }
     }
 
-    fn create_data_source_exec(files: Vec<PartitionedFile>) -> Arc<dyn ExecutionPlan> {
+    fn file_scan_config_builder() -> FileScanConfigBuilder {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
         ]));
 
-        let fsc = FileScanConfigBuilder::new(
+        FileScanConfigBuilder::new(
             ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
             schema,
             Arc::new(ArrowSource::default()),
         )
-        .with_file_group(FileGroup::new(files))
-        .build();
+    }
+
+    fn create_data_source_exec(files: Vec<PartitionedFile>) -> Arc<dyn ExecutionPlan> {
+        let fsc = file_scan_config_builder()
+            .with_file_group(FileGroup::new(files))
+            .build();
 
         DataSourceExec::from_data_source(fsc)
     }
 
     #[tokio::test]
     async fn test_respects_byte_size_setting() {
-        let runtime: Runtime = RuntimeBuilder::new().build().await;
-        let optimizer = DistributeFileScanOptimizer::new(runtime.datafusion());
+        let optimizer = DistributeFileScanOptimizer::new();
 
         // Default = 128MB per filegroup
         let files = vec![
@@ -306,7 +332,7 @@ mod tests {
             create_partitioned_file("file:///file1.parquet", 50_000_000, None),
             create_partitioned_file("file:///file2.parquet", 50_000_000, None),
             // Group 2 (trips `file_group_size_bytes`, is new group)
-            create_partitioned_file("file:///file3.parquet", 29_000_000, None),
+            create_partitioned_file("file:///file3.parquet", 28_000_001, None),
             // Group 3 (too big, new group)
             create_partitioned_file("file:///file4.parquet", 256_000_000, None),
             // Group 4 (too big, new group)
@@ -315,41 +341,96 @@ mod tests {
 
         let plan = create_data_source_exec(files);
 
-        let mut config = ConfigOptions::default();
-        config.extensions.insert(SpiceClusterConfig::default());
+        let optimized = optimizer
+            .optimize(plan, &DEFAULT_CONFIG_OPTIONS)
+            .expect("Must optimize");
 
-        let optimized = optimizer.optimize(plan, &config).expect("Must optimize");
-        let groups_after_optimize = SearchVisitor::default()
-            .down(|p| {
-                if concrete!(p, DataSourceExec).is_some() {
-                    Some(Arc::clone(p))
-                } else {
-                    None
-                }
-            })
-            .find(&optimized)
-            .expect("Must search plan")
-            .into_iter()
-            .filter_map(|d| {
-                if let Some(fsc) = concrete!(d, DataSourceExec)
-                    .and_then(|d| d.data_source().as_any().downcast_ref::<FileScanConfig>())
-                {
-                    Some(fsc.file_groups.clone())
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect::<Vec<_>>();
+        let file_groups_after_optimize =
+            SearchVisitor::collect_concrete_down::<DataSourceExec>(&optimized)
+                .expect("Must search plan")
+                .into_iter()
+                .flat_map(|d| {
+                    concrete!(d, DataSourceExec)
+                        .and_then(|ds| ds.data_source().as_any().downcast_ref::<FileScanConfig>())
+                        .map(|fsc| fsc.file_groups.clone())
+                })
+                .flatten()
+                .collect::<Vec<_>>();
 
         // There should be 4 groups with 5 total files
-        assert_eq!(groups_after_optimize.len(), 4);
+        assert_eq!(file_groups_after_optimize.len(), 4);
         assert_eq!(
-            groups_after_optimize
+            file_groups_after_optimize
                 .into_iter()
-                .map(|g| g.files().len())
+                .map(|g| g.len())
                 .sum::<usize>(),
             5
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respects_max_stages() {
+        let optimizer = DistributeFileScanOptimizer::new();
+
+        let files = (0..10000)
+            .map(|i| {
+                create_partitioned_file(
+                    format!("file:///{}.parquet", i).as_str(),
+                    128_000_000,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let plan = create_data_source_exec(files);
+
+        let mut config_with_max_stages = DEFAULT_CONFIG_OPTIONS.clone();
+        config_with_max_stages
+            .set("spice.execution.file_scan_expand_max_stages", "200")
+            .expect("Must set config");
+
+        let optimized = optimizer
+            .optimize(plan, &config_with_max_stages)
+            .expect("Must optimize");
+
+        let data_source_execs = SearchVisitor::collect_concrete_down::<DataSourceExec>(&optimized)
+            .expect("Must search plan");
+
+        // There should be 200 max DataSourceExec stages
+        assert_eq!(data_source_execs.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_respects_input_partitioning() {
+        let optimizer = DistributeFileScanOptimizer::new();
+
+        let file_scan_config = file_scan_config_builder()
+            .with_file_group(FileGroup::new(vec![
+                create_partitioned_file("file://a.parquet", 512_000_000, None),
+                create_partitioned_file("file://b.parquet", 512_000_000, None),
+            ]))
+            .build();
+
+        let data_source_exec = DataSourceExec::new(Arc::new(file_scan_config));
+        let schema = Arc::clone(&data_source_exec.schema());
+        let partitioning = Partitioning::Hash(
+            vec![col("name", schema.as_ref()).expect("Must bind expr")],
+            1337,
+        );
+
+        let data_source_exec = data_source_exec.with_partitioning(partitioning.clone());
+
+        let optimized = optimizer
+            .optimize(Arc::new(data_source_exec), &DEFAULT_CONFIG_OPTIONS)
+            .expect("Must optimize");
+
+        let repart_execs = SearchVisitor::collect_concrete_down::<RepartitionExec>(&optimized)
+            .expect("Must search plan");
+
+        assert!(
+            repart_execs
+                .iter()
+                .all(|e| e.output_partitioning() == &partitioning)
         );
     }
 }
