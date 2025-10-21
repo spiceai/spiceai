@@ -77,7 +77,7 @@ iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
-jsonwebtoken = "9.3.0"
+jsonwebtoken = "10.1.0"
 llms = { path = "../llms" }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
