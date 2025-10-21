@@ -58,4 +58,3 @@ license-files = []
 name = "text-embeddings-backend-candle"
 expression = "Apache-2.0"
 license-files = []
-

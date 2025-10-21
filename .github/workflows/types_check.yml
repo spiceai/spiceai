@@ -31,6 +31,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - run: rustup toolchain install stable --profile minimal
 
