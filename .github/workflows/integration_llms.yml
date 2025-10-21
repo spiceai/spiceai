@@ -90,16 +90,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Cache Rust build artifacts
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-rust-llms-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-llms-
-            ${{ runner.os }}-rust-
-
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
