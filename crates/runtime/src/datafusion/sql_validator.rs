@@ -42,7 +42,7 @@ pub async fn validate_sql_query_operations(
 ) -> Result<(), DataFusionError> {
     // First collect all DML operations that need async validation
     let mut dml_deletes = Vec::new();
-    
+
     plan.apply_with_subqueries(|node| {
         match node {
             // Data Definition Language (DDL): CREATE / DROP TABLES / VIEWS / SCHEMAS
@@ -101,7 +101,7 @@ pub async fn validate_sql_query_operations(
             _ => Ok(TreeNodeRecursion::Continue),
         }
     })?;
-    
+
     // Now validate DELETE operations asynchronously
     for table_name in dml_deletes {
         if super::is_spice_internal_dataset(&table_name) {
@@ -110,7 +110,7 @@ pub async fn validate_sql_query_operations(
                 table_name
             );
         }
-        
+
         if !df.is_accelerated(&table_name).await {
             return plan_err!(
                 "DELETE operations are only allowed on accelerated tables. \
@@ -121,7 +121,7 @@ pub async fn validate_sql_query_operations(
             );
         }
     }
-    
+
     Ok(())
 }
 

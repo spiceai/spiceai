@@ -98,14 +98,16 @@ impl QueryPlanner for SpiceQueryPlanner {
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Handle DML operations (UPDATE, DELETE) before delegating to DefaultPhysicalPlanner
-        
-        // Handle UPDATE operations  
-        if let LogicalPlan::Dml(stmt @ DmlStatement {
-            table_name,
-            op: WriteOp::Update,
-            input,
-            ..
-        }) = logical_plan
+
+        // Handle UPDATE operations
+        if let LogicalPlan::Dml(
+            stmt @ DmlStatement {
+                table_name,
+                op: WriteOp::Update,
+                input,
+                ..
+            },
+        ) = logical_plan
         {
             // Get the table provider through the catalog
             let table_source = session_state
@@ -132,18 +134,20 @@ impl QueryPlanner for SpiceQueryPlanner {
                         table_name
                     ))
                 })?;
-            
+
             // Check if it supports update
-            if let Some(update_provider) = data_components::update::get_update_provider(table_source) {
+            if let Some(update_provider) =
+                data_components::update::get_update_provider(table_source)
+            {
                 // Extract filters from the UPDATE statement's input plan
                 let filters = match input.as_ref() {
                     LogicalPlan::Filter(filter) => vec![filter.predicate.clone()],
                     _ => vec![],
                 };
-                
+
                 // Unqualify column references in filters (remove table qualifiers)
                 let unqualified_filters = unqualify_filters(filters)?;
-                
+
                 // Extract assignments from the DML statement
                 // The input plan contains a Projection with the SET expressions
                 let mut assignment_map = std::collections::HashMap::new();
@@ -156,20 +160,20 @@ impl QueryPlanner for SpiceQueryPlanner {
                         }
                     }
                 }
-                
+
                 // Call update on the update provider - it returns the execution plan
                 return update_provider
                     .update(session_state, &unqualified_filters, assignment_map)
                     .await;
             }
-            
+
             return datafusion::common::plan_err!(
                 "Table '{}' does not support UPDATE operations. \
                 Only accelerated tables support UPDATE.",
                 table_name
             );
         }
-        
+
         // Handle DELETE operations
         if let LogicalPlan::Dml(DmlStatement {
             table_name,
@@ -203,7 +207,7 @@ impl QueryPlanner for SpiceQueryPlanner {
                         table_name
                     ))
                 })?;
-            
+
             // Check if it supports deletion
             if let Some(deletion_provider) = get_deletion_provider(table_source) {
                 // Extract filters from the DELETE statement's input plan
@@ -212,23 +216,23 @@ impl QueryPlanner for SpiceQueryPlanner {
                     LogicalPlan::Filter(filter) => vec![filter.predicate.clone()],
                     _ => vec![],
                 };
-                
+
                 // Unqualify column references in filters (remove table qualifiers)
                 let unqualified_filters = unqualify_filters(filters)?;
-                
+
                 // Call delete_from on the deletion provider - it returns the execution plan
                 return deletion_provider
                     .delete_from(session_state, &unqualified_filters)
                     .await;
             }
-            
+
             return datafusion::common::plan_err!(
                 "Table '{}' does not support DELETE operations. \
                 Only accelerated tables support DELETE.",
                 table_name
             );
         }
-        
+
         // For all other operations, use the default physical planner
         let physical_planner =
             DefaultPhysicalPlanner::with_extension_planners(self.extension_planners.clone());
