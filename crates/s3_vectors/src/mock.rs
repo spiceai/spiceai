@@ -295,7 +295,7 @@ impl S3Vectors for MockClient {
         input: PutVectorsInput,
     ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
         let index_name = input.index_name().unwrap_or_default();
-        let vectors = input.vectors();
+        let num_vectors = input.vectors().len();
 
         let mut data = match self.data.lock() {
             Ok(lock) => lock,
@@ -305,7 +305,7 @@ impl S3Vectors for MockClient {
         let current_count = *data.vector_counts.get(index_name).unwrap_or(&0);
         let quota_limit = *data.quota_limits.get(index_name).unwrap_or(&usize::MAX);
 
-        if current_count + vectors.len() > quota_limit {
+        if current_count + num_vectors > quota_limit {
             let service_error = ServiceQuotaExceededException::builder()
                 .message("Vector quota exceeded")
                 .build()
@@ -325,7 +325,7 @@ impl S3Vectors for MockClient {
             ));
         }
 
-        let new_count = current_count + vectors.len();
+        let new_count = current_count + num_vectors;
         data.vector_counts.insert(index_name.to_string(), new_count);
 
         Ok(PutVectorsOutput::builder().build())

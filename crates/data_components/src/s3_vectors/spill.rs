@@ -94,28 +94,6 @@ impl SpillIndex {
         }))
     }
 
-    /// Generates the next spill index name in sequence.
-    #[must_use]
-    pub fn next_spill_name(base_name: &str, existing_spills: &[String]) -> Option<String> {
-        let mut max_sequence = 0;
-
-        // Find the highest existing sequence number
-        for spill_name in existing_spills {
-            if let Ok(Some(spill)) = Self::parse(spill_name)
-                && spill.base_name == base_name
-            {
-                max_sequence = max_sequence.max(spill.sequence);
-            }
-        }
-
-        let next_sequence = max_sequence + 1;
-        if next_sequence > MAX_SPILL_SEQUENCE {
-            return None;
-        }
-
-        Some(Self::format_name(base_name, next_sequence))
-    }
-
     /// Checks if an index name represents a spill index.
     #[must_use]
     pub fn is_spill_index(index_name: &str) -> bool {
@@ -230,34 +208,6 @@ mod tests {
         assert!(SpillIndex::parse("myindex.abc").expect("success").is_none());
         let result = SpillIndex::parse("myindex.aa");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_next_spill_name() {
-        let existing = vec![];
-        assert_eq!(
-            SpillIndex::next_spill_name("myindex", &existing),
-            Some("myindex.01".to_string())
-        );
-
-        let existing = vec!["myindex.01".to_string()];
-        assert_eq!(
-            SpillIndex::next_spill_name("myindex", &existing),
-            Some("myindex.02".to_string())
-        );
-
-        let existing = vec![
-            "myindex.01".to_string(),
-            "myindex.03".to_string(),
-            "other.01".to_string(),
-        ];
-        assert_eq!(
-            SpillIndex::next_spill_name("myindex", &existing),
-            Some("myindex.04".to_string())
-        );
-
-        let existing = vec!["myindex.99".to_string()];
-        assert_eq!(SpillIndex::next_spill_name("myindex", &existing), None);
     }
 
     #[test]

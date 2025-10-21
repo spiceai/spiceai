@@ -37,9 +37,8 @@ use datafusion::{
 use s3_vectors::{
     CreateIndexError, CreateIndexInput, CreateVectorBucketError, CreateVectorBucketInput,
     DataType as S3DataType, DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput,
-    GetVectorBucketError, GetVectorBucketInput, ListIndexesInput, MetadataConfiguration,
-    PUT_VECTORS_MAX_ITEMS, PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError,
-    VectorData,
+    GetVectorBucketError, GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS,
+    PutInputVector, PutVectorsError, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -540,7 +539,7 @@ impl S3VectorsTable {
         matches!(error, PutVectorsError::ServiceQuotaExceededException(_))
     }
 
-    async fn get_next_spill_index(
+async fn get_next_spill_index(
         &self,
         current_index: &S3VectorIdentifier,
     ) -> Result<Option<S3VectorIdentifier>> {
@@ -565,40 +564,36 @@ impl S3VectorsTable {
             }
         };
 
-        let list_indexes_output = self
-            .client
-            .list_indexes(
-                ListIndexesInput::builder()
-                    .set_vector_bucket_name(Some(bucket_name.clone()))
-                    .build()
-                    .context(S3VectorBuildSnafu)?,
-            )
-            .await
-            .map_err(|e| Error::S3VectorListIndexesError {
-                source: e.into_service_error(),
-            })?;
-
-        let existing_index_names: Vec<String> = list_indexes_output
-            .indexes()
-            .iter()
-            .map(|idx| idx.index_name().to_string())
-            .collect();
-
-        let next_spill_name = SpillIndex::next_spill_name(&base_index_name, &existing_index_names);
-
-        match next_spill_name {
-            Some(spill_name) => {
-                let index_exists = existing_index_names.contains(&spill_name);
-                if !index_exists {
-                    self.create_spill_index(&bucket_name, &spill_name).await?;
+        // Start from 01 for main index, or continue from current spill index
+        let mut spill_num = if let Some(index_name) = current_index.index_name() {
+            if SpillIndex::is_spill_index(index_name) {
+                match SpillIndex::parse(index_name) {
+                    Ok(Some(spill)) => spill.sequence + 1,
+                    _ => 1,
                 }
-
-                Ok(Some(S3VectorIdentifier::Index {
-                    bucket_name,
-                    index_name: spill_name,
-                }))
+            } else {
+                1
             }
-            None => Ok(None),
+        } else {
+            1
+        };
+
+        loop {
+            if spill_num > 99 {
+                return Ok(None);
+            }
+            let spill_name = format!("{base_index_name}.{spill_num:02}");
+            match self.create_spill_index(&bucket_name, &spill_name).await {
+                Ok(_) => {
+                    return Ok(Some(S3VectorIdentifier::Index {
+                        bucket_name: bucket_name.clone(),
+                        index_name: spill_name,
+                    }));
+                }
+                Err(_) => {
+                    spill_num += 1;
+                }
+            }
         }
     }
 
@@ -771,8 +766,10 @@ mod tests {
             "test-index",
         );
 
-        // Set a low quota limit
+        // Set a low quota limit for main index and potential spill indexes
         mock_client.set_quota_limit("test-index", 3);
+        mock_client.set_quota_limit("test-index.01", 3);
+        mock_client.set_quota_limit("test-index.02", 3);
 
         // Create the bucket and index first
         table
@@ -822,12 +819,10 @@ mod tests {
             "test-index",
         );
 
-        for i in 0..99 {
-            let index_name = if i == 0 {
-                "test-index".to_string()
-            } else {
-                format!("test-index.{i:02}")
-            };
+        // Set quota limits for main index and 99 spill indexes (01-99)
+        mock_client.set_quota_limit("test-index", 1);
+        for i in 1..=99 {
+            let index_name = format!("test-index.{i:02}");
             mock_client.set_quota_limit(&index_name, 1);
         }
 
