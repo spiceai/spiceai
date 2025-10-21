@@ -27,7 +27,7 @@ governor.workspace = true
 hf-hub.workspace = true
 insta = { workspace = true, features = ["filters"] }
 itertools.workspace = true
-regex = "1.11.3"
+regex = "1.12.2"
 reqwest.workspace = true
 reqwest-eventsource = "0.6.0"
 runtime-rate-control = { path = "../runtime-rate-control" }

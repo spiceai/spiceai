@@ -367,6 +367,16 @@ pub(crate) async fn run_search_w_explain(
         .await
 }
 
+pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
+    col.into().with_metadata(
+        [(
+            "vectors".to_string(),
+            serde_json::Value::String("non-filterable".to_string()),
+        )]
+        .into(),
+    )
+}
+
 #[tokio::test]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let ds = get_mega_science_dataset(
@@ -975,6 +985,85 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     .await
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
+    let mut ds = get_mega_science_dataset(
+        Some("qs"),
+        Some(
+            Column::new("question")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
+                .with_metadata(
+                    [(
+                        "vectors".to_string(),
+                        Value::String("non-filterable".to_string()),
+                    )]
+                    .into(),
+                ),
+        ),
+        Some(
+            Column::new("answer")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+        ),
+    );
+    ds.columns.push(vectors_nonfilterable_col("subject"));
+
+    run_search_w_explain(
+        AppBuilder::new("search_app")
+            .with_dataset(ds).build(),
+        vec![
+            SearchTestCase::new(
+                "text_search_metadata_basic",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_additional_columns",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_with_where",
+                SearchTestType::Http(json!({
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_answer",
+                SearchTestType::Sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_answer_w_question",
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_question",
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_subject_filter",
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) where subject='math' order by score desc LIMIT 4"),
+            ),
+            SearchTestCase::new(
+                "text_search_metadata_sql_text_search_subject_projection",
+                SearchTestType::Sql("SELECT id, subject, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+            ),
+        ],
+        true
+    )
+    .await
+}
+
 #[cfg(feature = "flightsql")]
 #[tokio::test]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
@@ -1072,7 +1161,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_search_with_cache() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpcds_dataset_w_embeddings(
         "cached_search",

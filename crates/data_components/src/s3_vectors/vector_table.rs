@@ -35,10 +35,10 @@ use datafusion::{
 };
 
 use s3_vectors::{
-    CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
-    GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
-    MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector, PutVectorsInput, S3Vectors,
-    SdkError, VectorData,
+    CreateIndexError, CreateIndexInput, CreateVectorBucketError, CreateVectorBucketInput,
+    DistanceMetric, Document, GetIndexError, GetIndexInput, GetIndexOutput, GetVectorBucketError,
+    GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
+    PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -214,7 +214,7 @@ impl S3VectorsTable {
             )
         };
 
-        client
+        match client
             .create_index(
                 CreateIndexInput::builder()
                     .data_type(s3_vectors::DataType::Float32)
@@ -227,10 +227,25 @@ impl S3VectorsTable {
                     .context(S3VectorBuildSnafu)?,
             )
             .await
-            .map_err(|e| Error::S3VectorCreateIndexError {
-                source: e.into_service_error(),
-            })?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => match &e {
+                SdkError::ServiceError(service_error)
+                    if matches!(service_error.err(), CreateIndexError::ConflictException(_)) =>
+                {
+                    // Check if the index exists now (it might have been created by another thread)
+                    match Self::get_index_if_exists(vector_id, client).await? {
+                        Some(_) => Ok(()), // Index exists, treat as success
+                        None => Err(Error::S3VectorCreateIndexError {
+                            source: e.into_service_error(),
+                        }),
+                    }
+                }
+                _ => Err(Error::S3VectorCreateIndexError {
+                    source: e.into_service_error(),
+                }),
+            },
+        }
     }
 
     async fn create_bucket(
@@ -240,7 +255,7 @@ impl S3VectorsTable {
         let S3VectorIdentifier::Index { bucket_name, .. } = id else {
             return Err(Error::CreateIndexUsingArn);
         };
-        client
+        match client
             .create_vector_bucket(
                 CreateVectorBucketInput::builder()
                     .vector_bucket_name(bucket_name.clone())
@@ -248,10 +263,29 @@ impl S3VectorsTable {
                     .context(S3VectorBuildSnafu)?,
             )
             .await
-            .map_err(|e| Error::S3VectorCreateBucketError {
-                source: e.into_service_error(),
-            })?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => match &e {
+                SdkError::ServiceError(service_error)
+                    if matches!(
+                        service_error.err(),
+                        CreateVectorBucketError::ConflictException(_)
+                    ) =>
+                {
+                    // Check if the bucket exists now (it might have been created by another thread)
+                    if Self::check_if_bucket_exists(client, id).await? {
+                        Ok(()) // Bucket exists, treat as success
+                    } else {
+                        Err(Error::S3VectorCreateBucketError {
+                            source: e.into_service_error(),
+                        })
+                    }
+                }
+                _ => Err(Error::S3VectorCreateBucketError {
+                    source: e.into_service_error(),
+                }),
+            },
+        }
     }
 
     async fn check_if_bucket_exists(

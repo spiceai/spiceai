@@ -1,0 +1,59 @@
+#syntax=docker/dockerfile:1.7
+
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+
+FROM ${CUDA_RUNTIME_IMAGE} AS binary
+
+ARG REL_VERSION
+ARG CUDA_COMPUTE_CAP=80
+ARG GITHUB_REPOSITORY=spiceai/spiceai
+
+RUN if [ -z "$REL_VERSION" ]; then echo "REL_VERSION build-arg is required" >&2; exit 1; fi
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl tar \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}
+
+ENV REL_VERSION=${REL_VERSION}
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
+RUN set -eux; \
+    asset="spiced_models_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
+    base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
+    curl -fSLo /tmp/spiced.tar.gz "${base_url}"; \
+    tar -C /root -xzf /tmp/spiced.tar.gz; \
+    chmod +x /root/spiced; \
+    rm -f /tmp/spiced.tar.gz
+
+FROM ${CUDA_RUNTIME_IMAGE} AS runtime
+
+ENV CUDA_NVCC_FLAGS=-fPIE
+
+ARG CARGO_FEATURES
+ARG CUDA_COMPUTE_CAP=80
+
+# Allow DuckDB to load extensions
+RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}
+
+RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
+    apt-get update \
+    && apt-get install --yes --no-install-recommends unixodbc \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+  fi
+
+COPY --from=binary /root/spiced /usr/local/bin/spiced
+
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
+WORKDIR /app
+
+EXPOSE 8090
+EXPOSE 9090
+EXPOSE 50051
+
+ENTRYPOINT ["/usr/local/bin/spiced"]
+CMD ["--http","0.0.0.0:8090","--metrics","0.0.0.0:9090","--flight","0.0.0.0:50051"]

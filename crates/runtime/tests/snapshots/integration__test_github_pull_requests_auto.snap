@@ -2,18 +2,18 @@
 source: crates/runtime/tests/integration.rs
 description: "Query: SELECT additions, review_comments, discussion FROM spiceai_pulls_auto LIMIT 10"
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                      |
-+---------------+---------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: spiceai_pulls_auto.additions, spiceai_pulls_auto.review_comments, spiceai_pulls_auto.discussion               |
-|               |   Limit: skip=0, fetch=10                                                                                                 |
-|               |     BytesProcessedNode                                                                                                    |
-|               |       TableScan: spiceai_pulls_auto projection=[additions, discussion, review_comments], fetch=10                         |
-| physical_plan | ProjectionExec: expr=[additions@0 as additions, review_comments@2 as review_comments, discussion@1 as discussion]         |
-|               |   GlobalLimitExec: skip=0, fetch=10                                                                                       |
-|               |     BytesProcessedExec                                                                                                    |
-|               |       ProjectionExec: expr=[additions@0 as additions, discussion@20 as discussion, review_comments@21 as review_comments] |
-|               |         CooperativeExec                                                                                                   |
-|               |           GraphQLTableProviderExec limit=[10]                                                                             |
-|               |                                                                                                                           |
-+---------------+---------------------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                    |
++---------------+-------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: spiceai_pulls_auto.additions, spiceai_pulls_auto.review_comments, spiceai_pulls_auto.discussion             |
+|               |   Limit: skip=0, fetch=10                                                                                               |
+|               |     BytesProcessedNode                                                                                                  |
+|               |       TableScan: spiceai_pulls_auto projection=[additions, discussion, review_comments], fetch=10                       |
+| physical_plan | ProjectionExec: expr=[additions@0 as additions, review_comments@2 as review_comments, discussion@1 as discussion]       |
+|               |   BytesProcessedExec                                                                                                    |
+|               |     ProjectionExec: expr=[additions@0 as additions, discussion@20 as discussion, review_comments@21 as review_comments] |
+|               |       GlobalLimitExec: skip=0, fetch=10                                                                                 |
+|               |         CooperativeExec                                                                                                 |
+|               |           GraphQLTableProviderExec limit=[10]                                                                           |
+|               |                                                                                                                         |
++---------------+-------------------------------------------------------------------------------------------------------------------------+

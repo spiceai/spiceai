@@ -18,7 +18,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
-use spicepod::semantic::IndexStore;
+use spicepod::semantic::{IndexStore, MetadataType};
 use std::any::Any;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -50,8 +50,7 @@ impl FullTextConnector {
         Self { inner_connector }
     }
 
-    pub(crate) async fn wrap_table(
-        &self,
+    pub(crate) fn wrap_table(
         inner_table_provider: Arc<dyn TableProvider>,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
@@ -103,13 +102,24 @@ impl FullTextConnector {
             None
         };
 
+        let store_fields = dataset
+            .columns
+            .iter()
+            .filter_map(|c| {
+                if let Some(MetadataType::NonFilterable) = c.as_vector_metadata() {
+                    return Some(c.name.clone());
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+
         let index = FullTextDatabaseIndex::try_new(
             Arc::clone(&inner_table_provider),
             search_fields.clone(),
             Some(primary_key),
             directory,
+            &store_fields,
         )
-        .await
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: dataset.source().to_string(),
             message: e.to_string(),
@@ -180,8 +190,7 @@ impl DataConnector for FullTextConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
-            .await
+        Self::wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
     }
 
     async fn read_write_provider(
@@ -189,7 +198,7 @@ impl DataConnector for FullTextConnector {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(self.wrap_table(inner, dataset).await),
+            Some(Ok(inner)) => Some(Self::wrap_table(inner, dataset)),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }
