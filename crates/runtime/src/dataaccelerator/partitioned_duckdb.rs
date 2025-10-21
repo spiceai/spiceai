@@ -75,7 +75,7 @@ impl DuckDBPartitionMode {
             "files" => DuckDBPartitionMode::Files,
             other => {
                 tracing::warn!(
-                    "Unknown `duckdb_partition_mode` '{}', defaulting to 'files' mode.",
+                    "Unknown `partition_mode` '{}', defaulting to 'files' mode.",
                     other
                 );
                 DuckDBPartitionMode::Files
@@ -88,7 +88,7 @@ impl DuckDBPartitionMode {
 pub fn get_duckdb_partition_mode(params: &Option<spicepod::param::Params>) -> DuckDBPartitionMode {
     params
         .as_ref()
-        .and_then(|p| p.as_string_map().get("duckdb_partition_mode").cloned())
+        .and_then(|p| p.as_string_map().get("partition_mode").cloned())
         .map_or(DuckDBPartitionMode::Files, |v| {
             DuckDBPartitionMode::parse_str(&v)
         })
