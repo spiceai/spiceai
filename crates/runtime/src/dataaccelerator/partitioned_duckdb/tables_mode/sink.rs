@@ -324,6 +324,10 @@ fn insert_overwrite(
         .context(UnableToBeginTransactionSnafu)
         .map_err(to_retriable_data_write_error)?;
 
+    // Snapshot all existing partition tables (main views) before writing new data,
+    // so we can later drop any views and internal tables that are not present in the latest refresh.
+    let mut candidates_to_drop = get_existing_partition_tables(&tx, table_definition)?;
+
     tracing::debug!("Initial load for {}", table_definition.name());
     let (num_rows, tables) = write_to_tables(
         table_definition,
@@ -355,6 +359,14 @@ fn insert_overwrite(
                     .delete_table(&tx)
                     .map_err(to_retriable_data_write_error)
             })?;
+
+        // partition still exists so should NOT be deleted
+        candidates_to_drop.remove(&new_table.definition_name().to_string());
+    }
+
+    // Drop obsolete partition tables that no longer exist after the latest full refresh.
+    for view in candidates_to_drop.values() {
+        drop_partition_view(view, &tx)?;
     }
 
     tx.commit()
@@ -596,6 +608,69 @@ fn write_data_chunk_to_table(
     Ok(rows as u64)
 }
 
+/// Gets all existing partition tables for a given base table definition.
+fn get_existing_partition_tables(
+    tx: &Transaction<'_>,
+    base_table_definition: &Arc<TableDefinition>,
+) -> datafusion::common::Result<HashMap<String, TableManager>> {
+    let base_table_name = base_table_definition.name();
+
+    let pattern = format!("%/{base_table_name}");
+    let mut stmt = tx
+        .prepare("SELECT table_name FROM information_schema.tables WHERE table_name LIKE ?1")
+        .map_err(to_retriable_data_write_error)?;
+
+    let mut existing_partitions = HashMap::new();
+    let mut rows = stmt
+        .query([&pattern])
+        .map_err(to_retriable_data_write_error)?;
+
+    while let Some(row) = rows.next().map_err(to_retriable_data_write_error)? {
+        let table_name: String = row.get(0).map_err(to_retriable_data_write_error)?;
+        let partition_table_def =
+            create_partition_table_definition(base_table_definition, table_name.clone());
+        existing_partitions.insert(table_name, TableManager::new(partition_table_def));
+    }
+
+    Ok(existing_partitions)
+}
+
+/// Drops a partition view used by full refresh and all its associated internal tables.
+///
+/// # Arguments
+/// * `view` - The [`TableManager`] representing the partition view to drop. This should be the view itself, not an internal table used by the view.
+/// * `tx` - The active `DuckDB` transaction used to execute the drop operations.
+///
+/// # Errors
+/// Returns an error if any internal table or the view cannot be dropped.
+fn drop_partition_view(
+    view: &TableManager,
+    tx: &Transaction<'_>,
+) -> datafusion::common::Result<()> {
+    tracing::debug!(
+        "Dropping partitioned table {name}",
+        name = view.table_name()
+    );
+
+    // First drop internal tables
+    for (old_table, _) in view
+        .list_other_internal_tables(tx)
+        .map_err(to_retriable_data_write_error)?
+    {
+        old_table
+            .delete_table(tx)
+            .map_err(to_retriable_data_write_error)?;
+    }
+
+    tx.execute(
+        &format!(r#"DROP VIEW IF EXISTS "{}""#, view.table_name()),
+        [],
+    )
+    .map_err(to_retriable_data_write_error)?;
+
+    Ok(())
+}
+
 fn to_datafusion_error(error: Error) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
@@ -699,6 +774,47 @@ mod test {
                 view_rows, expected_rows_per_partition,
                 "Expected view to have {expected_rows_per_partition} rows from a partitioned table"
             );
+        }
+    }
+
+    fn verify_partition_does_not_exist(
+        tx: &duckdb::Transaction,
+        table_definition: &Arc<TableDefinition>,
+        partition_name: &str,
+        with_internal: bool,
+    ) {
+        let partition_table_name = format!("{partition_name}/{}", table_definition.name());
+        let partitioned_table_definition = TableDefinition::new(
+            RelationName::new(partition_table_name),
+            Arc::clone(&table_definition.schema()),
+        );
+
+        if with_internal {
+            let internal_tables = partitioned_table_definition
+                .list_internal_tables(tx)
+                .expect("to list internal tables");
+
+            assert_eq!(
+                internal_tables.len(),
+                0,
+                "Expected no internal tables for partition {partition_name}"
+            );
+        }
+
+        let main_table_exists_result = tx.query_row(
+            "SELECT COUNT(1) FROM information_schema.tables WHERE table_name = ?1",
+            [partitioned_table_definition.name().to_string()],
+            |row| row.get::<_, i64>(0),
+        );
+
+        match main_table_exists_result {
+            Ok(count) => assert_eq!(
+                count, 0,
+                "Expected view or main table for partition {partition_name} to be removed"
+            ),
+            Err(e) => panic!(
+                "Failed to check if main table or view exists for partition {partition_name}: {e}"
+            ),
         }
     }
 
@@ -819,6 +935,126 @@ mod test {
             1,
             true,
         );
+
+        tx2.rollback().expect("to rollback");
+    }
+
+    #[tokio::test]
+    async fn test_write_overwrite_partition_removal() {
+        // Test scenario:
+        // 1. Write to a table with overwrite mode creating two partitions
+        // 2. Write to the same table again with overwrite mode but only one partition
+        // Expected behavior: Old partition table should be removed, only new partition should exist
+        let pool = get_mem_duckdb();
+
+        let table_definition = get_test_table_definition();
+
+        // Create partitioner by name - partition by "region" column
+        let partitioned_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let partitioner = Arc::new(
+            BatchPartitioner::new(
+                &partitioned_by.expression,
+                table_definition.schema(),
+                &partitioned_by,
+            )
+            .expect("should create partitioner"),
+        );
+
+        let duckdb_sink = DuckDBPartitionedDataSink::new(
+            Arc::clone(&pool),
+            Arc::clone(&table_definition),
+            InsertOp::Overwrite,
+            None,
+            table_definition.schema(),
+            partitioner,
+        );
+        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+
+        // First write: Test data with two different regions to create two partitions
+        // id, region
+        // 1, "us-east-1"
+        // 2, "us-west-1"
+        // 3, "us-east-1"
+        // 4, "us-west-1"
+        let batches1 = vec![
+            RecordBatch::try_new(
+                Arc::clone(&table_definition.schema()),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                    ])),
+                ],
+            )
+            .expect("should create a record batch"),
+        ];
+
+        let stream1: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches1, table_definition.schema(), None)
+                .expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream1, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all");
+
+        let mut conn1 = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb1 = DuckDB::duckdb_conn(&mut conn1).expect("to get duckdb conn");
+        let tx1 = duckdb1.conn.transaction().expect("to begin transaction");
+
+        // Verify both partitions were created
+        verify_state_after_write(
+            &tx1,
+            &table_definition,
+            &["region=us-east-1", "region=us-west-1"],
+            2,
+            true,
+        );
+
+        tx1.rollback().expect("to rollback");
+
+        // Second write: Only write data for one partition (us-east-1)
+        let batches2 = vec![
+            RecordBatch::try_new(
+                Arc::clone(&table_definition.schema()),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(10), Some(11)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("us-east-1"),
+                        Some("us-east-1"),
+                    ])),
+                ],
+            )
+            .expect("should create a record batch"),
+        ];
+
+        let stream2: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches2, table_definition.schema(), None)
+                .expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream2, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all");
+
+        let mut conn2 = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb2 = DuckDB::duckdb_conn(&mut conn2).expect("to get duckdb conn");
+        let tx2 = duckdb2.conn.transaction().expect("to begin transaction");
+
+        // Verify only the us-east-1 partition exists with 2 rows
+        verify_state_after_write(&tx2, &table_definition, &["region=us-east-1"], 2, true);
+
+        // Verify that the us-west-1 partition table was removed
+        verify_partition_does_not_exist(&tx2, &table_definition, "region=us-west-1", true);
 
         tx2.rollback().expect("to rollback");
     }
