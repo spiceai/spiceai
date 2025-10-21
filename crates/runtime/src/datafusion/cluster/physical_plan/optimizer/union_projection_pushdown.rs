@@ -5,21 +5,24 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_datasource::source::DataSourceExec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// This looks for any `ProjectionExec` atop `UnionExec` and attempts to push it down into
+/// the inputs of the union
 #[derive(Debug)]
-pub struct UnionProjectionPushdown {}
+pub struct UnionProjectionPushdownOptimizer {}
 
-impl UnionProjectionPushdown {
+impl UnionProjectionPushdownOptimizer {
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(UnionProjectionPushdown {})
+        Arc::new(UnionProjectionPushdownOptimizer {})
     }
 
     fn find_eligible_union(projection: &ProjectionExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -79,7 +82,7 @@ impl UnionProjectionPushdown {
     }
 }
 
-impl PhysicalOptimizerRule for UnionProjectionPushdown {
+impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -106,33 +109,37 @@ impl PhysicalOptimizerRule for UnionProjectionPushdown {
 
                 let projection_expr = projection.expr().to_vec();
 
-                // Take the projection and apply it on top of the union inputs. Notably, this means
-                // above the shuffles of `expand_file_scan`
+                // Take the projection and apply it on top of the union inputs. Specifically, on top
+                // of the repartition exec emitted by `DistributeFileScanOptimizer`
                 for leaf in union_exec.children() {
                     let leaf_key: PlanNodeKey = leaf.as_ref().into();
 
+                    // Decorate the projection atop the union input
                     let projection = Arc::new(ProjectionExec::try_new(
                         projection_expr.clone(),
                         Arc::clone(leaf),
                     )?);
 
+                    // Find the downstream repartition or coalesce
                     let maybe_repartition =
                         SearchVisitor::first_concrete_down::<RepartitionExec>(leaf)?;
 
-                    let wrapped: Arc<dyn ExecutionPlan> = if let Some(repartition) =
-                        maybe_repartition
-                            .as_ref()
-                            .and_then(|p| concrete!(p, RepartitionExec))
-                    {
-                        Arc::new(RepartitionExec::try_new(
-                            projection,
-                            repartition.partitioning().clone(),
-                        )?)
-                    } else {
-                        projection
-                    };
+                    let maybe_coalesce =
+                        SearchVisitor::first_concrete_down::<CoalescePartitionsExec>(leaf)?;
 
-                    replacements.insert(leaf_key, wrapped);
+                    let rewrite_leaf: Arc<dyn ExecutionPlan> =
+                        if let Some(repartition) = maybe_repartition {
+                            Arc::new(RepartitionExec::try_new(
+                                projection,
+                                repartition.output_partitioning().clone(),
+                            )?)
+                        } else if let Some(_) = maybe_coalesce {
+                            Arc::new(CoalescePartitionsExec::new(projection))
+                        } else {
+                            projection
+                        };
+
+                    replacements.insert(leaf_key, rewrite_leaf);
                 }
 
                 Ok(Transformed::yes(Arc::clone(projection.input())))
@@ -150,10 +157,82 @@ impl PhysicalOptimizerRule for UnionProjectionPushdown {
     }
 
     fn name(&self) -> &'static str {
-        "InvertUnionProjectionOptimizer"
+        "UnionProjectionPushdownOptimizer"
     }
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer;
+    use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::tests::create_partitioned_file;
+    use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::tests::{
+        DEFAULT_CONFIG_OPTIONS, create_data_source_exec,
+    };
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use std::sync::LazyLock;
+
+    static OPTIMIZER: LazyLock<PhysicalOptimizer> = LazyLock::new(|| {
+        PhysicalOptimizer::with_rules(vec![
+            DistributeFileScanOptimizer::new(),
+            UnionProjectionPushdownOptimizer::new(),
+        ])
+    });
+
+    fn optimize(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        OPTIMIZER.rules.iter().fold(Arc::clone(plan), |acc, rule| {
+            rule.optimize(acc, &DEFAULT_CONFIG_OPTIONS)
+                .expect("Must optimize")
+        })
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushdown() {
+        let files = vec![
+            create_partitioned_file("file:///file4.parquet", 256_000_000, None),
+            create_partitioned_file("file:///file5.parquet", 256_000_000, None),
+        ];
+
+        let data_source_exec = create_data_source_exec(files);
+        let projection_exec = ProjectionExec::try_new(
+            vec![(
+                col("id", data_source_exec.schema().as_ref()).expect("Must bind expr"),
+                "foo".to_string(),
+            )],
+            data_source_exec,
+        )
+        .expect("Must make projection_exec");
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(projection_exec);
+
+        // We start with 1 projection
+        assert_eq!(
+            SearchVisitor::collect_concrete_down::<ProjectionExec>(&plan)
+                .expect("Must collect")
+                .len(),
+            1
+        );
+
+        let optimized = optimize(&plan);
+
+        let data_source_exec_leaves =
+            SearchVisitor::collect_concrete_down::<DataSourceExec>(&optimized)
+                .expect("Must collect")
+                .len();
+
+        // Make sure we have enough leaves to test with
+        assert!(data_source_exec_leaves > 1);
+
+        // The number of projections must match the number of DataSourceExec leaves
+        assert_eq!(
+            SearchVisitor::collect_concrete_down::<ProjectionExec>(&optimized)
+                .expect("Must collect")
+                .len(),
+            data_source_exec_leaves
+        );
     }
 }

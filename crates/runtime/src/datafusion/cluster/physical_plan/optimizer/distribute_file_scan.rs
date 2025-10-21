@@ -267,7 +267,7 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::datafusion::cluster::physical_plan::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -278,13 +278,17 @@ mod tests {
     use object_store::path::Path;
     use std::sync::LazyLock;
 
-    static DEFAULT_CONFIG_OPTIONS: LazyLock<ConfigOptions> = LazyLock::new(|| {
+    pub static DEFAULT_CONFIG_OPTIONS: LazyLock<ConfigOptions> = LazyLock::new(|| {
         let mut config = ConfigOptions::default();
         config.extensions.insert(SpiceClusterConfig::default());
         config
     });
 
-    fn create_partitioned_file(path: &str, size: u64, range: Option<FileRange>) -> PartitionedFile {
+    pub fn create_partitioned_file(
+        path: &str,
+        size: u64,
+        range: Option<FileRange>,
+    ) -> PartitionedFile {
         PartitionedFile {
             object_meta: ObjectMeta {
                 location: Path::from(path),
@@ -314,7 +318,7 @@ mod tests {
         )
     }
 
-    fn create_data_source_exec(files: Vec<PartitionedFile>) -> Arc<dyn ExecutionPlan> {
+    pub fn create_data_source_exec(files: Vec<PartitionedFile>) -> Arc<dyn ExecutionPlan> {
         let fsc = file_scan_config_builder()
             .with_file_group(FileGroup::new(files))
             .build();

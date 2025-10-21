@@ -52,7 +52,7 @@ use {
     crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec,
     crate::datafusion::cluster::config::SpiceClusterConfig,
     crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer,
-    crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdown,
+    crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdownOptimizer,
     ::datafusion::execution::SessionStateBuilder,
     ::datafusion::prelude::SessionConfig,
     ballista_core::extension::SessionConfigExt,
@@ -637,7 +637,7 @@ impl Runtime {
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env())
                     .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
-                    .with_physical_optimizer_rule(UnionProjectionPushdown::new())
+                    .with_physical_optimizer_rule(UnionProjectionPushdownOptimizer::new())
                     .build(),
             )
         }));
