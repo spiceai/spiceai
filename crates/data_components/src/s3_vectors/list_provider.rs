@@ -13,7 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{Arc, Mutex},
+};
 
 use crate::s3_vectors::{
     Error, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -133,7 +136,7 @@ async fn create_spill_plan(
                 client: Arc::clone(client),
                 schema: Arc::clone(&table.table.schema),
                 constraints: table.table.constraints.clone(),
-                idx: index_table_identifier,
+                idx: Arc::new(Mutex::new(index_table_identifier)),
                 dimension: table.table.dimension,
                 columns: table.table.columns.clone(),
                 distance_metric: table.table.distance_metric.clone(),
@@ -236,7 +239,7 @@ async fn create_partition_plan(
             client: Arc::clone(client),
             schema: Arc::clone(&table.table.schema),
             constraints: table.table.constraints.clone(),
-            idx: index_table_identifier,
+            idx: Arc::new(Mutex::new(index_table_identifier)),
             dimension: table.table.dimension,
             columns: table.table.columns.clone(),
             distance_metric: table.table.distance_metric.clone(),
@@ -300,10 +303,13 @@ impl TableProvider for S3VectorsListTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let (_, bucket_name, index_name) = self.table.idx.index_identifier_variables();
+        let (_, bucket_name, index_name) = {
+            let idx = self.table.idx.lock().unwrap();
+            idx.index_identifier_variables()
+        };
 
-        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name)
-            && let Some(plan) = create_spill_plan(
+        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
+            if let Some(plan) = create_spill_plan(
                 &self.table.client,
                 &bucket_name,
                 &index_name,
@@ -312,8 +318,9 @@ impl TableProvider for S3VectorsListTable {
                 limit,
             )
             .await?
-        {
-            return Ok(plan);
+            {
+                return Ok(plan);
+            }
         }
 
         if self.partition_by.is_empty() {
@@ -322,8 +329,11 @@ impl TableProvider for S3VectorsListTable {
             );
         }
 
-        let (_, Some(bucket_name), Some(index_name)) = self.table.idx.index_identifier_variables()
-        else {
+        let (_, bucket_name, index_name) = {
+            let idx = self.table.idx.lock().unwrap();
+            idx.index_identifier_variables()
+        };
+        let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
             return exec_err!("No bucket name or index name for bucket query");
         };
 
@@ -384,7 +394,7 @@ impl S3VectorsListExec {
         );
 
         Self {
-            idx: table.table.idx.clone(),
+            idx: table.table.idx.lock().unwrap().clone(),
             client: Arc::clone(&table.table.client),
             plan_properties: properties,
             limit,
@@ -714,10 +724,10 @@ mod tests {
             client: mock_client,
             schema,
             constraints: Constraints::default(),
-            idx: S3VectorIdentifier::Index {
+            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name_prefix.to_string(),
-            },
+            })),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -800,10 +810,10 @@ mod tests {
             client: mock_client,
             schema,
             constraints: Constraints::default(),
-            idx: S3VectorIdentifier::Index {
+            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: virtual_index_name.to_string(),
-            },
+            })),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -896,10 +906,10 @@ mod tests {
             client: mock_client,
             schema,
             constraints: Constraints::default(),
-            idx: S3VectorIdentifier::Index {
+            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: virtual_index_name.to_string(),
-            },
+            })),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -1019,11 +1029,11 @@ mod tests {
             client: mock_client,
             schema,
             constraints: Constraints::default(),
-            idx: S3VectorIdentifier::Index {
+            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: base_index_name.to_string(),
-            },
-            dimension: 0,
+            })),
+            dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };

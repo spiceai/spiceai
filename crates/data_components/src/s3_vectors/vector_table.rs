@@ -490,7 +490,8 @@ impl S3VectorsTable {
         let mut current_index = match self.idx.lock() {
             Ok(i) => i,
             Err(e) => e.into_inner(),
-        };
+        }
+        .clone();
         let mut attempt_count = 0;
 
         loop {
@@ -526,7 +527,12 @@ impl S3VectorsTable {
                                 tracing::info!(
                                     "S3 Vector index {current_index} reached capacity, spilling to {next_index}",
                                 );
-                                *current_index = next_index;
+                                // Update the stored index
+                                match self.idx.lock() {
+                                    Ok(mut guard) => *guard = next_index.clone(),
+                                    Err(e) => *e.into_inner() = next_index.clone(),
+                                }
+                                current_index = next_index;
                             }
                             None => {
                                 return Err(Error::MaxSpillAttemptsReached);
