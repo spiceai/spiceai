@@ -101,6 +101,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
