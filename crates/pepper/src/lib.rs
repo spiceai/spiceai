@@ -16,18 +16,24 @@ limitations under the License.
 
 #![deny(missing_docs)]
 
-//! Pepper: A minimal `DuckLake`-inspired lakehouse format using `SQLite` for metadata
+//! Pepper: A minimal `DuckLake`-inspired lakehouse format with configurable metadata backend
 //! and Vortex files as the data lake.
 //!
 //! This module provides a lakehouse format that combines:
-//! - `SQLite` for transactional metadata management (schemas, tables, files)
+//! - Configurable metadata backend (`SQLite` or Arrow/Feather) for transactional metadata management (schemas, tables, files)
 //! - Vortex files for efficient columnar data storage
 //!
 //! # Architecture
 //!
 //! Pepper follows the `DuckLake` specification with these key components:
-//! - **Metadata Catalog**: `SQLite` database storing table metadata and file references
+//! - **Metadata Catalog**: Configurable backend (SQLite or Arrow/Feather) storing table metadata and file references
 //! - **Data Lake**: Directory of Vortex files containing the actual data
+//!
+//! # Backend Options
+//!
+//! Pepper supports multiple metadata backends:
+//! - **SQLite** (`sqlite://path/to/database.db`): Traditional relational database with ACID guarantees
+//! - **Arrow/Feather** (`arrow://path/to/directory`): Cloud-native format using DataFusion with Arrow IPC files
 //!
 //! # Virtual Files Concept
 //!
@@ -46,12 +52,16 @@ limitations under the License.
 //! - **Getting stats**: Query the `ListingTable`'s statistics
 //!
 //! This design allows Pepper to leverage Vortex's columnar format and `DataFusion`'s
-//! `ListingTable` capabilities while maintaining transactional metadata in `SQLite`.
+//! `ListingTable` capabilities while maintaining transactional metadata with the chosen backend.
 //!
 //! # Core Concepts
 //!
 //! - **Tables**: Metadata about table schemas and structure
 //! - **Data Files**: Metadata for virtual files (Vortex `ListingTables` at unique directories)
+
+mod arrow_backend;
+mod backend;
+mod sqlite_backend;
 
 pub mod catalog;
 pub mod metadata;

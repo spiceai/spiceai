@@ -328,9 +328,32 @@ impl PepperAccelerator {
             source: Box::new(e),
         })?;
 
-        let catalog = Arc::new(PepperCatalog::new(format!(
-            "sqlite://{metadata_dir}/pepper.db"
-        )));
+        // Determine the metadata store backend (sqlite or arrow)
+        let metadata_store = if let Some(acceleration) = source.acceleration() {
+            acceleration
+                .params
+                .get("pepper_metadata_store")
+                .map(|s| s.as_str())
+                .unwrap_or("sqlite")
+        } else {
+            "sqlite"
+        };
+
+        // Validate the metadata_store value
+        let connection_string = match metadata_store {
+            "sqlite" => format!("sqlite://{metadata_dir}/pepper.db"),
+            "arrow" => format!("arrow://{metadata_dir}/pepper_catalog"),
+            _ => {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Invalid pepper_metadata_store value '{}'. Must be 'sqlite' or 'arrow'",
+                        metadata_store
+                    )),
+                });
+            }
+        };
+
+        let catalog = Arc::new(PepperCatalog::new(connection_string));
 
         // Initialize the catalog (creates tables if needed)
         catalog
@@ -364,6 +387,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("unsupported_type_action")
         .description("How to handle data types not natively supported by Pepper (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
+    ParameterSpec::component("pepper_metadata_store")
+        .description("The metadata store backend to use for Pepper catalog. Options: 'sqlite' (default, uses SQLite database), 'arrow' (uses Apache Arrow IPC/Feather files)")
+        .default("sqlite"),
 ];
 
 #[async_trait]

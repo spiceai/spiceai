@@ -25,22 +25,52 @@ use pepper::{MetadataCatalog, PepperCatalog, PepperTableProvider};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> {
+/// Backend configuration for tests
+#[derive(Debug, Clone, Copy)]
+enum Backend {
+    Sqlite,
+    Arrow,
+}
+
+impl Backend {
+    /// Create a connection string for this backend
+    fn connection_string(&self, temp_dir: &TempDir) -> String {
+        match self {
+            Backend::Sqlite => {
+                let db_path = temp_dir.path().join("test.db");
+                format!("sqlite://{}", db_path.to_string_lossy())
+            }
+            Backend::Arrow => {
+                let metadata_path = temp_dir.path().join("metadata");
+                format!("arrow://{}", metadata_path.to_string_lossy())
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Backend::Sqlite => "SQLite",
+            Backend::Arrow => "Arrow/Feather",
+        }
+    }
+}
+
+/// Run the basic workflow test with a specific backend
+async fn run_basic_workflow_test(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "\n🧪 Testing Pepper basic workflow with {} backend",
+        backend.name()
+    );
+
     // Create a temporary directory for the test
     let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test.db");
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path)?;
 
     // 1. Create and initialize catalog
-    let catalog = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
+    let catalog = Arc::new(PepperCatalog::new(backend.connection_string(&temp_dir)));
     catalog.init().await?;
-    println!("✓ Catalog initialized");
+    println!("✓ Catalog initialized ({})", backend.name());
 
     // 2. Create table schema
     let schema = Arc::new(Schema::new(vec![
@@ -164,9 +194,9 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(total_rows, 3, "Expected 3 rows in projection");
     println!("✓ Projection query successful (1 column, 3 rows)");
 
-    // 13. Verify SQLite metastore after first insert
-    verify_sqlite_metadata(&db_path, &data_path)?;
-    println!("✓ SQLite metastore verification successful (round 1)");
+    // 13. Verify metadata after first insert (backend-specific)
+    verify_metadata(&backend, &temp_dir, &data_path)?;
+    println!("✓ Metadata verification successful (round 1)");
 
     // === ROUND 2: Second insert ===
     println!("\n--- Round 2: Additional insert ---");
@@ -257,11 +287,132 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(total_rows, 5, "Expected 5 rows in projection");
     println!("✓ Projection query successful (round 2: 1 column, 5 rows)");
 
-    // 20. Verify SQLite metastore after second insert
-    verify_sqlite_metadata(&db_path, &data_path)?;
-    println!("✓ SQLite metastore verification successful (round 2)");
+    // 20. Verify metadata after second insert
+    verify_metadata(&backend, &temp_dir, &data_path)?;
+    println!("✓ Metadata verification successful (round 2)");
 
-    println!("\n✅ Basic workflow test passed!");
+    println!(
+        "\n✅ Basic workflow test passed with {} backend!",
+        backend.name()
+    );
+    Ok(())
+}
+
+// Public test functions that call the shared implementation
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_pepper_basic_workflow_sqlite() -> Result<(), Box<dyn std::error::Error>> {
+    run_basic_workflow_test(Backend::Sqlite).await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_pepper_basic_workflow_arrow() -> Result<(), Box<dyn std::error::Error>> {
+    run_basic_workflow_test(Backend::Arrow).await
+}
+
+/// Verify metadata based on the backend type
+fn verify_metadata(
+    backend: &Backend,
+    temp_dir: &TempDir,
+    data_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match backend {
+        Backend::Sqlite => {
+            let db_path = temp_dir.path().join("test.db");
+            verify_sqlite_metadata(&db_path, data_path)
+        }
+        Backend::Arrow => {
+            let metadata_path = temp_dir.path().join("metadata");
+            verify_arrow_metadata(&metadata_path, data_path)
+        }
+    }
+}
+
+/// Helper function to verify `Arrow` metadata contains expected data
+fn verify_arrow_metadata(
+    metadata_path: &std::path::Path,
+    data_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow_ipc::reader::FileReader;
+
+    // 1. Verify metadata file exists
+    let metadata_file = metadata_path.join("pepper_metadata.arrow");
+    assert!(metadata_file.exists(), "Metadata file should exist");
+
+    let file = std::fs::File::open(&metadata_file)?;
+    let reader = FileReader::try_new(file, None)?;
+
+    let batches: Vec<_> = reader.collect::<Result<_, _>>()?;
+    assert!(!batches.is_empty(), "Metadata should contain data");
+
+    // Find next_catalog_id in metadata
+    let mut found_catalog_id = false;
+    for batch in &batches {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("keys column");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("values column");
+
+        for i in 0..batch.num_rows() {
+            if keys.value(i) == "next_catalog_id" {
+                let next_id = values.value(i);
+                assert!(next_id >= 2, "Expected next_catalog_id to be at least 2");
+                found_catalog_id = true;
+                println!("  • Metadata verified: next_catalog_id={next_id}");
+                break;
+            }
+        }
+    }
+    assert!(found_catalog_id, "Should find next_catalog_id in metadata");
+
+    // 2. Verify tables file exists and has test_table entry
+    let tables_file = metadata_path.join("pepper_table.arrow");
+    assert!(tables_file.exists(), "Tables file should exist");
+
+    let file = std::fs::File::open(&tables_file)?;
+    let reader = FileReader::try_new(file, None)?;
+
+    let batches: Vec<_> = reader.collect::<Result<_, _>>()?;
+    assert!(!batches.is_empty(), "Tables should contain data");
+
+    // Verify we have test_table
+    let mut found_test_table = false;
+    for batch in &batches {
+        let table_names = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("table_name column");
+        let paths = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path column");
+
+        for i in 0..batch.num_rows() {
+            if table_names.value(i) == "test_table" {
+                assert_eq!(
+                    paths.value(i),
+                    data_path.to_string_lossy().to_string(),
+                    "Expected path to match data directory"
+                );
+                found_test_table = true;
+                println!("  • Table metadata verified: name=test_table");
+                break;
+            }
+        }
+    }
+    assert!(found_test_table, "Should find test_table in tables");
+
+    println!("  • Arrow metadata files verified");
+
     Ok(())
 }
 
@@ -372,31 +523,48 @@ fn verify_sqlite_metadata(
     Ok(())
 }
 
-#[tokio::test]
-async fn test_pepper_catalog_persistence() -> Result<(), Box<dyn std::error::Error>> {
+/// Run catalog persistence test with a specific backend
+async fn run_catalog_persistence_test(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "\n🧪 Testing catalog persistence with {} backend",
+        backend.name()
+    );
+
     let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("persist.db");
 
     // Create catalog and initialize
     {
-        let catalog = PepperCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()));
+        let catalog = PepperCatalog::new(backend.connection_string(&temp_dir));
         catalog.init().await?;
-        println!("✓ First initialization complete");
+        println!("✓ First initialization complete ({})", backend.name());
     }
 
     // Re-open and verify it doesn't fail
     {
-        let catalog = PepperCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()));
+        let catalog = PepperCatalog::new(backend.connection_string(&temp_dir));
         catalog.init().await?;
         println!("✓ Second initialization complete (idempotent)");
     }
 
-    println!("\n✅ Catalog persistence test passed!");
+    println!(
+        "\n✅ Catalog persistence test passed with {} backend!",
+        backend.name()
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_pepper_catalog_persistence_sqlite() -> Result<(), Box<dyn std::error::Error>> {
+    run_catalog_persistence_test(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn test_pepper_catalog_persistence_arrow() -> Result<(), Box<dyn std::error::Error>> {
+    run_catalog_persistence_test(Backend::Arrow).await
+}
+
+/// Run statistics test with a specific backend
+async fn run_statistics_test(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::TableReference;
     use datafusion::execution::context::SessionContext;
@@ -404,21 +572,19 @@ async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
     use pepper::metadata::CreateTableOptions;
     use pepper::{PepperCatalog, PepperTableProvider};
     use std::sync::Arc;
-    use tempfile::TempDir;
 
-    println!("\n🧪 Testing Pepper statistics tracking...");
+    println!(
+        "\n🧪 Testing Pepper statistics tracking with {} backend...",
+        backend.name()
+    );
 
     // 1. Setup test environment
     let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("stats_test.db");
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path)?;
 
     // 2. Create catalog and table
-    let catalog = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
+    let catalog = Arc::new(PepperCatalog::new(backend.connection_string(&temp_dir)));
     catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![
@@ -438,7 +604,7 @@ async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
         table_options,
     )
     .await?;
-    println!("✓ Table created");
+    println!("✓ Table created ({})", backend.name());
 
     // 3. Check that statistics method is available and delegates to ListingTable
     // The statistics() method returns Option<Statistics> from the underlying ListingTable
@@ -477,6 +643,19 @@ async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
         println!("  • Statistics provide query optimizer information for better performance");
     }
 
-    println!("\n✅ Statistics tracking test passed!");
+    println!(
+        "\n✅ Statistics tracking test passed with {} backend!",
+        backend.name()
+    );
     Ok(())
+}
+
+#[tokio::test]
+async fn test_pepper_statistics_sqlite() -> Result<(), Box<dyn std::error::Error>> {
+    run_statistics_test(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn test_pepper_statistics_arrow() -> Result<(), Box<dyn std::error::Error>> {
+    run_statistics_test(Backend::Arrow).await
 }

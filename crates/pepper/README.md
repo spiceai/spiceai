@@ -1,12 +1,12 @@
 # Pepper
 
-A minimal DuckLake-inspired implementation for the Vortex accelerator that combines SQLite for metadata management with Vortex files as the data lake.
+A minimal DuckLake-inspired implementation for the Vortex accelerator that combines configurable metadata backends (SQLite or Arrow/Feather) with Vortex files as the data lake.
 
 ## Overview
 
 Pepper provides a lakehouse format that enables efficient CRUD operations on columnar data with the following features:
 
-- **SQLite Metadata Catalog**: Transactional metadata management following the DuckLake specification
+- **Configurable Metadata Backend**: Choose between SQLite or Arrow/Feather for metadata management
 - **Vortex Data Files**: High-performance columnar storage with compression
 
 **Note**: While the codebase includes a snapshot module (`snapshot.rs`) and a `SnapshotManager` API stub, snapshot functionality is not yet implemented or available in this version of Pepper. Similarly, MVCC and deletion vectors are not supported. These features are planned for future releases.
@@ -18,7 +18,8 @@ Pepper provides a lakehouse format that enables efficient CRUD operations on col
 │      Pepper Table                   │
 │                                     │
 │  ┌──────────────────────────────┐  │
-│  │   SQLite Metadata Catalog    │  │
+│  │   Metadata Catalog           │  │
+│  │   (SQLite or Arrow/Feather)  │  │
 │  │                              │  │
 │  │  - Table Schemas            │  │
 │  │  - Data File References     │  │
@@ -54,8 +55,13 @@ pub trait MetadataCatalog: Send + Sync {
 
 Implementations:
 
-- `PepperCatalog`: SQLite-based catalog (primary implementation)
-- Future: PostgreSQL, DuckDB, etc.
+- `SqliteBackend`: SQLite-based catalog with ACID guarantees
+- `ArrowBackend`: Arrow/Feather-based catalog using Arrow IPC files for cloud-native storage
+
+Connection strings:
+
+- SQLite: `sqlite://path/to/database.db`
+- Arrow/Feather: `arrow://path/to/metadata/directory`
 
 ### 2. Metadata Structures (`metadata.rs`)
 
@@ -236,8 +242,12 @@ use pepper::{
     PepperCatalog, PepperTableProvider, CreateTableOptions,
 };
 
-// Create catalog
+// Create catalog with SQLite backend
 let catalog = Arc::new(PepperCatalog::new("sqlite:///data/catalog.db"));
+catalog.init().await?;
+
+// Or create catalog with Arrow/Feather backend for cloud-native storage
+let catalog = Arc::new(PepperCatalog::new("arrow:///data/metadata"));
 catalog.init().await?;
 
 // Create table

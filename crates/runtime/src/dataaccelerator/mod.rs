@@ -784,7 +784,9 @@ mod accelerator_compat_tests {
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
             #[cfg(feature = "pepper")]
-            (Engine::Pepper, "file", None), // Pepper only supports file mode
+            (Engine::Pepper, "file", Some("sqlite")), // Pepper with SQLite metadata backend
+            #[cfg(feature = "pepper")]
+            (Engine::Pepper, "file", Some("arrow")), // Pepper with Arrow metadata backend
         ];
 
         for (engine, mode, timestamp_format) in test_configs {
@@ -792,7 +794,12 @@ mod accelerator_compat_tests {
             let test_env = TestEnvironment::new();
 
             let mode_label = if let Some(ts_fmt) = timestamp_format {
-                format!("{}, timestamp_format={}", mode, ts_fmt)
+                if engine == Engine::Pepper {
+                    // For Pepper, timestamp_format is actually the metadata store backend
+                    format!("{}, pepper_metadata_store={}", mode, ts_fmt)
+                } else {
+                    format!("{}, timestamp_format={}", mode, ts_fmt)
+                }
             } else {
                 mode.to_string()
             };
@@ -827,9 +834,15 @@ mod accelerator_compat_tests {
             // Add mode option for engines that need it (e.g., Vortex)
             options.insert("mode".to_string(), mode.to_string());
 
-            // Add timestamp_format option for Turso
+            // Add timestamp_format option for Turso or pepper_metadata_store for Pepper
             if let Some(ts_fmt) = timestamp_format {
-                options.insert("internal_timestamp_format".to_string(), ts_fmt.to_string());
+                if engine == Engine::Pepper {
+                    // For Pepper, use pepper_metadata_store parameter
+                    options.insert("pepper_metadata_store".to_string(), ts_fmt.to_string());
+                } else {
+                    // For other engines (e.g., Turso), use internal_timestamp_format
+                    options.insert("internal_timestamp_format".to_string(), ts_fmt.to_string());
+                }
             }
 
             let external_table = CreateExternalTable {
@@ -969,6 +982,13 @@ mod accelerator_compat_tests {
                     }
                     // Use test environment's metadata directory for Pepper
                     params.insert("pepper_metadata_dir".to_string(), test_env.metadata_dir());
+                    // Add pepper_metadata_store parameter if specified (sqlite or arrow)
+                    if let Some(metadata_store) = timestamp_format {
+                        params.insert(
+                            "pepper_metadata_store".to_string(),
+                            metadata_store.to_string(),
+                        );
+                    }
                     // Use 'error' mode for tests to fail on unsupported types
                     // This matches the new default production behavior
                     params.insert("unsupported_type_action".to_string(), "error".to_string());
