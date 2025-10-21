@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
-
 use ::cache::{
     get_logical_plan_input_tables,
     key::CacheKey,
@@ -35,6 +33,7 @@ use datafusion::{
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
+use std::{fmt::Display, sync::Arc};
 use tokio::time::Instant;
 use tracing::Span;
 use tracing_futures::Instrument;
@@ -47,12 +46,12 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
-use async_stream::stream;
-use futures::StreamExt;
-
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use async_stream::stream;
+use futures::StreamExt;
+use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -285,6 +284,13 @@ impl Query {
                 final_stream,
                 physical_plan,
                 Arc::clone(&request_context),
+                inner_span.clone(),
+            );
+
+            let final_stream = attach_query_active_guard_to_stream(
+                final_stream,
+                &request_context,
+                inner_span.clone(),
             );
 
             Ok(QueryResult::new(
@@ -489,12 +495,72 @@ fn attach_query_tracker_to_stream(
     ))
 }
 
+/// This guard guarantees:
+///  * If we incremented nested query count, we will decrement. And vice versa.
+///  * If we incremented active query count, we will decrement. And vice versa.
+///  * Active query count decrement will be called with the same dimensions as increment.
+pub struct QueryActiveGuard {
+    request_context: Arc<RequestContext>,
+    dimensions: &'static [KeyValue],
+    active: bool,
+}
+
+impl QueryActiveGuard {
+    pub fn new(request_context: Arc<RequestContext>) -> Self {
+        let dimensions = request_context.to_protocol_dimensions();
+
+        let active = request_context.entered_top_level_query();
+        if active {
+            crate::metrics::telemetry::inc_query_active_count(dimensions);
+        }
+
+        Self {
+            request_context,
+            dimensions,
+            active,
+        }
+    }
+}
+
+impl Drop for QueryActiveGuard {
+    fn drop(&mut self) {
+        let exited = self.request_context.exited_top_level_query();
+        if self.active && exited {
+            crate::metrics::telemetry::dec_query_active_count(self.dimensions);
+        }
+    }
+}
+
+fn attach_query_active_guard_to_stream(
+    stream: SendableRecordBatchStream,
+    request_context: &Arc<RequestContext>,
+    span: Span,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+
+    let guard = QueryActiveGuard::new(Arc::clone(request_context));
+
+    let updated_stream =
+        futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
+            stream
+                .next()
+                .await
+                .map(|batch_result| (batch_result, (stream, guard)))
+        });
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        Box::pin(updated_stream.instrument(span)),
+    ))
+}
+
 #[must_use]
 /// Attaches logic to a stream which emits metrics from a physical plan.
 fn attach_physical_plan_metrics_to_stream(
     mut stream: SendableRecordBatchStream,
     physical_plan: Arc<dyn ExecutionPlan>,
     request_context: Arc<RequestContext>,
+    span: Span,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
 
@@ -513,7 +579,7 @@ fn attach_physical_plan_metrics_to_stream(
 
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
-        Box::pin(updated_stream),
+        Box::pin(updated_stream.instrument(span)),
     ))
 }
 
