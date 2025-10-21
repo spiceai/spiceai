@@ -378,7 +378,7 @@ async fn get_filter_for_table(
         Ok(f) => Ok(Some(f)),
         Err(e) if is_field_not_found_on_unrelated_table(&tbl, &e) => {
             tracing::debug!(
-                "Ignoring SQL filter ('{}') on table {tbl:?} for search request as its column do not reference this table",
+                "Ignoring SQL filter ('{}') on table {tbl:?} for search request as its columns do not reference this table",
                 filter
             );
             Ok(None)
