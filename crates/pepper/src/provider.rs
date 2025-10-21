@@ -74,7 +74,7 @@ pub struct PepperTableProvider {
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
-    /// Wrapped in RwLock to allow updating the listing table on overwrite operations.
+    /// Wrapped in `RwLock` to allow updating the listing table on overwrite operations.
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
 }
 

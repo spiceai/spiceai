@@ -266,7 +266,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
 
     // Count subdirectories before overwrite
     let entries_before: Vec<_> = std::fs::read_dir(&data_path)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
         .collect();
     println!(
@@ -283,7 +283,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
 
     // Count subdirectories after overwrite - should have created a new one
     let entries_after: Vec<_> = std::fs::read_dir(&data_path)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
         .collect();
     println!("✓ Subdirectories after overwrite: {}", entries_after.len());
@@ -297,7 +297,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
 
     // Verify overwrite directory naming
     let overwrite_dirs: Vec<_> = std::fs::read_dir(&data_path)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir() && e.file_name().to_string_lossy().starts_with("overwrite_"))
         .collect();
     assert!(

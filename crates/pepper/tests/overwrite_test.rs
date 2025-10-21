@@ -70,7 +70,10 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Verify initial data
     let df = ctx.sql("SELECT * FROM test_overwrite ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|batch| batch.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 3, "Expected 3 rows after initial insert");
     println!("✓ Initial data verified (3 rows)");
 
@@ -79,7 +82,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check how many subdirectories exist before overwrite
     let entries_before: Vec<_> = std::fs::read_dir(&data_path)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
         .collect();
     println!(
@@ -95,7 +98,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Check that a new subdirectory was created
     let entries_after: Vec<_> = std::fs::read_dir(&data_path)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
         .collect();
     println!("✓ Subdirectories after overwrite: {}", entries_after.len());
@@ -112,23 +115,26 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     // overwrite directory, so queries should only see the new data (2 rows)
     let df = ctx.sql("SELECT * FROM test_overwrite ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|batch| batch.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
 
     assert_eq!(
         total_rows, 2,
         "Expected 2 rows after overwrite (old data replaced)"
     );
-    println!(
-        "✓ Query returned {} rows after overwrite (old data replaced)",
-        total_rows
-    );
+    println!("✓ Query returned {total_rows} rows after overwrite (old data replaced)");
 
     // Verify we can see the new data
     let df = ctx
         .sql("SELECT * FROM test_overwrite WHERE id >= 10 ORDER BY id")
         .await?;
     let results = df.collect().await?;
-    let new_data_rows: usize = results.iter().map(|batch| batch.num_rows()).sum();
+    let new_data_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(
         new_data_rows, 2,
         "Expected to find 2 new rows with id >= 10"
@@ -137,7 +143,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Verify subdirectory naming
     let overwrite_dirs: Vec<_> = std::fs::read_dir(&data_path)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir() && e.file_name().to_string_lossy().starts_with("overwrite_"))
         .collect();
     assert!(
