@@ -66,7 +66,7 @@ jobs:
           echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
 
   lint:
-    name: Run Go & Rust Linters
+    name: Run Go & Rust Linters and Build
     runs-on: spiceai-dev-runners
     env:
       GOVER: 1.25.3
@@ -131,6 +131,11 @@ jobs:
         with:
           os: 'linux'
 
+      - name: Install Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - name: Check if sccache can be set up
         run: |
           if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
@@ -142,7 +147,7 @@ jobs:
           fi
 
       - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -170,106 +175,8 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
-      - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
-
-      - name: Check if Cargo.lock is updated
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          if git diff --exit-code Cargo.lock; then
-            echo "Cargo.lock is up to date"
-          else
-            echo "Update Cargo.lock"
-            exit 1
-          fi
-
-  build:
-    name: Build Go & Rust
-    runs-on: spiceai-dev-runners
-    env:
-      GOVER: 1.25.3
-    needs: check_changes
-
-    steps:
-      - uses: actions/checkout@v5
-
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # Cache Go modules
-      - name: Cache Go modules
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      # Cache Rust build artifacts
-      - name: Cache Rust build
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-rust-build-${{ env.RUST_PROFILE }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-build-${{ env.RUST_PROFILE }}-
-            ${{ runner.os }}-rust-build-
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
-
-      - name: Install Nextest
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
-      - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
-
-      - name: Set up make
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
-
-      - run: make build-cli nextest
+      - name: Build CLI and run nextest
+        run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -293,3 +200,13 @@ jobs:
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
+
+      - name: Check if Cargo.lock is updated
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
