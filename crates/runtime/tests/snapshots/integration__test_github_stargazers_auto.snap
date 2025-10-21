@@ -8,8 +8,8 @@ description: "Query: SELECT * FROM spiceai_stargazers_auto LIMIT 10"
 | logical_plan  | Limit: skip=0, fetch=10                                                                                                                      |
 |               |   BytesProcessedNode                                                                                                                         |
 |               |     TableScan: spiceai_stargazers_auto projection=[starred_at, login, email, name, company, x_username, location, avatar_url, bio], fetch=10 |
-| physical_plan | GlobalLimitExec: skip=0, fetch=10                                                                                                            |
-|               |   BytesProcessedExec                                                                                                                         |
+| physical_plan | BytesProcessedExec                                                                                                                           |
+|               |   GlobalLimitExec: skip=0, fetch=10                                                                                                          |
 |               |     CooperativeExec                                                                                                                          |
 |               |       GraphQLTableProviderExec limit=[10]                                                                                                    |
 |               |                                                                                                                                              |
