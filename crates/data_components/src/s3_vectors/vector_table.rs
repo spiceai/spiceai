@@ -518,11 +518,7 @@ impl S3VectorsTable {
                                 current_index = next_index;
                             }
                             None => {
-                                return Err(Error::InternalError {
-                                    source: Box::new(std::io::Error::other(format!(
-                                        "S3 Vector index {current_index} reached capacity and no more spill indexes available",
-                                    ))),
-                                });
+                                return Err(Error::MaxSpillAttemptsReached);
                             }
                         }
                     } else {
