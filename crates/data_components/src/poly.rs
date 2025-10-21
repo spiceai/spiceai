@@ -70,6 +70,11 @@ impl PolyTableProvider {
     pub fn get_federated_table_provider(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.fed)
     }
+
+    #[must_use]
+    pub fn writer(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.write)
+    }
 }
 
 #[async_trait]
