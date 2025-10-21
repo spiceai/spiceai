@@ -106,6 +106,14 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
+      - name: Configure Cargo directories (self-hosted macOS)
+        if: matrix.target.builder == 'spiceai-macos'
+        run: |
+          set -euo pipefail
+          cargo_home="${{ runner.temp }}/cargo-${{ github.run_id }}-${{ github.job }}"
+          mkdir -p "$cargo_home/bin"
+          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
+
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
@@ -149,27 +157,6 @@ jobs:
 
       - name: Build spiced
         run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension"
-
-      - name: Update build cache (macOS)
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          if [ -d /Users/spiceai/build/target ]; then
-            rsync -av target/ /Users/spiceai/build/target/
-          fi
-
-      - name: Update build cache (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av target/ /home/spiceai/build/target/
-          fi
-
-      - name: Update build cache (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
-          }
 
       - name: Build spice
         run: make -C bin/spice
