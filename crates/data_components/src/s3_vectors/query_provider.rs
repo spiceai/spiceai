@@ -390,12 +390,16 @@ impl TableProvider for S3VectorsQueryTable {
             .map_err(DataFusionError::External)?;
 
         let (_, bucket_name, index_name) = {
-            let idx = self.table.idx.lock().unwrap();
+            let idx = match self.table.idx.lock() {
+                Ok(i) => i,
+                Err(e) => e.into_inner(),
+            };
+
             idx.index_identifier_variables()
         };
 
-        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
-            if let Some(plan) = create_spill_plan_query(
+        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name)
+            && let Some(plan) = create_spill_plan_query(
                 &self.table.client,
                 &bucket_name,
                 &index_name,
@@ -406,9 +410,8 @@ impl TableProvider for S3VectorsQueryTable {
                 query_vector.clone(),
             )
             .await?
-            {
-                return Ok(plan);
-            }
+        {
+            return Ok(plan);
         }
 
         if self.partition_by.is_empty() {
@@ -433,7 +436,10 @@ impl TableProvider for S3VectorsQueryTable {
         }
 
         let (_, bucket_name, index_name) = {
-            let idx = self.table.idx.lock().unwrap();
+            let idx = match self.table.idx.lock() {
+                Ok(i) => i,
+                Err(e) => e.into_inner(),
+            };
             idx.index_identifier_variables()
         };
         let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
@@ -505,13 +511,19 @@ impl S3VectorsQueryExec {
             Boundedness::Bounded,
         );
 
+        let idx = match table.table.idx.lock() {
+            Ok(i) => i,
+            Err(e) => e.into_inner(),
+        }
+        .clone();
+
         Self {
-            idx: table.table.idx.lock().unwrap().clone(),
+            idx,
             client: Arc::clone(&table.table.client),
             plan_properties: properties,
             query,
             limit: i32::try_from(limit).unwrap_or(i32::MAX),
-            filters: filters.to_vec(),
+            filters,
         }
     }
 }

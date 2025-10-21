@@ -602,7 +602,7 @@ impl S3VectorsTable {
             }
             let spill_name = format!("{base_index_name}.{spill_num:02}");
             match self.create_spill_index(&bucket_name, &spill_name).await {
-                Ok(_) => {
+                Ok(()) => {
                     return Ok(Some(S3VectorIdentifier::Index {
                         bucket_name: bucket_name.clone(),
                         index_name: spill_name,
