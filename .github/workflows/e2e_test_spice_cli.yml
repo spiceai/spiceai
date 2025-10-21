@@ -69,6 +69,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - name: Set up make
         if: matrix.target.target_os == 'linux' && github.event.inputs.build_cli == 'true'
