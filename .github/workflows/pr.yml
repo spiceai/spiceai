@@ -100,17 +100,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-      # Cache Rust build artifacts
-      - name: Cache Rust build
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-rust-lint-${{ env.RUST_PROFILE }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-lint-${{ env.RUST_PROFILE }}-
-            ${{ runner.os }}-rust-lint-
-
       - name: Set up Go
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/setup-go@v6
