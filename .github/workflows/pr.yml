@@ -154,9 +154,9 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: |
           # Check for this branch's cache, or pull from trunk
-          if mc ls spice-minio/spiceai-cache/${{ github.ref_name }}/; then
+          if mc ls spice-minio/spiceai-cache/${{ github.ref_name }}/ 2>/dev/null | grep -q .; then
             mc cp --recursive spice-minio/spiceai-cache/${{ github.ref_name }}/target ./target
-          elif mc ls spice-minio/spiceai-cache/trunk/; then
+          elif mc ls spice-minio/spiceai-cache/trunk/ 2>/dev/null | grep -q .; then
             mc cp --recursive spice-minio/spiceai-cache/trunk/target ./target || echo "No trunk cache found"
           fi
 
