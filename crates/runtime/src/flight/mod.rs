@@ -494,7 +494,13 @@ pub async fn start(
                 .as_ref()
                 .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
         }) {
-        format!("{host}:{port}").parse().unwrap_or(bind_address)
+        match format!("{host}:{port}").parse() {
+            Ok(addr) => addr,
+            Err(_) => {
+                tracing::warn!("Failed to parse executor address {host}:{port}, using default bind_address");
+                bind_address
+            }
+        }
     } else {
         bind_address
     };
