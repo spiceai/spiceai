@@ -18,11 +18,11 @@ description: "Query: tpch_simple_q2"
 |               |     AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]                                                            |
 |               |       CoalescePartitionsExec                                                                                                        |
 |               |         AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]                                                      |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
 |               |             BytesProcessedExec                                                                                                      |
 |               |               CooperativeExec                                                                                                       |
 |               |                 SqlServerExec sql=SELECT l_linenumber FROM lineitem                                                                 |
-|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                           |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                           |
 |               |       BytesProcessedExec                                                                                                            |
 |               |         CooperativeExec                                                                                                             |
 |               |           SqlServerExec sql=SELECT l_linenumber FROM lineitem                                                                       |
