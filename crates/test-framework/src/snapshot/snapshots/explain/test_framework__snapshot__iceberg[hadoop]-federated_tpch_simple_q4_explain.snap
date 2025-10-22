@@ -15,9 +15,9 @@ description: "Query: tpch_simple_q4"
 |               |     ProjectionExec: expr=[avg(lineitem.l_tax)@2 as avg(lineitem.l_tax), l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity]      |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity], aggr=[avg(lineitem.l_tax)] |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                      |
-|               |           RepartitionExec: partitioning=Hash([l_linenumber@0, l_quantity@1], 16), input_partitions=16                                    |
+|               |           RepartitionExec: partitioning=Hash([l_linenumber@0, l_quantity@1], 32), input_partitions=32                                    |
 |               |             AggregateExec: mode=Partial, gby=[l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity], aggr=[avg(lineitem.l_tax)]    |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                      |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                      |
 |               |                 BytesProcessedExec                                                                                                       |
 |               |                   CooperativeExec                                                                                                        |
 |               |                     IcebergTableScan projection:[l_linenumber,l_quantity,l_tax] predicate:[] limit:[]                                    |
