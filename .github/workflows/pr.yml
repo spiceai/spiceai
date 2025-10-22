@@ -164,6 +164,13 @@ jobs:
       #       rm target.tar
       #     fi
 
+      - name: Pull target cache from minio
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: |
+          mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar.zst ./
+          tar --zstd -xf target.tar.zst -C ./target
+          rm target.tar.zst
+
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@v3
