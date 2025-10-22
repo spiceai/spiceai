@@ -154,14 +154,14 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: |
           # Check for this branch's cache, or pull from trunk
-          if mc stat spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar.gz 2>/dev/null | grep -q .; then
-            mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar.gz ./
-            tar -xzf target.tar.gz -C ./target
-            rm target.tar.gz
-          elif mc stat spice-minio/spiceai-cache/trunk/target.tar.gz 2>/dev/null | grep -q .; then
-            mc cp spice-minio/spiceai-cache/trunk/target.tar.gz ./
-            tar -xzf target.tar.gz -C ./target
-            rm target.tar.gz
+          if mc stat spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar 2>/dev/null | grep -q .; then
+            mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar ./
+            tar -xvf target.tar -C ./target
+            rm target.tar
+          elif mc stat spice-minio/spiceai-cache/trunk/target.tar 2>/dev/null | grep -q .; then
+            mc cp spice-minio/spiceai-cache/trunk/target.tar ./
+            tar -xvf target.tar -C ./target
+            rm target.tar
           fi
 
       - name: Install Protoc
@@ -225,5 +225,5 @@ jobs:
       - name: Upload target cache to minio
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: |
-          tar -czf target.tar.gz -C ./target .
-          mc cp ./target.tar.gz spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar.gz
+          tar -cvf target.tar -C ./target .
+          mc cp ./target.tar spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar
