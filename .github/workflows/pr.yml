@@ -225,5 +225,6 @@ jobs:
       - name: Upload target cache to minio
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: |
+          sudo apt install zstd -y
           tar --zstd -cf target.tar.zst -C ./target .
           mc cp ./target.tar.zst spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar.zst
