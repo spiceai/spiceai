@@ -60,9 +60,9 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::runtime::Handle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};

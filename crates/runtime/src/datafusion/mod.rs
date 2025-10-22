@@ -589,7 +589,7 @@ impl DataFusion {
 
     #[must_use]
     pub fn tokio_runtime(&self) -> Option<&tokio::runtime::Handle> {
-        self.tokio_runtime.get().map(|rt| rt.handle())
+        self.tokio_runtime.get().map(ManagedTokioRuntime::handle)
     }
 
     async fn get_table_provider(
