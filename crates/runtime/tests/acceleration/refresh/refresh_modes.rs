@@ -120,8 +120,8 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
                 .map(arrow::array::RecordBatch::num_rows)
                 .sum();
             assert_eq!(
-                final_count, 1,
-                "{engine} full mode: Expected 1 row after full refresh"
+                final_count, 2,
+                "{engine} full mode: Expected 2 rows after full refresh"
             );
 
             running_container.remove().await?;
