@@ -277,7 +277,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-functions-json 0.49.0, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-functions-json/
 
-- datafusion-table-providers 0.1.0,  
+- datafusion-table-providers 0.1.0, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-table-providers
 
 - delta_kernel 0.14.0, Apache-2.0 
@@ -633,12 +633,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - serde_json 1.0.145, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
-
-- serde_qs 0.8.5, Apache-2.0 OR MIT 
-  <br/>https://github.com/samscott89/serde_qs
-
-- serde_qs 1.0.0-rc.3, Apache-2.0 OR MIT 
-  <br/>https://github.com/samscott89/serde_qs
 
 - serde_yaml 0.9.34+deprecated, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/serde-yaml
