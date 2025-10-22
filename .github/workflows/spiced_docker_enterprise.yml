@@ -249,6 +249,8 @@ jobs:
     runs-on: 'spicehq-dev-runners'
     env:
       CUDA_COMPUTE_CAP: 80
+    # CUDA isn't a supported target yet
+    if: ${{ false }}
     steps:
       - name: Skip CUDA build
         if: ${{ needs.setup.outputs.run_cuda != 'true' }}
@@ -337,13 +339,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to DockerHub
-        if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Import images and create manifests
         run: |
@@ -456,13 +451,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to DockerHub
-        if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Import images and create manifests
         run: |
