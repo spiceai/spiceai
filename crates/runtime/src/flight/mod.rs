@@ -497,7 +497,9 @@ pub async fn start(
         match format!("{host}:{port}").parse() {
             Ok(addr) => addr,
             Err(_) => {
-                tracing::warn!("Failed to parse executor address {host}:{port}, using default bind_address");
+                tracing::warn!(
+                    "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
+                );
                 bind_address
             }
         }

@@ -116,7 +116,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     .downcast_ref::<MemorySourceConfig>()
                     .is_some()
                 {
-                    return exec_err!("Memory source scans cannot be distributed across cluster nodes. Use file-based or remote data sources instead.");
+                    return exec_err!(
+                        "Memory source scans cannot be distributed across cluster nodes. Use file-based or remote data sources instead."
+                    );
                 }
 
                 return self.inner.try_encode(node, buf);

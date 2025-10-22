@@ -72,14 +72,11 @@ pub async fn initialize_cluster_executor(
         SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
     });
 
-    let Some(work_dir) = rt.df.temp_directory.clone().or(env::temp_dir()
-        .to_str()
-        .map(std::string::ToString::to_string))
-    else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Unable to bind executor temp dir".to_string().into(),
-        });
-    };
+    let work_dir = rt
+        .df
+        .temp_directory
+        .clone()
+        .unwrap_or(env::temp_dir().to_string_lossy().to_string());
 
     let scheduler_connection =
         create_grpc_client_connection(rt.config.cluster.scheduler_url.clone().to_string())
@@ -174,18 +171,12 @@ pub async fn initialize_cluster_executor(
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
-    let bind_addr = rt.config.cluster.scheduler_url.clone();
+    let bind_addr = rt.config.flight_bind_address;
 
     let mut scheduler_config = SchedulerConfig::default();
 
-    bind_addr.host_str().iter().for_each(|h| {
-        scheduler_config.bind_host = (*h).to_string();
-    });
-
-    bind_addr
-        .port()
-        .iter()
-        .for_each(|p| scheduler_config.bind_port = *p);
+    scheduler_config.bind_host = bind_addr.ip().to_string();
+    scheduler_config.bind_port = bind_addr.port();
 
     scheduler_config.override_logical_codec =
         Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt)));

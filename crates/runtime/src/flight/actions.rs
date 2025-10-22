@@ -127,7 +127,7 @@ pub(crate) async fn do_action(
                 .extension::<AppContextExtension>()
                 .and_then(|a| a.app())
             else {
-                unreachable!("Must bind app spec");
+                return Err(Status::internal("App context not available"));
             };
 
             let bs = serde_json::to_vec(&app).map_err(to_tonic_err)?;
