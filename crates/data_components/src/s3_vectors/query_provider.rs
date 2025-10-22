@@ -15,7 +15,10 @@ limitations under the License.
 */
 use std::{
     any::Any,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::AtomicU8,
+        Arc,
+    },
 };
 
 use crate::s3_vectors::{
@@ -117,7 +120,8 @@ async fn create_spill_plan_query(
                 client: Arc::clone(client),
                 schema: Arc::clone(&table.table.schema),
                 constraints: table.table.constraints.clone(),
-                idx: Arc::new(Mutex::new(index_table_identifier)),
+                idx: Arc::new(index_table_identifier),
+                spill_index: Arc::new(AtomicU8::new(0)),
                 dimension: table.table.dimension,
                 columns: table.table.columns.clone(),
                 distance_metric: table.table.distance_metric.clone(),
@@ -223,7 +227,8 @@ async fn create_partition_plan_query(
             client: Arc::clone(client),
             schema: Arc::clone(&table.table.schema),
             constraints: table.table.constraints.clone(),
-            idx: Arc::new(Mutex::new(index_table_identifier)),
+            idx: Arc::new(index_table_identifier),
+                spill_index: Arc::new(AtomicU8::new(0)),
             dimension: table.table.dimension,
             columns: table.table.columns.clone(),
             distance_metric: table.table.distance_metric.clone(),
@@ -347,14 +352,8 @@ impl TableProvider for S3VectorsQueryTable {
             .await
             .map_err(DataFusionError::External)?;
 
-        let (_, bucket_name, index_name) = {
-            let idx = match self.table.idx.lock() {
-                Ok(i) => i,
-                Err(e) => e.into_inner(),
-            };
-
-            idx.index_identifier_variables()
-        };
+        let current_index = self.table.current_index();
+        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
 
         if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name)
             && let Some(plan) = create_spill_plan_query(
@@ -393,13 +392,8 @@ impl TableProvider for S3VectorsQueryTable {
             )));
         }
 
-        let (_, bucket_name, index_name) = {
-            let idx = match self.table.idx.lock() {
-                Ok(i) => i,
-                Err(e) => e.into_inner(),
-            };
-            idx.index_identifier_variables()
-        };
+        let current_index = self.table.current_index();
+        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
         let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
             return exec_err!("No bucket name or index name for bucket query");
         };
@@ -469,11 +463,7 @@ impl S3VectorsQueryExec {
             Boundedness::Bounded,
         );
 
-        let idx = match table.table.idx.lock() {
-            Ok(i) => i,
-            Err(e) => e.into_inner(),
-        }
-        .clone();
+        let idx = table.table.current_index();
 
         Self {
             idx,
@@ -627,7 +617,7 @@ async fn query_vector_stream(
             let _ = tx
                 .send(Err(DataFusionError::ArrowError(
                     Box::new(e),
-                    Some("Received only partial JSON payload from QueryVectors".to_string()),
+                     Some("Received only partial JSON payload from QueryVectors".to_string())
                 )))
                 .await;
         }
@@ -789,10 +779,11 @@ mod tests {
             client: mock_client,
             schema: Arc::clone(&schema),
             constraints: Constraints::default(),
-            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
+            idx: Arc::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: virtual_index_name.to_string(),
-            })),
+            }),
+            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -896,10 +887,11 @@ mod tests {
             client: mock_client,
             schema: Arc::clone(&schema),
             constraints: Constraints::default(),
-            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
+            idx: Arc::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: "virtual_index.01".to_string(), // Access via spill name
-            })),
+            }),
+            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -1027,10 +1019,11 @@ mod tests {
             client: mock_client,
             schema,
             constraints: Constraints::default(),
-            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
+            idx: Arc::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: base_index_name.to_string(),
-            })),
+            }),
+            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -1110,10 +1103,11 @@ mod tests {
             client: mock_client,
             schema,
             constraints: Constraints::default(),
-            idx: Arc::new(Mutex::new(S3VectorIdentifier::Index {
+            idx: Arc::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
-            })),
+            }),
+            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,

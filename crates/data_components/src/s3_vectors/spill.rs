@@ -20,7 +20,7 @@ use snafu::prelude::*;
 const SPILL_SEPARATOR: &str = ".";
 
 /// Maximum sequence number for spill indexes (00-99).
-const MAX_SPILL_SEQUENCE: u8 = 99;
+pub const MAX_SPILL_SEQUENCE: u8 = 99;
 
 /// Represents a spill index with its base name and sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]

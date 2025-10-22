@@ -99,14 +99,6 @@ impl S3Vector {
     fn metadata_columns(&self) -> &MetadataColumns {
         &self.metadata_columns
     }
-
-    fn get_identifier(&self) -> S3VectorIdentifier {
-        match self.table.idx.lock() {
-            Ok(i) => i,
-            Err(e) => e.into_inner(),
-        }
-        .clone()
-    }
 }
 
 #[async_trait]
@@ -132,7 +124,7 @@ impl SearchIndex for S3Vector {
                 let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
                 for (partition_value, partition_record) in partitions.into_values() {
-                    let id = self.get_identifier();
+                    let id = self.table.current_index();
                     // change the index name to a partition name
                     let id = match &id {
                         S3VectorIdentifier::IndexArn(_) => {
