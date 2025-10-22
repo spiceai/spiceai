@@ -57,6 +57,7 @@ use {
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
+use ballista_executor::executor::Executor;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -247,6 +248,10 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    UnableToLockWritableExecutorHandle {},
+
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
     ))]
@@ -335,16 +340,18 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    tokio_runtime: OnceLock<ManagedTokioRuntime>,
+    metrics: Option<Metrics>,
+
+    pub temp_directory: Option<String>,
     #[cfg(feature = "cluster")]
     pub cluster_config: Arc<ClusterConfig>,
     #[cfg(feature = "cluster")]
     pub scheduler_state: RwLock<Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>>>,
     #[cfg(feature = "cluster")]
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
-    pub temp_directory: Option<String>,
-
-    tokio_runtime: OnceLock<ManagedTokioRuntime>,
-    metrics: Option<Metrics>,
+    #[cfg(feature = "cluster")]
+    pub executor: RwLock<Option<Arc<Executor>>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1853,6 +1860,16 @@ impl DataFusion {
             .try_write()
             .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
         *scheduler_server = Some(server);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
+        let mut executor_handle = self
+            .executor
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableExecutorHandle {})?;
+        *executor_handle = Some(executor);
         Ok(())
     }
 }

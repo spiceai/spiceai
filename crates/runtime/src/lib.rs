@@ -46,23 +46,9 @@ use app::App;
 
 #[cfg(feature = "cluster")]
 use {
-    crate::Error::FailedToStartClusterScheduler,
+    crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler},
     crate::config::{ClusterConfig, ClusterMode},
-    crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
-    crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec,
-    crate::datafusion::cluster::config::SpiceClusterConfig,
-    crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer,
-    crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdownOptimizer,
-    ::datafusion::execution::SessionStateBuilder,
-    ::datafusion::prelude::SessionConfig,
-    ballista_core::extension::SessionConfigExt,
-    ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process},
-    ballista_scheduler::cluster::BallistaCluster,
-    ballista_scheduler::config::SchedulerConfig,
-    ballista_scheduler::scheduler_process,
-    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
-    runtime_object_store::registry::default_runtime_env,
-    tokio::net::TcpListener,
+    crate::datafusion::cluster,
 };
 
 use builder::RuntimeBuilder;
@@ -72,7 +58,7 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::Stream;
+use futures::{Stream, TryFutureExt};
 use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
@@ -119,7 +105,9 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+
 pub use runtime_parameters as parameters;
+
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
@@ -489,8 +477,7 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
-    #[cfg(feature = "cluster")]
-    cluster_config: Arc<ClusterConfig>,
+    runtime_config: Arc<Config>,
 }
 
 impl Debug for Runtime {
@@ -596,69 +583,11 @@ impl Runtime {
     }
 
     #[cfg(feature = "cluster")]
-    pub async fn start_cluster_scheduler(self: &Arc<Self>) -> Result<()> {
-        let bind_addr = self.cluster_config.scheduler_url.clone();
-
-        let mut scheduler_config = SchedulerConfig::default();
-
-        bind_addr.host_str().iter().for_each(|h| {
-            scheduler_config.bind_host = (*h).to_string();
-        });
-
-        bind_addr
-            .port()
-            .iter()
-            .for_each(|p| scheduler_config.bind_port = *p);
-
-        scheduler_config.override_logical_codec =
-            Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(self)));
-        scheduler_config.override_physical_codec = Some(
-            SpicePhysicalCodec::new_codec(Arc::clone(self)).map_err(|e| {
-                FailedToStartClusterScheduler {
-                    source: Box::new(e),
-                }
-            })?,
-        );
-
-        scheduler_config.grpc_server_max_decoding_message_size = u32::MAX;
-        scheduler_config.grpc_server_max_encoding_message_size = u32::MAX;
-
-        // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
-        let current_context = Arc::clone(&self.df.ctx);
-
-        scheduler_config.override_session_builder = Some(Arc::new(move |_cfg| {
-            let cfg = current_context
-                .copied_config()
-                .with_option_extension(SpiceClusterConfig::default());
-
-            Ok(
-                SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
-                    .with_config(cfg)
-                    .with_runtime_env(default_runtime_env())
-                    .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
-                    .with_physical_optimizer_rule(UnionProjectionPushdownOptimizer::new())
-                    .build(),
-            )
-        }));
-
-        let cluster = BallistaCluster::new_from_config(&scheduler_config)
-            .await
-            .map_err(|e| FailedToStartClusterScheduler {
+    pub async fn bind_cluster_scheduler(self: &Arc<Self>) -> Result<()> {
+        let scheduler = cluster::create_scheduler_server(self).await.map_err(|e| {
+            FailedToStartClusterScheduler {
                 source: Box::new(e),
-            })?;
-
-        self.status
-            .update_cluster("scheduler", ComponentStatus::Ready);
-
-        tracing::info!("Starting Ballista scheduler on {}", bind_addr);
-
-        let scheduler = scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
-            cluster,
-            scheduler_config.into(),
-        )
-        .await
-        .map_err(|e| FailedToStartClusterScheduler {
-            source: Box::new(e),
+            }
         })?;
 
         self.df
@@ -677,139 +606,18 @@ impl Runtime {
     }
 
     #[cfg(feature = "cluster")]
-    pub async fn start_cluster_executor(self: &Arc<Self>) -> Result<()> {
-        let runtime_handle = Arc::clone(self);
-
-        let mut executor_config = ExecutorProcessConfig {
-            override_logical_codec: Some(SpiceLogicalCodec::new_codec()),
-            override_physical_codec: Some(
-                SpicePhysicalCodec::new_codec(Arc::clone(self)).map_err(|e| {
-                    Error::FailedToStartClusterExecutor {
-                        source: Box::new(e),
-                    }
-                })?,
-            ),
-            override_runtime_producer: Some(Arc::new(move |_cfg| {
-                Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env()))
-            })),
-            override_config_producer: Some(Arc::new(move || {
-                SessionConfig::new_with_ballista()
-                    .with_option_extension(SpiceClusterConfig::default())
-            })),
-            grpc_max_encoding_message_size: u32::MAX,
-            grpc_max_decoding_message_size: u32::MAX,
-            work_dir: self.df.temp_directory.clone(),
-            ..Default::default()
-        };
-
-        // Set up executor runtime, and initialize AWS SDK (since there are no datasets here to do so)
-        let _bind_aws_creds = aws_sdk_credential_bridge::initialize_sdk_config().await;
-
-        self.cluster_config
-            .scheduler_url
-            .host()
-            .iter()
-            .for_each(|h| {
-                executor_config.scheduler_host = (*h).to_string();
-            });
-
-        self.cluster_config
-            .scheduler_url
-            .port()
-            .iter()
-            .for_each(|h| {
-                executor_config.scheduler_port = *h;
-            });
-
-        let default_grpc_binding = TcpListener::bind("0.0.0.0:50050")
-            .await
-            .and_then(|l| l.local_addr())
-            .map_err(|e| Error::FailedToStartClusterExecutor {
-                source: Box::new(e),
-            });
-
-        // Ask the TCP stack for a free port by trying to bind ::0
-        // It's not important which port this binds to, since the endpoint information is sent
-        // during registration
-        let dynamic_grpc_binding = TcpListener::bind("0.0.0.0:0")
-            .await
-            .and_then(|l| l.local_addr())
-            .map_err(|e| Error::FailedToStartClusterExecutor {
-                source: Box::new(e),
-            });
-
-        let bindable_addr = default_grpc_binding.or(dynamic_grpc_binding)?;
-
-        executor_config.port = bindable_addr.port();
-        executor_config.bind_host = bindable_addr.ip().to_string();
-        executor_config.external_host = Some(bindable_addr.ip().to_string());
-
-        self.executor_bind_app(self.cluster_config.scheduler_url.to_string())
-            .await?;
-
+    pub async fn start_cluster_executor(self: &Arc<Self>) -> Result<impl Future<Output = Result<()>>> {
         self.status
             .update_cluster("executor", ComponentStatus::Ready);
 
-        start_executor_process(Arc::new(executor_config))
+        Ok(cluster::create_executor_loop(self)
             .await
-            .map_err(|e| Error::FailedToStartClusterExecutor {
+            .map_err(|e| FailedToStartClusterExecutor {
                 source: Box::new(e),
-            })
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn executor_bind_app(
-        self: &Arc<Self>,
-        scheduler_flight_url: impl Into<Arc<str>>,
-    ) -> Result<()> {
-        let flight_client = flight_client::FlightClient::try_new(
-            scheduler_flight_url.into(),
-            flight_client::Credentials::anonymous(),
-            None,
-        )
-        .await
-        .map_err(|e| Error::FailedToStartClusterExecutor {
-            source: Box::new(e),
-        })?;
-
-        let action = arrow_flight::Action {
-            r#type: "GetAppDefinition".to_string(),
-            body: bytes::Bytes::new(),
-        };
-
-        let response = flight_client
-            .client()
-            .clone()
-            .do_action(action)
-            .await
-            .map_err(|e| Error::FailedToStartClusterExecutor {
-                source: format!("Failed to call GetAppDefinition: {e}").into(),
-            })?;
-
-        let mut stream = response.into_inner();
-        if let Some(result) =
-            stream
-                .message()
-                .await
-                .map_err(|e| Error::FailedToStartClusterExecutor {
-                    source: Box::new(e),
-                })?
-        {
-            let app_def: App = serde_json::from_slice(&result.body).map_err(|e| {
-                Error::FailedToStartClusterExecutor {
-                    source: format!("Failed to deserialize app definition: {e}").into(),
-                }
-            })?;
-
-            *self.app.write().await = Some(Arc::new(app_def));
-        }
-
-        Arc::clone(self).load_catalogs().await;
-        self.load_embeddings().await;
-        Arc::clone(self).load_models().await;
-        Arc::clone(self).load_tools().await;
-
-        Ok(())
+            })?
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            }))
     }
 
     /// Starts the HTTP, Flight, OpenTelemetry and Metrics servers all listening on the ports specified in the given `Config`.
@@ -847,20 +655,53 @@ impl Runtime {
         };
 
         #[cfg(feature = "cluster")]
-        let cluster_future = async {
-            match self.cluster_config.mode {
-                Some(ClusterMode::Scheduler) => self.start_cluster_scheduler().await,
-                Some(ClusterMode::Executor) => self.start_cluster_executor().await,
-                None => Ok(()),
-            }
+        if matches!(self.runtime_config.cluster.mode, Some(ClusterMode::Scheduler)) {
+            self.bind_cluster_scheduler().await?;
+        }
+
+        let maybe_executor_future = if matches!(self.runtime_config.cluster.mode, Some(ClusterMode::Executor)) {
+            Some(self.start_cluster_executor())
+        } else {
+            None
         };
 
-        #[cfg(not(feature = "cluster"))]
-        let cluster_future = async { Ok(()) };
+        // Start Flight server
+        let flight_shutdown = CancellationToken::new();
+        let self_ref = Arc::clone(&self);
+        let cloned_tls_config = tls_config.clone();
+        let cloned_endpoint_auth = endpoint_auth.clone();
+        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+
+        let flight_future = self
+            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+                flight::start(
+                    config.flight_bind_address,
+                    cloned_app_ref,
+                    Arc::clone(&self_ref),
+                    cloned_tls_config,
+                    cloned_endpoint_auth,
+                    Arc::clone(&self_ref.rate_limits),
+                    Some(flight_shutdown),
+                )
+                    .await
+                    .context(UnableToStartFlightServerSnafu)
+            })
+            .await;
 
         #[cfg(feature = "cluster")]
-        if matches!(self.cluster_config.mode, Some(ClusterMode::Executor)) {
-            return tokio::try_join!(shutdown_signal_future, cluster_future,).map(|_| ());
+        // If this is an executor, we only need the shutdown signal and flight server
+        if matches!(
+            self.runtime_config.cluster.mode,
+            Some(ClusterMode::Executor)
+        ) {
+            let Some(executor_future) = maybe_executor_future else {
+                return Err(FailedToStartClusterExecutor {
+                    source: "Executor work loop not bound. This is a bug.".to_string().into(),
+                })
+            };
+
+            return tokio::try_join!(shutdown_signal_future, executor_future, flight_future,)
+                .map(|_| ());
         }
 
         // Start Http server
@@ -895,29 +736,6 @@ impl Runtime {
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
                     .context(UnableToStartMetricsServerSnafu)
-            })
-            .await;
-
-        // Start Flight server
-        let flight_shutdown = CancellationToken::new();
-        let self_ref = Arc::clone(&self);
-        let cloned_tls_config = tls_config.clone();
-        let cloned_endpoint_auth = endpoint_auth.clone();
-        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
-
-        let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                flight::start(
-                    config.flight_bind_address,
-                    cloned_app_ref,
-                    Arc::clone(&self_ref),
-                    cloned_tls_config,
-                    cloned_endpoint_auth,
-                    Arc::clone(&self_ref.rate_limits),
-                    Some(flight_shutdown),
-                )
-                .await
-                .context(UnableToStartFlightServerSnafu)
             })
             .await;
 
@@ -969,7 +787,6 @@ impl Runtime {
 
         // wait for all servers to shut down or if any of the servers fail to start
         match tokio::try_join!(
-            cluster_future,
             http_future,
             flight_future,
             metrics_future,

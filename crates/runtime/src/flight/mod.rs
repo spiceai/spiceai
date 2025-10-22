@@ -58,6 +58,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -65,6 +66,7 @@ use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
+use url::quirks::port;
 
 mod actions;
 mod do_exchange;
@@ -428,7 +430,7 @@ pub async fn start(
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
-    let svc = FlightServiceServer::new(service)
+    let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
@@ -456,11 +458,13 @@ pub async fn start(
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
-        .layer(auth_layer)
-        .add_service(svc);
+        .layer(auth_layer);
+
+    #[cfg(not(feature = "cluster"))]
+    let mut server = server.add_service(spice_flight_service);
 
     #[cfg(feature = "cluster")]
-    match rt.cluster_config.mode {
+    let server = match rt.runtime_config.cluster.mode {
         Some(ClusterMode::Scheduler) => {
             let Some(scheduler) = rt
                 .df
@@ -473,17 +477,33 @@ pub async fn start(
             };
 
             let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
-            server = server.add_service(scheduler_grpc_server);
+            server
+                .add_service(spice_flight_service)
+                .add_service(scheduler_grpc_server)
         }
         Some(ClusterMode::Executor) => {
             let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
                 .max_decoding_message_size(usize::MAX)
                 .max_encoding_message_size(usize::MAX);
 
-            server = server.add_service(executor_flight);
+            server.add_service(executor_flight)
         }
-        _ => { /* no-op */ }
-    }
+        _ => server.add_service(spice_flight_service),
+    };
+
+    // If running an executor, we may have resolved another port to bind if 50051 is taken
+    #[cfg(feature = "cluster")]
+    let bind_address: SocketAddr = if let Some((host, port)) =
+        rt.df.executor.read().ok().and_then(|maybe_executor| {
+            maybe_executor
+                .as_ref()
+                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
+        }) {
+        println!("gonna bind {}", format!("{}:{}", host, port));
+        format!("{}:{}", host, port).parse().unwrap_or(bind_address)
+    } else {
+        bind_address
+    };
 
     if let Some(token) = shutdown_signal {
         server

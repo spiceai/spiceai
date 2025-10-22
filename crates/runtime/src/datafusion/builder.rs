@@ -300,15 +300,17 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            temp_directory: self.temp_directory.clone(),
+            tokio_runtime: OnceLock::new(),
+            metrics: self.metrics,
             #[cfg(feature = "cluster")]
             cluster_config: self.cluster_config,
             #[cfg(feature = "cluster")]
             scheduler_state: RwLock::new(None),
             #[cfg(feature = "cluster")]
             scheduler_server: RwLock::new(None),
-            temp_directory: self.temp_directory.clone(),
-            tokio_runtime: OnceLock::new(),
-            metrics: self.metrics,
+            #[cfg(feature = "cluster")]
+            executor: RwLock::new(None),
         }
     }
 }
