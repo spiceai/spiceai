@@ -49,7 +49,7 @@ impl SpicePhysicalCodec {
     /// Used during encode and decode
     fn runtime(&self) -> Result<Arc<Runtime>> {
         self.runtime.clone().ok_or(DataFusionError::Execution(
-            "SpicePhysicalCodec did not bind an App handle. This is a bug.".to_string(),
+            "SpicePhysicalCodec did not bind a Runtime handle. This is a bug.".to_string(),
         ))
     }
 }
