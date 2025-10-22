@@ -193,16 +193,24 @@ async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow:
 }
 
 // Pepper (feature-gated)
+// Note: These tests currently fail because Pepper only supports mode: file.
+// Support for mode: append and mode: full will be implemented later.
 #[cfg(feature = "pepper")]
 #[tokio::test]
-async fn test_acceleration_refresh_pepper_append_variant() -> Result<(), anyhow::Error> {
+#[should_panic(expected = "Pepper data accelerator only supports file mode")]
+async fn test_acceleration_refresh_pepper_append_variant() {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("pepper").await
+    test_refresh_append_for_engine("pepper")
+        .await
+        .expect("Pepper data accelerator only supports file mode");
 }
 
 #[cfg(feature = "pepper")]
 #[tokio::test]
-async fn test_acceleration_refresh_pepper_full_variant() -> Result<(), anyhow::Error> {
+#[should_panic(expected = "Pepper data accelerator only supports file mode")]
+async fn test_acceleration_refresh_pepper_full_variant() {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("pepper").await
+    test_refresh_full_for_engine("pepper")
+        .await
+        .expect("Pepper data accelerator only supports file mode");
 }
