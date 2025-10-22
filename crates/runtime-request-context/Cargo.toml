@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
 app = { path = "../app" }
 spicepod = { path = "../spicepod" }
