@@ -49,6 +49,7 @@ use crate::{status, view};
 #[cfg(feature = "cluster")]
 use {
     crate::config::ClusterConfig,
+    ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
@@ -56,7 +57,6 @@ use {
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
-use ballista_executor::executor::Executor;
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;

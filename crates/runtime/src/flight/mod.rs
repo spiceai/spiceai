@@ -18,7 +18,7 @@ limitations under the License.
 use {
     crate::config::ClusterMode,
     ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
-    ballista_executor::flight_service::BallistaFlightService,
+    ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
 };
 
 use crate::auth::EndpointAuth;
@@ -58,7 +58,6 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -457,7 +456,7 @@ pub async fn start(
         .layer(auth_layer);
 
     #[cfg(not(feature = "cluster"))]
-    let mut server = server.add_service(spice_flight_service);
+    let server = server.add_service(spice_flight_service);
 
     #[cfg(feature = "cluster")]
     let server = match rt.config.cluster.mode {
