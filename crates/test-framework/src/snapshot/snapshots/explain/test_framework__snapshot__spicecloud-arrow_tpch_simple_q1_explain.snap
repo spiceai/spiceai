@@ -2,17 +2,17 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q1"
 ---
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                      |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                                                                                |
-|               |   BytesProcessedNode                                                                                                                      |
-|               |     TableScan: lineitem projection=[l_orderkey]                                                                                           |
-| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]                                                                        |
-|               |   CoalescePartitionsExec                                                                                                                  |
-|               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]                                                                  |
-|               |       BytesProcessedExec                                                                                                                  |
-|               |         SchemaCastScanExec                                                                                                                |
-|               |           DataSourceExec: partitions=16, partition_sizes=[184, 184, 184, 183, 183, 183, 183, 183, 183, 183, 183, 183, 183, 183, 183, 183] |
-|               |                                                                                                                                           |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                      |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                                                                                                                                |
+|               |   BytesProcessedNode                                                                                                                                                                      |
+|               |     TableScan: lineitem projection=[l_orderkey]                                                                                                                                           |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]                                                                                                                        |
+|               |   CoalescePartitionsExec                                                                                                                                                                  |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]                                                                                                                  |
+|               |       BytesProcessedExec                                                                                                                                                                  |
+|               |         SchemaCastScanExec                                                                                                                                                                |
+|               |           DataSourceExec: partitions=32, partition_sizes=[92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 92, 91, 91, 91, 91, 91, 91, 91, 91, 91, 91, 91, 91, 91] |
+|               |                                                                                                                                                                                           |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

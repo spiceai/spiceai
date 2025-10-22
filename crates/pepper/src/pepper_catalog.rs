@@ -344,6 +344,23 @@ impl MetadataCatalog for PepperCatalog {
         })
     }
 
+    async fn update_table_path(&self, table_id: i64, new_path: &str) -> CatalogResult<()> {
+        let db_path_owned = self.db_path().to_string();
+        let new_path_owned = new_path.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path_owned)?;
+
+            conn.execute(
+                "UPDATE pepper_table SET path = ?1 WHERE table_id = ?2",
+                rusqlite::params![new_path_owned, table_id],
+            )?;
+
+            Ok::<(), CatalogError>(())
+        })
+        .await?
+    }
+
     async fn list_tables(&self) -> CatalogResult<Vec<TableMetadata>> {
         // Implementation would query all active tables
         Ok(vec![])

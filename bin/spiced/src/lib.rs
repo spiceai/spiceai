@@ -37,6 +37,7 @@ use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
+use runtime_async::ManagedTokioRuntime;
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
@@ -86,6 +87,11 @@ pub enum Error {
 
     #[snafu(display("Unable to initialize metrics: {source}"))]
     UnableToInitializeMetrics { source: Box<dyn std::error::Error> },
+
+    #[snafu(display("Unable to initialize the DataFusion Tokio runtime: {source}"))]
+    UnableToInitializeDatafusionTokioRuntime {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
@@ -175,6 +181,7 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
@@ -249,6 +256,13 @@ pub async fn run(args: Args) -> Result<()> {
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;
+
+    // This needs to be created after tracing is set up, or else task_history events aren't emitted.
+    let tokio_runtime = ManagedTokioRuntime::try_new()
+        .boxed()
+        .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+    rt.datafusion().set_tokio_runtime(tokio_runtime);
 
     if let Some(metrics_registry) = prometheus_registry {
         init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
