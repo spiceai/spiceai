@@ -169,7 +169,7 @@ jobs:
         run: |
           sudo apt install zstd -y
           mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar.zst ./
-          tar --zstd -xf target.tar.zst -C ./target
+          tar --zstd -xf target.tar.zst
           rm target.tar.zst
 
       - name: Install Protoc
