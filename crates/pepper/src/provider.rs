@@ -53,7 +53,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use vortex_datafusion::VortexFormat;
 
 /// Pepper table provider that reads from Vortex virtual files.
@@ -72,8 +72,12 @@ pub struct PepperTableProvider {
     _catalog: Arc<dyn MetadataCatalog>,
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
-    /// but this `ListingTable` currently scans all of them together
-    listing_table: Arc<ListingTable>,
+    /// but this `ListingTable` currently scans all of them together.
+    /// Wrapped in `RwLock` to allow updating the listing table on overwrite operations.
+    /// Uses `std::sync::RwLock` instead of `tokio::sync::RwLock` because we need
+    /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
+    /// and `statistics`), and the lock is held for very short durations (just Arc clones).
+    listing_table: Arc<RwLock<Arc<ListingTable>>>,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -94,13 +98,18 @@ impl PepperTableProvider {
     pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
 
-        // Create listing table for the Vortex files
-        let table_path = &table_metadata.path;
-        let dir_url_str = if table_path.ends_with('/') {
-            table_path.to_string()
-        } else {
-            format!("{table_path}/")
-        };
+        // Construct path to current snapshot
+        // Directory structure: [table_path]/[table_id]/[snapshot_id]/
+        // All tables have a snapshot ID (created on table initialization)
+        let snapshot_dir = std::path::PathBuf::from(&table_metadata.path)
+            .join(table_metadata.table_id.to_string())
+            .join(&table_metadata.current_snapshot_id);
+
+        // DataFusion requires trailing slash for directory URLs
+        let mut dir_url_str = snapshot_dir.to_string_lossy().to_string();
+        if !dir_url_str.ends_with('/') {
+            dir_url_str.push('/');
+        }
 
         let table_url = ListingTableUrl::parse(&dir_url_str).map_err(|e| {
             super::catalog::CatalogError::InvalidOperation {
@@ -124,7 +133,7 @@ impl PepperTableProvider {
         Ok(Self {
             table_metadata,
             _catalog: catalog,
-            listing_table: Arc::new(listing_table),
+            listing_table: Arc::new(RwLock::new(Arc::new(listing_table))),
         })
     }
 
@@ -293,8 +302,16 @@ impl PepperTableProvider {
         let state = ctx.state();
 
         // Delegate to ListingTable's insert_into to write Vortex files
-        let insert_plan = self
-            .listing_table
+        // Clone the Arc and drop the lock before awaiting
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|e| {
+                super::catalog::CatalogError::InvalidOperation {
+                    message: format!("Failed to acquire read lock on listing table: {e}"),
+                }
+            })?;
+            Arc::clone(&guard)
+        };
+        let insert_plan = listing_table
             .insert_into(&state, stream_exec, InsertOp::Append)
             .await
             .map_err(|e| super::catalog::CatalogError::InvalidOperation {
@@ -405,16 +422,29 @@ impl TableProvider for PepperTableProvider {
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // Delegate to the underlying listing table
-        self.listing_table
-            .scan(state, projection, filters, limit)
-            .await
+        // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire read lock on listing table: {e}"
+                ))
+            })?;
+            Arc::clone(&guard)
+        };
+        listing_table.scan(state, projection, filters, limit).await
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        self.listing_table.supports_filters_pushdown(filters)
+        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
+        let listing_table = self.listing_table.read().map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to acquire read lock on listing table: {e}"
+            ))
+        })?;
+        listing_table.supports_filters_pushdown(filters)
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
@@ -432,7 +462,10 @@ impl TableProvider for PepperTableProvider {
         //
         // Note: Statistics are cached by the ListingTable and may not reflect
         // very recent writes until the table metadata is refreshed.
-        self.listing_table.statistics()
+        //
+        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
+        let listing_table = self.listing_table.read().ok()?;
+        listing_table.statistics()
     }
 
     fn get_table_definition(&self) -> Option<&str> {
@@ -449,24 +482,92 @@ impl TableProvider for PepperTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Block overwrite operations until multiple ListingTables are implemented
-        // Overwrite requires atomic replacement of all virtual files, which needs
-        // proper catalog tracking of individual files (not yet implemented)
+        // Handle overwrite by creating a new snapshot
+        // Directory structure: [data_dir]/[table_id]/[snapshot_id]/
         if overwrite == InsertOp::Overwrite {
-            return Err(datafusion_common::DataFusionError::NotImplemented(
-                "INSERT OVERWRITE is not yet supported for Pepper tables. \
-                 Use INSERT INTO for append operations."
-                    .to_string(),
-            ));
+            // Generate a new UUIDv7 for the snapshot
+            let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+            // Create snapshot directory: [table_path]/[table_id]/[snapshot_id]/
+            let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
+                .join(self.table_metadata.table_id.to_string())
+                .join(&new_snapshot_id);
+
+            // Create the snapshot directory
+            tokio::fs::create_dir_all(&snapshot_dir)
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+
+            // DataFusion requires trailing slash for directory URLs
+            let mut snapshot_dir_str = snapshot_dir.to_string_lossy().to_string();
+            if !snapshot_dir_str.ends_with('/') {
+                snapshot_dir_str.push('/');
+            }
+
+            // Create a new ListingTable pointing to the snapshot directory
+            let table_url = ListingTableUrl::parse(&snapshot_dir_str)
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+
+            let format = Arc::new(VortexFormat::default());
+            let listing_options = ListingOptions::new(format);
+
+            let config = ListingTableConfig::new(table_url)
+                .with_listing_options(listing_options)
+                .with_schema(Arc::clone(&self.table_metadata.schema));
+
+            let new_listing_table = Arc::new(ListingTable::try_new(config)?);
+
+            // Perform the insert using the new listing table with append mode
+            // (Vortex only supports append at the file level)
+            let result = new_listing_table
+                .insert_into(state, input, InsertOp::Append)
+                .await?;
+
+            // Update the catalog to point to the new snapshot
+            self._catalog
+                .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to update snapshot after overwrite: {e}"
+                    ))
+                })?;
+
+            // Update the provider's listing table to point to the new snapshot
+            // This ensures subsequent queries in the same context will read from the new data
+            let mut listing_table_guard = self.listing_table.write().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire write lock on listing table: {e}"
+                ))
+            })?;
+            *listing_table_guard = new_listing_table;
+
+            return Ok(result);
         }
 
-        // Delegate to the underlying listing table for Vortex file writing
-        // The listing table will use VortexSink to write the data
-        // In the future, we would also:
-        // 1. Track the written files in the Pepper catalog
-        // 2. Handle primary key constraints if needed
-        self.listing_table
-            .insert_into(state, input, overwrite)
+        // For regular appends, use the existing snapshot and listing table
+        // Ensure the snapshot directory exists (it might not if this is the first write to a newly created table)
+        let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
+            .join(self.table_metadata.table_id.to_string())
+            .join(&self.table_metadata.current_snapshot_id);
+
+        if !snapshot_dir.exists() {
+            tokio::fs::create_dir_all(&snapshot_dir)
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+        }
+
+        // Clone the Arc and drop the lock before awaiting
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire read lock on listing table: {e}"
+                ))
+            })?;
+            Arc::clone(&guard)
+        };
+        listing_table
+            .insert_into(state, input, InsertOp::Append)
             .await
     }
 }

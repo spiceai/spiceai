@@ -2702,6 +2702,114 @@ mod accelerator_compat_tests {
         .await;
     }
 
+    #[tokio::test]
+    #[allow(clippy::unreadable_literal)]
+    async fn test_overwrite_operations() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            let ctx = SessionContext::new();
+            let schema = test_schema(Some(engine));
+
+            // Insert initial data - 50 records
+            let initial_data = generate_test_data(Arc::clone(&schema), 50, 0);
+            insert_test_data(&table, &ctx, initial_data).await;
+
+            // Verify initial data is there
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 50,
+                "{:?}: should have 50 rows after initial insert",
+                engine
+            );
+
+            // Now INSERT OVERWRITE with different data - 30 records with offset 100
+            let overwrite_data = generate_test_data(Arc::clone(&schema), 30, 100);
+            let table_schema = table.schema();
+            let transformed_data = if overwrite_data.schema() == table_schema {
+                overwrite_data
+            } else {
+                transform_batch_to_schema(&overwrite_data, Arc::clone(&table_schema))
+                    .expect("data transformation should succeed")
+            };
+
+            let exec_schema = transformed_data.schema();
+            let exec = MockExec::new(vec![Ok(transformed_data)], exec_schema);
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Overwrite)
+                .await
+                .expect("overwrite insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("overwrite insert successful");
+
+            // Verify that old data is gone and new data is present
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 30,
+                "{:?}: should have 30 rows after overwrite (not 50 or 80)",
+                engine
+            );
+
+            // Verify that the new data IDs are from the overwrite batch (offset 100)
+            // IDs should be 100, 101, ..., 129
+            for batch in &results {
+                let id_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id should be Int64Array");
+
+                for i in 0..id_col.len() {
+                    if !id_col.is_null(i) {
+                        let id_value = id_col.value(i);
+                        assert!(
+                            (100..130).contains(&id_value),
+                            "{:?}: ID should be in range [100, 130), got {}",
+                            engine,
+                            id_value
+                        );
+                    }
+                }
+            }
+
+            // Verify old data (IDs 0-49) is not present
+            for batch in &results {
+                let id_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id should be Int64Array");
+
+                for i in 0..id_col.len() {
+                    if !id_col.is_null(i) {
+                        let id_value = id_col.value(i);
+                        assert!(
+                            !(0..50).contains(&id_value),
+                            "{:?}: Old ID {} should not be present after overwrite",
+                            engine,
+                            id_value
+                        );
+                    }
+                }
+            }
+        })
+        .await;
+    }
+
     // Helper function to format duration in a compact way
     fn format_duration_compact(d: std::time::Duration) -> String {
         let micros = d.as_micros();
