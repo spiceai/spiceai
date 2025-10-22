@@ -52,10 +52,10 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to write vectors to S3 Vectors. {source}"))]
-    S3VectorPutVectorError { source: PutVectorsError },
+    S3VectorPutVectorError { source: Box<PutVectorsError> },
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
-    S3VectorQueryVectorsError { source: QueryVectorsError },
+    S3VectorQueryVectorsError { source: Box<QueryVectorsError> },
 
     #[snafu(display(
         "Failed to query vectors from S3 Vectors due to an unsupported filter: {filter_pre} {filter:?}"
@@ -66,16 +66,18 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to create index in S3 Vectors. {source}"))]
-    S3VectorCreateIndexError { source: CreateIndexError },
+    S3VectorCreateIndexError { source: Box<CreateIndexError> },
 
     #[snafu(display("Failed to create bucket in S3 Vectors. {source}"))]
-    S3VectorCreateBucketError { source: CreateVectorBucketError },
+    S3VectorCreateBucketError {
+        source: Box<CreateVectorBucketError>,
+    },
 
     #[snafu(display("Failed to get bucket from S3 Vectors. {source}"))]
-    S3VectorGetBucketError { source: GetVectorBucketError },
+    S3VectorGetBucketError { source: Box<GetVectorBucketError> },
 
     #[snafu(display("Failed to get index from S3 Vectors. {source}"))]
-    S3VectorGetIndexError { source: GetIndexError },
+    S3VectorGetIndexError { source: Box<GetIndexError> },
 
     #[snafu(display("Failed to construct a request to send to S3 Vectors. {source}"))]
     S3VectorBuildError { source: BuildError },
@@ -108,7 +110,7 @@ pub enum Error {
         specified: DistanceMetric,
     },
     #[snafu(display("S3 vector indexes cannot be listed"))]
-    S3VectorListIndexesError { source: ListIndexesError },
+    S3VectorListIndexesError { source: Box<ListIndexesError> },
 
     #[snafu(display("Spill index error: {source}"))]
     SpillIndexError { source: SpillIndexError },
@@ -193,7 +195,7 @@ pub async fn list_index_names(
         .map_err(|e| {
             DataFusionError::External(
                 Error::S3VectorListIndexesError {
-                    source: e.into_service_error(),
+                    source: Box::new(e.into_service_error()),
                 }
                 .into(),
             )

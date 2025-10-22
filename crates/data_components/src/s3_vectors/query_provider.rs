@@ -15,10 +15,7 @@ limitations under the License.
 */
 use std::{
     any::Any,
-    sync::{
-        atomic::AtomicU8,
-        Arc,
-    },
+    sync::{Arc, atomic::AtomicU8},
 };
 
 use crate::s3_vectors::{
@@ -228,7 +225,7 @@ async fn create_partition_plan_query(
             schema: Arc::clone(&table.table.schema),
             constraints: table.table.constraints.clone(),
             idx: Arc::new(index_table_identifier),
-                spill_index: Arc::new(AtomicU8::new(0)),
+            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: table.table.dimension,
             columns: table.table.columns.clone(),
             distance_metric: table.table.distance_metric.clone(),
@@ -591,7 +588,7 @@ async fn query_vector_stream(
 
             DataFusionError::External(
                 Error::S3VectorQueryVectorsError {
-                    source: e.into_service_error(),
+                    source: Box::new(e.into_service_error()),
                 }
                 .into(),
             )
@@ -617,7 +614,7 @@ async fn query_vector_stream(
             let _ = tx
                 .send(Err(DataFusionError::ArrowError(
                     Box::new(e),
-                     Some("Received only partial JSON payload from QueryVectors".to_string())
+                    Some("Received only partial JSON payload from QueryVectors".to_string()),
                 )))
                 .await;
         }

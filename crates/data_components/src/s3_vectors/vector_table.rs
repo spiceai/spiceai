@@ -100,6 +100,7 @@ impl S3VectorTableResult {
 
 impl S3VectorsTable {
     /// Returns the current index identifier, accounting for spilling.
+    #[must_use]
     pub fn current_index(&self) -> S3VectorIdentifier {
         let spill_num = self.spill_index.load(Ordering::SeqCst);
         if spill_num == 0 {
@@ -291,12 +292,12 @@ impl S3VectorsTable {
                     match Self::get_index_if_exists(vector_id, client).await? {
                         Some(_) => Ok(()), // Index exists, treat as success
                         None => Err(Error::S3VectorCreateIndexError {
-                            source: e.into_service_error(),
+                            source: Box::new(e.into_service_error()),
                         }),
                     }
                 }
                 _ => Err(Error::S3VectorCreateIndexError {
-                    source: e.into_service_error(),
+                    source: Box::new(e.into_service_error()),
                 }),
             },
         }
@@ -331,12 +332,12 @@ impl S3VectorsTable {
                         Ok(()) // Bucket exists, treat as success
                     } else {
                         Err(Error::S3VectorCreateBucketError {
-                            source: e.into_service_error(),
+                            source: Box::new(e.into_service_error()),
                         })
                     }
                 }
                 _ => Err(Error::S3VectorCreateBucketError {
-                    source: e.into_service_error(),
+                    source: Box::new(e.into_service_error()),
                 }),
             },
         }
@@ -375,11 +376,11 @@ impl S3VectorsTable {
                         });
                     }
                     Err(Error::S3VectorGetBucketError {
-                        source: e.into_service_error(),
+                        source: Box::new(e.into_service_error()),
                     })
                 }
                 _ => Err(Error::S3VectorGetBucketError {
-                    source: e.into_service_error(),
+                    source: Box::new(e.into_service_error()),
                 }),
             },
         }
@@ -409,7 +410,7 @@ impl S3VectorsTable {
             }
             Ok(output) => Ok(Some(output)),
             Err(e) => Err(Error::S3VectorGetIndexError {
-                source: e.into_service_error(),
+                source: Box::new(e.into_service_error()),
             }),
         }
     }
@@ -577,13 +578,13 @@ impl S3VectorsTable {
                         .await?;
                     } else {
                         return Err(Error::S3VectorPutVectorError {
-                            source: service_error.into_err(),
+                            source: Box::new(service_error.into_err()),
                         });
                     }
                 }
                 Err(e) => {
                     return Err(Error::S3VectorPutVectorError {
-                        source: e.into_service_error(),
+                        source: Box::new(e.into_service_error()),
                     });
                 }
             }

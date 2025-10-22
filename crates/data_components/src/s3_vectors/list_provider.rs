@@ -138,6 +138,7 @@ async fn create_spill_plan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_partition_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,

@@ -52,9 +52,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl SpillIndex {
-    /// Creates a new spill index name.
-    #[must_use]
-    pub fn format_name(base_name: &str, sequence: u8) -> String {
+    fn format_name(base_name: &str, sequence: u8) -> String {
         format!("{base_name}{SPILL_SEPARATOR}{sequence:02}")
     }
 
@@ -94,18 +92,9 @@ impl SpillIndex {
         }))
     }
 
-    /// Checks if an index name represents a spill index.
-    #[must_use]
-    pub fn is_spill_index(index_name: &str) -> bool {
-        Self::parse(index_name).is_ok_and(|opt| opt.is_some())
-    }
-
     /// Gets all spill index names that belong to the same virtual index.
     #[must_use]
-    pub fn get_spill_indexes_for_virtual_index(
-        base_name: &str,
-        all_indexes: &[String],
-    ) -> Vec<String> {
+    fn get_spill_indexes_for_virtual_index(base_name: &str, all_indexes: &[String]) -> Vec<String> {
         let mut spill_indexes = Vec::new();
 
         for index_name in all_indexes {
@@ -208,15 +197,6 @@ mod tests {
         assert!(SpillIndex::parse("myindex.abc").expect("success").is_none());
         let result = SpillIndex::parse("myindex.aa");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_is_spill_index() {
-        assert!(SpillIndex::is_spill_index("myindex.01"));
-        assert!(SpillIndex::is_spill_index("myindex.99"));
-        assert!(!SpillIndex::is_spill_index("myindex"));
-        assert!(!SpillIndex::is_spill_index("myindex.1"));
-        assert!(!SpillIndex::is_spill_index("myindex.123"));
     }
 
     #[test]
