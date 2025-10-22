@@ -18,7 +18,7 @@ use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
     Runtime,
     component::catalog::Catalog,
-    dataconnector::parameters::{ConnectorParams, aws::load_config},
+    dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;
@@ -288,7 +288,7 @@ impl CatalogConnector for IcebergCatalog {
                     source: Box::new(e),
                 })?;
 
-            let aws_sdk_config = load_config(
+            let aws_sdk_config = initiate_config_with_credentials(
                 "IcebergCatalogConnector",
                 "s3_region",
                 "s3_access_key_id",
@@ -296,13 +296,14 @@ impl CatalogConnector for IcebergCatalog {
                 "s3_session_token",
                 &self.params,
             )
-            .await
             .map_err(|e| super::Error::InvalidConfiguration {
                 connector: "iceberg".into(),
                 message: e.to_string(),
                 connector_component: ConnectorComponent::from(catalog),
                 source: Box::new(e),
-            })?;
+            })?
+            .load()
+            .await;
 
             Some(
                 S3CredentialProvider::from_config(&aws_sdk_config)
