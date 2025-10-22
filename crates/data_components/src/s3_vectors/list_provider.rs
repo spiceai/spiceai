@@ -79,6 +79,8 @@ impl S3VectorsListTable {
     }
 }
 
+/// Create an execution plan to scan across spill indexes. If no spill indexes
+/// are found return None.
 #[allow(clippy::too_many_arguments)]
 async fn create_spill_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
@@ -138,6 +140,7 @@ async fn create_spill_plan(
     }
 }
 
+/// Create an execution plan to scan across partitions.
 #[allow(clippy::too_many_arguments)]
 async fn create_partition_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
