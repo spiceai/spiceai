@@ -19,6 +19,8 @@ jobs:
 
       - name: Set up make
         uses: ./.github/actions/setup-make
+        with:
+          os: macos
 
       - name: Build Cargo project
         run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
