@@ -106,6 +106,9 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get table metadata by ID.
     async fn get_table_by_id(&self, table_id: i64) -> CatalogResult<TableMetadata>;
 
+    /// Update the data path for a table (used for INSERT OVERWRITE).
+    async fn update_table_path(&self, table_id: i64, new_path: &str) -> CatalogResult<()>;
+
     /// List all active tables.
     async fn list_tables(&self) -> CatalogResult<Vec<TableMetadata>>;
 
