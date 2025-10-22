@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,9 @@ use crate::acceleration::refresh::common::{
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
 use crate::{init_tracing, utils::test_request_context};
+use spicepod::acceleration::Mode;
+use spicepod::param::Params;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -32,7 +35,8 @@ async fn test_acceleration_refresh_pepper_append() -> Result<(), anyhow::Error> 
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let db_conn = initialize_postgres(port).await?;
-            let acceleration_config = get_acceleration_config_append("pepper", None);
+            let mut acceleration_config = get_acceleration_config_append("pepper", None);
+            acceleration_config.mode = Mode::File;
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
@@ -77,7 +81,8 @@ async fn test_acceleration_refresh_pepper_full() -> Result<(), anyhow::Error> {
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let db_conn = initialize_postgres(port).await?;
-            let acceleration_config = get_acceleration_config_full("pepper", None);
+            let mut acceleration_config = get_acceleration_config_full("pepper", None);
+            acceleration_config.mode = Mode::File;
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
