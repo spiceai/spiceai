@@ -44,7 +44,7 @@ impl SpiceLogicalCodec {
 
     fn runtime(&self) -> Result<Arc<Runtime>> {
         self.runtime.clone().ok_or(DataFusionError::Execution(
-            "SpiceLogicalCodec did not bind an App handle. This is a bug.".to_string(),
+            "SpiceLogicalCodec did not bind a Runtime handle. This is a bug.".to_string(),
         ))
     }
 }
