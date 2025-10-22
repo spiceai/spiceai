@@ -11,9 +11,9 @@ description: "Query: tpch_simple_q6"
 |               |       BytesProcessedNode                                                   |
 |               |         TableScan: ice.tpch_sf1.orders projection=[o_orderkey], fetch=10   |
 | physical_plan | ProjectionExec: expr=[o_orderkey@0 + 1 as key]                             |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1    |
-|               |     GlobalLimitExec: skip=0, fetch=10                                      |
-|               |       BytesProcessedExec                                                   |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1    |
+|               |     BytesProcessedExec                                                     |
+|               |       GlobalLimitExec: skip=0, fetch=10                                    |
 |               |         CooperativeExec                                                    |
 |               |           IcebergTableScan projection:[o_orderkey] predicate:[] limit:[10] |
 |               |                                                                            |

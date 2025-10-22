@@ -2,20 +2,20 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q3"
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                        |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: lineitem.l_comment, lineitem.l_partkey                                                                          |
-|               |   Sort: lineitem.l_linenumber DESC NULLS FIRST, fetch=10                                                                    |
-|               |     Projection: lineitem.l_comment, lineitem.l_partkey, lineitem.l_linenumber                                               |
-|               |       BytesProcessedNode                                                                                                    |
-|               |         TableScan: lineitem projection=[l_comment, l_linenumber, l_partkey]                                                 |
-| physical_plan | ProjectionExec: expr=[l_comment@0 as l_comment, l_partkey@1 as l_partkey]                                                   |
-|               |   SortPreservingMergeExec: [l_linenumber@2 DESC], fetch=10                                                                  |
-|               |     SortExec: TopK(fetch=10), expr=[l_linenumber@2 DESC], preserve_partitioning=[true]                                      |
-|               |       ProjectionExec: expr=[l_comment@0 as l_comment, l_partkey@2 as l_partkey, l_linenumber@1 as l_linenumber]             |
-|               |         BytesProcessedExec                                                                                                  |
-|               |           SchemaCastScanExec                                                                                                |
-|               |             DataSourceExec: partitions=16, partition_sizes=[94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 93, 93, 93] |
-|               |                                                                                                                             |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                        |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: lineitem.l_comment, lineitem.l_partkey                                                                                                                                          |
+|               |   Sort: lineitem.l_linenumber DESC NULLS FIRST, fetch=10                                                                                                                                    |
+|               |     Projection: lineitem.l_comment, lineitem.l_partkey, lineitem.l_linenumber                                                                                                               |
+|               |       BytesProcessedNode                                                                                                                                                                    |
+|               |         TableScan: lineitem projection=[l_comment, l_linenumber, l_partkey]                                                                                                                 |
+| physical_plan | ProjectionExec: expr=[l_comment@0 as l_comment, l_partkey@1 as l_partkey]                                                                                                                   |
+|               |   SortPreservingMergeExec: [l_linenumber@2 DESC], fetch=10                                                                                                                                  |
+|               |     SortExec: TopK(fetch=10), expr=[l_linenumber@2 DESC], preserve_partitioning=[true]                                                                                                      |
+|               |       ProjectionExec: expr=[l_comment@0 as l_comment, l_partkey@2 as l_partkey, l_linenumber@1 as l_linenumber]                                                                             |
+|               |         BytesProcessedExec                                                                                                                                                                  |
+|               |           SchemaCastScanExec                                                                                                                                                                |
+|               |             DataSourceExec: partitions=32, partition_sizes=[47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 46, 46, 46] |
+|               |                                                                                                                                                                                             |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
