@@ -39,6 +39,7 @@ assignees: ''
 - [ ] Create `release/X.Y` from `trunk` one day before release.
   - Refer to [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md).
 - [ ] Lock the branch to critical fixes only and notify the team.
+- [ ] (Docs DRI) Create `release/X.Y.Z` in [spiceai/docs](https://github.com/spiceai/docs). All PRs should target the release branch until the release goes live.
 
 ## Pre-Release Testing & Validation
 

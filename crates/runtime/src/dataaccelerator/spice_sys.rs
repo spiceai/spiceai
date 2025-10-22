@@ -267,7 +267,7 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "postgres"))]
         Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
-        Engine::Arrow | Engine::Vortex => UnsupportedEngineSnafu {
+        Engine::Arrow | Engine::Pepper => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }
         .fail(),
