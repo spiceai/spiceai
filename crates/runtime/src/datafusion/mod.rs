@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -321,7 +321,7 @@ pub struct DataFusion {
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
 
-    tokio_runtime: ManagedTokioRuntime,
+    tokio_runtime: OnceLock<ManagedTokioRuntime>,
     metrics: Option<Metrics>,
 }
 
@@ -578,9 +578,18 @@ impl DataFusion {
             .contains(table_reference)
     }
 
+    pub fn set_tokio_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.tokio_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
     #[must_use]
-    pub fn tokio_runtime(&self) -> &tokio::runtime::Handle {
-        self.tokio_runtime.handle()
+    pub fn tokio_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.tokio_runtime.get().map(|rt| rt.handle())
     }
 
     async fn get_table_provider(

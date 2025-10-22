@@ -141,14 +141,25 @@ impl Query {
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        let runtime_handle = self.df.tokio_runtime().clone();
+
+        let Some(runtime_handle) = self.df.tokio_runtime().clone() else {
+            return self.run_internal(request_context).await;
+        };
+
+        let span = Span::current();
 
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
         let (result_tx, result_rx) = oneshot::channel::<Result<(CacheStatus, SchemaRef), Error>>();
 
         let request_context_clone = Arc::clone(&request_context);
+        let inner_span = span.clone();
         let driver_task = async move {
-            match self.run_internal(request_context_clone).await {
+            let stream_span = inner_span.clone();
+            match self
+                .run_internal(request_context_clone)
+                .instrument(inner_span)
+                .await
+            {
                 Ok(query_result) => {
                     let schema = query_result.data.schema();
                     let cache_status = query_result.cache_status;
@@ -158,7 +169,9 @@ impl Query {
                     }
 
                     let mut stream = query_result.data;
-                    while let Some(batch) = Arc::clone(&request_context).scope(stream.next()).await
+                    while let Some(batch) = Arc::clone(&request_context)
+                        .scope(stream.next().instrument(stream_span.clone()))
+                        .await
                     {
                         if batch_tx.send(batch).await.is_err() {
                             break;
@@ -173,7 +186,7 @@ impl Query {
             }
         };
 
-        let driver_handle = runtime_handle.spawn(driver_task);
+        let driver_handle = runtime_handle.spawn(driver_task.instrument(span));
 
         let (cache_status, schema) = match result_rx.await {
             Ok(Ok((cache_status, schema))) => (cache_status, schema),

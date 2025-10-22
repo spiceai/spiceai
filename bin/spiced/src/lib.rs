@@ -250,6 +250,13 @@ pub async fn run(args: Args) -> Result<()> {
     .await
     .context(UnableToInitializeTracingSnafu)?;
 
+    // This needs to be created after tracing is set up, or else task_history events aren't emitted.
+    let tokio_runtime = ManagedTokioRuntime::try_new().unwrap_or_else(|err| {
+        panic!("Failed to create managed tokio runtime for DataFusion: {err}. This is a bug.");
+    });
+
+    rt.datafusion().set_tokio_runtime(tokio_runtime);
+
     if let Some(metrics_registry) = prometheus_registry {
         init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
     }

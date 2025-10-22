@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use super::{
@@ -53,7 +53,6 @@ use datafusion_optimizer_rules::{
     },
     physical_plan::EmptyHashJoinExecPhysicalOptimization,
 };
-use runtime_async::ManagedTokioRuntime;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -98,7 +97,6 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
-    tokio_runtime: ManagedTokioRuntime,
     metrics: Option<Metrics>,
 }
 
@@ -127,10 +125,6 @@ impl DataFusionBuilder {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let tokio_runtime = ManagedTokioRuntime::try_new().unwrap_or_else(|err| {
-            panic!("Failed to create managed tokio runtime for DataFusion: {err}. This is a bug.");
-        });
-
         Self {
             config: df_config,
             status,
@@ -141,7 +135,6 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
-            tokio_runtime,
             metrics: None,
         }
     }
@@ -301,7 +294,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
-            tokio_runtime: self.tokio_runtime,
+            tokio_runtime: OnceLock::new(),
             metrics: self.metrics,
         }
     }
