@@ -90,13 +90,8 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut replacements: HashMap<PlanNodeKey, Arc<dyn ExecutionPlan>> = HashMap::new();
 
-        let optimized = plan
+        let pruned = Arc::clone(&plan)
             .transform_down(|p| {
-                // We might need to rewrite this node
-                if let Some(replacement) = replacements.remove(&p.as_ref().into()) {
-                    return Ok(Transformed::yes(replacement));
-                }
-
                 // Only operate on `ProjectionExec`
                 let Some(projection) = concrete!(p, ProjectionExec) else {
                     return Ok(Transformed::no(p));
@@ -146,6 +141,23 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
             })?
             .data;
 
+        // If we can push down, this will be populated
+        if replacements.is_empty() {
+            return Ok(plan);
+        }
+
+        // Rewrite projection-pruned plan with replacements
+        let optimized = pruned
+            .transform_down(|p| {
+                if let Some(replacement) = replacements.remove(&p.as_ref().into()) {
+                    Ok(Transformed::yes(replacement))
+                } else {
+                    Ok(Transformed::no(p))
+                }
+            })?
+            .data;
+
+        // If there are any leftover replacements, something is wrong
         if replacements.is_empty() {
             Ok(optimized)
         } else {
