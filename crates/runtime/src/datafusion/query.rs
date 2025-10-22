@@ -53,8 +53,6 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
-use async_stream::stream;
-
 #[cfg(feature = "cluster")]
 use {
     crate::config::ClusterMode,
