@@ -207,7 +207,7 @@ impl MetadataCatalog for PepperCatalog {
             })?)
         };
 
-        let result = tokio::task::spawn_blocking(move || {
+        let blocking_result = tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open_with_flags(
                 &db_path_owned,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -267,7 +267,7 @@ impl MetadataCatalog for PepperCatalog {
         .await??;
 
         // Destructure the return value from spawn_blocking
-        let (table_id, initial_snapshot_id, base_path) = result;
+        let (table_id, initial_snapshot_id, base_path) = blocking_result;
 
         // Create the initial snapshot directory
         // Directory structure: [base_path]/[table_id]/[snapshot_id]/
