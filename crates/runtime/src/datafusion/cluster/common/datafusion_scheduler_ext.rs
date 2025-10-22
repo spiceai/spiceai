@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task;
 
+/// Some convenience methods for the `DataFusion` for accessing the scheduler state in clustered mode
 pub trait DataFusionSchedulerExtensions<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
     fn scheduler_state(&self) -> Option<Arc<SchedulerState<T, U>>>;
 
@@ -27,9 +28,9 @@ pub trait DataFusionSchedulerExtensions<T: 'static + AsLogicalPlan, U: 'static +
 
 impl DataFusionSchedulerExtensions<LogicalPlanNode, PhysicalPlanNode> for DataFusion {
     fn scheduler_state(&self) -> Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>> {
-        self.scheduler_state
+        self.scheduler_server
             .try_read()
             .ok()
-            .and_then(|maybe_state| maybe_state.clone())
+            .and_then(|maybe_server| maybe_server.clone().map(|s| Arc::clone(&s.state)))
     }
 }

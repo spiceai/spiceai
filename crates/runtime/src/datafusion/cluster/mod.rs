@@ -1,14 +1,12 @@
-use crate::Error::FailedToStartClusterScheduler;
-use crate::datafusion::cluster;
+use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
 use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer;
 use crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdownOptimizer;
 use crate::status::ComponentStatus;
-use crate::{Error, Runtime};
+use crate::{FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, Runtime};
 use app::App;
-use ballista_core::error::BallistaError;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
@@ -21,23 +19,19 @@ use ballista_core::utils::create_grpc_client_connection;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
-use ballista_executor::executor_process::ExecutorProcessConfig;
 use ballista_executor::metrics::LoggingMetricsCollector;
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
-use datafusion::common::{Result, config_err};
-use datafusion::error::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use runtime_object_store::registry::default_runtime_env;
-use serde_json::error::Category::Data;
-use std::env;
-use std::num::NonZero;
-use std::sync::Arc;
 use futures::TryFutureExt;
+use runtime_object_store::registry::default_runtime_env;
+use snafu::ResultExt;
+use std::env;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -46,10 +40,141 @@ pub mod common;
 pub mod config;
 pub mod physical_plan;
 
-pub async fn create_scheduler_server(
+/// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
+pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
+    let scheduler = create_scheduler_server(rt).await?;
+
+    rt.df
+        .bind_scheduler_server(Arc::new(scheduler))
+        .map_err(|e| FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
+    rt.status
+        .update_cluster("scheduler", ComponentStatus::Ready);
+
+    Ok(())
+}
+
+/// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
+/// work loop as a future
+pub async fn initialize_cluster_executor(
+    rt: Arc<Runtime>,
+) -> crate::Result<impl Future<Output = crate::Result<()>>> {
+    executor_bind_app(&rt, rt.config.cluster.scheduler_url.to_string()).await?;
+
+    let runtime_handle = Arc::clone(&rt);
+
+    let runtime_producer: RuntimeProducer =
+        Arc::new(move |_cfg| Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env())));
+
+    let config_producer: ConfigProducer = Arc::new(move || {
+        SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
+    });
+
+    let Some(work_dir) = rt.df.temp_directory.clone().or(env::temp_dir()
+        .to_str()
+        .map(std::string::ToString::to_string))
+    else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to bind executor temp dir".to_string().into(),
+        });
+    };
+
+    let scheduler_connection =
+        create_grpc_client_connection(rt.config.cluster.scheduler_url.clone().to_string())
+            .await
+            .map_err(|_| FailedToStartClusterExecutor {
+                source: format!(
+                    "Unable to connect to scheduler at {}",
+                    rt.config.cluster.scheduler_url
+                )
+                .into(),
+            })?;
+
+    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
+        .max_encoding_message_size(usize::MAX)
+        .max_decoding_message_size(usize::MAX);
+
+    // Try to bind the same flight port Spice usually does, but if we cannot, bind a different
+    // port to allow for easy local deployments
+    let default_grpc_binding = TcpListener::bind(rt.config.flight_bind_address)
+        .await
+        .and_then(|l| l.local_addr());
+
+    let dynamic_grpc_binding = TcpListener::bind("0.0.0.0:0")
+        .await
+        .and_then(|l| l.local_addr());
+
+    let bindable_addr = default_grpc_binding
+        .or(dynamic_grpc_binding)
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    let Some(concurrent_tasks) = std::thread::available_parallelism()
+        .ok()
+        .and_then(|nz| u32::try_from(nz.get()).ok())
+    else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to determine executor task parallelism."
+                .to_string()
+                .into(),
+        });
+    };
+
+    let executor_id = Uuid::new_v4().to_string();
+    let executor_meta = ExecutorRegistration {
+        id: executor_id.clone(),
+        // flight service
+        host: Some(bindable_addr.ip().to_string()),
+        port: u32::from(bindable_addr.port()),
+        // grpc_port is used only for push mode, and not initialized for pull mode (default)
+        grpc_port: 50052,
+        specification: Some(ExecutorSpecification {
+            resources: vec![ExecutorResource {
+                resource: Some(Resource::TaskSlots(concurrent_tasks)),
+            }],
+        }),
+    };
+
+    let executor = Arc::new(Executor::new(
+        executor_meta,
+        &work_dir,
+        runtime_producer,
+        config_producer,
+        Arc::new(BallistaFunctionRegistry::default()),
+        Arc::new(LoggingMetricsCollector::default()),
+        concurrent_tasks as usize,
+        None,
+    ));
+
+    let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+        SpiceLogicalCodec::new_codec(),
+        SpicePhysicalCodec::new_codec(Arc::clone(&rt))
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?,
+    );
+
+    rt.df
+        .bind_executor(Arc::clone(&executor))
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    rt.status.update_cluster("executor", ComponentStatus::Ready);
+
+    Ok(
+        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec).map_err(|e| {
+            FailedToStartClusterExecutor {
+                source: Box::new(e),
+            }
+        }),
+    )
+}
+
+async fn create_scheduler_server(
     rt: &Arc<Runtime>,
-) -> Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
-    let bind_addr = rt.runtime_config.cluster.scheduler_url.clone();
+) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
+    let bind_addr = rt.config.cluster.scheduler_url.clone();
 
     let mut scheduler_config = SchedulerConfig::default();
 
@@ -64,7 +189,11 @@ pub async fn create_scheduler_server(
 
     scheduler_config.override_logical_codec =
         Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt)));
-    scheduler_config.override_physical_codec = Some(SpicePhysicalCodec::new_codec(Arc::clone(rt))?);
+    scheduler_config.override_physical_codec = Some(
+        SpicePhysicalCodec::new_codec(Arc::clone(rt))
+            .boxed()
+            .context(FailedToStartClusterSchedulerSnafu)?,
+    );
 
     scheduler_config.grpc_server_max_decoding_message_size = u32::MAX;
     scheduler_config.grpc_server_max_encoding_message_size = u32::MAX;
@@ -89,7 +218,8 @@ pub async fn create_scheduler_server(
 
     let cluster = BallistaCluster::new_from_config(&scheduler_config)
         .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        .boxed()
+        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.status
         .update_cluster("scheduler", ComponentStatus::Ready);
@@ -101,113 +231,23 @@ pub async fn create_scheduler_server(
         scheduler_config.into(),
     )
     .await
-    .map_err(|e| DataFusionError::External(Box::new(e)))
+    .boxed()
+    .context(FailedToStartClusterSchedulerSnafu)
 }
 
-pub async fn create_executor_loop(rt: &Arc<Runtime>) -> Result<impl Future<Output = Result<()>>> {
-    executor_bind_app(rt, rt.runtime_config.cluster.scheduler_url.to_string()).await?;
-
-    let runtime_handle = Arc::clone(rt);
-
-    let runtime_producer: RuntimeProducer =
-        Arc::new(move |_cfg| Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env())));
-
-    let config_producer: ConfigProducer = Arc::new(move || {
-        SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
-    });
-
-    let Some(work_dir) = rt
-        .df
-        .temp_directory
-        .clone()
-        .or(env::temp_dir().to_str().map(|s| s.to_string()))
-    else {
-        return config_err!("Unable to bind executor temp dir");
-    };
-
-    let scheduler_connection =
-        create_grpc_client_connection(rt.runtime_config.cluster.scheduler_url.clone().to_string())
-            .await
-            .map_err(|e| {
-                DataFusionError::Configuration(format!(
-                    "Unable to connect to scheduler at {}",
-                    rt.runtime_config.cluster.scheduler_url
-                ))
-            })?;
-
-    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
-        .max_encoding_message_size(usize::MAX)
-        .max_decoding_message_size(usize::MAX);
-
-    // Try to bind the same flight port Spice usually does, but if we cannot, bind a different
-    // port to allow for easy local deployments
-    let default_grpc_binding = TcpListener::bind(rt.runtime_config.flight_bind_address)
-        .await
-        .and_then(|l| l.local_addr());
-
-    let dynamic_grpc_binding = TcpListener::bind("0.0.0.0:0")
-        .await
-        .and_then(|l| l.local_addr());
-
-    let bindable_addr = default_grpc_binding
-        .or(dynamic_grpc_binding)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    let Some(concurrent_tasks) = std::thread::available_parallelism()
-        .ok()
-        .and_then(|nz| u32::try_from(nz.get()).ok())
-    else {
-        return config_err!("Unable to determine executor task parallelism.");
-    };
-
-    let executor_id = Uuid::new_v4().to_string();
-    let executor_meta = ExecutorRegistration {
-        id: executor_id.clone(),
-        host: None,
-        port: bindable_addr.port() as u32,
-        grpc_port: 50052,
-        specification: Some(ExecutorSpecification {
-            resources: vec![ExecutorResource {
-                resource: Some(Resource::TaskSlots(concurrent_tasks)),
-            }],
-        }),
-    };
-
-    let executor = Arc::new(Executor::new(
-        executor_meta,
-        &work_dir,
-        runtime_producer,
-        config_producer,
-        Arc::new(BallistaFunctionRegistry::default()),
-        Arc::new(LoggingMetricsCollector::default()),
-        concurrent_tasks as usize,
-        None,
-    ));
-
-    let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
-        SpiceLogicalCodec::new_codec(),
-        SpicePhysicalCodec::new_codec(Arc::clone(rt))?,
-    );
-
-    rt.df
-        .bind_executor(Arc::clone(&executor))
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    Ok(execution_loop::poll_loop(scheduler.clone(), executor.clone(), codec)
-        .map_err(|e| DataFusionError::External(Box::new(e))))
-}
-
-pub async fn executor_bind_app(
+/// Initializes relevant `App` runtime components retrieved from the scheduler node
+async fn executor_bind_app(
     rt: &Arc<Runtime>,
     scheduler_flight_url: impl Into<Arc<str>>,
-) -> Result<()> {
+) -> crate::Result<()> {
     let flight_client = flight_client::FlightClient::try_new(
         scheduler_flight_url.into(),
         flight_client::Credentials::anonymous(),
         None,
     )
     .await
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    .boxed()
+    .context(FailedToStartClusterExecutorSnafu)?;
 
     let action = arrow_flight::Action {
         r#type: "GetAppDefinition".to_string(),
@@ -219,19 +259,19 @@ pub async fn executor_bind_app(
         .clone()
         .do_action(action)
         .await
-        .map_err(|e| {
-            DataFusionError::Configuration(format!("Failed to call GetAppDefinition: {e}"))
-        })?;
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
 
     let mut stream = response.into_inner();
     if let Some(result) = stream
         .message()
         .await
-        .map_err(|e| DataFusionError::Configuration(format!("Failed to read response: {e}")))?
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?
     {
-        let app_def: App = serde_json::from_slice(&result.body).map_err(|e| {
-            DataFusionError::Configuration(format!("Failed to deserialize app definition: {e}"))
-        })?;
+        let app_def: App = serde_json::from_slice(&result.body)
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
 
         *rt.app.write().await = Some(Arc::new(app_def));
     }

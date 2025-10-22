@@ -306,8 +306,6 @@ impl DataFusionBuilder {
             #[cfg(feature = "cluster")]
             cluster_config: self.cluster_config,
             #[cfg(feature = "cluster")]
-            scheduler_state: RwLock::new(None),
-            #[cfg(feature = "cluster")]
             scheduler_server: RwLock::new(None),
             #[cfg(feature = "cluster")]
             executor: RwLock::new(None),

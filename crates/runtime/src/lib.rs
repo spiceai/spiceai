@@ -46,8 +46,7 @@ use app::App;
 
 #[cfg(feature = "cluster")]
 use {
-    crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler},
-    crate::config::{ClusterConfig, ClusterMode},
+    crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode,
     crate::datafusion::cluster,
 };
 
@@ -58,7 +57,7 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::{Stream, TryFutureExt};
+use futures::Stream;
 use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
@@ -431,6 +430,8 @@ pub enum Error {
     },
 }
 
+#[cfg(feature = "cluster")]
+const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -477,7 +478,7 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
-    runtime_config: Arc<Config>,
+    config: Arc<Config>,
 }
 
 impl Debug for Runtime {
@@ -582,44 +583,6 @@ impl Runtime {
         None
     }
 
-    #[cfg(feature = "cluster")]
-    pub async fn bind_cluster_scheduler(self: &Arc<Self>) -> Result<()> {
-        let scheduler = cluster::create_scheduler_server(self).await.map_err(|e| {
-            FailedToStartClusterScheduler {
-                source: Box::new(e),
-            }
-        })?;
-
-        self.df
-            .bind_scheduler_state(Arc::clone(&scheduler.state))
-            .map_err(|e| FailedToStartClusterScheduler {
-                source: Box::new(e),
-            })?;
-
-        self.df
-            .bind_scheduler_server(Arc::new(scheduler))
-            .map_err(|e| FailedToStartClusterScheduler {
-                source: Box::new(e),
-            })?;
-
-        Ok(())
-    }
-
-    #[cfg(feature = "cluster")]
-    pub async fn start_cluster_executor(self: &Arc<Self>) -> Result<impl Future<Output = Result<()>>> {
-        self.status
-            .update_cluster("executor", ComponentStatus::Ready);
-
-        Ok(cluster::create_executor_loop(self)
-            .await
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            })?
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            }))
-    }
-
     /// Starts the HTTP, Flight, OpenTelemetry and Metrics servers all listening on the ports specified in the given `Config`.
     ///
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
@@ -654,15 +617,23 @@ impl Runtime {
             }
         };
 
+        // - Scheduler: does some init, but all requests handled by Flight RPC stack
+        // - Executor: does some init, but has a polling loop to fetch work from scheduler
         #[cfg(feature = "cluster")]
-        if matches!(self.runtime_config.cluster.mode, Some(ClusterMode::Scheduler)) {
-            self.bind_cluster_scheduler().await?;
-        }
-
-        let maybe_executor_future = if matches!(self.runtime_config.cluster.mode, Some(ClusterMode::Executor)) {
-            Some(self.start_cluster_executor())
-        } else {
-            None
+        let maybe_cluster_future = match self.config.cluster.mode {
+            Some(ClusterMode::Scheduler) => {
+                cluster::initialize_cluster_scheduler(&self).await?;
+                None
+            }
+            Some(ClusterMode::Executor) => Some(
+                self.start_runtime_task(
+                    CLUSTER_EXECUTOR,
+                    None,
+                    cluster::initialize_cluster_executor(Arc::clone(&self)).await?,
+                )
+                .await,
+            ),
+            _ => None,
         };
 
         // Start Flight server
@@ -683,21 +654,20 @@ impl Runtime {
                     Arc::clone(&self_ref.rate_limits),
                     Some(flight_shutdown),
                 )
-                    .await
-                    .context(UnableToStartFlightServerSnafu)
+                .await
+                .context(UnableToStartFlightServerSnafu)
             })
             .await;
 
         #[cfg(feature = "cluster")]
         // If this is an executor, we only need the shutdown signal and flight server
-        if matches!(
-            self.runtime_config.cluster.mode,
-            Some(ClusterMode::Executor)
-        ) {
-            let Some(executor_future) = maybe_executor_future else {
+        if matches!(self.config.cluster.mode, Some(ClusterMode::Executor)) {
+            let Some(executor_future) = maybe_cluster_future else {
                 return Err(FailedToStartClusterExecutor {
-                    source: "Executor work loop not bound. This is a bug.".to_string().into(),
-                })
+                    source: "Executor work loop not bound. This is a bug."
+                        .to_string()
+                        .into(),
+                });
             };
 
             return tokio::try_join!(shutdown_signal_future, executor_future, flight_future,)

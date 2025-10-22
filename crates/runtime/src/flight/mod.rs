@@ -66,7 +66,6 @@ use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
-use url::quirks::port;
 
 mod actions;
 mod do_exchange;
@@ -433,9 +432,6 @@ pub async fn start(
     let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
-    tracing::info!("Spice Runtime Flight listening on {bind_address}");
-    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
-
     let mut server = Server::builder();
 
     if let Some(ref tls_config) = tls_config {
@@ -464,7 +460,7 @@ pub async fn start(
     let mut server = server.add_service(spice_flight_service);
 
     #[cfg(feature = "cluster")]
-    let server = match rt.runtime_config.cluster.mode {
+    let server = match rt.config.cluster.mode {
         Some(ClusterMode::Scheduler) => {
             let Some(scheduler) = rt
                 .df
@@ -499,11 +495,13 @@ pub async fn start(
                 .as_ref()
                 .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
         }) {
-        println!("gonna bind {}", format!("{}:{}", host, port));
-        format!("{}:{}", host, port).parse().unwrap_or(bind_address)
+        format!("{host}:{port}").parse().unwrap_or(bind_address)
     } else {
         bind_address
     };
+
+    tracing::info!("Spice Runtime Flight listening on {bind_address}");
+    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
     if let Some(token) = shutdown_signal {
         server

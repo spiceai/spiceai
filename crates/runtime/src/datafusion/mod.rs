@@ -50,7 +50,6 @@ use crate::{status, view};
 use {
     crate::config::ClusterConfig,
     ballista_scheduler::scheduler_server::SchedulerServer,
-    ballista_scheduler::state::SchedulerState,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
@@ -346,8 +345,6 @@ pub struct DataFusion {
     pub temp_directory: Option<String>,
     #[cfg(feature = "cluster")]
     pub cluster_config: Arc<ClusterConfig>,
-    #[cfg(feature = "cluster")]
-    pub scheduler_state: RwLock<Option<Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>>>,
     #[cfg(feature = "cluster")]
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     #[cfg(feature = "cluster")]
@@ -1835,19 +1832,6 @@ impl DataFusion {
                 catalog_provider.schema(schema)
             }
         }
-    }
-
-    #[cfg(feature = "cluster")]
-    pub fn bind_scheduler_state(
-        &self,
-        state: Arc<SchedulerState<LogicalPlanNode, PhysicalPlanNode>>,
-    ) -> Result<()> {
-        let mut scheduler_state = self
-            .scheduler_state
-            .try_write()
-            .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
-        *scheduler_state = Some(state);
-        Ok(())
     }
 
     #[cfg(feature = "cluster")]
