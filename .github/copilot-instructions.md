@@ -99,7 +99,7 @@ mod tests {
 }
 ```
 
-**Note**: In test code, `.unwrap()` and `.expect()` are allowed since test failures should panic.
+**Note**: In test code, `.expect()` with descriptive messages is preferred over `.unwrap()` since test failures should panic with clear context.
 
 ### Stream Handling (CRITICAL)
 
