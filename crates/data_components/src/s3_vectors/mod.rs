@@ -15,13 +15,16 @@ limitations under the License.
 */
 
 use arrow::error::ArrowError;
+use datafusion::error::DataFusionError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, ListIndexesError, PutVectorsError, QueryVectorsError,
+    GetVectorBucketError, ListIndexesError, ListIndexesInput, PutVectorsError, QueryVectorsError,
+    S3Vectors,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
-use snafu::Snafu;
+use snafu::{ResultExt as _, Snafu};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 pub mod list_provider;
 pub mod partition;
@@ -169,4 +172,36 @@ impl S3VectorIdentifier {
             None
         }
     }
+}
+
+/// Lists index names with the given prefix in the specified bucket.
+pub async fn list_index_names(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: &str,
+    prefix: &str,
+) -> Result<Vec<String>, DataFusionError> {
+    let list_indexes_output = client
+        .list_indexes(
+            ListIndexesInput::builder()
+                .set_vector_bucket_name(Some(bucket_name.to_string()))
+                .set_prefix(Some(prefix.to_string()))
+                .build()
+                .boxed()
+                .map_err(DataFusionError::External)?,
+        )
+        .await
+        .map_err(|e| {
+            DataFusionError::External(
+                Error::S3VectorListIndexesError {
+                    source: e.into_service_error(),
+                }
+                .into(),
+            )
+        })?;
+
+    Ok(list_indexes_output
+        .indexes()
+        .iter()
+        .map(|idx| idx.index_name().to_string())
+        .collect())
 }

@@ -19,7 +19,7 @@ use std::{
 };
 
 use crate::s3_vectors::{
-    Error, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
     partition::{BelongsWith, PartitionedIndexName},
     vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
@@ -54,8 +54,8 @@ use datafusion::{
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use s3_vectors::{
-    LIST_VECTORS_MAX_RESULTS, ListIndexesInput, ListOutputVector, ListVectorsInput,
-    ListVectorsOutput, S3Vectors, VectorData,
+    LIST_VECTORS_MAX_RESULTS, ListOutputVector, ListVectorsInput, ListVectorsOutput, S3Vectors,
+    VectorData,
 };
 use s3_vectors_metadata_filter::document_to_json_map;
 use snafu::ResultExt;
@@ -96,30 +96,7 @@ async fn create_spill_plan(
         index_name.to_string()
     };
 
-    let list_indexes_output = client
-        .list_indexes(
-            ListIndexesInput::builder()
-                .set_vector_bucket_name(Some(bucket_name.to_string()))
-                .set_prefix(Some(base_name))
-                .build()
-                .boxed()
-                .map_err(DataFusionError::External)?,
-        )
-        .await
-        .map_err(|e| {
-            DataFusionError::External(
-                Error::S3VectorListIndexesError {
-                    source: e.into_service_error(),
-                }
-                .into(),
-            )
-        })?;
-
-    let all_index_names: Vec<String> = list_indexes_output
-        .indexes()
-        .iter()
-        .map(|idx| idx.index_name().to_string())
-        .collect();
+    let all_index_names = super::list_index_names(client, bucket_name, &base_name).await?;
 
     let virtual_index_names =
         SpillIndex::get_all_indexes_for_virtual_index(index_name, &all_index_names);
@@ -173,31 +150,13 @@ async fn create_partition_plan(
         PartitionedIndexName::common_prefix(index_name, &table.column_name, &table.partition_by)
             .map_err(|e| DataFusionError::Plan(e.to_string()))?;
 
-    let list_indexes_output = client
-        .list_indexes(
-            ListIndexesInput::builder()
-                .set_vector_bucket_name(Some(bucket_name.to_string()))
-                .set_prefix(Some(prefix))
-                .build()
-                .boxed()
-                .map_err(DataFusionError::External)?,
-        )
-        .await
-        .map_err(|e| {
-            DataFusionError::External(
-                Error::S3VectorListIndexesError {
-                    source: e.into_service_error(),
-                }
-                .into(),
-            )
-        })?;
+    let all_index_names = super::list_index_names(client, bucket_name, &prefix).await?;
 
-    let index_names: Vec<_> = list_indexes_output
-        .indexes()
+    let index_names: Vec<_> = all_index_names
         .iter()
-        .filter_map(|idx| {
+        .filter_map(|idx_name| {
             let Ok(partitioned_index_name) =
-                PartitionedIndexName::from_index_name(idx.index_name())
+                PartitionedIndexName::from_index_name(idx_name)
             else {
                 return None;
             };
@@ -210,11 +169,10 @@ async fn create_partition_plan(
                 ),
                 BelongsWith::ThisDataset
             ) {
-                Some(idx.index_name().to_string())
+                Some(idx_name.clone())
             } else {
                 tracing::debug!(
-                    "S3 index {} returned but does not belong with this dataset: {index_name}",
-                    idx.index_name()
+                    "S3 index {idx_name} returned but does not belong with this dataset: {index_name}",
                 );
                 None
             }
