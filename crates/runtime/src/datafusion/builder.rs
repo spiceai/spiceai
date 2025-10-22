@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use super::{
@@ -108,6 +108,11 @@ pub(crate) fn get_df_default_config() -> SessionConfig {
 }
 
 impl DataFusionBuilder {
+    /// Creates a new `DataFusionBuilder` with the runtime defaults.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a managed Tokio runtime cannot be created. This indicates a bug in the runtime initialization.
     #[must_use]
     pub fn new(
         status: Arc<status::RuntimeStatus>,
@@ -289,6 +294,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            tokio_runtime: OnceLock::new(),
             metrics: self.metrics,
         }
     }
