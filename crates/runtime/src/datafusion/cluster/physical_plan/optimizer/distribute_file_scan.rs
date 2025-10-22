@@ -13,7 +13,7 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource::source::{DataSource, DataSourceExec};
 use itertools::Itertools;
 use std::cmp::max;
 use std::sync::Arc;
@@ -111,10 +111,8 @@ impl DistributeFileScanOptimizer {
 
         let stage_size = if (groups.len() / stage_size) > max_stages {
             groups.len() / max_stages
-        }
-        // `UnionExec` requires at least 2 inputs
-        else if (groups.len() / stage_size) < 2 {
-            groups.len() / 2
+        } else if (groups.len() / stage_size) < 2 {
+            max(groups.len() / 2, 1)
         } else {
             stage_size
         };
@@ -158,11 +156,18 @@ impl DistributeFileScanOptimizer {
             Self::groups_by_byte_size(partitioned_files, file_group_byte_size)
         };
 
-        Ok(Some(Self::groups_to_stages(
+        let stages = Self::groups_to_stages(
             file_groups,
             task_partitions,
             spice_config.execution.file_scan_expand_max_stages,
-        )))
+        );
+
+        // `UnionExec` requires at least 2 inputs, some reads are too small
+        if stages.len() < 2 {
+            return Ok(None);
+        }
+
+        Ok(Some(stages))
     }
 
     ///  Ballista's `DistributedPlanner` only makes stages if it can detect these nodes in a plan:
@@ -240,9 +245,10 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
                         .with_file_groups(stage)
                         .build();
 
-                    // Propagate partitioning too
+                    // Propagate source partitioning
+                    let new_scan_partitioning = new_scan.output_partitioning();
                     let new_data_source_exec = DataSourceExec::new(Arc::new(new_scan))
-                        .with_partitioning(plan.output_partitioning().clone());
+                        .with_partitioning(new_scan_partitioning);
 
                     Self::with_stage_repartition(
                         Arc::new(new_data_source_exec),
@@ -269,6 +275,7 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::datafusion::cluster::common::plan_node_key::PlanNodeKey;
     use crate::datafusion::cluster::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
@@ -405,36 +412,21 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_respects_input_partitioning() {
+    async fn test_small_read_bail_out() {
         let optimizer = DistributeFileScanOptimizer::new();
 
-        let file_scan_config = file_scan_config_builder()
-            .with_file_group(FileGroup::new(vec![
-                create_partitioned_file("file://a.parquet", 512_000_000, None),
-                create_partitioned_file("file://b.parquet", 512_000_000, None),
-            ]))
-            .build();
-
-        let data_source_exec = DataSourceExec::new(Arc::new(file_scan_config));
-        let schema = Arc::clone(&data_source_exec.schema());
-        let partitioning = Partitioning::Hash(
-            vec![col("name", schema.as_ref()).expect("Must bind expr")],
-            1337,
-        );
-
-        let data_source_exec = data_source_exec.with_partitioning(partitioning.clone());
+        let plan = create_data_source_exec(vec![create_partitioned_file(
+            "file:///file1.parquet",
+            5_000_000,
+            None,
+        )]);
+        let plan_key: PlanNodeKey = plan.as_ref().into();
 
         let optimized_plan = optimizer
-            .optimize(Arc::new(data_source_exec), &DEFAULT_CONFIG_OPTIONS)
+            .optimize(plan, &DEFAULT_CONFIG_OPTIONS)
             .expect("Must optimize");
+        let optimized_plan_key: PlanNodeKey = optimized_plan.as_ref().into();
 
-        let repart_execs = SearchVisitor::collect_concrete_down::<RepartitionExec>(&optimized_plan)
-            .expect("Must search plan");
-
-        assert!(
-            repart_execs
-                .iter()
-                .all(|e| e.output_partitioning() == &partitioning)
-        );
+        assert_eq!(plan_key, optimized_plan_key);
     }
 }
