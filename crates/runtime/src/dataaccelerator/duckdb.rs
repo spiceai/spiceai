@@ -36,7 +36,7 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter},
+    duckdb::{write::{DuckDBTableWriter, WriteCompletionHandler}, DuckDBSettingsRegistry, DuckDBTableProviderFactory, TableManager},
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
@@ -419,7 +419,7 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        Ok(create_table_provider(&self.duckdb_factory, &cmd).await?)
+        Ok(create_table_provider(&self.duckdb_factory, &cmd, retention_sql_handler_for_source(source)).await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -431,9 +431,45 @@ impl DataAccelerator for DuckDBAccelerator {
     }
 }
 
+fn retention_sql_handler_for_source(source: Option<&dyn AccelerationSource>) -> Option<WriteCompletionHandler> {
+    let source = source?;
+    let acceleration = source.acceleration()?;
+    let retention_sql = acceleration.retention_sql.as_ref()?.clone();
+    let source_name = source.name().to_string();
+    
+    Some(Arc::new(move |tx: &duckdb::Transaction, table_manager: &TableManager, _schema| {
+        tracing::info!("Executing retention SQL: {retention_sql}");
+        
+        let row_count_query = format!("SELECT COUNT(*) FROM {}", table_manager.table_name());
+
+        match tx.prepare(&row_count_query) {
+            Ok(mut stmt) => {
+                match stmt.query_row([], |row| {
+                    let count: i64 = row.get(0)?;
+                    Ok(count)
+                }) {
+                    Ok(count) => {
+                        tracing::info!("Table '{source_name}' has {count} rows after write");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to get row count for table '{source_name}': {e}");
+                        Err(datafusion::common::DataFusionError::External(Box::new(e)))
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to prepare row count query for table '{source_name}': {e}");
+                Err(datafusion::common::DataFusionError::External(Box::new(e)))
+            }
+        }
+    }))
+}
+
 pub(crate) async fn create_table_provider(
     duckdb_factory: &DuckDBTableProviderFactory,
     cmd: &CreateExternalTable,
+    on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
     let table_provider = duckdb_factory
@@ -447,7 +483,13 @@ pub(crate) async fn create_table_provider(
     };
 
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
-    let duckdb_writer = Arc::new(duckdb_writer.clone());
+
+    let mut duckdb_writer = duckdb_writer.clone();
+     if let Some(handler) = on_data_written {
+        duckdb_writer = duckdb_writer.with_on_data_written_handler(handler);
+    }
+
+    let duckdb_writer = Arc::new(duckdb_writer);
     let cloned_writer = Arc::clone(&duckdb_writer);
 
     let table_provider = Arc::new(PolyTableProvider::new(
