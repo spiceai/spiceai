@@ -9,6 +9,7 @@ ARG BINARY_VARIANT=default
 ARG TARGETOS
 ARG TARGETARCH
 ARG GITHUB_REPOSITORY=spiceai/spiceai
+ARG GITHUB_TOKEN
 
 RUN if [ -z "$REL_VERSION" ]; then echo "REL_VERSION build-arg is required" >&2; exit 1; fi
 
@@ -20,6 +21,13 @@ ENV REL_VERSION=${REL_VERSION}
 ENV BINARY_VARIANT=${BINARY_VARIANT}
 
 RUN set -eux; \
+    download_asset() { \
+      if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        curl -fSLo /tmp/spiced.tar.gz -H "Authorization: token ${GITHUB_TOKEN}" "$1"; \
+      else \
+        curl -fSLo /tmp/spiced.tar.gz "$1"; \
+      fi; \
+    }; \
     case "${TARGETOS}" in \
       ""|linux) os_slug=linux ;; \
       *) echo "Unsupported TARGETOS: ${TARGETOS}" >&2; exit 1 ;; \
@@ -37,11 +45,11 @@ RUN set -eux; \
       asset="spiced_${variant_slug}_${os_slug}_${arch_slug}.tar.gz"; \
     fi; \
     base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
-    if ! curl -fSLo /tmp/spiced.tar.gz "${base_url}"; then \
+    if ! download_asset "${base_url}"; then \
       if [ "${BINARY_VARIANT}" = "odbc" ]; then \
         asset="spiced_odbc_models_${os_slug}_${arch_slug}.tar.gz"; \
         base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
-        curl -fSLo /tmp/spiced.tar.gz "${base_url}"; \
+        download_asset "${base_url}"; \
       else \
         echo "Failed to download release asset from ${base_url}" >&2; \
         exit 1; \
