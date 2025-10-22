@@ -400,6 +400,12 @@ pub enum Error {
         "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
     ))]
     AddressAlreadyInUse { addr: String },
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display(
+        "The cluster scheduler is not initialized, preventing the flight service from starting."
+    ))]
+    ClusterSchedulerNotInitialized {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -468,7 +474,7 @@ pub async fn start(
                 .ok()
                 .and_then(|r| r.iter().next().cloned())
             else {
-                unreachable!("Scheduler server not bound");
+                return Err(Error::ClusterSchedulerNotInitialized {});
             };
 
             let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
@@ -494,14 +500,13 @@ pub async fn start(
                 .as_ref()
                 .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
         }) {
-        match format!("{host}:{port}").parse() {
-            Ok(addr) => addr,
-            Err(_) => {
-                tracing::warn!(
-                    "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
-                );
-                bind_address
-            }
+        if let Ok(addr) = format!("{host}:{port}").parse() {
+            addr
+        } else {
+            tracing::warn!(
+                "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
+            );
+            bind_address
         }
     } else {
         bind_address

@@ -126,7 +126,7 @@ pub struct ClusterConfig {
 impl Default for ClusterConfig {
     fn default() -> Self {
         let url = match Url::parse("spiced://localhost:50051") {
-            Ok(url) => url.clone(),
+            Ok(url) => url,
             Err(e) => unreachable!("The default URI could not be parsed: {}", e),
         };
 

@@ -126,7 +126,7 @@ pub async fn initialize_cluster_executor(
         host: Some(bindable_addr.ip().to_string()),
         port: u32::from(bindable_addr.port()),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
-        grpc_port: 50052,
+        grpc_port: 0,
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
                 resource: Some(Resource::TaskSlots(concurrent_tasks)),
@@ -173,39 +173,39 @@ async fn create_scheduler_server(
 ) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
     let bind_addr = rt.config.flight_bind_address;
 
-    let mut scheduler_config = SchedulerConfig::default();
-
-    scheduler_config.bind_host = bind_addr.ip().to_string();
-    scheduler_config.bind_port = bind_addr.port();
-
-    scheduler_config.override_logical_codec =
-        Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt)));
-    scheduler_config.override_physical_codec = Some(
-        SpicePhysicalCodec::new_codec(Arc::clone(rt))
-            .boxed()
-            .context(FailedToStartClusterSchedulerSnafu)?,
-    );
-
-    scheduler_config.grpc_server_max_decoding_message_size = u32::MAX;
-    scheduler_config.grpc_server_max_encoding_message_size = u32::MAX;
-
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
 
-    scheduler_config.override_session_builder = Some(Arc::new(move |_cfg| {
-        let cfg = current_context
-            .copied_config()
-            .with_option_extension(SpiceClusterConfig::default());
+    let scheduler_config = SchedulerConfig {
+        bind_host: bind_addr.ip().to_string(),
+        bind_port: bind_addr.port(),
 
-        Ok(
-            SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
-                .with_config(cfg)
-                .with_runtime_env(default_runtime_env())
-                .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
-                .with_physical_optimizer_rule(UnionProjectionPushdownOptimizer::new())
-                .build(),
-        )
-    }));
+        override_logical_codec: Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt))),
+        override_physical_codec: Some(
+            SpicePhysicalCodec::new_codec(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        ),
+
+        grpc_server_max_decoding_message_size: u32::MAX,
+        grpc_server_max_encoding_message_size: u32::MAX,
+
+        override_session_builder: Some(Arc::new(move |_cfg| {
+            let cfg = current_context
+                .copied_config()
+                .with_option_extension(SpiceClusterConfig::default());
+
+            Ok(
+                SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
+                    .with_config(cfg)
+                    .with_runtime_env(default_runtime_env())
+                    .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
+                    .with_physical_optimizer_rule(UnionProjectionPushdownOptimizer::new())
+                    .build(),
+            )
+        })),
+        ..Default::default()
+    };
 
     let cluster = BallistaCluster::new_from_config(&scheduler_config)
         .await
