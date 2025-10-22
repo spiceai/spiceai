@@ -53,8 +53,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use vortex_datafusion::VortexFormat;
 
 /// Pepper table provider that reads from Vortex virtual files.
@@ -75,6 +74,9 @@ pub struct PepperTableProvider {
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
     /// Wrapped in `RwLock` to allow updating the listing table on overwrite operations.
+    /// Uses `std::sync::RwLock` instead of `tokio::sync::RwLock` because we need
+    /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
+    /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
 }
 
@@ -297,7 +299,11 @@ impl PepperTableProvider {
         // Delegate to ListingTable's insert_into to write Vortex files
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().await;
+            let guard = self.listing_table.read().map_err(|e| {
+                super::catalog::CatalogError::InvalidOperation {
+                    message: format!("Failed to acquire read lock on listing table: {e}"),
+                }
+            })?;
             Arc::clone(&guard)
         };
         let insert_plan = listing_table
@@ -413,7 +419,11 @@ impl TableProvider for PepperTableProvider {
         // Delegate to the underlying listing table
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
-            let guard = self.listing_table.read().await;
+            let guard = self.listing_table.read().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire read lock on listing table: {e}"
+                ))
+            })?;
             Arc::clone(&guard)
         };
         listing_table.scan(state, projection, filters, limit).await
@@ -423,18 +433,13 @@ impl TableProvider for PepperTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        // This is a synchronous method called during query planning.
-        // Since we can't use blocking_read from async context, we use try_read with retries.
-        // Query planning should be fast, so a short retry loop is acceptable and better
-        // than returning Inexact (which would degrade query performance).
-        for _ in 0..100 {
-            if let Ok(listing_table) = self.listing_table.try_read() {
-                return listing_table.supports_filters_pushdown(filters);
-            }
-            std::hint::spin_loop();
-        }
-        // If we can't get the lock after retries, be conservative
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
+        let listing_table = self.listing_table.read().map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to acquire read lock on listing table: {e}"
+            ))
+        })?;
+        listing_table.supports_filters_pushdown(filters)
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
@@ -453,18 +458,9 @@ impl TableProvider for PepperTableProvider {
         // Note: Statistics are cached by the ListingTable and may not reflect
         // very recent writes until the table metadata is refreshed.
         //
-        // This is a synchronous method called during query planning.
-        // Since we can't use blocking_read from async context, we use try_read with retries.
-        // Query planning should be fast, so a short retry loop is acceptable and better
-        // than returning None (which would cause poor optimizer decisions).
-        for _ in 0..100 {
-            if let Ok(listing_table) = self.listing_table.try_read() {
-                return listing_table.statistics();
-            }
-            std::hint::spin_loop();
-        }
-        // If we can't get the lock after retries, return None as a last resort
-        None
+        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
+        let listing_table = self.listing_table.read().ok()?;
+        listing_table.statistics()
     }
 
     fn get_table_definition(&self) -> Option<&str> {
@@ -486,18 +482,10 @@ impl TableProvider for PepperTableProvider {
         // Vortex operations underneath
         if overwrite == InsertOp::Overwrite {
             // Create a new subdirectory for the overwrite data
-            // Use a timestamp-based name to ensure uniqueness
-            let timestamp = chrono::Utc::now().timestamp_nanos_opt().ok_or_else(|| {
-                datafusion_common::DataFusionError::Execution(
-                    "Failed to get current timestamp for overwrite directory name".to_string(),
-                )
-            })?;
-
-            let overwrite_dir = format!(
-                "{}/overwrite_{}/",
-                self.table_metadata.path.trim_end_matches('/'),
-                timestamp
-            );
+            // Use the table_id to ensure a stable directory name that's updated on each overwrite
+            let overwrite_dir = std::path::PathBuf::from(&self.table_metadata.path)
+                .join(format!("overwrite_{}", self.table_metadata.table_id));
+            let overwrite_dir = overwrite_dir.to_string_lossy().to_string();
 
             // Create the directory
             tokio::fs::create_dir_all(&overwrite_dir)
@@ -523,9 +511,24 @@ impl TableProvider for PepperTableProvider {
                 .insert_into(state, input, InsertOp::Append)
                 .await?;
 
+            // Update the catalog to point to the new overwrite directory
+            // This ensures that future table providers will scan the correct location
+            self._catalog
+                .update_table_path(self.table_metadata.table_id, &overwrite_dir)
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to update catalog path after overwrite: {e}"
+                    ))
+                })?;
+
             // Update the provider's listing table to point to the new directory
-            // This ensures subsequent queries will read from the new data
-            let mut listing_table_guard = self.listing_table.write().await;
+            // This ensures subsequent queries in the same context will read from the new data
+            let mut listing_table_guard = self.listing_table.write().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire write lock on listing table: {e}"
+                ))
+            })?;
             *listing_table_guard = new_listing_table;
 
             return Ok(result);
@@ -536,7 +539,11 @@ impl TableProvider for PepperTableProvider {
         // even for regular inserts
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().await;
+            let guard = self.listing_table.read().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire read lock on listing table: {e}"
+                ))
+            })?;
             Arc::clone(&guard)
         };
         listing_table
