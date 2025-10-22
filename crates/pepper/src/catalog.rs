@@ -106,11 +106,11 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get table metadata by ID.
     async fn get_table_by_id(&self, table_id: i64) -> CatalogResult<TableMetadata>;
 
-    /// Get the current snapshot ID for a table (UUIDv7 string).
+    /// Get the current snapshot ID for a table (`UUIDv7` string).
     /// All tables have a snapshot (created on table initialization).
     async fn get_current_snapshot(&self, table_id: i64) -> CatalogResult<String>;
 
-    /// Set the current snapshot ID for a table (UUIDv7 string).
+    /// Set the current snapshot ID for a table (`UUIDv7` string).
     async fn set_current_snapshot(&self, table_id: i64, snapshot_id: &str) -> CatalogResult<()>;
 
     /// List all active tables.

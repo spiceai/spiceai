@@ -21,8 +21,6 @@ use crate::postgres::common;
 use crate::postgres::common::get_random_port;
 use crate::{init_tracing, utils::test_request_context};
 use spicepod::acceleration::Mode;
-use spicepod::param::Params;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
