@@ -150,19 +150,19 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
-      - name: Pull target cache from minio
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: |
-          # Check for this branch's cache, or pull from trunk
-          if mc stat spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar 2>/dev/null | grep -q .; then
-            mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar ./
-            tar -xvf target.tar -C ./target
-            rm target.tar
-          elif mc stat spice-minio/spiceai-cache/trunk/target.tar 2>/dev/null | grep -q .; then
-            mc cp spice-minio/spiceai-cache/trunk/target.tar ./
-            tar -xvf target.tar -C ./target
-            rm target.tar
-          fi
+      # - name: Pull target cache from minio
+      #   if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+      #   run: |
+      #     # Check for this branch's cache, or pull from trunk
+      #     if mc stat spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar 2>/dev/null | grep -q .; then
+      #       mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/target.tar ./
+      #       tar -xvf target.tar -C ./target
+      #       rm target.tar
+      #     elif mc stat spice-minio/spiceai-cache/trunk/target.tar 2>/dev/null | grep -q .; then
+      #       mc cp spice-minio/spiceai-cache/trunk/target.tar ./
+      #       tar -xvf target.tar -C ./target
+      #       rm target.tar
+      #     fi
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
