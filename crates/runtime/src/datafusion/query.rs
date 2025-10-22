@@ -62,6 +62,7 @@ use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::runtime::Handle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -141,11 +142,20 @@ impl Query {
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
+        if let Some(runtime_handle) = self.df.tokio_runtime().cloned() {
+            return self
+                .run_with_managed_runtime(request_context, runtime_handle)
+                .await;
+        }
 
-        let Some(runtime_handle) = self.df.tokio_runtime().clone() else {
-            return self.run_internal(request_context).await;
-        };
+        self.run_internal(request_context).await
+    }
 
+    async fn run_with_managed_runtime(
+        self,
+        request_context: Arc<RequestContext>,
+        runtime_handle: Handle,
+    ) -> Result<QueryResult> {
         let span = Span::current();
 
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
