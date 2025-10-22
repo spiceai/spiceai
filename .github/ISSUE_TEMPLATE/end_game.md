@@ -8,12 +8,15 @@ assignees: ''
 
 ## DRIs
 
-| Role    | DRI |
-| ------- | --- |
-| Endgame |     |
-| QA      |     |
-| Docs    |     |
-| Comms   |     |
+| Role           | DRI          |
+|----------------|--------------|
+| Primary        |              |
+| QA + Secondary |              |
+| Docs           |              |
+| Comms          | @wyattwenzel |
+
+**Note**: Until this endgame is closed, whenever Primary DRI goes offline, he/she should clearly handoff control of the release to the Secondary DRI in the
+release coordination channel. Secondary DRI should positively acknowledge the handoff.
 
 ## Milestone Release Timeline
 
@@ -203,7 +206,7 @@ assignees: ''
       - Branch: `trunk`
       - Build the CLI: `false`
       - Release Version: the version tag released.
-- [ ] Notify that the OSS release is complete and ready for communications.
+- [ ] Notify that the OSS release is complete and ready for communications in the release coordination channel.
 
 ## Post-Release Housekeeping
 
