@@ -24,6 +24,7 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_federation::FederatedPlanner;
+use datafusion_optimizer_rules::logical_plan::CacheInvalidationExtensionPlanner;
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use std::sync::Arc;
 
@@ -56,6 +57,7 @@ impl SpiceQueryPlanner {
             Arc::new(FederatedPlanner::new()),
             Arc::new(SpiceExtensionPlanner::new()),
             Arc::new(IndexTableScanExtensionPlanner::new()),
+            Arc::new(CacheInvalidationExtensionPlanner::new()),
         ]
     }
 
