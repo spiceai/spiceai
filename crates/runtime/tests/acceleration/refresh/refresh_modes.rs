@@ -112,7 +112,7 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
             // Refresh should replace all data with current source state
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
-            // After refresh: 1 row (full mode replaces with current source)
+            // After refresh: 2 rows (full mode replaces with current source)
             let df = rt.datafusion().ctx.table("test_table").await?;
             let results = df.collect().await?;
             let final_count: usize = results
