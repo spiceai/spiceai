@@ -227,6 +227,7 @@ default = [
     "aws-secrets-manager",
     "sharepoint",
     "bedrock",
+    "duckdb",
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
