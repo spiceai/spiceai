@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,14 +18,13 @@ use crate::acceleration::refresh::common::{
     initialize_postgres, refresh_table, start_test_runtime,
 };
 use crate::postgres::common;
-use crate::postgres::common::{PG_PASSWORD, get_random_port};
+use crate::postgres::common::get_random_port;
 use crate::{init_tracing, utils::test_request_context};
-use spicepod::param::Params;
-use std::collections::HashMap;
+use spicepod::acceleration::Mode;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn test_acceleration_refresh_postgres_append() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_pepper_append() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -34,21 +33,8 @@ async fn test_acceleration_refresh_postgres_append() -> Result<(), anyhow::Error
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let db_conn = initialize_postgres(port).await?;
-            let acceleration_params: HashMap<String, String> = [
-                ("pg_host".to_string(), "localhost".to_string()),
-                ("pg_user".to_string(), "postgres".to_string()),
-                ("pg_pass".to_string(), PG_PASSWORD.to_string()),
-                ("pg_db".to_string(), "acceleration".to_string()),
-                ("pg_sslmode".to_string(), "disable".to_string()),
-                ("pg_port".to_string(), port.to_string()),
-            ]
-            .iter()
-            .cloned()
-            .collect();
-            let acceleration_config = get_acceleration_config_append(
-                "postgres",
-                Some(Params::from_string_map(acceleration_params)),
-            );
+            let mut acceleration_config = get_acceleration_config_append("pepper", None);
+            acceleration_config.mode = Mode::File;
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
@@ -65,6 +51,7 @@ async fn test_acceleration_refresh_postgres_append() -> Result<(), anyhow::Error
                 "INSERT INTO test_table (created_at) VALUES (now());",
             )
             .await?;
+
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
@@ -83,7 +70,7 @@ async fn test_acceleration_refresh_postgres_append() -> Result<(), anyhow::Error
 }
 
 #[tokio::test]
-async fn test_acceleration_refresh_postgres_full() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_pepper_full() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -92,21 +79,8 @@ async fn test_acceleration_refresh_postgres_full() -> Result<(), anyhow::Error> 
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let db_conn = initialize_postgres(port).await?;
-            let acceleration_params: HashMap<String, String> = [
-                ("pg_host".to_string(), "localhost".to_string()),
-                ("pg_user".to_string(), "postgres".to_string()),
-                ("pg_pass".to_string(), PG_PASSWORD.to_string()),
-                ("pg_db".to_string(), "acceleration".to_string()),
-                ("pg_sslmode".to_string(), "disable".to_string()),
-                ("pg_port".to_string(), port.to_string()),
-            ]
-            .iter()
-            .cloned()
-            .collect();
-            let acceleration_config = get_acceleration_config_full(
-                "postgres",
-                Some(Params::from_string_map(acceleration_params)),
-            );
+            let mut acceleration_config = get_acceleration_config_full("pepper", None);
+            acceleration_config.mode = Mode::File;
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
@@ -123,6 +97,7 @@ async fn test_acceleration_refresh_postgres_full() -> Result<(), anyhow::Error> 
                 "INSERT INTO test_table (created_at) VALUES (now());",
             )
             .await?;
+
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;

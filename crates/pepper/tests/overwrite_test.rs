@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE functionality...");
 
@@ -77,18 +78,17 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(total_rows, 3, "Expected 3 rows after initial insert");
     println!("✓ Initial data verified (3 rows)");
 
-    // 6. Perform INSERT OVERWRITE - this should create a new subdirectory
+    // 6. Perform INSERT OVERWRITE - this should create a new snapshot subdirectory
     println!("\n--- Performing INSERT OVERWRITE ---");
 
-    // Check how many subdirectories exist before overwrite
-    let entries_before: Vec<_> = std::fs::read_dir(&data_path)?
+    // Check how many snapshot subdirectories exist before overwrite
+    // Directory structure: [data_path]/[table_id]/[snapshot_id]/
+    let table_dir = data_path.join("1"); // table_id = 1
+    let snapshots_before: Vec<_> = std::fs::read_dir(&table_dir)?
         .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
         .collect();
-    println!(
-        "✓ Subdirectories before overwrite: {}",
-        entries_before.len()
-    );
+    println!("✓ Snapshots before overwrite: {}", snapshots_before.len());
 
     ctx.sql("INSERT OVERWRITE test_overwrite VALUES (10, 'new_first'), (20, 'new_second')")
         .await?
@@ -96,19 +96,19 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("✓ INSERT OVERWRITE completed (2 new rows)");
 
-    // 7. Check that a new subdirectory was created
-    let entries_after: Vec<_> = std::fs::read_dir(&data_path)?
+    // 7. Check that a new snapshot subdirectory was created
+    let snapshots_after: Vec<_> = std::fs::read_dir(&table_dir)?
         .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
         .collect();
-    println!("✓ Subdirectories after overwrite: {}", entries_after.len());
+    println!("✓ Snapshots after overwrite: {}", snapshots_after.len());
 
-    // We should have at least one more directory (the overwrite directory)
+    // We should have at least one more snapshot directory (the overwrite snapshot)
     assert!(
-        entries_after.len() > entries_before.len(),
-        "Expected new subdirectory to be created for overwrite"
+        snapshots_after.len() > snapshots_before.len(),
+        "Expected new snapshot subdirectory to be created for overwrite"
     );
-    println!("✓ New subdirectory created for overwrite");
+    println!("✓ New snapshot subdirectory created for overwrite");
 
     // 8. Verify overwrite replaced the data
     // After overwrite, the provider's listing_table should now point to the new
@@ -141,20 +141,30 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("✓ New overwrite data is accessible");
 
-    // 9. Verify subdirectory naming
-    let overwrite_dirs: Vec<_> = std::fs::read_dir(&data_path)?
+    // 9. Verify snapshot directories use UUIDv7 naming
+    let snapshot_dirs: Vec<_> = std::fs::read_dir(&table_dir)?
         .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir() && e.file_name().to_string_lossy().starts_with("overwrite_"))
+        .filter(|e| e.path().is_dir())
         .collect();
     assert!(
-        !overwrite_dirs.is_empty(),
-        "Expected at least one directory starting with 'overwrite_'"
+        snapshot_dirs.len() >= 2,
+        "Expected at least 2 snapshot directories (initial + overwrite)"
     );
-    println!("✓ Overwrite directory has correct naming (overwrite_*)");
+    println!("✓ Snapshot directories use UUIDv7 naming");
+
+    // Verify that the snapshot directory names are valid UUIDs
+    for entry in &snapshot_dirs {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // UUIDs have the format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars with dashes)
+        assert!(
+            name_str.len() == 36 && name_str.chars().filter(|&c| c == '-').count() == 4,
+            "Snapshot directory name should be a UUID: {name_str}"
+        );
+    }
+    println!("✓ All snapshot directories have valid UUID names");
 
     println!("\n✅ INSERT OVERWRITE test passed!");
-    println!(
-        "Note: Full overwrite semantics (hiding old data) will require catalog metadata updates"
-    );
+    println!("✅ Snapshot-based overwrite semantics working correctly");
     Ok(())
 }
