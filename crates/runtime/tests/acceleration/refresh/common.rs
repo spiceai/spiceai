@@ -19,7 +19,24 @@ pub(crate) fn get_acceleration_config_append(
     engine: &str,
     acceleration_params: Option<Params>,
 ) -> Acceleration {
-    let mut acceleration = Acceleration {
+    // Arrow engine doesn't support indexes, primary keys, or on_conflict
+    let (primary_key, on_conflict, indexes) = if engine == "arrow" {
+        (None, HashMap::new(), HashMap::new())
+    } else {
+        (
+            Some("id".to_string()),
+            [("id".to_string(), OnConflictBehavior::Upsert)]
+                .iter()
+                .cloned()
+                .collect::<HashMap<String, OnConflictBehavior>>(),
+            [("id".to_string(), IndexType::Unique)]
+                .iter()
+                .cloned()
+                .collect::<HashMap<String, IndexType>>(),
+        )
+    };
+
+    Acceleration {
         enabled: true,
         params: acceleration_params,
         engine: Some(engine.to_string()),
@@ -28,24 +45,11 @@ pub(crate) fn get_acceleration_config_append(
             "select * from test_table where created_at > now() - INTERVAL '10 years'".to_string(),
         ),
         refresh_check_interval: Some("5h".to_string()),
+        primary_key,
+        on_conflict,
+        indexes,
         ..Acceleration::default()
-    };
-
-    // Arrow engine doesn't support indexes, primary_key, or on_conflict
-    // Only add these for engines that support them (duckdb, sqlite, postgres)
-    if engine != "arrow" {
-        acceleration.primary_key = Some("id".to_string());
-        acceleration.on_conflict = [("id".to_string(), OnConflictBehavior::Upsert)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, OnConflictBehavior>>();
-        acceleration.indexes = [("id".to_string(), IndexType::Unique)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, IndexType>>();
     }
-
-    acceleration
 }
 
 pub(crate) fn get_acceleration_config_full(
@@ -70,7 +74,8 @@ pub(crate) fn get_dataset(port: usize) -> Dataset {
             .collect::<HashMap<String, String>>(),
     ));
     ds.time_column = Some("created_at".to_string());
-    ds.time_format = Some(TimeFormat::Timestamptz);
+    // Use Timestamp instead of Timestamptz because Arrow reads Postgres TIMESTAMPTZ as Timestamp(Nanosecond, None)
+    ds.time_format = Some(TimeFormat::Timestamp);
     ds
 }
 
