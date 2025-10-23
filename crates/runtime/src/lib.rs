@@ -664,7 +664,7 @@ impl Runtime {
         if matches!(self.config.cluster.mode, Some(ClusterMode::Executor)) {
             let Some(executor_future) = maybe_cluster_future else {
                 return Err(FailedToStartClusterExecutor {
-                    source: "Executor work loop not bound. This is a bug."
+                    source: "Executor work loop not bound. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
                         .to_string()
                         .into(),
                 });

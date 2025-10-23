@@ -65,7 +65,11 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
             "BytesProcessedNode" => Extension {
                 node: Arc::new(BytesProcessedNode::new(inputs[0].clone())),
             },
-            other => return exec_err!("SpiceLogicalCodec does not support {other}"),
+            other => {
+                return exec_err!(
+                    "SpiceLogicalCodec does not support {other}. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
+                );
+            }
         };
 
         Ok(node)
@@ -94,7 +98,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
             Ok(table_provider)
         } else {
             exec_err!(
-                "SpiceLogicalCodec could not resolve table reference {}",
+                "SpiceLogicalCodec could not resolve table reference {}. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
                 table_ref
             )
         }
