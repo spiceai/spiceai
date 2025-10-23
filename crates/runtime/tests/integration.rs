@@ -21,7 +21,6 @@ use std::sync::Arc;
 use crate::utils::TEST_REQUEST_CONTEXT;
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
-use runtime_request_context::RequestContext;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
