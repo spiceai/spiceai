@@ -28,7 +28,7 @@ on:
 
 jobs:
   setup:
-    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == true) }}
+    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
     runs-on: ubuntu-latest
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
