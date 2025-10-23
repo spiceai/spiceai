@@ -520,29 +520,8 @@ impl DataAccelerator for PepperAccelerator {
             };
             let has_primary_key = !primary_keys.is_empty();
 
-            // Get time_column from the source - only Dataset supports time_column
-            // Views do not have time_column configuration, so they default to false
-            let has_time_column = if let Some(dataset) = source
-                .as_any()
-                .downcast_ref::<crate::component::dataset::Dataset>(
-            ) {
-                dataset.time_column.is_some()
-            } else if source
-                .as_any()
-                .downcast_ref::<crate::component::view::View>()
-                .is_some()
-            {
-                // Views don't support time_column - this is intentional
-                // Views use full refresh mode by default and don't need time-based append
-                false
-            } else {
-                // Unknown source type - assume no time_column
-                tracing::warn!(
-                    "Unknown acceleration source type for '{}', assuming no time_column",
-                    source.name()
-                );
-                false
-            };
+            // Get time_column from the source via the trait method
+            let has_time_column = source.time_column().is_some();
 
             // Validate: can have neither, one, but not both
             match (has_primary_key, has_time_column) {

@@ -523,6 +523,10 @@ pub trait AccelerationSource: Send + Sync {
     /// Returns the name of this source
     fn name(&self) -> &TableReference;
 
+    /// Returns the time column name if configured, None otherwise
+    /// Views always return None as they don't support time-based append mode
+    fn time_column(&self) -> Option<&str>;
+
     /// Returns a reference to `Any` for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 }

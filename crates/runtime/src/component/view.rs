@@ -250,6 +250,10 @@ impl AccelerationSource for View {
         &self.name
     }
 
+    fn time_column(&self) -> Option<&str> {
+        None
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
