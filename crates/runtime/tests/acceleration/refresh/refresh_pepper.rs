@@ -51,7 +51,7 @@ async fn test_acceleration_refresh_pepper_append() -> Result<(), anyhow::Error> 
             let mut acceleration_config =
                 get_acceleration_config_append("pepper", Some(Params::from_string_map(params)));
             acceleration_config.mode = Mode::File;
-            // Pepper requires either primary_key OR time_column for append mode, not both
+            // Pepper append mode supports primary_key, time_column, or neither (for duplicate appends), but not both
             acceleration_config.primary_key = None;
             let rt = start_test_runtime(port, acceleration_config).await?;
 
