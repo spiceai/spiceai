@@ -268,6 +268,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("index_scan_max_count"),
     ParameterSpec::runtime("partition_mode"),
     ParameterSpec::component("partitioned_write_flush_threshold"),
+    ParameterSpec::runtime("on_insert_sort_column"),
+    ParameterSpec::runtime("on_insert_sort_direction"),
 ];
 
 #[async_trait]
@@ -419,7 +421,7 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        Ok(create_table_provider(&self.duckdb_factory, &cmd, retention_sql_handler_for_source(source)).await?)
+        Ok(create_table_provider(&self.duckdb_factory, &cmd, on_data_written_handler_for_source(source)).await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -431,38 +433,81 @@ impl DataAccelerator for DuckDBAccelerator {
     }
 }
 
-fn retention_sql_handler_for_source(source: Option<&dyn AccelerationSource>) -> Option<WriteCompletionHandler> {
+fn on_data_written_handler_for_source(source: Option<&dyn AccelerationSource>) -> Option<WriteCompletionHandler> {
     let source = source?;
     let acceleration = source.acceleration()?;
-    let retention_sql = acceleration.retention_sql.as_ref()?.clone();
+
+    // Access the sort parameters
+    let sort_column = acceleration.params.get("on_insert_sort_column");
+    let sort_direction = acceleration.params.get("on_insert_sort_direction");
+
+    let retention_sql = acceleration.retention_sql.clone();
+
+    // Only continue if we have sort parameters or retention SQL
+    if sort_column.is_none() && sort_direction.is_none() && retention_sql.is_none() {
+        return None;
+    }
+
+
+    let retention_sql = acceleration.retention_sql.clone();
+    let sort_column = sort_column.cloned();
+    let sort_direction = sort_direction.cloned();
     let source_name = source.name().to_string();
     
     Some(Arc::new(move |tx: &duckdb::Transaction, table_manager: &TableManager, _schema| {
-        tracing::info!("Executing retention SQL: {retention_sql}");
-        
-        let row_count_query = format!("SELECT COUNT(*) FROM {}", table_manager.table_name());
-
-        match tx.prepare(&row_count_query) {
-            Ok(mut stmt) => {
-                match stmt.query_row([], |row| {
-                    let count: i64 = row.get(0)?;
-                    Ok(count)
-                }) {
-                    Ok(count) => {
-                        tracing::info!("Table '{source_name}' has {count} rows after write");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to get row count for table '{source_name}': {e}");
-                        Err(datafusion::common::DataFusionError::External(Box::new(e)))
+        // Handle sorting if parameters are provided
+        if let (Some(column), Some(direction)) = (&sort_column, &sort_direction) {
+            let sort_sql = format!(
+                "CREATE OR REPLACE TABLE {} AS SELECT * FROM {} ORDER BY {column} {direction}",
+                table_manager.table_name(),
+                table_manager.table_name(),
+            );
+            
+            tracing::info!("Executing sort SQL: {sort_sql}");
+            
+            match tx.prepare(&sort_sql) {
+                Ok(mut stmt) => {
+                    match stmt.execute([]) {
+                        Ok(rows_affected) => {
+                            tracing::info!("Sort SQL executed for table '{source_name}', {rows_affected} rows affected");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to execute sort SQL for table '{source_name}': {e}");
+                            return Err(datafusion::common::DataFusionError::External(Box::new(e)));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::error!("Failed to prepare row count query for table '{source_name}': {e}");
-                Err(datafusion::common::DataFusionError::External(Box::new(e)))
+                Err(e) => {
+                    tracing::error!("Failed to prepare sort SQL for table '{source_name}': {e}");
+                    return Err(datafusion::common::DataFusionError::External(Box::new(e)));
+                }
             }
         }
+
+        // Handle retention SQL if provided (existing functionality)
+        if let Some(retention_sql) = &retention_sql {
+            tracing::info!("Executing retention SQL: {retention_sql}");
+            
+            match tx.prepare(retention_sql) {
+                Ok(mut stmt) => {
+                    match stmt.execute([]) {
+                        Ok(rows_affected) => {
+                            tracing::info!("Retention SQL executed for table '{source_name}', {rows_affected} rows affected");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to execute retention SQL for table '{source_name}': {e}");
+                            return Err(datafusion::common::DataFusionError::External(Box::new(e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to prepare retention SQL for table '{source_name}': {e}");
+                    return Err(datafusion::common::DataFusionError::External(Box::new(e)));
+                }
+            }
+        }
+
+        Ok(())
     }))
 }
 
