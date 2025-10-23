@@ -28,7 +28,7 @@ on:
 
 jobs:
   setup:
-    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == true) }}
+    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
     runs-on: ubuntu-latest
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
@@ -148,6 +148,7 @@ jobs:
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             GITHUB_REPOSITORY=${{ github.repository }}
+            GITHUB_TOKEN=${{ github.token }}
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: models
@@ -225,6 +226,7 @@ jobs:
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             GITHUB_REPOSITORY=${{ github.repository }}
+            GITHUB_TOKEN=${{ github.token }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: models
@@ -247,6 +249,8 @@ jobs:
     runs-on: 'spicehq-dev-runners'
     env:
       CUDA_COMPUTE_CAP: 80
+    # CUDA isn't a supported target yet
+    if: ${{ false }}
     steps:
       - name: Skip CUDA build
         if: ${{ needs.setup.outputs.run_cuda != 'true' }}
@@ -283,6 +287,7 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
             GITHUB_REPOSITORY=${{ github.repository }}
+            GITHUB_TOKEN=${{ github.token }}
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts
@@ -334,13 +339,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to DockerHub
-        if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Import images and create manifests
         run: |
@@ -408,7 +406,7 @@ jobs:
 
       # triggers https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml workflow
       - name: Trigger platform images promotion
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        if: needs.setup.outputs.publish == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -453,13 +451,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to DockerHub
-        if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Import images and create manifests
         run: |
