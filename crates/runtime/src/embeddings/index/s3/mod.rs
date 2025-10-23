@@ -17,6 +17,7 @@ limitations under the License.
 use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
+use aws_config::timeout::TimeoutConfigBuilder;
 use data_components::s3_vectors::{
     MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
@@ -36,7 +37,7 @@ use spicepod::{
 use tokio::sync::RwLock;
 
 use crate::{
-    dataconnector::parameters::aws::load_config,
+    dataconnector::parameters::aws::initiate_config_with_credentials,
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
 };
@@ -57,6 +58,9 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         )
         .one_of(&["euclidean", "cosine"])
         .secret(),
+    ParameterSpec::runtime("client_timeout").description(
+        "The duration to wait prior to receiving the first response byte, in time unit format. E.g. 30s, 1m.",
+    ),
     ParameterSpec::component("arn")
         .description("The S3 Vectors bucket ARN to use for the S3 Vectors index.")
         .secret(),
@@ -161,6 +165,15 @@ async fn try_vector_table(
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
+    let client_timeout = string_from_params(&params, "client_timeout")
+        .map(fundu::parse_duration)
+        .transpose()
+        .map_err(|_| {
+            Box::from(format!(
+                "S3 vectors index configured with invalid 'client_timeout'= '{}'",
+                string_from_params(&params, "client_timeout").unwrap_or_default() // If missing, uses default ("").
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
 
     let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
@@ -183,15 +196,21 @@ async fn try_vector_table(
         Box::from(format!("Invalid S3 Vectors bucket defined: {e}"))
     })?;
 
-    let config = load_config(
+    let mut config_bldr = initiate_config_with_credentials(
         "S3Vectors",
         "aws_region",
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
         &params,
-    )
-    .await?;
+    )?;
+
+    if let Some(dur) = client_timeout {
+        config_bldr =
+            config_bldr.timeout_config(TimeoutConfigBuilder::new().operation_timeout(dur).build());
+    }
+
+    let config = config_bldr.load().await;
 
     let s3_vector_client = S3VectorClient::new(Client::new(&config));
 
