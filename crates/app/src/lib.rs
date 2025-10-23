@@ -146,7 +146,7 @@ impl AppBuilder {
         self.management.clone_from(&spicepod.management);
         if let Some(ref snapshot) = spicepod.snapshots {
             self.snapshots = Some(snapshot.clone());
-        };
+        }
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
