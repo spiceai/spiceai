@@ -38,11 +38,6 @@ use crate::execution_plan::schema_cast::SchemaCastScanExec;
 use super::TableScanParams;
 
 /// [`FallbackAsyncTableProvider`] is a generic function type that allows the deferred construction of a [`TableProvider`].
-///
-/// Functions that look like this match [`FallbackAsyncTableProvider`].
-/// ```rust
-/// async fn my_fallback_handler() -> Arc<dyn TableProvider> {}
-/// ```
 pub type FallbackAsyncTableProvider = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Arc<dyn TableProvider>> + Send + Sync + 'static>>
         + Send

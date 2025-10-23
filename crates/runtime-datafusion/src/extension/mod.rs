@@ -28,7 +28,7 @@ pub mod bytes_processed;
 
 /// [`ExtensionPlanQueryPlanner`] implements [`QueryPlanner`] with a set of [`ExtensionPlanner`].
 ///
-/// It provides all [`ExtensionPlanner]s to [`DefaultPhysicalPlanner`] during [`QueryPlanner::create_physical_plan`].
+/// It provides all [`ExtensionPlanner`]s to [`DefaultPhysicalPlanner`] during [`QueryPlanner::create_physical_plan`].
 #[derive(Default)]
 pub struct ExtensionPlanQueryPlanner {
     extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
