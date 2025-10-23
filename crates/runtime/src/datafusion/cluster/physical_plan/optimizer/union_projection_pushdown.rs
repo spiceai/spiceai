@@ -162,7 +162,7 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
             Ok(optimized)
         } else {
             exec_err!(
-                "{}: Failed to bind all plan replacements. This is a bug.",
+                "{}: Failed to bind all plan replacements. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
                 self.name()
             )
         }

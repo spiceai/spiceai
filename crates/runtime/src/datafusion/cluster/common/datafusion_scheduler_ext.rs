@@ -1,4 +1,5 @@
 use crate::datafusion::DataFusion;
+use async_trait::async_trait;
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use ballista_scheduler::state::SchedulerState;
 use datafusion::common::{DataFusionError, Result};
@@ -7,19 +8,19 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Handle;
-use tokio::task;
 
 /// Some convenience methods for the `DataFusion` for accessing the scheduler state in clustered mode
+#[async_trait]
 pub trait DataFusionSchedulerExtensions<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
     fn scheduler_state(&self) -> Option<Arc<SchedulerState<T, U>>>;
 
-    fn executors(&self) -> Result<Vec<(ExecutorMetadata, Option<Duration>)>> {
+    async fn executors(&self) -> Result<Vec<(ExecutorMetadata, Option<Duration>)>> {
         if let Some(scheduler_state) = self.scheduler_state() {
-            task::block_in_place(|| {
-                Handle::current().block_on(scheduler_state.executor_manager.get_executor_state())
-            })
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+            scheduler_state
+                .executor_manager
+                .get_executor_state()
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))
         } else {
             Ok(vec![])
         }

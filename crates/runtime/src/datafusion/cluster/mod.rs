@@ -95,18 +95,25 @@ pub async fn initialize_cluster_executor(
 
     // Try to bind the same flight port Spice usually does, but if we cannot, bind a different
     // port to allow for easy local deployments
-    let default_grpc_binding = TcpListener::bind(rt.config.flight_bind_address)
+    let bind_addr = if let Ok(flight_bind_addr) = TcpListener::bind(rt.config.flight_bind_address)
         .await
-        .and_then(|l| l.local_addr());
-
-    let dynamic_grpc_binding = TcpListener::bind("0.0.0.0:0")
+        .and_then(|l| l.local_addr())
+    {
+        flight_bind_addr
+    } else if let Ok(dynamic_addr) = TcpListener::bind("127.0.0.1:0")
         .await
-        .and_then(|l| l.local_addr());
-
-    let bindable_addr = default_grpc_binding
-        .or(dynamic_grpc_binding)
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
+        .and_then(|l| l.local_addr())
+    {
+        dynamic_addr
+    } else {
+        return Err(FailedToStartClusterExecutor {
+            source: format!(
+                "Unable to bind Flight service to configured address ({}) or fallback",
+                rt.config.flight_bind_address
+            )
+            .into(),
+        });
+    };
 
     let Some(concurrent_tasks) = std::thread::available_parallelism()
         .ok()
@@ -123,8 +130,8 @@ pub async fn initialize_cluster_executor(
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service
-        host: Some(bindable_addr.ip().to_string()),
-        port: u32::from(bindable_addr.port()),
+        host: Some(bind_addr.ip().to_string()),
+        port: u32::from(bind_addr.port()),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
         grpc_port: 0,
         specification: Some(ExecutorSpecification {
@@ -147,7 +154,7 @@ pub async fn initialize_cluster_executor(
 
     let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
         SpiceLogicalCodec::new_codec(),
-        SpicePhysicalCodec::new_codec(Arc::clone(&rt))
+        SpicePhysicalCodec::new(Arc::clone(&rt))
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?,
     );
@@ -182,7 +189,7 @@ async fn create_scheduler_server(
 
         override_logical_codec: Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt))),
         override_physical_codec: Some(
-            SpicePhysicalCodec::new_codec(Arc::clone(rt))
+            SpicePhysicalCodec::new(Arc::clone(rt))
                 .boxed()
                 .context(FailedToStartClusterSchedulerSnafu)?,
         ),

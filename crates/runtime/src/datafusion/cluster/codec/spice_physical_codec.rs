@@ -26,6 +26,8 @@ macro_rules! deserialize {
     };
 }
 
+const SPICE_EXEC_NAME: &str = "spice.exec.name";
+
 /// Serialization support for custom Spice execution nodes
 pub struct SpicePhysicalCodec {
     inner: Arc<dyn PhysicalExtensionCodec>,
@@ -39,7 +41,7 @@ impl Debug for SpicePhysicalCodec {
 }
 
 impl SpicePhysicalCodec {
-    pub fn new_codec(runtime: Arc<Runtime>) -> Result<Arc<dyn PhysicalExtensionCodec>> {
+    pub fn new(runtime: Arc<Runtime>) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
             runtime: Some(runtime),
@@ -68,7 +70,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         let exec_params = serde_json::from_slice::<HashMap<String, Value>>(buf)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        match exec_params.get("spice.exec.name").and_then(|v| v.as_str()) {
+        match exec_params.get(SPICE_EXEC_NAME).and_then(|v| v.as_str()) {
             Some("SchemaCastScanExec") => {
                 let schema = deserialize!(exec_params, "spice.exec.schema", Schema)?;
                 let exec = Arc::new(SchemaCastScanExec::new(
@@ -88,7 +90,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
         let mut map: HashMap<&str, Value> = HashMap::new();
-        map.insert("spice.exec.name", node.name().into());
+        map.insert(SPICE_EXEC_NAME, node.name().into());
 
         match node.name() {
             "SchemaCastScanExec" => {

@@ -82,9 +82,18 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
             Response Message: N/A"
             .into(),
     };
+    let get_app_definition_action_type = FlightActionType {
+        r#type: ActionType::GetAppDefinition.to_string(),
+        description:
+            "Used in cluster mode to ask Spice for its App declaration for runtime dependencies.\n
+            Request Message: N/A
+            Response Message: app::App serialized as JSON bytes"
+                .into(),
+    };
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
         Ok(close_prepared_statement_action_type),
+        Ok(get_app_definition_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || start);

@@ -10,8 +10,6 @@ use datafusion_expr::{Extension, LogicalPlan, ScalarUDF};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use std::fmt::Debug;
 use std::sync::Arc;
-use tokio::runtime::Handle;
-use tokio::task;
 
 /// Serialization support for custom Spice logical nodes
 pub struct SpiceLogicalCodec {
@@ -90,9 +88,16 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         _buf: &[u8],
         table_ref: &TableReference,
         _schema: SchemaRef,
-        ctx: &SessionContext,
+        _ctx: &SessionContext,
     ) -> Result<Arc<dyn TableProvider>> {
-        task::block_in_place(|| Handle::current().block_on(ctx.table_provider(table_ref.clone())))
+        if let Some(table_provider) = self.runtime()?.df.get_table_sync(table_ref) {
+            Ok(table_provider)
+        } else {
+            exec_err!(
+                "SpiceLogicalCodec could not resolve table reference {}",
+                table_ref
+            )
+        }
     }
 
     // no-op
