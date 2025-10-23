@@ -19,7 +19,7 @@ pub(crate) fn get_acceleration_config_append(
     engine: &str,
     acceleration_params: Option<Params>,
 ) -> Acceleration {
-    Acceleration {
+    let mut acceleration = Acceleration {
         enabled: true,
         params: acceleration_params,
         engine: Some(engine.to_string()),
@@ -28,17 +28,24 @@ pub(crate) fn get_acceleration_config_append(
             "select * from test_table where created_at > now() - INTERVAL '10 years'".to_string(),
         ),
         refresh_check_interval: Some("5h".to_string()),
-        primary_key: Some("id".to_string()),
-        on_conflict: [("id".to_string(), OnConflictBehavior::Upsert)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, OnConflictBehavior>>(),
-        indexes: [("id".to_string(), IndexType::Unique)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, IndexType>>(),
         ..Acceleration::default()
+    };
+
+    // Arrow engine doesn't support indexes, primary_key, or on_conflict
+    // Only add these for engines that support them (duckdb, sqlite, postgres)
+    if engine != "arrow" {
+        acceleration.primary_key = Some("id".to_string());
+        acceleration.on_conflict = [("id".to_string(), OnConflictBehavior::Upsert)]
+            .iter()
+            .cloned()
+            .collect::<HashMap<String, OnConflictBehavior>>();
+        acceleration.indexes = [("id".to_string(), IndexType::Unique)]
+            .iter()
+            .cloned()
+            .collect::<HashMap<String, IndexType>>();
     }
+
+    acceleration
 }
 
 pub(crate) fn get_acceleration_config_full(

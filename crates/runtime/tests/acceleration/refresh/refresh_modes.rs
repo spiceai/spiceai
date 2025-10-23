@@ -20,7 +20,7 @@ limitations under the License.
 //! refresh modes using a helper function with variants for each engine.
 
 use crate::acceleration::refresh::common::{
-    execute_ps_sql, get_acceleration_config_append, get_acceleration_config_full,
+    execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
     initialize_postgres, refresh_table, start_test_runtime,
 };
 use crate::postgres::common;
@@ -40,8 +40,7 @@ async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Erro
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             // Initial state: 1 row
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let initial_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -62,8 +61,7 @@ async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Erro
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             // After refresh: 2 rows (append mode keeps old + adds new)
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let final_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -91,8 +89,7 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             // Initial state: 1 row
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let initial_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -113,8 +110,7 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             // After refresh: 2 rows (full mode replaces with current source)
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let final_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
