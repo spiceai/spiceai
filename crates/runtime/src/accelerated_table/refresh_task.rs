@@ -774,7 +774,6 @@ impl RefreshTask {
             return Ok(StreamingDataUpdate::new(stream, update_type));
         }
 
-        let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
         let get_data_result = get_data(
             &mut ctx,
             dataset_name,
