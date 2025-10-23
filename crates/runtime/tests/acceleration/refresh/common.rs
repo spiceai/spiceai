@@ -63,6 +63,7 @@ pub(crate) fn get_dataset(port: usize) -> Dataset {
             .collect::<HashMap<String, String>>(),
     ));
     ds.time_column = Some("created_at".to_string());
+    ds.time_format = Some(TimeFormat::Timestamptz);
     ds
 }
 
