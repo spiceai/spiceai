@@ -80,7 +80,7 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
-use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
 
