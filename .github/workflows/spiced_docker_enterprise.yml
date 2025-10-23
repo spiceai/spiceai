@@ -28,7 +28,7 @@ on:
 
 jobs:
   setup:
-    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == true) }}
+    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
     runs-on: ubuntu-latest
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
@@ -406,7 +406,7 @@ jobs:
 
       # triggers https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml workflow
       - name: Trigger platform images promotion
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        if: needs.setup.outputs.publish == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
