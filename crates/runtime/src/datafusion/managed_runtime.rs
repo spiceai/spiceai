@@ -172,3 +172,129 @@ impl Drop for RuntimeDriverStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::error::DataFusionError;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::StreamExt;
+    use runtime_request_context::Protocol;
+    use tokio::runtime::Builder;
+
+    fn test_request_context() -> Arc<RequestContext> {
+        Arc::new(RequestContext::builder(Protocol::Internal).build())
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    #[tokio::test]
+    async fn run_record_batch_stream_on_runtime_streams_batches() {
+        let runtime = test_runtime();
+        let handle = runtime.handle().clone();
+        let request_context = test_request_context();
+
+        let managed = run_record_batch_stream_on_runtime(
+            handle,
+            Arc::clone(&request_context),
+            Span::current(),
+            async move {
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )]));
+
+                let columns: Vec<ArrayRef> =
+                    vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef];
+                let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+                    .expect("create record batch");
+
+                let batches = vec![
+                    Ok::<_, DataFusionError>(batch.clone()),
+                    Ok::<_, DataFusionError>(batch),
+                ];
+
+                let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    futures::stream::iter(batches).boxed(),
+                ));
+
+                Ok::<_, DataFusionError>((42_u8, stream))
+            },
+        )
+        .await
+        .expect("managed stream");
+
+        let (metadata, stream) = managed.into_parts();
+        assert_eq!(metadata, 42_u8);
+
+        let results: Vec<_> = stream.collect().await;
+        assert_eq!(results.len(), 2);
+        let first_batch = results
+            .first()
+            .expect("first batch result")
+            .as_ref()
+            .expect("batch ok");
+        assert_eq!(first_batch.num_rows(), 3);
+        runtime.shutdown_background();
+    }
+
+    #[tokio::test]
+    async fn run_record_batch_stream_on_runtime_propagates_future_errors() {
+        let runtime = test_runtime();
+        let handle = runtime.handle().clone();
+        let request_context = test_request_context();
+
+        let result = run_record_batch_stream_on_runtime(
+            handle,
+            Arc::clone(&request_context),
+            Span::current(),
+            async move { Err::<(u8, SendableRecordBatchStream), &'static str>("boom") },
+        )
+        .await;
+
+        match result {
+            Err(ManagedRuntimeError::Future(message)) => assert_eq!(message, "boom"),
+            Ok(_) => panic!("expected managed runtime error"),
+            Err(ManagedRuntimeError::DriverTaskEnded) => {
+                panic!("expected future error, got driver termination")
+            }
+        }
+        runtime.shutdown_background();
+    }
+
+    #[tokio::test]
+    async fn run_record_batch_stream_on_runtime_handles_driver_task_end() {
+        let runtime = test_runtime();
+        let handle = runtime.handle().clone();
+        let request_context = test_request_context();
+
+        let result = run_record_batch_stream_on_runtime::<_, u8, &'static str>(
+            handle,
+            request_context,
+            Span::current(),
+            async move {
+                panic!("driver task panic");
+            },
+        )
+        .await;
+
+        match result {
+            Err(ManagedRuntimeError::DriverTaskEnded) => (),
+            Ok(_) => panic!("expected driver termination error"),
+            Err(ManagedRuntimeError::Future(_)) => {
+                panic!("expected driver termination error, got future error")
+            }
+        }
+        runtime.shutdown_background();
+    }
+}
