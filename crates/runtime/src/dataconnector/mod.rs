@@ -54,6 +54,7 @@ use tokio::sync::Mutex;
 
 use std::future::Future;
 
+pub mod blocking;
 pub mod listing;
 
 pub mod abfs;
@@ -430,6 +431,7 @@ pub async fn register_all() {
     register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
     register_connector_factory("iceberg", iceberg::IcebergDataConnectorFactory::new_arc()).await;
     register_connector_factory("glue", glue::GlueDataConnectorFactory::new_arc()).await;
+    register_connector_factory("blocking", blocking::BlockingConnectorFactory::new_arc()).await;
 }
 
 pub async fn unregister_all() {
