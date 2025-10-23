@@ -98,13 +98,18 @@ impl PepperTableProvider {
     pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
 
-        // Create listing table for the Vortex files
-        let table_path = &table_metadata.path;
-        let dir_url_str = if table_path.ends_with('/') {
-            table_path.to_string()
-        } else {
-            format!("{table_path}/")
-        };
+        // Construct path to current snapshot
+        // Directory structure: [table_path]/[table_id]/[snapshot_id]/
+        // All tables have a snapshot ID (created on table initialization)
+        let snapshot_dir = std::path::PathBuf::from(&table_metadata.path)
+            .join(table_metadata.table_id.to_string())
+            .join(&table_metadata.current_snapshot_id);
+
+        // DataFusion requires trailing slash for directory URLs
+        let mut dir_url_str = snapshot_dir.to_string_lossy().to_string();
+        if !dir_url_str.ends_with('/') {
+            dir_url_str.push('/');
+        }
 
         let table_url = ListingTableUrl::parse(&dir_url_str).map_err(|e| {
             super::catalog::CatalogError::InvalidOperation {
@@ -477,23 +482,30 @@ impl TableProvider for PepperTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Handle overwrite by creating a new ListingTable with a new subdirectory
-        // This allows us to logically implement overwrite while using append-only
-        // Vortex operations underneath
+        // Handle overwrite by creating a new snapshot
+        // Directory structure: [data_dir]/[table_id]/[snapshot_id]/
         if overwrite == InsertOp::Overwrite {
-            // Create a new subdirectory for the overwrite data
-            // Use the table_id to ensure a stable directory name that's updated on each overwrite
-            let overwrite_dir = std::path::PathBuf::from(&self.table_metadata.path)
-                .join(format!("overwrite_{}", self.table_metadata.table_id));
-            let overwrite_dir = overwrite_dir.to_string_lossy().to_string();
+            // Generate a new UUIDv7 for the snapshot
+            let new_snapshot_id = uuid::Uuid::now_v7().to_string();
 
-            // Create the directory
-            tokio::fs::create_dir_all(&overwrite_dir)
+            // Create snapshot directory: [table_path]/[table_id]/[snapshot_id]/
+            let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
+                .join(self.table_metadata.table_id.to_string())
+                .join(&new_snapshot_id);
+
+            // Create the snapshot directory
+            tokio::fs::create_dir_all(&snapshot_dir)
                 .await
                 .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
 
-            // Create a new ListingTable pointing to the overwrite directory
-            let table_url = ListingTableUrl::parse(&overwrite_dir)
+            // DataFusion requires trailing slash for directory URLs
+            let mut snapshot_dir_str = snapshot_dir.to_string_lossy().to_string();
+            if !snapshot_dir_str.ends_with('/') {
+                snapshot_dir_str.push('/');
+            }
+
+            // Create a new ListingTable pointing to the snapshot directory
+            let table_url = ListingTableUrl::parse(&snapshot_dir_str)
                 .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
 
             let format = Arc::new(VortexFormat::default());
@@ -511,18 +523,17 @@ impl TableProvider for PepperTableProvider {
                 .insert_into(state, input, InsertOp::Append)
                 .await?;
 
-            // Update the catalog to point to the new overwrite directory
-            // This ensures that future table providers will scan the correct location
+            // Update the catalog to point to the new snapshot
             self._catalog
-                .update_table_path(self.table_metadata.table_id, &overwrite_dir)
+                .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
                 .await
                 .map_err(|e| {
                     datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to update catalog path after overwrite: {e}"
+                        "Failed to update snapshot after overwrite: {e}"
                     ))
                 })?;
 
-            // Update the provider's listing table to point to the new directory
+            // Update the provider's listing table to point to the new snapshot
             // This ensures subsequent queries in the same context will read from the new data
             let mut listing_table_guard = self.listing_table.write().map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -534,9 +545,18 @@ impl TableProvider for PepperTableProvider {
             return Ok(result);
         }
 
-        // For regular appends, use the existing listing table with append mode
-        // The Vortex ListingTable only supports append mode, so we always use Append
-        // even for regular inserts
+        // For regular appends, use the existing snapshot and listing table
+        // Ensure the snapshot directory exists (it might not if this is the first write to a newly created table)
+        let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
+            .join(self.table_metadata.table_id.to_string())
+            .join(&self.table_metadata.current_snapshot_id);
+
+        if !snapshot_dir.exists() {
+            tokio::fs::create_dir_all(&snapshot_dir)
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+        }
+
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
             let guard = self.listing_table.read().map_err(|e| {

@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::DatabaseName;
 use crate::dataconnector::glue::{GlueDataConnector, InputFormat};
-use crate::dataconnector::parameters::aws::load_config;
+use crate::dataconnector::parameters::aws::initiate_config_with_credentials;
 use crate::dataconnector::{DataConnector, parameters};
 use crate::{
     Runtime,
@@ -118,7 +118,7 @@ impl GlueCatalogProvider {
     ) -> Result<Self> {
         Self::validate_parameters(&mut parameters).await?;
 
-        let config = load_config(
+        let config = initiate_config_with_credentials(
             "GlueCatalogConnector",
             "region",
             "key",
@@ -126,8 +126,9 @@ impl GlueCatalogProvider {
             "session_token",
             &parameters.parameters,
         )
-        .await
-        .context(ConfigurationLoadingFailedSnafu)?;
+        .context(ConfigurationLoadingFailedSnafu)?
+        .load()
+        .await;
 
         let client = Client::new(&config);
 
