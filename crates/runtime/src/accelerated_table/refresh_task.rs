@@ -808,7 +808,10 @@ impl RefreshTask {
         )
     }
 
-    fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
+    async fn refresh_df_context(
+        &self,
+        federated_provider: Arc<dyn TableProvider>,
+    ) -> SessionContext {
         let state_builder = SessionStateBuilder::new()
             .with_config(get_df_default_config())
             .with_runtime_env(default_runtime_env())
@@ -836,6 +839,10 @@ impl RefreshTask {
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
+
+        state
+            .config_mut()
+            .set_extension(RequestContext::current(AsyncMarker::new().await));
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");
@@ -892,7 +899,9 @@ impl RefreshTask {
 
         let existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
-            &self.refresh_df_context(Arc::clone(&federated_provider)),
+            &self
+                .refresh_df_context(Arc::clone(&federated_provider))
+                .await,
         )
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
@@ -928,7 +937,7 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> super::Result<Option<u128>> {
         let federated = self.federated.table_provider().await;
-        let ctx = self.refresh_df_context(federated);
+        let ctx = self.refresh_df_context(federated).await;
 
         refresh
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
