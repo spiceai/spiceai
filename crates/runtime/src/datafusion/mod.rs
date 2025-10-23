@@ -89,6 +89,7 @@ pub mod dialect;
 pub mod error;
 pub mod extension;
 pub mod filter_converter;
+pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;
