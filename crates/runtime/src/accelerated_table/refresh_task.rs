@@ -720,10 +720,7 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
-        let mut ctx = self
-            .refresh_df_context(Arc::clone(&federated_provider))
-            .await;
-            
+
         let dataset_name = self.dataset_name.clone();
         let update_type = match refresh.mode {
             RefreshMode::Disabled => {
@@ -743,11 +740,27 @@ impl RefreshTask {
             let request_context = RequestContext::current(AsyncMarker::new().await);
             let span = Span::current();
 
+            // Capture necessary state to create ctx inside the closure
+            let dataset_name_for_ctx = self.dataset_name.clone();
+            let federated_for_ctx = Arc::clone(&self.federated);
+            let accelerator_for_ctx = Arc::clone(&self.accelerator);
+            let disable_federation = self.disable_federation;
+
             let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
                 runtime_handle,
                 request_context,
                 span,
                 async move {
+                    // Create ctx inside the managed runtime to avoid creating it twice
+                    let mut ctx = Self::create_refresh_df_context(
+                        Arc::clone(&provider_for_runtime),
+                        &dataset_name_for_ctx,
+                        &federated_for_ctx,
+                        &accelerator_for_ctx,
+                        disable_federation,
+                    )
+                    .await;
+
                     let data = get_data(
                         &mut ctx,
                         dataset_name_for_runtime,
@@ -773,6 +786,11 @@ impl RefreshTask {
             let (update_type, stream) = managed_stream.into_parts();
             return Ok(StreamingDataUpdate::new(stream, update_type));
         }
+
+        // Create ctx only in the fallback path (no managed runtime)
+        let mut ctx = self
+            .refresh_df_context(Arc::clone(&federated_provider))
+            .await;
 
         let get_data_result = get_data(
             &mut ctx,
@@ -814,6 +832,26 @@ impl RefreshTask {
         &self,
         federated_provider: Arc<dyn TableProvider>,
     ) -> SessionContext {
+        Self::create_refresh_df_context(
+            federated_provider,
+            &self.dataset_name,
+            &self.federated,
+            &self.accelerator,
+            self.disable_federation,
+        )
+        .await
+    }
+
+    /// Static helper method to create a `DataFusion` context for refresh operations.
+    /// This is separated from `refresh_df_context` to allow it to be called from async closures
+    /// without requiring `self`, avoiding the need to create the context twice.
+    async fn create_refresh_df_context(
+        federated_provider: Arc<dyn TableProvider>,
+        dataset_name: &TableReference,
+        _federated: &Arc<FederatedTable>,
+        accelerator: &Arc<dyn TableProvider>,
+        disable_federation: bool,
+    ) -> SessionContext {
         let state_builder = SessionStateBuilder::new()
             .with_config(get_df_default_config())
             .with_runtime_env(default_runtime_env())
@@ -827,7 +865,7 @@ impl RefreshTask {
         let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
 
         // If federation is disabled, disable the federation analyzer rule and don't include the federated planner.
-        if self.disable_federation {
+        if disable_federation {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(false);
         } else {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(true);
@@ -853,31 +891,31 @@ impl RefreshTask {
         let default_catalog = state.config_options().catalog.default_catalog.clone();
         let ctx = SessionContext::new_with_state(state);
 
-        match schema::ensure_schema_exists(&ctx, &default_catalog, &self.dataset_name) {
+        match schema::ensure_schema_exists(&ctx, &default_catalog, dataset_name) {
             Ok(()) => (),
             Err(_) => {
                 unreachable!("The default catalog should always exist");
             }
         }
 
-        if let Err(e) = ctx.register_table(self.dataset_name.clone(), federated_provider) {
+        if let Err(e) = ctx.register_table(dataset_name.clone(), federated_provider) {
             tracing::error!("Unable to register federated table: {e}");
         }
 
         let mut acc_dataset_name = String::with_capacity(
-            self.dataset_name.table().len() + self.dataset_name.schema().map_or(0, str::len),
+            dataset_name.table().len() + dataset_name.schema().map_or(0, str::len),
         );
 
-        if let Some(schema) = self.dataset_name.schema() {
+        if let Some(schema) = dataset_name.schema() {
             acc_dataset_name.push_str(schema);
         }
 
         acc_dataset_name.push_str("accelerated_");
-        acc_dataset_name.push_str(self.dataset_name.table());
+        acc_dataset_name.push_str(dataset_name.table());
 
         if let Err(e) = ctx.register_table(
             TableReference::parse_str(&acc_dataset_name),
-            Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))),
+            Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");
         }
