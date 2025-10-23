@@ -351,9 +351,13 @@ pub async fn create_synced_internal_accelerated_table(
     runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let ctx = Arc::clone(&runtime.datafusion().ctx);
-    let source_table_provider =
-        get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets), runtime)
-            .await?;
+    let source_table_provider = get_spiceai_table_provider(
+        table_reference.table(),
+        from,
+        Arc::clone(&secrets),
+        Arc::clone(&runtime),
+    )
+    .await?;
     let federated_table = Arc::new(FederatedTable::new_unchecked(source_table_provider));
 
     let accelerated_table_provider = accelerator_engine_registry
@@ -377,6 +381,7 @@ pub async fn create_synced_internal_accelerated_table(
         accelerated_table_provider,
         refresh,
     );
+    builder.tokio_runtime(runtime.datafusion().tokio_runtime().cloned());
 
     builder.retention(retention);
 

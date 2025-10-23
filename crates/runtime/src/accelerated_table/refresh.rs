@@ -43,6 +43,7 @@ use runtime_acceleration::snapshot::{
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
+use tokio::runtime::Handle;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
@@ -437,6 +438,7 @@ pub struct Refresher {
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     on_complete_notification: Option<Arc<Notify>>,
+    tokio_runtime: Option<Handle>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -459,6 +461,7 @@ impl Refresher {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        tokio_runtime: Option<Handle>,
     ) -> Self {
         Self {
             runtime_status,
@@ -479,6 +482,7 @@ impl Refresher {
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
             metrics: None,
+            tokio_runtime,
         }
     }
 
@@ -629,6 +633,8 @@ impl Refresher {
         }
 
         refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
+
+        refresh_task_runner = refresh_task_runner.with_tokio_runtime(self.tokio_runtime.clone());
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -797,6 +803,7 @@ impl Refresher {
                 self.metrics.clone(),
             )
             .with_disable_federation(self.disable_federation)
+            .with_tokio_runtime(self.tokio_runtime.clone())
             .build(),
         );
 
@@ -830,6 +837,7 @@ impl Refresher {
                 self.metrics.clone(),
             )
             .with_disable_federation(self.disable_federation)
+            .with_tokio_runtime(self.tokio_runtime.clone())
             .build(),
         );
 
@@ -998,6 +1006,7 @@ mod tests {
             Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
+            None,
         );
 
         refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1206,6 +1215,7 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1360,6 +1370,7 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1564,6 +1575,7 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));

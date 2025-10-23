@@ -34,7 +34,11 @@ use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
 use snafu::{OptionExt, ResultExt};
-use tokio::time::Instant;
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex, RwLock, Semaphore, oneshot},
+    time::Instant,
+};
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -43,6 +47,7 @@ use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
 use crate::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
 use crate::datafusion::is_spice_internal_dataset;
+use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::timing::MultiTimeMeasurement;
@@ -64,7 +69,6 @@ use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 use crate::component::dataset::TimeFormat;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
-use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
 use super::refresh::Refresh;
 use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
@@ -80,6 +84,7 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
 
@@ -105,6 +110,7 @@ pub struct RefreshTaskBuilder {
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
+    tokio_runtime: Option<Handle>,
 }
 
 impl RefreshTaskBuilder {
@@ -127,6 +133,7 @@ impl RefreshTaskBuilder {
             disable_federation: false,
             semaphore: None,
             metrics,
+            tokio_runtime: None,
         }
     }
 
@@ -140,6 +147,12 @@ impl RefreshTaskBuilder {
     #[must_use]
     pub fn with_semaphore(mut self, semaphore: Arc<Semaphore>) -> RefreshTaskBuilder {
         self.semaphore = Some(semaphore);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tokio_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
+        self.tokio_runtime = runtime;
         self
     }
 
@@ -167,6 +180,7 @@ impl RefreshTaskBuilder {
                 .iter()
                 .cloned()
                 .collect(),
+            tokio_runtime: self.tokio_runtime,
         }
     }
 }
@@ -183,6 +197,7 @@ pub struct RefreshTask {
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Arc<Semaphore>,
     enabled_metrics: HashSet<String>,
+    tokio_runtime: Option<Handle>,
 }
 
 impl RefreshTask {
@@ -705,10 +720,7 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
-
-        let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
         let dataset_name = self.dataset_name.clone();
-
         let update_type = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -718,12 +730,54 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
+        if let Some(runtime_handle) = self.tokio_runtime.clone() {
+            let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
+            let dataset_name_for_runtime = dataset_name.clone();
+            let filters_for_runtime = filters.clone();
+            let update_type_for_runtime = update_type.clone();
+            let provider_for_runtime = Arc::clone(&federated_provider);
+            let sql_for_runtime = refresh.sql.clone();
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+            let span = Span::current();
+
+            let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+                runtime_handle,
+                request_context,
+                span,
+                async move {
+                    let data = get_data(
+                        &mut ctx,
+                        dataset_name_for_runtime,
+                        provider_for_runtime,
+                        sql_for_runtime,
+                        filters_for_runtime,
+                    )
+                    .await
+                    .map_err(check_and_mark_retriable_error)?;
+                    Ok((update_type_for_runtime, data))
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                ManagedRuntimeError::Future(df_err) => retry_from_df_error(df_err),
+                ManagedRuntimeError::DriverTaskEnded => {
+                    retry_from_df_error(DataFusionError::Execution(
+                        "Refresh driver task ended unexpectedly".to_string(),
+                    ))
+                }
+            })?;
+
+            let (update_type, stream) = managed_stream.into_parts();
+            return Ok(StreamingDataUpdate::new(stream, update_type));
+        }
+
+        let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
         let get_data_result = get_data(
             &mut ctx,
-            dataset_name.clone(),
+            dataset_name,
             federated_provider,
             refresh.sql.clone(),
-            filters.clone(),
+            filters,
         )
         .await
         .map_err(check_and_mark_retriable_error);

@@ -52,6 +52,7 @@ use runtime_acceleration::snapshot::SnapshotBehavior;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
@@ -246,6 +247,7 @@ pub struct Builder {
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
     metrics: Option<Metrics>,
+    tokio_runtime: Option<Handle>,
 }
 
 impl Builder {
@@ -279,6 +281,7 @@ impl Builder {
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
             metrics: None,
+            tokio_runtime: None,
         }
     }
 
@@ -319,6 +322,11 @@ impl Builder {
 
     pub fn metrics(&mut self, metrics: Metrics) -> &mut Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn tokio_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
+        self.tokio_runtime = runtime;
         self
     }
 
@@ -461,6 +469,7 @@ impl Builder {
             Some(self.federated_source),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
+            self.tokio_runtime.clone(),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
