@@ -284,7 +284,7 @@ mod tests {
     ) -> FallbackAsyncTableProvider {
         Arc::new(move || {
             let table_provider = Arc::clone(&table_provider);
-            Box::pin(async move { table_provider.clone() })
+            Box::pin(async move { Arc::clone(&table_provider) })
         })
     }
 

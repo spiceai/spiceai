@@ -29,34 +29,29 @@ pub mod bytes_processed;
 /// [`ExtensionPlanQueryPlanner`] implements [`QueryPlanner`] with a set of [`ExtensionPlanner`].
 ///
 /// It provides all [`ExtensionPlanner`]s to [`DefaultPhysicalPlanner`] during [`QueryPlanner::create_physical_plan`].
-#[derive(Default)]
 pub struct ExtensionPlanQueryPlanner {
-    extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+    physical_planner: Arc<dyn PhysicalPlanner>,
 }
 
 impl std::fmt::Debug for ExtensionPlanQueryPlanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExtensionPlanQueryPlanner")
-            .field("extension_planners", &self.extension_planners.len())
-            .finish()
+        f.debug_struct("ExtensionPlanQueryPlanner").finish()
+    }
+}
+impl Default for ExtensionPlanQueryPlanner {
+    fn default() -> Self {
+        Self {
+            physical_planner: Arc::new(DefaultPhysicalPlanner::default()),
+        }
     }
 }
 
 impl ExtensionPlanQueryPlanner {
     #[must_use]
-    pub fn new() -> Self {
-        ExtensionPlanQueryPlanner {
-            extension_planners: vec![],
+    pub fn from_extension_planners(planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>) -> Self {
+        Self {
+            physical_planner: Arc::new(DefaultPhysicalPlanner::with_extension_planners(planners)),
         }
-    }
-
-    #[must_use]
-    pub fn with_extension_planners(
-        mut self,
-        planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
-    ) -> Self {
-        self.extension_planners = planners;
-        self
     }
 }
 
@@ -67,9 +62,7 @@ impl QueryPlanner for ExtensionPlanQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let physical_planner =
-            DefaultPhysicalPlanner::with_extension_planners(self.extension_planners.clone());
-        physical_planner
+        self.physical_planner
             .create_physical_plan(logical_plan, session_state)
             .await
     }

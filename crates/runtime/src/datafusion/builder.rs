@@ -212,7 +212,7 @@ impl DataFusionBuilder {
             .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(
-                ExtensionPlanQueryPlanner::new().with_extension_planners(vec![
+                ExtensionPlanQueryPlanner::from_extension_planners(vec![
                     Arc::new(FederatedPlanner::new()),
                     Arc::new(BytesProcessedExtensionPlanner::new(Box::new(
                         track_bytes_processed,

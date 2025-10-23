@@ -103,7 +103,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .with_runtime_env(default_runtime_env())
                 .with_default_features()
                 .with_query_planner(Arc::new(
-                    ExtensionPlanQueryPlanner::new().with_extension_planners(vec![
+                    ExtensionPlanQueryPlanner::from_extension_planners(vec![
                         Arc::new(FederatedPlanner::new()),
                         Arc::new(IndexTableScanExtensionPlanner::new()),
                     ]),

@@ -779,11 +779,10 @@ impl RefreshTask {
             extension_planners.push(Arc::new(FederatedPlanner::new()));
         }
 
-        let query_planner =
-            ExtensionPlanQueryPlanner::new().with_extension_planners(extension_planners);
-
         let mut state = state_builder
-            .with_query_planner(Arc::new(query_planner))
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::from_extension_planners(extension_planners),
+            ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
