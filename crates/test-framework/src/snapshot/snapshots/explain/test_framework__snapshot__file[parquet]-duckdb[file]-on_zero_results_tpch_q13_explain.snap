@@ -24,33 +24,33 @@ description: "Query: tpch_q13"
 |               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                                                            |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                            |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                       |
-|               |           RepartitionExec: partitioning=Hash([c_count@0], 16), input_partitions=16                                                                                        |
+|               |           RepartitionExec: partitioning=Hash([c_count@0], 32), input_partitions=32                                                                                        |
 |               |             AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                               |
 |               |               ProjectionExec: expr=[count(orders.o_orderkey)@1 as c_count]                                                                                                |
 |               |                 AggregateExec: mode=SinglePartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]                                                    |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1]                               |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                         |
-|               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 16), input_partitions=16                                                                        |
+|               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 32), input_partitions=32                                                                        |
 |               |                           BytesProcessedExec                                                                                                                              |
 |               |                             SchemaCastScanExec                                                                                                                            |
-|               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                       |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                       |
 |               |                                 FallbackOnZeroResultsScanExec                                                                                                             |
 |               |                                   CoalescePartitionsExec                                                                                                                  |
-|               |                                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                 |
+|               |                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                 |
 |               |                                       CooperativeExec                                                                                                                     |
 |               |                                         DuckSqlExec sql= SELECT "c_custkey" FROM customer                                                                                 |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                         |
-|               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 16), input_partitions=16                                                                        |
+|               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 32), input_partitions=32                                                                        |
 |               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                                                     |
 |               |                             BytesProcessedExec                                                                                                                            |
 |               |                               CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
 |               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                                                       |
 |               |                                   SchemaCastScanExec                                                                                                                      |
-|               |                                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                 |
+|               |                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                 |
 |               |                                       FallbackOnZeroResultsScanExec                                                                                                       |
 |               |                                         CoalescePartitionsExec                                                                                                            |
-|               |                                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                           |
+|               |                                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                           |
 |               |                                             CooperativeExec                                                                                                               |
 |               |                                               DuckSqlExec sql= SELECT "o_orderkey", "o_custkey", "o_comment" FROM orders WHERE "o_comment" NOT LIKE '%special%requests%'  |
 |               |                                                                                                                                                                           |

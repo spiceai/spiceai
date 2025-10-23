@@ -23,7 +23,7 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, parameters::aws::load_config,
+    ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
 };
 
 #[derive(Debug)]
@@ -101,7 +101,7 @@ impl DataConnector for DynamoDB {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_name = dataset.path();
 
-        let config = load_config(
+        let config = initiate_config_with_credentials(
             "DynamoDBTableProvider",
             "aws_region",
             "aws_access_key_id",
@@ -109,12 +109,13 @@ impl DataConnector for DynamoDB {
             "aws_session_token",
             &self.params,
         )
-        .await
         .map_err(|message| DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "dynamodb".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             message: message.to_string(),
-        })?;
+        })?
+        .load()
+        .await;
 
         let client = Client::new(&config);
         let provider = DynamoDBTableProvider::try_new(Arc::new(client), Arc::from(table_name))

@@ -12668,6 +12668,7 @@ name = "runtime-request-context"
 version = "1.9.0-enterprise-beta"
 dependencies = [
  "app",
+ "async-stream",
  "async-trait",
  "axum 0.8.4",
  "base64 0.22.1",
@@ -13068,6 +13069,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3vectors",
+ "aws-smithy-runtime-api",
  "aws-smithy-types",
  "tokio",
 ]
@@ -14043,6 +14045,7 @@ dependencies = [
  "prometheus",
  "reqwest",
  "runtime",
+ "runtime-async",
  "runtime-auth",
  "rustls 0.23.31",
  "rustls-pemfile 2.2.0",

@@ -421,14 +421,15 @@ impl DataAccelerator for PepperAccelerator {
             }));
         }
 
-        // Validate refresh_mode - only append is supported
+        // Validate refresh_mode - append and full are supported
         if let Some(acceleration) = source.acceleration() {
             if let Some(refresh_mode) = acceleration.refresh_mode
                 && refresh_mode != RefreshMode::Append
+                && refresh_mode != RefreshMode::Full
             {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(format!(
-                        "Pepper data accelerator currently only supports append refresh mode, but {refresh_mode:?} was specified. Please set refresh_mode: append"
+                        "Pepper data accelerator supports append and full refresh modes, but {refresh_mode:?} was specified. Please set refresh_mode to either append or full"
                     )),
                 }));
             }

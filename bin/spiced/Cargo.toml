@@ -24,6 +24,7 @@ otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
+runtime-async = { path = "../../crates/runtime-async" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 rustls.workspace = true
 rustls-pemfile.workspace = true

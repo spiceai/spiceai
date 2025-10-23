@@ -177,6 +177,8 @@ jobs:
           MSSQL_PASSWORD: S3cretP@ssw0rd
           MSSQL_TPCH_DB: tpch_sf1
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
 
       - name: Run the throughput test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
