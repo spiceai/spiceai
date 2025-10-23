@@ -49,6 +49,7 @@ use std::{
     sync::Arc,
 };
 
+/// A function that receives the number of bytes processed with [`KeyValue`] dimensions from the thread's [`RequestContext`].
 pub type BytesEmittedCallback = Box<dyn Fn(u64, &[KeyValue]) + Send + Sync + 'static>;
 
 pub struct BytesProcessedExtensionPlanner {

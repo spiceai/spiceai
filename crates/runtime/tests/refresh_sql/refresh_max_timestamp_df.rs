@@ -27,8 +27,10 @@ use runtime::Runtime;
 use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::AnalyzerRulesBuilder;
-use runtime::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
-use runtime::execution_plan::schema_cast::EnsureSchema;
+use runtime_datafusion::{
+    execution_plan::schema_cast::EnsureSchema,
+    extension::{ExtensionPlanQueryPlanner, SpiceExtensionPlanner},
+};
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
@@ -101,13 +103,13 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
             let mut state = SessionStateBuilder::new()
                 .with_runtime_env(default_runtime_env())
                 .with_default_features()
-                .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
-                    vec![
+                .with_query_planner(Arc::new(
+                    ExtensionPlanQueryPlanner::new().with_extension_planners(vec![
                         Arc::new(FederatedPlanner::new()),
                         Arc::new(SpiceExtensionPlanner::new()),
                         Arc::new(IndexTableScanExtensionPlanner::new()),
-                    ],
-                )))
+                    ]),
+                ))
                 .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
                 .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
                 .build();

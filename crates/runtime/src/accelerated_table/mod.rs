@@ -680,8 +680,10 @@ impl TableProvider for AcceleratedTable {
             .await?;
 
         let federated = Arc::clone(&self.federated);
-        let fallback_fn: FallbackAsyncTableProvider =
-            Arc::new(move || Box::pin(federated.table_provider()));
+        let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
+            let federated = federated.clone();
+            Box::pin(async move { federated.table_provider().await })
+        });
 
         let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => input,
