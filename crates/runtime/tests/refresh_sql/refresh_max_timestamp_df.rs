@@ -28,8 +28,7 @@ use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_t
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::AnalyzerRulesBuilder;
 use runtime_datafusion::{
-    execution_plan::schema_cast::EnsureSchema,
-    extension::{ExtensionPlanQueryPlanner, SpiceExtensionPlanner},
+    execution_plan::schema_cast::EnsureSchema, extension::ExtensionPlanQueryPlanner,
 };
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,

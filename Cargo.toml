@@ -24,6 +24,7 @@ members = [
     "crates/runtime",
     "crates/runtime-auth",
     "crates/runtime-async",
+    "crates/runtime-datafusion",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-parameters",
@@ -51,7 +52,7 @@ members = [
     "tools/spicepodschema/",
     "tools/spiceschema",
     "tools/testoperator",
-    "tools/parsley", "crates/runtime-datafusion",
+    "tools/parsley",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021

@@ -13,12 +13,11 @@ arrow.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
+dashmap = "6.1.0"
 datafusion.workspace = true
+datafusion-federation = { workspace = true }
 futures.workspace = true
 opentelemetry.workspace = true
-datafusion-federation = { workspace = true }
-dashmap = "6.1.0"
-
 runtime-request-context = { path = "../runtime-request-context" }
 tracing.workspace = true
 
