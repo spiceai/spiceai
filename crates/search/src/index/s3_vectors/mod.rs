@@ -124,8 +124,9 @@ impl SearchIndex for S3Vector {
                 let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
                 for (partition_value, partition_record) in partitions.into_values() {
+                    let id = self.table.current_index();
                     // change the index name to a partition name
-                    let id = match &self.table.idx {
+                    let id = match &id {
                         S3VectorIdentifier::IndexArn(_) => {
                             tracing::warn!(
                                 "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
