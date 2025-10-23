@@ -16,7 +16,11 @@ limitations under the License.
 
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
+use datafusion::logical_expr::UserDefinedLogicalNode;
+use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::{
     common::{
         DFSchemaRef,
@@ -33,6 +37,7 @@ use datafusion::{
 };
 use datafusion_federation::FederatedPlanNode;
 use futures::{Stream, StreamExt};
+use opentelemetry::KeyValue;
 use runtime_request_context::RequestContext;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -44,29 +49,84 @@ use std::{
     sync::Arc,
 };
 
+pub type BytesEmittedCallback = Box<dyn Fn(u64, &[KeyValue]) + Send + Sync + 'static>;
+
+pub struct BytesProcessedExtensionPlanner {
+    emit_bytes_callback: Arc<BytesEmittedCallback>,
+}
+
+impl Default for BytesProcessedExtensionPlanner {
+    fn default() -> Self {
+        BytesProcessedExtensionPlanner {
+            emit_bytes_callback: Arc::new(Box::new(|_, _| {})),
+        }
+    }
+}
+
+impl BytesProcessedExtensionPlanner {
+    #[must_use]
+    pub fn new(emit_bytes_callback: BytesEmittedCallback) -> Self {
+        BytesProcessedExtensionPlanner {
+            emit_bytes_callback: Arc::new(emit_bytes_callback),
+        }
+    }
+}
+
+#[async_trait]
+impl ExtensionPlanner for BytesProcessedExtensionPlanner {
+    async fn plan_extension(
+        &self,
+        _planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        _session_state: &SessionState,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // bytes_processed Extension
+        let bytes_processed_node = node.as_any().downcast_ref::<BytesProcessedNode>();
+        if bytes_processed_node.is_some() {
+            assert_eq!(logical_inputs.len(), 1, "should have 1 input");
+            assert_eq!(physical_inputs.len(), 1, "should have 1 input");
+            let physical_input = &physical_inputs[0];
+
+            let exec_plan = Arc::new(BytesProcessedExec::new(
+                Arc::clone(physical_input),
+                Arc::clone(&self.emit_bytes_callback),
+            ));
+            return Ok(Some(exec_plan));
+        }
+
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BytesProcessedOptimizerRule {}
 
 struct BytesProcessedStream {
     inner: SendableRecordBatchStream,
-    bytes_processed: u64,
     request_context: Arc<RequestContext>,
+    bytes_processed: u64,
+    emit_bytes: Arc<BytesEmittedCallback>,
 }
 
 impl BytesProcessedStream {
-    pub fn new(inner: SendableRecordBatchStream, request_context: Arc<RequestContext>) -> Self {
+    pub fn new(
+        inner: SendableRecordBatchStream,
+        request_context: Arc<RequestContext>,
+        emit_bytes: Arc<BytesEmittedCallback>,
+    ) -> Self {
         Self {
             inner,
             bytes_processed: 0,
             request_context,
+            emit_bytes,
         }
     }
 
     fn emit_bytes_processed(&self) {
-        crate::metrics::telemetry::track_bytes_processed(
-            self.bytes_processed,
-            &self.request_context.to_dimensions(),
-        );
+        let fnn = &self.emit_bytes;
+        fnn(self.bytes_processed, &self.request_context.to_dimensions());
     }
 }
 
@@ -252,11 +312,18 @@ impl Hash for BytesProcessedNode {
 
 pub(crate) struct BytesProcessedExec {
     input_exec: Arc<dyn ExecutionPlan>,
+    emit_bytes_callback: Arc<BytesEmittedCallback>,
 }
 
 impl BytesProcessedExec {
-    pub(crate) fn new(input_exec: Arc<dyn ExecutionPlan>) -> Self {
-        Self { input_exec }
+    pub(crate) fn new(
+        input_exec: Arc<dyn ExecutionPlan>,
+        emit_bytes_callback: Arc<BytesEmittedCallback>,
+    ) -> Self {
+        Self {
+            input_exec,
+            emit_bytes_callback,
+        }
     }
 }
 
@@ -313,7 +380,10 @@ impl ExecutionPlan for BytesProcessedExec {
         let Some(input) = children.into_iter().next() else {
             panic!("should have one input");
         };
-        Ok(Arc::new(Self { input_exec: input }))
+        Ok(Arc::new(Self {
+            input_exec: input,
+            emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
+        }))
     }
 
     fn execute(
@@ -332,7 +402,11 @@ impl ExecutionPlan for BytesProcessedExec {
             )
         };
 
-        let bytes_processed_stream = BytesProcessedStream::new(stream, request_context);
+        let bytes_processed_stream = BytesProcessedStream::new(
+            stream,
+            request_context,
+            Arc::clone(&self.emit_bytes_callback),
+        );
 
         let stream_adapter = RecordBatchStreamAdapter::new(schema, bytes_processed_stream);
 
@@ -347,8 +421,6 @@ impl ExecutionPlan for BytesProcessedExec {
 
 #[cfg(test)]
 mod tests {
-    use crate::datafusion::extension::bytes_processed::BytesProcessedExec;
-    use crate::{Runtime, RuntimeBuilder};
     use arrow::array::Int64Array;
     use arrow::record_batch::RecordBatch;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -360,7 +432,10 @@ mod tests {
     use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
+    use datafusion::prelude::SessionContext;
     use std::sync::Arc;
+
+    use crate::extension::bytes_processed::BytesProcessedExec;
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -375,12 +450,10 @@ mod tests {
     #[allow(clippy::similar_names)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
-        let runtime: Runtime = RuntimeBuilder::new().build().await;
+        let ctx = SessionContext::new();
         let test_table = make_test_table()?;
 
-        let data_source_exec = test_table
-            .scan(&runtime.df.ctx.state(), None, &[], None)
-            .await?;
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
 
         let lex_ordering = LexOrdering::new(vec![
             PhysicalSortExpr::new_default(physical_col("id", data_source_exec.schema().as_ref())?)
@@ -390,8 +463,10 @@ mod tests {
         .expect("could not generate lex ordering");
         let sort_exec = SortExec::new(lex_ordering, data_source_exec);
 
-        let final_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(BytesProcessedExec::new(Arc::new(sort_exec)));
+        let final_plan: Arc<dyn ExecutionPlan> = Arc::new(BytesProcessedExec::new(
+            Arc::new(sort_exec),
+            Arc::new(Box::new(|_, _| {})),
+        ));
 
         /*
            At this point `final_plan` is:
@@ -416,7 +491,7 @@ mod tests {
 
         // Optimizer is a bag of rules
         let optimizer = PhysicalOptimizer::new();
-        let config = runtime.df.ctx.state().config_options().clone();
+        let config = ctx.state().config_options().clone();
 
         // Fold over the default rules to apply the same optimizations DF would at runtime
         let optimized = optimizer

@@ -21,11 +21,6 @@ use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, Zer
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
-use crate::execution_plan::TableScanParams;
-use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
-use crate::execution_plan::schema_cast::SchemaCastScanExec;
-use crate::execution_plan::slice::SliceExec;
-use crate::execution_plan::tee::TeeExec;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::SchemaRef;
@@ -49,6 +44,11 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
+use runtime_datafusion::execution_plan::{
+    TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
+    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec,
+};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -679,12 +679,16 @@ impl TableProvider for AcceleratedTable {
             .scan(state, projection, filters, limit)
             .await?;
 
+        let federated = Arc::clone(&self.federated);
+        let fallback_fn: FallbackAsyncTableProvider =
+            Arc::new(move || Box::pin(federated.table_provider()));
+
         let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => input,
             ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
-                Arc::clone(&self.federated),
+                fallback_fn,
                 TableScanParams::new(state, projection, filters, limit),
             )),
         };

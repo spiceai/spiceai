@@ -23,11 +23,9 @@ use std::{
 use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
-    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
-    schema::SpiceSchemaProvider,
 };
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
-use crate::{datafusion::extension::SpiceExtensionPlanner, status};
+use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
 use datafusion::config::SpillCompression;
 use datafusion::{
@@ -52,6 +50,13 @@ use datafusion_optimizer_rules::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::EmptyHashJoinExecPhysicalOptimization,
+};
+use runtime_datafusion::{
+    extension::{
+        ExtensionPlanQueryPlanner,
+        bytes_processed::{BytesProcessedExtensionPlanner, BytesProcessedOptimizerRule},
+    },
+    schema_provider::SpiceSchemaProvider,
 };
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
@@ -201,13 +206,15 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
-            .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
-                vec![
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::new().with_extension_planners(vec![
                     Arc::new(FederatedPlanner::new()),
-                    Arc::new(SpiceExtensionPlanner::new()),
+                    Arc::new(BytesProcessedExtensionPlanner::new(Box::new(
+                        track_bytes_processed,
+                    ))),
                     Arc::new(CacheInvalidationExtensionPlanner::new()),
-                ],
-            )))
+                ]),
+            ))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
