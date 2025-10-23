@@ -720,6 +720,10 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
+        let mut ctx = self
+            .refresh_df_context(Arc::clone(&federated_provider))
+            .await;
+            
         let dataset_name = self.dataset_name.clone();
         let update_type = match refresh.mode {
             RefreshMode::Disabled => {
@@ -731,7 +735,6 @@ impl RefreshTask {
         };
 
         if let Some(runtime_handle) = self.tokio_runtime.clone() {
-            let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
             let dataset_name_for_runtime = dataset_name.clone();
             let filters_for_runtime = filters.clone();
             let update_type_for_runtime = update_type.clone();
