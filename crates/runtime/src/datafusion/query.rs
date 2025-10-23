@@ -49,7 +49,6 @@ mod tracker;
 
 #[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterMode,
     crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
     crate::datafusion::cluster::config::SpiceClusterConfig,
     crate::datafusion::extension::SpiceQueryPlanner,
@@ -67,6 +66,7 @@ use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
+use crate::config::ClusterMode;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
@@ -328,7 +328,23 @@ impl Query {
                 t
             });
 
-            let physical_plan = match session.create_physical_plan(&plan).await {
+            // Special handling for DescribeTable in cluster mode - execute locally
+            #[cfg(feature = "cluster")]
+            let use_local_session = {
+                matches!(ctx.df.cluster_config.mode, Some(ClusterMode::Scheduler))
+                    && matches!(&*plan, LogicalPlan::DescribeTable { .. })
+            };
+
+            #[cfg(not(feature = "cluster"))]
+            let use_local_session = false;
+
+            let session_for_execution = if use_local_session {
+                ctx.df.ctx.state()
+            } else {
+                session
+            };
+
+            let physical_plan = match session_for_execution.create_physical_plan(&plan).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     let e = find_datafusion_root(e);
@@ -343,7 +359,7 @@ impl Query {
                 }
             };
 
-            let task_ctx = Arc::new(TaskContext::from(&session));
+            let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
 
             let res_stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
                 Ok(stream) => stream,
