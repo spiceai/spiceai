@@ -13,6 +13,7 @@ graph TD
     A[spice] --> B[datafusion-table-providers]
     A --> C[datafusion-federation]
     A --> D[datafusion]
+    A --> I[datafusion-ballista]
     A -.-> E[arrow-rs]
 
     B --> C
@@ -23,6 +24,9 @@ graph TD
     C -.-> E
 
     D -.-> E
+
+    I --> D
+    I -.-> E
 
     F[snowflake-rs] -.-> E
     G[delta-kernel-rs] -.-> E
@@ -49,6 +53,11 @@ graph TD
 
 The following forked dependencies use DataFusion and need to be upgraded in lockstep. This typically involves pulling the latest changes from the upstream repository, resolving conflicts, and updating the commit hash in `Cargo.toml` (See [Core Dependency Upgrade](#core-dependency-upgrade)).
 
+- [ ] **[datafusion-ballista](https://github.com/spiceai/datafusion-ballista)**: Update the fork to be compatible with the new DataFusion version.
+  - Sync the forked main branch with the upstream repository.
+  - Update DataFusion dependencies in ballista-core and ballista-scheduler.
+  - Run `cargo test` to confirm compatibility.
+  - Do not merge into the `spice` branch until the main Spice OSS PR is ready to be merged. Merging sooner can block other PRs.
 - [ ] **[datafusion-federation](https://github.com/spiceai/datafusion-federation)**: Update the fork to be compatible with the new DataFusion version.
 - [ ] **[datafusion-table-providers](https://github.com/datafusion-contrib/datafusion-table-providers)**: Update the fork to be compatible with the new DataFusion version.
   - Do not merge the into the `spiceai` branch until the main Spice OSS PR is ready to be merged. Merging sooner can block other PRs.
@@ -68,9 +77,9 @@ Spice should use the same version of Arrow that DataFusion uses. If DataFusion u
 - [ ] Create a new branch in Spice for the upgrade process. A personal branch may be best until tests at the end are passing to avoid issues with protected branch names.
 - [ ] Update the `datafusion` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ] If Arrow needs updating, update the `arrow-rs` dependency in the root `Cargo.toml` to the new patched commit.
+- [ ] Update the `datafusion-ballista` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ] Update the `datafusion-federation` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ] Update the `datafusion-table-providers` dependency in the root `Cargo.toml` to the new patched commit.
-- [ ] Update the `datafusion-federation` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ] Run `make build` to ensure the entire project compiles without errors.
   - [ ] Address any compilation errors or test failures. This may involve fixing code that is incompatible with the new DataFusion version
 - [ ] Run all tests using `make build-cli nextest` to verify that all functionality is working as expected and snapshots have not changed.

@@ -1,7 +1,7 @@
-use crate::configure_test_datafusion;
 use crate::postgres::common;
 use crate::postgres::common::get_pg_params;
 use crate::utils::runtime_ready_check;
+use crate::{configure_test_datafusion, configure_test_datafusion_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::common::TableReference;
@@ -19,7 +19,7 @@ pub(crate) fn get_acceleration_config_append(
     engine: &str,
     acceleration_params: Option<Params>,
 ) -> Acceleration {
-    Acceleration {
+    let mut acceleration = Acceleration {
         enabled: true,
         params: acceleration_params,
         engine: Some(engine.to_string()),
@@ -28,17 +28,24 @@ pub(crate) fn get_acceleration_config_append(
             "select * from test_table where created_at > now() - INTERVAL '10 years'".to_string(),
         ),
         refresh_check_interval: Some("5h".to_string()),
-        primary_key: Some("id".to_string()),
-        on_conflict: [("id".to_string(), OnConflictBehavior::Upsert)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, OnConflictBehavior>>(),
-        indexes: [("id".to_string(), IndexType::Unique)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, IndexType>>(),
         ..Acceleration::default()
+    };
+
+    // Arrow engine doesn't support indexes, primary_key, or on_conflict
+    // Only add these for engines that support them (duckdb, sqlite, postgres)
+    if engine != "arrow" {
+        acceleration.primary_key = Some("id".to_string());
+        acceleration.on_conflict = [("id".to_string(), OnConflictBehavior::Upsert)]
+            .iter()
+            .cloned()
+            .collect::<HashMap<String, OnConflictBehavior>>();
+        acceleration.indexes = [("id".to_string(), IndexType::Unique)]
+            .iter()
+            .cloned()
+            .collect::<HashMap<String, IndexType>>();
     }
+
+    acceleration
 }
 
 pub(crate) fn get_acceleration_config_full(
@@ -202,6 +209,7 @@ async fn start_test_runtime_with_dataset(
         .build();
 
     configure_test_datafusion();
+    configure_test_datafusion_request_context();
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
     let cloned_rt = Arc::clone(&rt);

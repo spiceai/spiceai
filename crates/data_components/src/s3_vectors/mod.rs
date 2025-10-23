@@ -15,18 +15,22 @@ limitations under the License.
 */
 
 use arrow::error::ArrowError;
+use datafusion::error::DataFusionError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, ListIndexesError, PutVectorsError, QueryVectorsError,
+    GetVectorBucketError, ListIndexesError, ListIndexesInput, PutVectorsError, QueryVectorsError,
+    S3Vectors,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
-use snafu::Snafu;
+use snafu::{ResultExt as _, Snafu};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 pub mod list_provider;
 pub mod partition;
-pub mod put_vectors_sink;
 pub mod query_provider;
+mod spill;
+pub use spill::{Error as SpillIndexError, SpillIndex};
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};
 mod metadata_column;
@@ -48,10 +52,10 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to write vectors to S3 Vectors. {source}"))]
-    S3VectorPutVectorError { source: PutVectorsError },
+    S3VectorPutVectorError { source: Box<PutVectorsError> },
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
-    S3VectorQueryVectorsError { source: QueryVectorsError },
+    S3VectorQueryVectorsError { source: Box<QueryVectorsError> },
 
     #[snafu(display(
         "Failed to query vectors from S3 Vectors due to an unsupported filter: {filter_pre} {filter:?}"
@@ -62,16 +66,18 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to create index in S3 Vectors. {source}"))]
-    S3VectorCreateIndexError { source: CreateIndexError },
+    S3VectorCreateIndexError { source: Box<CreateIndexError> },
 
     #[snafu(display("Failed to create bucket in S3 Vectors. {source}"))]
-    S3VectorCreateBucketError { source: CreateVectorBucketError },
+    S3VectorCreateBucketError {
+        source: Box<CreateVectorBucketError>,
+    },
 
     #[snafu(display("Failed to get bucket from S3 Vectors. {source}"))]
-    S3VectorGetBucketError { source: GetVectorBucketError },
+    S3VectorGetBucketError { source: Box<GetVectorBucketError> },
 
     #[snafu(display("Failed to get index from S3 Vectors. {source}"))]
-    S3VectorGetIndexError { source: GetIndexError },
+    S3VectorGetIndexError { source: Box<GetIndexError> },
 
     #[snafu(display("Failed to construct a request to send to S3 Vectors. {source}"))]
     S3VectorBuildError { source: BuildError },
@@ -104,7 +110,13 @@ pub enum Error {
         specified: DistanceMetric,
     },
     #[snafu(display("S3 vector indexes cannot be listed"))]
-    S3VectorListIndexesError { source: ListIndexesError },
+    S3VectorListIndexesError { source: Box<ListIndexesError> },
+
+    #[snafu(display("Spill index error: {source}"))]
+    SpillIndexError { source: SpillIndexError },
+
+    #[snafu(display("Exceeded maximum spill attempts while writing vectors"))]
+    MaxSpillAttemptsReached,
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -132,6 +144,7 @@ impl Display for S3VectorIdentifier {
 
 impl S3VectorIdentifier {
     /// Return (index arn, bucket name and index name) based on how the vector index is identified.
+    /// For virtual indexes, returns the bucket name and virtual index name for writing operations.
     #[must_use]
     pub fn index_identifier_variables(&self) -> (Option<String>, Option<String>, Option<String>) {
         match self {
@@ -142,4 +155,55 @@ impl S3VectorIdentifier {
             Self::IndexArn(arn) => (Some(arn.clone()), None, None),
         }
     }
+
+    /// Gets the bucket name for this identifier, if available.
+    #[must_use]
+    pub fn bucket_name(&self) -> Option<&str> {
+        match self {
+            Self::Index { bucket_name, .. } => Some(bucket_name),
+            Self::IndexArn(_) => None,
+        }
+    }
+
+    /// Gets the virtual index name for this identifier, if it's a virtual index.
+    #[must_use]
+    pub fn index_name(&self) -> Option<&str> {
+        if let Self::Index { index_name, .. } = self {
+            Some(index_name)
+        } else {
+            None
+        }
+    }
+}
+
+/// Lists index names with the given prefix in the specified bucket.
+pub async fn list_index_names(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: &str,
+    prefix: &str,
+) -> Result<Vec<String>, DataFusionError> {
+    let list_indexes_output = client
+        .list_indexes(
+            ListIndexesInput::builder()
+                .set_vector_bucket_name(Some(bucket_name.to_string()))
+                .set_prefix(Some(prefix.to_string()))
+                .build()
+                .boxed()
+                .map_err(DataFusionError::External)?,
+        )
+        .await
+        .map_err(|e| {
+            DataFusionError::External(
+                Error::S3VectorListIndexesError {
+                    source: Box::new(e.into_service_error()),
+                }
+                .into(),
+            )
+        })?;
+
+    Ok(list_indexes_output
+        .indexes()
+        .iter()
+        .map(|idx| idx.index_name().to_string())
+        .collect())
 }
