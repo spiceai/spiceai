@@ -533,17 +533,10 @@ impl S3VectorsTable {
 
     /// Writes a chunk of vectors, handling spilling to additional indexes when capacity is exceeded.
     async fn write_chunk_with_spilling(&self, chunk: &[PutInputVector]) -> Result<()> {
-        const MAX_SPILL_ATTEMPTS: usize = 100; // Prevent infinite loops
 
         let mut current_index = self.current_index();
-        let mut attempt_count = 0;
 
         loop {
-            attempt_count += 1;
-            if attempt_count > MAX_SPILL_ATTEMPTS {
-                return Err(Error::MaxSpillAttemptsReached);
-            }
-
             let (index_arn, vector_bucket_name, index_name) =
                 current_index.index_identifier_variables();
 
