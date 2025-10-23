@@ -430,9 +430,9 @@ impl Builder {
                     #[cfg(not(feature = "pepper"))]
                     let is_pepper = false;
 
+                    let schema = self.accelerator.schema();
                     let has_primary_key =
                         self.accelerator.constraints().is_some_and(|constraints| {
-                            let schema = self.accelerator.schema();
                             !get_primary_keys_from_constraints(constraints, &schema).is_empty()
                         });
 
