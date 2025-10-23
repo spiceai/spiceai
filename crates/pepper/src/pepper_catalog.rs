@@ -82,7 +82,8 @@ impl PepperCatalog {
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             schema_json TEXT NOT NULL,
-            primary_key_json TEXT
+            primary_key_json TEXT,
+            current_snapshot_id TEXT NOT NULL DEFAULT ''
         )
     ";
 
@@ -206,7 +207,7 @@ impl MetadataCatalog for PepperCatalog {
             })?)
         };
 
-        tokio::task::spawn_blocking(move || {
+        let blocking_result = tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open_with_flags(
                 &db_path_owned,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -228,13 +229,17 @@ impl MetadataCatalog for PepperCatalog {
             // Generate table UUID
             let table_uuid = uuid::Uuid::now_v7().to_string();
 
-            // Insert table metadata
+            // Generate initial snapshot UUID
+            let initial_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+            // Insert table metadata with initial snapshot
             conn.execute(
                 r"
                 INSERT INTO pepper_table (
                     table_id, table_uuid,
-                    table_name, path, path_is_relative, schema_json, primary_key_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    table_name, path, path_is_relative, schema_json, primary_key_json,
+                    current_snapshot_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ",
                 rusqlite::params![
                     table_id,
@@ -244,6 +249,7 @@ impl MetadataCatalog for PepperCatalog {
                     false, // path_is_relative - using absolute paths for now
                     schema_json,
                     primary_key_json,
+                    initial_snapshot_id, // All tables start with an initial snapshot
                 ],
             )?;
 
@@ -256,9 +262,24 @@ impl MetadataCatalog for PepperCatalog {
             // Commit transaction
             conn.execute("COMMIT", [])?;
 
-            Ok::<i64, CatalogError>(table_id)
+            Ok::<(i64, String, String), CatalogError>((table_id, initial_snapshot_id, base_path))
         })
-        .await?
+        .await??;
+
+        // Destructure the return value from spawn_blocking
+        let (table_id, initial_snapshot_id, base_path) = blocking_result;
+
+        // Create the initial snapshot directory
+        // Directory structure: [base_path]/[table_id]/[snapshot_id]/
+        let snapshot_dir = std::path::PathBuf::from(&base_path)
+            .join(table_id.to_string())
+            .join(&initial_snapshot_id);
+
+        tokio::fs::create_dir_all(&snapshot_dir)
+            .await
+            .map_err(|e| CatalogError::Io { source: e })?;
+
+        Ok(table_id)
     }
 
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
@@ -275,7 +296,8 @@ impl MetadataCatalog for PepperCatalog {
             let mut stmt = conn.prepare(
                 r"
                 SELECT table_id, table_uuid,
-                       table_name, path, path_is_relative, schema_json, primary_key_json
+                       table_name, path, path_is_relative, schema_json, primary_key_json,
+                       current_snapshot_id
                 FROM pepper_table
                 WHERE table_name = ?1
                 LIMIT 1
@@ -291,6 +313,7 @@ impl MetadataCatalog for PepperCatalog {
                     let _path_is_relative: bool = row.get(4)?;
                     let schema_json: String = row.get(5)?;
                     let primary_key_json: Option<String> = row.get(6)?;
+                    let current_snapshot_id: String = row.get(7)?;
 
                     // Deserialize schema using Arrow IPC format
                     let schema = {
@@ -323,6 +346,7 @@ impl MetadataCatalog for PepperCatalog {
                         path_is_relative: _path_is_relative,
                         schema,
                         primary_key,
+                        current_snapshot_id,
                     })
                 })
                 .map_err(|e| match e {
@@ -344,16 +368,36 @@ impl MetadataCatalog for PepperCatalog {
         })
     }
 
-    async fn update_table_path(&self, table_id: i64, new_path: &str) -> CatalogResult<()> {
+    async fn get_current_snapshot(&self, table_id: i64) -> CatalogResult<String> {
         let db_path_owned = self.db_path().to_string();
-        let new_path_owned = new_path.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+
+            let snapshot_id: String = conn.query_row(
+                "SELECT current_snapshot_id FROM pepper_table WHERE table_id = ?1",
+                [table_id],
+                |row| row.get(0),
+            )?;
+
+            Ok::<String, CatalogError>(snapshot_id)
+        })
+        .await?
+    }
+
+    async fn set_current_snapshot(&self, table_id: i64, snapshot_id: &str) -> CatalogResult<()> {
+        let db_path_owned = self.db_path().to_string();
+        let snapshot_id_owned = snapshot_id.to_string();
 
         tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open(&db_path_owned)?;
 
             conn.execute(
-                "UPDATE pepper_table SET path = ?1 WHERE table_id = ?2",
-                rusqlite::params![new_path_owned, table_id],
+                "UPDATE pepper_table SET current_snapshot_id = ?1 WHERE table_id = ?2",
+                rusqlite::params![snapshot_id_owned, table_id],
             )?;
 
             Ok::<(), CatalogError>(())

@@ -24,6 +24,7 @@ use super::{Nameable, WithDependsOn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Eval {
     pub name: String,
 

@@ -35,6 +35,9 @@ pub struct TableMetadata {
     pub schema: SchemaRef,
     /// Primary key columns (for deletion vector support)
     pub primary_key: Vec<String>,
+    /// Current snapshot ID (`UUIDv7`, changes on overwrite/delete operations)
+    /// All tables are created with an initial snapshot.
+    pub current_snapshot_id: String,
 }
 
 /// Represents a data file containing table rows.
