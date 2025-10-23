@@ -604,9 +604,12 @@ impl Refresher {
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return None,
-            (AccelerationRefreshMode::Append(Some(receiver)), Some(_))
-            | (AccelerationRefreshMode::Full(receiver), _) => receiver,
-            (AccelerationRefreshMode::Append(_), _) => {
+            (
+                AccelerationRefreshMode::Append(Some(receiver))
+                | AccelerationRefreshMode::Full(receiver),
+                _,
+            ) => receiver,
+            (AccelerationRefreshMode::Append(None), _) => {
                 return Some(self.start_streaming_append());
             }
             (AccelerationRefreshMode::Changes(stream), _) => {

@@ -249,6 +249,10 @@ impl AccelerationSource for View {
     fn name(&self) -> &TableReference {
         &self.name
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ViewBuilder {

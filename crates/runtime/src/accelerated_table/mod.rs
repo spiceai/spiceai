@@ -19,6 +19,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
+use crate::dataaccelerator::get_primary_keys_from_constraints;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::execution_plan::TableScanParams;
@@ -46,6 +47,8 @@ use datafusion::{
     logical_expr::Expr,
 };
 use opentelemetry::KeyValue;
+#[cfg(feature = "pepper")]
+use pepper::PepperTableProvider;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::SnapshotBehavior;
@@ -409,6 +412,7 @@ impl Builder {
     }
 
     /// Build the accelerated table
+    #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         let on_complete_notification = Arc::new(Notify::new());
 
@@ -416,14 +420,40 @@ impl Builder {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
                 if self.refresh.time_column.is_none() {
-                    // Get the append stream
-                    let Some(append_stream) = self.append_stream else {
-                        return AppendStreamRequiredSnafu.fail();
-                    };
-                    (
-                        refresh::AccelerationRefreshMode::Changes(append_stream),
-                        None,
-                    )
+                    // Check if this is a Pepper table or if there's a primary key constraint
+                    #[cfg(feature = "pepper")]
+                    let is_pepper = self
+                        .accelerator
+                        .as_any()
+                        .downcast_ref::<PepperTableProvider>()
+                        .is_some();
+                    #[cfg(not(feature = "pepper"))]
+                    let is_pepper = false;
+
+                    let has_primary_key =
+                        self.accelerator.constraints().is_some_and(|constraints| {
+                            let schema = self.accelerator.schema();
+                            !get_primary_keys_from_constraints(constraints, &schema).is_empty()
+                        });
+
+                    if is_pepper || has_primary_key {
+                        // Use append mode with primary key (e.g., Pepper) or for Pepper tables
+                        let (start_refresh, on_start_refresh) =
+                            mpsc::channel::<Option<RefreshOverrides>>(1);
+                        (
+                            refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
+                            Some(start_refresh),
+                        )
+                    } else {
+                        // Get the append stream
+                        let Some(append_stream) = self.append_stream else {
+                            return AppendStreamRequiredSnafu.fail();
+                        };
+                        (
+                            refresh::AccelerationRefreshMode::Changes(append_stream),
+                            None,
+                        )
+                    }
                 } else {
                     let (start_refresh, on_start_refresh) =
                         mpsc::channel::<Option<RefreshOverrides>>(1);

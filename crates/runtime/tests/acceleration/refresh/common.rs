@@ -63,7 +63,33 @@ pub(crate) fn get_dataset(port: usize) -> Dataset {
             .collect::<HashMap<String, String>>(),
     ));
     ds.time_column = Some("created_at".to_string());
-    ds.time_format = Some(TimeFormat::Timestamptz);
+    ds
+}
+
+pub(crate) fn get_dataset_no_time_column(port: usize) -> Dataset {
+    let mut ds = Dataset::new("postgres:test_table", "test_table");
+    ds.params = Some(Params::from_string_map(
+        get_pg_params(port)
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect::<HashMap<String, String>>(),
+    ));
+    // No time_column set - for testing append without constraints
+    ds
+}
+
+/// Get dataset with Unix timestamp column (INT) to work around Vortex v0.52.1 timestamp metadata bug
+#[allow(dead_code)]
+pub(crate) fn get_dataset_unix_time(port: usize) -> Dataset {
+    let mut ds = Dataset::new("postgres:test_table", "test_table");
+    ds.params = Some(Params::from_string_map(
+        get_pg_params(port)
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect::<HashMap<String, String>>(),
+    ));
+    ds.time_column = Some("created_at".to_string());
+    ds.time_format = Some(TimeFormat::UnixSeconds);
     ds
 }
 
@@ -91,14 +117,49 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
         "
                 CREATE TABLE test_table (
                     id SERIAL PRIMARY KEY,
-                    created_at TIMESTAMP WITH TIME ZONE
+                    created_at TIMESTAMP(3) WITH TIME ZONE
                 )",
     )
     .await?;
 
     execute_ps_sql(
         &db_conn,
-        "INSERT INTO test_table (created_at) VALUES (now())",
+        "INSERT INTO test_table (created_at) VALUES (date_trunc('milliseconds', now()))",
+    )
+    .await?;
+
+    execute_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
+
+    Ok(db_conn)
+}
+
+/// Initialize `PostgreSQL` with Unix timestamp (INT) to work around Vortex v0.52.1 bugs
+/// Workarounds:
+/// 1. Uses INT instead of TIMESTAMP to avoid timestamp `ExtMetadata` encoding mismatch
+/// 2. Uses NOT NULL to avoid nullable/non-nullable schema mismatch in Vortex
+pub(crate) async fn initialize_postgres_vortex_workaround(
+    port: usize,
+) -> Result<PostgresConnection, anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("Error connecting: {}", e))?;
+
+    execute_ps_sql(
+        &db_conn,
+        "
+                CREATE TABLE test_table (
+                    id INT NOT NULL PRIMARY KEY,
+                    created_at INT NOT NULL
+                )",
+    )
+    .await?;
+
+    execute_ps_sql(
+        &db_conn,
+        "INSERT INTO test_table (id, created_at) VALUES (1, 1)",
     )
     .await?;
 
@@ -111,8 +172,29 @@ pub(crate) async fn start_test_runtime(
     port: usize,
     acceleration: Acceleration,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
-    let mut dataset = get_dataset(port);
+    start_test_runtime_with_dataset(port, acceleration, get_dataset(port)).await
+}
 
+pub(crate) async fn start_test_runtime_no_time_column(
+    port: usize,
+    acceleration: Acceleration,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    start_test_runtime_with_dataset(port, acceleration, get_dataset_no_time_column(port)).await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn start_test_runtime_unix_time(
+    port: usize,
+    acceleration: Acceleration,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    start_test_runtime_with_dataset(port, acceleration, get_dataset_unix_time(port)).await
+}
+
+async fn start_test_runtime_with_dataset(
+    _port: usize,
+    acceleration: Acceleration,
+    mut dataset: Dataset,
+) -> Result<Arc<Runtime>, anyhow::Error> {
     dataset.acceleration = Some(acceleration);
     let app = AppBuilder::new("test_acceleration_refresh")
         .with_dataset(dataset)

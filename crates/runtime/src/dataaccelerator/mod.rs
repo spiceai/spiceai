@@ -522,6 +522,9 @@ pub trait AccelerationSource: Send + Sync {
 
     /// Returns the name of this source
     fn name(&self) -> &TableReference;
+
+    /// Returns a reference to `Any` for downcasting
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub async fn acceleration_file_path(
@@ -540,7 +543,10 @@ pub async fn acceleration_file_path(
     Ok(PathBuf::from(file))
 }
 
-fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaRef) -> Vec<String> {
+pub(crate) fn get_primary_keys_from_constraints(
+    constraints: &Constraints,
+    schema: &SchemaRef,
+) -> Vec<String> {
     constraints
         .iter()
         .filter_map(|constraint| {
