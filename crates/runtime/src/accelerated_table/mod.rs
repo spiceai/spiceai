@@ -681,7 +681,7 @@ impl TableProvider for AcceleratedTable {
 
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
-            let federated = federated.clone();
+            let federated = Arc::clone(&federated);
             Box::pin(async move { federated.table_provider().await })
         });
 
