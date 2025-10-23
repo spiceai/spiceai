@@ -36,7 +36,7 @@ pub struct ExtensionPlanQueryPlanner {
 
 impl std::fmt::Debug for ExtensionPlanQueryPlanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpiceQueryPlanner")
+        f.debug_struct("ExtensionPlanQueryPlanner")
             .field("extension_planners", &self.extension_planners.len())
             .finish()
     }
