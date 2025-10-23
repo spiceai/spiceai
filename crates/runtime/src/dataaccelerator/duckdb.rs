@@ -36,7 +36,10 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
-    duckdb::{write::{DuckDBTableWriter, WriteCompletionHandler}, DuckDBSettingsRegistry, DuckDBTableProviderFactory, TableManager},
+    duckdb::{
+        DuckDBSettingsRegistry, DuckDBTableProviderFactory, TableManager,
+        write::{DuckDBTableWriter, WriteCompletionHandler},
+    },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
@@ -421,7 +424,12 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        Ok(create_table_provider(&self.duckdb_factory, &cmd, on_data_written_handler_for_source(source)).await?)
+        Ok(create_table_provider(
+            &self.duckdb_factory,
+            &cmd,
+            on_data_written_handler_for_source(source),
+        )
+        .await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -433,7 +441,9 @@ impl DataAccelerator for DuckDBAccelerator {
     }
 }
 
-fn on_data_written_handler_for_source(source: Option<&dyn AccelerationSource>) -> Option<WriteCompletionHandler> {
+fn on_data_written_handler_for_source(
+    source: Option<&dyn AccelerationSource>,
+) -> Option<WriteCompletionHandler> {
     let source = source?;
     let acceleration = source.acceleration()?;
 
@@ -448,67 +458,99 @@ fn on_data_written_handler_for_source(source: Option<&dyn AccelerationSource>) -
         return None;
     }
 
-
     let retention_sql = acceleration.retention_sql.clone();
     let sort_column = sort_column.cloned();
     let sort_direction = sort_direction.cloned();
     let source_name = source.name().to_string();
-    
-    Some(Arc::new(move |tx: &duckdb::Transaction, table_manager: &TableManager, _schema| {
-        // Handle sorting if parameters are provided
-        if let (Some(column), Some(direction)) = (&sort_column, &sort_direction) {
-            let sort_sql = format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT * FROM {} ORDER BY {column} {direction}",
-                table_manager.table_name(),
-                table_manager.table_name(),
-            );
-            
-            tracing::info!("Executing sort SQL: {sort_sql}");
-            
-            match tx.prepare(&sort_sql) {
-                Ok(mut stmt) => {
-                    match stmt.execute([]) {
+
+    Some(Arc::new(
+        move |tx: &duckdb::Transaction, table_manager: &TableManager, _schema| {
+            // Handle sorting if parameters are provided
+            if let (Some(column), Some(direction)) = (&sort_column, &sort_direction) {
+                let sort_sql = format!(
+                    "CREATE OR REPLACE TABLE {} AS SELECT * FROM {} ORDER BY {column} {direction}",
+                    table_manager.table_name(),
+                    table_manager.table_name(),
+                );
+
+                tracing::info!("Executing sort SQL: {sort_sql}");
+
+                match tx.prepare(&sort_sql) {
+                    Ok(mut stmt) => match stmt.execute([]) {
                         Ok(rows_affected) => {
-                            tracing::info!("Sort SQL executed for table '{source_name}', {rows_affected} rows affected");
+                            tracing::info!(
+                                "Sort SQL executed for table '{source_name}', {rows_affected} rows affected"
+                            );
                         }
                         Err(e) => {
-                            tracing::error!("Failed to execute sort SQL for table '{source_name}': {e}");
+                            tracing::error!(
+                                "Failed to execute sort SQL for table '{source_name}': {e}"
+                            );
                             return Err(datafusion::common::DataFusionError::External(Box::new(e)));
                         }
+                    },
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to prepare sort SQL for table '{source_name}': {e}"
+                        );
+                        return Err(datafusion::common::DataFusionError::External(Box::new(e)));
                     }
                 }
+            }
+
+            // Handle retention SQL if provided (existing functionality)
+            if let Some(retention_sql) = &retention_sql {
+                tracing::info!("Executing retention SQL: {retention_sql}");
+
+                match tx.prepare(retention_sql) {
+                    Ok(mut stmt) => match stmt.execute([]) {
+                        Ok(rows_affected) => {
+                            tracing::info!(
+                                "Retention SQL executed for table '{source_name}', {rows_affected} rows affected"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to execute retention SQL for table '{source_name}': {e}"
+                            );
+                            return Err(datafusion::common::DataFusionError::External(Box::new(e)));
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to prepare retention SQL for table '{source_name}': {e}"
+                        );
+                        return Err(datafusion::common::DataFusionError::External(Box::new(e)));
+                    }
+                }
+            }
+
+            // execute ANALYZE
+            let analyze_sql = format!("ANALYZE {}", table_manager.table_name());
+            tracing::info!("Executing analyze SQL: {analyze_sql}");
+            match tx.prepare(&analyze_sql) {
+                Ok(mut stmt) => match stmt.execute([]) {
+                    Ok(rows_affected) => {
+                        tracing::info!(
+                            "Analyze SQL executed for table '{source_name}', {rows_affected} rows affected"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to execute analyze SQL for table '{source_name}': {e}"
+                        );
+                        return Err(datafusion::common::DataFusionError::External(Box::new(e)));
+                    }
+                },
                 Err(e) => {
-                    tracing::error!("Failed to prepare sort SQL for table '{source_name}': {e}");
+                    tracing::error!("Failed to prepare analyze SQL for table '{source_name}': {e}");
                     return Err(datafusion::common::DataFusionError::External(Box::new(e)));
                 }
             }
-        }
 
-        // Handle retention SQL if provided (existing functionality)
-        if let Some(retention_sql) = &retention_sql {
-            tracing::info!("Executing retention SQL: {retention_sql}");
-            
-            match tx.prepare(retention_sql) {
-                Ok(mut stmt) => {
-                    match stmt.execute([]) {
-                        Ok(rows_affected) => {
-                            tracing::info!("Retention SQL executed for table '{source_name}', {rows_affected} rows affected");
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to execute retention SQL for table '{source_name}': {e}");
-                            return Err(datafusion::common::DataFusionError::External(Box::new(e)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to prepare retention SQL for table '{source_name}': {e}");
-                    return Err(datafusion::common::DataFusionError::External(Box::new(e)));
-                }
-            }
-        }
-
-        Ok(())
-    }))
+            Ok(())
+        },
+    ))
 }
 
 pub(crate) async fn create_table_provider(
@@ -530,7 +572,7 @@ pub(crate) async fn create_table_provider(
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
 
     let mut duckdb_writer = duckdb_writer.clone();
-     if let Some(handler) = on_data_written {
+    if let Some(handler) = on_data_written {
         duckdb_writer = duckdb_writer.with_on_data_written_handler(handler);
     }
 
