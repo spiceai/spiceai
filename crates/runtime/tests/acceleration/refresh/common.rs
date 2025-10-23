@@ -1,7 +1,7 @@
-use crate::configure_test_datafusion;
 use crate::postgres::common;
 use crate::postgres::common::get_pg_params;
 use crate::utils::runtime_ready_check;
+use crate::{configure_test_datafusion, configure_test_datafusion_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::common::TableReference;
@@ -119,6 +119,7 @@ pub(crate) async fn start_test_runtime(
         .build();
 
     configure_test_datafusion();
+    configure_test_datafusion_request_context();
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
     let cloned_rt = Arc::clone(&rt);
