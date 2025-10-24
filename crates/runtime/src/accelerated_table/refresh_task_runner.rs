@@ -21,6 +21,7 @@ use super::{
 };
 use futures::future::BoxFuture;
 use tokio::{
+    runtime::Handle,
     select,
     sync::{
         Semaphore,
@@ -46,6 +47,7 @@ pub struct RefreshTaskRunnerBuilder {
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
+    tokio_runtime: Option<Handle>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -68,6 +70,7 @@ impl RefreshTaskRunnerBuilder {
             disable_federation: false,
             semaphore: None,
             metrics: None,
+            tokio_runtime: None,
         }
     }
 
@@ -91,6 +94,12 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_tokio_runtime(mut self, runtime: Option<Handle>) -> Self {
+        self.tokio_runtime = runtime;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -105,6 +114,8 @@ impl RefreshTaskRunnerBuilder {
         if let Some(semaphore) = self.semaphore {
             refresh_task_builder = refresh_task_builder.with_semaphore(semaphore);
         }
+
+        refresh_task_builder = refresh_task_builder.with_tokio_runtime(self.tokio_runtime);
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 
