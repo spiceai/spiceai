@@ -108,7 +108,7 @@ impl TaskHistoryExporter {
             }
 
             // Only capture plans for tasks with exact name "sql_query"
-            if span.task.as_ref() != "sql_query" && !span.input.is_empty() {
+            if span.task.as_ref() != "sql_query" || span.input.is_empty() {
                 continue;
             }
 
