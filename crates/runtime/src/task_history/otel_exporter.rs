@@ -189,7 +189,7 @@ impl SpanExporter for TaskHistoryExporter {
     fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
         let min_sql_duration_ms = self.min_sql_duration_ms;
         let should_include = |task_span: &TaskSpan| {
-            min_sql_duration_ms.map_or(true, |min| task_span.execution_duration_ms >= min)
+            min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
         };
         let spans: Vec<TaskSpan> = batch
             .into_iter()
