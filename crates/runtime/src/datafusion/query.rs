@@ -176,9 +176,9 @@ impl Query {
                 self.df.cluster_config.scheduler_url.to_string(),
                 cfg.ballista_config(),
                 SpiceLogicalCodec::new_codec(),
-                DefaultPhysicalPlanner::with_extension_planners(
+                DefaultPhysicalPlanner::with_extension_planners(vec![
                     ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
-                ),
+                ]),
             );
 
         SessionStateBuilder::new_from_existing(self.df.ctx.state())

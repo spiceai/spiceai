@@ -229,12 +229,12 @@ impl BytesProcessedOptimizerRule {
 }
 
 #[derive(PartialOrd)]
-pub(crate) struct BytesProcessedNode {
+pub struct BytesProcessedNode {
     pub(super) input: LogicalPlan,
 }
 
 impl BytesProcessedNode {
-    pub(crate) fn new(input: LogicalPlan) -> Self {
+    pub fn new(input: LogicalPlan) -> Self {
         assert!(input.inputs().is_empty(), "should have no inputs");
         Self { input }
     }
@@ -318,14 +318,14 @@ impl Hash for BytesProcessedNode {
     }
 }
 
-pub(crate) struct BytesProcessedExec {
+pub struct BytesProcessedExec {
     input_exec: Arc<dyn ExecutionPlan>,
     emit_bytes_callback: Arc<BytesEmittedCallback>,
     fallback_to_new_context: bool,
 }
 
 impl BytesProcessedExec {
-    pub(crate) fn new(
+    pub fn new(
         input_exec: Arc<dyn ExecutionPlan>,
         emit_bytes_callback: Arc<BytesEmittedCallback>,
     ) -> Self {
