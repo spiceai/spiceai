@@ -81,6 +81,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "tpc_extension",
     "workers",
     "search",
+    "ballista",
     "datafusion",
 ];
 

@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
@@ -43,7 +44,7 @@ use util::in_tracing_context;
 
 pub mod runtime;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct App {
     pub name: String,
 

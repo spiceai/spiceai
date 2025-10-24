@@ -53,19 +53,36 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterMode,
+    crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
+    crate::datafusion::cluster::config::SpiceClusterConfig,
+    crate::datafusion::extension::SpiceQueryPlanner,
+    ballista_core::extension::{SessionConfigExt, SessionStateExt},
+    ballista_core::planner::BallistaQueryPlanner,
+    datafusion::execution::SessionStateBuilder,
+    datafusion::physical_planner::DefaultPhysicalPlanner,
+    datafusion_proto::protobuf::LogicalPlanNode,
+};
+
+use datafusion::execution::SessionState;
+
+use async_stream::stream;
+use futures::{Stream, StreamExt};
+
+use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
+
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
-use async_stream::stream;
-use futures::{Stream, StreamExt};
+
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-
-use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -135,6 +152,44 @@ macro_rules! handle_error {
 }
 
 impl Query {
+    #[cfg(not(feature = "cluster"))]
+    #[allow(clippy::unnecessary_wraps)]
+    fn get_session_state(&self) -> Result<SessionState> {
+        Ok(self.df.ctx.state())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn get_session_state(&self) -> Result<SessionState> {
+        if !matches!(self.df.cluster_config.mode, Some(ClusterMode::Scheduler)) {
+            return Ok(self.df.ctx.state());
+        }
+
+        let cfg = self
+            .df
+            .ctx
+            .copied_config()
+            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec());
+
+        let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
+            BallistaQueryPlanner::with_local_planner(
+                self.df.cluster_config.scheduler_url.to_string(),
+                cfg.ballista_config(),
+                SpiceLogicalCodec::new_codec(),
+                DefaultPhysicalPlanner::with_extension_planners(
+                    SpiceQueryPlanner::default_extension_planners(),
+                ),
+            );
+
+        SessionStateBuilder::new_from_existing(self.df.ctx.state())
+            .with_config(
+                cfg.with_ballista_query_planner(Arc::new(query_planner))
+                    .with_option_extension(SpiceClusterConfig::default()),
+            )
+            .build()
+            .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
+            .map_err(|e| Error::UnableToExecuteQuery { source: e })
+    }
+
     /// Run a query and return the result.
     ///
     /// # Panics
@@ -231,7 +286,7 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.df.ctx.state();
+            let mut session = self.get_session_state()?;
 
             let ctx = self;
             let tracker = ctx.tracker;
