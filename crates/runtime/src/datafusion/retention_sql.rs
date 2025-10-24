@@ -26,6 +26,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{TableReference, sqlparser};
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
+use tokio::runtime::Handle;
 
 use crate::datafusion::builder::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
@@ -176,7 +177,10 @@ fn validate_table_name(
 fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let df_schema = DFSchema::try_from(schema).context(SchemaConversionSnafu)?;
 
-    let ctx = SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env());
+    let ctx = SessionContext::new_with_config_rt(
+        get_df_default_config(),
+        default_runtime_env(Handle::current()),
+    );
 
     // To convert SQLExpr to DataFusion Expr, we need SqlToRel, which requires a ContextProvider.
     // SessionContextProvider used by DataFusion is not exposed publicly, so we provide the filter as a string

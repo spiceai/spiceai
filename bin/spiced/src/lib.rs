@@ -42,6 +42,7 @@ use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
+use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
@@ -264,7 +265,7 @@ pub async fn run(args: Args) -> Result<()> {
         .boxed()
         .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-    rt.datafusion().set_tokio_runtime(tokio_runtime);
+    rt.datafusion().set_cpu_runtime(tokio_runtime);
 
     if let Some(metrics_registry) = prometheus_registry {
         init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;

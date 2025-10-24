@@ -124,6 +124,7 @@ pub fn from_s3_url_and_config(
     url: &url::Url,
     region: Option<String>,
     sdk_config: &SdkConfig,
+    io_runtime: Handle,
 ) -> Result<Box<dyn ObjectStore>> {
     if url.scheme() != "s3" {
         return Err(Error::NotAnS3Url {
@@ -135,7 +136,7 @@ pub fn from_s3_url_and_config(
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
     let credential_provider = S3CredentialProvider::from_config(sdk_config)?;
 
-    builder = builder.with_http_connector(SpawnedReqwestConnector::new(Handle::current()));
+    builder = builder.with_http_connector(SpawnedReqwestConnector::new(io_runtime));
 
     if let Some(region) = region.or(sdk_config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);

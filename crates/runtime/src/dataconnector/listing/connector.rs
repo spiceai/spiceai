@@ -989,6 +989,7 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
+    use tokio::runtime::Handle;
     use url::Url;
 
     use crate::component::dataset::builder::DatasetBuilder;

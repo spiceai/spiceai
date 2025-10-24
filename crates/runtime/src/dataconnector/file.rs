@@ -52,12 +52,14 @@ impl std::fmt::Display for File {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct FileFactory {}
 
 impl FileFactory {
     #[must_use]
-    pub fn new() -> Self {}
+    pub fn new() -> Self {
+        Self {}
+    }
 
     #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {

@@ -44,13 +44,13 @@ impl std::fmt::Display for Https {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct HttpsFactory {}
 
 impl HttpsFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        HttpsFactory::default()
     }
 
     #[must_use]

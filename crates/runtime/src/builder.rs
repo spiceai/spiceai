@@ -204,9 +204,12 @@ impl RuntimeBuilder {
         #[cfg(feature = "cluster")]
         let cluster_config = Arc::new(self.runtime_config.cluster.clone());
 
+        let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
+            io_runtime.clone(),
         )
         .memory_limit(memory_limit)
         .temp_directory(query.temp_directory)
@@ -274,9 +277,7 @@ impl RuntimeBuilder {
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
-            io_runtime: self
-                .io_runtime
-                .unwrap_or_else(|| tokio::runtime::Handle::current()),
+            io_runtime,
             status: self.runtime_status,
             tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,

@@ -682,6 +682,7 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
+    use tokio::runtime::Handle;
     use tokio::sync::RwLock;
 
     use super::*;
