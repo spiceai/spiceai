@@ -165,9 +165,7 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Build CLI and run nextest
-        run: |
-          export DEV=true
-          make build-cli nextest
+        run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
