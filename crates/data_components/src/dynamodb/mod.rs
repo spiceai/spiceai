@@ -13,5 +13,33 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use snafu::Snafu;
+use std::sync::Arc;
 
 pub mod provider;
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Failed to fetch table information. Error: {source} Verify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/dynamodb"
+    ))]
+    DescribeTableError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    ScanError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Table does not exist: {table_name}"))]
+    TableDoesNotExist { table_name: Arc<str> },
+
+    #[snafu(display("Table status is not active"))]
+    TableStatusIsNotActive,
+
+    #[snafu(display("Failed to infer schema: {source}"))]
+    SchemaInferenceError { source: arrow::error::ArrowError },
+}

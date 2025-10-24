@@ -42,32 +42,12 @@ use datafusion::{
     prelude::Expr,
 };
 
+use super::{
+    DescribeTableSnafu, Error, Result, ScanSnafu, SchemaInferenceSnafu, TableDoesNotExistSnafu,
+    TableStatusIsNotActiveSnafu,
+};
 use serde_json::Value;
 use snafu::prelude::*;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display(
-        "Failed to fetch table information. Error: {source} Verify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/dynamodb"
-    ))]
-    DescribeTableError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    ScanError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Table does not exist: {table_name}"))]
-    TableDoesNotExist { table_name: Arc<str> },
-
-    #[snafu(display("Table status is not active"))]
-    TableStatusIsNotActive,
-
-    #[snafu(display("Failed to infer schema: {source}"))]
-    SchemaInferenceError { source: arrow::error::ArrowError },
-}
 
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {

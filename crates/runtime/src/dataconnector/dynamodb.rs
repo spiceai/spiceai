@@ -61,6 +61,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use for DynamoDB.")
         .secret(),
+    ParameterSpec::runtime("unnest_depth")
+        .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
+    ParameterSpec::runtime("num_docs_to_infer_schema")
+        .description("Number of documents to use to infer the schema. Defaults to 10.")
+        .default("10"),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
