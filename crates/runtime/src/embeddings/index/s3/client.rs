@@ -38,13 +38,25 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
+const TTL_DURATION_MINIMUM: Duration = Duration::from_secs(5);
+
 pub struct S3VectorClient {
     client: Client,
     list_indexes_cache: RwLock<HashMap<String, (ListIndexesOutput, Instant)>>,
-    ttl: Duration,
+    ttl: Option<Duration>,
 }
+
 impl S3VectorClient {
-    pub fn new(client: Client, ttl: Duration) -> Self {
+    pub fn new(client: Client, ttl: Option<Duration>) -> Self {
+        let ttl = ttl.map(|d| {
+            if d < TTL_DURATION_MINIMUM {
+                tracing::warn!("S3 vector index poll interval minimum is 5s.");
+                TTL_DURATION_MINIMUM
+            } else {
+                d
+            }
+        });
+
         Self {
             client,
             list_indexes_cache: RwLock::new(HashMap::new()),
@@ -75,21 +87,20 @@ impl S3Vectors for S3VectorClient {
             .inspect_err(|_| super::metrics::create_index::ERRORS.add(1, &[]));
 
         // Add index to cache on successful creation but keep expiration
-        if result.is_ok() {
+        if result.is_ok() && self.ttl.is_some() {
             if let Some(bucket) = &input.vector_bucket_name {
                 let mut cache = self.list_indexes_cache.write().await;
-                if let Some((list_indexes, _expiration)) = cache.get_mut(bucket) {
-                    if let Some(index_name) = &input.index_name
-                        && let Some(vector_bucket_name) = &input.vector_bucket_name
-                    {
-                        let new_index = IndexSummary::builder()
-                            .vector_bucket_name(vector_bucket_name)
-                            .index_name(index_name)
-                            .index_arn("arn") // not important for our cache
-                            .creation_time(DateTime::from_secs(1)) // not important for our cache
-                            .build()?;
-                        list_indexes.indexes.push(new_index);
-                    }
+                if let Some((list_indexes, _expiration)) = cache.get_mut(bucket)
+                    && let Some(index_name) = &input.index_name
+                    && let Some(vector_bucket_name) = &input.vector_bucket_name
+                {
+                    let new_index = IndexSummary::builder()
+                        .vector_bucket_name(vector_bucket_name)
+                        .index_name(index_name)
+                        .index_arn("arn") // not important for our cache
+                        .creation_time(DateTime::from_secs(1)) // not important for our cache
+                        .build()?;
+                    list_indexes.indexes.push(new_index);
                 }
                 cache.remove(bucket);
             }
@@ -260,11 +271,11 @@ impl S3Vectors for S3VectorClient {
 
         // Check cache if next_token is None (full list)
         let is_full_list = input.next_token.is_none();
-        if is_full_list {
+        if is_full_list && let Some(ttl) = self.ttl {
             let cache = self.list_indexes_cache.read().await;
             if let Some(bucket) = &input.vector_bucket_name
                 && let Some((cached_output, timestamp)) = cache.get(bucket)
-                && timestamp.elapsed() < self.ttl
+                && timestamp.elapsed() < ttl
             {
                 return Ok(cached_output.clone());
             }
@@ -284,6 +295,7 @@ impl S3Vectors for S3VectorClient {
 
         // Cache successful full list results
         if is_full_list
+            && self.ttl.is_some()
             && let Ok(output) = &result
             && let Some(bucket) = input.vector_bucket_name
         {

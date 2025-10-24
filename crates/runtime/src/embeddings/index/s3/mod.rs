@@ -79,6 +79,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use.")
         .secret(),
+    ParameterSpec::component("index_poll_interval")
+        .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query.")
 ];
 
 /// Attempt to construct an [`S3Vector`] for the provided dataset on the given column.
@@ -174,6 +176,15 @@ async fn try_vector_table(
                 string_from_params(&params, "client_timeout").unwrap_or_default() // If missing, uses default ("").
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
+    let index_poll_interval = string_from_params(&params, "index_poll_interval")
+        .map(fundu::parse_duration)
+        .transpose()
+        .map_err(|_| {
+            Box::from(format!(
+                "S3 vectors index configured with invalid 'index_poll_interval'= '{}'",
+                string_from_params(&params, "index_poll_interval").unwrap_or_default() // If missing, uses default ("").
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
 
     let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
@@ -212,7 +223,7 @@ async fn try_vector_table(
 
     let config = config_bldr.load().await;
 
-    let s3_vector_client = S3VectorClient::new(Client::new(&config), Duration::from_secs(300));
+    let s3_vector_client = S3VectorClient::new(Client::new(&config), index_poll_interval);
 
     let s3_vector_client =
         Arc::new(S3VectorRetryClientBuilder::new(Arc::new(s3_vector_client)).build())
