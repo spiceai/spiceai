@@ -34,18 +34,22 @@ use axum::{
     Extension, Json,
     extract::Query,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
 };
 use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use headers_accept::Accept;
+use http::HeaderMap;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use itertools::Itertools;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tracing::Span;
 use tracing_futures::Instrument;
@@ -57,6 +61,9 @@ const DEFAULT_NSQL_RETRIES: u8 = 10;
 
 // Maximum number of concurrent sampling tools executions for NSQL
 const DATA_SAMPLING_MAX_CONCURRENT: usize = 10;
+
+// NSQL streaming keep alive interval in seconds
+const NSQL_STREAM_KEEP_ALIVE: u64 = 10;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -250,7 +257,6 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
         )))
     )
 ))]
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
@@ -258,16 +264,39 @@ pub(crate) async fn post(
     Query(params): Query<NsqlQueryParams>,
     Json(payload): Json<Request>,
 ) -> Response {
-    handle_nsql_query(rt, llms, accept, params, payload).await
+    if params.stream {
+        let stream = futures::stream::once(handle_nsql_query(rt, llms, accept, payload)).map(
+            |(status, _, body)| {
+                if status.is_success() {
+                    Ok(Event::default().data(body))
+                } else {
+                    Err(status.to_string())
+                }
+            },
+        );
+        Sse::new(stream)
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(NSQL_STREAM_KEEP_ALIVE))
+                    .text("nsql still in progress"),
+            )
+            .into_response()
+    } else {
+        handle_nsql_query(rt, llms, accept, payload)
+            .await
+            .into_response()
+    }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_nsql_query(
     rt: Arc<Runtime>,
     llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     accept: Option<TypedHeader<Accept>>,
-    params: NsqlQueryParams,
     payload: Request,
-) -> Response {
+) -> (StatusCode, HeaderMap, String) {
+    let headers = HeaderMap::new();
+
     // track ai_inferences_with_spice_count metric
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
@@ -298,7 +327,7 @@ pub(crate) async fn handle_nsql_query(
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Error getting schema messages: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
         }
     };
 
@@ -311,7 +340,7 @@ pub(crate) async fn handle_nsql_query(
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("Error sampling datasets for NSQL messages: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
             }
         }
     } else {
@@ -322,9 +351,9 @@ pub(crate) async fn handle_nsql_query(
     let Some(nql_model) = models.get(&payload.model) else {
         return (
             StatusCode::BAD_REQUEST,
+            headers,
             format!("Model {} not found", payload.model),
-        )
-            .into_response();
+        );
     };
 
     let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
@@ -338,9 +367,9 @@ pub(crate) async fn handle_nsql_query(
         else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                headers,
                 "Error preparing data for NQL model".to_string(),
-            )
-                .into_response();
+            );
         };
 
         req.messages.extend(schema_messages.clone());
@@ -350,7 +379,7 @@ pub(crate) async fn handle_nsql_query(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Error running NQL model: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
             }
         };
 
@@ -361,7 +390,7 @@ pub(crate) async fn handle_nsql_query(
 
                 if return_sql_only(accept.as_ref()) {
                     tracing::trace!("Not running query, requested SQL only:\n{cleaned_query}");
-                    return (StatusCode::OK, cleaned_query).into_response();
+                    return (StatusCode::OK, headers, cleaned_query);
                 }
 
                 tracing::debug!("Running query:\n{cleaned_query}");
@@ -385,7 +414,7 @@ pub(crate) async fn handle_nsql_query(
 
                         if num_retries >= DEFAULT_NSQL_RETRIES {
                             tracing::error!("Error executing query: {e}");
-                            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                            return (StatusCode::BAD_REQUEST, headers, e.to_string());
                         }
 
                         tracing::debug!("Error executing query: {e}. Retrying...");
@@ -401,13 +430,13 @@ pub(crate) async fn handle_nsql_query(
                 tracing::trace!("No query produced from NSQL model");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
                     "No query produced from NSQL model".to_string(),
-                )
-                    .into_response();
+                );
             }
             Err(e) => {
                 tracing::error!("Error running NSQL model: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
             }
         }
     }
