@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterMode,
+    ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
+    ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
+};
+
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
@@ -393,6 +400,12 @@ pub enum Error {
         "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
     ))]
     AddressAlreadyInUse { addr: String },
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display(
+        "The cluster scheduler is not initialized, preventing the flight service from starting."
+    ))]
+    ClusterSchedulerNotInitialized {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -421,11 +434,8 @@ pub async fn start(
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
-    let svc = FlightServiceServer::new(service)
+    let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
-
-    tracing::info!("Spice Runtime Flight listening on {bind_address}");
-    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
     let mut server = Server::builder();
 
@@ -443,13 +453,67 @@ pub async fn start(
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
-    let server = server
+    #[allow(unused_mut)]
+    let mut server = server
         .layer(RequestContextLayer::new(app, rt.datafusion()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
-        .layer(auth_layer)
-        .add_service(svc);
+        .layer(auth_layer);
+
+    #[cfg(not(feature = "cluster"))]
+    let server = server.add_service(spice_flight_service);
+
+    #[cfg(feature = "cluster")]
+    let server = match rt.config.cluster.mode {
+        Some(ClusterMode::Scheduler) => {
+            let Some(scheduler) = rt
+                .df
+                .scheduler_server
+                .read()
+                .ok()
+                .and_then(|r| r.iter().next().cloned())
+            else {
+                return Err(Error::ClusterSchedulerNotInitialized {});
+            };
+
+            let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
+            server
+                .add_service(spice_flight_service)
+                .add_service(scheduler_grpc_server)
+        }
+        Some(ClusterMode::Executor) => {
+            let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX);
+
+            server.add_service(executor_flight)
+        }
+        _ => server.add_service(spice_flight_service),
+    };
+
+    // If running an executor, we may have resolved another port to bind if 50051 is taken
+    #[cfg(feature = "cluster")]
+    let bind_address: SocketAddr = if let Some((host, port)) =
+        rt.df.executor.read().ok().and_then(|maybe_executor| {
+            maybe_executor
+                .as_ref()
+                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
+        }) {
+        if let Ok(addr) = format!("{host}:{port}").parse() {
+            addr
+        } else {
+            tracing::warn!(
+                "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
+            );
+            bind_address
+        }
+    } else {
+        bind_address
+    };
+
+    tracing::info!("Spice Runtime Flight listening on {bind_address}");
+    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
     if let Some(token) = shutdown_signal {
         server

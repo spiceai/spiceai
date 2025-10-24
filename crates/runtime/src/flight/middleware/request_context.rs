@@ -28,6 +28,7 @@ use crate::{
 use app::App;
 use runtime_request_context::{Protocol, RequestContext};
 
+use crate::datafusion::app_context_extension::AppContextExtension;
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};
 
@@ -89,6 +90,7 @@ where
                 .with_app_opt(self.app.clone())
                 .with_extension(DataFusionContextExtension::new(Arc::clone(&self.df)))
                 .with_extension(ModelContextExtension::new())
+                .with_extension(AppContextExtension::new(self.app.clone()))
                 .from_headers(headers)
                 .build(),
         );
