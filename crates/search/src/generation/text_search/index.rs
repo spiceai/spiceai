@@ -505,7 +505,7 @@ mod tests {
             )),
             fields_with_indices
                 .iter()
-                .map(|(original_idx, _)| Arc::clone(&batch.column(*original_idx)))
+                .map(|(original_idx, _)| Arc::clone(batch.column(*original_idx)))
                 .collect::<Vec<_>>(),
         )
     }
