@@ -1,5 +1,5 @@
 ---
-name: pr
+name: CI
 
 on:
   merge_group:
@@ -10,17 +10,21 @@ on:
       - release-*
       - release/*
       - feature-*
+  push:
+    branches:
+      - trunk
+      - release/*
   workflow_dispatch:
     inputs:
       profile_option:
-        description: 'Which Rust build profile to use? (Default is lint)'
+        description: 'Which Rust build profile to use? (Default is release)'
         required: false
         type: choice
         options:
           - 'lint'
           - 'release'
           - 'release-lto'
-        default: 'lint'
+        default: 'release'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -28,12 +32,9 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
-  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
 jobs:
-  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
-  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
-  # a sucess when skipped).
   check_changes:
     runs-on: spiceai-dev-runners
     outputs:
@@ -64,7 +65,7 @@ jobs:
         run: |
           echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
 
-  lint:
+  lint_and_build:
     name: Run Go & Rust Linters and Build
     runs-on: spiceai-dev-runners
     env:
@@ -198,3 +199,89 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
+
+      - name: Upload build artifacts
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: target/
+          retention-days: 1
+
+  install_targets:
+    name: Test Install Targets
+    runs-on: spiceai-dev-runners
+    needs: [check_changes, lint_and_build]
+    env:
+      GOVER: 1.25.3
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download build artifacts
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/download-artifact@v5
+        with:
+          name: build-artifacts
+          path: target/
+
+      - name: Touch binaries to prevent rebuild
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          touch target/release/spice
+          touch target/release/spiced
+
+      - name: Set up Go
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GOVER }}
+          cache: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install Protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: make install
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install
+
+      - name: make install-dev
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install-dev
+
+      - name: make install-with-models
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install-with-models
+
+      - name: make install-with-odbc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install-with-odbc
+
+      - name: make install-cli
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install-cli
+
+      - name: make install-runtime
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install-runtime
