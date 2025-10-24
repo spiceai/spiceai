@@ -93,6 +93,7 @@ impl TaskHistoryExporter {
 
     /// Asynchronously captures query plans for spans that meet the threshold.
     /// This runs on a separate tokio task to avoid blocking the original query.
+    /// The spans passed to this method have already been filtered by the caller.
     async fn capture_plans_async(
         df: Arc<DataFusion>,
         spans: Vec<TaskSpan>,
@@ -100,18 +101,6 @@ impl TaskHistoryExporter {
         min_plan_duration_ms: Option<f64>,
     ) {
         for span in spans {
-            // Skip if execution duration doesn't meet min_plan_duration threshold
-            if let Some(min_duration) = min_plan_duration_ms
-                && span.execution_duration_ms < min_duration
-            {
-                continue;
-            }
-
-            // Only capture plans for tasks with exact name "sql_query"
-            if span.task.as_ref() != "sql_query" || span.input.is_empty() {
-                continue;
-            }
-
             let explain_query = match captured_plan {
                 TaskHistoryCapturedPlan::None => continue,
                 TaskHistoryCapturedPlan::Explain => {
@@ -306,17 +295,48 @@ impl SpanExporter for TaskHistoryExporter {
             .collect();
 
         Box::pin(async move {
-            // First, write the spans without captured_plan
-            TaskSpan::write(Arc::clone(&df), spans.clone())
+            // Separate logic: if plan capture is disabled, write all spans directly
+            if matches!(captured_plan, TaskHistoryCapturedPlan::None) {
+                return TaskSpan::write(Arc::clone(&df), spans)
+                    .await
+                    .map_err(|e| TraceError::Other(Box::new(e)));
+            }
+
+            // Filter spans that need plan capture before cloning
+            let should_capture_plan = |span: &TaskSpan| {
+                // Check min_plan_duration threshold
+                if let Some(min_duration) = min_plan_duration_ms
+                    && span.execution_duration_ms < min_duration
+                {
+                    return false;
+                }
+                // Only capture plans for sql_query tasks with non-empty input
+                span.task.as_ref() == "sql_query" && !span.input.is_empty()
+            };
+
+            // Clone only the spans that need plan capture
+            let spans_for_plan: Vec<TaskSpan> = spans
+                .iter()
+                .filter(|s| should_capture_plan(s))
+                .cloned()
+                .collect();
+
+            // Write all spans first
+            TaskSpan::write(Arc::clone(&df), spans)
                 .await
                 .map_err(|e| TraceError::Other(Box::new(e)))?;
 
-            // If captured_plan is enabled, spawn async tasks to capture plans
-            if !matches!(captured_plan, TaskHistoryCapturedPlan::None) {
+            // Spawn async task to capture plans for filtered spans
+            if !spans_for_plan.is_empty() {
                 let df_clone = Arc::clone(&df);
                 tokio::spawn(async move {
-                    Self::capture_plans_async(df_clone, spans, captured_plan, min_plan_duration_ms)
-                        .await;
+                    Self::capture_plans_async(
+                        df_clone,
+                        spans_for_plan,
+                        captured_plan,
+                        min_plan_duration_ms,
+                    )
+                    .await;
                 });
             }
 
