@@ -258,6 +258,16 @@ pub(crate) async fn post(
     Query(params): Query<NsqlQueryParams>,
     Json(payload): Json<Request>,
 ) -> Response {
+    handle_nsql_query(rt, llms, accept, params, payload).await
+}
+
+pub(crate) async fn handle_nsql_query(
+    rt: Arc<Runtime>,
+    llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    accept: Option<TypedHeader<Accept>>,
+    params: NsqlQueryParams,
+    payload: Request,
+) -> Response {
     // track ai_inferences_with_spice_count metric
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
