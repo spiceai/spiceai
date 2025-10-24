@@ -63,7 +63,7 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
@@ -74,7 +74,7 @@ use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
-use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root, managed_runtime};
+use super::managed_runtime;
 use managed_runtime::ManagedRuntimeError;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
