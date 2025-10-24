@@ -157,6 +157,10 @@ install-with-models-cuda:
 install-with-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
 
+.PHONY: install-with-odbc-dev
+install-with-odbc-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="odbc"
+
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin

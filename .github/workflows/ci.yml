@@ -259,7 +259,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: make install
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'pull_request'
         run: |
           make install
 
@@ -268,13 +268,23 @@ jobs:
         run: |
           make install-dev
 
-      - name: make install-with-models
+      - name: make install-with-models-dev
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install-with-models-dev
+
+      - name: make install-with-odbc-dev
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          make install-with-odbc-dev
+
+      - name: make install-with-models
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'pull_request'
         run: |
           make install-with-models
 
       - name: make install-with-odbc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'pull_request'
         run: |
           make install-with-odbc
 
@@ -284,6 +294,6 @@ jobs:
           make install-cli
 
       - name: make install-runtime
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'pull_request'
         run: |
           make install-runtime
