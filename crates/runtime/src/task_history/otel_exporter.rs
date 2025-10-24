@@ -191,14 +191,7 @@ impl SpanExporter for TaskHistoryExporter {
         let spans: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
-            .filter(|task_span| {
-                // If min_sql_duration is set, filter out spans with shorter execution times
-                if let Some(min_duration) = min_sql_duration_ms {
-                    task_span.execution_duration_ms >= min_duration
-                } else {
-                    true
-                }
-            })
+            .filter(|task_span| min_sql_duration_ms.map_or(true, |min| task_span.execution_duration_ms >= min))
             .collect();
 
         let df = Arc::clone(&self.df);
