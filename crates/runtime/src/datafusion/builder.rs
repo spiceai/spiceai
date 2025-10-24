@@ -29,7 +29,6 @@ use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
-use datafusion::config::SpillCompression;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -46,6 +45,7 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
+use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -226,15 +226,7 @@ impl DataFusionBuilder {
             .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(
-                ExtensionPlanQueryPlanner::from_extension_planners(vec![
-                    Arc::new(IndexTableScanExtensionPlanner::new()),
-                    Arc::new(FederatedPlanner::new()),
-                    Arc::new(BytesProcessedExtensionPlanner::new(
-                        Box::new(track_bytes_processed),
-                        cfg!(feature = "cluster"),
-                    )),
-                    Arc::new(CacheInvalidationExtensionPlanner::new()),
-                ]),
+                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
             ))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
@@ -436,6 +428,18 @@ pub(crate) fn runtime_env(
             unreachable!("Tests ensure this should never fail: {e}");
         }
     }
+}
+
+pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+    vec![
+        Arc::new(IndexTableScanExtensionPlanner::new()),
+        Arc::new(FederatedPlanner::new()),
+        Arc::new(BytesProcessedExtensionPlanner::new(
+            Box::new(track_bytes_processed),
+            cfg!(feature = "cluster"),
+        )),
+        Arc::new(CacheInvalidationExtensionPlanner::new()),
+    ]
 }
 
 #[cfg(test)]

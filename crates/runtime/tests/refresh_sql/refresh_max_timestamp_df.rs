@@ -99,18 +99,18 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .downcast_ref::<PolyTableProvider>()
                 .expect("Expected PolyTableProvider");
 
-            let mut state = SessionStateBuilder::new()
-                .with_runtime_env(default_runtime_env())
-                .with_default_features()
-                .with_query_planner(Arc::new(
-                    ExtensionPlanQueryPlanner::from_extension_planners(vec![
-                        Arc::new(FederatedPlanner::new()),
-                        Arc::new(IndexTableScanExtensionPlanner::new()),
-                    ]),
-                ))
-                .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
-                .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
-                .build();
+            let mut state =
+                SessionStateBuilder::new()
+                    .with_runtime_env(default_runtime_env())
+                    .with_default_features()
+                    .with_query_planner(Arc::new(
+                        ExtensionPlanQueryPlanner::from_extension_planners(
+                            default_extension_planners(),
+                        ),
+                    ))
+                    .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
+                    .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+                    .build();
 
             if let Err(e) = datafusion_functions_json::register_all(&mut state) {
                 tracing::error!("Unable to register JSON functions: {e}");

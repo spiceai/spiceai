@@ -56,14 +56,15 @@ mod tracker;
 #[cfg(feature = "cluster")]
 use {
     crate::config::ClusterMode,
+    crate::datafusion::builder::default_extension_planners,
     crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
     crate::datafusion::cluster::config::SpiceClusterConfig,
-    crate::datafusion::extension::SpiceQueryPlanner,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
     datafusion::execution::SessionStateBuilder,
     datafusion::physical_planner::DefaultPhysicalPlanner,
     datafusion_proto::protobuf::LogicalPlanNode,
+    runtime_datafusion::extension::ExtensionPlanQueryPlanner,
 };
 
 use datafusion::execution::SessionState;
@@ -176,7 +177,7 @@ impl Query {
                 cfg.ballista_config(),
                 SpiceLogicalCodec::new_codec(),
                 DefaultPhysicalPlanner::with_extension_planners(
-                    SpiceQueryPlanner::default_extension_planners(),
+                    ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
                 ),
             );
 
