@@ -32,6 +32,7 @@ use crate::{
 use async_openai::types::ChatCompletionRequestMessage;
 use axum::{
     Extension, Json,
+    extract::Query,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -137,6 +138,14 @@ pub struct Request {
 
 fn default_sample_data_enabled() -> bool {
     true
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+pub struct NsqlQueryParams {
+    /// If true, streams the response instead of waiting for completion
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn default_model() -> String {
@@ -246,6 +255,7 @@ pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     accept: Option<TypedHeader<Accept>>,
+    Query(params): Query<NsqlQueryParams>,
     Json(payload): Json<Request>,
 ) -> Response {
     // track ai_inferences_with_spice_count metric
