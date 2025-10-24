@@ -17,28 +17,39 @@ limitations under the License.
 use async_trait::async_trait;
 use s3_vectors::{
     Client, CreateIndexError, CreateIndexInput, CreateIndexOutput, CreateVectorBucketError,
-    CreateVectorBucketInput, CreateVectorBucketOutput, DeleteIndexError, DeleteIndexInput,
-    DeleteIndexOutput, DeleteVectorBucketError, DeleteVectorBucketInput, DeleteVectorBucketOutput,
-    DeleteVectorBucketPolicyError, DeleteVectorBucketPolicyInput, DeleteVectorBucketPolicyOutput,
-    DeleteVectorsError, DeleteVectorsInput, DeleteVectorsOutput, GetIndexError, GetIndexInput,
-    GetIndexOutput, GetVectorBucketError, GetVectorBucketInput, GetVectorBucketOutput,
-    GetVectorBucketPolicyError, GetVectorBucketPolicyInput, GetVectorBucketPolicyOutput,
-    GetVectorsError, GetVectorsInput, GetVectorsOutput, ListIndexesError, ListIndexesInput,
-    ListIndexesOutput, ListVectorBucketsError, ListVectorBucketsInput, ListVectorBucketsOutput,
-    ListVectorsError, ListVectorsInput, ListVectorsOutput, PutVectorBucketPolicyError,
-    PutVectorBucketPolicyInput, PutVectorBucketPolicyOutput, PutVectorsError, PutVectorsInput,
-    PutVectorsOutput, QueryVectorsError, QueryVectorsInput, QueryVectorsOutput, S3Vectors,
-    SdkError,
+    CreateVectorBucketInput, CreateVectorBucketOutput, DateTime, DeleteIndexError,
+    DeleteIndexInput, DeleteIndexOutput, DeleteVectorBucketError, DeleteVectorBucketInput,
+    DeleteVectorBucketOutput, DeleteVectorBucketPolicyError, DeleteVectorBucketPolicyInput,
+    DeleteVectorBucketPolicyOutput, DeleteVectorsError, DeleteVectorsInput, DeleteVectorsOutput,
+    GetIndexError, GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
+    GetVectorBucketOutput, GetVectorBucketPolicyError, GetVectorBucketPolicyInput,
+    GetVectorBucketPolicyOutput, GetVectorsError, GetVectorsInput, GetVectorsOutput, IndexSummary,
+    ListIndexesError, ListIndexesInput, ListIndexesOutput, ListVectorBucketsError,
+    ListVectorBucketsInput, ListVectorBucketsOutput, ListVectorsError, ListVectorsInput,
+    ListVectorsOutput, PutVectorBucketPolicyError, PutVectorBucketPolicyInput,
+    PutVectorBucketPolicyOutput, PutVectorsError, PutVectorsInput, PutVectorsOutput,
+    QueryVectorsError, QueryVectorsInput, QueryVectorsOutput, S3Vectors, SdkError,
 };
 
 use crate::timing::TimeMeasurement;
 
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time::Instant;
+
 pub struct S3VectorClient {
     client: Client,
+    list_indexes_cache: RwLock<HashMap<String, (ListIndexesOutput, Instant)>>,
+    ttl: Duration,
 }
 impl S3VectorClient {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(client: Client, ttl: Duration) -> Self {
+        Self {
+            client,
+            list_indexes_cache: RwLock::new(HashMap::new()),
+            ttl,
+        }
     }
 }
 #[async_trait]
@@ -50,17 +61,41 @@ impl S3Vectors for S3VectorClient {
         let _guard = TimeMeasurement::new(&super::metrics::create_index::LATENCY, &[]);
         super::metrics::create_index::REQUESTS.add(1, &[]);
 
-        self.client
+        let result = self
+            .client
             .create_index()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
+            .set_vector_bucket_name(input.vector_bucket_name.clone())
+            .set_index_name(input.index_name.clone())
             .set_data_type(input.data_type)
             .set_dimension(input.dimension)
             .set_distance_metric(input.distance_metric)
             .set_metadata_configuration(input.metadata_configuration)
             .send()
             .await
-            .inspect_err(|_| super::metrics::create_index::ERRORS.add(1, &[]))
+            .inspect_err(|_| super::metrics::create_index::ERRORS.add(1, &[]));
+
+        // Add index to cache on successful creation but keep expiration
+        if result.is_ok() {
+            if let Some(bucket) = &input.vector_bucket_name {
+                let mut cache = self.list_indexes_cache.write().await;
+                if let Some((list_indexes, _expiration)) = cache.get_mut(bucket) {
+                    if let Some(index_name) = &input.index_name
+                        && let Some(vector_bucket_name) = &input.vector_bucket_name
+                    {
+                        let new_index = IndexSummary::builder()
+                            .vector_bucket_name(vector_bucket_name)
+                            .index_name(index_name)
+                            .index_arn("arn") // not important for our cache
+                            .creation_time(DateTime::from_secs(1)) // not important for our cache
+                            .build()?;
+                        list_indexes.indexes.push(new_index);
+                    }
+                }
+                cache.remove(bucket);
+            }
+        }
+
+        result
     }
 
     async fn create_vector_bucket(
@@ -223,16 +258,40 @@ impl S3Vectors for S3VectorClient {
         let _guard = TimeMeasurement::new(&super::metrics::list_indexes::LATENCY, &[]);
         super::metrics::list_indexes::REQUESTS.add(1, &[]);
 
-        self.client
+        // Check cache if next_token is None (full list)
+        let is_full_list = input.next_token.is_none();
+        if is_full_list {
+            let cache = self.list_indexes_cache.read().await;
+            if let Some(bucket) = &input.vector_bucket_name
+                && let Some((cached_output, timestamp)) = cache.get(bucket)
+                && timestamp.elapsed() < self.ttl
+            {
+                return Ok(cached_output.clone());
+            }
+        }
+
+        let result = self
+            .client
             .list_indexes()
-            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_vector_bucket_name(input.vector_bucket_name.clone())
             .set_vector_bucket_arn(input.vector_bucket_arn)
             .set_max_results(input.max_results)
             .set_next_token(input.next_token)
             .set_prefix(input.prefix)
             .send()
             .await
-            .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]))
+            .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]));
+
+        // Cache successful full list results
+        if is_full_list
+            && let Ok(output) = &result
+            && let Some(bucket) = input.vector_bucket_name
+        {
+            let mut cache = self.list_indexes_cache.write().await;
+            cache.insert(bucket, (output.clone(), Instant::now()));
+        }
+
+        result
     }
 
     async fn list_vector_buckets(

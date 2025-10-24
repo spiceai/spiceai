@@ -585,10 +585,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field};
     use datafusion::{logical_expr::col, prelude::SessionContext, scalar::ScalarValue};
-    use s3_vectors::{
-        DistanceMetric, IndexSummary,
-        mock::{DateTime, MockClient},
-    };
+    use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
 
     #[tokio::test]
     async fn scan_plan_with_partitions() -> Result<(), Box<dyn std::error::Error>> {

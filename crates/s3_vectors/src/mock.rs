@@ -61,9 +61,8 @@ use aws_sdk_s3vectors::{
 };
 use aws_smithy_runtime_api::{client::result::ServiceError, http::StatusCode};
 use aws_smithy_types::body::SdkBody;
-pub use aws_smithy_types::{DateTime, Document, Number, error::operation::BuildError};
 
-use crate::S3Vectors;
+use crate::{DateTime, S3Vectors};
 
 #[derive(Default, Debug)]
 pub struct MockData {

@@ -676,10 +676,7 @@ mod tests {
         prelude::{SessionContext, col},
         scalar::ScalarValue,
     };
-    use s3_vectors::{
-        DistanceMetric, IndexSummary,
-        mock::{DateTime, MockClient},
-    };
+    use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
 
     #[derive(Debug)]
     struct MockComputeVector {
