@@ -62,7 +62,7 @@ const DEFAULT_NSQL_RETRIES: u8 = 10;
 const DATA_SAMPLING_MAX_CONCURRENT: usize = 10;
 
 // NSQL streaming keep alive interval in seconds
-const NSQL_STREAM_KEEP_ALIVE: u64 = 10;
+const NSQL_STREAM_KEEP_ALIVE: u64 = 30;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
