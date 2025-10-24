@@ -133,6 +133,11 @@ impl DuckDBAccelerator {
             dataset: source.name().to_string(),
         })?;
 
+        let pool_size_param = source
+            .acceleration()
+            .and_then(|accel| accel.params.get("duckdb_pool_size"))
+            .and_then(|size_str| size_str.parse::<u32>().ok());
+
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
@@ -140,7 +145,7 @@ impl DuckDBAccelerator {
                     &source.app(),
                     source.runtime(),
                 );
-                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let max_size = pool_size_param.unwrap_or_else(|| Self::get_max_size(num_accelerating_datasets));
                 let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
                     .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
@@ -154,7 +159,7 @@ impl DuckDBAccelerator {
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
-                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let max_size = pool_size_param.unwrap_or_else(|| Self::get_max_size(num_accelerating_datasets));
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
                     .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
@@ -273,6 +278,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("partitioned_write_flush_threshold"),
     ParameterSpec::runtime("on_insert_sort_column"),
     ParameterSpec::runtime("on_insert_sort_direction"),
+    ParameterSpec::component("pool_size"),
 ];
 
 #[async_trait]
@@ -464,7 +470,7 @@ fn on_data_written_handler_for_source(
     let source_name = source.name().to_string();
 
     Some(Arc::new(
-        move |tx: &duckdb::Transaction, table_manager: &TableManager, _schema| {
+        move |tx: &duckdb::Transaction, table_manager: &TableManager, _schema, _num_rows| {
             // Handle sorting if parameters are provided
             if let (Some(column), Some(direction)) = (&sort_column, &sort_direction) {
                 let sort_sql = format!(

@@ -259,7 +259,7 @@ datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git",
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "5897255853b7f2b60aa29fe640ae238ec6288a7c" } # spiceai/spiceai-49
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5ad2f52b9bafc6eaa50851f2e1fcf0585fb5184d" }                      # spiceai-49
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "ecb6cead6aaff4ac45f93ddf0be36973616a9029" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1c55ae5dd8486abd98cf030e693032bf64f1e188" } # spiceai
 # datafusion-table-providers = { path = "../other/datafusion-table-providers/core/" } # spiceai
 
 
