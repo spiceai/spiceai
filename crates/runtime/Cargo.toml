@@ -29,6 +29,10 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
+ballista = { workspace = true, optional = true }
+ballista-core = { workspace = true, optional = true }
+ballista-scheduler = { workspace = true, optional = true }
+ballista-executor = { workspace = true, optional = true }
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
 base64.workspace = true
 byte-unit.workspace = true
@@ -47,6 +51,7 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
+datafusion-proto = { workspace = true, optional = true }
 datafusion-table-providers = { workspace = true }
 datafusion-optimizer-rules = {path ="../datafusion-optimizer-rules"}
 db_connection_pool = { path = "../db_connection_pool" }
@@ -218,6 +223,7 @@ clickhouse = [
     "arrow_sql_gen/clickhouse",
     "data_components/clickhouse",
 ]
+cluster = ["dep:ballista", "dep:ballista-core", "dep:ballista-scheduler", "dep:ballista-executor", "dep:datafusion-proto"]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
@@ -227,6 +233,7 @@ default = [
     "aws-secrets-manager",
     "sharepoint",
     "bedrock",
+    "dep:datafusion-proto"
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]

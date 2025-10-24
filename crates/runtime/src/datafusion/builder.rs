@@ -26,8 +26,10 @@ use super::{
     extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
     schema::SpiceSchemaProvider,
 };
+#[cfg(feature = "cluster")]
+use crate::config::ClusterConfig;
+use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
-use crate::{datafusion::extension::SpiceExtensionPlanner, status};
 use cache::Caching;
 use datafusion::config::SpillCompression;
 use datafusion::{
@@ -46,13 +48,9 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
-use datafusion_optimizer_rules::{
-    logical_plan::{
-        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
-    },
-    physical_plan::EmptyHashJoinExecPhysicalOptimization,
-};
+use datafusion_federation::sql::federation_analyzer_rule;
+use datafusion_optimizer_rules::logical_plan::cache_invalidation::CacheInvalidationOptimizerRule;
+use datafusion_optimizer_rules::physical_plan::EmptyHashJoinExecPhysicalOptimization;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -97,6 +95,8 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
+    #[cfg(feature = "cluster")]
+    cluster_config: Arc<ClusterConfig>,
     metrics: Option<Metrics>,
 }
 
@@ -135,6 +135,8 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
+            #[cfg(feature = "cluster")]
+            cluster_config: Arc::new(ClusterConfig::default()),
             metrics: None,
         }
     }
@@ -148,6 +150,13 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_caching(mut self, caching: Arc<Caching>) -> Self {
         self.caching = Some(caching);
+        self
+    }
+
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
+        self.cluster_config = config;
         self
     }
 
@@ -206,13 +215,10 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
-            .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
-                vec![
-                    Arc::new(FederatedPlanner::new()),
-                    Arc::new(SpiceExtensionPlanner::new()),
-                    Arc::new(CacheInvalidationExtensionPlanner::new()),
-                ],
-            )))
+            .with_query_planner(Arc::new(
+                SpiceQueryPlanner::new()
+                    .with_extension_planners(SpiceQueryPlanner::default_extension_planners()),
+            ))
             .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
@@ -294,8 +300,15 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            temp_directory: self.temp_directory.clone(),
             tokio_runtime: OnceLock::new(),
             metrics: self.metrics,
+            #[cfg(feature = "cluster")]
+            cluster_config: self.cluster_config,
+            #[cfg(feature = "cluster")]
+            scheduler_server: RwLock::new(None),
+            #[cfg(feature = "cluster")]
+            executor: RwLock::new(None),
         }
     }
 }

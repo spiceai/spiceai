@@ -20,6 +20,7 @@ use ::tools::rename::with_name;
 use async_stream::stream;
 use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -42,6 +43,13 @@ use crate::{
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
+
+#[cfg(feature = "cluster")]
+use {
+    crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode,
+    crate::datafusion::cluster,
+};
+
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
@@ -96,7 +104,9 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+
 pub use runtime_parameters as parameters;
+
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
@@ -406,8 +416,22 @@ pub enum Error {
 
     #[snafu(display("Full text search is not supported for views."))]
     FullTextSearchNotSupportedForView,
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Failed to start Ballista scheduler: {source}"))]
+    FailedToStartClusterScheduler {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Failed to start or register Ballista executor: {source}"))]
+    FailedToStartClusterExecutor {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
+#[cfg(feature = "cluster")]
+const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -454,6 +478,13 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+    config: Arc<Config>,
+}
+
+impl Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Runtime {self:p}")
+    }
 }
 
 impl Runtime {
@@ -568,6 +599,81 @@ impl Runtime {
             .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
+        // Shutdown signal
+        let shutdown_signal_future = async {
+            let graceful_shutdown = async {
+                shutdown_signal().await;
+                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
+                self.shutdown().await;
+                Ok(())
+            };
+            tokio::select! {
+                result = graceful_shutdown => result,
+                () = force_shutdown_signal() => {
+                    tracing::info!("Force shutdown signal received. Terminating immediately.");
+                    // return error to force stop waiting for other tasks and terminate immediately
+                    Err(Error::ForceTerminated)
+                }
+            }
+        };
+
+        // - Scheduler: does some init, but all requests handled by Flight RPC stack
+        // - Executor: does some init, but has a polling loop to fetch work from scheduler
+        #[cfg(feature = "cluster")]
+        let maybe_cluster_future = match self.config.cluster.mode {
+            Some(ClusterMode::Scheduler) => {
+                cluster::initialize_cluster_scheduler(&self).await?;
+                None
+            }
+            Some(ClusterMode::Executor) => Some(
+                self.start_runtime_task(
+                    CLUSTER_EXECUTOR,
+                    None,
+                    cluster::initialize_cluster_executor(Arc::clone(&self)).await?,
+                )
+                .await,
+            ),
+            _ => None,
+        };
+
+        // Start Flight server
+        let flight_shutdown = CancellationToken::new();
+        let self_ref = Arc::clone(&self);
+        let cloned_tls_config = tls_config.clone();
+        let cloned_endpoint_auth = endpoint_auth.clone();
+        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+
+        let flight_future = self
+            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+                flight::start(
+                    config.flight_bind_address,
+                    cloned_app_ref,
+                    Arc::clone(&self_ref),
+                    cloned_tls_config,
+                    cloned_endpoint_auth,
+                    Arc::clone(&self_ref.rate_limits),
+                    Some(flight_shutdown),
+                )
+                .await
+                .context(UnableToStartFlightServerSnafu)
+            })
+            .await;
+
+        #[cfg(feature = "cluster")]
+        // If this is an executor, we only need the shutdown signal and flight server
+        if matches!(self.config.cluster.mode, Some(ClusterMode::Executor)) {
+            let Some(executor_future) = maybe_cluster_future else {
+                return Err(FailedToStartClusterExecutor {
+                    source: "Executor work loop not bound. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
+                        .to_string()
+                        .into(),
+                });
+            };
+
+            return tokio::try_join!(shutdown_signal_future, executor_future, flight_future,)
+                .map(|_| ());
+        }
+
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
@@ -600,29 +706,6 @@ impl Runtime {
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
                     .context(UnableToStartMetricsServerSnafu)
-            })
-            .await;
-
-        // Start Flight server
-        let flight_shutdown = CancellationToken::new();
-        let self_ref = Arc::clone(&self);
-        let cloned_tls_config = tls_config.clone();
-        let cloned_endpoint_auth = endpoint_auth.clone();
-        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
-
-        let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                flight::start(
-                    config.flight_bind_address,
-                    cloned_app_ref,
-                    Arc::clone(&self_ref),
-                    cloned_tls_config,
-                    cloned_endpoint_auth,
-                    Arc::clone(&self_ref.rate_limits),
-                    Some(flight_shutdown),
-                )
-                .await
-                .context(UnableToStartFlightServerSnafu)
             })
             .await;
 
@@ -671,24 +754,6 @@ impl Runtime {
                     .context(UnableToInitializePodsWatcherSnafu)
             })
             .await;
-
-        // Shutdown signal
-        let shutdown_signal_future = async {
-            let graceful_shutdown = async {
-                shutdown_signal().await;
-                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
-                self.shutdown().await;
-                Ok(())
-            };
-            tokio::select! {
-                result = graceful_shutdown => result,
-                () = force_shutdown_signal() => {
-                    tracing::info!("Force shutdown signal received. Terminating immediately.");
-                    // return error to force stop waiting for other tasks and terminate immediately
-                    Err(Error::ForceTerminated)
-                }
-            }
-        };
 
         // wait for all servers to shut down or if any of the servers fail to start
         match tokio::try_join!(
