@@ -33,7 +33,7 @@ use datafusion::{
 };
 use datafusion_federation::FederatedPlanNode;
 use futures::{Stream, StreamExt};
-use runtime_request_context::RequestContext;
+use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{
@@ -324,8 +324,15 @@ impl ExecutionPlan for BytesProcessedExec {
         let stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
-        let Some(request_context) = context.session_config().get_extension::<RequestContext>()
-        else {
+        let request_context = if let Some(request_context) =
+            context.session_config().get_extension::<RequestContext>()
+        {
+            request_context
+        }
+        // TODO
+        else if cfg!(feature = "cluster") {
+            Arc::new(RequestContextBuilder::new(Protocol::Internal).build())
+        } else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
             panic!(
                 "The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues"
