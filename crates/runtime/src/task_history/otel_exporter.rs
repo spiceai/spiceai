@@ -101,10 +101,10 @@ impl TaskHistoryExporter {
     ) {
         for span in spans {
             // Skip if execution duration doesn't meet min_plan_duration threshold
-            if let Some(min_duration) = min_plan_duration_ms {
-                if span.execution_duration_ms < min_duration {
-                    continue;
-                }
+            if let Some(min_duration) = min_plan_duration_ms
+                && span.execution_duration_ms < min_duration
+            {
+                continue;
             }
 
             // Only capture plans for tasks with exact name "sql_query"
@@ -124,7 +124,7 @@ impl TaskHistoryExporter {
 
             // Run EXPLAIN query asynchronously
             match df.query_builder(&explain_query).build().run().await {
-                Ok(mut stream) => {
+                Ok(stream) => {
                     // Collect all result rows
                     let mut plan_output = String::new();
                     match futures::TryStreamExt::try_collect::<Vec<_>>(stream.data).await {
@@ -137,12 +137,11 @@ impl TaskHistoryExporter {
                                         if let Some(str_array) = column
                                             .as_any()
                                             .downcast_ref::<arrow::array::StringArray>(
-                                        ) {
-                                            if !str_array.is_null(row_idx) {
-                                                let value = str_array.value(row_idx);
-                                                plan_output.push_str(value);
-                                                plan_output.push('\n');
-                                            }
+                                        ) && !str_array.is_null(row_idx)
+                                        {
+                                            let value = str_array.value(row_idx);
+                                            plan_output.push_str(value);
+                                            plan_output.push('\n');
                                         }
                                     }
                                 }
@@ -297,12 +296,13 @@ impl SpanExporter for TaskHistoryExporter {
         let min_plan_duration_ms = self.min_plan_duration_ms;
         let df = Arc::clone(&self.df);
 
+        let should_include = |task_span: &TaskSpan| {
+            min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
+        };
         let spans: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
-            .filter(|task_span| {
-                min_sql_duration_ms.map_or(true, |min| task_span.execution_duration_ms >= min)
-            })
+            .filter(should_include)
             .collect();
 
         Box::pin(async move {

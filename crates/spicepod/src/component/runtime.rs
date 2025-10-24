@@ -280,8 +280,7 @@ impl TaskHistory {
         }
 
         Err(format!(
-            r#"Expected "none", "explain", or "explain analyze" for "captured_plan", but got: "{}""#,
-            captured_plan
+            r#"Expected "none", "explain", or "explain analyze" for "captured_plan", but got: "{captured_plan}""#
         )
         .into())
     }
