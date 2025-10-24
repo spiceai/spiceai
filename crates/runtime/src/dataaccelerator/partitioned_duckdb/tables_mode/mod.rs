@@ -229,6 +229,13 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         self.base_accelerator.parameters()
     }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::debug!(
+            "Tables mode partitioned DuckDB accelerator shutdown: delegating to base accelerator"
+        );
+        self.base_accelerator.shutdown().await
+    }
 }
 
 /// Responsible for discovering and managing table-based partitions in `DuckDB` by

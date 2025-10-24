@@ -337,6 +337,20 @@ impl DataAccelerator for SqliteAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::debug!("SQLite accelerator shutdown");
+        // SQLite connections are managed by SqliteTableProviderFactory from datafusion-table-providers.
+        // The factory's connection pool instances are private, so we cannot access them directly
+        // to run PRAGMA wal_checkpoint(TRUNCATE) or PRAGMA optimize.
+        //
+        // SQLite connections will be properly closed when the factory is dropped, and the OS
+        // will handle any remaining WAL cleanup.
+        //
+        // Future enhancement: Contribute to datafusion-table-providers to add a public
+        // shutdown method on SqliteTableProviderFactory.
+        Ok(())
+    }
 }
 
 #[cfg(test)]

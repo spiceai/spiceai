@@ -643,6 +643,34 @@ impl DataAccelerator for PepperAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use pepper::{MetadataCatalog, PepperCatalog};
+
+        tracing::debug!("Pepper accelerator shutdown: starting catalog shutdown");
+
+        // Pepper uses a shared catalog database for all tables
+        let metadata_dir = format!("{}/metadata", crate::spice_data_base_path());
+        let catalog_path = format!("sqlite://{metadata_dir}/pepper.db");
+
+        // Check if the catalog file exists before attempting shutdown
+        let db_file_path = format!("{metadata_dir}/pepper.db");
+        if !std::path::Path::new(&db_file_path).exists() {
+            tracing::debug!("Pepper catalog does not exist, skipping shutdown");
+            return Ok(());
+        }
+
+        let catalog = PepperCatalog::new(catalog_path);
+
+        // Run shutdown on the catalog to flush WAL and optimize
+        catalog.shutdown().await.map_err(|e| {
+            tracing::warn!("Failed to shutdown Pepper catalog: {e}");
+            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
+        tracing::debug!("Pepper accelerator shutdown: complete");
+        Ok(())
+    }
 }
 
 /// Partition creator for Pepper accelerator

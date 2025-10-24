@@ -449,6 +449,16 @@ impl DataAccelerator for DuckDBAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::debug!("DuckDB accelerator shutdown: Running final checkpoint");
+
+        // Note: DuckDB already has `PRAGMA enable_checkpoint_on_shutdown` set
+        // which will automatically checkpoint when connections are closed.
+        // This method serves as a hook for any future cleanup needs.
+
+        Ok(())
+    }
 }
 
 pub(crate) async fn create_table_provider(
