@@ -505,7 +505,7 @@ mod tests {
             )),
             fields_with_indices
                 .iter()
-                .map(|(original_idx, _)| batch.column(*original_idx).clone())
+                .map(|(original_idx, _)| Arc::clone(&batch.column(*original_idx)))
                 .collect::<Vec<_>>(),
         )
     }
@@ -597,7 +597,7 @@ mod tests {
             )
             .expect("Failed to create FullTextSearchFieldIndex");
 
-            // First, ensure old data is no longer existant.
+            // First, ensure old data is no longer existent.
             insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
             +----------------+----+--------------------+----------------+
             | content        | id | score              | value          |
@@ -692,7 +692,7 @@ mod tests {
             )
             .expect("Failed to create FullTextSearchFieldIndex");
 
-            // First, ensure old data is no longer existant.
+            // First, ensure old data is no longer existent.
             insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
             +----------------+-----+-----+--------------------+----------------+
             | content        | id1 | id2 | score              | value          |
