@@ -17,7 +17,7 @@ limitations under the License.
 use snafu::prelude::*;
 
 /// The separator used between the base index name and spill sequence number.
-const SPILL_SEPARATOR: &str = ".";
+const SPILL_SEPARATOR: &str = "-";
 
 /// Maximum sequence number for spill indexes (00-99).
 pub const MAX_SPILL_SEQUENCE: u8 = 99;
@@ -34,7 +34,7 @@ pub struct SpillIndex {
 #[derive(Debug, PartialEq, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Invalid spill index name format: '{name}'. Expected format: base_name.sequence_number"
+        "Invalid spill index name format: '{name}'. Expected format: base_name{SPILL_SEPARATOR}sequence_number"
     ))]
     InvalidSpillIndexFormat { name: String },
 
@@ -147,27 +147,27 @@ mod tests {
 
     #[test]
     fn test_format_name() {
-        assert_eq!(SpillIndex::format_name("myindex", 0), "myindex.00");
-        assert_eq!(SpillIndex::format_name("myindex", 1), "myindex.01");
-        assert_eq!(SpillIndex::format_name("myindex", 42), "myindex.42");
-        assert_eq!(SpillIndex::format_name("myindex", 99), "myindex.99");
+        assert_eq!(SpillIndex::format_name("myindex", 0), "myindex-00");
+        assert_eq!(SpillIndex::format_name("myindex", 1), "myindex-01");
+        assert_eq!(SpillIndex::format_name("myindex", 42), "myindex-42");
+        assert_eq!(SpillIndex::format_name("myindex", 99), "myindex-99");
     }
 
     #[test]
     fn test_parse_valid_spill_index() {
-        let result = SpillIndex::parse("myindex.00")
+        let result = SpillIndex::parse("myindex-00")
             .expect("success")
             .expect("success");
         assert_eq!(result.base_name, "myindex");
         assert_eq!(result.sequence, 0);
 
-        let result = SpillIndex::parse("myindex.42")
+        let result = SpillIndex::parse("myindex-42")
             .expect("success")
             .expect("success");
         assert_eq!(result.base_name, "myindex");
         assert_eq!(result.sequence, 42);
 
-        let result = SpillIndex::parse("test_index.99")
+        let result = SpillIndex::parse("test_index-99")
             .expect("success")
             .expect("success");
         assert_eq!(result.base_name, "test_index");
@@ -176,13 +176,13 @@ mod tests {
 
     #[test]
     fn test_parse_partitioned_spill_index() {
-        let result = SpillIndex::parse("myindex.hash1.hash2.hash3.01")
+        let result = SpillIndex::parse("myindex.hash1.hash2.hash3-01")
             .expect("success")
             .expect("success");
         assert_eq!(result.base_name, "myindex.hash1.hash2.hash3");
         assert_eq!(result.sequence, 1);
 
-        let result = SpillIndex::parse("dataset.col.expr.val.05")
+        let result = SpillIndex::parse("dataset.col.expr.val-05")
             .expect("success")
             .expect("success");
         assert_eq!(result.base_name, "dataset.col.expr.val");
@@ -195,7 +195,7 @@ mod tests {
         assert!(SpillIndex::parse("myindex.1").expect("success").is_none());
         assert!(SpillIndex::parse("myindex.123").expect("success").is_none());
         assert!(SpillIndex::parse("myindex.abc").expect("success").is_none());
-        let result = SpillIndex::parse("myindex.aa");
+        let result = SpillIndex::parse("myindex-aa");
         assert!(result.is_err());
     }
 
@@ -203,19 +203,19 @@ mod tests {
     fn test_get_spill_indexes_for_virtual_index() {
         let all_indexes = vec![
             "myindex".to_string(),
-            "myindex.01".to_string(),
-            "myindex.02".to_string(),
-            "other.01".to_string(),
-            "myindex.10".to_string(),
+            "myindex-01".to_string(),
+            "myindex-02".to_string(),
+            "other-01".to_string(),
+            "myindex-10".to_string(),
         ];
 
         let result = SpillIndex::get_spill_indexes_for_virtual_index("myindex", &all_indexes);
         assert_eq!(
             result,
             vec![
-                "myindex.01".to_string(),
-                "myindex.02".to_string(),
-                "myindex.10".to_string(),
+                "myindex-01".to_string(),
+                "myindex-02".to_string(),
+                "myindex-10".to_string(),
             ]
         );
     }
@@ -224,9 +224,9 @@ mod tests {
     fn test_get_all_indexes_for_virtual_index() {
         let all_indexes = vec![
             "myindex".to_string(),
-            "myindex.01".to_string(),
-            "myindex.02".to_string(),
-            "other.01".to_string(),
+            "myindex-01".to_string(),
+            "myindex-02".to_string(),
+            "other-01".to_string(),
         ];
 
         // From main index
@@ -235,19 +235,19 @@ mod tests {
             result,
             vec![
                 "myindex".to_string(),
-                "myindex.01".to_string(),
-                "myindex.02".to_string(),
+                "myindex-01".to_string(),
+                "myindex-02".to_string(),
             ]
         );
 
         // From spill index
-        let result = SpillIndex::get_all_indexes_for_virtual_index("myindex.01", &all_indexes);
+        let result = SpillIndex::get_all_indexes_for_virtual_index("myindex-01", &all_indexes);
         assert_eq!(
             result,
             vec![
                 "myindex".to_string(),
-                "myindex.01".to_string(),
-                "myindex.02".to_string(),
+                "myindex-01".to_string(),
+                "myindex-02".to_string(),
             ]
         );
     }
