@@ -32,7 +32,6 @@ use crate::{
 use async_openai::types::ChatCompletionRequestMessage;
 use axum::{
     Extension, Json,
-    extract::Query,
     http::StatusCode,
     response::{
         IntoResponse, Response, Sse,
@@ -134,6 +133,10 @@ pub struct Request {
     #[serde(default = "default_model")]
     pub model: String,
 
+    /// If true, streams the response instead of waiting for completion
+    #[serde(default)]
+    pub stream: bool,
+
     /// Whether sample data is included in the context for SQL generation. Default: true
     #[serde(default = "default_sample_data_enabled")]
     pub sample_data_enabled: bool,
@@ -145,14 +148,6 @@ pub struct Request {
 
 fn default_sample_data_enabled() -> bool {
     true
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
-pub struct NsqlQueryParams {
-    /// If true, streams the response instead of waiting for completion
-    #[serde(default)]
-    pub stream: bool,
 }
 
 fn default_model() -> String {
@@ -261,19 +256,20 @@ pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     accept: Option<TypedHeader<Accept>>,
-    Query(params): Query<NsqlQueryParams>,
     Json(payload): Json<Request>,
 ) -> Response {
-    if params.stream {
-        let stream = futures::stream::once(handle_nsql_query(rt, llms, accept, payload)).map(
-            |(status, _, body)| {
+    // track ai_inferences_with_spice_count metric
+    let context = RequestContext::current(AsyncMarker::new().await);
+
+    if payload.stream {
+        let stream = futures::stream::once(handle_nsql_query(rt, context, llms, accept, payload))
+            .map(|(status, _, body)| {
                 if status.is_success() {
                     Ok(Event::default().data(body))
                 } else {
                     Err(status.to_string())
                 }
-            },
-        );
+            });
         Sse::new(stream)
             .keep_alive(
                 KeepAlive::new()
@@ -282,7 +278,7 @@ pub(crate) async fn post(
             )
             .into_response()
     } else {
-        handle_nsql_query(rt, llms, accept, payload)
+        handle_nsql_query(rt, context, llms, accept, payload)
             .await
             .into_response()
     }
@@ -291,15 +287,13 @@ pub(crate) async fn post(
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_nsql_query(
     rt: Arc<Runtime>,
+    context: Arc<RequestContext>,
     llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     accept: Option<TypedHeader<Accept>>,
     payload: Request,
 ) -> (StatusCode, HeaderMap, String) {
-    let headers = HeaderMap::new();
-
-    // track ai_inferences_with_spice_count metric
-    let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
+    let headers = HeaderMap::new();
 
     crate::model::add_tools_used(&context, 1);
 
