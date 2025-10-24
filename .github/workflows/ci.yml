@@ -17,14 +17,14 @@ on:
   workflow_dispatch:
     inputs:
       profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
+        description: 'Which Rust build profile to use? (Default is lint)'
         required: false
         type: choice
         options:
           - 'lint'
           - 'release'
           - 'release-lto'
-        default: 'release'
+        default: 'lint'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -32,7 +32,7 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
-  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
 
 jobs:
   check_changes:
@@ -165,7 +165,9 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Build CLI and run nextest
-        run: make build-cli nextest
+        run: |
+          export DEV=true
+          make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -205,7 +207,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-artifacts
-          path: target/
+          path: |
+            target/release/spice
+            target/debug/spiced
           retention-days: 1
 
   install_targets:
@@ -229,7 +233,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           touch target/release/spice
-          touch target/release/spiced
+          touch target/debug/spiced
 
       - name: Set up Go
         if: needs.check_changes.outputs.relevant_changes == 'true'
