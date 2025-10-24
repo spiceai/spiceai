@@ -44,6 +44,7 @@ macro_rules! extract_attr {
 pub struct TaskHistoryExporter {
     df: Arc<DataFusion>,
     captured_output: TaskHistoryCapturedOutput,
+    min_sql_duration_ms: Option<f64>,
 }
 
 impl Debug for TaskHistoryExporter {
@@ -53,10 +54,15 @@ impl Debug for TaskHistoryExporter {
 }
 
 impl TaskHistoryExporter {
-    pub fn new(df: Arc<DataFusion>, captured_output: TaskHistoryCapturedOutput) -> Self {
+    pub fn new(
+        df: Arc<DataFusion>,
+        captured_output: TaskHistoryCapturedOutput,
+        min_sql_duration_ms: Option<f64>,
+    ) -> Self {
         Self {
             df,
             captured_output,
+            min_sql_duration_ms,
         }
     }
 
@@ -181,9 +187,18 @@ impl TaskHistoryExporter {
 
 impl SpanExporter for TaskHistoryExporter {
     fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
+        let min_sql_duration_ms = self.min_sql_duration_ms;
         let spans: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
+            .filter(|task_span| {
+                // If min_sql_duration is set, filter out spans with shorter execution times
+                if let Some(min_duration) = min_sql_duration_ms {
+                    task_span.execution_duration_ms >= min_duration
+                } else {
+                    true
+                }
+            })
             .collect();
 
         let df = Arc::clone(&self.df);
