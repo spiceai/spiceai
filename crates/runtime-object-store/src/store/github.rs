@@ -28,11 +28,13 @@ use http::{
 use object_store::{
     ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    client::SpawnedReqwestConnector,
     http::{HttpBuilder, HttpStore},
     path::Path,
 };
 use serde::Deserialize;
 use snafu::prelude::*;
+use tokio::runtime::Handle;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -93,6 +95,7 @@ impl GitHubRawObjectStore {
                 "https://raw.githubusercontent.com/{org}/{repo}/{rev}"
             ))
             .with_client_options(ClientOptions::default().with_default_headers(headers))
+            .with_http_connector(SpawnedReqwestConnector::new(Handle::current()))
             .build()
             .context(HttpBuilderFailedSnafu)?;
         Ok(Self {

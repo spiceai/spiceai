@@ -102,6 +102,7 @@ pub enum Error {
 pub struct S3 {
     pub(crate) params: Parameters,
     pub(crate) runtime: Option<Runtime>,
+    pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for S3 {
@@ -181,6 +182,7 @@ impl DataConnectorFactory for S3Factory {
             let s3 = S3 {
                 params: params.parameters,
                 runtime: params.runtime.map(Arc::unwrap_or_clone),
+                tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
@@ -208,6 +210,10 @@ impl ListingTableConnector for S3 {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        self.tokio_io_runtime.clone()
     }
 
     fn get_object_store_url(

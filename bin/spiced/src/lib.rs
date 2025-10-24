@@ -235,7 +235,8 @@ pub async fn run(args: Args) -> Result<()> {
         )]))
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
-        .with_runtime_config(args.runtime.clone());
+        .with_runtime_config(args.runtime.clone())
+        .with_io_runtime(Handle::current());
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());

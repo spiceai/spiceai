@@ -29,7 +29,7 @@ use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::StreamExt;
 use object_store::{
     ClientOptions, ObjectStore, PutMode, PutPayload, UpdateVersion, aws::AmazonS3Builder,
-    path::Path as ObjectPath,
+    client::SpawnedReqwestConnector, path::Path as ObjectPath,
 };
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
@@ -41,6 +41,7 @@ use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    runtime::Handle,
     sync::RwLock,
 };
 use url::Url;
@@ -1365,6 +1366,7 @@ async fn build_s3_object_store(
 
     let mut s3_builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
+        .with_http_connector(SpawnedReqwestConnector::new(Handle::current()))
         .with_allow_http(allow_http);
     let mut client_options = ClientOptions::default();
 
