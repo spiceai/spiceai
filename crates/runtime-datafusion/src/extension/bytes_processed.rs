@@ -38,7 +38,7 @@ use datafusion::{
 use datafusion_federation::FederatedPlanNode;
 use futures::{Stream, StreamExt};
 use opentelemetry::KeyValue;
-use runtime_request_context::RequestContext;
+use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{
@@ -54,21 +54,24 @@ pub type BytesEmittedCallback = Box<dyn Fn(u64, &[KeyValue]) + Send + Sync + 'st
 
 pub struct BytesProcessedExtensionPlanner {
     emit_bytes_callback: Arc<BytesEmittedCallback>,
+    fallback_to_new_context: bool,
 }
 
 impl Default for BytesProcessedExtensionPlanner {
     fn default() -> Self {
         BytesProcessedExtensionPlanner {
             emit_bytes_callback: Arc::new(Box::new(|_, _| {})),
+            fallback_to_new_context: false,
         }
     }
 }
 
 impl BytesProcessedExtensionPlanner {
     #[must_use]
-    pub fn new(emit_bytes_callback: BytesEmittedCallback) -> Self {
+    pub fn new(emit_bytes_callback: BytesEmittedCallback, fallback_to_new_context: bool) -> Self {
         BytesProcessedExtensionPlanner {
             emit_bytes_callback: Arc::new(emit_bytes_callback),
+            fallback_to_new_context,
         }
     }
 }
@@ -90,11 +93,15 @@ impl ExtensionPlanner for BytesProcessedExtensionPlanner {
             assert_eq!(physical_inputs.len(), 1, "should have 1 input");
             let physical_input = &physical_inputs[0];
 
-            let exec_plan = Arc::new(BytesProcessedExec::new(
+            let mut exec_plan = BytesProcessedExec::new(
                 Arc::clone(physical_input),
                 Arc::clone(&self.emit_bytes_callback),
-            ));
-            return Ok(Some(exec_plan));
+            );
+            if self.fallback_to_new_context {
+                exec_plan = exec_plan.fallback_to_new_context();
+            }
+
+            return Ok(Some(Arc::new(exec_plan)));
         }
 
         Ok(None)
@@ -314,6 +321,7 @@ impl Hash for BytesProcessedNode {
 pub(crate) struct BytesProcessedExec {
     input_exec: Arc<dyn ExecutionPlan>,
     emit_bytes_callback: Arc<BytesEmittedCallback>,
+    fallback_to_new_context: bool,
 }
 
 impl BytesProcessedExec {
@@ -324,7 +332,13 @@ impl BytesProcessedExec {
         Self {
             input_exec,
             emit_bytes_callback,
+            fallback_to_new_context: false,
         }
+    }
+
+    pub(crate) fn fallback_to_new_context(mut self) -> Self {
+        self.fallback_to_new_context = true;
+        self
     }
 }
 
@@ -384,6 +398,7 @@ impl ExecutionPlan for BytesProcessedExec {
         Ok(Arc::new(Self {
             input_exec: input,
             emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
+            fallback_to_new_context: self.fallback_to_new_context,
         }))
     }
 
@@ -395,8 +410,13 @@ impl ExecutionPlan for BytesProcessedExec {
         let stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
-        let Some(request_context) = context.session_config().get_extension::<RequestContext>()
-        else {
+        let request_context = if let Some(request_context) =
+            context.session_config().get_extension::<RequestContext>()
+        {
+            request_context
+        } else if self.fallback_to_new_context {
+            Arc::new(RequestContextBuilder::new(Protocol::Internal).build())
+        } else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
             panic!(
                 "The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues"

@@ -769,9 +769,10 @@ impl RefreshTask {
             .with_default_features();
 
         let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
-            Arc::new(BytesProcessedExtensionPlanner::new(Box::new(
-                track_bytes_processed,
-            ))),
+            Arc::new(BytesProcessedExtensionPlanner::new(
+                Box::new(track_bytes_processed),
+                cfg!(feature = "cluster"),
+            )),
             Arc::new(IndexTableScanExtensionPlanner::new()),
         ];
 

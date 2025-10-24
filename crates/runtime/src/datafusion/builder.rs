@@ -24,6 +24,8 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
+#[cfg(feature = "cluster")]
+use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
@@ -58,6 +60,7 @@ use runtime_datafusion::{
     },
     schema_provider::SpiceSchemaProvider,
 };
+use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -102,6 +105,8 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
+    #[cfg(feature = "cluster")]
+    cluster_config: Arc<ClusterConfig>,
     metrics: Option<Metrics>,
 }
 
@@ -140,6 +145,8 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
+            #[cfg(feature = "cluster")]
+            cluster_config: Arc::new(ClusterConfig::default()),
             metrics: None,
         }
     }
@@ -153,6 +160,13 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_caching(mut self, caching: Arc<Caching>) -> Self {
         self.caching = Some(caching);
+        self
+    }
+
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
+        self.cluster_config = config;
         self
     }
 
@@ -213,10 +227,12 @@ impl DataFusionBuilder {
             .with_default_features()
             .with_query_planner(Arc::new(
                 ExtensionPlanQueryPlanner::from_extension_planners(vec![
+                    Arc::new(IndexTableScanExtensionPlanner::new()),
                     Arc::new(FederatedPlanner::new()),
-                    Arc::new(BytesProcessedExtensionPlanner::new(Box::new(
-                        track_bytes_processed,
-                    ))),
+                    Arc::new(BytesProcessedExtensionPlanner::new(
+                        Box::new(track_bytes_processed),
+                        cfg!(feature = "cluster"),
+                    )),
                     Arc::new(CacheInvalidationExtensionPlanner::new()),
                 ]),
             ))
@@ -301,8 +317,15 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            temp_directory: self.temp_directory.clone(),
             tokio_runtime: OnceLock::new(),
             metrics: self.metrics,
+            #[cfg(feature = "cluster")]
+            cluster_config: self.cluster_config,
+            #[cfg(feature = "cluster")]
+            scheduler_server: RwLock::new(None),
+            #[cfg(feature = "cluster")]
+            executor: RwLock::new(None),
         }
     }
 }
