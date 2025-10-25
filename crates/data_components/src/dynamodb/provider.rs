@@ -20,10 +20,10 @@ use super::{
     DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::dynamodb::arrow::attribute_map_to_json;
+use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
-use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
@@ -31,6 +31,7 @@ use aws_sdk_dynamodb::{
     operation::scan::builders::ScanFluentBuilder,
     types::{AttributeValue, TableStatus},
 };
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::project_schema,
@@ -45,6 +46,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use futures::stream::{StreamExt, TryStreamExt};
 use snafu::prelude::*;
 
 #[derive(Debug)]
@@ -259,6 +261,46 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         Ok(self)
     }
 
+    // fn execute_old(
+    //     &self,
+    //     _partition: usize,
+    //     _context: Arc<TaskContext>,
+    // ) -> DataFusionResult<SendableRecordBatchStream> {
+    //     let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.table_schema), 2);
+    //     let tx = builder.tx();
+    //
+    //     let schema = Arc::clone(&self.table_schema);
+    //     let request = self.request.clone().into_paginator();
+    //
+    //     builder.spawn(async move {
+    //         let mut stream = request.send();
+    //
+    //         while let Some(item) = stream.next().await {
+    //             let scan_output =
+    //                 item.map_err(|e| DataFusionError::Execution(map_sdk_error(e).to_string()))?;
+    //             for scan_item in scan_output.items() {
+    //                 let json_value = attribute_map_to_json(scan_item).to_string();
+    //                 let batches = ReaderBuilder::new(Arc::clone(&schema))
+    //                     .with_batch_size(1024)
+    //                     .build(Cursor::new(json_value.as_bytes()))
+    //                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
+    //                     .collect::<Result<Vec<_>, _>>()
+    //                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    //
+    //                 for batch in batches {
+    //                     tx.send(Ok(batch)).await.map_err(|_| {
+    //                         DataFusionError::Execution("Failed to send record batch".to_string())
+    //                     })?;
+    //                 }
+    //             }
+    //         }
+    //
+    //         Ok(())
+    //     });
+    //
+    //     Ok(builder.build())
+    // }
+
     fn execute(
         &self,
         _partition: usize,
@@ -269,28 +311,48 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         let schema = Arc::clone(&self.table_schema);
         let request = self.request.clone().into_paginator();
+        let unnest_depth = Some(1); // Assuming this field exists on self
 
         builder.spawn(async move {
-            let mut stream = request.send();
+            let mut paginator = request.send();
+            let mut buffer = Vec::new();
+            const CHUNK_SIZE: usize = 4000;
 
-            while let Some(item) = stream.next().await {
+            while let Some(result) = paginator.next().await {
                 let scan_output =
-                    item.map_err(|e| DataFusionError::Execution(map_sdk_error(e).to_string()))?;
-                for scan_item in scan_output.items() {
-                    let json_value = attribute_map_to_json(scan_item).to_string();
-                    let batches = ReaderBuilder::new(Arc::clone(&schema))
-                        .with_batch_size(1024)
-                        .build(Cursor::new(json_value.as_bytes()))
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                    result.map_err(to_execution_error)?;
 
-                    for batch in batches {
-                        tx.send(Ok(batch)).await.map_err(|_| {
-                            DataFusionError::Execution("Failed to send record batch".to_string())
-                        })?;
-                    }
+                buffer.extend(scan_output.items().to_vec());
+
+                while buffer.len() >= CHUNK_SIZE {
+                    let chunk: Vec<_> = buffer.drain(..CHUNK_SIZE).collect();
+
+                    let unnested_items = match unnest_depth {
+                        None | Some(0) => chunk,
+                        Some(unnest_depth) => unnest_dynamodb_items(chunk, unnest_depth)
+                            .map_err(to_execution_error)?,
+                    };
+
+                    let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
+                        .map_err(to_execution_error)?;
+
+                    tx.send(Ok(batch)).await.map_err(to_execution_error)?;
                 }
+            }
+
+            // Process remaining items in buffer
+            if !buffer.is_empty() {
+                let unnested_items = match unnest_depth {
+                    None | Some(0) => buffer,
+                    Some(unnest_depth) => {
+                        unnest_dynamodb_items(buffer, unnest_depth).map_err(to_execution_error)?
+                    }
+                };
+
+                let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
+                    .map_err(to_execution_error)?;
+
+                tx.send(Ok(batch)).await.map_err(to_execution_error)?;
             }
 
             Ok(())
@@ -298,6 +360,65 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         Ok(builder.build())
     }
+
+    // fn execute(
+    //     &self,
+    //     _partition: usize,
+    //     _context: Arc<TaskContext>,
+    // ) -> DataFusionResult<SendableRecordBatchStream> {
+    //     let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.table_schema), 2);
+    //     let tx = builder.tx();
+    //
+    //     let schema = Arc::clone(&self.table_schema);
+    //     let request = self.request.clone().into_paginator();
+    //
+    //     let unnest_depth = Some(1);
+    //
+    //     builder.spawn(async move {
+    //         let items_stream = request
+    //             .send()
+    //             .map_err(|e| DataFusionError::Execution(map_sdk_error(e).to_string()))
+    //             .map_ok(|page| {
+    //                 futures::stream::iter(
+    //                     page.items()
+    //                         .to_vec()
+    //                         .into_iter()
+    //                         .map(Ok::<_, DataFusionError>)
+    //                 )
+    //             })
+    //             .try_flatten();
+    //
+    //         let mut chunked_stream = items_stream.try_chunks(4000);
+    //
+    //         while let Some(chunk_result) = chunked_stream.next().await {
+    //             let chunk = chunk_result
+    //                 .map_err(|e| DataFusionError::Execution(format!("Stream error: {:?}", e)))?;
+    //
+    //             let unnested_items = match unnest_depth {
+    //                 None | Some(0) => chunk,
+    //                 Some(unnest_depth) => unnest_dynamodb_items(chunk, unnest_depth)?,
+    //             };
+    //
+    //             let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
+    //                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    //
+    //             tx.send(Ok(batch)).await.map_err(|_| {
+    //                 DataFusionError::Execution("Failed to send record batch".to_string())
+    //             })?;
+    //         }
+    //
+    //         Ok(())
+    //     });
+    //
+    //     Ok(builder.build())
+    // }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn to_execution_error(
+    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> DataFusionError {
+    DataFusionError::Execution(format!("{}", e.into()).to_string())
 }
 
 fn map_sdk_error<E>(err: SdkError<E>) -> Box<dyn std::error::Error + Send + Sync>
