@@ -58,18 +58,25 @@ pub struct DynamoDBTableProvider {
     table_schema: SchemaRef,
     partition_key: String,
     sort_key: Option<String>,
+    column_to_alias_map: HashMap<String, String>, // #c0 -> actual_name
+    alias_to_column_map: HashMap<String, String>, // actual_name -> #c0
 }
 
 impl DynamoDBTableProvider {
     pub async fn try_new(client: Arc<Client>, table_name: Arc<str>) -> Result<Self, Error> {
         let (table_schema, partition_key, sort_key) =
             Self::schema(Arc::clone(&client), &table_name).await?;
+
+        let (column_to_alias_map, alias_to_column_map) = build_column_alias_maps(&table_schema);
+
         Ok(Self {
             client,
             table_name,
             table_schema,
             partition_key,
             sort_key,
+            column_to_alias_map,
+            alias_to_column_map,
         })
     }
 
@@ -166,6 +173,23 @@ impl DynamoDBTableProvider {
 
         infer_arrow_schema_from_items(&unnested_items)
     }
+}
+
+fn build_column_alias_maps(
+    schema: &SchemaRef,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut column_to_alias_map = HashMap::new();
+    let mut alias_to_column_map = HashMap::new();
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        let column_name = field.name().clone();
+        let alias = format!("#c{i}");
+
+        column_to_alias_map.insert(column_name.clone(), alias.clone());
+        alias_to_column_map.insert(alias, column_name);
+    }
+
+    (column_to_alias_map, alias_to_column_map)
 }
 
 /// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
