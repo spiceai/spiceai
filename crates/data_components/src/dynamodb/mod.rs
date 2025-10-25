@@ -18,9 +18,10 @@ use std::sync::Arc;
 
 mod arrow;
 pub mod provider;
+mod request_builder;
 mod schema;
+mod table_schema;
 mod unnest;
-// mod expression;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

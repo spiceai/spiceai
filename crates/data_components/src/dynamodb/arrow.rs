@@ -26,7 +26,7 @@ use arrow::array::{
     NullBuilder,
     RecordBatch,
     StringBuilder,
-    TimestampMillisecondBuilder, // Add these imports
+    TimestampMillisecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -40,7 +40,6 @@ pub fn dynamodb_items_to_arrow(
     projected_schema: SchemaRef,
 ) -> Result<RecordBatch> {
     if items.is_empty() {
-        // Return empty batch with correct schema
         let empty_arrays: Vec<ArrayRef> = projected_schema
             .fields()
             .iter()

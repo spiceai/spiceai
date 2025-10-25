@@ -44,22 +44,6 @@ pub fn infer_arrow_schema_from_items(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn is_iso8601_timestamp(s: &str) -> bool {
-    // Try parsing as ISO8601 timestamp
-    // Handles formats like: 2023-08-31T12:34:56Z, 2023-08-31T12:34:56.123Z, 2023-08-31T12:34:56+00:00
-    chrono::DateTime::parse_from_rfc3339(s).is_ok()
-        || s.parse::<chrono::DateTime<chrono::Utc>>().is_ok()
-}
-
-fn is_date_yyyy_mm_dd(s: &str) -> bool {
-    // Check for YYYY-MM-DD format (exactly 10 chars with 2 dashes)
-    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2 {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
-    } else {
-        false
-    }
-}
-
 fn analyze_item(
     item: &HashMap<String, AttributeValue>,
     field_types: &mut HashMap<String, DataType>,
@@ -173,6 +157,22 @@ fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
 
         // Otherwise use string as the most general type
         _ => DataType::Utf8,
+    }
+}
+
+fn is_iso8601_timestamp(s: &str) -> bool {
+    // Try parsing as ISO8601 timestamp
+    // Handles formats like: 2023-08-31T12:34:56Z, 2023-08-31T12:34:56.123Z, 2023-08-31T12:34:56+00:00
+    chrono::DateTime::parse_from_rfc3339(s).is_ok()
+        || s.parse::<chrono::DateTime<chrono::Utc>>().is_ok()
+}
+
+fn is_date_yyyy_mm_dd(s: &str) -> bool {
+    // Check for YYYY-MM-DD format (exactly 10 chars with 2 dashes)
+    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2 {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+    } else {
+        false
     }
 }
 
