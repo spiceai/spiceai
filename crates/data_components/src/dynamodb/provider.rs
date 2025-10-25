@@ -382,6 +382,13 @@ where
         }
     }
 
+    if let Some(err) = source.downcast_ref::<aws_sdk_dynamodb::operation::query::QueryError>() {
+        // Error metadata message (if present) contains a specific error message
+        if let Some(err_msg) = err.meta().message() {
+            return err_msg.into();
+        }
+    }
+
     if let Some(err) =
         source.downcast_ref::<aws_sdk_dynamodb::operation::describe_table::DescribeTableError>()
     {
