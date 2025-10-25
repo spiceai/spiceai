@@ -119,11 +119,10 @@ impl TaskHistoryExporter {
             let plan_span = tracing::span!(
                 target: "task_history",
                 tracing::Level::INFO,
-                "sql_query",
+                "plan",
                 input = %explain_query,
                 runtime_query = true
             );
-            plan_span.record("task_override", "plan");
             plan_span.record("parent_id", span.span_id.as_ref());
 
             // Run EXPLAIN query within the span context so it appears as a child task
@@ -320,9 +319,8 @@ impl SpanExporter for TaskHistoryExporter {
                 }
 
                 // Don't capture plans for queries that are already EXPLAIN queries
-                // (case-insensitive check to avoid recursive EXPLAIN ANALYZE EXPLAIN ANALYZE...)
-                let input_lower = span.input.trim_start().to_lowercase();
-                !input_lower.starts_with("explain")
+                let input_trimmed = span.input.trim_start();
+                !(input_trimmed.len() >= 7 && input_trimmed[..7].eq_ignore_ascii_case("explain"))
             };
 
             // Clone only the spans that need plan capture
