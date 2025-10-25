@@ -24,12 +24,14 @@ use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::types::KeyType;
 use aws_sdk_dynamodb::{
     Client,
     error::SdkError,
     operation::scan::builders::ScanFluentBuilder,
+    operation::query::builders::QueryFluentBuilder,
     types::{AttributeValue, TableStatus},
 };
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -339,6 +341,124 @@ impl DynamoDBTableProvider {
             _ => false,
         }
     }
+
+    /// Split filters into key conditions (for Query) and other filters
+    /// Returns (Some((partition_expr, sort_expr)), other_filters) if valid for Query
+    /// Returns (None, all_filters) if must use Scan
+    fn split_key_and_other_filters(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<(Option<(Expr, Option<Expr>)>, Vec<Expr>)> {
+        let mut partition_expr = None;
+        let mut sort_expr = None;
+        let mut other_filters = Vec::new();
+        let mut has_or = false;
+
+        for filter in filters {
+            if self.contains_or(filter) {
+                has_or = true;
+                other_filters.push(filter.clone());
+                continue;
+            }
+
+            if let Some(extracted) = self.try_extract_key_filter(filter) {
+                match extracted {
+                    KeyFilter::Partition(expr) => {
+                        if partition_expr.is_some() {
+                            // Multiple partition key filters - invalid
+                            return Ok((None, filters.to_vec()));
+                        }
+                        partition_expr = Some(expr);
+                    }
+                    KeyFilter::Sort(expr) => {
+                        if sort_expr.is_some() {
+                            // Multiple sort key filters - invalid
+                            return Ok((None, filters.to_vec()));
+                        }
+                        sort_expr = Some(expr);
+                    }
+                }
+            } else {
+                other_filters.push(filter.clone());
+            }
+        }
+
+        // If OR is present or no partition key, must use Scan
+        if has_or || partition_expr.is_none() {
+            return Ok((None, filters.to_vec()));
+        }
+
+        Ok((Some((partition_expr.unwrap(), sort_expr)), other_filters))
+    }
+
+    fn contains_or(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                matches!(op, Operator::Or) || self.contains_or(left) || self.contains_or(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn try_extract_key_filter(&self, expr: &Expr) -> Option<KeyFilter> {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                // Check if this is a key column comparison
+                if let Expr::Column(col) = left.as_ref() {
+                    if col.name == self.partition_key {
+                        // Partition key must use = operator
+                        if matches!(op, Operator::Eq) {
+                            return Some(KeyFilter::Partition(expr.clone()));
+                        }
+                    } else if let Some(ref sort_key) = self.sort_key {
+                        if col.name == *sort_key {
+                            // Sort key can use =, <, >, <=, >=
+                            if matches!(
+                                op,
+                                Operator::Eq
+                                    | Operator::Lt
+                                    | Operator::LtEq
+                                    | Operator::Gt
+                                    | Operator::GtEq
+                            ) {
+                                return Some(KeyFilter::Sort(expr.clone()));
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn build_key_condition_expression(
+        &self,
+        partition_expr: &Expr,
+        sort_expr: Option<&Expr>,
+    ) -> datafusion::error::Result<(String, HashMap<String, AttributeValue>)> {
+        let mut attribute_values = HashMap::new();
+        let mut value_counter = 0;
+
+        let partition_str = self.expr_to_filter_string(
+            partition_expr,
+            &mut attribute_values,
+            &mut value_counter,
+        )?;
+
+        let key_condition = if let Some(sort) = sort_expr {
+            let sort_str = self.expr_to_filter_string(
+                sort,
+                &mut attribute_values,
+                &mut value_counter,
+            )?;
+            format!("{} AND {}", partition_str, sort_str)
+        } else {
+            partition_str
+        };
+
+        Ok((key_condition, attribute_values))
+    }
 }
 
 fn build_column_alias_maps(
@@ -393,6 +513,17 @@ fn projection_expression(
     }
 }
 
+enum KeyFilter {
+    Partition(Expr),
+    Sort(Expr),
+}
+
+#[derive(Clone)]
+enum DynamoDBRequest {
+    Query(QueryFluentBuilder),
+    Scan(ScanFluentBuilder),
+}
+
 #[async_trait]
 impl TableProvider for DynamoDBTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -414,32 +545,12 @@ impl TableProvider for DynamoDBTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let mut request = self.client.scan().table_name(self.table_name.to_string());
-
-        // Build projection expression using aliases
         let projected_schema = project_schema(&self.table_schema, projection)?;
-        let projection_expr: Vec<_> = projected_schema
-            .fields()
-            .iter()
-            .filter_map(|f| self.column_to_alias_map.get(f.name()))
-            .cloned()
-            .collect();
 
-        if !projection_expr.is_empty() {
-            println!("projection_expr: {:?}", projection_expr);
-            request = request.projection_expression(projection_expr.join(", "));
-        }
+        // Try to extract key conditions for query optimization
+        let (key_filters, other_filters) = self.split_key_and_other_filters(filters)?;
 
-        // Build filter expression (you need to implement this)
-        let (filter_str, attribute_values) = self.build_filter_expression(filters)?;
-        if !filter_str.is_empty() {
-            println!("filter_str: {:?}", filter_str);
-            println!("attribute_values: {:?}", attribute_values);
-            request = request.filter_expression(filter_str);
-            request = request.set_expression_attribute_values(Some(attribute_values));
-        }
-
-        // Collect aliases used in projection and filters
+        // Collect attribute names used in projection and filters
         let mut attribute_names = HashMap::new();
         for field in projected_schema.fields() {
             if let Some(alias) = self.column_to_alias_map.get(field.name()) {
@@ -448,22 +559,101 @@ impl TableProvider for DynamoDBTableProvider {
         }
         self.add_filter_column_aliases(filters, &mut attribute_names);
 
-        if !attribute_names.is_empty() {
-            println!("attribute_names: {:?}", attribute_names);
-            request = request.set_expression_attribute_names(Some(attribute_names));
-        }
+        // Build projection expression
+        let projection_expr: Vec<_> = projected_schema
+            .fields()
+            .iter()
+            .filter_map(|f| self.column_to_alias_map.get(f.name()))
+            .cloned()
+            .collect();
 
-        if let Some(limit) = limit {
-            request = request.limit(
-                i32::try_from(limit)
-                    .map_err(|_| DataFusionError::Execution("Limit too large".to_string()))?,
-            );
-        }
+        let projection_str = if projection_expr.is_empty() {
+            None
+        } else {
+            Some(projection_expr.join(", "))
+        };
 
-        Ok(Arc::new(DynamoDBTableProviderExec::new(
-            request,
-            projected_schema,
-        )))
+        let limit_i32 = limit.map(|l| {
+            i32::try_from(l).map_err(|_| DataFusionError::Execution("Limit too large".to_string()))
+        }).transpose()?;
+
+        // Decide between query and scan
+        let request: DynamoDBRequest = if let Some((partition_expr, sort_expr)) = key_filters {
+            println!("!! QUERY !!");
+
+            // Use Query with KeyConditionExpression
+            let mut query_request = self.client.query().table_name(self.table_name.to_string());
+
+            let (key_condition, mut key_values) = self.build_key_condition_expression(
+                &partition_expr,
+                sort_expr.as_ref(),
+            )?;
+
+            println!("Key condition: {}", key_condition);
+            query_request = query_request.key_condition_expression(key_condition);
+
+            // Build filter expression for remaining filters
+            if !other_filters.is_empty() {
+                let (filter_str, mut filter_values) = self.build_filter_expression(&other_filters)?;
+                key_values.extend(filter_values);
+                println!("filter_expression: {:?}", filter_str);
+                query_request = query_request.filter_expression(filter_str);
+            }
+
+            if !key_values.is_empty() {
+                println!("key_values: {:?}", &key_values);
+                query_request = query_request.set_expression_attribute_values(Some(key_values));
+            }
+
+            if let Some(proj) = projection_str {
+                println!("projection_expression: {:?}", &proj);
+                query_request = query_request.projection_expression(proj);
+            }
+
+            if !attribute_names.is_empty() {
+                println!("attribute_names: {:?}", &attribute_names);
+                query_request = query_request.set_expression_attribute_names(Some(attribute_names));
+            }
+
+            if let Some(l) = limit_i32 {
+                query_request = query_request.limit(l);
+            }
+
+            DynamoDBRequest::Query(query_request)
+        } else {
+            println!("!! SCAN !!");
+
+            // Use Scan with FilterExpression
+            let mut scan_request = self.client.scan().table_name(self.table_name.to_string());
+
+            if !filters.is_empty() {
+                let (filter_str, attribute_values) = self.build_filter_expression(filters)?;
+                if !filter_str.is_empty() {
+                    println!("filter_expression: {:?}", &filter_str);
+                    println!("attribute_values: {:?}", &attribute_values);
+                    scan_request = scan_request.filter_expression(filter_str);
+                    scan_request = scan_request.set_expression_attribute_values(Some(attribute_values));
+                }
+            }
+
+            if let Some(proj) = projection_str {
+                println!("projection_expression: {:?}", &proj);
+                scan_request = scan_request.projection_expression(proj);
+            }
+
+            if !attribute_names.is_empty() {
+                println!("attribute_names: {:?}", &attribute_names);
+                scan_request = scan_request.set_expression_attribute_names(Some(attribute_names));
+            }
+
+            if let Some(l) = limit_i32 {
+                scan_request = scan_request.limit(l);
+            }
+
+            DynamoDBRequest::Scan(scan_request)
+        };
+
+        Ok(Arc::new(DynamoDBTableProviderExec::new(request, projected_schema)))
     }
 
     fn supports_filters_pushdown(
@@ -486,19 +676,19 @@ impl TableProvider for DynamoDBTableProvider {
 }
 
 pub struct DynamoDBTableProviderExec {
-    request: ScanFluentBuilder,
-    table_schema: SchemaRef,
+    request: DynamoDBRequest,
+    projected_schema: SchemaRef,
     properties: PlanProperties,
 }
 
 impl DynamoDBTableProviderExec {
     #[must_use]
-    pub fn new(request: ScanFluentBuilder, table_schema: SchemaRef) -> Self {
+    pub fn new(request: DynamoDBRequest, projected_schema: SchemaRef) -> Self {
         Self {
             request,
-            table_schema: Arc::clone(&table_schema),
+            projected_schema: Arc::clone(&projected_schema),
             properties: PlanProperties::new(
-                EquivalenceProperties::new(table_schema),
+                EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
@@ -529,7 +719,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.table_schema)
+        Arc::clone(&self.projected_schema)
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -547,96 +737,57 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         Ok(self)
     }
 
-    // fn execute_old(
-    //     &self,
-    //     _partition: usize,
-    //     _context: Arc<TaskContext>,
-    // ) -> DataFusionResult<SendableRecordBatchStream> {
-    //     let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.table_schema), 2);
-    //     let tx = builder.tx();
-    //
-    //     let schema = Arc::clone(&self.table_schema);
-    //     let request = self.request.clone().into_paginator();
-    //
-    //     builder.spawn(async move {
-    //         let mut stream = request.send();
-    //
-    //         while let Some(item) = stream.next().await {
-    //             let scan_output =
-    //                 item.map_err(|e| DataFusionError::Execution(map_sdk_error(e).to_string()))?;
-    //             for scan_item in scan_output.items() {
-    //                 let json_value = attribute_map_to_json(scan_item).to_string();
-    //                 let batches = ReaderBuilder::new(Arc::clone(&schema))
-    //                     .with_batch_size(1024)
-    //                     .build(Cursor::new(json_value.as_bytes()))
-    //                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
-    //                     .collect::<Result<Vec<_>, _>>()
-    //                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    //
-    //                 for batch in batches {
-    //                     tx.send(Ok(batch)).await.map_err(|_| {
-    //                         DataFusionError::Execution("Failed to send record batch".to_string())
-    //                     })?;
-    //                 }
-    //             }
-    //         }
-    //
-    //         Ok(())
-    //     });
-    //
-    //     Ok(builder.build())
-    // }
-
     fn execute(
         &self,
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.table_schema), 2);
+        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.projected_schema), 2);
         let tx = builder.tx();
 
-        let schema = Arc::clone(&self.table_schema);
-        let request = self.request.clone().into_paginator();
+        let schema = Arc::clone(&self.projected_schema);
+        let request = self.request.clone();
         let unnest_depth = Some(1);
 
         builder.spawn(async move {
-            let mut paginator = request.send();
             let mut buffer = Vec::new();
             const CHUNK_SIZE: usize = 4_000;
 
-            while let Some(result) = paginator.next().await {
-                let scan_output = result.map_err(to_execution_error)?;
+            // Create paginator based on request type
+            match request {
+                DynamoDBRequest::Query(query) => {
+                    let mut paginator = query.into_paginator().send();
 
-                buffer.extend(scan_output.items().to_vec());
+                    while let Some(result) = paginator.next().await {
+                        let output = result.map_err(to_execution_error)?;
+                        buffer.extend(output.items().to_vec());
 
-                while buffer.len() >= CHUNK_SIZE {
-                    let chunk: Vec<_> = buffer.drain(..CHUNK_SIZE).collect();
+                        while buffer.len() >= CHUNK_SIZE {
+                            let chunk: Vec<_> = buffer.drain(..CHUNK_SIZE).collect();
+                            let batch = process_chunk(chunk, unnest_depth, Arc::clone(&schema))?;
+                            tx.send(Ok(batch)).await.map_err(to_execution_error)?;
+                        }
+                    }
+                }
+                DynamoDBRequest::Scan(scan) => {
+                    let mut paginator = scan.into_paginator().send();
 
-                    let unnested_items = match unnest_depth {
-                        None | Some(0) => chunk,
-                        Some(unnest_depth) => unnest_dynamodb_items(chunk, unnest_depth)
-                            .map_err(to_execution_error)?,
-                    };
+                    while let Some(result) = paginator.next().await {
+                        let output = result.map_err(to_execution_error)?;
+                        buffer.extend(output.items().to_vec());
 
-                    let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
-                        .map_err(to_execution_error)?;
-
-                    tx.send(Ok(batch)).await.map_err(to_execution_error)?;
+                        while buffer.len() >= CHUNK_SIZE {
+                            let chunk: Vec<_> = buffer.drain(..CHUNK_SIZE).collect();
+                            let batch = process_chunk(chunk, unnest_depth, Arc::clone(&schema))?;
+                            tx.send(Ok(batch)).await.map_err(to_execution_error)?;
+                        }
+                    }
                 }
             }
 
             // Process remaining items in buffer
             if !buffer.is_empty() {
-                let unnested_items = match unnest_depth {
-                    None | Some(0) => buffer,
-                    Some(unnest_depth) => {
-                        unnest_dynamodb_items(buffer, unnest_depth).map_err(to_execution_error)?
-                    }
-                };
-
-                let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
-                    .map_err(to_execution_error)?;
-
+                let batch = process_chunk(buffer, unnest_depth, Arc::clone(&schema))?;
                 tx.send(Ok(batch)).await.map_err(to_execution_error)?;
             }
 
@@ -645,6 +796,22 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         Ok(builder.build())
     }
+
+    // Helper function to reduce duplication
+
+}
+
+fn process_chunk(
+    chunk: Vec<HashMap<String, AttributeValue>>,
+    unnest_depth: Option<usize>,
+    schema: SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    let unnested_items = match unnest_depth {
+        None | Some(0) => chunk,
+        Some(depth) => unnest_dynamodb_items(chunk, depth).map_err(to_execution_error)?,
+    };
+
+    dynamodb_items_to_arrow(&unnested_items, schema).map_err(to_execution_error)
 }
 
 #[allow(clippy::needless_pass_by_value)]
