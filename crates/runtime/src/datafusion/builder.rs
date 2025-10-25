@@ -59,7 +59,10 @@ use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
 use std::sync::LazyLock;
-use tokio::sync::{RwLock as TokioRwLock, Semaphore};
+use tokio::{
+    runtime::Handle,
+    sync::{RwLock as TokioRwLock, Semaphore},
+};
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
@@ -100,6 +103,7 @@ pub struct DataFusionBuilder {
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
     metrics: Option<Metrics>,
+    io_runtime: Handle,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -119,6 +123,7 @@ impl DataFusionBuilder {
     pub fn new(
         status: Arc<status::RuntimeStatus>,
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+        io_runtime: Handle,
     ) -> Self {
         let mut df_config = get_df_default_config()
             .with_information_schema(true)
@@ -138,6 +143,7 @@ impl DataFusionBuilder {
             caching: None,
             spill_compression: None,
             metrics: None,
+            io_runtime,
         }
     }
 
@@ -215,7 +221,11 @@ impl DataFusionBuilder {
                     Arc::new(CacheInvalidationExtensionPlanner::new()),
                 ],
             )))
-            .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
+            .with_runtime_env(runtime_env(
+                self.memory_limit,
+                self.temp_directory.clone(),
+                self.io_runtime.clone(),
+            ))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
 
@@ -296,6 +306,9 @@ impl DataFusionBuilder {
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
             tokio_runtime: OnceLock::new(),
+            temp_directory: self.temp_directory.clone(),
+            cpu_runtime: OnceLock::new(),
+            io_runtime: self.io_runtime,
             metrics: self.metrics,
         }
     }
@@ -360,6 +373,7 @@ impl Default for AnalyzerRulesBuilder {
 pub(crate) fn runtime_env(
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
+    io_runtime: Handle,
 ) -> Arc<RuntimeEnv> {
     let disk_manager_builder = if let Some(directory) = temp_directory {
         let mode = DiskManagerMode::Directories(vec![directory.into()]);
@@ -397,7 +411,7 @@ pub(crate) fn runtime_env(
     };
 
     match RuntimeEnvBuilder::default()
-        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
         .with_memory_pool(memory_pool)
         .with_disk_manager_builder(disk_manager_builder)
         .build_arc()

@@ -605,7 +605,7 @@ impl Runtime {
         let source = ds.source();
 
         let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
-            .build(self.secrets())
+            .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 

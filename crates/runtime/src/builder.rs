@@ -34,6 +34,7 @@ use crate::{
 use app::App;
 use spicepod::component::caching::Caching;
 use token_provider::registry::TokenProviderRegistry;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 use util::in_tracing_context;
 
@@ -49,6 +50,7 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
+    io_runtime: Option<Handle>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
@@ -66,6 +68,7 @@ impl RuntimeBuilder {
             autoload_extensions: HashMap::new(),
             runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
+            io_runtime: None,
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
@@ -131,6 +134,11 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
+        self.io_runtime = Some(io_runtime);
+        self
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
@@ -187,9 +195,12 @@ impl RuntimeBuilder {
 
         let caching = Runtime::init_caching(Some(&caching_config));
 
+        let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
+            io_runtime.clone(),
         )
         .memory_limit(memory_limit)
         .temp_directory(query.temp_directory)
@@ -252,6 +263,7 @@ impl RuntimeBuilder {
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
+            io_runtime,
             status: self.runtime_status,
             tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
