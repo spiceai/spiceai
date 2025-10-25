@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +44,22 @@ pub fn infer_arrow_schema_from_items(
     Ok(Arc::new(Schema::new(fields)))
 }
 
+fn is_iso8601_timestamp(s: &str) -> bool {
+    // Try parsing as ISO8601 timestamp
+    // Handles formats like: 2023-08-31T12:34:56Z, 2023-08-31T12:34:56.123Z, 2023-08-31T12:34:56+00:00
+    chrono::DateTime::parse_from_rfc3339(s).is_ok()
+        || s.parse::<chrono::DateTime<chrono::Utc>>().is_ok()
+}
+
+fn is_date_yyyy_mm_dd(s: &str) -> bool {
+    // Check for YYYY-MM-DD format (exactly 10 chars with 2 dashes)
+    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2 {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+    } else {
+        false
+    }
+}
+
 fn analyze_item(
     item: &HashMap<String, AttributeValue>,
     field_types: &mut HashMap<String, DataType>,
@@ -67,7 +83,16 @@ fn analyze_item(
 fn infer_dynamodb_type(value: &AttributeValue) -> DataType {
     match value {
         AttributeValue::Bool(_) => DataType::Boolean,
-        AttributeValue::S(_) => DataType::Utf8,
+        AttributeValue::S(s) => {
+            // Try to detect temporal types
+            if is_iso8601_timestamp(s) {
+                DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC")))
+            } else if is_date_yyyy_mm_dd(s) {
+                DataType::Date32
+            } else {
+                DataType::Utf8
+            }
+        }
         AttributeValue::Ss(_) => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         AttributeValue::N(n) => {
             // Determine if it's an integer or float based on the string representation
@@ -118,6 +143,27 @@ fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
         (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => {
             DataType::Float64
         }
+
+        // Temporal type unification - if same temporal type, keep it
+        (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => type1.clone(),
+        (DataType::Date32, DataType::Date32) => DataType::Date32,
+        (DataType::Date64, DataType::Date64) => DataType::Date64,
+
+        // Mixed temporal types - fall back to string
+        (DataType::Timestamp(_, _), DataType::Date32)
+        | (DataType::Date32, DataType::Timestamp(_, _))
+        | (DataType::Timestamp(_, _), DataType::Date64)
+        | (DataType::Date64, DataType::Timestamp(_, _))
+        | (DataType::Date32, DataType::Date64)
+        | (DataType::Date64, DataType::Date32) => DataType::Utf8,
+
+        // Temporal mixed with string - fall back to string
+        (DataType::Timestamp(_, _), DataType::Utf8)
+        | (DataType::Utf8, DataType::Timestamp(_, _))
+        | (DataType::Date32, DataType::Utf8)
+        | (DataType::Utf8, DataType::Date32)
+        | (DataType::Date64, DataType::Utf8)
+        | (DataType::Utf8, DataType::Date64) => DataType::Utf8,
 
         // Numeric type promotion for lists (e.g., Number Sets)
         (DataType::List(field1), DataType::List(field2)) => {
@@ -537,5 +583,249 @@ mod tests {
         for field in schema.fields() {
             assert!(field.is_nullable());
         }
+    }
+
+    #[test]
+    fn test_iso8601_timestamp_detection() {
+        let items = vec![
+            HashMap::from([
+                ("id".to_string(), av_string("1")),
+                ("created_at".to_string(), av_string("2023-08-31T12:34:56Z")),
+            ]),
+            HashMap::from([
+                ("id".to_string(), av_string("2")),
+                ("created_at".to_string(), av_string("2024-01-15T08:22:11.123Z")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let created_at_field = schema.field_with_name("created_at").unwrap();
+
+        assert!(matches!(
+        created_at_field.data_type(),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+    ));
+    }
+
+    #[test]
+    fn test_iso8601_timestamp_with_timezone() {
+        let items = vec![
+            HashMap::from([
+                ("event_time".to_string(), av_string("2023-08-31T12:34:56+00:00")),
+            ]),
+            HashMap::from([
+                ("event_time".to_string(), av_string("2024-01-15T08:22:11-05:00")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let event_time_field = schema.field_with_name("event_time").unwrap();
+
+        assert!(matches!(
+        event_time_field.data_type(),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+    ));
+    }
+
+    #[test]
+    fn test_date_yyyy_mm_dd_detection() {
+        let items = vec![
+            HashMap::from([
+                ("id".to_string(), av_string("1")),
+                ("birth_date".to_string(), av_string("2024-01-15")),
+            ]),
+            HashMap::from([
+                ("id".to_string(), av_string("2")),
+                ("birth_date".to_string(), av_string("1990-05-22")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let birth_date_field = schema.field_with_name("birth_date").unwrap();
+
+        assert_eq!(birth_date_field.data_type(), &DataType::Date32);
+    }
+
+    #[test]
+    fn test_mixed_timestamp_and_plain_string_falls_back_to_utf8() {
+        let items = vec![
+            HashMap::from([
+                ("value".to_string(), av_string("2023-08-31T12:34:56Z")),
+            ]),
+            HashMap::from([
+                ("value".to_string(), av_string("not a timestamp")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let value_field = schema.field_with_name("value").unwrap();
+
+        assert_eq!(value_field.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_mixed_date_and_plain_string_falls_back_to_utf8() {
+        let items = vec![
+            HashMap::from([
+                ("value".to_string(), av_string("2024-01-15")),
+            ]),
+            HashMap::from([
+                ("value".to_string(), av_string("random text")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let value_field = schema.field_with_name("value").unwrap();
+
+        assert_eq!(value_field.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_mixed_timestamp_and_date_falls_back_to_utf8() {
+        let items = vec![
+            HashMap::from([
+                ("value".to_string(), av_string("2023-08-31T12:34:56Z")),
+            ]),
+            HashMap::from([
+                ("value".to_string(), av_string("2024-01-15")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let value_field = schema.field_with_name("value").unwrap();
+
+        assert_eq!(value_field.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_invalid_date_format_stays_utf8() {
+        let items = vec![
+            HashMap::from([
+                ("value".to_string(), av_string("01-15-2024")), // MM-DD-YYYY, not valid
+            ]),
+            HashMap::from([
+                ("value".to_string(), av_string("2024/01/15")), // Wrong separator
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let value_field = schema.field_with_name("value").unwrap();
+
+        assert_eq!(value_field.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_invalid_timestamp_format_stays_utf8() {
+        let items = vec![
+            HashMap::from([
+                ("value".to_string(), av_string("2023-08-31 12:34:56")), // Missing T
+            ]),
+            HashMap::from([
+                ("value".to_string(), av_string("2023-13-31T12:34:56Z")), // Invalid month
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let value_field = schema.field_with_name("value").unwrap();
+
+        assert_eq!(value_field.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_multiple_temporal_columns() {
+        let items = vec![
+            HashMap::from([
+                ("id".to_string(), av_string("1")),
+                ("created_at".to_string(), av_string("2023-08-31T12:34:56Z")),
+                ("birth_date".to_string(), av_string("1990-05-22")),
+                ("name".to_string(), av_string("John Doe")),
+            ]),
+            HashMap::from([
+                ("id".to_string(), av_string("2")),
+                ("created_at".to_string(), av_string("2024-01-15T08:22:11Z")),
+                ("birth_date".to_string(), av_string("1985-12-10")),
+                ("name".to_string(), av_string("Jane Smith")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+
+        let id_field = schema.field_with_name("id").unwrap();
+        assert_eq!(id_field.data_type(), &DataType::Utf8);
+
+        let created_at_field = schema.field_with_name("created_at").unwrap();
+        assert!(matches!(
+        created_at_field.data_type(),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+    ));
+
+        let birth_date_field = schema.field_with_name("birth_date").unwrap();
+        assert_eq!(birth_date_field.data_type(), &DataType::Date32);
+
+        let name_field = schema.field_with_name("name").unwrap();
+        assert_eq!(name_field.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_consistent_timestamps_across_many_items() {
+        let items: Vec<_> = (0..10)
+            .map(|i| {
+                HashMap::from([
+                    ("id".to_string(), av_string(&i.to_string())),
+                    ("timestamp".to_string(), av_string(&format!("2024-01-{:02}T10:00:00Z", i + 1))),
+                ])
+            })
+            .collect();
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let timestamp_field = schema.field_with_name("timestamp").unwrap();
+
+        assert!(matches!(
+        timestamp_field.data_type(),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+    ));
+    }
+
+    #[test]
+    fn test_empty_string_with_temporal_types() {
+        let items = vec![
+            HashMap::from([
+                ("value".to_string(), av_string("2024-01-15")),
+            ]),
+            HashMap::from([
+                ("value".to_string(), av_string("")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let value_field = schema.field_with_name("value").unwrap();
+
+        assert_eq!(value_field.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_null_value_with_temporal_types() {
+        let items = vec![
+            HashMap::from([
+                ("id".to_string(), av_string("1")),
+                ("timestamp".to_string(), av_string("2024-01-15T10:00:00Z")),
+            ]),
+            HashMap::from([
+                ("id".to_string(), av_string("2")),
+                ("timestamp".to_string(), AttributeValue::Null(true)),
+            ]),
+            HashMap::from([
+                ("id".to_string(), av_string("3")),
+                ("timestamp".to_string(), av_string("2024-01-16T10:00:00Z")),
+            ]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let timestamp_field = schema.field_with_name("timestamp").unwrap();
+
+        assert!(matches!(
+        timestamp_field.data_type(),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+    ));
     }
 }
