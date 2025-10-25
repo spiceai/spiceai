@@ -20,6 +20,7 @@ mod arrow;
 pub mod provider;
 mod schema;
 mod unnest;
+// mod expression;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

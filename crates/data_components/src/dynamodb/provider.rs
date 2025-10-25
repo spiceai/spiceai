@@ -25,6 +25,7 @@ use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use aws_sdk_dynamodb::types::KeyType;
 use aws_sdk_dynamodb::{
     Client,
     error::SdkError,
@@ -48,60 +49,105 @@ use datafusion::{
 };
 use futures::stream::{StreamExt, TryStreamExt};
 use snafu::prelude::*;
+// use crate::dynamodb::expression::{combine_exprs_with_and, expr_to_dynamodb_filter};
 
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
     client: Arc<Client>,
     table_name: Arc<str>,
     table_schema: SchemaRef,
+    partition_key: String,
+    sort_key: Option<String>,
 }
 
 impl DynamoDBTableProvider {
     pub async fn try_new(client: Arc<Client>, table_name: Arc<str>) -> Result<Self, Error> {
-        let status = Self::get_table_status(Arc::clone(&client), Arc::clone(&table_name)).await?;
-        if status != TableStatus::Active {
-            return TableStatusIsNotActiveSnafu.fail();
-        }
-        let table_schema = Self::schema(Arc::clone(&client), &table_name).await?;
+        let (table_schema, partition_key, sort_key) =
+            Self::schema(Arc::clone(&client), &table_name).await?;
         Ok(Self {
             client,
             table_name,
             table_schema,
+            partition_key,
+            sort_key,
         })
     }
 
-    async fn get_table_status(
+    pub async fn schema(
         client: Arc<Client>,
-        table_name: Arc<str>,
-    ) -> Result<TableStatus, Error> {
+        table_name: &str,
+    ) -> Result<(SchemaRef, String, Option<String>)> {
         let response = client
             .describe_table()
-            .table_name(table_name.to_string())
+            .table_name(table_name)
             .send()
             .await
             .map_err(map_sdk_error)
             .context(DescribeTableSnafu)?;
 
         let Some(table) = response.table() else {
-            return TableDoesNotExistSnafu {
-                table_name: Arc::clone(&table_name),
-            }
-            .fail();
+            return TableDoesNotExistSnafu { table_name }.fail();
         };
-        let Some(table_status) = table.table_status() else {
-            return TableDoesNotExistSnafu {
-                table_name: Arc::clone(&table_name),
-            }
-            .fail();
-        };
-        Ok(table_status.clone())
-    }
 
-    pub async fn schema(client: Arc<Client>, table_name: &str) -> Result<SchemaRef> {
+        let Some(table_status) = table.table_status() else {
+            return TableDoesNotExistSnafu { table_name }.fail();
+        };
+        if *table_status != TableStatus::Active {
+            return TableStatusIsNotActiveSnafu.fail();
+        }
+
+        let key_schema = table.key_schema();
+
+        let mut partition_key = None;
+        let mut sort_key = None;
+
+        for key in key_schema {
+            match key.key_type() {
+                KeyType::Hash => {
+                    partition_key = Some(key.attribute_name().to_string());
+                }
+                KeyType::Range => {
+                    sort_key = Some(key.attribute_name().to_string());
+                }
+                _ => {}
+            }
+        }
+
+        let Some(partition_key) = partition_key else {
+            unreachable!("Table must have a partition key")
+        };
+
         let mut request = client.scan().table_name(table_name);
 
         if let Some(limit) = Some(10) {
-            // TODO
+            request = request.limit(limit);
+        }
+
+        let items: Vec<_> = request
+            .send()
+            .await
+            .map_err(map_sdk_error)
+            .context(ScanSnafu)?
+            .items()
+            .to_vec();
+
+        let unnested_items = match Some(1) {
+            None | Some(0) => items,
+            Some(unnest_depth) => unnest_dynamodb_items(items, unnest_depth)?,
+        };
+
+        Ok((
+            infer_arrow_schema_from_items(&unnested_items)?,
+            partition_key,
+            sort_key,
+        ))
+    }
+
+    pub async fn schema_old(client: Arc<Client>, table_name: &str) -> Result<SchemaRef> {
+        let mut request = client.scan().table_name(table_name);
+
+        // TODO
+        if let Some(limit) = Some(10) {
             request = request.limit(limit);
         }
 
@@ -185,6 +231,20 @@ impl TableProvider for DynamoDBTableProvider {
                     .map_err(|_| DataFusionError::Execution("Limit is too large".to_string()))?,
             );
         }
+
+        // let mut request = match combine_exprs_with_and(filters) {
+        //     Some(e) => {
+        //         let filter = expr_to_dynamodb_filter(&e).ok_or(DataFusionError::Execution(
+        //             "Failed to convert expressions".to_string(),
+        //         ))?;
+        //         request
+        //             .filter_expression(&filter.filter_expression)
+        //             .set_expression_attribute_names(Some(filter.expression_attribute_names))
+        //             .set_expression_attribute_values(Some(filter.expression_attribute_values))
+        //     },
+        //     None => request,
+        // };
+
         if let Some((projection, names)) = projection_expression(projection, &self.table_schema) {
             request = request.projection_expression(projection);
             for (placeholder, name) in &names {
@@ -311,16 +371,15 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         let schema = Arc::clone(&self.table_schema);
         let request = self.request.clone().into_paginator();
-        let unnest_depth = Some(1); // Assuming this field exists on self
+        let unnest_depth = Some(1);
 
         builder.spawn(async move {
             let mut paginator = request.send();
             let mut buffer = Vec::new();
-            const CHUNK_SIZE: usize = 4000;
+            const CHUNK_SIZE: usize = 4_000;
 
             while let Some(result) = paginator.next().await {
-                let scan_output =
-                    result.map_err(to_execution_error)?;
+                let scan_output = result.map_err(to_execution_error)?;
 
                 buffer.extend(scan_output.items().to_vec());
 
@@ -360,58 +419,6 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         Ok(builder.build())
     }
-
-    // fn execute(
-    //     &self,
-    //     _partition: usize,
-    //     _context: Arc<TaskContext>,
-    // ) -> DataFusionResult<SendableRecordBatchStream> {
-    //     let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.table_schema), 2);
-    //     let tx = builder.tx();
-    //
-    //     let schema = Arc::clone(&self.table_schema);
-    //     let request = self.request.clone().into_paginator();
-    //
-    //     let unnest_depth = Some(1);
-    //
-    //     builder.spawn(async move {
-    //         let items_stream = request
-    //             .send()
-    //             .map_err(|e| DataFusionError::Execution(map_sdk_error(e).to_string()))
-    //             .map_ok(|page| {
-    //                 futures::stream::iter(
-    //                     page.items()
-    //                         .to_vec()
-    //                         .into_iter()
-    //                         .map(Ok::<_, DataFusionError>)
-    //                 )
-    //             })
-    //             .try_flatten();
-    //
-    //         let mut chunked_stream = items_stream.try_chunks(4000);
-    //
-    //         while let Some(chunk_result) = chunked_stream.next().await {
-    //             let chunk = chunk_result
-    //                 .map_err(|e| DataFusionError::Execution(format!("Stream error: {:?}", e)))?;
-    //
-    //             let unnested_items = match unnest_depth {
-    //                 None | Some(0) => chunk,
-    //                 Some(unnest_depth) => unnest_dynamodb_items(chunk, unnest_depth)?,
-    //             };
-    //
-    //             let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
-    //                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    //
-    //             tx.send(Ok(batch)).await.map_err(|_| {
-    //                 DataFusionError::Execution("Failed to send record batch".to_string())
-    //             })?;
-    //         }
-    //
-    //         Ok(())
-    //     });
-    //
-    //     Ok(builder.build())
-    // }
 }
 
 #[allow(clippy::needless_pass_by_value)]
