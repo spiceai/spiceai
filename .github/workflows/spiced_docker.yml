@@ -141,6 +141,8 @@ jobs:
           file: Dockerfile-release
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
+          cache-from: type=gha,scope=build-amd64
+          cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
@@ -216,6 +218,8 @@ jobs:
           file: Dockerfile-release
           platforms: linux/arm64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
+          cache-from: type=gha,scope=build-arm64
+          cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}

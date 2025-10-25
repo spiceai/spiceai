@@ -35,6 +35,9 @@ on:
 env:
   FORBIDDEN_LICENSE_CHECK: |
     grep -B 1 -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   license-check-rust:
@@ -59,7 +62,7 @@ jobs:
     name: Check Golang Licenses
     runs-on: self-hosted
     env:
-      GOVER: 1.24.2
+      GOVER: 1.25.3
 
     steps:
       - uses: actions/checkout@v5
@@ -68,6 +71,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - name: Install go-licences
         run: go get github.com/google/go-licenses

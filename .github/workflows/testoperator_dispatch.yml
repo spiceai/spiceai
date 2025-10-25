@@ -42,7 +42,7 @@ jobs:
       matrix:
         branch:
           - 'trunk'
-          - 'release/1.7'
+          - 'release/1.8'
     concurrency:
       group: testoperator-dispatch-scheduled
       cancel-in-progress: false
