@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
-
+use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
@@ -33,6 +32,7 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::{Mutex, RwLock};
 use util::in_tracing_context;
@@ -52,6 +52,7 @@ pub struct RuntimeBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
+    runtime_config: Arc<Config>,
 }
 
 impl RuntimeBuilder {
@@ -69,6 +70,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
+            runtime_config: Arc::new(Config::default()),
         }
     }
 
@@ -79,6 +81,11 @@ impl RuntimeBuilder {
 
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
+        self
+    }
+
+    pub fn with_runtime_config(mut self, config: Config) -> Self {
+        self.runtime_config = Arc::new(config);
         self
     }
 
@@ -186,6 +193,8 @@ impl RuntimeBuilder {
         }
 
         let caching = Runtime::init_caching(Some(&caching_config));
+        #[cfg(feature = "cluster")]
+        let cluster_config = Arc::new(self.runtime_config.cluster.clone());
 
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
@@ -197,6 +206,11 @@ impl RuntimeBuilder {
         .with_task_history(task_history)
         .with_caching(caching)
         .with_metrics(metrics);
+
+        #[cfg(feature = "cluster")]
+        {
+            df_builder = df_builder.with_cluster_config(cluster_config);
+        };
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
@@ -257,6 +271,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            config: Arc::clone(&self.runtime_config),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

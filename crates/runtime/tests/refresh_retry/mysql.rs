@@ -120,6 +120,7 @@ async fn create_refresh_task(
             accelerated_table.get_accelerator(),
             None,
         )
+        .with_tokio_runtime(rt.datafusion().tokio_runtime().cloned())
         .build(),
         accelerated_table.refresh_params().read().await.clone(),
     ))

@@ -91,7 +91,7 @@ impl RefreshTask {
     ) -> impl Stream<Item = crate::accelerated_table::Result<(Option<SystemTime>, DataUpdate)>>
     {
         let federated = self.federated.table_provider().await;
-        let ctx = self.refresh_df_context(Arc::clone(&federated));
+        let ctx = self.refresh_df_context(Arc::clone(&federated)).await;
         let dataset_name = self.dataset_name.clone();
 
         stream! {
