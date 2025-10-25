@@ -485,3 +485,647 @@ impl ArrayBuilderTrait for NullArrayBuilder {
         Ok(Arc::new(self.0.finish()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use aws_sdk_dynamodb::primitives::Blob;
+    use aws_sdk_dynamodb::types::AttributeValue;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn av_string(s: &str) -> AttributeValue {
+        AttributeValue::S(s.to_string())
+    }
+
+    fn av_number(n: &str) -> AttributeValue {
+        AttributeValue::N(n.to_string())
+    }
+
+    fn av_bool(b: bool) -> AttributeValue {
+        AttributeValue::Bool(b)
+    }
+
+    fn av_null() -> AttributeValue {
+        AttributeValue::Null(true)
+    }
+
+    fn av_binary(bytes: Vec<u8>) -> AttributeValue {
+        AttributeValue::B(Blob::new(bytes))
+    }
+
+    #[test]
+    fn test_empty_items() {
+        let items: Vec<HashMap<String, AttributeValue>> = vec![];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema.clone()).unwrap();
+        assert_eq!(result.num_rows(), 0);
+        assert_eq!(result.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_simple_types() {
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), av_string("Alice"));
+        item.insert("age".to_string(), av_number("30"));
+        item.insert("height".to_string(), av_number("5.6"));
+        item.insert("is_active".to_string(), av_bool(true));
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+            Field::new("height", DataType::Float64, true),
+            Field::new("is_active", DataType::Boolean, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result.num_columns(), 4);
+
+        // Verify data
+        let name_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(name_array.value(0), "Alice");
+
+        let age_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(age_array.value(0), 30);
+
+        let height_array = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(height_array.value(0), 5.6);
+
+        let is_active_array = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(is_active_array.value(0));
+    }
+
+    #[test]
+    fn test_string_set() {
+        let mut item = HashMap::new();
+        item.insert(
+            "tags".to_string(),
+            AttributeValue::Ss(vec![
+                "tag1".to_string(),
+                "tag2".to_string(),
+                "tag3".to_string(),
+            ]),
+        );
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let tags_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+
+        let arc = tags_array.value(0);
+        let values = arc
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), "tag1");
+        assert_eq!(values.value(1), "tag2");
+        assert_eq!(values.value(2), "tag3");
+    }
+
+    #[test]
+    fn test_number_set_int() {
+        let mut item = HashMap::new();
+        item.insert(
+            "scores".to_string(),
+            AttributeValue::Ns(vec!["10".to_string(), "20".to_string(), "30".to_string()]),
+        );
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "scores",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let scores_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+
+        let arc = scores_array.value(0);
+        let values = arc
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), 10);
+        assert_eq!(values.value(1), 20);
+        assert_eq!(values.value(2), 30);
+    }
+
+    #[test]
+    fn test_number_set_float() {
+        let mut item = HashMap::new();
+        item.insert(
+            "ratings".to_string(),
+            AttributeValue::Ns(vec![
+                "1.5".to_string(),
+                "2.5".to_string(),
+                "3.14".to_string(),
+            ]),
+        );
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ratings",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let ratings_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+
+        let arc = ratings_array.value(0);
+        let values = arc
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), 1.5);
+        assert_eq!(values.value(1), 2.5);
+        assert_eq!(values.value(2), 3.14);
+    }
+
+    #[test]
+    fn test_binary_set() {
+        let mut item = HashMap::new();
+        item.insert(
+            "data".to_string(),
+            AttributeValue::Bs(vec![Blob::new(vec![1, 2, 3]), Blob::new(vec![4, 5, 6])]),
+        );
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let data_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+
+        let arc = data_array.value(0);
+        let values = arc
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.value(0), &[1, 2, 3]);
+        assert_eq!(values.value(1), &[4, 5, 6]);
+    }
+
+    #[test]
+    fn test_binary_type() {
+        let mut item = HashMap::new();
+        item.insert("file_data".to_string(), av_binary(vec![1, 2, 3, 4, 5]));
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "file_data",
+            DataType::Binary,
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let data_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+
+        assert_eq!(data_array.value(0), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_heterogeneous_list() {
+        let mut item = HashMap::new();
+        item.insert(
+            "mixed".to_string(),
+            AttributeValue::L(vec![
+                av_string("text"),
+                av_number("42"),
+                av_bool(true),
+                av_null(),
+            ]),
+        );
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "mixed",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let mixed_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+
+        let arc = mixed_array.value(0);
+        let values = arc
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(values.len(), 4);
+        assert_eq!(values.value(0), "text");
+        assert_eq!(values.value(1), "42");
+        assert_eq!(values.value(2), "true");
+        assert_eq!(values.value(3), "null");
+    }
+
+    #[test]
+    fn test_map_to_json_string() {
+        let mut inner_map = HashMap::new();
+        inner_map.insert("name".to_string(), av_string("Alice"));
+        inner_map.insert("age".to_string(), av_number("30"));
+
+        let mut item = HashMap::new();
+        item.insert("user".to_string(), AttributeValue::M(inner_map));
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new("user", DataType::Utf8, true)]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let user_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        let json_str = user_array.value(0);
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+
+        assert_eq!(parsed["name"], "Alice");
+        assert!(parsed["age"].is_number() || parsed["age"].is_string());
+    }
+
+    #[test]
+    fn test_null_values() {
+        let mut item1 = HashMap::new();
+        item1.insert("name".to_string(), av_string("Alice"));
+        item1.insert("age".to_string(), av_null());
+
+        let mut item2 = HashMap::new();
+        item2.insert("name".to_string(), av_null());
+        item2.insert("age".to_string(), av_number("30"));
+
+        let items = vec![item1, item2];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 2);
+
+        let name_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(name_array.value(0), "Alice");
+        assert!(name_array.is_null(1));
+
+        let age_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(age_array.is_null(0));
+        assert_eq!(age_array.value(1), 30);
+    }
+
+    #[test]
+    fn test_missing_fields() {
+        let mut item1 = HashMap::new();
+        item1.insert("name".to_string(), av_string("Alice"));
+        item1.insert("age".to_string(), av_number("30"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("name".to_string(), av_string("Bob"));
+        // age is missing
+
+        let items = vec![item1, item2];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 2);
+
+        let age_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(age_array.value(0), 30);
+        assert!(age_array.is_null(1)); // Missing field treated as null
+    }
+
+    #[test]
+    fn test_number_parsing_edge_cases() {
+        let mut item = HashMap::new();
+        item.insert("int_pos".to_string(), av_number("42"));
+        item.insert("int_neg".to_string(), av_number("-42"));
+        item.insert("float_pos".to_string(), av_number("3.14"));
+        item.insert("float_neg".to_string(), av_number("-3.14"));
+        item.insert("scientific".to_string(), av_number("1.5e10"));
+        item.insert("zero".to_string(), av_number("0"));
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("int_pos", DataType::Int64, true),
+            Field::new("int_neg", DataType::Int64, true),
+            Field::new("float_pos", DataType::Float64, true),
+            Field::new("float_neg", DataType::Float64, true),
+            Field::new("scientific", DataType::Float64, true),
+            Field::new("zero", DataType::Int64, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let int_pos = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(int_pos.value(0), 42);
+
+        let int_neg = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(int_neg.value(0), -42);
+
+        let float_pos = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(float_pos.value(0), 3.14);
+
+        let float_neg = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(float_neg.value(0), -3.14);
+
+        let scientific = result
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(scientific.value(0), 1.5e10);
+
+        let zero = result
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(zero.value(0), 0);
+    }
+
+    #[test]
+    fn test_multiple_items() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("name".to_string(), av_string("Alice"));
+        item1.insert("age".to_string(), av_number("30"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert("name".to_string(), av_string("Bob"));
+        item2.insert("age".to_string(), av_number("25"));
+
+        let mut item3 = HashMap::new();
+        item3.insert("id".to_string(), av_string("3"));
+        item3.insert("name".to_string(), av_string("Charlie"));
+        item3.insert("age".to_string(), av_number("35"));
+
+        let items = vec![item1, item2, item3];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_columns(), 3);
+
+        let name_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(name_array.value(0), "Alice");
+        assert_eq!(name_array.value(1), "Bob");
+        assert_eq!(name_array.value(2), "Charlie");
+    }
+
+    #[test]
+    fn test_empty_list() {
+        let mut item = HashMap::new();
+        item.insert("empty_list".to_string(), AttributeValue::L(vec![]));
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "empty_list",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let list_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+
+        let arc = list_array.value(0);
+        let values = arc
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(values.len(), 0);
+    }
+
+    #[test]
+    fn test_nested_map_in_list() {
+        let mut inner_map = HashMap::new();
+        inner_map.insert("key".to_string(), av_string("value"));
+
+        let mut item = HashMap::new();
+        item.insert(
+            "nested".to_string(),
+            AttributeValue::L(vec![AttributeValue::M(inner_map)]),
+        );
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "nested",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let list_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+
+        let arc = list_array.value(0);
+        let values = arc
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(values.len(), 1);
+        // The nested map should be converted to a string representation
+        assert!(values.value(0).contains("key") || values.value(0).contains("Map"));
+    }
+
+    #[test]
+    fn test_all_null_values() {
+        let mut item = HashMap::new();
+        item.insert("nullable_string".to_string(), av_null());
+        item.insert("nullable_int".to_string(), av_null());
+        item.insert("nullable_float".to_string(), av_null());
+        item.insert("nullable_bool".to_string(), av_null());
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("nullable_string", DataType::Utf8, true),
+            Field::new("nullable_int", DataType::Int64, true),
+            Field::new("nullable_float", DataType::Float64, true),
+            Field::new("nullable_bool", DataType::Boolean, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+
+        let string_array = result
+            .column_by_name("nullable_string")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(string_array.len(), 1);
+        assert!(string_array.is_null(0));
+
+        let int_array = result
+            .column_by_name("nullable_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(int_array.len(), 1);
+        assert!(int_array.is_null(0));
+
+        let float_array = result
+            .column_by_name("nullable_float")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(float_array.len(), 1);
+        assert!(float_array.is_null(0));
+
+        let bool_array = result
+            .column_by_name("nullable_bool")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert_eq!(bool_array.len(), 1);
+        assert!(bool_array.is_null(0));
+    }
+}
