@@ -274,7 +274,9 @@ fn scalar_to_attribute_value(scalar: &ScalarValue) -> datafusion::error::Result<
         ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
         ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
         ScalarValue::Null => Ok(AttributeValue::Null(true)),
-        _ => Err(DataFusionError::NotImplemented("ScalarValue type not supported".to_string())),
+        _ => Err(DataFusionError::NotImplemented(
+            "ScalarValue type not supported".to_string(),
+        )),
     }
 }
 
@@ -282,7 +284,7 @@ fn scalar_to_attribute_value(scalar: &ScalarValue) -> datafusion::error::Result<
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::logical_expr::{col, lit, BinaryExpr, Operator};
+    use datafusion::logical_expr::{BinaryExpr, Operator, col, lit};
     use std::sync::Arc;
 
     fn create_test_schema() -> DynamoDBTableSchema {
@@ -327,16 +329,10 @@ mod tests {
 
     #[test]
     fn test_sort_key_optional() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
 
-        let table_schema = DynamoDBTableSchema::new(
-            Arc::from("test_table"),
-            schema,
-            "id".to_string(),
-            None,
-        );
+        let table_schema =
+            DynamoDBTableSchema::new(Arc::from("test_table"), schema, "id".to_string(), None);
 
         assert_eq!(table_schema.sort_key(), None);
     }
@@ -604,7 +600,9 @@ mod tests {
                 right: Box::new(lit(25i64)),
             });
 
-            let result = schema.expr_to_filter_string(&expr, &mut values, &mut counter).unwrap();
+            let result = schema
+                .expr_to_filter_string(&expr, &mut values, &mut counter)
+                .unwrap();
             assert!(result.contains(expected_str));
         }
     }

@@ -276,3 +276,369 @@ impl<'a> DynamoDBRequestBuilder<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use aws_config::BehaviorVersion;
+    use aws_sdk_dynamodb::Client;
+    use datafusion::logical_expr::{col, lit};
+    use std::sync::Arc;
+
+    async fn create_test_client() -> Client {
+        let config = aws_config::defaults(BehaviorVersion::latest())
+            .region("us-east-1")
+            .load()
+            .await;
+        Client::new(&config)
+    }
+
+    fn create_test_schema() -> DynamoDBTableSchema {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("sort_key", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+
+        DynamoDBTableSchema::new(
+            Arc::from("test_table"),
+            schema,
+            "id".to_string(),
+            Some("sort_key".to_string()),
+        )
+    }
+
+    fn create_projection_schema(fields: Vec<&str>) -> SchemaRef {
+        Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|&name| Field::new(name, DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_builder_creation() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        assert!(std::ptr::eq(builder.schema, &schema));
+    }
+
+    #[tokio::test]
+    async fn test_build_query_with_partition_key_only() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("id").eq(lit("user123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {}
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_query_with_partition_and_sort_key() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("sort_key").gt(lit("2024-01-01")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {}
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_query_with_additional_filters() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("age").gt(lit(18i64)),
+            col("active").eq(lit(true)),
+        ];
+        let projection = create_projection_schema(vec!["id", "name", "age"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {}
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_scan_without_partition_key() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("age").gt(lit(18i64))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {}
+            DynamoDBRequest::Query(_) => panic!("Expected Scan request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_scan_with_no_filters() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {}
+            DynamoDBRequest::Query(_) => panic!("Expected Scan request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_scan_with_or_filter() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![
+            col("id")
+                .eq(lit("user123"))
+                .or(col("id").eq(lit("user456"))),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {}
+            DynamoDBRequest::Query(_) => panic!("Expected Scan request due to OR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_with_limit() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("id").eq(lit("user123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, Some(10)).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {}
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_with_limit_too_large() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("id").eq(lit("user123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, Some(i32::MAX as usize + 1));
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_query_all_sort_key_operators() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let sort_operators = vec![
+            col("sort_key").eq(lit("value")),
+            col("sort_key").lt(lit("value")),
+            col("sort_key").lt_eq(lit("value")),
+            col("sort_key").gt(lit("value")),
+            col("sort_key").gt_eq(lit("value")),
+        ];
+
+        for sort_op in sort_operators {
+            let filters = vec![col("id").eq(lit("user123")), sort_op];
+            let projection = create_projection_schema(vec!["id", "name"]);
+
+            let result = builder.build(&filters, projection, None).unwrap();
+
+            match result {
+                DynamoDBRequest::Query(_) => {}
+                DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_partition_keys_forces_scan() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("id").eq(lit("user123")), col("id").eq(lit("user456"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {}
+            DynamoDBRequest::Query(_) => panic!("Expected Scan due to multiple partition keys"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_sort_keys_forces_scan() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("sort_key").gt(lit("2024-01-01")),
+            col("sort_key").lt(lit("2024-12-31")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {}
+            DynamoDBRequest::Query(_) => panic!("Expected Scan due to multiple sort keys"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_key_with_wrong_operator_forces_scan() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("id").gt(lit("user123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {}
+            DynamoDBRequest::Query(_) => panic!("Expected Scan - partition key must use ="),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_projection() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("id").eq(lit("user123"))];
+        let projection = Arc::new(Schema::empty());
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        // Should still create a query, just without projection
+        match result {
+            DynamoDBRequest::Query(_) => {}
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_projection_with_unknown_columns() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("id").eq(lit("user123"))];
+        let projection = create_projection_schema(vec!["unknown_column"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        // Should still work, projection will just be empty
+        match result {
+            DynamoDBRequest::Query(_) => {}
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nested_or_in_filter() {
+        let client = create_test_client().await;
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("age")
+                .gt(lit(18i64))
+                .and(col("active").eq(lit(true)).or(col("active").eq(lit(false)))),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        // OR anywhere in the filter tree should force a scan
+        match result {
+            DynamoDBRequest::Scan(_) => {}
+            DynamoDBRequest::Query(_) => panic!("Expected Scan due to nested OR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_without_sort_key() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let table_schema = DynamoDBTableSchema::new(
+            Arc::from("test_table"),
+            schema,
+            "id".to_string(),
+            None, // No sort key
+        );
+
+        let client = create_test_client().await;
+        let builder = DynamoDBRequestBuilder::new(&client, &table_schema);
+
+        let filters = vec![col("id").eq(lit("user123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {}
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+}

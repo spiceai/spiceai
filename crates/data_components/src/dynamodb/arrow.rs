@@ -15,18 +15,8 @@ limitations under the License.
 */
 use super::{Error, Result};
 use arrow::array::{
-    Array,
-    ArrayRef,
-    BinaryBuilder,
-    BooleanBuilder,
-    Date32Builder,
-    Float64Builder,
-    Int64Builder,
-    ListBuilder,
-    NullBuilder,
-    RecordBatch,
-    StringBuilder,
-    TimestampMillisecondBuilder,
+    Array, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder,
+    ListBuilder, NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use aws_sdk_dynamodb::types::AttributeValue;
