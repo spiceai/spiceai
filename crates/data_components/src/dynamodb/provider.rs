@@ -170,30 +170,6 @@ impl DynamoDBTableProvider {
         ))
     }
 
-    pub async fn schema_old(client: Arc<Client>, table_name: &str) -> Result<SchemaRef> {
-        let mut request = client.scan().table_name(table_name);
-
-        // TODO
-        if let Some(limit) = Some(10) {
-            request = request.limit(limit);
-        }
-
-        let items: Vec<_> = request
-            .send()
-            .await
-            .map_err(map_sdk_error)
-            .context(ScanSnafu)?
-            .items()
-            .to_vec();
-
-        let unnested_items = match Some(1) {
-            None | Some(0) => items,
-            Some(unnest_depth) => unnest_dynamodb_items(items, unnest_depth)?,
-        };
-
-        infer_arrow_schema_from_items(&unnested_items)
-    }
-
     fn build_filter_expression(
         &self,
         filters: &[Expr],
@@ -476,41 +452,6 @@ fn build_column_alias_maps(
     }
 
     (column_to_alias_map, alias_to_column_map)
-}
-
-/// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
-/// Because projection expressions may use reserved words in `DynamoDB`, this function automatically generates expression attribute names for each column to avoid conflicts.
-/// The expression format used is `#c{idx}` for each projected column, where `{idx}` is the column projection index.
-/// See: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ExpressionAttributeNames.html#Expressions.ExpressionAttributeNames.ReservedWords>
-/// Returns a tuple of (`projection_expression`, `expression_attribute_names`) for the `DynamoDB` scan.
-/// Returns None if no projection is required.
-fn projection_expression(
-    projection: Option<&Vec<usize>>,
-    schema: &SchemaRef,
-) -> Option<(String, HashMap<String, String>)> {
-    let projection = projection?;
-    if projection.is_empty() {
-        return None;
-    }
-
-    // For each projected field, generate a placeholder and mapping
-    let mut expr_parts = Vec::with_capacity(projection.len());
-    let mut attr_names = HashMap::with_capacity(projection.len());
-
-    for (i, &idx) in projection.iter().enumerate() {
-        let field = schema.field(idx);
-        let name = field.name();
-        let placeholder = format!("#c{i}");
-        expr_parts.push(placeholder.clone());
-        attr_names.insert(placeholder, name.clone());
-    }
-
-    let expr = expr_parts.join(", ");
-    if expr.is_empty() {
-        None
-    } else {
-        Some((expr, attr_names))
-    }
 }
 
 enum KeyFilter {
@@ -796,9 +737,6 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         Ok(builder.build())
     }
-
-    // Helper function to reduce duplication
-
 }
 
 fn process_chunk(
@@ -813,6 +751,42 @@ fn process_chunk(
 
     dynamodb_items_to_arrow(&unnested_items, schema).map_err(to_execution_error)
 }
+
+/// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
+/// Because projection expressions may use reserved words in `DynamoDB`, this function automatically generates expression attribute names for each column to avoid conflicts.
+/// The expression format used is `#c{idx}` for each projected column, where `{idx}` is the column projection index.
+/// See: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ExpressionAttributeNames.html#Expressions.ExpressionAttributeNames.ReservedWords>
+/// Returns a tuple of (`projection_expression`, `expression_attribute_names`) for the `DynamoDB` scan.
+/// Returns None if no projection is required.
+fn projection_expression(
+    projection: Option<&Vec<usize>>,
+    schema: &SchemaRef,
+) -> Option<(String, HashMap<String, String>)> {
+    let projection = projection?;
+    if projection.is_empty() {
+        return None;
+    }
+
+    // For each projected field, generate a placeholder and mapping
+    let mut expr_parts = Vec::with_capacity(projection.len());
+    let mut attr_names = HashMap::with_capacity(projection.len());
+
+    for (i, &idx) in projection.iter().enumerate() {
+        let field = schema.field(idx);
+        let name = field.name();
+        let placeholder = format!("#c{i}");
+        expr_parts.push(placeholder.clone());
+        attr_names.insert(placeholder, name.clone());
+    }
+
+    let expr = expr_parts.join(", ");
+    if expr.is_empty() {
+        None
+    } else {
+        Some((expr, attr_names))
+    }
+}
+
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn to_execution_error(
