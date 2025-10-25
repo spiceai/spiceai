@@ -16,10 +16,7 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, fmt, io::Cursor, sync::Arc};
 
-use arrow::{
-    datatypes::SchemaRef,
-    json::{ReaderBuilder, reader::infer_json_schema_from_iterator},
-};
+use arrow::{datatypes::SchemaRef, json::{ReaderBuilder}};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
@@ -114,13 +111,6 @@ impl DynamoDBTableProvider {
 
         infer_arrow_schema_from_items(output.items())
     }
-}
-
-fn infer_schema(json_values: &[Value]) -> Result<SchemaRef> {
-    let schema = infer_json_schema_from_iterator(json_values.iter().map(Result::Ok))
-        .context(SchemaInferenceSnafu)?;
-
-    Ok(Arc::new(schema))
 }
 
 fn attribute_map_to_json(map: &HashMap<String, AttributeValue>) -> Value {
