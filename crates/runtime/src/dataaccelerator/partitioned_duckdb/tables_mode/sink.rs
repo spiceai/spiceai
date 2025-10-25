@@ -378,6 +378,26 @@ fn insert_overwrite(
                     .map_err(to_retriable_data_write_error)
             })?;
 
+        // execute ANALYZE
+        let source_name = new_table.table_name();
+        let analyze_sql = format!("ANALYZE {}", source_name);
+        tracing::info!("Executing analyze SQL: {analyze_sql}");
+        match tx.prepare(&analyze_sql) {
+            Ok(mut stmt) => match stmt.execute([]) {
+                Ok(rows_affected) => {
+                    tracing::info!(
+                        "Analyze SQL executed for table '{source_name}', {rows_affected} rows affected"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to execute analyze SQL for table '{source_name}': {e}");
+                }
+            },
+            Err(e) => {
+                tracing::error!("Failed to prepare analyze SQL for table '{source_name}': {e}");
+            }
+        }
+
         // partition still exists so should NOT be deleted
         candidates_to_drop.remove(&new_table.definition_name().to_string());
     }
@@ -454,6 +474,28 @@ fn insert_append(
         false,
     )
     .map_err(to_retriable_data_write_error)?;
+
+    for table in &tables {
+        // execute ANALYZE
+        let source_name = table.table_name();
+        let analyze_sql = format!("ANALYZE {}", source_name);
+        tracing::info!("Executing analyze SQL: {analyze_sql}");
+        match tx.prepare(&analyze_sql) {
+            Ok(mut stmt) => match stmt.execute([]) {
+                Ok(rows_affected) => {
+                    tracing::info!(
+                        "Analyze SQL executed for table '{source_name}', {rows_affected} rows affected"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to execute analyze SQL for table '{source_name}': {e}");
+                }
+            },
+            Err(e) => {
+                tracing::error!("Failed to prepare analyze SQL for table '{source_name}': {e}");
+            }
+        }
+    }
 
     on_commit_transaction
         .try_recv()
