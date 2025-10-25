@@ -192,6 +192,7 @@ azure_core = "0.28.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 dirs = "6.0.0"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
@@ -279,3 +280,7 @@ sqlite = [
 turso = []
 pepper = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
+
+[[bench]]
+name = "prepared_statement"
+harness = false
