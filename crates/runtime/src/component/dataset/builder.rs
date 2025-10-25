@@ -242,6 +242,7 @@ impl DatasetBuilder {
                 app.snapshots.clone(),
                 self.acceleration_snapshot,
                 runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
             );
         }
 

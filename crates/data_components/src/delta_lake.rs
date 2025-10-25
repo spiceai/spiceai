@@ -54,6 +54,7 @@ use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
+use tokio::runtime::Handle;
 use url::Url;
 
 use crate::Read;
@@ -77,6 +78,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DeltaTableFactory {
     params: HashMap<String, SecretString>,
+    io_runtime: Handle,
 }
 
 impl std::fmt::Debug for DeltaTableFactory {
@@ -89,8 +91,8 @@ impl std::fmt::Debug for DeltaTableFactory {
 
 impl DeltaTableFactory {
     #[must_use]
-    pub fn new(params: HashMap<String, SecretString>) -> Self {
-        Self { params }
+    pub fn new(params: HashMap<String, SecretString>, io_runtime: Handle) -> Self {
+        Self { params, io_runtime }
     }
 }
 
@@ -101,7 +103,8 @@ impl Read for DeltaTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone()).boxed()?;
+        let delta: DeltaTable =
+            DeltaTable::from(delta_path, self.params.clone(), self.io_runtime.clone()).boxed()?;
         Ok(Arc::new(delta))
     }
 }
@@ -115,7 +118,11 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    pub fn from(table_location: String, options: HashMap<String, SecretString>) -> Result<Self> {
+    pub fn from(
+        table_location: String,
+        options: HashMap<String, SecretString>,
+        io_runtime: Handle,
+    ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
 
@@ -146,8 +153,10 @@ impl DeltaTable {
         ) {
             (true, Some(sdk_config)) => {
                 let region = storage_options.get("aws_region").map(ToString::to_string);
-                aws_sdk_credential_bridge::from_s3_url_and_config(&table_url, region, sdk_config)
-                    .ok()
+                aws_sdk_credential_bridge::from_s3_url_and_config(
+                    &table_url, region, sdk_config, io_runtime,
+                )
+                .ok()
             }
             _ => None,
         };
@@ -155,13 +164,13 @@ impl DeltaTable {
         let engine = match table_object_store {
             Some(object_store) => Arc::new(DefaultEngine::new(
                 object_store.into(),
-                Arc::new(TokioBackgroundExecutor::new()),
+                Arc::new(TokioBackgroundExecutor::default()),
             )),
             None => Arc::new(
                 DefaultEngine::try_new(
                     &table_url,
                     storage_options,
-                    Arc::new(TokioBackgroundExecutor::new()),
+                    Arc::new(TokioBackgroundExecutor::default()),
                 )
                 .map_err(handle_delta_error)?,
             ),

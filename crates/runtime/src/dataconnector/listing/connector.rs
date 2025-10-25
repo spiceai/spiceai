@@ -84,13 +84,13 @@ pub trait ListingTableConnector: DataConnector {
     fn get_params(&self) -> &Parameters;
 
     #[must_use]
-    fn get_session_context() -> SessionContext {
+    fn get_session_context(&self) -> SessionContext {
         SessionContext::new_with_config_rt(
             get_df_default_config().set_bool(
                 "datafusion.execution.listing_table_ignore_subdirectory",
                 false,
             ),
-            default_runtime_env(),
+            default_runtime_env(self.get_tokio_io_runtime()),
         )
     }
 
@@ -105,7 +105,7 @@ pub trait ListingTableConnector: DataConnector {
                 connector_component: ConnectorComponent::from(dataset),
             },
         )?;
-        Self::get_session_context()
+        self.get_session_context()
             .runtime_env()
             .object_store(&listing_store_url)
             .boxed()
@@ -118,6 +118,10 @@ pub trait ListingTableConnector: DataConnector {
     fn get_runtime(&self) -> Option<Runtime> {
         None
     }
+
+    /// Returns a handle to the IO runtime that this object store connector should
+    /// use for spawning IO tasks.
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle;
 
     async fn construct_metadata_provider(
         &self,
@@ -519,7 +523,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let object_store = self.get_object_store(dataset)?;
 
-        let ctx: SessionContext = Self::get_session_context();
+        let ctx: SessionContext = self.get_session_context();
 
         let (schema_infer_url, schema_infer_meta) =
             if let Some(url) = dataset.params.get("schema_source_path") {
@@ -985,6 +989,7 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
+    use tokio::runtime::Handle;
     use url::Url;
 
     use crate::component::dataset::builder::DatasetBuilder;
@@ -1039,6 +1044,10 @@ mod tests {
 
         fn get_params(&self) -> &Parameters {
             &self.params
+        }
+
+        fn get_tokio_io_runtime(&self) -> Handle {
+            Handle::current()
         }
 
         fn get_object_store_url(
