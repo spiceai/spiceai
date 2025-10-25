@@ -107,10 +107,10 @@ impl TaskHistoryExporter {
             let explain_query = match captured_plan {
                 TaskHistoryCapturedPlan::None => continue,
                 TaskHistoryCapturedPlan::Explain => {
-                    format!("EXPLAIN {sql_input}")
+                    format!("EXPLAIN {}", span.input.as_ref())
                 }
                 TaskHistoryCapturedPlan::ExplainAnalyze => {
-                    format!("EXPLAIN ANALYZE {sql_input}")
+                    format!("EXPLAIN ANALYZE {}", span.input.as_ref())
                 }
             };
 
