@@ -271,11 +271,13 @@ impl TaskHistory {
             return Ok(TaskHistoryCapturedPlan::None);
         };
 
-        if captured_plan.as_ref() == "none" {
+        let captured_plan_lower = captured_plan.to_lowercase();
+
+        if captured_plan_lower == "none" {
             return Ok(TaskHistoryCapturedPlan::None);
-        } else if captured_plan.as_ref() == "explain" {
+        } else if captured_plan_lower == "explain" {
             return Ok(TaskHistoryCapturedPlan::Explain);
-        } else if captured_plan.as_ref() == "explain analyze" {
+        } else if captured_plan_lower == "explain analyze" {
             return Ok(TaskHistoryCapturedPlan::ExplainAnalyze);
         }
 
