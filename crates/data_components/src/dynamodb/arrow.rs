@@ -15,11 +15,22 @@ limitations under the License.
 */
 use super::{Error, Result};
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, ListBuilder,
-    NullBuilder, RecordBatch, StringBuilder,
+    Array,
+    ArrayRef,
+    BinaryBuilder,
+    BooleanBuilder,
+    Date32Builder,
+    Float64Builder,
+    Int64Builder,
+    ListBuilder,
+    NullBuilder,
+    RecordBatch,
+    StringBuilder,
+    TimestampMillisecondBuilder, // Add these imports
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use aws_sdk_dynamodb::types::AttributeValue;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,6 +74,12 @@ fn create_empty_array(data_type: &DataType) -> ArrayRef {
         DataType::Float64 => Arc::new(Float64Builder::new().finish()),
         DataType::Utf8 => Arc::new(StringBuilder::new().finish()),
         DataType::Binary => Arc::new(BinaryBuilder::new().finish()),
+        DataType::Date32 => Arc::new(Date32Builder::new().finish()),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Arc::new(
+            TimestampMillisecondBuilder::new()
+                .with_timezone(Arc::from("UTC"))
+                .finish(),
+        ),
         DataType::List(field) => match field.data_type() {
             DataType::Utf8 => {
                 let values_builder = StringBuilder::new();
@@ -141,6 +158,10 @@ fn create_builders(schema: &SchemaRef, capacity: usize) -> Result<BuilderMap, Er
             DataType::Float64 => Box::new(Float64ArrayBuilder::new(capacity)),
             DataType::Utf8 => Box::new(StringArrayBuilder::new(capacity)),
             DataType::Binary => Box::new(BinaryArrayBuilder::new(capacity)),
+            DataType::Date32 => Box::new(Date32ArrayBuilder::new(capacity)),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                Box::new(TimestampMillisecondArrayBuilder::new(capacity))
+            }
             DataType::List(field) => match field.data_type() {
                 DataType::Utf8 => Box::new(StringListArrayBuilder::new(capacity)),
                 DataType::Int64 => Box::new(Int64ListArrayBuilder::new(capacity)),
@@ -204,6 +225,8 @@ struct Int64ArrayBuilder(Int64Builder);
 struct Float64ArrayBuilder(Float64Builder);
 struct StringArrayBuilder(StringBuilder);
 struct BinaryArrayBuilder(BinaryBuilder);
+struct Date32ArrayBuilder(Date32Builder);
+struct TimestampMillisecondArrayBuilder(TimestampMillisecondBuilder);
 struct StringListArrayBuilder(ListBuilder<StringBuilder>);
 struct Int64ListArrayBuilder(ListBuilder<Int64Builder>);
 struct Float64ListArrayBuilder(ListBuilder<Float64Builder>);
@@ -329,6 +352,60 @@ impl ArrayBuilderTrait for BinaryArrayBuilder {
     fn append_attribute_value(&mut self, value: Option<&AttributeValue>) -> Result<(), Error> {
         match value {
             Some(AttributeValue::B(blob)) => self.0.append_value(blob.as_ref()),
+            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
+            Some(_) => self.0.append_null(),
+        }
+        Ok(())
+    }
+
+    fn finish_builder(mut self: Box<Self>) -> Result<ArrayRef, Error> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+impl Date32ArrayBuilder {
+    fn new(capacity: usize) -> Self {
+        Self(Date32Builder::with_capacity(capacity))
+    }
+}
+
+impl ArrayBuilderTrait for Date32ArrayBuilder {
+    fn append_attribute_value(&mut self, value: Option<&AttributeValue>) -> Result<(), Error> {
+        match value {
+            Some(AttributeValue::S(s)) => {
+                // Parse YYYY-MM-DD string to Date32 (days since epoch)
+                match parse_date_yyyy_mm_dd(s) {
+                    Some(days) => self.0.append_value(days),
+                    None => self.0.append_null(),
+                }
+            }
+            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
+            Some(_) => self.0.append_null(),
+        }
+        Ok(())
+    }
+
+    fn finish_builder(mut self: Box<Self>) -> Result<ArrayRef, Error> {
+        Ok(Arc::new(self.0.finish()))
+    }
+}
+
+impl TimestampMillisecondArrayBuilder {
+    fn new(capacity: usize) -> Self {
+        Self(TimestampMillisecondBuilder::with_capacity(capacity).with_timezone(Arc::from("UTC")))
+    }
+}
+
+impl ArrayBuilderTrait for TimestampMillisecondArrayBuilder {
+    fn append_attribute_value(&mut self, value: Option<&AttributeValue>) -> Result<(), Error> {
+        match value {
+            Some(AttributeValue::S(s)) => {
+                // Parse ISO8601 string to timestamp (milliseconds since epoch)
+                match parse_iso8601_timestamp(s) {
+                    Some(millis) => self.0.append_value(millis),
+                    None => self.0.append_null(),
+                }
+            }
             Some(AttributeValue::Null(_)) | None => self.0.append_null(),
             Some(_) => self.0.append_null(),
         }
@@ -484,6 +561,33 @@ impl ArrayBuilderTrait for NullArrayBuilder {
     fn finish_builder(mut self: Box<Self>) -> Result<ArrayRef, Error> {
         Ok(Arc::new(self.0.finish()))
     }
+}
+
+fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
+    // Try parsing as RFC3339 (most common ISO8601 format)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_millis());
+    }
+
+    // Try parsing as UTC timestamp without explicit timezone
+    if let Ok(dt) = s.parse::<DateTime<Utc>>() {
+        return Some(dt.timestamp_millis());
+    }
+
+    None
+}
+
+fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
+    // Parse YYYY-MM-DD format
+    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2 {
+        if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            // Convert to days since Unix epoch (1970-01-01)
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+            let duration = date.signed_duration_since(epoch);
+            return Some(duration.num_days() as i32);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1127,5 +1231,423 @@ mod tests {
             .unwrap();
         assert_eq!(bool_array.len(), 1);
         assert!(bool_array.is_null(0));
+    }
+
+    #[test]
+    fn test_date32_conversion() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("birth_date".to_string(), av_string("1990-05-22"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert("birth_date".to_string(), av_string("2024-01-15"));
+
+        let items = vec![item1, item2];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("birth_date", DataType::Date32, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 2);
+
+        // Verify date values
+        let date_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+
+        // 1990-05-22 is 7446 days since epoch
+        assert_eq!(date_array.value(0), 7446);
+        // 2024-01-15 is 19737 days since epoch
+        assert_eq!(date_array.value(1), 19737);
+    }
+
+    #[test]
+    fn test_timestamp_conversion() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("created_at".to_string(), av_string("2023-08-31T12:34:56Z"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert(
+            "created_at".to_string(),
+            av_string("2024-01-15T08:22:11.123Z"),
+        );
+
+        let items = vec![item1, item2];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 2);
+
+        // Verify timestamp values
+        let timestamp_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+
+        // 2023-08-31T12:34:56Z = 1693488896000 ms
+        assert_eq!(timestamp_array.value(0), 1693485296000);
+        // 2024-01-15T08:22:11.123Z = 1705309331123 ms
+        assert_eq!(timestamp_array.value(1), 1705306931123);
+    }
+
+    #[test]
+    fn test_timestamp_with_timezone() {
+        let mut item = HashMap::new();
+        item.insert("id".to_string(), av_string("1"));
+        item.insert(
+            "event_time".to_string(),
+            av_string("2023-08-31T12:34:56+00:00"),
+        );
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let timestamp_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+
+        assert_eq!(timestamp_array.value(0), 1693485296000);
+    }
+
+    #[test]
+    fn test_temporal_null_values() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("created_at".to_string(), av_string("2023-08-31T12:34:56Z"));
+        item1.insert("birth_date".to_string(), av_string("1990-05-22"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert("created_at".to_string(), av_null());
+        item2.insert("birth_date".to_string(), av_null());
+
+        let items = vec![item1, item2];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+            Field::new("birth_date", DataType::Date32, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 2);
+
+        let timestamp_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+
+        assert!(!timestamp_array.is_null(0));
+        assert!(timestamp_array.is_null(1));
+
+        let date_array = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+
+        assert!(!date_array.is_null(0));
+        assert!(date_array.is_null(1));
+    }
+
+    #[test]
+    fn test_temporal_missing_values() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("created_at".to_string(), av_string("2023-08-31T12:34:56Z"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        // created_at is missing
+
+        let items = vec![item1, item2];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 2);
+
+        let timestamp_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+
+        assert!(!timestamp_array.is_null(0));
+        assert!(timestamp_array.is_null(1));
+    }
+
+    #[test]
+    fn test_invalid_date_format_becomes_null() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("birth_date".to_string(), av_string("2024-01-15"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert("birth_date".to_string(), av_string("01-15-2024")); // Invalid format
+
+        let mut item3 = HashMap::new();
+        item3.insert("id".to_string(), av_string("3"));
+        item3.insert("birth_date".to_string(), av_string("not a date"));
+
+        let items = vec![item1, item2, item3];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("birth_date", DataType::Date32, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 3);
+
+        let date_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+
+        assert!(!date_array.is_null(0)); // Valid date
+        assert!(date_array.is_null(1)); // Invalid format
+        assert!(date_array.is_null(2)); // Invalid format
+    }
+
+    #[test]
+    fn test_invalid_timestamp_format_becomes_null() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("created_at".to_string(), av_string("2023-08-31T12:34:56Z"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert("created_at".to_string(), av_string("2023-08-31 12:34:56")); // Missing T
+
+        let mut item3 = HashMap::new();
+        item3.insert("id".to_string(), av_string("3"));
+        item3.insert("created_at".to_string(), av_string("not a timestamp"));
+
+        let items = vec![item1, item2, item3];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 3);
+
+        let timestamp_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+
+        assert!(!timestamp_array.is_null(0)); // Valid timestamp
+        assert!(timestamp_array.is_null(1)); // Invalid format
+        assert!(timestamp_array.is_null(2)); // Invalid format
+    }
+
+    #[test]
+    fn test_multiple_temporal_columns() {
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("name".to_string(), av_string("Alice"));
+        item1.insert("created_at".to_string(), av_string("2023-08-31T12:34:56Z"));
+        item1.insert("updated_at".to_string(), av_string("2024-01-15T10:00:00Z"));
+        item1.insert("birth_date".to_string(), av_string("1990-05-22"));
+        item1.insert("hire_date".to_string(), av_string("2020-03-15"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert("name".to_string(), av_string("Bob"));
+        item2.insert("created_at".to_string(), av_string("2023-09-01T08:00:00Z"));
+        item2.insert("updated_at".to_string(), av_string("2024-01-16T12:30:00Z"));
+        item2.insert("birth_date".to_string(), av_string("1985-12-10"));
+        item2.insert("hire_date".to_string(), av_string("2019-07-01"));
+
+        let items = vec![item1, item2];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+            Field::new(
+                "updated_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+            Field::new("birth_date", DataType::Date32, true),
+            Field::new("hire_date", DataType::Date32, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 6);
+
+        // Verify all temporal columns have valid values
+        let created_at_array = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+        assert!(!created_at_array.is_null(0));
+        assert!(!created_at_array.is_null(1));
+
+        let updated_at_array = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+        assert!(!updated_at_array.is_null(0));
+        assert!(!updated_at_array.is_null(1));
+
+        let birth_date_array = result
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+        assert!(!birth_date_array.is_null(0));
+        assert!(!birth_date_array.is_null(1));
+
+        let hire_date_array = result
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+        assert!(!hire_date_array.is_null(0));
+        assert!(!hire_date_array.is_null(1));
+    }
+
+    #[test]
+    fn test_empty_items_with_temporal_schema() {
+        let items: Vec<HashMap<String, AttributeValue>> = vec![];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+            Field::new("birth_date", DataType::Date32, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema.clone()).unwrap();
+        assert_eq!(result.num_rows(), 0);
+        assert_eq!(result.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_wrong_type_for_temporal_field_becomes_null() {
+        let mut item = HashMap::new();
+        item.insert("id".to_string(), av_string("1"));
+        item.insert("created_at".to_string(), av_number("12345")); // Wrong type
+        item.insert("birth_date".to_string(), av_bool(true)); // Wrong type
+
+        let items = vec![item];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some(Arc::from("UTC")),
+                ),
+                true,
+            ),
+            Field::new("birth_date", DataType::Date32, true),
+        ]));
+
+        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let timestamp_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .unwrap();
+        assert!(timestamp_array.is_null(0));
+
+        let date_array = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+        assert!(date_array.is_null(0));
     }
 }

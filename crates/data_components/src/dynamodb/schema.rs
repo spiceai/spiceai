@@ -594,7 +594,10 @@ mod tests {
             ]),
             HashMap::from([
                 ("id".to_string(), av_string("2")),
-                ("created_at".to_string(), av_string("2024-01-15T08:22:11.123Z")),
+                (
+                    "created_at".to_string(),
+                    av_string("2024-01-15T08:22:11.123Z"),
+                ),
             ]),
         ];
 
@@ -602,29 +605,31 @@ mod tests {
         let created_at_field = schema.field_with_name("created_at").unwrap();
 
         assert!(matches!(
-        created_at_field.data_type(),
-        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
-    ));
+            created_at_field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+        ));
     }
 
     #[test]
     fn test_iso8601_timestamp_with_timezone() {
         let items = vec![
-            HashMap::from([
-                ("event_time".to_string(), av_string("2023-08-31T12:34:56+00:00")),
-            ]),
-            HashMap::from([
-                ("event_time".to_string(), av_string("2024-01-15T08:22:11-05:00")),
-            ]),
+            HashMap::from([(
+                "event_time".to_string(),
+                av_string("2023-08-31T12:34:56+00:00"),
+            )]),
+            HashMap::from([(
+                "event_time".to_string(),
+                av_string("2024-01-15T08:22:11-05:00"),
+            )]),
         ];
 
         let schema = infer_arrow_schema_from_items(&items).unwrap();
         let event_time_field = schema.field_with_name("event_time").unwrap();
 
         assert!(matches!(
-        event_time_field.data_type(),
-        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
-    ));
+            event_time_field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+        ));
     }
 
     #[test]
@@ -649,12 +654,8 @@ mod tests {
     #[test]
     fn test_mixed_timestamp_and_plain_string_falls_back_to_utf8() {
         let items = vec![
-            HashMap::from([
-                ("value".to_string(), av_string("2023-08-31T12:34:56Z")),
-            ]),
-            HashMap::from([
-                ("value".to_string(), av_string("not a timestamp")),
-            ]),
+            HashMap::from([("value".to_string(), av_string("2023-08-31T12:34:56Z"))]),
+            HashMap::from([("value".to_string(), av_string("not a timestamp"))]),
         ];
 
         let schema = infer_arrow_schema_from_items(&items).unwrap();
@@ -666,12 +667,8 @@ mod tests {
     #[test]
     fn test_mixed_date_and_plain_string_falls_back_to_utf8() {
         let items = vec![
-            HashMap::from([
-                ("value".to_string(), av_string("2024-01-15")),
-            ]),
-            HashMap::from([
-                ("value".to_string(), av_string("random text")),
-            ]),
+            HashMap::from([("value".to_string(), av_string("2024-01-15"))]),
+            HashMap::from([("value".to_string(), av_string("random text"))]),
         ];
 
         let schema = infer_arrow_schema_from_items(&items).unwrap();
@@ -683,12 +680,8 @@ mod tests {
     #[test]
     fn test_mixed_timestamp_and_date_falls_back_to_utf8() {
         let items = vec![
-            HashMap::from([
-                ("value".to_string(), av_string("2023-08-31T12:34:56Z")),
-            ]),
-            HashMap::from([
-                ("value".to_string(), av_string("2024-01-15")),
-            ]),
+            HashMap::from([("value".to_string(), av_string("2023-08-31T12:34:56Z"))]),
+            HashMap::from([("value".to_string(), av_string("2024-01-15"))]),
         ];
 
         let schema = infer_arrow_schema_from_items(&items).unwrap();
@@ -755,9 +748,9 @@ mod tests {
 
         let created_at_field = schema.field_with_name("created_at").unwrap();
         assert!(matches!(
-        created_at_field.data_type(),
-        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
-    ));
+            created_at_field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+        ));
 
         let birth_date_field = schema.field_with_name("birth_date").unwrap();
         assert_eq!(birth_date_field.data_type(), &DataType::Date32);
@@ -772,7 +765,10 @@ mod tests {
             .map(|i| {
                 HashMap::from([
                     ("id".to_string(), av_string(&i.to_string())),
-                    ("timestamp".to_string(), av_string(&format!("2024-01-{:02}T10:00:00Z", i + 1))),
+                    (
+                        "timestamp".to_string(),
+                        av_string(&format!("2024-01-{:02}T10:00:00Z", i + 1)),
+                    ),
                 ])
             })
             .collect();
@@ -781,20 +777,16 @@ mod tests {
         let timestamp_field = schema.field_with_name("timestamp").unwrap();
 
         assert!(matches!(
-        timestamp_field.data_type(),
-        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
-    ));
+            timestamp_field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+        ));
     }
 
     #[test]
     fn test_empty_string_with_temporal_types() {
         let items = vec![
-            HashMap::from([
-                ("value".to_string(), av_string("2024-01-15")),
-            ]),
-            HashMap::from([
-                ("value".to_string(), av_string("")),
-            ]),
+            HashMap::from([("value".to_string(), av_string("2024-01-15"))]),
+            HashMap::from([("value".to_string(), av_string(""))]),
         ];
 
         let schema = infer_arrow_schema_from_items(&items).unwrap();
@@ -824,8 +816,8 @@ mod tests {
         let timestamp_field = schema.field_with_name("timestamp").unwrap();
 
         assert!(matches!(
-        timestamp_field.data_type(),
-        DataType::Timestamp(TimeUnit::Millisecond, Some(_))
-    ));
+            timestamp_field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+        ));
     }
 }
