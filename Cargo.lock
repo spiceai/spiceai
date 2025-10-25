@@ -12193,6 +12193,7 @@ name = "runtime-async"
 version = "1.8.3"
 dependencies = [
  "futures",
+ "num_cpus",
  "snafu",
  "tokio",
  "tracing",

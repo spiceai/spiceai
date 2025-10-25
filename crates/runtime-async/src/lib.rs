@@ -70,7 +70,12 @@ impl ManagedTokioRuntime {
     ///
     /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
     pub fn try_new() -> Result<Self> {
+        let cpu_cores = num_cpus::get();
+        let worker_threads = std::cmp::max(cpu_cores.saturating_sub(1), 1);
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            // Reserve one core for the primary Tokio runtime handling HTTP and control-plane work.
+            .worker_threads(worker_threads)
             .enable_all()
             .build()?;
         let handle = runtime.handle().clone();
