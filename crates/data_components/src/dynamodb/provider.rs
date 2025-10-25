@@ -51,6 +51,24 @@ use futures::stream::{StreamExt, TryStreamExt};
 use snafu::prelude::*;
 // use crate::dynamodb::expression::{combine_exprs_with_and, expr_to_dynamodb_filter};
 
+use datafusion::logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown};
+use datafusion::scalar::ScalarValue;
+
+fn scalar_to_attribute_value(scalar: &ScalarValue) -> datafusion::error::Result<AttributeValue> {
+    match scalar {
+        ScalarValue::Utf8(Some(s)) => Ok(AttributeValue::S(s.clone())),
+        ScalarValue::Int64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Float64(Some(f)) => Ok(AttributeValue::N(f.to_string())),
+        ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
+        ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
+        ScalarValue::Null => Ok(AttributeValue::Null(true)),
+        _ => Err(DataFusionError::NotImplemented(format!(
+            "ScalarValue type not supported"
+        ))),
+    }
+}
+
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
     client: Arc<Client>,
@@ -173,6 +191,154 @@ impl DynamoDBTableProvider {
 
         infer_arrow_schema_from_items(&unnested_items)
     }
+
+    fn build_filter_expression(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<(String, HashMap<String, AttributeValue>)> {
+        if filters.is_empty() {
+            return Ok((String::new(), HashMap::new()));
+        }
+
+        let mut attribute_values = HashMap::new();
+        let mut value_counter = 0;
+
+        let filter_parts: Vec<String> = filters
+            .iter()
+            .filter_map(|expr| {
+                self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter)
+                    .ok()
+            })
+            .collect();
+
+        if filter_parts.is_empty() {
+            return Ok((String::new(), HashMap::new()));
+        }
+
+        let filter_expr = filter_parts.join(" AND ");
+        Ok((filter_expr, attribute_values))
+    }
+
+    fn expr_to_filter_string(
+        &self,
+        expr: &Expr,
+        attribute_values: &mut HashMap<String, AttributeValue>,
+        value_counter: &mut usize,
+    ) -> datafusion::error::Result<String> {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                let left_str = self.expr_to_filter_string(left, attribute_values, value_counter)?;
+                let right_str =
+                    self.expr_to_filter_string(right, attribute_values, value_counter)?;
+
+                let op_str = match op {
+                    Operator::Eq => "=",
+                    Operator::NotEq => "<>",
+                    Operator::Lt => "<",
+                    Operator::LtEq => "<=",
+                    Operator::Gt => ">",
+                    Operator::GtEq => ">=",
+                    Operator::And => "AND",
+                    Operator::Or => "OR",
+                    _ => {
+                        return Err(DataFusionError::NotImplemented(format!(
+                            "Operator {:?} not supported",
+                            op
+                        )));
+                    }
+                };
+
+                Ok(format!("({} {} {})", left_str, op_str, right_str))
+            }
+            Expr::Column(col) => self
+                .column_to_alias_map
+                .get(col.name.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("Column {} not found", col.name))
+                }),
+            Expr::Literal(scalar, _) => {
+                let value_key = format!(":v{}", value_counter);
+                *value_counter += 1;
+
+                let attr_value = scalar_to_attribute_value(scalar)?;
+                attribute_values.insert(value_key.clone(), attr_value);
+
+                Ok(value_key)
+            }
+            _ => Err(DataFusionError::NotImplemented(format!(
+                "Expression type not supported in filters"
+            ))),
+        }
+    }
+
+    fn add_filter_column_aliases(
+        &self,
+        filters: &[Expr],
+        attribute_names: &mut HashMap<String, String>,
+    ) {
+        for expr in filters {
+            self.extract_columns_from_expr(expr, attribute_names);
+        }
+    }
+
+    fn extract_columns_from_expr(
+        &self,
+        expr: &Expr,
+        attribute_names: &mut HashMap<String, String>,
+    ) {
+        match expr {
+            Expr::Column(col) => {
+                if let Some(alias) = self.column_to_alias_map.get(col.name.as_str()) {
+                    attribute_names.insert(alias.clone(), col.name.to_string());
+                }
+            }
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                self.extract_columns_from_expr(left, attribute_names);
+                self.extract_columns_from_expr(right, attribute_names);
+            }
+            _ => {}
+        }
+    }
+
+    fn is_filter_supported(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                // Check if operator is supported
+                let op_supported = matches!(
+                    op,
+                    Operator::Eq
+                        | Operator::NotEq
+                        | Operator::Lt
+                        | Operator::LtEq
+                        | Operator::Gt
+                        | Operator::GtEq
+                        | Operator::And
+                        | Operator::Or
+                );
+
+                op_supported && self.is_filter_supported(left) && self.is_filter_supported(right)
+            }
+            Expr::Column(col) => {
+                // Check if column exists in schema
+                self.column_to_alias_map.contains_key(col.name.as_str())
+            }
+            Expr::Literal(scalar, _) => {
+                // Check if literal type is supported
+                matches!(
+                    scalar,
+                    ScalarValue::Utf8(_)
+                        | ScalarValue::Int64(_)
+                        | ScalarValue::Int32(_)
+                        | ScalarValue::Float64(_)
+                        | ScalarValue::Float32(_)
+                        | ScalarValue::Boolean(_)
+                        | ScalarValue::Null
+                )
+            }
+            _ => false,
+        }
+    }
 }
 
 fn build_column_alias_maps(
@@ -245,41 +411,77 @@ impl TableProvider for DynamoDBTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let mut request = self.client.scan().table_name(self.table_name.to_string());
+
+        // Build projection expression using aliases
+        let projected_schema = project_schema(&self.table_schema, projection)?;
+        let projection_expr: Vec<_> = projected_schema
+            .fields()
+            .iter()
+            .filter_map(|f| self.column_to_alias_map.get(f.name()))
+            .cloned()
+            .collect();
+
+        if !projection_expr.is_empty() {
+            println!("projection_expr: {:?}", projection_expr);
+            request = request.projection_expression(projection_expr.join(", "));
+        }
+
+        // Build filter expression (you need to implement this)
+        let (filter_str, attribute_values) = self.build_filter_expression(filters)?;
+        if !filter_str.is_empty() {
+            println!("filter_str: {:?}", filter_str);
+            println!("attribute_values: {:?}", attribute_values);
+            request = request.filter_expression(filter_str);
+            request = request.set_expression_attribute_values(Some(attribute_values));
+        }
+
+        // Collect aliases used in projection and filters
+        let mut attribute_names = HashMap::new();
+        for field in projected_schema.fields() {
+            if let Some(alias) = self.column_to_alias_map.get(field.name()) {
+                attribute_names.insert(alias.clone(), field.name().clone());
+            }
+        }
+        self.add_filter_column_aliases(filters, &mut attribute_names);
+
+        if !attribute_names.is_empty() {
+            println!("attribute_names: {:?}", attribute_names);
+            request = request.set_expression_attribute_names(Some(attribute_names));
+        }
+
         if let Some(limit) = limit {
             request = request.limit(
                 i32::try_from(limit)
-                    .map_err(|_| DataFusionError::Execution("Limit is too large".to_string()))?,
+                    .map_err(|_| DataFusionError::Execution("Limit too large".to_string()))?,
             );
         }
 
-        // let mut request = match combine_exprs_with_and(filters) {
-        //     Some(e) => {
-        //         let filter = expr_to_dynamodb_filter(&e).ok_or(DataFusionError::Execution(
-        //             "Failed to convert expressions".to_string(),
-        //         ))?;
-        //         request
-        //             .filter_expression(&filter.filter_expression)
-        //             .set_expression_attribute_names(Some(filter.expression_attribute_names))
-        //             .set_expression_attribute_values(Some(filter.expression_attribute_values))
-        //     },
-        //     None => request,
-        // };
-
-        if let Some((projection, names)) = projection_expression(projection, &self.table_schema) {
-            request = request.projection_expression(projection);
-            for (placeholder, name) in &names {
-                request = request.expression_attribute_names(placeholder, name);
-            }
-        }
-        let projected_schema = project_schema(&self.table_schema, projection)?;
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             request,
             projected_schema,
         )))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        let support: Vec<_> = filters
+            .iter()
+            .map(|expr| {
+                if self.is_filter_supported(expr) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect();
+
+        Ok(support)
     }
 }
 
