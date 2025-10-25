@@ -41,7 +41,7 @@ use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, Stats};
@@ -112,7 +112,7 @@ impl Read for DeltaTableFactory {
 #[derive(Debug)]
 pub struct DeltaTable {
     table_url: Url,
-    engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     arrow_schema: SchemaRef,
     delta_schema: delta_kernel::schema::SchemaRef,
 }
@@ -154,10 +154,7 @@ impl DeltaTable {
             (true, Some(sdk_config)) => {
                 let region = storage_options.get("aws_region").map(ToString::to_string);
                 aws_sdk_credential_bridge::from_s3_url_and_config(
-                    &table_url,
-                    region,
-                    sdk_config,
-                    io_runtime.clone(),
+                    &table_url, region, sdk_config, io_runtime,
                 )
                 .ok()
             }
@@ -167,13 +164,13 @@ impl DeltaTable {
         let engine = match table_object_store {
             Some(object_store) => Arc::new(DefaultEngine::new(
                 object_store.into(),
-                Arc::new(TokioMultiThreadExecutor::new(io_runtime)),
+                Arc::new(TokioBackgroundExecutor::default()),
             )),
             None => Arc::new(
                 DefaultEngine::try_new(
                     &table_url,
                     storage_options,
-                    Arc::new(TokioMultiThreadExecutor::new(io_runtime)),
+                    Arc::new(TokioBackgroundExecutor::default()),
                 )
                 .map_err(handle_delta_error)?,
             ),
@@ -557,13 +554,13 @@ impl TableProvider for DeltaTable {
 
 struct ScanContext {
     pub errs: Vec<datafusion::error::DataFusionError>,
-    engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     pub files: Vec<PartitionFileContext>,
     table_root: Url,
 }
 
 impl ScanContext {
-    fn new(engine: Arc<DefaultEngine<TokioMultiThreadExecutor>>, table_root: Url) -> Self {
+    fn new(engine: Arc<DefaultEngine<TokioBackgroundExecutor>>, table_root: Url) -> Self {
         Self {
             engine,
             errs: Vec::new(),
