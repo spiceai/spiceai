@@ -19,6 +19,7 @@ use std::sync::Arc;
 mod arrow;
 pub mod provider;
 mod schema;
+mod unnest;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -49,4 +50,7 @@ pub enum Error {
     ConversionError {
         source: Box<dyn std::error::Error + std::marker::Send + Sync>,
     },
+
+    #[snafu(display("Invalid item access: {message}"))]
+    InvalidItemAccess { message: String },
 }
