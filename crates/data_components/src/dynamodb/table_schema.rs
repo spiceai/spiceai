@@ -6,6 +6,13 @@ use datafusion::scalar::ScalarValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub partition_key: String,
+    pub sort_key: Option<String>,
+}
+
 /// Encapsulates DynamoDB table schema, keys, and expression conversion logic.
 /// This struct knows WHAT the table structure is and WHAT operations are supported.
 #[derive(Debug, Clone)]
@@ -14,6 +21,7 @@ pub struct DynamoDBTableSchema {
     pub table_schema: SchemaRef,
     pub partition_key: String,
     pub sort_key: Option<String>,
+    pub global_secondary_indexes: Vec<IndexInfo>,
     pub column_to_alias_map: HashMap<String, String>, // actual_name -> #c0
     pub alias_to_column_map: HashMap<String, String>, // #c0 -> actual_name
 }
@@ -24,6 +32,7 @@ impl DynamoDBTableSchema {
         table_schema: SchemaRef,
         partition_key: String,
         sort_key: Option<String>,
+        gsi_info: Vec<IndexInfo>,
     ) -> Self {
         let (column_to_alias_map, alias_to_column_map) = build_column_alias_maps(&table_schema);
 
@@ -32,6 +41,7 @@ impl DynamoDBTableSchema {
             table_schema,
             partition_key,
             sort_key,
+            global_secondary_indexes: gsi_info,
             column_to_alias_map,
             alias_to_column_map,
         }
@@ -301,6 +311,7 @@ mod tests {
             schema,
             "id".to_string(),
             Some("sort_key".to_string()),
+            Vec::new(),
         )
     }
 
@@ -331,8 +342,13 @@ mod tests {
     fn test_sort_key_optional() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
 
-        let table_schema =
-            DynamoDBTableSchema::new(Arc::from("test_table"), schema, "id".to_string(), None);
+        let table_schema = DynamoDBTableSchema::new(
+            Arc::from("test_table"),
+            schema,
+            "id".to_string(),
+            None,
+            Vec::new(),
+        );
 
         assert_eq!(table_schema.sort_key(), None);
     }

@@ -308,6 +308,7 @@ mod tests {
             schema,
             "id".to_string(),
             Some("sort_key".to_string()),
+            Vec::new(),
         )
     }
 
@@ -626,6 +627,7 @@ mod tests {
             schema,
             "id".to_string(),
             None, // No sort key
+            Vec::new(),
         );
 
         let client = create_test_client().await;

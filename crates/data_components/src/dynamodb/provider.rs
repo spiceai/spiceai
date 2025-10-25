@@ -49,7 +49,7 @@ use datafusion::{
 use snafu::prelude::*;
 
 use crate::dynamodb::request_builder::{DynamoDBRequest, DynamoDBRequestBuilder};
-use crate::dynamodb::table_schema::DynamoDBTableSchema;
+use crate::dynamodb::table_schema::{DynamoDBTableSchema, IndexInfo};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 
 #[derive(Debug)]
@@ -60,7 +60,7 @@ pub struct DynamoDBTableProvider {
 
 impl DynamoDBTableProvider {
     pub async fn try_new(client: Arc<Client>, table_name: Arc<str>) -> Result<Self, Error> {
-        let (table_schema, partition_key, sort_key) =
+        let (table_schema, partition_key, sort_key, gsi_info) =
             Self::fetch_table_metadata(Arc::clone(&client), &table_name).await?;
 
         Ok(Self {
@@ -70,6 +70,7 @@ impl DynamoDBTableProvider {
                 table_schema,
                 partition_key,
                 sort_key,
+                gsi_info,
             ),
         })
     }
@@ -77,7 +78,7 @@ impl DynamoDBTableProvider {
     async fn fetch_table_metadata(
         client: Arc<Client>,
         table_name: &str,
-    ) -> Result<(SchemaRef, String, Option<String>)> {
+    ) -> Result<(SchemaRef, String, Option<String>, Vec<IndexInfo>)> {
         let response = client
             .describe_table()
             .table_name(table_name)
@@ -118,6 +119,32 @@ impl DynamoDBTableProvider {
             unreachable!("Table must have a partition key")
         };
 
+        let mut gsi_info = Vec::new();
+        for gsi in table.global_secondary_indexes() {
+            let mut gsi_partition_key = None;
+            let mut gsi_sort_key = None;
+
+            for key in gsi.key_schema() {
+                match key.key_type() {
+                    KeyType::Hash => {
+                        gsi_partition_key = Some(key.attribute_name().to_string());
+                    }
+                    KeyType::Range => {
+                        gsi_sort_key = Some(key.attribute_name().to_string());
+                    }
+                    _ => {}
+                }
+            }
+
+            if let (Some(name), Some(pk)) = (gsi.index_name(), gsi_partition_key) {
+                gsi_info.push(IndexInfo {
+                    name: name.to_string(),
+                    partition_key: pk,
+                    sort_key: gsi_sort_key,
+                });
+            }
+        }
+
         let mut request = client.scan().table_name(table_name);
 
         if let Some(limit) = Some(10) {
@@ -141,6 +168,7 @@ impl DynamoDBTableProvider {
             infer_arrow_schema_from_items(&unnested_items)?,
             partition_key,
             sort_key,
+            gsi_info,
         ))
     }
 }
