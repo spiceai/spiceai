@@ -16,6 +16,13 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, fmt, io::Cursor, sync::Arc};
 
+use super::{
+    DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
+    TableStatusIsNotActiveSnafu,
+};
+use crate::dynamodb::arrow::attribute_map_to_json;
+use crate::dynamodb::schema::infer_arrow_schema_from_items;
+use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
@@ -38,14 +45,6 @@ use datafusion::{
     },
     prelude::Expr,
 };
-
-use super::{
-    DescribeTableSnafu, Error, Result, ScanSnafu, SchemaInferenceSnafu, TableDoesNotExistSnafu,
-    TableStatusIsNotActiveSnafu,
-};
-use crate::dynamodb::arrow::attribute_map_to_json;
-use crate::dynamodb::schema::infer_arrow_schema_from_items;
-use serde_json::Value;
 use snafu::prelude::*;
 
 #[derive(Debug)]
@@ -104,13 +103,20 @@ impl DynamoDBTableProvider {
             request = request.limit(limit);
         }
 
-        let output = request
+        let items: Vec<_> = request
             .send()
             .await
             .map_err(map_sdk_error)
-            .context(ScanSnafu)?;
+            .context(ScanSnafu)?
+            .items()
+            .to_vec();
 
-        infer_arrow_schema_from_items(output.items())
+        let unnested_items = match Some(1) {
+            None | Some(0) => items,
+            Some(unnest_depth) => unnest_dynamodb_items(items, unnest_depth)?,
+        };
+
+        infer_arrow_schema_from_items(&unnested_items)
     }
 }
 
