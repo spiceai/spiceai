@@ -18,7 +18,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{Error, Result};
+use super::Result;
 
 pub fn infer_arrow_schema_from_items(
     items: &[HashMap<String, AttributeValue>],

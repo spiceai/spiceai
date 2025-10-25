@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, fmt, io::Cursor, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use super::{
     DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
@@ -46,7 +46,6 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use futures::stream::{StreamExt, TryStreamExt};
 use snafu::prelude::*;
 
 use crate::dynamodb::request_builder::{DynamoDBRequest, DynamoDBRequestBuilder};

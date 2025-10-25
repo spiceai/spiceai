@@ -247,7 +247,7 @@ impl<'a> DynamoDBRequestBuilder<'a> {
 
     fn try_extract_key_filter(&self, expr: &Expr) -> Option<KeyFilter> {
         match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            Expr::BinaryExpr(BinaryExpr { left, op, .. }) => {
                 if let Expr::Column(col) = left.as_ref() {
                     if col.name.as_str() == self.schema.partition_key.as_str() {
                         // Partition key must use = operator
