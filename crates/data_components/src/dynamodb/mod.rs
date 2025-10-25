@@ -16,6 +16,7 @@ limitations under the License.
 use snafu::Snafu;
 use std::sync::Arc;
 
+mod arrow;
 pub mod provider;
 mod schema;
 
@@ -42,5 +43,10 @@ pub enum Error {
     TableStatusIsNotActive,
 
     #[snafu(display("Failed to infer schema: {source}"))]
-    SchemaInferenceError { source: arrow::error::ArrowError },
+    SchemaInferenceError { source: ::arrow::error::ArrowError },
+
+    #[snafu(display("Failed to convert DynamoDB items to Arrow: {source}"))]
+    ConversionError {
+        source: Box<dyn std::error::Error + std::marker::Send + Sync>,
+    },
 }

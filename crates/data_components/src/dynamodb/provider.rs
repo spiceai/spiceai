@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, fmt, io::Cursor, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, json::{ReaderBuilder}};
+use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
@@ -43,6 +43,7 @@ use super::{
     DescribeTableSnafu, Error, Result, ScanSnafu, SchemaInferenceSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
+use crate::dynamodb::arrow::attribute_map_to_json;
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use serde_json::Value;
 use snafu::prelude::*;
@@ -110,37 +111,6 @@ impl DynamoDBTableProvider {
             .context(ScanSnafu)?;
 
         infer_arrow_schema_from_items(output.items())
-    }
-}
-
-fn attribute_map_to_json(map: &HashMap<String, AttributeValue>) -> Value {
-    Value::Object(
-        map.iter()
-            .map(|(k, v)| (k.clone(), attribute_value_to_json(v)))
-            .collect(),
-    )
-}
-
-fn attribute_value_to_json(av: &AttributeValue) -> Value {
-    match av {
-        AttributeValue::S(s) => Value::String(s.clone()),
-        AttributeValue::N(n) => {
-            // DynamoDB numbers are strings, so we need to parse them
-            if let Ok(i) = n.parse::<i64>() {
-                Value::Number(i.into())
-            } else if let Ok(f) = n.parse::<f64>() {
-                // Need to check if it's a valid JSON number
-                serde_json::Number::from_f64(f)
-                    .map(Value::Number)
-                    .unwrap_or(Value::String(n.clone()))
-            } else {
-                Value::String(n.clone())
-            }
-        }
-        AttributeValue::Bool(b) => Value::Bool(*b),
-        AttributeValue::L(list) => Value::Array(list.iter().map(attribute_value_to_json).collect()),
-        AttributeValue::M(map) => attribute_map_to_json(map),
-        AttributeValue::Null(_) | _ => Value::Null,
     }
 }
 
