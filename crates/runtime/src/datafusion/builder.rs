@@ -305,8 +305,6 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
-            tokio_runtime: OnceLock::new(),
-            temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,

@@ -51,7 +51,7 @@ use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use async_stream::stream;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
