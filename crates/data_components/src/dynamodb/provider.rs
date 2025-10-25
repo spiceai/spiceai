@@ -145,6 +145,8 @@ impl DynamoDBTableProvider {
             }
         }
 
+        println!("gsi_info: {:#?}", gsi_info);
+
         let mut request = client.scan().table_name(table_name);
 
         if let Some(limit) = Some(10) {

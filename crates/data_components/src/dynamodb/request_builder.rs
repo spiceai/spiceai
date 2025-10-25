@@ -1,4 +1,4 @@
-use crate::dynamodb::table_schema::DynamoDBTableSchema;
+use crate::dynamodb::table_schema::{DynamoDBTableSchema, IndexInfo};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
 use aws_sdk_dynamodb::operation::scan::builders::ScanFluentBuilder;
@@ -22,6 +22,12 @@ pub struct DynamoDBRequestBuilder<'a> {
 enum KeyFilter {
     Partition(Expr),
     Sort(Expr),
+}
+
+#[derive(Debug, Clone)]
+pub enum IndexSelection {
+    BaseTable,
+    GSI(String), // GSI name
 }
 
 impl<'a> DynamoDBRequestBuilder<'a> {
@@ -53,7 +59,7 @@ impl<'a> DynamoDBRequestBuilder<'a> {
             })
             .transpose()?;
 
-        if let Some((partition_expr, sort_expr)) = key_filters {
+        if let Some((partition_expr, sort_expr, index_selection)) = key_filters {
             self.build_query_request(
                 &partition_expr,
                 sort_expr.as_ref(),
@@ -61,6 +67,7 @@ impl<'a> DynamoDBRequestBuilder<'a> {
                 projection_expr.as_deref(),
                 attribute_names,
                 limit_i32,
+                index_selection,
             )
         } else {
             self.build_scan_request(
@@ -80,6 +87,7 @@ impl<'a> DynamoDBRequestBuilder<'a> {
         projection: Option<&str>,
         attribute_names: HashMap<String, String>,
         limit: Option<i32>,
+        index_selection: IndexSelection,
     ) -> DataFusionResult<DynamoDBRequest> {
         println!("!! QUERY !!");
 
@@ -87,6 +95,16 @@ impl<'a> DynamoDBRequestBuilder<'a> {
             .client
             .query()
             .table_name(self.schema.table_name().to_string());
+
+        match index_selection {
+            IndexSelection::BaseTable => {
+                println!("!! QUERY - Base Table !!");
+            }
+            IndexSelection::GSI(index_name) => {
+                println!("!! QUERY - GSI: {} !!", index_name);
+                query_request = query_request.index_name(index_name);
+            }
+        }
 
         let (key_condition, mut key_values) = self
             .schema
@@ -165,35 +183,66 @@ impl<'a> DynamoDBRequestBuilder<'a> {
         Ok(DynamoDBRequest::Scan(scan_request))
     }
 
-    fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
+    fn separate_key_filters(
+        &self,
+        filters: &[Expr],
+    ) -> (Option<(Expr, Option<Expr>, IndexSelection)>, Vec<Expr>) {
+        // Check for OR conditions first - if present, can't use Query
+        let has_or = filters.iter().any(|f| self.contains_or(f));
+        if has_or {
+            return (None, filters.to_vec());
+        }
+
+        // Try to match base table keys first
+        if let Some((partition, sort, other)) = self.try_match_index(
+            filters,
+            &self.schema.partition_key,
+            self.schema.sort_key.as_deref(),
+        ) {
+            return (Some((partition, sort, IndexSelection::BaseTable)), other);
+        }
+
+        // Try each GSI
+        for gsi in &self.schema.global_secondary_indexes {
+            if let Some((partition, sort, other)) =
+                self.try_match_index(filters, &gsi.partition_key, gsi.sort_key.as_deref())
+            {
+                return (
+                    Some((partition, sort, IndexSelection::GSI(gsi.name.clone()))),
+                    other,
+                );
+            }
+        }
+
+        // No matching index found - must use Scan
+        (None, filters.to_vec())
+    }
+
+    /// Attempts to match filters against a specific index (base table or GSI)
+    fn try_match_index(
+        &self,
+        filters: &[Expr],
+        partition_key: &str,
+        sort_key: Option<&str>,
+    ) -> Option<(Expr, Option<Expr>, Vec<Expr>)> {
         let mut partition_expr = None;
         let mut sort_expr = None;
         let mut other_filters = Vec::new();
-        let mut has_or = false;
 
         for filter in filters {
-            if self.contains_or(filter) {
-                has_or = true;
-                other_filters.push(filter.clone());
-                continue;
-            }
-
-            println!("filter: {:?}", filter);
-            println!("extracted: {:?}", self.try_extract_key_filter(filter));
-
-            if let Some(extracted) = self.try_extract_key_filter(filter) {
+            if let Some(extracted) = self.try_extract_key_filter(filter, partition_key, sort_key) {
                 match extracted {
                     KeyFilter::Partition(expr) => {
                         if partition_expr.is_some() {
                             // Multiple partition key filters - invalid
-                            return (None, filters.to_vec());
+                            return None;
                         }
                         partition_expr = Some(expr);
                     }
                     KeyFilter::Sort(expr) => {
                         if sort_expr.is_some() {
                             // Multiple sort key filters - invalid
-                            return (None, filters.to_vec());
+                            return None;
                         }
                         sort_expr = Some(expr);
                     }
@@ -203,11 +252,8 @@ impl<'a> DynamoDBRequestBuilder<'a> {
             }
         }
 
-        if has_or || partition_expr.is_none() {
-            return (None, filters.to_vec());
-        }
-
-        (Some((partition_expr.unwrap(), sort_expr)), other_filters)
+        // Must have partition key to use Query
+        partition_expr.map(|p| (p, sort_expr, other_filters))
     }
 
     fn build_projection_expression(&self, projection: SchemaRef) -> Option<String> {
@@ -245,17 +291,23 @@ impl<'a> DynamoDBRequestBuilder<'a> {
         }
     }
 
-    fn try_extract_key_filter(&self, expr: &Expr) -> Option<KeyFilter> {
+    /// Extracts key filter if the expression matches the specified partition or sort key
+    fn try_extract_key_filter(
+        &self,
+        expr: &Expr,
+        partition_key: &str,
+        sort_key: Option<&str>,
+    ) -> Option<KeyFilter> {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, .. }) => {
                 if let Expr::Column(col) = left.as_ref() {
-                    if col.name.as_str() == self.schema.partition_key.as_str() {
+                    if col.name.as_str() == partition_key {
                         // Partition key must use = operator
                         if matches!(op, Operator::Eq) {
                             return Some(KeyFilter::Partition(expr.clone()));
                         }
-                    } else if let Some(ref sort_key) = self.schema.sort_key {
-                        if col.name.as_str() == sort_key.as_str() {
+                    } else if let Some(sk) = sort_key {
+                        if col.name.as_str() == sk {
                             // Sort key can use =, <, >, <=, >=
                             if matches!(
                                 op,
