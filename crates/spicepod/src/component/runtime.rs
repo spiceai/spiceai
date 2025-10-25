@@ -271,20 +271,15 @@ impl TaskHistory {
             return Ok(TaskHistoryCapturedPlan::None);
         };
 
-        let captured_plan_lower = captured_plan.to_lowercase();
-
-        if captured_plan_lower == "none" {
-            return Ok(TaskHistoryCapturedPlan::None);
-        } else if captured_plan_lower == "explain" {
-            return Ok(TaskHistoryCapturedPlan::Explain);
-        } else if captured_plan_lower == "explain analyze" {
-            return Ok(TaskHistoryCapturedPlan::ExplainAnalyze);
+        match captured_plan.to_lowercase().as_str() {
+            "none" => Ok(TaskHistoryCapturedPlan::None),
+            "explain" => Ok(TaskHistoryCapturedPlan::Explain),
+            "explain analyze" => Ok(TaskHistoryCapturedPlan::ExplainAnalyze),
+            _ => Err(format!(
+                r#"Expected "none", "explain", or "explain analyze" for "captured_plan", but got: "{captured_plan}""#
+            )
+            .into()),
         }
-
-        Err(format!(
-            r#"Expected "none", "explain", or "explain analyze" for "captured_plan", but got: "{captured_plan}""#
-        )
-        .into())
     }
 
     fn retention_value_as_secs(

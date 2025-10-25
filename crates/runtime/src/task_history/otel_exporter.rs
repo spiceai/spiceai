@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::util::pretty::pretty_format_batches;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use tracing::Instrument;
 
 use futures::future::BoxFuture;
 use opentelemetry::trace::{SpanId, TraceError};
@@ -100,18 +103,14 @@ impl TaskHistoryExporter {
         captured_plan: TaskHistoryCapturedPlan,
         _min_plan_duration_ms: Option<f64>,
     ) {
-        use arrow::util::pretty::pretty_format_batches;
-        use futures::StreamExt;
-        use tracing::Instrument;
-
         for span in spans {
             let explain_query = match captured_plan {
                 TaskHistoryCapturedPlan::None => continue,
                 TaskHistoryCapturedPlan::Explain => {
-                    format!("EXPLAIN {}", span.input.as_ref())
+                    format!("EXPLAIN {sql_input}")
                 }
                 TaskHistoryCapturedPlan::ExplainAnalyze => {
-                    format!("EXPLAIN ANALYZE {}", span.input.as_ref())
+                    format!("EXPLAIN ANALYZE {sql_input}")
                 }
             };
 
