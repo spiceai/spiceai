@@ -17,6 +17,7 @@ use snafu::Snafu;
 use std::sync::Arc;
 
 pub mod provider;
+mod schema;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

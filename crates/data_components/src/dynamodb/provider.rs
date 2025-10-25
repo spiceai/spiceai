@@ -46,6 +46,7 @@ use super::{
     DescribeTableSnafu, Error, Result, ScanSnafu, SchemaInferenceSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
+use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use serde_json::Value;
 use snafu::prelude::*;
 
@@ -97,36 +98,25 @@ impl DynamoDBTableProvider {
         Ok(table_status.clone())
     }
 
-    async fn scan(
-        client: Arc<Client>,
-        table_name: &str,
-        limit: Option<i32>,
-    ) -> Result<Vec<Value>, Error> {
+    pub async fn schema(client: Arc<Client>, table_name: &str) -> Result<SchemaRef> {
         let mut request = client.scan().table_name(table_name);
-        if let Some(limit) = limit {
+
+        if let Some(limit) = Some(10) {
+            // TODO
             request = request.limit(limit);
         }
 
-        let response = request
+        let output = request
             .send()
             .await
             .map_err(map_sdk_error)
             .context(ScanSnafu)?;
 
-        let mut result = Vec::new();
-        for item in response.items() {
-            result.push(attribute_map_to_json(item));
-        }
-        Ok(result)
-    }
-
-    pub async fn schema(client: Arc<Client>, table_name: &str) -> Result<SchemaRef, Error> {
-        let json_values = Self::scan(client, table_name, Some(10)).await?;
-        infer_schema(&json_values)
+        infer_arrow_schema_from_items(output.items())
     }
 }
 
-fn infer_schema(json_values: &[Value]) -> Result<SchemaRef, Error> {
+fn infer_schema(json_values: &[Value]) -> Result<SchemaRef> {
     let schema = infer_json_schema_from_iterator(json_values.iter().map(Result::Ok))
         .context(SchemaInferenceSnafu)?;
 
