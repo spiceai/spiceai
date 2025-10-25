@@ -198,6 +198,8 @@ pub struct TaskHistory {
     pub retention_period: Arc<str>,
     #[serde(default = "default_retention_check_interval")]
     pub retention_check_interval: Arc<str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_sql_duration: Option<Arc<str>>,
 }
 
 fn default_none() -> Arc<str> {
@@ -219,6 +221,7 @@ impl Default for TaskHistory {
             captured_output: default_none(),
             retention_period: default_retention_period(),
             retention_check_interval: default_retention_check_interval(),
+            min_sql_duration: None,
         }
     }
 }
@@ -268,6 +271,22 @@ impl TaskHistory {
 
     pub fn retention_check_interval_as_secs(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
         Self::retention_value_as_secs(&self.retention_check_interval, "check interval")
+    }
+
+    /// Parses the `min_sql_duration` field into milliseconds as f64. Returns `Ok(None)` if not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the duration string cannot be parsed.
+    pub fn min_sql_duration_as_millis(&self) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+        let Some(min_sql_duration) = &self.min_sql_duration else {
+            return Ok(None);
+        };
+
+        let duration =
+            fundu::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
+
+        Ok(Some(duration.as_secs_f64() * 1000.0))
     }
 }
 
@@ -702,5 +721,90 @@ mod tests {
         ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
+    }
+
+    #[test]
+    fn test_task_history_min_duration() {
+        // Test default (no min_sql_duration)
+        let task_history = TaskHistory::default();
+        assert_eq!(task_history.min_sql_duration, None);
+        assert_eq!(
+            task_history
+                .min_sql_duration_as_millis()
+                .expect("should parse successfully"),
+            None
+        );
+
+        // Test with various duration formats
+        let test_cases = vec![
+            ("5ms", 5.0),
+            ("100ms", 100.0),
+            ("1s", 1000.0),
+            ("2.5s", 2500.0),
+            ("1m", 60_000.0),
+            ("1h", 3_600_000.0),
+        ];
+
+        for (duration_str, expected_ms) in test_cases {
+            let task_history = TaskHistory {
+                enabled: true,
+                captured_output: "none".into(),
+                retention_period: "8h".into(),
+                retention_check_interval: "15m".into(),
+                min_sql_duration: Some(duration_str.into()),
+            };
+
+            let result = task_history
+                .min_sql_duration_as_millis()
+                .expect("should parse successfully");
+            assert_eq!(
+                result,
+                Some(expected_ms),
+                "Failed for duration: {duration_str}"
+            );
+        }
+
+        // Test invalid duration
+        let task_history = TaskHistory {
+            enabled: true,
+            captured_output: "none".into(),
+            retention_period: "8h".into(),
+            retention_check_interval: "15m".into(),
+            min_sql_duration: Some("invalid".into()),
+        };
+        assert!(
+            task_history.min_sql_duration_as_millis().is_err(),
+            "should fail for invalid duration"
+        );
+    }
+
+    #[test]
+    fn test_task_history_yaml_parsing() {
+        // Test with min_sql_duration
+        let yaml = r"
+            task_history:
+                enabled: true
+                captured_output: truncated
+                retention_period: 8h
+                retention_check_interval: 15m
+                min_sql_duration: 10ms
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
+        assert_eq!(
+            runtime
+                .task_history
+                .min_sql_duration_as_millis()
+                .expect("should parse"),
+            Some(10.0)
+        );
+
+        // Test without min_sql_duration (should use default None)
+        let yaml = r"
+            task_history:
+                enabled: true
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.task_history.min_sql_duration, None);
     }
 }
