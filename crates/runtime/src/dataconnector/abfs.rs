@@ -29,6 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
 use std::sync::{Arc, LazyLock};
+use tokio::runtime::Handle;
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -60,6 +61,7 @@ pub enum Error {
 #[derive(Debug)]
 pub struct AzureBlobFS {
     params: Parameters,
+    tokio_io_runtime: Handle,
 }
 
 #[derive(Default, Clone)]
@@ -206,6 +208,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
             if use_emulator {
                 let azure = AzureBlobFS {
                     params: params.parameters,
+                    tokio_io_runtime: params.io_runtime,
                 };
                 Ok(Arc::new(azure) as Arc<dyn DataConnector>)
             } else {
@@ -221,6 +224,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 } else {
                     let azure = AzureBlobFS {
                         params: params.parameters,
+                        tokio_io_runtime: params.io_runtime,
                     };
                     Ok(Arc::new(azure) as Arc<dyn DataConnector>)
                 }
@@ -250,6 +254,10 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> Handle {
+        self.tokio_io_runtime.clone()
     }
 
     fn get_object_store_url(

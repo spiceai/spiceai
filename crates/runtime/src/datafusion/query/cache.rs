@@ -311,6 +311,7 @@ mod tests {
         Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
     };
     use spicepod::component::caching::SQLResultsCacheConfig;
+    use tokio::runtime::Handle;
 
     use crate::{
         builder::RuntimeBuilder,
@@ -356,6 +357,7 @@ mod tests {
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
+                Handle::current(),
             )
             .with_caching(Arc::new(
                 Caching::new()

@@ -39,6 +39,7 @@ use runtime::{
     accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
 use spicepod::acceleration::Acceleration;
+use tokio::runtime::Handle;
 use tokio::time;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -118,9 +119,9 @@ async fn create_refresh_task(
             Arc::clone(&accelerated_table.get_federated_table()),
             None,
             accelerated_table.get_accelerator(),
-            None,
+            Handle::current(),
         )
-        .with_tokio_runtime(rt.datafusion().tokio_runtime().cloned())
+        .with_cpu_runtime(rt.datafusion().cpu_runtime().cloned())
         .build(),
         accelerated_table.refresh_params().read().await.clone(),
     ))
