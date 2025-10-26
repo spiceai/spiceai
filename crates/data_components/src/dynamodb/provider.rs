@@ -315,7 +315,7 @@ use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 
 async fn process_item_stream<E>(
-    pagination_stream: PaginationStream<Result<HashMap<String, AttributeValue>, E>>,
+    pagination_stream: PaginationStream<Result<HashMap<String, AttributeValue>, SdkError<E>>>,
     tx: Sender<datafusion::common::Result<RecordBatch>>,
     schema: SchemaRef,
     unnest_depth: Option<usize>,
@@ -330,7 +330,7 @@ where
     });
 
     let chunked_stream = item_stream
-        .map(|result| result.map_err(to_execution_error))
+        .map(|result| result.map_err(|e| to_execution_error(map_sdk_error(e))))
         .chunks(CHUNK_SIZE);
 
     pin_mut!(chunked_stream);
