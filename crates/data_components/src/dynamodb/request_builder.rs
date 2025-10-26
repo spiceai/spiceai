@@ -385,17 +385,18 @@ pub fn build_request_from_plan(client: &Client, request: DynamoDBRequestPlan) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_dynamodb::types::AttributeValue;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
     use std::sync::Arc;
 
     fn create_test_schema() -> DynamoDBTableSchema {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("sort_key", DataType::Utf8, true),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("age", DataType::Int64, true),
-            Field::new("active", DataType::Boolean, true),
+            Field::new("id", DataType::Utf8, false),        // #c0
+            Field::new("sort_key", DataType::Utf8, true),   // #c1
+            Field::new("name", DataType::Utf8, true),       // #c2
+            Field::new("age", DataType::Int64, true),       // #c3
+            Field::new("active", DataType::Boolean, true),  // #c4
         ]));
 
         DynamoDBTableSchema::new(
@@ -428,7 +429,29 @@ mod tests {
         match result {
             DynamoDBRequestPlan::Query(params) => {
                 assert_eq!(params.table_name, "test_table");
-                assert!(params.key_condition_expression.is_some());
+
+                // Key condition should be: (#c0 = :v1000)
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#c0 = :v1000)".to_string())
+                );
+
+                // Should have attribute name for id
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
+
+                // Should have attribute value for user123
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v1000"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+
+                // No filter expression for partition key only
+                assert_eq!(params.filter_expression, None);
+
+                // Projection should be present
+                assert!(params.projection_expression.is_some());
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
@@ -450,7 +473,30 @@ mod tests {
         match result {
             DynamoDBRequestPlan::Query(params) => {
                 assert_eq!(params.table_name, "test_table");
-                assert!(params.key_condition_expression.is_some());
+
+                // Key condition should be: (#c0 = :v1000) AND (#c1 = :v1001)
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#c0 = :v1000) AND (#c1 = :v1001)".to_string())
+                );
+
+                // Should have attribute names for id and sort_key
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
+                assert_eq!(attr_names.get("#c1"), Some(&"sort_key".to_string()));
+
+                // Should have attribute values
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v1000"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v1001"),
+                    Some(&AttributeValue::S("2024-01-01".to_string()))
+                );
+
+                assert_eq!(params.filter_expression, None);
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
@@ -469,8 +515,34 @@ mod tests {
         match result {
             DynamoDBRequestPlan::Query(params) => {
                 assert_eq!(params.table_name, "test_table");
-                assert!(params.key_condition_expression.is_some());
-                assert!(params.filter_expression.is_some());
+
+                // Key condition for partition key: (#c0 = :v1000)
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#c0 = :v1000)".to_string())
+                );
+
+                // Filter expression for age: (#c3 > :v0)
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c3 > :v0)".to_string())
+                );
+
+                // Should have attribute names for id and age
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
+                assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
+
+                // Should have attribute values (key values start at 1000, filter values at 0)
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v1000"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::N("18".to_string()))
+                );
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
@@ -489,7 +561,9 @@ mod tests {
         match result {
             DynamoDBRequestPlan::Scan(params) => {
                 assert_eq!(params.table_name, "test_table");
-                assert!(params.filter_expression.is_none());
+                assert_eq!(params.filter_expression, None);
+                assert_eq!(params.expression_attribute_values, None);
+                assert!(params.projection_expression.is_some());
             }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
         }
@@ -508,7 +582,23 @@ mod tests {
         match result {
             DynamoDBRequestPlan::Scan(params) => {
                 assert_eq!(params.table_name, "test_table");
-                assert!(params.filter_expression.is_some());
+
+                // Filter expression: (#c2 = :v0)
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c2 = :v0)".to_string())
+                );
+
+                // Should have attribute name for name
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c2"), Some(&"name".to_string()));
+
+                // Should have attribute value for John
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::S("John".to_string()))
+                );
             }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
         }
@@ -529,7 +619,28 @@ mod tests {
         let result = builder.plan(&filters, projection, None).unwrap();
 
         match result {
-            DynamoDBRequestPlan::Scan(_) => {}
+            DynamoDBRequestPlan::Scan(params) => {
+                assert_eq!(params.table_name, "test_table");
+
+                // Filter expression with OR: ((#c0 = :v0) OR (#c0 = :v1))
+                assert_eq!(
+                    params.filter_expression,
+                    Some("((#c0 = :v0) OR (#c0 = :v1))".to_string())
+                );
+
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
+
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v1"),
+                    Some(&AttributeValue::S("user456".to_string()))
+                );
+            }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request due to OR"),
         }
     }
@@ -547,6 +658,7 @@ mod tests {
         match result {
             DynamoDBRequestPlan::Query(params) => {
                 assert_eq!(params.limit, Some(10));
+                assert_eq!(params.table_name, "test_table");
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
@@ -574,22 +686,36 @@ mod tests {
         let schema = create_test_schema();
         let builder = DynamoDBRequestBuilder::new(&schema);
 
-        let sort_operators = vec![
-            col("sort_key").eq(lit("value")),
-            col("sort_key").lt(lit("value")),
-            col("sort_key").lt_eq(lit("value")),
-            col("sort_key").gt(lit("value")),
-            col("sort_key").gt_eq(lit("value")),
+        let test_cases = vec![
+            (col("sort_key").eq(lit("value")), "(#c1 = :v1001)"),
+            (col("sort_key").lt(lit("value")), "(#c1 < :v1001)"),
+            (col("sort_key").lt_eq(lit("value")), "(#c1 <= :v1001)"),
+            (col("sort_key").gt(lit("value")), "(#c1 > :v1001)"),
+            (col("sort_key").gt_eq(lit("value")), "(#c1 >= :v1001)"),
         ];
 
-        for sort_op in sort_operators {
+        for (sort_op, expected_sort_condition) in test_cases {
             let filters = vec![col("id").eq(lit("user123")), sort_op];
             let projection = create_projection_schema(vec!["id", "name"]);
 
             let result = builder.plan(&filters, projection, None).unwrap();
 
             match result {
-                DynamoDBRequestPlan::Query(_) => {}
+                DynamoDBRequestPlan::Query(params) => {
+                    // Key condition should be: (#c0 = :v1000) AND <sort_condition>
+                    let expected = format!("(#c0 = :v1000) AND {}", expected_sort_condition);
+                    assert_eq!(params.key_condition_expression, Some(expected));
+
+                    let attr_values = params.expression_attribute_values.unwrap();
+                    assert_eq!(
+                        attr_values.get(":v1000"),
+                        Some(&AttributeValue::S("user123".to_string()))
+                    );
+                    assert_eq!(
+                        attr_values.get(":v1001"),
+                        Some(&AttributeValue::S("value".to_string()))
+                    );
+                }
                 DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
             }
         }
@@ -606,7 +732,23 @@ mod tests {
         let result = builder.plan(&filters, projection, None).unwrap();
 
         match result {
-            DynamoDBRequestPlan::Scan(_) => {}
+            DynamoDBRequestPlan::Scan(params) => {
+                // Both conditions should be in filter: ((#c0 = :v0) AND (#c0 = :v1))
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c0 = :v0) AND (#c0 = :v1)".to_string())
+                );
+
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v1"),
+                    Some(&AttributeValue::S("user456".to_string()))
+                );
+            }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan due to multiple partition keys"),
         }
     }
@@ -626,7 +768,31 @@ mod tests {
         let result = builder.plan(&filters, projection, None).unwrap();
 
         match result {
-            DynamoDBRequestPlan::Scan(_) => {}
+            DynamoDBRequestPlan::Scan(params) => {
+                // All conditions in filter: ((#c0 = :v0) AND ((#c1 > :v1) AND (#c1 < :v2)))
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c0 = :v0) AND (#c1 > :v1) AND (#c1 < :v2)".to_string())
+                );
+
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
+                assert_eq!(attr_names.get("#c1"), Some(&"sort_key".to_string()));
+
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v1"),
+                    Some(&AttributeValue::S("2024-01-01".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v2"),
+                    Some(&AttributeValue::S("2024-12-31".to_string()))
+                );
+            }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan due to multiple sort keys"),
         }
     }
@@ -642,7 +808,19 @@ mod tests {
         let result = builder.plan(&filters, projection, None).unwrap();
 
         match result {
-            DynamoDBRequestPlan::Scan(_) => {}
+            DynamoDBRequestPlan::Scan(params) => {
+                // Filter expression: (#c0 > :v0)
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c0 > :v0)".to_string())
+                );
+
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+            }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan - partition key must use ="),
         }
     }
@@ -657,28 +835,14 @@ mod tests {
 
         let result = builder.plan(&filters, projection, None).unwrap();
 
-        // Should still create a query, just without projection
         match result {
             DynamoDBRequestPlan::Query(params) => {
-                assert!(params.projection_expression.is_none());
+                assert_eq!(params.projection_expression, None);
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#c0 = :v1000)".to_string())
+                );
             }
-            DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
-        }
-    }
-
-    #[test]
-    fn test_projection_with_unknown_columns() {
-        let schema = create_test_schema();
-        let builder = DynamoDBRequestBuilder::new(&schema);
-
-        let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(vec!["unknown_column"]);
-
-        let result = builder.plan(&filters, projection, None).unwrap();
-
-        // Should still work, projection will just be empty
-        match result {
-            DynamoDBRequestPlan::Query(_) => {}
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
     }
@@ -700,7 +864,14 @@ mod tests {
 
         // OR anywhere in the filter tree should force a scan
         match result {
-            DynamoDBRequestPlan::Scan(_) => {}
+            DynamoDBRequestPlan::Scan(params) => {
+                // Complex nested expression with OR
+                let filter = params.filter_expression.unwrap();
+                assert!(filter.contains("OR"));
+                assert!(filter.contains("#c0")); // id
+                assert!(filter.contains("#c3")); // age
+                assert!(filter.contains("#c4")); // active
+            }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan due to nested OR"),
         }
     }
@@ -708,8 +879,8 @@ mod tests {
     #[test]
     fn test_schema_without_sort_key() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, false),    // #c0
+            Field::new("name", DataType::Utf8, true),   // #c1
         ]));
 
         let table_schema = DynamoDBTableSchema::new(
@@ -727,27 +898,15 @@ mod tests {
         let result = builder.plan(&filters, projection, None).unwrap();
 
         match result {
-            DynamoDBRequestPlan::Query(_) => {}
-            DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
-        }
-    }
-
-    #[test]
-    fn test_plan_with_projection_expression() {
-        let schema = create_test_schema();
-        let builder = DynamoDBRequestBuilder::new(&schema);
-
-        let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(vec!["id", "name", "age"]);
-
-        let result = builder.plan(&filters, projection, None).unwrap();
-
-        match result {
             DynamoDBRequestPlan::Query(params) => {
-                assert!(params.projection_expression.is_some());
-                let proj_expr = params.projection_expression.unwrap();
-                // Projection should contain the requested fields
-                assert!(proj_expr.contains("id") || proj_expr.contains("#"));
+                // Only partition key condition
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#c0 = :v1000)".to_string())
+                );
+
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
@@ -766,48 +925,140 @@ mod tests {
         match result {
             DynamoDBRequestPlan::Scan(params) => {
                 assert_eq!(params.limit, Some(25));
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c2 = :v0)".to_string())
+                );
             }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
         }
     }
 
     #[test]
-    fn test_plan_query_with_expression_attribute_values() {
+    fn test_plan_query_with_multiple_filter_expressions() {
         let schema = create_test_schema();
         let builder = DynamoDBRequestBuilder::new(&schema);
 
-        let filters = vec![col("id").eq(lit("user123")), col("age").gt(lit(18i64))];
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("age").gt(lit(18i64)),
+            col("active").eq(lit(true)),
+        ];
         let projection = create_projection_schema(vec!["id", "name"]);
 
         let result = builder.plan(&filters, projection, None).unwrap();
 
         match result {
             DynamoDBRequestPlan::Query(params) => {
-                assert!(params.expression_attribute_values.is_some());
-                let values = params.expression_attribute_values.unwrap();
-                assert!(!values.is_empty());
+                // Key condition for partition key
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#c0 = :v1000)".to_string())
+                );
+
+                // Filter expression for age and active: ((#c3 > :v0) AND (#c4 = :v1))
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c3 > :v0) AND (#c4 = :v1)".to_string())
+                );
+
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.len(), 4);
+                assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
+                assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
+                assert_eq!(attr_names.get("#c4"), Some(&"active".to_string()));
+
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v1000"),
+                    Some(&AttributeValue::S("user123".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::N("18".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v1"),
+                    Some(&AttributeValue::Bool(true))
+                );
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
     }
 
     #[test]
-    fn test_plan_scan_with_expression_attribute_values() {
+    fn test_plan_scan_with_multiple_filters() {
         let schema = create_test_schema();
         let builder = DynamoDBRequestBuilder::new(&schema);
 
-        let filters = vec![col("name").eq(lit("John")), col("age").gt(lit(25i64))];
+        let filters = vec![
+            col("name").eq(lit("John")),
+            col("age").gt(lit(25i64)),
+        ];
         let projection = create_projection_schema(vec!["id", "name"]);
 
         let result = builder.plan(&filters, projection, None).unwrap();
 
         match result {
             DynamoDBRequestPlan::Scan(params) => {
-                assert!(params.expression_attribute_values.is_some());
-                let values = params.expression_attribute_values.unwrap();
-                assert!(!values.is_empty());
+                // Filter expression: ((#c2 = :v0) AND (#c3 > :v1))
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c2 = :v0) AND (#c3 > :v1)".to_string())
+                );
+
+                let attr_names = params.expression_attribute_names.unwrap();
+                assert_eq!(attr_names.get("#c2"), Some(&"name".to_string()));
+                assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
+
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::S("John".to_string()))
+                );
+                assert_eq!(
+                    attr_values.get(":v1"),
+                    Some(&AttributeValue::N("25".to_string()))
+                );
             }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
+        }
+    }
+
+    #[test]
+    fn test_plan_query_with_not_equal_in_filter() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestBuilder::new(&schema);
+
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("name").not_eq(lit("Admin")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.plan(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequestPlan::Query(params) => {
+                // Key condition
+                assert_eq!(
+                    params.key_condition_expression,
+                    Some("(#c0 = :v1000)".to_string())
+                );
+
+                // Filter expression with not equal: (#c2 <> :v0)
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#c2 <> :v0)".to_string())
+                );
+
+                let attr_values = params.expression_attribute_values.unwrap();
+                assert_eq!(
+                    attr_values.get(":v0"),
+                    Some(&AttributeValue::S("Admin".to_string()))
+                );
+            }
+            DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
     }
 }
