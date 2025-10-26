@@ -135,6 +135,7 @@ mod tests {
         let mut builder = DataFusionBuilder::new(
             RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::new()),
+            Handle::current(),
         );
 
         // Add cache if provided

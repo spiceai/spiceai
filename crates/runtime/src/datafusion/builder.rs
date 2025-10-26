@@ -56,7 +56,7 @@ use datafusion_optimizer_rules::{
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use tokio::{
     runtime::Handle,
     sync::{RwLock as TokioRwLock, Semaphore},

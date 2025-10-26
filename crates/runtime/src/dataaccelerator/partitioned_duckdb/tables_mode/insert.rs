@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use crate::datafusion::extension::pass_thru::PassThruExec;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -32,6 +31,7 @@ use datafusion::{
 };
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_optimizer_rules::pass_thru::PassThruExec;
 use datafusion_table_providers::{
     duckdb::TableDefinition, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
     util::on_conflict::OnConflict,
