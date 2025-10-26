@@ -52,6 +52,7 @@ use runtime_datafusion::execution_plan::{
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
@@ -246,6 +247,8 @@ pub struct Builder {
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
     metrics: Option<Metrics>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl Builder {
@@ -256,6 +259,7 @@ impl Builder {
         federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -279,6 +283,8 @@ impl Builder {
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
             metrics: None,
+            cpu_runtime: None,
+            io_runtime,
         }
     }
 
@@ -319,6 +325,11 @@ impl Builder {
 
     pub fn metrics(&mut self, metrics: Metrics) -> &mut Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn cpu_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
+        self.cpu_runtime = runtime;
         self
     }
 
@@ -461,6 +472,8 @@ impl Builder {
             Some(self.federated_source),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
+            self.cpu_runtime.clone(),
+            self.io_runtime.clone(),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -491,6 +504,7 @@ impl Builder {
                 Arc::clone(&self.accelerator),
                 retention,
                 self.caching.clone(),
+                self.io_runtime.clone(),
             ));
             handlers.push(retention_check_handle);
         }
@@ -525,6 +539,7 @@ impl AcceleratedTable {
         federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
+        io_runtime: Handle,
     ) -> Builder {
         Builder::new(
             runtime_status,
@@ -533,6 +548,7 @@ impl AcceleratedTable {
             federated_source,
             accelerator,
             refresh,
+            io_runtime,
         )
     }
 

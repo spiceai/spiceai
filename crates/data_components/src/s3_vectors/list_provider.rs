@@ -711,7 +711,7 @@ mod tests {
 
         // Create 2 spill indexes
         for i in 1..=2 {
-            let spill_index_name = format!("{virtual_index_name}.{i:02}");
+            let spill_index_name = format!("{virtual_index_name}-{i:02}");
             indexes.push(
                 IndexSummary::builder()
                     .vector_bucket_name(bucket_name)

@@ -16,13 +16,13 @@ limitations under the License.
 
 mod credential_provider;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use tokio::{runtime::Handle, sync::OnceCell};
 
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_s3::config::ProvideCredentials;
 use aws_smithy_runtime_api::client::runtime_components::BuildError;
 pub use credential_provider::S3CredentialProvider;
-use object_store::{ObjectStore, aws::AmazonS3Builder};
+use object_store::{ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConnector};
 use url::Url;
 
 #[derive(Debug, snafu::Snafu)]
@@ -98,7 +98,9 @@ pub async fn from_s3_url(url: &url::Url, region: Option<String>) -> Result<Box<d
     }
 
     let bucket_name = get_bucket_name(url)?;
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
+    let mut builder = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket_name)
+        .with_http_connector(SpawnedReqwestConnector::new(Handle::current()));
     let (credential_provider, config) = S3CredentialProvider::from_env().await?;
 
     if let Some(region) = region.or(config.region().map(ToString::to_string)) {
@@ -122,6 +124,7 @@ pub fn from_s3_url_and_config(
     url: &url::Url,
     region: Option<String>,
     sdk_config: &SdkConfig,
+    io_runtime: Handle,
 ) -> Result<Box<dyn ObjectStore>> {
     if url.scheme() != "s3" {
         return Err(Error::NotAnS3Url {
@@ -132,6 +135,8 @@ pub fn from_s3_url_and_config(
     let bucket_name = get_bucket_name(url)?;
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
     let credential_provider = S3CredentialProvider::from_config(sdk_config)?;
+
+    builder = builder.with_http_connector(SpawnedReqwestConnector::new(io_runtime));
 
     if let Some(region) = region.or(sdk_config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);

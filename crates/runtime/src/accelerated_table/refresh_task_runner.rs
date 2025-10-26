@@ -21,6 +21,7 @@ use super::{
 };
 use futures::future::BoxFuture;
 use tokio::{
+    runtime::Handle,
     select,
     sync::{
         Semaphore,
@@ -46,6 +47,8 @@ pub struct RefreshTaskRunnerBuilder {
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -57,6 +60,7 @@ impl RefreshTaskRunnerBuilder {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -68,6 +72,8 @@ impl RefreshTaskRunnerBuilder {
             disable_federation: false,
             semaphore: None,
             metrics: None,
+            cpu_runtime: None,
+            io_runtime,
         }
     }
 
@@ -91,6 +97,12 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> Self {
+        self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -98,13 +110,16 @@ impl RefreshTaskRunnerBuilder {
             self.federated,
             self.federated_source,
             self.accelerator,
-            self.metrics,
+            self.io_runtime,
         )
-        .with_disable_federation(self.disable_federation);
+        .with_disable_federation(self.disable_federation)
+        .with_metrics(self.metrics);
 
         if let Some(semaphore) = self.semaphore {
             refresh_task_builder = refresh_task_builder.with_semaphore(semaphore);
         }
+
+        refresh_task_builder = refresh_task_builder.with_cpu_runtime(self.cpu_runtime);
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 
@@ -137,6 +152,7 @@ impl RefreshTaskRunner {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
     ) -> RefreshTaskRunnerBuilder {
         RefreshTaskRunnerBuilder::new(
             runtime_status,
@@ -145,6 +161,7 @@ impl RefreshTaskRunner {
             federated_source,
             refresh,
             accelerator,
+            io_runtime,
         )
     }
 

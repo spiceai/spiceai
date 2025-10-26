@@ -104,6 +104,7 @@ mod tests {
     use datafusion::{catalog::MemoryCatalogProvider, sql::TableReference};
     use runtime_datafusion::schema_provider::SpiceSchemaProvider;
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -118,6 +119,7 @@ mod tests {
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
             )
             .build(),
         );

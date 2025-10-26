@@ -177,8 +177,18 @@ where
         .transpose()?
         .unwrap_or_default();
 
+    let min_sql_duration_ms = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.min_sql_duration_as_millis())
+        .transpose()?
+        .flatten();
+
     let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
-        task_history::otel_exporter::TaskHistoryExporter::new(df, captured_output),
+        task_history::otel_exporter::TaskHistoryExporter::new(
+            df,
+            captured_output,
+            min_sql_duration_ms,
+        ),
     )];
 
     if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config).await {

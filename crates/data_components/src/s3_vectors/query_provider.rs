@@ -724,7 +724,7 @@ mod tests {
 
         // Create 2 spill indexes
         for i in 1..=2 {
-            let spill_index_name = format!("{virtual_index_name}.{i:02}");
+            let spill_index_name = format!("{virtual_index_name}-{i:02}");
             indexes.push(
                 IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
@@ -841,7 +841,7 @@ mod tests {
 
         // Create 2 spill indexes
         for i in 1..=2 {
-            let spill_index_name = format!("{virtual_index_name}.{i:02}");
+            let spill_index_name = format!("{virtual_index_name}-{i:02}");
             indexes.push(
                 IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
@@ -886,7 +886,7 @@ mod tests {
             constraints: Constraints::default(),
             idx: Arc::new(S3VectorIdentifier::Index {
                 bucket_name: bucket_name.to_string(),
-                index_name: "virtual_index.01".to_string(), // Access via spill name
+                index_name: "virtual_index-01".to_string(), // Access via spill name
             }),
             spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,

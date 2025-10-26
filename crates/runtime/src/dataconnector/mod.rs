@@ -682,6 +682,7 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
+    use tokio::runtime::Handle;
     use tokio::sync::RwLock;
 
     use super::*;
@@ -756,7 +757,7 @@ mod tests {
             ConnectorComponent::Dataset(Arc::new(dataset)),
         );
 
-        let result = builder.build(secrets).await;
+        let result = builder.build(secrets, Handle::current()).await;
         assert!(result.is_ok());
 
         let params = result.expect("failed to build connector params");
