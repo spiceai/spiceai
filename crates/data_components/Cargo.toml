@@ -22,6 +22,7 @@ aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-smithy-async = { workspace = true, optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
@@ -106,7 +107,7 @@ duckdb = [
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
 ]
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-async"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 mongodb = ["datafusion-table-providers/mongodb",]

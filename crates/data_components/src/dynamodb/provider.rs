@@ -32,6 +32,7 @@ use aws_sdk_dynamodb::{
     error::SdkError,
     types::{AttributeValue, TableStatus},
 };
+use aws_smithy_async::future::pagination_stream::{PaginationStream, TryFlatMap};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::project_schema,
@@ -51,6 +52,8 @@ use snafu::prelude::*;
 use crate::dynamodb::request_builder::{DynamoDBRequest, DynamoDBRequestBuilder};
 use crate::dynamodb::table_schema::{DynamoDBTableSchema, IndexInfo};
 use datafusion::logical_expr::TableProviderFilterPushDown;
+use futures::Stream;
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
@@ -290,51 +293,63 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let unnest_depth = Some(1);
 
         builder.spawn(async move {
-            let mut buffer = Vec::new();
-            const CHUNK_SIZE: usize = 4_000;
-
             match request {
                 DynamoDBRequest::Query(query) => {
-                    let mut paginator = query.into_paginator().send();
-
-                    while let Some(result) = paginator.next().await {
-                        let output = result.map_err(to_execution_error)?;
-                        buffer.extend(output.items().to_vec());
-
-                        while buffer.len() >= CHUNK_SIZE {
-                            let chunk: Vec<_> = buffer.drain(..CHUNK_SIZE).collect();
-                            let batch = process_chunk(chunk, unnest_depth, Arc::clone(&schema))?;
-                            tx.send(Ok(batch)).await.map_err(to_execution_error)?;
-                        }
-                    }
+                    let item_stream = TryFlatMap::new(query.into_paginator().send())
+                        .flat_map(|output| output.items().to_vec());
+                    process_item_stream(item_stream, tx, schema, unnest_depth).await
                 }
                 DynamoDBRequest::Scan(scan) => {
-                    let mut paginator = scan.into_paginator().send();
-
-                    while let Some(result) = paginator.next().await {
-                        let output = result.map_err(to_execution_error)?;
-                        buffer.extend(output.items().to_vec());
-
-                        while buffer.len() >= CHUNK_SIZE {
-                            let chunk: Vec<_> = buffer.drain(..CHUNK_SIZE).collect();
-                            let batch = process_chunk(chunk, unnest_depth, Arc::clone(&schema))?;
-                            tx.send(Ok(batch)).await.map_err(to_execution_error)?;
-                        }
-                    }
+                    let item_stream = TryFlatMap::new(scan.into_paginator().send())
+                        .flat_map(|output| output.items().to_vec());
+                    process_item_stream(item_stream, tx, schema, unnest_depth).await
                 }
             }
-
-            // Process remaining items in buffer
-            if !buffer.is_empty() {
-                let batch = process_chunk(buffer, unnest_depth, Arc::clone(&schema))?;
-                tx.send(Ok(batch)).await.map_err(to_execution_error)?;
-            }
-
-            Ok(())
         });
 
         Ok(builder.build())
     }
+}
+
+use futures::pin_mut;
+use futures::stream::{self, StreamExt};
+
+fn pagination_stream_to_stream<T: 'static>(
+    pagination_stream: PaginationStream<T>,
+) -> impl Stream<Item = T> {
+    stream::unfold(pagination_stream, |mut stream| async move {
+        stream.next().await.map(|item| (item, stream))
+    })
+}
+
+async fn process_item_stream<E>(
+    pagination_stream: PaginationStream<Result<HashMap<String, AttributeValue>, E>>,
+    tx: Sender<datafusion::common::Result<RecordBatch>>,
+    schema: SchemaRef,
+    unnest_depth: Option<usize>,
+) -> DataFusionResult<()>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    const CHUNK_SIZE: usize = 4_000;
+
+    let item_stream = pagination_stream_to_stream(pagination_stream);
+
+    let chunked_stream = item_stream
+        .map(|result| result.map_err(to_execution_error))
+        .chunks(CHUNK_SIZE);
+
+    pin_mut!(chunked_stream);
+
+    while let Some(chunk) = chunked_stream.next().await {
+        let items: Result<Vec<_>, _> = chunk.into_iter().collect();
+        let items = items?;
+
+        let batch = process_chunk(items, unnest_depth, Arc::clone(&schema))?;
+        tx.send(Ok(batch)).await.map_err(to_execution_error)?;
+    }
+
+    Ok(())
 }
 
 fn process_chunk(
