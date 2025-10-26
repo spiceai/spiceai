@@ -2,9 +2,10 @@ use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, UserDefinedLogicalNode};
 use derive_builder::Builder;
 use std::collections::HashMap;
+use datafusion::common::ScalarValue;
 
 #[derive(Clone, Debug)]
 pub enum DynamoDBRequestPlan {
@@ -67,7 +68,7 @@ impl DynamoDBRequestPlanBuilder {
         println!("key_filters: {key_filters:?}");
         println!("other_filters: {other_filters:?}");
 
-        let mut attribute_names = self.schema.extract_attribute_names(filters);
+        let mut attribute_names = self.extract_attribute_names(filters);
         self.add_projection_aliases(projection_schema, &mut attribute_names);
 
         let projection_expr = self.build_projection_expression(projection_schema);
@@ -106,13 +107,12 @@ impl DynamoDBRequestPlanBuilder {
             QueryParamsBuilder::default().table_name(self.schema.table_name().to_string());
 
         let (key_condition, mut key_values) = self
-            .schema
             .build_key_condition_expression(partition_expr, sort_expr)?;
 
         query_params = query_params.key_condition_expression(key_condition);
 
         if !other_filters.is_empty() {
-            let (filter_str, filter_values) = self.schema.build_filter_expression(other_filters);
+            let (filter_str, filter_values) = self.build_filter_expression(other_filters);
             key_values.extend(filter_values);
             query_params = query_params.filter_expression(filter_str);
         }
@@ -150,7 +150,7 @@ impl DynamoDBRequestPlanBuilder {
             ScanParamsBuilder::default().table_name(self.schema.table_name().to_string());
 
         if !filters.is_empty() {
-            let (filter_str, attribute_values) = self.schema.build_filter_expression(filters);
+            let (filter_str, attribute_values) = self.build_filter_expression(filters);
             if !filter_str.is_empty() {
                 scan_params = scan_params.filter_expression(filter_str);
                 scan_params = scan_params.expression_attribute_values(attribute_values);
@@ -175,6 +175,134 @@ impl DynamoDBRequestPlanBuilder {
         Ok(DynamoDBRequestPlan::Scan(scan))
     }
 
+    fn extract_attribute_names(&self, filters: &[Expr]) -> HashMap<String, String> {
+        let mut attribute_names = HashMap::new();
+        for expr in filters {
+            self.extract_columns_from_expr(expr, &mut attribute_names);
+        }
+        attribute_names
+    }
+
+    fn extract_columns_from_expr(
+        &self,
+        expr: &Expr,
+        attribute_names: &mut HashMap<String, String>,
+    ) {
+        match expr {
+            Expr::Column(col) => {
+                if let Some(alias) = self.schema.get_column_alias(col.name()) {
+                    attribute_names.insert(alias.to_string(), col.name.to_string());
+                }
+            }
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                self.extract_columns_from_expr(left, attribute_names);
+                self.extract_columns_from_expr(right, attribute_names);
+            }
+            _ => {}
+        }
+    }
+
+    fn build_key_condition_expression(
+        &self,
+        partition_expr: &Expr,
+        sort_expr: Option<&Expr>,
+    ) -> datafusion::error::Result<(String, HashMap<String, AttributeValue>)> {
+        let mut attribute_values = HashMap::new();
+        // Filters start with 0, whereas keys start with 1000 to avoid overlapping
+        let mut value_counter = 1000;
+
+        let partition_str =
+            self.expr_to_filter_string(partition_expr, &mut attribute_values, &mut value_counter)?;
+
+        let key_condition = if let Some(sort) = sort_expr {
+            let sort_str =
+                self.expr_to_filter_string(sort, &mut attribute_values, &mut value_counter)?;
+            format!("{partition_str} AND {sort_str}")
+        } else {
+            partition_str
+        };
+
+        Ok((key_condition, attribute_values))
+    }
+
+    fn build_filter_expression(
+        &self,
+        filters: &[Expr],
+    ) -> (String, HashMap<String, AttributeValue>) {
+        if filters.is_empty() {
+            return (String::new(), HashMap::new());
+        }
+
+        let mut attribute_values = HashMap::new();
+        let mut value_counter = 0;
+
+        let filter_parts: Vec<String> = filters
+            .iter()
+            .filter_map(|expr| {
+                self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter)
+                    .ok()
+            })
+            .collect();
+
+        if filter_parts.is_empty() {
+            return (String::new(), HashMap::new());
+        }
+
+        let filter_expr = filter_parts.join(" AND ");
+        (filter_expr, attribute_values)
+    }
+
+    fn expr_to_filter_string(
+        &self,
+        expr: &Expr,
+        attribute_values: &mut HashMap<String, AttributeValue>,
+        value_counter: &mut usize,
+    ) -> DataFusionResult<String> {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                let left_str = self.expr_to_filter_string(left, attribute_values, value_counter)?;
+                let right_str =
+                    self.expr_to_filter_string(right, attribute_values, value_counter)?;
+
+                let op_str = match op {
+                    Operator::Eq => "=",
+                    Operator::NotEq => "<>",
+                    Operator::Lt => "<",
+                    Operator::LtEq => "<=",
+                    Operator::Gt => ">",
+                    Operator::GtEq => ">=",
+                    Operator::And => "AND",
+                    Operator::Or => "OR",
+                    _ => {
+                        return Err(DataFusionError::NotImplemented(format!(
+                            "Operator {op:?} not supported"
+                        )));
+                    }
+                };
+
+                Ok(format!("({left_str} {op_str} {right_str})"))
+            }
+            Expr::Column(col) => self.schema
+                .get_column_alias(col.name())
+                .map(|alias| alias.to_string())
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("Column {} not found", col.name))
+                }),
+            Expr::Literal(scalar, _) => {
+                let value_key = format!(":v{value_counter}");
+                *value_counter += 1;
+
+                let attr_value = scalar_to_attribute_value(scalar)?;
+                attribute_values.insert(value_key.clone(), attr_value);
+
+                Ok(value_key)
+            }
+            _ => Err(DataFusionError::NotImplemented(
+                "Expression type not supported in filters".to_string(),
+            )),
+        }
+    }
+
     fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
         let has_or = filters.iter().any(contains_or);
         if has_or {
@@ -183,8 +311,8 @@ impl DynamoDBRequestPlanBuilder {
 
         if let Some((partition, sort, other)) = try_match_index(
             filters,
-            &self.schema.partition_key,
-            self.schema.sort_key.as_deref(),
+            &self.schema.partition_key(),
+            self.schema.sort_key().as_deref(),
         ) {
             return (Some((partition, sort)), other);
         }
@@ -216,6 +344,21 @@ impl DynamoDBRequestPlanBuilder {
                 attribute_names.insert(alias.to_string(), field.name().to_string());
             }
         }
+    }
+}
+
+fn scalar_to_attribute_value(scalar: &ScalarValue) -> datafusion::error::Result<AttributeValue> {
+    match scalar {
+        ScalarValue::Utf8(Some(s)) => Ok(AttributeValue::S(s.clone())),
+        ScalarValue::Int64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Float64(Some(f)) => Ok(AttributeValue::N(f.to_string())),
+        ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
+        ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
+        ScalarValue::Null => Ok(AttributeValue::Null(true)),
+        _ => Err(DataFusionError::NotImplemented(
+            "ScalarValue type not supported".to_string(),
+        )),
     }
 }
 

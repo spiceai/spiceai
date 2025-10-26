@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::{Error, Result};
+#[allow(unused_imports)]
 use arrow::array::{
     Array, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder,
     ListBuilder, NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
