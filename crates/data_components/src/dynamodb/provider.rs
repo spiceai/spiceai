@@ -49,7 +49,9 @@ use datafusion::{
 };
 use snafu::prelude::*;
 
-use crate::dynamodb::request_builder::{DynamoDBRequest, DynamoDBRequestBuilder};
+use crate::dynamodb::request_builder::{
+    DynamoDBRequest, DynamoDBRequestBuilder, DynamoDBRequestPlan, build_request_from_plan,
+};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use futures::Stream;
@@ -171,8 +173,9 @@ impl TableProvider for DynamoDBTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(self.table_schema.schema(), projection)?;
 
-        let builder = DynamoDBRequestBuilder::new(&self.client, &self.table_schema);
-        let request = builder.build(filters, projected_schema.clone(), limit)?;
+        let builder = DynamoDBRequestBuilder::new(&self.table_schema);
+        let request_plan = builder.plan(filters, projected_schema.clone(), limit)?;
+        let request = build_request_from_plan(&self.client, request_plan);
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             request,

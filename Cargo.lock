@@ -3872,6 +3872,7 @@ dependencies = [
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
+ "derive_builder",
  "document_parse",
  "duckdb",
  "flight_client",

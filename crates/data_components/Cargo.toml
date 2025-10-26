@@ -38,6 +38,7 @@ datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
+derive_builder = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -107,7 +108,7 @@ duckdb = [
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
 ]
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-async"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-async", "dep:derive_builder"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 mongodb = ["datafusion-table-providers/mongodb",]

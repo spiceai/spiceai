@@ -135,6 +135,7 @@ delta_kernel = { version = "0.14", features = [
     "arrow-55",
     "internal-api",
 ] }
+derive_builder = "0.20.2"
 ballista = "49.0.0"
 ballista-core = "49.0.0"
 ballista-scheduler = { version = "49.0.0" }
