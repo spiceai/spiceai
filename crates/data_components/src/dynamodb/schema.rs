@@ -134,20 +134,15 @@ fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
         (DataType::Date64, DataType::Date64) => DataType::Date64,
 
         // Mixed temporal types - fall back to string
-        (DataType::Timestamp(_, _), DataType::Date32)
-        | (DataType::Date32, DataType::Timestamp(_, _))
-        | (DataType::Timestamp(_, _), DataType::Date64)
-        | (DataType::Date64, DataType::Timestamp(_, _))
-        | (DataType::Date32, DataType::Date64)
-        | (DataType::Date64, DataType::Date32) => DataType::Utf8,
+        (DataType::Timestamp(_, _) | DataType::Date64, DataType::Date32) |
+(DataType::Date32 | DataType::Date64, DataType::Timestamp(_, _)) |
+(DataType::Timestamp(_, _) | DataType::Date32, DataType::Date64) => DataType::Utf8,
 
         // Temporal mixed with string - fall back to string
-        (DataType::Timestamp(_, _), DataType::Utf8)
-        | (DataType::Utf8, DataType::Timestamp(_, _))
-        | (DataType::Date32, DataType::Utf8)
-        | (DataType::Utf8, DataType::Date32)
-        | (DataType::Date64, DataType::Utf8)
-        | (DataType::Utf8, DataType::Date64) => DataType::Utf8,
+        (DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64,
+DataType::Utf8) |
+(DataType::Utf8,
+DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64) => DataType::Utf8,
 
         // Numeric type promotion for lists (e.g., Number Sets)
         (DataType::List(field1), DataType::List(field2)) => {
@@ -198,7 +193,7 @@ mod tests {
     #[test]
     fn test_empty_items() {
         let items: Vec<HashMap<String, AttributeValue>> = vec![];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
         assert_eq!(schema.fields().len(), 0);
     }
 
@@ -211,7 +206,7 @@ mod tests {
         item.insert("is_active".to_string(), av_bool(true));
 
         let items = vec![item];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
 
         // Check field count
         assert_eq!(schema.fields().len(), 4);
@@ -258,7 +253,7 @@ mod tests {
         );
 
         let items = vec![item];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
         let field_map: HashMap<String, &DataType> = schema
             .fields()
             .iter()
@@ -300,7 +295,7 @@ mod tests {
         item.insert("negative_float".to_string(), av_number("-2.5"));
 
         let items = vec![item];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
         let field_map: HashMap<String, &DataType> = schema
             .fields()
             .iter()
@@ -329,7 +324,7 @@ mod tests {
         );
 
         let items = vec![item1, item2];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
         let field_map: HashMap<String, &DataType> = schema
             .fields()
             .iter()
@@ -367,7 +362,7 @@ mod tests {
         );
 
         let items = vec![item];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
         let field_map: HashMap<String, &DataType> = schema
             .fields()
             .iter()
@@ -380,11 +375,10 @@ mod tests {
                 assert_eq!(
                     field.data_type(),
                     &DataType::Utf8,
-                    "Expected List<Utf8> for {}",
-                    list_name
+                    "Expected List<Utf8> for {list_name}"
                 );
             } else {
-                panic!("Expected List type for {}", list_name);
+                panic!("Expected List type for {list_name}");
             }
         }
     }
@@ -400,7 +394,7 @@ mod tests {
         item.insert("metadata".to_string(), AttributeValue::M(HashMap::new()));
 
         let items = vec![item];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
         let field_map: HashMap<String, &DataType> = schema
             .fields()
             .iter()
@@ -421,8 +415,8 @@ mod tests {
         item2.insert("value".to_string(), av_number("3.14"));
 
         let items = vec![item1, item2];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let field = schema.field_with_name("value").expect("arrow schema");
         assert_eq!(field.data_type(), &DataType::Float64);
     }
 
@@ -441,8 +435,8 @@ mod tests {
         );
 
         let items = vec![item1, item2];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let field = schema.field_with_name("numbers").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let field = schema.field_with_name("numbers").expect("arrow schema");
 
         if let DataType::List(inner_field) = field.data_type() {
             assert_eq!(inner_field.data_type(), &DataType::Float64);
@@ -460,8 +454,8 @@ mod tests {
         item2.insert("value".to_string(), av_string("text"));
 
         let items = vec![item1, item2];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let field = schema.field_with_name("value").expect("arrow schema");
         assert_eq!(field.data_type(), &DataType::Utf8);
     }
 
@@ -474,8 +468,8 @@ mod tests {
         item2.insert("value".to_string(), av_string("text"));
 
         let items = vec![item1, item2];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let field = schema.field_with_name("value").expect("arrow schema");
         assert_eq!(field.data_type(), &DataType::Utf8);
     }
 
@@ -488,8 +482,8 @@ mod tests {
         item2.insert("value".to_string(), AttributeValue::Null(true));
 
         let items = vec![item1, item2];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let field = schema.field_with_name("value").expect("arrow schema");
         assert_eq!(field.data_type(), &DataType::Null);
     }
 
@@ -508,7 +502,7 @@ mod tests {
         item3.insert("country".to_string(), av_string("US"));
 
         let items = vec![item1, item2, item3];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
 
         // Should have all unique fields
         assert_eq!(schema.fields().len(), 4);
@@ -536,7 +530,7 @@ mod tests {
         item.insert("banana".to_string(), av_string("yellow"));
 
         let items = vec![item];
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
 
         let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(field_names, vec!["apple", "banana", "monkey", "zebra"]);
@@ -550,7 +544,7 @@ mod tests {
         for i in 0..100 {
             let mut item = HashMap::new();
             item.insert("id".to_string(), av_number(&i.to_string()));
-            item.insert("name".to_string(), av_string(&format!("user_{}", i)));
+            item.insert("name".to_string(), av_string(&format!("user_{i}")));
 
             // Add optional fields for some items
             if i % 2 == 0 {
@@ -560,14 +554,14 @@ mod tests {
                 item.insert("city".to_string(), av_string("NYC"));
             }
             if i % 5 == 0 {
-                let score = (i as f64) / 10.0;
+                let score = f64::from(i) / 10.0;
                 item.insert("score".to_string(), av_number(&score.to_string()));
             }
 
             items.push(item);
         }
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
 
         // Should have all the fields
         let field_names: std::collections::HashSet<&str> =
@@ -601,8 +595,8 @@ mod tests {
             ]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let created_at_field = schema.field_with_name("created_at").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let created_at_field = schema.field_with_name("created_at").expect("arrow schema");
 
         assert!(matches!(
             created_at_field.data_type(),
@@ -623,8 +617,8 @@ mod tests {
             )]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let event_time_field = schema.field_with_name("event_time").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let event_time_field = schema.field_with_name("event_time").expect("arrow schema");
 
         assert!(matches!(
             event_time_field.data_type(),
@@ -645,8 +639,8 @@ mod tests {
             ]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let birth_date_field = schema.field_with_name("birth_date").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let birth_date_field = schema.field_with_name("birth_date").expect("arrow schema");
 
         assert_eq!(birth_date_field.data_type(), &DataType::Date32);
     }
@@ -658,8 +652,8 @@ mod tests {
             HashMap::from([("value".to_string(), av_string("not a timestamp"))]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let value_field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let value_field = schema.field_with_name("value").expect("arrow schema");
 
         assert_eq!(value_field.data_type(), &DataType::Utf8);
     }
@@ -671,8 +665,8 @@ mod tests {
             HashMap::from([("value".to_string(), av_string("random text"))]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let value_field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let value_field = schema.field_with_name("value").expect("arrow schema");
 
         assert_eq!(value_field.data_type(), &DataType::Utf8);
     }
@@ -684,8 +678,8 @@ mod tests {
             HashMap::from([("value".to_string(), av_string("2024-01-15"))]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let value_field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let value_field = schema.field_with_name("value").expect("arrow schema");
 
         assert_eq!(value_field.data_type(), &DataType::Utf8);
     }
@@ -701,8 +695,8 @@ mod tests {
             ]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let value_field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let value_field = schema.field_with_name("value").expect("arrow schema");
 
         assert_eq!(value_field.data_type(), &DataType::Utf8);
     }
@@ -718,8 +712,8 @@ mod tests {
             ]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let value_field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let value_field = schema.field_with_name("value").expect("arrow schema");
 
         assert_eq!(value_field.data_type(), &DataType::Utf8);
     }
@@ -741,21 +735,21 @@ mod tests {
             ]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
 
-        let id_field = schema.field_with_name("id").unwrap();
+        let id_field = schema.field_with_name("id").expect("arrow schema");
         assert_eq!(id_field.data_type(), &DataType::Utf8);
 
-        let created_at_field = schema.field_with_name("created_at").unwrap();
+        let created_at_field = schema.field_with_name("created_at").expect("arrow schema");
         assert!(matches!(
             created_at_field.data_type(),
             DataType::Timestamp(TimeUnit::Millisecond, Some(_))
         ));
 
-        let birth_date_field = schema.field_with_name("birth_date").unwrap();
+        let birth_date_field = schema.field_with_name("birth_date").expect("arrow schema");
         assert_eq!(birth_date_field.data_type(), &DataType::Date32);
 
-        let name_field = schema.field_with_name("name").unwrap();
+        let name_field = schema.field_with_name("name").expect("arrow schema");
         assert_eq!(name_field.data_type(), &DataType::Utf8);
     }
 
@@ -773,8 +767,8 @@ mod tests {
             })
             .collect();
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let timestamp_field = schema.field_with_name("timestamp").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let timestamp_field = schema.field_with_name("timestamp").expect("arrow schema");
 
         assert!(matches!(
             timestamp_field.data_type(),
@@ -789,8 +783,8 @@ mod tests {
             HashMap::from([("value".to_string(), av_string(""))]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let value_field = schema.field_with_name("value").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let value_field = schema.field_with_name("value").expect("arrow schema");
 
         assert_eq!(value_field.data_type(), &DataType::Utf8);
     }
@@ -812,8 +806,8 @@ mod tests {
             ]),
         ];
 
-        let schema = infer_arrow_schema_from_items(&items).unwrap();
-        let timestamp_field = schema.field_with_name("timestamp").unwrap();
+        let schema = infer_arrow_schema_from_items(&items).expect("arrow schema");
+        let timestamp_field = schema.field_with_name("timestamp").expect("arrow schema");
 
         assert!(matches!(
             timestamp_field.data_type(),

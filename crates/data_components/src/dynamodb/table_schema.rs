@@ -6,7 +6,7 @@ use datafusion::scalar::ScalarValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Encapsulates DynamoDB table schema, keys, and expression conversion logic.
+/// Encapsulates `DynamoDB` table schema, keys, and expression conversion logic.
 /// This struct knows WHAT the table structure is and WHAT operations are supported.
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableSchema {
@@ -57,7 +57,7 @@ impl DynamoDBTableSchema {
     pub fn get_column_alias(&self, column_name: &str) -> Option<&str> {
         self.column_to_alias_map
             .get(column_name)
-            .map(|s| s.as_str())
+            .map(String::as_str)
     }
 
     pub fn supports_filters_pushdown(
@@ -128,7 +128,7 @@ impl DynamoDBTableSchema {
         let key_condition = if let Some(sort) = sort_expr {
             let sort_str =
                 self.expr_to_filter_string(sort, &mut attribute_values, &mut value_counter)?;
-            format!("{} AND {}", partition_str, sort_str)
+            format!("{partition_str} AND {sort_str}")
         } else {
             partition_str
         };
@@ -200,13 +200,12 @@ impl DynamoDBTableSchema {
                     Operator::Or => "OR",
                     _ => {
                         return Err(DataFusionError::NotImplemented(format!(
-                            "Operator {:?} not supported",
-                            op
+                            "Operator {op:?} not supported"
                         )));
                     }
                 };
 
-                Ok(format!("({} {} {})", left_str, op_str, right_str))
+                Ok(format!("({left_str} {op_str} {right_str})"))
             }
             Expr::Column(col) => self
                 .column_to_alias_map
@@ -216,7 +215,7 @@ impl DynamoDBTableSchema {
                     DataFusionError::Execution(format!("Column {} not found", col.name))
                 }),
             Expr::Literal(scalar, _) => {
-                let value_key = format!(":v{}", value_counter);
+                let value_key = format!(":v{value_counter}");
                 *value_counter += 1;
 
                 let attr_value = scalar_to_attribute_value(scalar)?;
@@ -399,7 +398,7 @@ mod tests {
         let unsupported_filter = col("nonexistent").eq(lit(25i64));
 
         let filters = vec![&supported_filter, &unsupported_filter];
-        let result = schema.supports_filters_pushdown(&filters).unwrap();
+        let result = schema.supports_filters_pushdown(&filters).expect("supports_filters_pushdown");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
@@ -411,7 +410,7 @@ mod tests {
         let schema = create_test_schema();
 
         let filter = col("age").eq(lit(25i64));
-        let (expr, values) = schema.build_filter_expression(&[filter]).unwrap();
+        let (expr, values) = schema.build_filter_expression(&[filter]).expect("build_filter_expression");
 
         assert_eq!(expr, "(#c2 = :v0)");
         assert_eq!(values.len(), 1);
@@ -425,7 +424,7 @@ mod tests {
         let filter1 = col("age").gt(lit(18i64));
         let filter2 = col("active").eq(lit(true));
 
-        let (expr, values) = schema.build_filter_expression(&[filter1, filter2]).unwrap();
+        let (expr, values) = schema.build_filter_expression(&[filter1, filter2]).expect("build_filter_expression");
 
         assert!(expr.contains("AND"));
         assert!(expr.contains("#c2"));
@@ -437,7 +436,7 @@ mod tests {
     fn test_build_filter_expression_empty() {
         let schema = create_test_schema();
 
-        let (expr, values) = schema.build_filter_expression(&[]).unwrap();
+        let (expr, values) = schema.build_filter_expression(&[]).expect("build_filter_expression");
 
         assert!(expr.is_empty());
         assert!(values.is_empty());
@@ -449,7 +448,7 @@ mod tests {
 
         // (age > 18 AND active = true)
         let filter = col("age").gt(lit(18i64)).and(col("active").eq(lit(true)));
-        let (expr, values) = schema.build_filter_expression(&[filter]).unwrap();
+        let (expr, values) = schema.build_filter_expression(&[filter]).expect("build_filter_expression");
 
         assert!(expr.contains("AND"));
         assert!(expr.contains("#c2"));
@@ -492,7 +491,7 @@ mod tests {
         let partition_expr = col("id").eq(lit("user123"));
         let (expr, values) = schema
             .build_key_condition_expression(&partition_expr, None)
-            .unwrap();
+            .expect("build_key_condition_expression");
 
         assert_eq!(expr, "(#c0 = :v1000)");
         assert_eq!(values.len(), 1);
@@ -508,7 +507,7 @@ mod tests {
 
         let (expr, values) = schema
             .build_key_condition_expression(&partition_expr, Some(&sort_expr))
-            .unwrap();
+            .expect("build_key_condition_expression");
 
         assert!(expr.contains("AND"));
         assert!(expr.contains("#c0"));
@@ -519,7 +518,7 @@ mod tests {
     #[test]
     fn test_scalar_to_attribute_value_string() {
         let scalar = ScalarValue::Utf8(Some("test".to_string()));
-        let attr = scalar_to_attribute_value(&scalar).unwrap();
+        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
 
         match attr {
             AttributeValue::S(s) => assert_eq!(s, "test"),
@@ -530,22 +529,22 @@ mod tests {
     #[test]
     fn test_scalar_to_attribute_value_numbers() {
         let scalar_i64 = ScalarValue::Int64(Some(42));
-        let attr = scalar_to_attribute_value(&scalar_i64).unwrap();
+        let attr = scalar_to_attribute_value(&scalar_i64).expect("scalar_to_attribute_value");
         assert!(matches!(attr, AttributeValue::N(_)));
 
         let scalar_i32 = ScalarValue::Int32(Some(42));
-        let attr = scalar_to_attribute_value(&scalar_i32).unwrap();
+        let attr = scalar_to_attribute_value(&scalar_i32).expect("scalar_to_attribute_value");
         assert!(matches!(attr, AttributeValue::N(_)));
 
         let scalar_f64 = ScalarValue::Float64(Some(42.5));
-        let attr = scalar_to_attribute_value(&scalar_f64).unwrap();
+        let attr = scalar_to_attribute_value(&scalar_f64).expect("scalar_to_attribute_value");
         assert!(matches!(attr, AttributeValue::N(_)));
     }
 
     #[test]
     fn test_scalar_to_attribute_value_boolean() {
         let scalar = ScalarValue::Boolean(Some(true));
-        let attr = scalar_to_attribute_value(&scalar).unwrap();
+        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
 
         match attr {
             AttributeValue::Bool(b) => assert!(b),
@@ -556,7 +555,7 @@ mod tests {
     #[test]
     fn test_scalar_to_attribute_value_null() {
         let scalar = ScalarValue::Null;
-        let attr = scalar_to_attribute_value(&scalar).unwrap();
+        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
 
         assert!(matches!(attr, AttributeValue::Null(true)));
     }
@@ -604,7 +603,7 @@ mod tests {
 
             let result = schema
                 .expr_to_filter_string(&expr, &mut values, &mut counter)
-                .unwrap();
+                .expect("expr_to_filter_string");
             assert!(result.contains(expected_str));
         }
     }
@@ -619,7 +618,7 @@ mod tests {
 
         let (expr, values) = schema
             .build_filter_expression(&[string_filter, int_filter, bool_filter])
-            .unwrap();
+            .expect("build_filter_expression");
 
         assert!(expr.contains("#c3")); // name
         assert!(expr.contains("#c2")); // age

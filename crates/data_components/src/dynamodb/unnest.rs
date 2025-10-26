@@ -86,7 +86,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("age".to_string(), av_number("30"));
 
-        let result = unnest_dynamodb_item(&item, 10).unwrap();
+        let result = unnest_dynamodb_item(&item, 10).expect("unwrapped item");
 
         assert_eq!(result.len(), 2);
         assert!(matches!(result.get("name"), Some(AttributeValue::S(s)) if s == "Alice"));
@@ -103,7 +103,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("address".to_string(), av_map(inner_map));
 
-        let result = unnest_dynamodb_item(&item, 1).unwrap();
+        let result = unnest_dynamodb_item(&item, 1).expect("unwrapped item");
 
         assert_eq!(result.len(), 3);
         assert!(matches!(result.get("name"), Some(AttributeValue::S(s)) if s == "Alice"));
@@ -125,7 +125,7 @@ mod tests {
         let mut item = HashMap::new();
         item.insert("level1".to_string(), av_map(level1));
 
-        let result = unnest_dynamodb_item(&item, 10).unwrap();
+        let result = unnest_dynamodb_item(&item, 10).expect("unwrapped item");
 
         assert_eq!(result.len(), 1);
         assert!(matches!(
@@ -143,7 +143,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("address".to_string(), av_map(inner_map));
 
-        let result = unnest_dynamodb_item(&item, 0).unwrap();
+        let result = unnest_dynamodb_item(&item, 0).expect("unwrapped item");
 
         // At depth 0, maps should not be flattened
         assert_eq!(result.len(), 2);
@@ -165,7 +165,7 @@ mod tests {
         let mut item = HashMap::new();
         item.insert("level1".to_string(), av_map(level1));
 
-        let result = unnest_dynamodb_item(&item, 1).unwrap();
+        let result = unnest_dynamodb_item(&item, 1).expect("unwrapped item");
 
         // Only flatten one level deep
         assert_eq!(result.len(), 1);
@@ -184,7 +184,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("user".to_string(), av_map(inner_map));
 
-        let result = unnest_dynamodb_item(&item, 10).unwrap();
+        let result = unnest_dynamodb_item(&item, 10).expect("unwrapped item");
 
         assert_eq!(result.len(), 2);
         assert!(matches!(result.get("name"), Some(AttributeValue::S(s)) if s == "Alice"));
@@ -209,7 +209,7 @@ mod tests {
 
         let items = vec![item1, item2];
 
-        let results = unnest_dynamodb_items(items, 1).unwrap();
+        let results = unnest_dynamodb_items(items, 1).expect("unwrapped item");
 
         assert_eq!(results.len(), 2);
 
@@ -230,7 +230,7 @@ mod tests {
         item.insert("id".to_string(), av_string("1"));
         item.insert("metadata".to_string(), av_map(inner_map));
 
-        let result = unnest_dynamodb_item(&item, 1).unwrap();
+        let result = unnest_dynamodb_item(&item, 1).expect("unwrapped item");
 
         assert_eq!(result.len(), 3);
         assert!(matches!(result.get("id"), Some(AttributeValue::S(s)) if s == "1"));
@@ -244,7 +244,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("empty".to_string(), av_map(HashMap::new()));
 
-        let result = unnest_dynamodb_item(&item, 1).unwrap();
+        let result = unnest_dynamodb_item(&item, 1).expect("unwrapped item");
 
         // Empty map shouldn't add any keys
         assert_eq!(result.len(), 1);

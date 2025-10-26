@@ -29,7 +29,7 @@ use aws_sdk_dynamodb::{
     error::SdkError,
     types::{AttributeValue, TableStatus},
 };
-use aws_smithy_async::future::pagination_stream::{PaginationStream, TryFlatMap};
+use aws_smithy_async::future::pagination_stream::TryFlatMap;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::project_schema,
@@ -156,7 +156,7 @@ impl TableProvider for DynamoDBTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.table_schema.schema())
+        Arc::clone(self.table_schema.schema())
     }
 
     fn table_type(&self) -> TableType {

@@ -319,7 +319,7 @@ impl ArrayBuilderTrait for StringArrayBuilder {
             Some(AttributeValue::Null(_)) => self.0.append_null(),
             Some(other) => {
                 // Convert other types to string representation
-                self.0.append_value(format!("{:?}", other));
+                self.0.append_value(format!("{other:?}"));
             }
             None => self.0.append_null(),
         }
@@ -430,7 +430,7 @@ impl ArrayBuilderTrait for StringListArrayBuilder {
                         AttributeValue::N(n) => self.0.values().append_value(n),
                         AttributeValue::Bool(b) => self.0.values().append_value(b.to_string()),
                         AttributeValue::Null(_) => self.0.values().append_value("null"),
-                        other => self.0.values().append_value(format!("{:?}", other)),
+                        other => self.0.values().append_value(format!("{other:?}")),
                     }
                 }
                 self.0.append(true);
@@ -568,14 +568,13 @@ fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
 
 fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
     // Parse YYYY-MM-DD format
-    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2 {
-        if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2
+        && let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
             // Convert to days since Unix epoch (1970-01-01)
             let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
             let duration = date.signed_duration_since(epoch);
             return Some(duration.num_days() as i32);
         }
-    }
     None
 }
 
@@ -616,7 +615,7 @@ mod tests {
             Field::new("age", DataType::Int64, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema.clone()).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema.clone()).expect("to_arrow");
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.num_columns(), 2);
     }
@@ -638,7 +637,7 @@ mod tests {
             Field::new("is_active", DataType::Boolean, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
         assert_eq!(result.num_columns(), 4);
 
@@ -647,28 +646,28 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("name_array");
         assert_eq!(name_array.value(0), "Alice");
 
         let age_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("age_array");
         assert_eq!(age_array.value(0), 30);
 
         let height_array = result
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
+            .expect("height_array");
         assert_eq!(height_array.value(0), 5.6);
 
         let is_active_array = result
             .column(3)
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
-            .unwrap();
+            .expect("is_active_array");
         assert!(is_active_array.value(0));
     }
 
@@ -692,20 +691,20 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let tags_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .unwrap();
+            .expect("array");
 
         let arc = tags_array.value(0);
         let values = arc
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(values.len(), 3);
         assert_eq!(values.value(0), "tag1");
@@ -729,20 +728,20 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let scores_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .unwrap();
+            .expect("array");
 
         let arc = scores_array.value(0);
         let values = arc
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(values.len(), 3);
         assert_eq!(values.value(0), 10);
@@ -770,20 +769,20 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let ratings_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .unwrap();
+            .expect("array");
 
         let arc = ratings_array.value(0);
         let values = arc
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(values.len(), 3);
         assert_eq!(values.value(0), 1.5);
@@ -807,20 +806,20 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let data_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .unwrap();
+            .expect("array");
 
         let arc = data_array.value(0);
         let values = arc
             .as_any()
             .downcast_ref::<arrow::array::BinaryArray>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(values.len(), 2);
         assert_eq!(values.value(0), &[1, 2, 3]);
@@ -840,14 +839,14 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let data_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::BinaryArray>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(data_array.value(0), &[1, 2, 3, 4, 5]);
     }
@@ -873,20 +872,20 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let mixed_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .unwrap();
+            .expect("array");
 
         let arc = mixed_array.value(0);
         let values = arc
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(values.len(), 4);
         assert_eq!(values.value(0), "text");
@@ -908,17 +907,17 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("user", DataType::Utf8, true)]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let user_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
 
         let json_str = user_array.value(0);
-        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("json");
 
         assert_eq!(parsed["name"], "Alice");
         assert!(parsed["age"].is_number() || parsed["age"].is_string());
@@ -941,14 +940,14 @@ mod tests {
             Field::new("age", DataType::Int64, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 2);
 
         let name_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
         assert_eq!(name_array.value(0), "Alice");
         assert!(name_array.is_null(1));
 
@@ -956,7 +955,7 @@ mod tests {
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("array");
         assert!(age_array.is_null(0));
         assert_eq!(age_array.value(1), 30);
     }
@@ -978,14 +977,14 @@ mod tests {
             Field::new("age", DataType::Int64, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 2);
 
         let age_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(age_array.value(0), 30);
         assert!(age_array.is_null(1)); // Missing field treated as null
     }
@@ -1011,49 +1010,49 @@ mod tests {
             Field::new("zero", DataType::Int64, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let int_pos = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(int_pos.value(0), 42);
 
         let int_neg = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(int_neg.value(0), -42);
 
         let float_pos = result
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(float_pos.value(0), 3.14);
 
         let float_neg = result
             .column(3)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(float_neg.value(0), -3.14);
 
         let scientific = result
             .column(4)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(scientific.value(0), 1.5e10);
 
         let zero = result
             .column(5)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(zero.value(0), 0);
     }
 
@@ -1082,7 +1081,7 @@ mod tests {
             Field::new("age", DataType::Int64, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.num_columns(), 3);
 
@@ -1090,7 +1089,7 @@ mod tests {
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
         assert_eq!(name_array.value(0), "Alice");
         assert_eq!(name_array.value(1), "Bob");
         assert_eq!(name_array.value(2), "Charlie");
@@ -1109,20 +1108,20 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let list_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .unwrap();
+            .expect("array");
 
         let arc = list_array.value(0);
         let values = arc
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(values.len(), 0);
     }
@@ -1146,20 +1145,20 @@ mod tests {
             true,
         )]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let list_array = result
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
-            .unwrap();
+            .expect("array");
 
         let arc = list_array.value(0);
         let values = arc
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(values.len(), 1);
         // The nested map should be converted to a string representation
@@ -1183,41 +1182,41 @@ mod tests {
             Field::new("nullable_bool", DataType::Boolean, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
 
         let string_array = result
             .column_by_name("nullable_string")
-            .unwrap()
+            .expect("array")
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
         assert_eq!(string_array.len(), 1);
         assert!(string_array.is_null(0));
 
         let int_array = result
             .column_by_name("nullable_int")
-            .unwrap()
+            .expect("array")
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(int_array.len(), 1);
         assert!(int_array.is_null(0));
 
         let float_array = result
             .column_by_name("nullable_float")
-            .unwrap()
+            .expect("array")
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
+            .expect("array");
         assert_eq!(float_array.len(), 1);
         assert!(float_array.is_null(0));
 
         let bool_array = result
             .column_by_name("nullable_bool")
-            .unwrap()
+            .expect("array")
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
-            .unwrap();
+            .expect("array");
         assert_eq!(bool_array.len(), 1);
         assert!(bool_array.is_null(0));
     }
@@ -1239,7 +1238,7 @@ mod tests {
             Field::new("birth_date", DataType::Date32, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.num_columns(), 2);
 
@@ -1248,7 +1247,7 @@ mod tests {
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Date32Array>()
-            .unwrap();
+            .expect("array");
 
         // 1990-05-22 is 7446 days since epoch
         assert_eq!(date_array.value(0), 7446);
@@ -1283,7 +1282,7 @@ mod tests {
             ),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.num_columns(), 2);
 
@@ -1292,7 +1291,7 @@ mod tests {
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
 
         // 2023-08-31T12:34:56Z = 1693488896000 ms
         assert_eq!(timestamp_array.value(0), 1693485296000);
@@ -1323,14 +1322,14 @@ mod tests {
             ),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let timestamp_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
 
         assert_eq!(timestamp_array.value(0), 1693485296000);
     }
@@ -1362,14 +1361,14 @@ mod tests {
             Field::new("birth_date", DataType::Date32, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 2);
 
         let timestamp_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
 
         assert!(!timestamp_array.is_null(0));
         assert!(timestamp_array.is_null(1));
@@ -1378,7 +1377,7 @@ mod tests {
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::Date32Array>()
-            .unwrap();
+            .expect("array");
 
         assert!(!date_array.is_null(0));
         assert!(date_array.is_null(1));
@@ -1408,14 +1407,14 @@ mod tests {
             ),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 2);
 
         let timestamp_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
 
         assert!(!timestamp_array.is_null(0));
         assert!(timestamp_array.is_null(1));
@@ -1442,14 +1441,14 @@ mod tests {
             Field::new("birth_date", DataType::Date32, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 3);
 
         let date_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Date32Array>()
-            .unwrap();
+            .expect("array");
 
         assert!(!date_array.is_null(0)); // Valid date
         assert!(date_array.is_null(1)); // Invalid format
@@ -1484,14 +1483,14 @@ mod tests {
             ),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 3);
 
         let timestamp_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
 
         assert!(!timestamp_array.is_null(0)); // Valid timestamp
         assert!(timestamp_array.is_null(1)); // Invalid format
@@ -1541,7 +1540,7 @@ mod tests {
             Field::new("hire_date", DataType::Date32, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.num_columns(), 6);
 
@@ -1550,7 +1549,7 @@ mod tests {
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
         assert!(!created_at_array.is_null(0));
         assert!(!created_at_array.is_null(1));
 
@@ -1558,7 +1557,7 @@ mod tests {
             .column(3)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
         assert!(!updated_at_array.is_null(0));
         assert!(!updated_at_array.is_null(1));
 
@@ -1566,7 +1565,7 @@ mod tests {
             .column(4)
             .as_any()
             .downcast_ref::<arrow::array::Date32Array>()
-            .unwrap();
+            .expect("array");
         assert!(!birth_date_array.is_null(0));
         assert!(!birth_date_array.is_null(1));
 
@@ -1574,7 +1573,7 @@ mod tests {
             .column(5)
             .as_any()
             .downcast_ref::<arrow::array::Date32Array>()
-            .unwrap();
+            .expect("array");
         assert!(!hire_date_array.is_null(0));
         assert!(!hire_date_array.is_null(1));
     }
@@ -1595,7 +1594,7 @@ mod tests {
             Field::new("birth_date", DataType::Date32, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema.clone()).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema.clone()).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.num_columns(), 3);
     }
@@ -1622,21 +1621,21 @@ mod tests {
             Field::new("birth_date", DataType::Date32, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema).unwrap();
+        let result = dynamodb_items_to_arrow(&items, schema).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 1);
 
         let timestamp_array = result
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            .unwrap();
+            .expect("array");
         assert!(timestamp_array.is_null(0));
 
         let date_array = result
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::Date32Array>()
-            .unwrap();
+            .expect("array");
         assert!(date_array.is_null(0));
     }
 }
