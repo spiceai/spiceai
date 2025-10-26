@@ -161,6 +161,7 @@ mailparse = "0.15.0"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.3.0", features = ["openssl-tls"] }
 mysql_async = { version = "0.35.1", features = ["native-tls-tls", "chrono"] }
+num_cpus = "1.16"
 object_store = { version = "0.12", features = ["aws", "gcp", "azure", "http"] }
 odbc-api = { version = "13" }
 opentelemetry = { version = "0.27", default-features = false, features = [

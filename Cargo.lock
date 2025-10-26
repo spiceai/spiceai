@@ -12742,6 +12742,7 @@ name = "runtime-async"
 version = "1.9.0-unstable"
 dependencies = [
  "futures",
+ "num_cpus",
  "snafu",
  "tokio",
  "tracing",
