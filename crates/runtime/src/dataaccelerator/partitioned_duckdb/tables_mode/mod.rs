@@ -95,7 +95,12 @@ impl TablesModePartitionedDuckDBAccelerator {
             .file_path(source)
             .map_err(|e| super::Error::AccelerationInitializationFailed { source: e.into() })?;
 
-        get_pool(&self.duckdb_factory, &duckdb_path)
+        let pool_size = source
+            .acceleration()
+            .and_then(|accel| accel.params.get("connection_pool_size"))
+            .and_then(|size_str| size_str.parse::<u32>().ok());
+
+        get_pool(&self.duckdb_factory, &duckdb_path, pool_size)
             .await
             .context(FailedToCreateConnectionPoolSnafu)
     }
@@ -405,10 +410,13 @@ fn create_factory() -> DuckDBTableProviderFactory {
 async fn get_pool(
     duckdb_factory: &DuckDBTableProviderFactory,
     duckdb_path: &str,
+    connection_pool_size: Option<u32>,
 ) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
     let pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
-        .with_max_size(Some(20))
-        .with_min_idle(Some(10));
+        .with_max_size(Some(connection_pool_size.unwrap_or(10)))
+        .with_min_idle(Some(
+            crate::dataaccelerator::duckdb::DEFAULT_MIN_IDLE_CONNECTIONS,
+        ));
     Ok(Arc::new(
         duckdb_factory
             .get_or_init_instance_with_builder(pool_builder)
