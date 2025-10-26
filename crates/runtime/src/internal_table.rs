@@ -153,7 +153,9 @@ pub async fn create_internal_accelerated_table(
         "internal".to_string(),
         accelerated_table_provider,
         refresh,
+        runtime.tokio_io_runtime(),
     );
+    builder.cpu_runtime(runtime.datafusion().cpu_runtime().cloned());
 
     builder.retention(retention);
 
