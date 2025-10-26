@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
-
+use std::pin::Pin;
 use super::{
     DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
@@ -56,6 +56,8 @@ use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use futures::Stream;
 use tokio::sync::mpsc::Sender;
+use futures::pin_mut;
+use futures::stream::{self, StreamExt};
 
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
@@ -266,65 +268,105 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let unnest_depth = Some(1);
 
         builder.spawn(async move {
-            match request {
-                DynamoDBRequest::Query(query) => {
-                    let item_stream = TryFlatMap::new(query.into_paginator().send())
-                        .flat_map(|output| output.items().to_vec());
-                    process_item_stream(item_stream, tx, schema, unnest_depth).await
-                }
-                DynamoDBRequest::Scan(scan) => {
-                    let item_stream = TryFlatMap::new(scan.into_paginator().send())
-                        .flat_map(|output| output.items().to_vec());
-                    process_item_stream(item_stream, tx, schema, unnest_depth).await
-                }
+            const CHUNK_SIZE: usize = 4_000;
+
+            let item_stream = build_stream_from_plan(request);
+            let chunked_stream = item_stream.chunks(CHUNK_SIZE);
+            pin_mut!(chunked_stream);
+
+            while let Some(chunk) = chunked_stream.next().await {
+                let items: Result<Vec<_>, _> = chunk.into_iter().collect();
+                let items = items?;
+
+                let unnested_items = match unnest_depth {
+                    None | Some(0) => items,
+                    Some(depth) => unnest_dynamodb_items(items, depth).map_err(to_execution_error)?,
+                };
+
+                let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
+                    .map_err(to_execution_error)?;
+
+                tx.send(Ok(batch)).await.map_err(to_execution_error)?;
             }
+
+            Ok(())
         });
 
         Ok(builder.build())
     }
 }
 
-use futures::pin_mut;
-use futures::stream::{self, StreamExt};
+fn build_stream_from_plan(
+    request: DynamoDBRequest,
+) -> Pin<Box<dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static>> {
+    match request {
+        DynamoDBRequest::Query(query) => {
+            let pagination_stream = TryFlatMap::new(query.into_paginator().send())
+                .flat_map(|output| output.items().to_vec());
 
-async fn process_item_stream<E>(
-    pagination_stream: PaginationStream<Result<HashMap<String, AttributeValue>, SdkError<E>>>,
-    tx: Sender<datafusion::common::Result<RecordBatch>>,
-    schema: SchemaRef,
-    unnest_depth: Option<usize>,
-) -> DataFusionResult<()>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    const CHUNK_SIZE: usize = 4_000;
+            let stream = stream::unfold(pagination_stream, |mut s| async move {
+                s.next().await.map(|item| {
+                    let result = item.map_err(|e| to_execution_error(map_sdk_error(e)));
+                    (result, s)
+                })
+            });
 
-    let item_stream = stream::unfold(pagination_stream, |mut stream| async move {
-        stream.next().await.map(|item| (item, stream))
-    });
+            Box::pin(stream)
+        }
+        DynamoDBRequest::Scan(scan) => {
+            let pagination_stream = TryFlatMap::new(scan.into_paginator().send())
+                .flat_map(|output| output.items().to_vec());
 
-    let chunked_stream = item_stream
-        .map(|result| result.map_err(|e| to_execution_error(map_sdk_error(e))))
-        .chunks(CHUNK_SIZE);
+            let stream = stream::unfold(pagination_stream, |mut s| async move {
+                s.next().await.map(|item| {
+                    let result = item.map_err(|e| to_execution_error(map_sdk_error(e)));
+                    (result, s)
+                })
+            });
 
-    pin_mut!(chunked_stream);
-
-    while let Some(chunk) = chunked_stream.next().await {
-        let items: Result<Vec<_>, _> = chunk.into_iter().collect();
-        let items = items?;
-
-        let unnested_items = match unnest_depth {
-            None | Some(0) => items,
-            Some(depth) => unnest_dynamodb_items(items, depth).map_err(to_execution_error)?,
-        };
-
-        let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
-            .map_err(to_execution_error)?;
-
-        tx.send(Ok(batch)).await.map_err(to_execution_error)?;
+            Box::pin(stream)
+        }
     }
-
-    Ok(())
 }
+
+// async fn process_item_stream<E>(
+//     pagination_stream: PaginationStream<Result<HashMap<String, AttributeValue>, SdkError<E>>>,
+//     tx: Sender<datafusion::common::Result<RecordBatch>>,
+//     schema: SchemaRef,
+//     unnest_depth: Option<usize>,
+// ) -> DataFusionResult<()>
+// where
+//     E: std::error::Error + Send + Sync + 'static,
+// {
+//     const CHUNK_SIZE: usize = 4_000;
+//
+//     let item_stream = stream::unfold(pagination_stream, |mut stream| async move {
+//         stream.next().await.map(|item| (item, stream))
+//     });
+//
+//     let chunked_stream = item_stream
+//         .map(|result| result.map_err(|e| to_execution_error(map_sdk_error(e))))
+//         .chunks(CHUNK_SIZE);
+//
+//     pin_mut!(chunked_stream);
+//
+//     while let Some(chunk) = chunked_stream.next().await {
+//         let items: Result<Vec<_>, _> = chunk.into_iter().collect();
+//         let items = items?;
+//
+//         let unnested_items = match unnest_depth {
+//             None | Some(0) => items,
+//             Some(depth) => unnest_dynamodb_items(items, depth).map_err(to_execution_error)?,
+//         };
+//
+//         let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
+//             .map_err(to_execution_error)?;
+//
+//         tx.send(Ok(batch)).await.map_err(to_execution_error)?;
+//     }
+//
+//     Ok(())
+// }
 
 /// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
 /// Because projection expressions may use reserved words in `DynamoDB`, this function automatically generates expression attribute names for each column to avoid conflicts.
