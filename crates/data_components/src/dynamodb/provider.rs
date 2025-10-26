@@ -173,7 +173,13 @@ impl TableProvider for DynamoDBTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let projected_schema = project_schema(self.table_schema.schema(), projection)?;
+        let mut projected_schema = project_schema(self.table_schema.schema(), projection)?;
+
+        // If no columns are specified, use partition_key - otherwise DynamoDB returns an error
+        if projected_schema.fields.is_empty() {
+            let idx = self.table_schema.schema().index_of(self.table_schema.partition_key())?;
+            projected_schema = SchemaRef::from(self.table_schema.schema().project(&[idx])?);
+        }
 
         let request_plan =
             self.request_plan_builder
@@ -373,16 +379,6 @@ fn build_stream_from_plan(
             Box::pin(stream)
         }
     }
-}
-
-/// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
-/// Because projection expressions may use reserved words in `DynamoDB`, this function automatically generates expression attribute names for each column to avoid conflicts.
-/// The expression format used is `#c{idx}` for each projected column, where `{idx}` is the column projection index.
-/// See: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ExpressionAttributeNames.html#Expressions.ExpressionAttributeNames.ReservedWords>
-/// Returns a tuple of (`projection_expression`, `expression_attribute_names`) for the `DynamoDB` scan.
-/// Returns None if no projection is required.
-fn projection_expression() -> Option<(String, HashMap<String, String>)> {
-    todo!()
 }
 
 #[allow(clippy::needless_pass_by_value)]

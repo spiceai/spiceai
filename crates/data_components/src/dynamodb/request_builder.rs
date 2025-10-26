@@ -51,6 +51,18 @@ enum KeyFilter {
     Sort(Expr),
 }
 
+/// Builds optimized DynamoDB request plans (Query or Scan) from DataFusion filter expressions and projections.
+///
+/// The builder automatically determines the most efficient request type:
+///  * Query operations are generated when filters include an equality condition on the partition
+///    key (and optionally a sort key condition), providing  direct indexed access to items.
+///  * Scan operations are used as a fallback when key conditions cannot be met, such as when
+///    no partition key filter exists or when filters contain OR operators.
+///
+/// All column references are automatically aliased using `expression_attribute_names` to ensure compatibility
+/// with DynamoDB reserved words and special characters.
+/// See: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ExpressionAttributeNames.html#Expressions.ExpressionAttributeNames.ReservedWords>
+///
 impl DynamoDBRequestPlanBuilder {
     pub fn new(schema: DynamoDBTableSchema) -> Self {
         Self { schema }

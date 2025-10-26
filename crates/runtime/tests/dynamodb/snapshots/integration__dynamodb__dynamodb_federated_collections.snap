@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/dynamodb/mod.rs
+expression: formatted
+---
++----+-----------------+--------------------+----------------+
+| id | col_string_set  | col_number_set_int | col_list       |
++----+-----------------+--------------------+----------------+
+| 1  | [apple, banana] | [1, 2, 3]          | [1, foo, true] |
++----+-----------------+--------------------+----------------+
