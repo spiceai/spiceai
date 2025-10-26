@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use app::AppBuilder;
 use futures::StreamExt;
@@ -25,7 +25,6 @@ use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
-use std::env;
 use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::config::BehaviorVersion;
@@ -34,13 +33,14 @@ use aws_sdk_dynamodb::types::{
     ScalarAttributeType,
 };
 use rand::Rng;
+use std::env;
 
 pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::Error> {
-    let Ok(dynamodb_access_key_id) = env::var("AWS_DYNAMODB_KEY")  else {
+    let Ok(dynamodb_access_key_id) = env::var("AWS_DYNAMODB_KEY") else {
         panic!("AWS_DYNAMODB_KEY not set")
     };
 
-    let Ok(dynamodb_secret_access_key) = env::var("AWS_DYNAMODB_SECRET")  else {
+    let Ok(dynamodb_secret_access_key) = env::var("AWS_DYNAMODB_SECRET") else {
         panic!("AWS_DYNAMODB_SECRET not set")
     };
 
@@ -63,7 +63,10 @@ pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::E
     Ok(client)
 }
 
-async fn init_test_table(client: &aws_sdk_dynamodb::Client, table_name: &str) -> Result<(), anyhow::Error> {
+async fn init_test_table(
+    client: &aws_sdk_dynamodb::Client,
+    table_name: &str,
+) -> Result<(), anyhow::Error> {
     tracing::info!("Initializing test table: {}", table_name);
 
     let _ = client.delete_table().table_name(table_name).send().await;
@@ -112,10 +115,22 @@ async fn init_test_table(client: &aws_sdk_dynamodb::Client, table_name: &str) ->
     item1.insert("id".to_string(), AttributeValue::N("1".to_string()));
     item1.insert("version".to_string(), AttributeValue::N("2".to_string()));
     item1.insert("col_bool".to_string(), AttributeValue::Bool(true));
-    item1.insert("col_string".to_string(), AttributeValue::S("string 🚀😊".to_string()));
-    item1.insert("col_number_int".to_string(), AttributeValue::N("42".to_string()));
-    item1.insert("col_number_float".to_string(), AttributeValue::N("3.14159".to_string()));
-    item1.insert("col_number_scientific".to_string(), AttributeValue::N("1.23e10".to_string()));
+    item1.insert(
+        "col_string".to_string(),
+        AttributeValue::S("string 🚀😊".to_string()),
+    );
+    item1.insert(
+        "col_number_int".to_string(),
+        AttributeValue::N("42".to_string()),
+    );
+    item1.insert(
+        "col_number_float".to_string(),
+        AttributeValue::N("3.14159".to_string()),
+    );
+    item1.insert(
+        "col_number_scientific".to_string(),
+        AttributeValue::N("1.23e10".to_string()),
+    );
     item1.insert(
         "col_binary".to_string(),
         AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(b"blob")),
@@ -130,7 +145,11 @@ async fn init_test_table(client: &aws_sdk_dynamodb::Client, table_name: &str) ->
     );
     item1.insert(
         "col_number_set_float".to_string(),
-        AttributeValue::Ns(vec!["1.1".to_string(), "2.2".to_string(), "3.3".to_string()]),
+        AttributeValue::Ns(vec![
+            "1.1".to_string(),
+            "2.2".to_string(),
+            "3.3".to_string(),
+        ]),
     );
     item1.insert(
         "col_binary_set".to_string(),
@@ -155,7 +174,10 @@ async fn init_test_table(client: &aws_sdk_dynamodb::Client, table_name: &str) ->
     map.insert("name".to_string(), AttributeValue::S("John".to_string()));
     map.insert("age".to_string(), AttributeValue::N("30".to_string()));
     map.insert("is_active".to_string(), AttributeValue::Bool(true));
-    map.insert("balance".to_string(), AttributeValue::N("1234.56".to_string()));
+    map.insert(
+        "balance".to_string(),
+        AttributeValue::N("1234.56".to_string()),
+    );
     item1.insert("col_map".to_string(), AttributeValue::M(map));
 
     // Temporal types (stored as strings)
@@ -187,11 +209,17 @@ async fn init_test_table(client: &aws_sdk_dynamodb::Client, table_name: &str) ->
     item2.insert("col_string".to_string(), AttributeValue::Null(true));
     item2.insert("col_number_int".to_string(), AttributeValue::Null(true));
     item2.insert("col_number_float".to_string(), AttributeValue::Null(true));
-    item2.insert("col_number_scientific".to_string(), AttributeValue::Null(true));
+    item2.insert(
+        "col_number_scientific".to_string(),
+        AttributeValue::Null(true),
+    );
     item2.insert("col_binary".to_string(), AttributeValue::Null(true));
     item2.insert("col_string_set".to_string(), AttributeValue::Null(true));
     item2.insert("col_number_set_int".to_string(), AttributeValue::Null(true));
-    item2.insert("col_number_set_float".to_string(), AttributeValue::Null(true));
+    item2.insert(
+        "col_number_set_float".to_string(),
+        AttributeValue::Null(true),
+    );
     item2.insert("col_binary_set".to_string(), AttributeValue::Null(true));
     item2.insert("col_list".to_string(), AttributeValue::Null(true));
     item2.insert("col_map".to_string(), AttributeValue::Null(true));
@@ -210,7 +238,10 @@ async fn init_test_table(client: &aws_sdk_dynamodb::Client, table_name: &str) ->
     Ok(())
 }
 
-async fn cleanup_test_table(client: &aws_sdk_dynamodb::Client, table_name: &str) -> Result<(), anyhow::Error> {
+async fn cleanup_test_table(
+    client: &aws_sdk_dynamodb::Client,
+    table_name: &str,
+) -> Result<(), anyhow::Error> {
     tracing::info!("Cleaning up test table: {}", table_name);
     client.delete_table().table_name(table_name).send().await?;
     Ok(())
@@ -223,7 +254,10 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
     let table_name = "spice_integration_test";
     let client = get_dynamodb_client().await?;
 
-    let table_name = format!("spice_integration_test_{}", rand::rng().random_range(1000..=9999));
+    let table_name = format!(
+        "spice_integration_test_{}",
+        rand::rng().random_range(1000..=9999)
+    );
     init_test_table(&client, &table_name).await?;
 
     let test_result = test_request_context()
@@ -236,10 +270,7 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                 .build();
 
             configure_test_datafusion();
-            let rt = Runtime::builder()
-                .with_app(app)
-                .build()
-                .await;
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -260,14 +291,16 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                    AND table_name = 'test_dynamodb' \
                  ORDER BY column_name;",
                 "dynamodb_federated_schema",
-            ).await?;
+            )
+            .await?;
 
             // Test 2: Full table scan with ordering
             run_and_snapshot_query(
                 &rt,
                 "SELECT * FROM test_dynamodb ORDER BY id;",
                 "dynamodb_federated_full_scan",
-            ).await?;
+            )
+            .await?;
 
             // Test 3: Filtered query
             run_and_snapshot_query(
@@ -276,7 +309,8 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                  FROM test_dynamodb \
                  WHERE id = 1;",
                 "dynamodb_federated_filtered",
-            ).await?;
+            )
+            .await?;
 
             // Test 8: Query with filter
             run_and_snapshot_query(
@@ -285,14 +319,16 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                  FROM test_dynamodb \
                  WHERE id = 1 and version > '0';",
                 "dynamodb_federated_query_filtered",
-            ).await?;
+            )
+            .await?;
 
             // Test 4: Aggregation
             run_and_snapshot_query(
                 &rt,
                 "SELECT COUNT(*) as total_count FROM test_dynamodb;",
                 "dynamodb_federated_count",
-            ).await?;
+            )
+            .await?;
 
             // Test 5: Test null handling
             run_and_snapshot_query(
@@ -301,7 +337,8 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                  FROM test_dynamodb \
                  WHERE col_string IS NULL;",
                 "dynamodb_federated_nulls",
-            ).await?;
+            )
+            .await?;
 
             // Test 5: Test non-null handling
             run_and_snapshot_query(
@@ -310,7 +347,8 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                  FROM test_dynamodb \
                  WHERE col_string IS NOT NULL;",
                 "dynamodb_federated_not_nulls",
-            ).await?;
+            )
+            .await?;
 
             // Test 6: Test temporal types
             run_and_snapshot_query(
@@ -319,7 +357,8 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                  FROM test_dynamodb \
                  WHERE id = 1;",
                 "dynamodb_federated_temporal",
-            ).await?;
+            )
+            .await?;
 
             // Test 7: Test collections (sets and lists)
             run_and_snapshot_query(
@@ -328,7 +367,8 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                  FROM test_dynamodb \
                  WHERE id = 1;",
                 "dynamodb_federated_collections",
-            ).await?;
+            )
+            .await?;
 
             Ok(())
         })

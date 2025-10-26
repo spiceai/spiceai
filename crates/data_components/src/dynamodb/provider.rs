@@ -177,7 +177,10 @@ impl TableProvider for DynamoDBTableProvider {
 
         // If no columns are specified, use partition_key - otherwise DynamoDB returns an error
         if projected_schema.fields.is_empty() {
-            let idx = self.table_schema.schema().index_of(self.table_schema.partition_key())?;
+            let idx = self
+                .table_schema
+                .schema()
+                .index_of(self.table_schema.partition_key())?;
             projected_schema = SchemaRef::from(self.table_schema.schema().project(&[idx])?);
         }
 
