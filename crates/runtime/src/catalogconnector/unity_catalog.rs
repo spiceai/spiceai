@@ -157,8 +157,10 @@ impl CatalogConnector for UnityCatalog {
             connector_component: ConnectorComponent::from(catalog),
         })?;
 
-        let delta_table_creator =
-            Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>;
+        let delta_table_creator = Arc::new(DeltaTableFactory::new(
+            params.to_secret_map(),
+            runtime.tokio_io_runtime(),
+        )) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,
