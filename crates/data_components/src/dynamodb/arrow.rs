@@ -155,6 +155,7 @@ fn create_builders(schema: &SchemaRef, capacity: usize) -> BuilderMap {
                 _ => Box::new(StringListArrayBuilder::new(capacity)),
             },
             DataType::Null => Box::new(NullArrayBuilder::new()),
+            #[allow(clippy::match_same_arms)]
             _ => {
                 // Fallback to string for unsupported types
                 Box::new(StringArrayBuilder::new(capacity))
@@ -228,7 +229,7 @@ impl ArrayBuilderTrait for BooleanArrayBuilder {
     fn append_attribute_value(&mut self, value: Option<&AttributeValue>) -> Result<(), Error> {
         match value {
             Some(AttributeValue::Bool(b)) => self.0.append_value(*b),
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -254,7 +255,7 @@ impl ArrayBuilderTrait for Int64ArrayBuilder {
                     self.0.append_null();
                 }
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -280,7 +281,7 @@ impl ArrayBuilderTrait for Float64ArrayBuilder {
                     self.0.append_null();
                 }
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -309,12 +310,11 @@ impl ArrayBuilderTrait for StringArrayBuilder {
                 })?;
                 self.0.append_value(&json_str);
             }
-            Some(AttributeValue::Null(_)) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
             Some(other) => {
                 // Convert other types to string representation
                 self.0.append_value(format!("{other:?}"));
             }
-            None => self.0.append_null(),
         }
         Ok(())
     }
@@ -334,7 +334,7 @@ impl ArrayBuilderTrait for BinaryArrayBuilder {
     fn append_attribute_value(&mut self, value: Option<&AttributeValue>) -> Result<(), Error> {
         match value {
             Some(AttributeValue::B(blob)) => self.0.append_value(blob.as_ref()),
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -360,7 +360,7 @@ impl ArrayBuilderTrait for Date32ArrayBuilder {
                     None => self.0.append_null(),
                 }
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -386,7 +386,7 @@ impl ArrayBuilderTrait for TimestampMillisecondArrayBuilder {
                     None => self.0.append_null(),
                 }
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -425,7 +425,7 @@ impl ArrayBuilderTrait for StringListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -455,7 +455,7 @@ impl ArrayBuilderTrait for Int64ListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -485,7 +485,7 @@ impl ArrayBuilderTrait for Float64ListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -511,7 +511,7 @@ impl ArrayBuilderTrait for BinaryListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
+            Some(AttributeValue::Null(_) | _) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -745,7 +745,7 @@ mod tests {
             AttributeValue::Ns(vec![
                 "1.5".to_string(),
                 "2.5".to_string(),
-                "3.14".to_string(),
+                "6.14".to_string(),
             ]),
         );
 
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(values.len(), 3);
         assert!((values.value(0) - 1.5).abs() < 1e-6);
         assert!((values.value(1) - 2.5).abs() < 1e-6);
-        assert!((values.value(2) - 3.14).abs() < 1e-6);
+        assert!((values.value(2) - 6.14).abs() < 1e-6);
     }
 
     #[test]
@@ -982,8 +982,8 @@ mod tests {
         let mut item = HashMap::new();
         item.insert("int_pos".to_string(), av_number("42"));
         item.insert("int_neg".to_string(), av_number("-42"));
-        item.insert("float_pos".to_string(), av_number("3.14"));
-        item.insert("float_neg".to_string(), av_number("-3.14"));
+        item.insert("float_pos".to_string(), av_number("6.14"));
+        item.insert("float_neg".to_string(), av_number("-6.14"));
         item.insert("scientific".to_string(), av_number("1.5e10"));
         item.insert("zero".to_string(), av_number("0"));
 
@@ -1020,14 +1020,14 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .expect("array");
-        assert!((float_pos.value(0) - 3.14).abs() < 1e-6);
+        assert!((float_pos.value(0) - 6.14).abs() < 1e-6);
 
         let float_neg = result
             .column(3)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .expect("array");
-        assert!((float_neg.value(0) - -3.14).abs() < 1e-6);
+        assert!((float_neg.value(0) - -6.14).abs() < 1e-6);
 
         let scientific = result
             .column(4)

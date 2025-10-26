@@ -15,7 +15,6 @@ pub struct DynamoDBTableSchema {
     pub partition_key: String,
     pub sort_key: Option<String>,
     pub column_to_alias_map: HashMap<String, String>, // actual_name -> #c0
-    pub alias_to_column_map: HashMap<String, String>, // #c0 -> actual_name
 }
 
 impl DynamoDBTableSchema {
@@ -24,9 +23,8 @@ impl DynamoDBTableSchema {
         table_schema: SchemaRef,
         partition_key: String,
         sort_key: Option<String>,
-        // gsi_info: Vec<IndexInfo>,
     ) -> Self {
-        let (column_to_alias_map, alias_to_column_map) = build_column_alias_maps(&table_schema);
+        let column_to_alias_map = build_column_alias_maps(&table_schema);
 
         Self {
             table_name,
@@ -34,7 +32,6 @@ impl DynamoDBTableSchema {
             partition_key,
             sort_key,
             column_to_alias_map,
-            alias_to_column_map,
         }
     }
 
@@ -60,10 +57,7 @@ impl DynamoDBTableSchema {
             .map(String::as_str)
     }
 
-    pub fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Vec<TableProviderFilterPushDown> {
+    pub fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
         filters
             .iter()
             .map(|&expr| {
@@ -247,9 +241,7 @@ impl DynamoDBTableSchema {
     }
 }
 
-fn build_column_alias_maps(
-    schema: &SchemaRef,
-) -> (HashMap<String, String>, HashMap<String, String>) {
+fn build_column_alias_maps(schema: &SchemaRef) -> HashMap<String, String> {
     let mut column_to_alias_map = HashMap::new();
     let mut alias_to_column_map = HashMap::new();
 
@@ -261,7 +253,7 @@ fn build_column_alias_maps(
         alias_to_column_map.insert(alias, column_name);
     }
 
-    (column_to_alias_map, alias_to_column_map)
+    column_to_alias_map
 }
 
 fn scalar_to_attribute_value(scalar: &ScalarValue) -> datafusion::error::Result<AttributeValue> {
@@ -311,7 +303,6 @@ mod tests {
         assert_eq!(schema.partition_key(), "id");
         assert_eq!(schema.sort_key(), Some("sort_key"));
         assert_eq!(schema.column_to_alias_map.len(), 5);
-        assert_eq!(schema.alias_to_column_map.len(), 5);
     }
 
     #[test]
@@ -396,8 +387,7 @@ mod tests {
         let unsupported_filter = col("nonexistent").eq(lit(25i64));
 
         let filters = vec![&supported_filter, &unsupported_filter];
-        let result = schema
-            .supports_filters_pushdown(&filters);
+        let result = schema.supports_filters_pushdown(&filters);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
@@ -409,8 +399,7 @@ mod tests {
         let schema = create_test_schema();
 
         let filter = col("age").eq(lit(25i64));
-        let (expr, values) = schema
-            .build_filter_expression(&[filter]);
+        let (expr, values) = schema.build_filter_expression(&[filter]);
 
         assert_eq!(expr, "(#c2 = :v0)");
         assert_eq!(values.len(), 1);
@@ -424,8 +413,7 @@ mod tests {
         let filter1 = col("age").gt(lit(18i64));
         let filter2 = col("active").eq(lit(true));
 
-        let (expr, values) = schema
-            .build_filter_expression(&[filter1, filter2]);
+        let (expr, values) = schema.build_filter_expression(&[filter1, filter2]);
 
         assert!(expr.contains("AND"));
         assert!(expr.contains("#c2"));
@@ -437,8 +425,7 @@ mod tests {
     fn test_build_filter_expression_empty() {
         let schema = create_test_schema();
 
-        let (expr, values) = schema
-            .build_filter_expression(&[]);
+        let (expr, values) = schema.build_filter_expression(&[]);
 
         assert!(expr.is_empty());
         assert!(values.is_empty());
@@ -450,8 +437,7 @@ mod tests {
 
         // (age > 18 AND active = true)
         let filter = col("age").gt(lit(18i64)).and(col("active").eq(lit(true)));
-        let (expr, values) = schema
-            .build_filter_expression(&[filter]);
+        let (expr, values) = schema.build_filter_expression(&[filter]);
 
         assert!(expr.contains("AND"));
         assert!(expr.contains("#c2"));
@@ -572,15 +558,11 @@ mod tests {
             Field::new("col3", DataType::Boolean, false),
         ]));
 
-        let (col_to_alias, alias_to_col) = build_column_alias_maps(&schema);
+        let col_to_alias = build_column_alias_maps(&schema);
 
         assert_eq!(col_to_alias.get("col1"), Some(&"#c0".to_string()));
         assert_eq!(col_to_alias.get("col2"), Some(&"#c1".to_string()));
         assert_eq!(col_to_alias.get("col3"), Some(&"#c2".to_string()));
-
-        assert_eq!(alias_to_col.get("#c0"), Some(&"col1".to_string()));
-        assert_eq!(alias_to_col.get("#c1"), Some(&"col2".to_string()));
-        assert_eq!(alias_to_col.get("#c2"), Some(&"col3".to_string()));
     }
 
     #[test]
@@ -620,8 +602,8 @@ mod tests {
         let int_filter = col("age").eq(lit(30i64));
         let bool_filter = col("active").eq(lit(true));
 
-        let (expr, values) = schema
-            .build_filter_expression(&[string_filter, int_filter, bool_filter]);
+        let (expr, values) =
+            schema.build_filter_expression(&[string_filter, int_filter, bool_filter]);
 
         assert!(expr.contains("#c3")); // name
         assert!(expr.contains("#c2")); // age

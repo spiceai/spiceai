@@ -303,12 +303,10 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
     }
 }
 
+type Foo = dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
+
 #[deny(unused_variables)]
-fn build_stream_from_plan(
-    client: &Arc<Client>,
-    request: DynamoDBRequestPlan,
-) -> Pin<Box<dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static>>
-{
+fn build_stream_from_plan(client: &Arc<Client>, request: DynamoDBRequestPlan) -> Pin<Box<Foo>> {
     match request {
         DynamoDBRequestPlan::Query(QueryParams {
             table_name,

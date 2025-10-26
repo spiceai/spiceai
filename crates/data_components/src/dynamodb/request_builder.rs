@@ -206,12 +206,12 @@ impl DynamoDBRequestPlanBuilder {
 
     fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
         // Check for OR conditions first - if present, can't use Query
-        let has_or = filters.iter().any(|f| contains_or(f));
+        let has_or = filters.iter().any(contains_or);
         if has_or {
             return (None, filters.to_vec());
         }
 
-        if let Some((partition, sort, other)) = self.try_match_index(
+        if let Some((partition, sort, other)) = try_match_index(
             filters,
             &self.schema.partition_key,
             self.schema.sort_key.as_deref(),
@@ -221,44 +221,6 @@ impl DynamoDBRequestPlanBuilder {
 
         // No matching index found - must use Scan
         (None, filters.to_vec())
-    }
-
-    /// Attempts to match filters against a specific index (base table or GSI)
-    fn try_match_index(
-        &self,
-        filters: &[Expr],
-        partition_key: &str,
-        sort_key: Option<&str>,
-    ) -> Option<(Expr, Option<Expr>, Vec<Expr>)> {
-        let mut partition_expr = None;
-        let mut sort_expr = None;
-        let mut other_filters = Vec::new();
-
-        for filter in filters {
-            if let Some(extracted) = try_extract_key_filter(filter, partition_key, sort_key) {
-                match extracted {
-                    KeyFilter::Partition(expr) => {
-                        if partition_expr.is_some() {
-                            // Multiple partition key filters - invalid
-                            return None;
-                        }
-                        partition_expr = Some(expr);
-                    }
-                    KeyFilter::Sort(expr) => {
-                        if sort_expr.is_some() {
-                            // Multiple sort key filters - invalid
-                            return None;
-                        }
-                        sort_expr = Some(expr);
-                    }
-                }
-            } else {
-                other_filters.push(filter.clone());
-            }
-        }
-
-        // Must have partition key to use Query
-        partition_expr.map(|p| (p, sort_expr, other_filters))
     }
 
     fn build_projection_expression(&self, projection: &SchemaRef) -> Option<String> {
@@ -286,6 +248,43 @@ impl DynamoDBRequestPlanBuilder {
             }
         }
     }
+}
+
+/// Attempts to match filters against a specific index (base table or GSI)
+fn try_match_index(
+    filters: &[Expr],
+    partition_key: &str,
+    sort_key: Option<&str>,
+) -> Option<(Expr, Option<Expr>, Vec<Expr>)> {
+    let mut partition_expr = None;
+    let mut sort_expr = None;
+    let mut other_filters = Vec::new();
+
+    for filter in filters {
+        if let Some(extracted) = try_extract_key_filter(filter, partition_key, sort_key) {
+            match extracted {
+                KeyFilter::Partition(expr) => {
+                    if partition_expr.is_some() {
+                        // Multiple partition key filters - invalid
+                        return None;
+                    }
+                    partition_expr = Some(expr);
+                }
+                KeyFilter::Sort(expr) => {
+                    if sort_expr.is_some() {
+                        // Multiple sort key filters - invalid
+                        return None;
+                    }
+                    sort_expr = Some(expr);
+                }
+            }
+        } else {
+            other_filters.push(filter.clone());
+        }
+    }
+
+    // Must have partition key to use Query
+    partition_expr.map(|p| (p, sort_expr, other_filters))
 }
 
 fn contains_or(expr: &Expr) -> bool {
@@ -373,7 +372,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -423,7 +422,7 @@ mod tests {
             col("id").eq(lit("user123")),
             col("sort_key").eq(lit("2024-01-01")),
         ];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -471,7 +470,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123")), col("age").gt(lit(18i64))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -520,7 +519,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -543,7 +542,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("name").eq(lit("John"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -585,7 +584,7 @@ mod tests {
                 .eq(lit("user123"))
                 .or(col("id").eq(lit("user456"))),
         ];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -628,7 +627,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, Some(10))
@@ -649,7 +648,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder.build_request_plan(&filters, &projection, Some(i32::MAX as usize + 1));
 
@@ -677,7 +676,7 @@ mod tests {
 
         for (sort_op, expected_sort_condition) in test_cases {
             let filters = vec![col("id").eq(lit("user123")), sort_op];
-            let projection = create_projection_schema(&vec!["id", "name"]);
+            let projection = create_projection_schema(&["id", "name"]);
 
             let result = builder
                 .build_request_plan(&filters, &projection, None)
@@ -712,7 +711,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123")), col("id").eq(lit("user456"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -752,7 +751,7 @@ mod tests {
             col("sort_key").gt(lit("2024-01-01")),
             col("sort_key").lt(lit("2024-12-31")),
         ];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -798,7 +797,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").gt(lit("user123"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -856,7 +855,7 @@ mod tests {
                 .gt(lit(18i64))
                 .and(col("active").eq(lit(true)).or(col("active").eq(lit(false)))),
         ];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -893,7 +892,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(table_schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -922,7 +921,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("name").eq(lit("John"))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, Some(25))
@@ -947,7 +946,7 @@ mod tests {
             col("age").gt(lit(18i64)),
             col("active").eq(lit(true)),
         ];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -998,7 +997,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("name").eq(lit("John")), col("age").gt(lit(25i64))];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
@@ -1043,7 +1042,7 @@ mod tests {
             col("id").eq(lit("user123")),
             col("name").not_eq(lit("Admin")),
         ];
-        let projection = create_projection_schema(&vec!["id", "name"]);
+        let projection = create_projection_schema(&["id", "name"]);
 
         let result = builder
             .build_request_plan(&filters, &projection, None)
