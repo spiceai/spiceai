@@ -140,10 +140,10 @@ impl HealthMonitor {
                 }
 
                 tokio::select! {
-                    _ = task_token.cancelled() => {
+                    () = task_token.cancelled() => {
                         return HealthCheckReport { endpoints: stats };
                     }
-                    _ = tokio::time::sleep(SAMPLE_INTERVAL) => {}
+                    () = tokio::time::sleep(SAMPLE_INTERVAL) => {}
                 }
             }
         });
