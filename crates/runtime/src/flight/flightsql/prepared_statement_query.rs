@@ -207,6 +207,9 @@ pub(crate) async fn do_put_query(
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
 
+    // Read the schema first - Arrow Flight always sends schema before batches
+    let schema = decode_schema(&mut decoder).await?;
+
     // Collect all parameter batches
     let mut batches = Vec::new();
     let mut total_rows = 0;
@@ -236,8 +239,7 @@ pub(crate) async fn do_put_query(
     } else if batches.len() == 1 {
         batches.into_iter().next()
     } else {
-        let schema = decode_schema(&mut decoder).await?;
-        // Multiple batches received - combine them
+        // Multiple batches received - combine them using the schema we already have
         let combined = concat_batches(&schema, &batches)
             .map_err(|e| Status::internal(format!("Failed to combine parameter batches: {e}")))?;
         Some(combined)
