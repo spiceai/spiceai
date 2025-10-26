@@ -128,7 +128,8 @@ impl DynamoDBTableSchema {
         sort_expr: Option<&Expr>,
     ) -> datafusion::error::Result<(String, HashMap<String, AttributeValue>)> {
         let mut attribute_values = HashMap::new();
-        let mut value_counter = 0;
+        // Filters start with 0, whereas keys start with 1000 to avoid overlapping
+        let mut value_counter = 1000;
 
         let partition_str =
             self.expr_to_filter_string(partition_expr, &mut attribute_values, &mut value_counter)?;

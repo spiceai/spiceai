@@ -202,17 +202,17 @@ impl<'a> DynamoDBRequestBuilder<'a> {
             return (Some((partition, sort, IndexSelection::BaseTable)), other);
         }
 
-        // Try each GSI
-        for gsi in &self.schema.global_secondary_indexes {
-            if let Some((partition, sort, other)) =
-                self.try_match_index(filters, &gsi.partition_key, gsi.sort_key.as_deref())
-            {
-                return (
-                    Some((partition, sort, IndexSelection::GSI(gsi.name.clone()))),
-                    other,
-                );
-            }
-        }
+        // // Try each GSI
+        // for gsi in &self.schema.global_secondary_indexes {
+        //     if let Some((partition, sort, other)) =
+        //         self.try_match_index(filters, &gsi.partition_key, gsi.sort_key.as_deref())
+        //     {
+        //         return (
+        //             Some((partition, sort, IndexSelection::GSI(gsi.name.clone()))),
+        //             other,
+        //         );
+        //     }
+        // }
 
         // No matching index found - must use Scan
         (None, filters.to_vec())
