@@ -82,6 +82,7 @@ use runtime_async::ManagedTokioRuntime;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
+use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -340,7 +341,8 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
-    tokio_runtime: OnceLock<ManagedTokioRuntime>,
+    cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    io_runtime: Handle,
     metrics: Option<Metrics>,
 
     pub temp_directory: Option<String>,
@@ -369,8 +371,9 @@ impl DataFusion {
     pub fn builder(
         status: Arc<status::RuntimeStatus>,
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+        io_runtime: Handle,
     ) -> DataFusionBuilder {
-        DataFusionBuilder::new(status, accelerator_engine_registry)
+        DataFusionBuilder::new(status, accelerator_engine_registry, io_runtime)
     }
 
     #[must_use]
@@ -605,8 +608,8 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    pub fn set_tokio_runtime(&self, handle: ManagedTokioRuntime) {
-        if self.tokio_runtime.set(handle).is_err() {
+    pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.cpu_runtime.set(handle).is_err() {
             // Failure to set means this was already set - that shouldn't happen.
             tracing::error!(
                 "Failed to set tokio runtime on the Datafusion struct, this is an unexpected internal error"
@@ -615,8 +618,8 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn tokio_runtime(&self) -> Option<&tokio::runtime::Handle> {
-        self.tokio_runtime.get().map(ManagedTokioRuntime::handle)
+    pub fn cpu_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
     }
 
     async fn get_table_provider(
@@ -1067,8 +1070,9 @@ impl DataFusion {
             dataset.source().to_string(),
             accelerated_table_provider,
             refresh,
+            self.io_runtime.clone(),
         );
-        accelerated_table_builder.tokio_runtime(self.tokio_runtime().cloned());
+        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => Some(
@@ -1633,8 +1637,9 @@ impl DataFusion {
             "view".to_string(),
             accelerated_table_provider,
             refresh,
+            self.io_runtime.clone(),
         );
-        builder.tokio_runtime(self.tokio_runtime().cloned());
+        builder.cpu_runtime(self.cpu_runtime().cloned());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
@@ -1962,6 +1967,7 @@ mod tests {
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
+                Handle::current(),
             )
             .with_caching(Arc::new(
                 Caching::new().with_plans_cache(plan_cache_provider),
