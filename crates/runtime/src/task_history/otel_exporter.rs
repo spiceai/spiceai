@@ -336,10 +336,11 @@ impl SpanExporter for TaskHistoryExporter {
                 .map_err(|e| TraceError::Other(Box::new(e)))?;
 
             // Spawn async task to capture plans for filtered spans
+            // The task runs in the background without blocking the export operation
             if !spans_for_plan.is_empty() {
                 let df_clone = Arc::clone(&df);
                 let num_spans = spans_for_plan.len();
-                let handle = tokio::spawn(async move {
+                tokio::spawn(async move {
                     Self::capture_plans_async(
                         df_clone,
                         spans_for_plan,
@@ -347,32 +348,9 @@ impl SpanExporter for TaskHistoryExporter {
                         min_plan_duration_ms,
                     )
                     .await;
-                });
 
-                match handle.await {
-                    Ok(()) => {
-                        tracing::trace!(
-                            "Plan capture completed successfully for {num_spans} queries"
-                        );
-                    }
-                    Err(e) if e.is_panic() => {
-                        tracing::error!(
-                            "Failed to capture query plans: internal error occurred. \
-                            Query plan capture has been disabled for affected queries. \
-                            Consider disabling plan capture in the spicepod if this error persists."
-                        );
-                        tracing::debug!("Plan capture panic details: {e}");
-                    }
-                    Err(e) if e.is_cancelled() => {
-                        tracing::debug!("Query plan capture was cancelled (runtime shutting down)");
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to capture query plans: {e}. \
-                            Query plan capture will be retried on subsequent queries."
-                        );
-                    }
-                }
+                    tracing::trace!("Plan capture completed successfully for {num_spans} queries");
+                });
             }
 
             Ok(())
