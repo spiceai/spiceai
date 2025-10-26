@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
-use std::pin::Pin;
 use super::{
     DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
@@ -24,7 +22,6 @@ use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::types::KeyType;
 use aws_sdk_dynamodb::{
@@ -48,14 +45,15 @@ use datafusion::{
     prelude::Expr,
 };
 use snafu::prelude::*;
+use std::pin::Pin;
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use crate::dynamodb::request_builder::{
-    DynamoDBRequest, DynamoDBRequestBuilder, DynamoDBRequestPlan, build_request_from_plan,
+    DynamoDBRequestPlan, DynamoDBRequestPlanBuilder, QueryParams, ScanParams,
 };
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use futures::Stream;
-use tokio::sync::mpsc::Sender;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 
@@ -63,6 +61,7 @@ use futures::stream::{self, StreamExt};
 pub struct DynamoDBTableProvider {
     client: Arc<Client>,
     table_schema: DynamoDBTableSchema,
+    request_plan_builder: DynamoDBRequestPlanBuilder,
 }
 
 impl DynamoDBTableProvider {
@@ -70,14 +69,12 @@ impl DynamoDBTableProvider {
         let (table_schema, partition_key, sort_key) =
             Self::fetch_table_metadata(Arc::clone(&client), &table_name).await?;
 
+        let table_schema =
+            DynamoDBTableSchema::new(table_name, table_schema, partition_key, sort_key);
         Ok(Self {
             client,
-            table_schema: DynamoDBTableSchema::new(
-                table_name,
-                table_schema,
-                partition_key,
-                sort_key,
-            ),
+            table_schema: table_schema.clone(),
+            request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
         })
     }
 
@@ -175,12 +172,15 @@ impl TableProvider for DynamoDBTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(self.table_schema.schema(), projection)?;
 
-        let builder = DynamoDBRequestBuilder::new(&self.table_schema);
-        let request_plan = builder.plan(filters, projected_schema.clone(), limit)?;
-        let request = build_request_from_plan(&self.client, request_plan);
+        let request_plan = self.request_plan_builder.build_request_plan(
+            filters,
+            projected_schema.clone(),
+            limit,
+        )?;
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
-            request,
+            Arc::clone(&self.client),
+            request_plan,
             projected_schema,
         )))
     }
@@ -194,16 +194,22 @@ impl TableProvider for DynamoDBTableProvider {
 }
 
 pub struct DynamoDBTableProviderExec {
-    request: DynamoDBRequest,
+    client: Arc<Client>,
+    request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
     properties: PlanProperties,
 }
 
 impl DynamoDBTableProviderExec {
     #[must_use]
-    pub fn new(request: DynamoDBRequest, projected_schema: SchemaRef) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        request_plan: DynamoDBRequestPlan,
+        projected_schema: SchemaRef,
+    ) -> Self {
         Self {
-            request,
+            client,
+            request_plan,
             projected_schema: Arc::clone(&projected_schema),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
@@ -264,13 +270,14 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let tx = builder.tx();
 
         let schema = Arc::clone(&self.projected_schema);
-        let request = self.request.clone();
+        let client = Arc::clone(&self.client);
+        let request_plan = self.request_plan.clone();
         let unnest_depth = Some(1);
 
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
 
-            let item_stream = build_stream_from_plan(request);
+            let item_stream = build_stream_from_plan(client, request_plan);
             let chunked_stream = item_stream.chunks(CHUNK_SIZE);
             pin_mut!(chunked_stream);
 
@@ -280,7 +287,9 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
                 let unnested_items = match unnest_depth {
                     None | Some(0) => items,
-                    Some(depth) => unnest_dynamodb_items(items, depth).map_err(to_execution_error)?,
+                    Some(depth) => {
+                        unnest_dynamodb_items(items, depth).map_err(to_execution_error)?
+                    }
                 };
 
                 let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
@@ -296,12 +305,33 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
     }
 }
 
+#[deny(unused_variables)]
 fn build_stream_from_plan(
-    request: DynamoDBRequest,
-) -> Pin<Box<dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static>> {
+    client: Arc<Client>,
+    request: DynamoDBRequestPlan,
+) -> Pin<Box<dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static>>
+{
     match request {
-        DynamoDBRequest::Query(query) => {
-            let pagination_stream = TryFlatMap::new(query.into_paginator().send())
+        DynamoDBRequestPlan::Query(QueryParams {
+            table_name,
+            key_condition_expression,
+            filter_expression,
+            expression_attribute_values,
+            expression_attribute_names,
+            projection_expression,
+            limit,
+        }) => {
+            let request = client
+                .query()
+                .table_name(table_name)
+                .set_key_condition_expression(key_condition_expression)
+                .set_filter_expression(filter_expression)
+                .set_expression_attribute_values(expression_attribute_values)
+                .set_expression_attribute_names(expression_attribute_names)
+                .set_projection_expression(projection_expression)
+                .set_limit(limit);
+
+            let pagination_stream = TryFlatMap::new(request.into_paginator().send())
                 .flat_map(|output| output.items().to_vec());
 
             let stream = stream::unfold(pagination_stream, |mut s| async move {
@@ -313,8 +343,24 @@ fn build_stream_from_plan(
 
             Box::pin(stream)
         }
-        DynamoDBRequest::Scan(scan) => {
-            let pagination_stream = TryFlatMap::new(scan.into_paginator().send())
+        DynamoDBRequestPlan::Scan(ScanParams {
+            table_name,
+            filter_expression,
+            expression_attribute_values,
+            expression_attribute_names,
+            projection_expression,
+            limit,
+        }) => {
+            let request = client
+                .scan()
+                .table_name(table_name)
+                .set_filter_expression(filter_expression)
+                .set_expression_attribute_values(expression_attribute_values)
+                .set_expression_attribute_names(expression_attribute_names)
+                .set_projection_expression(projection_expression)
+                .set_limit(limit);
+
+            let pagination_stream = TryFlatMap::new(request.into_paginator().send())
                 .flat_map(|output| output.items().to_vec());
 
             let stream = stream::unfold(pagination_stream, |mut s| async move {
@@ -328,45 +374,6 @@ fn build_stream_from_plan(
         }
     }
 }
-
-// async fn process_item_stream<E>(
-//     pagination_stream: PaginationStream<Result<HashMap<String, AttributeValue>, SdkError<E>>>,
-//     tx: Sender<datafusion::common::Result<RecordBatch>>,
-//     schema: SchemaRef,
-//     unnest_depth: Option<usize>,
-// ) -> DataFusionResult<()>
-// where
-//     E: std::error::Error + Send + Sync + 'static,
-// {
-//     const CHUNK_SIZE: usize = 4_000;
-//
-//     let item_stream = stream::unfold(pagination_stream, |mut stream| async move {
-//         stream.next().await.map(|item| (item, stream))
-//     });
-//
-//     let chunked_stream = item_stream
-//         .map(|result| result.map_err(|e| to_execution_error(map_sdk_error(e))))
-//         .chunks(CHUNK_SIZE);
-//
-//     pin_mut!(chunked_stream);
-//
-//     while let Some(chunk) = chunked_stream.next().await {
-//         let items: Result<Vec<_>, _> = chunk.into_iter().collect();
-//         let items = items?;
-//
-//         let unnested_items = match unnest_depth {
-//             None | Some(0) => items,
-//             Some(depth) => unnest_dynamodb_items(items, depth).map_err(to_execution_error)?,
-//         };
-//
-//         let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
-//             .map_err(to_execution_error)?;
-//
-//         tx.send(Ok(batch)).await.map_err(to_execution_error)?;
-//     }
-//
-//     Ok(())
-// }
 
 /// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
 /// Because projection expressions may use reserved words in `DynamoDB`, this function automatically generates expression attribute names for each column to avoid conflicts.
