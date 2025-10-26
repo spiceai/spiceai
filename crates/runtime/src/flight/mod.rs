@@ -308,7 +308,7 @@ where
 {
     // Avoid cloning Status if already a Status
     if let Some(status) = (&e as &dyn std::any::Any).downcast_ref::<Status>() {
-        // Return a reference instead of cloning when possible
+        // Create a new Status with the same code and message to avoid cloning the entire Status struct
         return Status::new(status.code(), status.message());
     }
     Status::internal(format!("{e}"))

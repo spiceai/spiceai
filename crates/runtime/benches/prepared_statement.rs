@@ -207,6 +207,12 @@ fn bench_recordbatch_creation(c: &mut Criterion) {
         Field::new("p10", DataType::Utf8, false),
     ]));
 
+    // Pre-create string values outside the benchmark loop to avoid measuring allocation overhead
+    let string_values: Vec<String> = (0..10)
+        .filter(|i| i % 2 == 1)
+        .map(|i| format!("value_{i}"))
+        .collect();
+
     group.bench_function("create_10_params", |b| {
         b.iter(|| {
             let arrays: Vec<Arc<dyn arrow::array::Array>> = (0..10)
@@ -214,7 +220,8 @@ fn bench_recordbatch_creation(c: &mut Criterion) {
                     if i % 2 == 0 {
                         Arc::new(Int32Array::from(vec![i as i32])) as Arc<dyn arrow::array::Array>
                     } else {
-                        Arc::new(StringArray::from(vec![format!("value_{i}")]))
+                        let idx = i / 2;
+                        Arc::new(StringArray::from(vec![string_values[idx].as_str()]))
                             as Arc<dyn arrow::array::Array>
                     }
                 })
