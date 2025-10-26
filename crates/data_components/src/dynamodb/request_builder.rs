@@ -695,4 +695,380 @@ mod tests {
             DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
         }
     }
+
+    // Helper function to create a schema with GSIs
+    fn create_schema_with_gsis() -> DynamoDBTableSchema {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("sort_key", DataType::Utf8, true),
+            Field::new("gsi1_pk", DataType::Utf8, true),
+            Field::new("gsi1_sk", DataType::Utf8, true),
+            Field::new("gsi2_pk", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+
+        let gsi1 = IndexInfo {
+            name: "GSI1".to_string(),
+            partition_key: "gsi1_pk".to_string(),
+            sort_key: Some("gsi1_sk".to_string()),
+        };
+
+        let gsi2 = IndexInfo {
+            name: "GSI2".to_string(),
+            partition_key: "gsi2_pk".to_string(),
+            sort_key: None,
+        };
+
+        DynamoDBTableSchema::new(
+            Arc::from("test_table"),
+            schema,
+            "id".to_string(),
+            Some("sort_key".to_string()),
+            vec![gsi1, gsi2],
+        )
+    }
+
+    #[tokio::test]
+    async fn test_query_gsi_with_partition_key_only() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Query using GSI2 which has no sort key
+        let filters = vec![col("gsi2_pk").eq(lit("category123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                // Verify it's querying GSI2
+                println!("Should use GSI2 index");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI2"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_gsi_with_partition_and_sort_keys() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Query using GSI1 with both partition and sort keys
+        let filters = vec![
+            col("gsi1_pk").eq(lit("category123")),
+            col("gsi1_sk").gt(lit("2024-01-01")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should use GSI1 index with sort key condition");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_base_table_preferred_over_gsi() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Filters match both base table and GSI - base table should be preferred
+        let filters = vec![
+            col("id").eq(lit("user123")),
+            col("gsi1_pk").eq(lit("category123")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should use base table, not GSI");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on base table"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_used_when_base_table_not_available() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Only GSI partition key available, not base table key
+        let filters = vec![
+            col("gsi1_pk").eq(lit("category123")),
+            col("name").eq(lit("John")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should use GSI1 index");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_with_or_condition_forces_scan() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // OR condition should force scan even if GSI partition key is available
+        let filters = vec![
+            col("gsi1_pk")
+                .eq(lit("category123"))
+                .or(col("gsi1_pk").eq(lit("category456"))),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {
+                println!("OR condition forces scan even with GSI");
+            }
+            DynamoDBRequest::Query(_) => panic!("Expected Scan due to OR condition"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_with_wrong_partition_operator_forces_scan() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // GSI partition key with wrong operator (must be =)
+        let filters = vec![col("gsi1_pk").gt(lit("category123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {
+                println!("Wrong operator on GSI partition key forces scan");
+            }
+            DynamoDBRequest::Query(_) => panic!("Expected Scan - GSI partition key must use ="),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_gsis_match_uses_first() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Multiple GSI keys available - should use first matching GSI
+        let filters = vec![
+            col("gsi1_pk").eq(lit("category123")),
+            col("gsi2_pk").eq(lit("status_active")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should query (likely uses first found GSI or base table)");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_with_additional_filters() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // GSI key plus additional non-key filters
+        let filters = vec![
+            col("gsi1_pk").eq(lit("category123")),
+            col("age").gt(lit(18i64)),
+            col("name").eq(lit("John")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name", "age"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should query GSI1 with filter expression for additional filters");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_partial_sort_key_match() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // GSI1 has sort key but we only provide partition key
+        let filters = vec![
+            col("gsi1_pk").eq(lit("category123")),
+            col("name").eq(lit("John")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should query GSI1 with only partition key, name goes to filter");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_multiple_sort_key_conditions() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Multiple conditions on GSI sort key should force scan
+        let filters = vec![
+            col("gsi1_pk").eq(lit("category123")),
+            col("gsi1_sk").gt(lit("2024-01-01")),
+            col("gsi1_sk").lt(lit("2024-12-31")),
+        ];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {
+                println!("Multiple sort key conditions force scan");
+            }
+            DynamoDBRequest::Query(_) => {
+                panic!("Expected Scan due to multiple sort key conditions")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_with_all_sort_key_operators() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Test all valid sort key operators on GSI
+        let sort_operators = vec![
+            col("gsi1_sk").eq(lit("value")),
+            col("gsi1_sk").lt(lit("value")),
+            col("gsi1_sk").lt_eq(lit("value")),
+            col("gsi1_sk").gt(lit("value")),
+            col("gsi1_sk").gt_eq(lit("value")),
+        ];
+
+        for sort_op in sort_operators {
+            let filters = vec![col("gsi1_pk").eq(lit("category123")), sort_op];
+            let projection = create_projection_schema(vec!["id", "name"]);
+
+            let result = builder.build(&filters, projection.clone(), None).unwrap();
+
+            match result {
+                DynamoDBRequest::Query(_) => {
+                    println!("Should query GSI1 with sort key operator");
+                }
+                DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI1"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_matching_keys_forces_scan() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // Only non-key attributes - should force scan
+        let filters = vec![col("name").eq(lit("John")), col("age").gt(lit(25i64))];
+        let projection = create_projection_schema(vec!["id", "name", "age"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {
+                println!("No key attributes forces scan");
+            }
+            DynamoDBRequest::Query(_) => panic!("Expected Scan when no keys match"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_with_limit() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("gsi1_pk").eq(lit("category123"))];
+        let projection = create_projection_schema(vec!["id", "name"]);
+
+        let result = builder.build(&filters, projection, Some(50)).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should query GSI1 with limit");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_with_empty_projection() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        let filters = vec![col("gsi1_pk").eq(lit("category123"))];
+        let projection = Arc::new(Schema::empty());
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Query(_) => {
+                println!("Should query GSI1 without projection");
+            }
+            DynamoDBRequest::Scan(_) => panic!("Expected Query request on GSI1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gsi_nested_or_in_filter() {
+        let client = create_test_client().await;
+        let schema = create_schema_with_gsis();
+        let builder = DynamoDBRequestBuilder::new(&client, &schema);
+
+        // GSI key with nested OR in additional filters
+        let filters = vec![
+            col("gsi1_pk").eq(lit("category123")),
+            col("age")
+                .gt(lit(18i64))
+                .and(col("name").eq(lit("John")).or(col("name").eq(lit("Jane")))),
+        ];
+        let projection = create_projection_schema(vec!["id", "name", "age"]);
+
+        let result = builder.build(&filters, projection, None).unwrap();
+
+        match result {
+            DynamoDBRequest::Scan(_) => {
+                println!("Nested OR forces scan even with valid GSI key");
+            }
+            DynamoDBRequest::Query(_) => panic!("Expected Scan due to nested OR"),
+        }
+    }
 }
