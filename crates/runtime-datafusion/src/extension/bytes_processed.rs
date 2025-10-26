@@ -234,6 +234,7 @@ pub struct BytesProcessedNode {
 }
 
 impl BytesProcessedNode {
+    #[must_use]
     pub fn new(input: LogicalPlan) -> Self {
         assert!(input.inputs().is_empty(), "should have no inputs");
         Self { input }
