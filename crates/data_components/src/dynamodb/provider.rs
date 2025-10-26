@@ -64,6 +64,8 @@ pub struct DynamoDBTableProvider {
     request_plan_builder: DynamoDBRequestPlanBuilder,
 }
 
+type DynamoDBItemStream = dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
+
 impl DynamoDBTableProvider {
     pub async fn try_new(client: Arc<Client>, table_name: Arc<str>) -> Result<Self, Error> {
         let (table_schema, partition_key, sort_key) =
@@ -303,10 +305,8 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
     }
 }
 
-type Foo = dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
-
 #[deny(unused_variables)]
-fn build_stream_from_plan(client: &Arc<Client>, request: DynamoDBRequestPlan) -> Pin<Box<Foo>> {
+fn build_stream_from_plan(client: &Arc<Client>, request: DynamoDBRequestPlan) -> Pin<Box<DynamoDBItemStream>> {
     match request {
         DynamoDBRequestPlan::Query(QueryParams {
             table_name,
