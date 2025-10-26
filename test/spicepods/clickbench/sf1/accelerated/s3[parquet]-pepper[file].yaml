@@ -12,5 +12,6 @@ datasets:
       s3_key: ${secrets:S3_KEY}
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
+      enabled: true
       engine: pepper
       mode: file
