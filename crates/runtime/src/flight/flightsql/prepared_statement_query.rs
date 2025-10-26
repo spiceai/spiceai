@@ -17,6 +17,7 @@ limitations under the License.
 use std::{borrow::Cow, ops::ControlFlow};
 
 use arrow::array::RecordBatch;
+use arrow::compute::concat_batches;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, PutResult, Ticket,
     decode::{DecodedPayload, FlightDataDecoder},
@@ -63,6 +64,7 @@ mod record_batch_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::io::Cursor;
 
+    #[allow(clippy::ref_option)]
     pub fn serialize<S>(batch: &Option<RecordBatch>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -204,7 +206,6 @@ pub(crate) async fn do_put_query(
         .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
-    let _schema = decode_schema(&mut decoder).await?;
 
     // Collect all parameter batches
     let mut batches = Vec::new();
@@ -229,11 +230,17 @@ pub(crate) async fn do_put_query(
         ));
     }
 
-    // Convert the first batch directly to parameter storage without re-encoding
+    // Combine multiple batches if parameters span multiple batches
     let parameter_batch = if batches.is_empty() {
         None
-    } else {
+    } else if batches.len() == 1 {
         batches.into_iter().next()
+    } else {
+        let schema = decode_schema(&mut decoder).await?;
+        // Multiple batches received - combine them
+        let combined = concat_batches(&schema, &batches)
+            .map_err(|e| Status::internal(format!("Failed to combine parameter batches: {e}")))?;
+        Some(combined)
     };
 
     let mut stmt: PreparedStatement =
@@ -567,10 +574,12 @@ mod tests {
         ))
         .as_tabled_provider();
 
+        let io_runtime = tokio::runtime::Handle::current();
         let datafusion = Arc::new(
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                io_runtime,
             )
             .with_caching(Arc::new(Caching::new().with_plans_cache(plan_cache)))
             .build(),
@@ -621,10 +630,12 @@ mod tests {
         ))
         .as_tabled_provider();
 
+        let io_runtime = tokio::runtime::Handle::current();
         let datafusion = Arc::new(
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                io_runtime,
             )
             .with_caching(Arc::new(Caching::new().with_plans_cache(plan_cache)))
             .build(),
