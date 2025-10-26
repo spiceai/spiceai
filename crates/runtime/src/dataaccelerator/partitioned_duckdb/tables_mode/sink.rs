@@ -380,7 +380,7 @@ fn insert_overwrite(
 
         // execute ANALYZE
         let source_name = new_table.table_name();
-        let analyze_sql = format!("ANALYZE {}", source_name);
+        let analyze_sql = format!("ANALYZE \"{}\"", source_name);
         tracing::info!("Executing analyze SQL: {analyze_sql}");
         match tx.prepare(&analyze_sql) {
             Ok(mut stmt) => match stmt.execute([]) {
