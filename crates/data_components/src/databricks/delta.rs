@@ -24,12 +24,14 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::TokenProvider;
+use tokio::runtime::Handle;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
     endpoint: Endpoint,
     token_provider: Arc<dyn TokenProvider>,
     storage_options: HashMap<String, SecretString>,
+    io_runtime: Handle,
 }
 
 #[derive(Debug, Snafu)]
@@ -49,11 +51,13 @@ impl DatabricksDelta {
         endpoint: Endpoint,
         storage_options: HashMap<String, SecretString>,
         token_provider: Arc<dyn TokenProvider>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             endpoint,
             token_provider,
             storage_options,
+            io_runtime,
         }
     }
 
@@ -76,7 +80,7 @@ impl DatabricksDelta {
             }
         }
 
-        let delta_table = DeltaTable::from(table_uri, storage_options)?;
+        let delta_table = DeltaTable::from(table_uri, storage_options, self.io_runtime.clone())?;
 
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }

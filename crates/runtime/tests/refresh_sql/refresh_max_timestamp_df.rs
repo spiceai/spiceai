@@ -35,6 +35,7 @@ use runtime_datafusion_index::analyzer::{
 use runtime_object_store::registry::default_runtime_env;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 /// This test verifies:
 ///   *  `DataAccelerator::create_external_table` returns `PolyTableProvider`
@@ -99,7 +100,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .expect("Expected PolyTableProvider");
 
             let mut state = SessionStateBuilder::new()
-                .with_runtime_env(default_runtime_env())
+                .with_runtime_env(default_runtime_env(Handle::current()))
                 .with_default_features()
                 .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
                     vec![

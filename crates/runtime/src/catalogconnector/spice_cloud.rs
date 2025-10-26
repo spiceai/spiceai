@@ -214,7 +214,7 @@ impl SpiceCloudPlatformCatalog {
                     "spice.ai".into(),
                     ConnectorComponent::Dataset(Arc::new(template_dataset)),
                 )
-                .build(runtime.secrets())
+                .build(runtime.secrets(), runtime.tokio_io_runtime())
                 .await
                 .map_err(|e| super::Error::InvalidConfiguration {
                     connector: "spice.ai".into(),

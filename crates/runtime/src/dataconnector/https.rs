@@ -22,6 +22,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use tokio::runtime::Handle;
 use url::Url;
 
 use super::{ConnectorComponent, ConnectorParams};
@@ -34,6 +35,7 @@ use super::{
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
+    tokio_io_runtime: Handle,
 }
 
 impl std::fmt::Display for Https {
@@ -42,13 +44,13 @@ impl std::fmt::Display for Https {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct HttpsFactory {}
 
 impl HttpsFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        HttpsFactory::default()
     }
 
     #[must_use]
@@ -82,6 +84,7 @@ impl DataConnectorFactory for HttpsFactory {
         Box::pin(async move {
             Ok(Arc::new(Https {
                 params: params.parameters,
+                tokio_io_runtime: params.io_runtime,
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -102,6 +105,10 @@ impl ListingTableConnector for Https {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        self.tokio_io_runtime.clone()
     }
 
     fn get_object_store_url(
