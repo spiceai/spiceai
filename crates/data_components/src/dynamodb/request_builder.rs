@@ -102,57 +102,41 @@ impl DynamoDBRequestPlanBuilder {
         attribute_names: HashMap<String, String>,
         limit: Option<i32>,
     ) -> DataFusionResult<DynamoDBRequestPlan> {
-        println!("!! QUERY !!");
-
-        let mut builder = QueryParamsBuilder::default();
-        builder = builder.table_name(self.schema.table_name().to_string());
-        let mut query_params = builder;
-
-        // let mut query_request = self
-        //     .client
-        //     .query()
-        //     .table_name(self.schema.table_name().to_string());
+        let mut query_params =
+            QueryParamsBuilder::default().table_name(self.schema.table_name().to_string());
 
         let (key_condition, mut key_values) = self
             .schema
             .build_key_condition_expression(partition_expr, sort_expr)?;
 
-        println!("Key condition: {key_condition}");
-        // query_request = query_request.key_condition_expression(key_condition.clone());
         query_params = query_params.key_condition_expression(key_condition);
 
         if !other_filters.is_empty() {
             let (filter_str, filter_values) = self.schema.build_filter_expression(other_filters);
             key_values.extend(filter_values);
-            println!("filter_expression: {filter_str:?}");
-            // query_request = query_request.filter_expression(filter_str.clone());
             query_params = query_params.filter_expression(filter_str);
         }
 
         if !key_values.is_empty() {
-            println!("key_values: {:?}", &key_values);
-            // query_request = query_request.set_expression_attribute_values(Some(key_values.clone()));
             query_params = query_params.expression_attribute_values(key_values);
         }
 
         if let Some(proj) = projection {
-            println!("projection_expression: {proj:?}");
-            // query_request = query_request.projection_expression(proj.clone());
             query_params = query_params.projection_expression(proj);
         }
 
         if !attribute_names.is_empty() {
-            println!("attribute_names: {:?}", &attribute_names);
-            // query_request = query_request.set_expression_attribute_names(Some(attribute_names.clone()));
             query_params = query_params.expression_attribute_names(attribute_names);
         }
 
         if let Some(l) = limit {
-            // query_request = query_request.limit(l);
             query_params = query_params.limit(l);
         }
 
-        Ok(DynamoDBRequestPlan::Query(query_params.build().unwrap())) // TODO
+        let query = query_params
+            .build()
+            .map_err(|e| DataFusionError::Execution(format!("{e}").to_string()))?;
+        Ok(DynamoDBRequestPlan::Query(query))
     }
 
     fn build_scan_request(
@@ -162,50 +146,36 @@ impl DynamoDBRequestPlanBuilder {
         attribute_names: HashMap<String, String>,
         limit: Option<i32>,
     ) -> DataFusionResult<DynamoDBRequestPlan> {
-        println!("!! SCAN !!");
-
         let mut scan_params =
             ScanParamsBuilder::default().table_name(self.schema.table_name().to_string());
-
-        // let mut scan_request = self
-        //     .client
-        //     .scan()
-        //     .table_name(self.schema.table_name().to_string());
 
         if !filters.is_empty() {
             let (filter_str, attribute_values) = self.schema.build_filter_expression(filters);
             if !filter_str.is_empty() {
-                println!("filter_expression: {:?}", &filter_str);
-                println!("attribute_values: {:?}", &attribute_values);
-                // scan_request = scan_request.filter_expression(filter_str.clone());
-                // scan_request = scan_request.set_expression_attribute_values(Some(attribute_values.clone()));
                 scan_params = scan_params.filter_expression(filter_str);
                 scan_params = scan_params.expression_attribute_values(attribute_values);
             }
         }
 
         if let Some(proj) = projection {
-            println!("projection_expression: {proj:?}");
-            // scan_request = scan_request.projection_expression(proj.clone());
             scan_params = scan_params.projection_expression(proj);
         }
 
         if !attribute_names.is_empty() {
-            println!("attribute_names: {:?}", &attribute_names);
-            // scan_request = scan_request.set_expression_attribute_names(Some(attribute_names.clone()));
             scan_params = scan_params.expression_attribute_names(attribute_names);
         }
 
         if let Some(l) = limit {
-            // scan_request = scan_request.limit(l);
             scan_params = scan_params.limit(l);
         }
 
-        Ok(DynamoDBRequestPlan::Scan(scan_params.build().unwrap())) // TODO
+        let scan = scan_params
+            .build()
+            .map_err(|e| DataFusionError::Execution(format!("{e}").to_string()))?;
+        Ok(DynamoDBRequestPlan::Scan(scan))
     }
 
     fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
-        // Check for OR conditions first - if present, can't use Query
         let has_or = filters.iter().any(contains_or);
         if has_or {
             return (None, filters.to_vec());
@@ -219,7 +189,6 @@ impl DynamoDBRequestPlanBuilder {
             return (Some((partition, sort)), other);
         }
 
-        // No matching index found - must use Scan
         (None, filters.to_vec())
     }
 
@@ -265,14 +234,12 @@ fn try_match_index(
             match extracted {
                 KeyFilter::Partition(expr) => {
                     if partition_expr.is_some() {
-                        // Multiple partition key filters - invalid
                         return None;
                     }
                     partition_expr = Some(expr);
                 }
                 KeyFilter::Sort(expr) => {
                     if sort_expr.is_some() {
-                        // Multiple sort key filters - invalid
                         return None;
                     }
                     sort_expr = Some(expr);
@@ -283,7 +250,6 @@ fn try_match_index(
         }
     }
 
-    // Must have partition key to use Query
     partition_expr.map(|p| (p, sort_expr, other_filters))
 }
 
