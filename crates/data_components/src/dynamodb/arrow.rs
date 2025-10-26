@@ -152,6 +152,7 @@ fn create_builders(schema: &SchemaRef, capacity: usize) -> BuilderMap {
                 DataType::Int64 => Box::new(Int64ListArrayBuilder::new(capacity)),
                 DataType::Float64 => Box::new(Float64ListArrayBuilder::new(capacity)),
                 DataType::Binary => Box::new(BinaryListArrayBuilder::new(capacity)),
+                #[allow(clippy::match_same_arms)]
                 _ => Box::new(StringListArrayBuilder::new(capacity)),
             },
             DataType::Null => Box::new(NullArrayBuilder::new()),

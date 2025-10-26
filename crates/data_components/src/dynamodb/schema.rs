@@ -129,17 +129,6 @@ fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
         (DataType::Date32, DataType::Date32) => DataType::Date32,
         (DataType::Date64, DataType::Date64) => DataType::Date64,
 
-        // Mixed temporal types - fall back to string
-        (DataType::Timestamp(_, _) | DataType::Date64, DataType::Date32)
-        | (DataType::Date32 | DataType::Date64, DataType::Timestamp(_, _))
-        | (DataType::Timestamp(_, _) | DataType::Date32, DataType::Date64) => DataType::Utf8,
-
-        // Temporal mixed with string - fall back to string
-        (DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64, DataType::Utf8)
-        | (DataType::Utf8, DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64) => {
-            DataType::Utf8
-        }
-
         // Numeric type promotion for lists (e.g., Number Sets)
         (DataType::List(field1), DataType::List(field2)) => {
             let unified_inner = unify_types(field1.data_type(), field2.data_type());
