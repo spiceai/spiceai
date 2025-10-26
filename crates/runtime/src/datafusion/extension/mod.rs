@@ -122,6 +122,7 @@ mod tests {
     use futures::TryStreamExt;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
