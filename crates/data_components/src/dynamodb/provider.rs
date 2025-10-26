@@ -314,14 +314,6 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 
-fn pagination_stream_to_stream<T: 'static>(
-    pagination_stream: PaginationStream<T>,
-) -> impl Stream<Item = T> {
-    stream::unfold(pagination_stream, |mut stream| async move {
-        stream.next().await.map(|item| (item, stream))
-    })
-}
-
 async fn process_item_stream<E>(
     pagination_stream: PaginationStream<Result<HashMap<String, AttributeValue>, E>>,
     tx: Sender<datafusion::common::Result<RecordBatch>>,
@@ -333,7 +325,9 @@ where
 {
     const CHUNK_SIZE: usize = 4_000;
 
-    let item_stream = pagination_stream_to_stream(pagination_stream);
+    let item_stream = stream::unfold(pagination_stream, |mut stream| async move {
+        stream.next().await.map(|item| (item, stream))
+    });
 
     let chunked_stream = item_stream
         .map(|result| result.map_err(to_execution_error))
@@ -345,24 +339,18 @@ where
         let items: Result<Vec<_>, _> = chunk.into_iter().collect();
         let items = items?;
 
-        let batch = process_chunk(items, unnest_depth, Arc::clone(&schema))?;
+        let unnested_items = match unnest_depth {
+            None | Some(0) => items,
+            Some(depth) => unnest_dynamodb_items(items, depth).map_err(to_execution_error)?,
+        };
+
+        let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
+            .map_err(to_execution_error)?;
+
         tx.send(Ok(batch)).await.map_err(to_execution_error)?;
     }
 
     Ok(())
-}
-
-fn process_chunk(
-    chunk: Vec<HashMap<String, AttributeValue>>,
-    unnest_depth: Option<usize>,
-    schema: SchemaRef,
-) -> DataFusionResult<RecordBatch> {
-    let unnested_items = match unnest_depth {
-        None | Some(0) => chunk,
-        Some(depth) => unnest_dynamodb_items(chunk, depth).map_err(to_execution_error)?,
-    };
-
-    dynamodb_items_to_arrow(&unnested_items, schema).map_err(to_execution_error)
 }
 
 /// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
@@ -371,33 +359,8 @@ fn process_chunk(
 /// See: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ExpressionAttributeNames.html#Expressions.ExpressionAttributeNames.ReservedWords>
 /// Returns a tuple of (`projection_expression`, `expression_attribute_names`) for the `DynamoDB` scan.
 /// Returns None if no projection is required.
-fn projection_expression(
-    projection: Option<&Vec<usize>>,
-    schema: &SchemaRef,
-) -> Option<(String, HashMap<String, String>)> {
-    let projection = projection?;
-    if projection.is_empty() {
-        return None;
-    }
-
-    // For each projected field, generate a placeholder and mapping
-    let mut expr_parts = Vec::with_capacity(projection.len());
-    let mut attr_names = HashMap::with_capacity(projection.len());
-
-    for (i, &idx) in projection.iter().enumerate() {
-        let field = schema.field(idx);
-        let name = field.name();
-        let placeholder = format!("#c{i}");
-        expr_parts.push(placeholder.clone());
-        attr_names.insert(placeholder, name.clone());
-    }
-
-    let expr = expr_parts.join(", ");
-    if expr.is_empty() {
-        None
-    } else {
-        Some((expr, attr_names))
-    }
+fn projection_expression() -> Option<(String, HashMap<String, String>)> {
+    todo!()
 }
 
 #[allow(clippy::needless_pass_by_value)]
