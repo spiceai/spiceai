@@ -182,6 +182,7 @@ async fn create_scheduler_server(
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
+    let io_runtime = rt.tokio_io_runtime();
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -205,7 +206,7 @@ async fn create_scheduler_server(
             Ok(
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
                     .with_config(cfg)
-                    .with_runtime_env(default_runtime_env())
+                    .with_runtime_env(default_runtime_env(io_runtime.clone()))
                     .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
                     .with_physical_optimizer_rule(UnionProjectionPushdownOptimizer::new())
                     .build(),

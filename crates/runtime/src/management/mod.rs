@@ -275,6 +275,7 @@ async fn get_spiceai_table_provider(
     };
 
     let secrets = runtime.secrets();
+    let tokio_io_runtime = runtime.tokio_io_runtime();
 
     let mut dataset = DatasetBuilder::try_new(format!("spice.ai/{cloud_dataset_path}"), name)
         .boxed()
@@ -289,7 +290,7 @@ async fn get_spiceai_table_provider(
     dataset.access = AccessMode::ReadWrite;
 
     let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
-        .build(secrets)
+        .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 

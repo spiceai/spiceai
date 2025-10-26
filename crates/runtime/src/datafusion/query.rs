@@ -190,7 +190,7 @@ impl Query {
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        if let Some(runtime_handle) = self.df.tokio_runtime().cloned() {
+        if let Some(runtime_handle) = self.df.cpu_runtime().cloned() {
             return self
                 .run_with_managed_runtime(request_context, runtime_handle)
                 .await;
@@ -767,6 +767,7 @@ mod tests {
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
             )
             .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
             .build(),

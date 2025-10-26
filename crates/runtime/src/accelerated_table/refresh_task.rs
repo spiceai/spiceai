@@ -110,7 +110,8 @@ pub struct RefreshTaskBuilder {
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
-    tokio_runtime: Option<Handle>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl RefreshTaskBuilder {
@@ -121,7 +122,7 @@ impl RefreshTaskBuilder {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
-        metrics: Option<Metrics>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -132,8 +133,9 @@ impl RefreshTaskBuilder {
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
             disable_federation: false,
             semaphore: None,
-            metrics,
-            tokio_runtime: None,
+            metrics: None,
+            cpu_runtime: None,
+            io_runtime,
         }
     }
 
@@ -151,8 +153,14 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
-    pub fn with_tokio_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
-        self.tokio_runtime = runtime;
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> RefreshTaskBuilder {
+        self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
+        self.cpu_runtime = runtime;
         self
     }
 
@@ -180,7 +188,8 @@ impl RefreshTaskBuilder {
                 .iter()
                 .cloned()
                 .collect(),
-            tokio_runtime: self.tokio_runtime,
+            cpu_runtime: self.cpu_runtime,
+            io_runtime: self.io_runtime,
         }
     }
 }
@@ -197,7 +206,8 @@ pub struct RefreshTask {
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Arc<Semaphore>,
     enabled_metrics: HashSet<String>,
-    tokio_runtime: Option<Handle>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl RefreshTask {
@@ -208,7 +218,7 @@ impl RefreshTask {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
-        metrics: Option<Metrics>,
+        io_runtime: Handle,
     ) -> RefreshTaskBuilder {
         RefreshTaskBuilder::new(
             runtime_status,
@@ -216,7 +226,7 @@ impl RefreshTask {
             federated,
             federated_source,
             accelerator,
-            metrics,
+            io_runtime,
         )
     }
 
@@ -731,7 +741,7 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
-        if let Some(runtime_handle) = self.tokio_runtime.clone() {
+        if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
             let dataset_name_for_runtime = dataset_name.clone();
             let filters_for_runtime = filters.clone();
             let update_type_for_runtime = update_type.clone();
@@ -742,12 +752,12 @@ impl RefreshTask {
 
             // Capture necessary state to create ctx inside the closure
             let dataset_name_for_ctx = self.dataset_name.clone();
-            let federated_for_ctx = Arc::clone(&self.federated);
             let accelerator_for_ctx = Arc::clone(&self.accelerator);
             let disable_federation = self.disable_federation;
+            let io_runtime = self.io_runtime.clone();
 
             let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
-                runtime_handle,
+                cpu_runtime_handle,
                 request_context,
                 span,
                 async move {
@@ -755,9 +765,9 @@ impl RefreshTask {
                     let mut ctx = Self::create_refresh_df_context(
                         Arc::clone(&provider_for_runtime),
                         &dataset_name_for_ctx,
-                        &federated_for_ctx,
                         &accelerator_for_ctx,
                         disable_federation,
+                        io_runtime,
                     )
                     .await;
 
@@ -788,9 +798,14 @@ impl RefreshTask {
         }
 
         // Create ctx only in the fallback path (no managed runtime)
-        let mut ctx = self
-            .refresh_df_context(Arc::clone(&federated_provider))
-            .await;
+        let mut ctx = Self::create_refresh_df_context(
+            Arc::clone(&federated_provider),
+            &self.dataset_name,
+            &self.accelerator,
+            self.disable_federation,
+            self.io_runtime.clone(),
+        )
+        .await;
 
         let get_data_result = get_data(
             &mut ctx,
@@ -828,33 +843,19 @@ impl RefreshTask {
         )
     }
 
-    async fn refresh_df_context(
-        &self,
-        federated_provider: Arc<dyn TableProvider>,
-    ) -> SessionContext {
-        Self::create_refresh_df_context(
-            federated_provider,
-            &self.dataset_name,
-            &self.federated,
-            &self.accelerator,
-            self.disable_federation,
-        )
-        .await
-    }
-
     /// Static helper method to create a `DataFusion` context for refresh operations.
     /// This is separated from `refresh_df_context` to allow it to be called from async closures
     /// without requiring `self`, avoiding the need to create the context twice.
     async fn create_refresh_df_context(
         federated_provider: Arc<dyn TableProvider>,
         dataset_name: &TableReference,
-        _federated: &Arc<FederatedTable>,
         accelerator: &Arc<dyn TableProvider>,
         disable_federation: bool,
+        io_runtime: Handle,
     ) -> SessionContext {
         let state_builder = SessionStateBuilder::new()
             .with_config(get_df_default_config())
-            .with_runtime_env(default_runtime_env())
+            .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
 
         let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
@@ -939,9 +940,14 @@ impl RefreshTask {
 
         let existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
-            &self
-                .refresh_df_context(Arc::clone(&federated_provider))
-                .await,
+            &Self::create_refresh_df_context(
+                Arc::clone(&federated_provider),
+                &self.dataset_name,
+                &self.accelerator,
+                self.disable_federation,
+                self.io_runtime.clone(),
+            )
+            .await,
         )
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
@@ -977,7 +983,14 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> super::Result<Option<u128>> {
         let federated = self.federated.table_provider().await;
-        let ctx = self.refresh_df_context(federated).await;
+        let ctx = Self::create_refresh_df_context(
+            federated,
+            &self.dataset_name,
+            &self.accelerator,
+            self.disable_federation,
+            self.io_runtime.clone(),
+        )
+        .await;
 
         refresh
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())

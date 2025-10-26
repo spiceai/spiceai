@@ -23,7 +23,7 @@ use crate::{
 use arrow::record_batch::RecordBatch;
 use runtime::Runtime;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_aws_sdk_environment_resolution() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
