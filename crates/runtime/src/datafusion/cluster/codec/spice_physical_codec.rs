@@ -1,4 +1,5 @@
 use crate::Runtime;
+use crate::metrics::telemetry::track_bytes_processed;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use datafusion::common::{DataFusionError, Result, exec_err};
@@ -82,7 +83,10 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
             Some("BytesProcessedExec") => {
                 // TODO: Make RequestContext serializable
-                Ok(Arc::new(BytesProcessedExec::new(Arc::clone(&inputs[0]))))
+                Ok(Arc::new(
+                    BytesProcessedExec::new(Arc::clone(&inputs[0])),
+                    Box::new(track_bytes_processed),
+                ))
             }
             _ => exec_err!("Unsupported spice.exec.name"),
         }
