@@ -275,7 +275,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("partition_mode"),
     ParameterSpec::component("partitioned_write_flush_threshold"),
     ParameterSpec::runtime("connection_pool_size")
-        .description("The maximum number of connections created in the connection pool."),
+        .description("The maximum number of client connections created in the duckdb connection pool."),
 ];
 
 #[async_trait]
