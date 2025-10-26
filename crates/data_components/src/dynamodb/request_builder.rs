@@ -310,11 +310,9 @@ impl DynamoDBRequestPlanBuilder {
             return (None, filters.to_vec());
         }
 
-        if let Some((partition, sort, other)) = try_match_index(
-            filters,
-            self.schema.partition_key(),
-            self.schema.sort_key(),
-        ) {
+        if let Some((partition, sort, other)) =
+            try_match_index(filters, self.schema.partition_key(), self.schema.sort_key())
+        {
             return (Some((partition, sort)), other);
         }
 
@@ -1179,5 +1177,217 @@ mod tests {
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
         }
+    }
+
+    #[test]
+    fn test_build_filter_expression_simple() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filter = col("age").eq(lit(25i64));
+        let (expr, values) = builder.build_filter_expression(&[filter]);
+
+        assert_eq!(expr, "(#c3 = :v0)");
+        assert_eq!(values.len(), 1);
+        assert!(values.contains_key(":v0"));
+    }
+
+    #[test]
+    fn test_build_filter_expression_multiple_filters() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filter1 = col("age").gt(lit(18i64));
+        let filter2 = col("active").eq(lit(true));
+
+        let (expr, values) = builder.build_filter_expression(&[filter1, filter2]);
+
+        assert_eq!(expr, "(#c3 > :v0) AND (#c4 = :v1)");
+        assert_eq!(values.len(), 2);
+        assert!(values.contains_key(":v0"));
+        assert!(values.contains_key(":v1"));
+    }
+
+    #[test]
+    fn test_build_filter_expression_empty() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let (expr, values) = builder.build_filter_expression(&[]);
+
+        assert!(expr.is_empty());
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_build_filter_expression_complex() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        // (age > 18 AND active = true)
+        let filter = col("age").gt(lit(18i64)).and(col("active").eq(lit(true)));
+        let (expr, values) = builder.build_filter_expression(&[filter]);
+
+        assert_eq!(expr, "((#c3 > :v0) AND (#c4 = :v1))");
+        assert_eq!(values.len(), 2);
+        assert!(values.contains_key(":v0"));
+        assert!(values.contains_key(":v1"));
+    }
+
+    #[test]
+    fn test_extract_attribute_names() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filter1 = col("age").eq(lit(25i64));
+        let filter2 = col("name").eq(lit("John"));
+
+        let attr_names = builder.extract_attribute_names(&[filter1, filter2]);
+
+        assert_eq!(attr_names.len(), 2);
+        assert_eq!(attr_names.get("#c2"), Some(&"name".to_string()));
+        assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
+    }
+
+    #[test]
+    fn test_extract_attribute_names_nested() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        // age > 18 AND name = "John"
+        let filter = col("age").gt(lit(18i64)).and(col("name").eq(lit("John")));
+
+        let attr_names = builder.extract_attribute_names(&[filter]);
+
+        assert_eq!(attr_names.len(), 2);
+        assert_eq!(attr_names.get("#c2"), Some(&"name".to_string()));
+        assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
+    }
+
+    #[test]
+    fn test_build_key_condition_expression_partition_only() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let partition_expr = col("id").eq(lit("user123"));
+        let (expr, values) = builder
+            .build_key_condition_expression(&partition_expr, None)
+            .expect("build_key_condition_expression");
+
+        assert_eq!(expr, "(#c0 = :v1000)");
+        assert_eq!(values.len(), 1);
+        assert!(values.contains_key(":v1000"));
+    }
+
+    #[test]
+    fn test_build_key_condition_expression_with_sort() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let partition_expr = col("id").eq(lit("user123"));
+        let sort_expr = col("sort_key").gt(lit("2024-01-01"));
+
+        let (expr, values) = builder
+            .build_key_condition_expression(&partition_expr, Some(&sort_expr))
+            .expect("build_key_condition_expression");
+
+        assert_eq!(expr, "(#c0 = :v1000) AND (#c1 > :v1001)");
+        assert!(values.contains_key(":v1000"));
+        assert!(values.contains_key(":v1001"));
+    }
+
+    #[test]
+    fn test_scalar_to_attribute_value_string() {
+        let scalar = ScalarValue::Utf8(Some("test".to_string()));
+        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
+
+        match attr {
+            AttributeValue::S(s) => assert_eq!(s, "test"),
+            _ => panic!("Expected String attribute"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn test_scalar_to_attribute_value_numbers() {
+        let scalar_i64 = ScalarValue::Int64(Some(42));
+        let attr = scalar_to_attribute_value(&scalar_i64).expect("scalar_to_attribute_value");
+        assert!(matches!(attr, AttributeValue::N(_)));
+
+        let scalar_i32 = ScalarValue::Int32(Some(42));
+        let attr = scalar_to_attribute_value(&scalar_i32).expect("scalar_to_attribute_value");
+        assert!(matches!(attr, AttributeValue::N(_)));
+
+        let scalar_f64 = ScalarValue::Float64(Some(42.5));
+        let attr = scalar_to_attribute_value(&scalar_f64).expect("scalar_to_attribute_value");
+        assert!(matches!(attr, AttributeValue::N(_)));
+    }
+
+    #[test]
+    fn test_scalar_to_attribute_value_boolean() {
+        let scalar = ScalarValue::Boolean(Some(true));
+        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
+
+        match attr {
+            AttributeValue::Bool(b) => assert!(b),
+            _ => panic!("Expected Boolean attribute"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_to_attribute_value_null() {
+        let scalar = ScalarValue::Null;
+        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
+
+        assert!(matches!(attr, AttributeValue::Null(true)));
+    }
+
+    #[test]
+    fn test_expr_to_filter_string_all_operators() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let mut values = HashMap::new();
+        let mut counter = 0;
+
+        let operators = vec![
+            (Operator::Eq, "="),
+            (Operator::NotEq, "<>"),
+            (Operator::Lt, "<"),
+            (Operator::LtEq, "<="),
+            (Operator::Gt, ">"),
+            (Operator::GtEq, ">="),
+        ];
+
+        for (op, expected_str) in operators {
+            let expr = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col("age")),
+                op,
+                right: Box::new(lit(25i64)),
+            });
+
+            let result = builder
+                .expr_to_filter_string(&expr, &mut values, &mut counter)
+                .expect("expr_to_filter_string");
+            assert!(result.contains(expected_str));
+        }
+    }
+
+    #[test]
+    fn test_filter_with_different_data_types() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let string_filter = col("name").eq(lit("Alice"));
+        let int_filter = col("age").eq(lit(30i64));
+        let bool_filter = col("active").eq(lit(true));
+
+        let (expr, values) =
+            builder.build_filter_expression(&[string_filter, int_filter, bool_filter]);
+
+        assert!(expr.contains("#c3")); // name
+        assert!(expr.contains("#c2")); // age
+        assert!(expr.contains("#c4")); // active
+        assert_eq!(values.len(), 3);
     }
 }
