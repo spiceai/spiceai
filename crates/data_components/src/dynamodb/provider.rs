@@ -142,7 +142,7 @@ impl DynamoDBTableProvider {
         };
 
         Ok((
-            infer_arrow_schema_from_items(&unnested_items)?,
+            infer_arrow_schema_from_items(&unnested_items),
             partition_key,
             sort_key,
         ))
@@ -172,11 +172,9 @@ impl TableProvider for DynamoDBTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(self.table_schema.schema(), projection)?;
 
-        let request_plan = self.request_plan_builder.build_request_plan(
-            filters,
-            projected_schema.clone(),
-            limit,
-        )?;
+        let request_plan =
+            self.request_plan_builder
+                .build_request_plan(filters, &projected_schema, limit)?;
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             Arc::clone(&self.client),
@@ -189,7 +187,7 @@ impl TableProvider for DynamoDBTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        self.table_schema.supports_filters_pushdown(filters)
+        Ok(self.table_schema.supports_filters_pushdown(filters))
     }
 }
 
@@ -277,7 +275,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
 
-            let item_stream = build_stream_from_plan(client, request_plan);
+            let item_stream = build_stream_from_plan(&client, request_plan);
             let chunked_stream = item_stream.chunks(CHUNK_SIZE);
             pin_mut!(chunked_stream);
 
@@ -307,7 +305,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
 #[deny(unused_variables)]
 fn build_stream_from_plan(
-    client: Arc<Client>,
+    client: &Arc<Client>,
     request: DynamoDBRequestPlan,
 ) -> Pin<Box<dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static>>
 {

@@ -43,7 +43,7 @@ pub fn dynamodb_items_to_arrow(
         });
     }
 
-    let mut builders = create_builders(&projected_schema, items.len())?;
+    let mut builders = create_builders(&projected_schema, items.len());
 
     for item in items {
         append_item_to_builders(item, &projected_schema, &mut builders)?;
@@ -70,10 +70,6 @@ fn create_empty_array(data_type: &DataType) -> ArrayRef {
                 .finish(),
         ),
         DataType::List(field) => match field.data_type() {
-            DataType::Utf8 => {
-                let values_builder = StringBuilder::new();
-                Arc::new(ListBuilder::new(values_builder).finish())
-            }
             DataType::Int64 => {
                 let values_builder = Int64Builder::new();
                 Arc::new(ListBuilder::new(values_builder).finish())
@@ -137,7 +133,7 @@ trait ArrayBuilderTrait {
     fn finish_builder(self: Box<Self>) -> Result<ArrayRef, Error>;
 }
 
-fn create_builders(schema: &SchemaRef, capacity: usize) -> Result<BuilderMap, Error> {
+fn create_builders(schema: &SchemaRef, capacity: usize) -> BuilderMap {
     let mut builders: BuilderMap = HashMap::new();
 
     for field in schema.fields() {
@@ -168,7 +164,7 @@ fn create_builders(schema: &SchemaRef, capacity: usize) -> Result<BuilderMap, Er
         builders.insert(field.name().clone(), builder);
     }
 
-    Ok(builders)
+    builders
 }
 
 fn append_item_to_builders(
@@ -232,8 +228,7 @@ impl ArrayBuilderTrait for BooleanArrayBuilder {
     fn append_attribute_value(&mut self, value: Option<&AttributeValue>) -> Result<(), Error> {
         match value {
             Some(AttributeValue::Bool(b)) => self.0.append_value(*b),
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -259,8 +254,7 @@ impl ArrayBuilderTrait for Int64ArrayBuilder {
                     self.0.append_null();
                 }
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -286,8 +280,7 @@ impl ArrayBuilderTrait for Float64ArrayBuilder {
                     self.0.append_null();
                 }
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -341,8 +334,7 @@ impl ArrayBuilderTrait for BinaryArrayBuilder {
     fn append_attribute_value(&mut self, value: Option<&AttributeValue>) -> Result<(), Error> {
         match value {
             Some(AttributeValue::B(blob)) => self.0.append_value(blob.as_ref()),
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -368,8 +360,7 @@ impl ArrayBuilderTrait for Date32ArrayBuilder {
                     None => self.0.append_null(),
                 }
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -395,8 +386,7 @@ impl ArrayBuilderTrait for TimestampMillisecondArrayBuilder {
                     None => self.0.append_null(),
                 }
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -435,8 +425,7 @@ impl ArrayBuilderTrait for StringListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -466,8 +455,7 @@ impl ArrayBuilderTrait for Int64ListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -497,8 +485,7 @@ impl ArrayBuilderTrait for Float64ListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -524,8 +511,7 @@ impl ArrayBuilderTrait for BinaryListArrayBuilder {
                 }
                 self.0.append(true);
             }
-            Some(AttributeValue::Null(_)) | None => self.0.append_null(),
-            Some(_) => self.0.append_null(),
+            Some(AttributeValue::Null(_)) | Some(_) | None => self.0.append_null(),
         }
         Ok(())
     }
@@ -568,13 +554,15 @@ fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
 
 fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
     // Parse YYYY-MM-DD format
-    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2
-        && let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            // Convert to days since Unix epoch (1970-01-01)
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
-            let duration = date.signed_duration_since(epoch);
-            return Some(duration.num_days() as i32);
-        }
+    if s.len() == 10
+        && s.chars().filter(|c| *c == '-').count() == 2
+        && let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+    {
+        // Convert to days since Unix epoch (1970-01-01)
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+        let duration = date.signed_duration_since(epoch);
+        return i32::try_from(duration.num_days()).ok();
+    }
     None
 }
 
@@ -615,7 +603,7 @@ mod tests {
             Field::new("age", DataType::Int64, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema.clone()).expect("to_arrow");
+        let result = dynamodb_items_to_arrow(&items, Arc::clone(&schema)).expect("to_arrow");
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.num_columns(), 2);
     }
@@ -661,7 +649,7 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .expect("height_array");
-        assert_eq!(height_array.value(0), 5.6);
+        assert!((height_array.value(0) - 5.6).abs() < 1e-6);
 
         let is_active_array = result
             .column(3)
@@ -785,9 +773,9 @@ mod tests {
             .expect("array");
 
         assert_eq!(values.len(), 3);
-        assert_eq!(values.value(0), 1.5);
-        assert_eq!(values.value(1), 2.5);
-        assert_eq!(values.value(2), 3.14);
+        assert!((values.value(0) - 1.5).abs() < 1e-6);
+        assert!((values.value(1) - 2.5).abs() < 1e-6);
+        assert!((values.value(2) - 3.14).abs() < 1e-6);
     }
 
     #[test]
@@ -1032,21 +1020,21 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .expect("array");
-        assert_eq!(float_pos.value(0), 3.14);
+        assert!((float_pos.value(0) - 3.14).abs() < 1e-6);
 
         let float_neg = result
             .column(3)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .expect("array");
-        assert_eq!(float_neg.value(0), -3.14);
+        assert!((float_neg.value(0) - -3.14).abs() < 1e-6);
 
         let scientific = result
             .column(4)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .expect("array");
-        assert_eq!(scientific.value(0), 1.5e10);
+        assert!((scientific.value(0) - 1.5e10).abs() < 1e-6);
 
         let zero = result
             .column(5)
@@ -1294,9 +1282,9 @@ mod tests {
             .expect("array");
 
         // 2023-08-31T12:34:56Z = 1693488896000 ms
-        assert_eq!(timestamp_array.value(0), 1693485296000);
+        assert_eq!(timestamp_array.value(0), 1_693_485_296_000);
         // 2024-01-15T08:22:11.123Z = 1705309331123 ms
-        assert_eq!(timestamp_array.value(1), 1705306931123);
+        assert_eq!(timestamp_array.value(1), 1_705_306_931_123);
     }
 
     #[test]
@@ -1331,7 +1319,7 @@ mod tests {
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
             .expect("array");
 
-        assert_eq!(timestamp_array.value(0), 1693485296000);
+        assert_eq!(timestamp_array.value(0), 1_693_485_296_000);
     }
 
     #[test]
@@ -1594,7 +1582,8 @@ mod tests {
             Field::new("birth_date", DataType::Date32, true),
         ]));
 
-        let result = dynamodb_items_to_arrow(&items, schema.clone()).expect("dynamodb_items_to_arrow");
+        let result =
+            dynamodb_items_to_arrow(&items, Arc::clone(&schema)).expect("dynamodb_items_to_arrow");
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.num_columns(), 3);
     }

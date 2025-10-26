@@ -59,7 +59,7 @@ impl DynamoDBRequestPlanBuilder {
     pub fn build_request_plan(
         &self,
         filters: &[Expr],
-        projection_schema: SchemaRef,
+        projection_schema: &SchemaRef,
         limit: Option<usize>,
     ) -> DataFusionResult<DynamoDBRequestPlan> {
         // Separate key filters from other filters
@@ -68,7 +68,7 @@ impl DynamoDBRequestPlanBuilder {
         println!("other_filters: {other_filters:?}");
 
         let mut attribute_names = self.schema.extract_attribute_names(filters);
-        self.add_projection_aliases(projection_schema.clone(), &mut attribute_names);
+        self.add_projection_aliases(projection_schema, &mut attribute_names);
 
         let projection_expr = self.build_projection_expression(projection_schema);
 
@@ -122,7 +122,7 @@ impl DynamoDBRequestPlanBuilder {
         query_params = query_params.key_condition_expression(key_condition);
 
         if !other_filters.is_empty() {
-            let (filter_str, filter_values) = self.schema.build_filter_expression(other_filters)?;
+            let (filter_str, filter_values) = self.schema.build_filter_expression(other_filters);
             key_values.extend(filter_values);
             println!("filter_expression: {filter_str:?}");
             // query_request = query_request.filter_expression(filter_str.clone());
@@ -173,7 +173,7 @@ impl DynamoDBRequestPlanBuilder {
         //     .table_name(self.schema.table_name().to_string());
 
         if !filters.is_empty() {
-            let (filter_str, attribute_values) = self.schema.build_filter_expression(filters)?;
+            let (filter_str, attribute_values) = self.schema.build_filter_expression(filters);
             if !filter_str.is_empty() {
                 println!("filter_expression: {:?}", &filter_str);
                 println!("attribute_values: {:?}", &attribute_values);
@@ -206,7 +206,7 @@ impl DynamoDBRequestPlanBuilder {
 
     fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
         // Check for OR conditions first - if present, can't use Query
-        let has_or = filters.iter().any(|f| self.contains_or(f));
+        let has_or = filters.iter().any(|f| contains_or(f));
         if has_or {
             return (None, filters.to_vec());
         }
@@ -235,7 +235,7 @@ impl DynamoDBRequestPlanBuilder {
         let mut other_filters = Vec::new();
 
         for filter in filters {
-            if let Some(extracted) = self.try_extract_key_filter(filter, partition_key, sort_key) {
+            if let Some(extracted) = try_extract_key_filter(filter, partition_key, sort_key) {
                 match extracted {
                     KeyFilter::Partition(expr) => {
                         if partition_expr.is_some() {
@@ -261,7 +261,7 @@ impl DynamoDBRequestPlanBuilder {
         partition_expr.map(|p| (p, sort_expr, other_filters))
     }
 
-    fn build_projection_expression(&self, projection: SchemaRef) -> Option<String> {
+    fn build_projection_expression(&self, projection: &SchemaRef) -> Option<String> {
         let projection_expr: Vec<String> = projection
             .fields
             .iter()
@@ -277,7 +277,7 @@ impl DynamoDBRequestPlanBuilder {
 
     fn add_projection_aliases(
         &self,
-        projection: SchemaRef,
+        projection: &SchemaRef,
         attribute_names: &mut HashMap<String, String>,
     ) {
         for field in &projection.fields {
@@ -286,50 +286,50 @@ impl DynamoDBRequestPlanBuilder {
             }
         }
     }
+}
 
-    fn contains_or(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                matches!(op, Operator::Or) || self.contains_or(left) || self.contains_or(right)
-            }
-            _ => false,
+fn contains_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            matches!(op, Operator::Or) || contains_or(left) || contains_or(right)
         }
+        _ => false,
     }
+}
 
-    /// Extracts key filter if the expression matches the specified partition or sort key
-    fn try_extract_key_filter(
-        &self,
-        expr: &Expr,
-        partition_key: &str,
-        sort_key: Option<&str>,
-    ) -> Option<KeyFilter> {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op, .. }) => {
-                if let Expr::Column(col) = left.as_ref() {
-                    if col.name.as_str() == partition_key {
-                        // Partition key must use = operator
-                        if matches!(op, Operator::Eq) {
-                            return Some(KeyFilter::Partition(expr.clone()));
-                        }
-                    } else if let Some(sk) = sort_key
-                        && col.name.as_str() == sk {
-                            // Sort key can use =, <, >, <=, >=
-                            if matches!(
-                                op,
-                                Operator::Eq
-                                    | Operator::Lt
-                                    | Operator::LtEq
-                                    | Operator::Gt
-                                    | Operator::GtEq
-                            ) {
-                                return Some(KeyFilter::Sort(expr.clone()));
-                            }
-                        }
+/// Extracts key filter if the expression matches the specified partition or sort key
+fn try_extract_key_filter(
+    expr: &Expr,
+    partition_key: &str,
+    sort_key: Option<&str>,
+) -> Option<KeyFilter> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, .. }) => {
+            if let Expr::Column(col) = left.as_ref() {
+                if col.name.as_str() == partition_key {
+                    // Partition key must use = operator
+                    if matches!(op, Operator::Eq) {
+                        return Some(KeyFilter::Partition(expr.clone()));
+                    }
+                } else if let Some(sk) = sort_key
+                    && col.name.as_str() == sk
+                {
+                    // Sort key can use =, <, >, <=, >=
+                    if matches!(
+                        op,
+                        Operator::Eq
+                            | Operator::Lt
+                            | Operator::LtEq
+                            | Operator::Gt
+                            | Operator::GtEq
+                    ) {
+                        return Some(KeyFilter::Sort(expr.clone()));
+                    }
                 }
-                None
             }
-            _ => None,
+            None
         }
+        _ => None,
     }
 }
 
@@ -358,7 +358,7 @@ mod tests {
         )
     }
 
-    fn create_projection_schema(fields: Vec<&str>) -> Arc<Schema> {
+    fn create_projection_schema(fields: &[&str]) -> Arc<Schema> {
         Arc::new(Schema::new(
             fields
                 .iter()
@@ -373,10 +373,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -390,11 +390,15 @@ mod tests {
                 );
 
                 // Should have attribute name for id
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
 
                 // Should have attribute value for user123
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v1000"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -419,10 +423,10 @@ mod tests {
             col("id").eq(lit("user123")),
             col("sort_key").eq(lit("2024-01-01")),
         ];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -436,12 +440,16 @@ mod tests {
                 );
 
                 // Should have attribute names for id and sort_key
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
                 assert_eq!(attr_names.get("#c1"), Some(&"sort_key".to_string()));
 
                 // Should have attribute values
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v1000"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -463,10 +471,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123")), col("age").gt(lit(18i64))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -483,12 +491,16 @@ mod tests {
                 assert_eq!(params.filter_expression, Some("(#c3 > :v0)".to_string()));
 
                 // Should have attribute names for id and age
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
                 assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
 
                 // Should have attribute values (key values start at 1000, filter values at 0)
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v1000"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -508,10 +520,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -531,10 +543,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("name").eq(lit("John"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -545,11 +557,15 @@ mod tests {
                 assert_eq!(params.filter_expression, Some("(#c2 = :v0)".to_string()));
 
                 // Should have attribute name for name
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c2"), Some(&"name".to_string()));
 
                 // Should have attribute value for John
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v0"),
                     Some(&AttributeValue::S("John".to_string()))
@@ -569,10 +585,10 @@ mod tests {
                 .eq(lit("user123"))
                 .or(col("id").eq(lit("user456"))),
         ];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -585,10 +601,14 @@ mod tests {
                     Some("((#c0 = :v0) OR (#c0 = :v1))".to_string())
                 );
 
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
 
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v0"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -608,10 +628,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, Some(10))
+            .build_request_plan(&filters, &projection, Some(10))
             .expect("request plan");
 
         match result {
@@ -629,12 +649,17 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
-        let result = builder.build_request_plan(&filters, projection, Some(i32::MAX as usize + 1));
+        let result = builder.build_request_plan(&filters, &projection, Some(i32::MAX as usize + 1));
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Limit too large"));
+        assert!(
+            result
+                .expect_err("error")
+                .to_string()
+                .contains("Limit too large")
+        );
     }
 
     #[test]
@@ -652,10 +677,10 @@ mod tests {
 
         for (sort_op, expected_sort_condition) in test_cases {
             let filters = vec![col("id").eq(lit("user123")), sort_op];
-            let projection = create_projection_schema(vec!["id", "name"]);
+            let projection = create_projection_schema(&vec!["id", "name"]);
 
             let result = builder
-                .build_request_plan(&filters, projection, None)
+                .build_request_plan(&filters, &projection, None)
                 .expect("request plan");
 
             match result {
@@ -664,7 +689,9 @@ mod tests {
                     let expected = format!("(#c0 = :v1000) AND {expected_sort_condition}");
                     assert_eq!(params.key_condition_expression, Some(expected));
 
-                    let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                    let attr_values = params
+                        .expression_attribute_values
+                        .expect("expression_attribute_values");
                     assert_eq!(
                         attr_values.get(":v1000"),
                         Some(&AttributeValue::S("user123".to_string()))
@@ -685,10 +712,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").eq(lit("user123")), col("id").eq(lit("user456"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -699,7 +726,9 @@ mod tests {
                     Some("(#c0 = :v0) AND (#c0 = :v1)".to_string())
                 );
 
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v0"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -723,10 +752,10 @@ mod tests {
             col("sort_key").gt(lit("2024-01-01")),
             col("sort_key").lt(lit("2024-12-31")),
         ];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -737,11 +766,15 @@ mod tests {
                     Some("(#c0 = :v0) AND (#c1 > :v1) AND (#c1 < :v2)".to_string())
                 );
 
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
                 assert_eq!(attr_names.get("#c1"), Some(&"sort_key".to_string()));
 
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v0"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -765,10 +798,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("id").gt(lit("user123"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -776,7 +809,9 @@ mod tests {
                 // Filter expression: (#c0 > :v0)
                 assert_eq!(params.filter_expression, Some("(#c0 > :v0)".to_string()));
 
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v0"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -795,7 +830,7 @@ mod tests {
         let projection = Arc::new(Schema::empty());
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -821,10 +856,10 @@ mod tests {
                 .gt(lit(18i64))
                 .and(col("active").eq(lit(true)).or(col("active").eq(lit(false)))),
         ];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         // OR anywhere in the filter tree should force a scan
@@ -858,10 +893,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(table_schema);
 
         let filters = vec![col("id").eq(lit("user123"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -872,7 +907,9 @@ mod tests {
                     Some("(#c0 = :v1000)".to_string())
                 );
 
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
             }
             DynamoDBRequestPlan::Scan(_) => panic!("Expected Query request"),
@@ -885,10 +922,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("name").eq(lit("John"))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, Some(25))
+            .build_request_plan(&filters, &projection, Some(25))
             .expect("request plan");
 
         match result {
@@ -910,10 +947,10 @@ mod tests {
             col("age").gt(lit(18i64)),
             col("active").eq(lit(true)),
         ];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -930,13 +967,17 @@ mod tests {
                     Some("(#c3 > :v0) AND (#c4 = :v1)".to_string())
                 );
 
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.len(), 4);
                 assert_eq!(attr_names.get("#c0"), Some(&"id".to_string()));
                 assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
                 assert_eq!(attr_names.get("#c4"), Some(&"active".to_string()));
 
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v1000"),
                     Some(&AttributeValue::S("user123".to_string()))
@@ -957,10 +998,10 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filters = vec![col("name").eq(lit("John")), col("age").gt(lit(25i64))];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -971,11 +1012,15 @@ mod tests {
                     Some("(#c2 = :v0) AND (#c3 > :v1)".to_string())
                 );
 
-                let attr_names = params.expression_attribute_names.expect("expression_attribute_names");
+                let attr_names = params
+                    .expression_attribute_names
+                    .expect("expression_attribute_names");
                 assert_eq!(attr_names.get("#c2"), Some(&"name".to_string()));
                 assert_eq!(attr_names.get("#c3"), Some(&"age".to_string()));
 
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v0"),
                     Some(&AttributeValue::S("John".to_string()))
@@ -998,10 +1043,10 @@ mod tests {
             col("id").eq(lit("user123")),
             col("name").not_eq(lit("Admin")),
         ];
-        let projection = create_projection_schema(vec!["id", "name"]);
+        let projection = create_projection_schema(&vec!["id", "name"]);
 
         let result = builder
-            .build_request_plan(&filters, projection, None)
+            .build_request_plan(&filters, &projection, None)
             .expect("request plan");
 
         match result {
@@ -1015,7 +1060,9 @@ mod tests {
                 // Filter expression with not equal: (#c2 <> :v0)
                 assert_eq!(params.filter_expression, Some("(#c2 <> :v0)".to_string()));
 
-                let attr_values = params.expression_attribute_values.expect("expression_attribute_values");
+                let attr_values = params
+                    .expression_attribute_values
+                    .expect("expression_attribute_values");
                 assert_eq!(
                     attr_values.get(":v0"),
                     Some(&AttributeValue::S("Admin".to_string()))

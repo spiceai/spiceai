@@ -63,8 +63,8 @@ impl DynamoDBTableSchema {
     pub fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        let support: Vec<_> = filters
+    ) -> Vec<TableProviderFilterPushDown> {
+        filters
             .iter()
             .map(|&expr| {
                 if self.is_filter_supported(expr) {
@@ -73,17 +73,15 @@ impl DynamoDBTableSchema {
                     TableProviderFilterPushDown::Unsupported
                 }
             })
-            .collect();
-
-        Ok(support)
+            .collect()
     }
 
     pub fn build_filter_expression(
         &self,
         filters: &[Expr],
-    ) -> DataFusionResult<(String, HashMap<String, AttributeValue>)> {
+    ) -> (String, HashMap<String, AttributeValue>) {
         if filters.is_empty() {
-            return Ok((String::new(), HashMap::new()));
+            return (String::new(), HashMap::new());
         }
 
         let mut attribute_values = HashMap::new();
@@ -98,11 +96,11 @@ impl DynamoDBTableSchema {
             .collect();
 
         if filter_parts.is_empty() {
-            return Ok((String::new(), HashMap::new()));
+            return (String::new(), HashMap::new());
         }
 
         let filter_expr = filter_parts.join(" AND ");
-        Ok((filter_expr, attribute_values))
+        (filter_expr, attribute_values)
     }
 
     pub fn extract_attribute_names(&self, filters: &[Expr]) -> HashMap<String, String> {
@@ -398,7 +396,8 @@ mod tests {
         let unsupported_filter = col("nonexistent").eq(lit(25i64));
 
         let filters = vec![&supported_filter, &unsupported_filter];
-        let result = schema.supports_filters_pushdown(&filters).expect("supports_filters_pushdown");
+        let result = schema
+            .supports_filters_pushdown(&filters);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
@@ -410,7 +409,8 @@ mod tests {
         let schema = create_test_schema();
 
         let filter = col("age").eq(lit(25i64));
-        let (expr, values) = schema.build_filter_expression(&[filter]).expect("build_filter_expression");
+        let (expr, values) = schema
+            .build_filter_expression(&[filter]);
 
         assert_eq!(expr, "(#c2 = :v0)");
         assert_eq!(values.len(), 1);
@@ -424,7 +424,8 @@ mod tests {
         let filter1 = col("age").gt(lit(18i64));
         let filter2 = col("active").eq(lit(true));
 
-        let (expr, values) = schema.build_filter_expression(&[filter1, filter2]).expect("build_filter_expression");
+        let (expr, values) = schema
+            .build_filter_expression(&[filter1, filter2]);
 
         assert!(expr.contains("AND"));
         assert!(expr.contains("#c2"));
@@ -436,7 +437,8 @@ mod tests {
     fn test_build_filter_expression_empty() {
         let schema = create_test_schema();
 
-        let (expr, values) = schema.build_filter_expression(&[]).expect("build_filter_expression");
+        let (expr, values) = schema
+            .build_filter_expression(&[]);
 
         assert!(expr.is_empty());
         assert!(values.is_empty());
@@ -448,7 +450,8 @@ mod tests {
 
         // (age > 18 AND active = true)
         let filter = col("age").gt(lit(18i64)).and(col("active").eq(lit(true)));
-        let (expr, values) = schema.build_filter_expression(&[filter]).expect("build_filter_expression");
+        let (expr, values) = schema
+            .build_filter_expression(&[filter]);
 
         assert!(expr.contains("AND"));
         assert!(expr.contains("#c2"));
@@ -527,6 +530,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn test_scalar_to_attribute_value_numbers() {
         let scalar_i64 = ScalarValue::Int64(Some(42));
         let attr = scalar_to_attribute_value(&scalar_i64).expect("scalar_to_attribute_value");
@@ -617,8 +621,7 @@ mod tests {
         let bool_filter = col("active").eq(lit(true));
 
         let (expr, values) = schema
-            .build_filter_expression(&[string_filter, int_filter, bool_filter])
-            .expect("build_filter_expression");
+            .build_filter_expression(&[string_filter, int_filter, bool_filter]);
 
         assert!(expr.contains("#c3")); // name
         assert!(expr.contains("#c2")); // age
