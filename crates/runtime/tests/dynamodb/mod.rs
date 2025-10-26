@@ -264,7 +264,7 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{}", table_name),
+                    &format!("dynamodb:{table_name}"),
                     "test_dynamodb",
                 ))
                 .build();
