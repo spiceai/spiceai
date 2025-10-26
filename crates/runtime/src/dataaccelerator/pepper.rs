@@ -523,19 +523,21 @@ impl DataAccelerator for PepperAccelerator {
             // Get time_column from the source via the trait method
             let has_time_column = source.time_column().is_some();
 
-            // Validate: can have neither, one, but not both
+            // Validate: must have exactly one (not both, not neither)
             match (has_primary_key, has_time_column) {
                 (false, false) => {
-                    // No constraints - will append all data including duplicates
-                    tracing::info!(
-                        "Append mode for dataset '{}': no primary_key or time_column specified, will append all data including duplicates",
-                        source.name()
-                    );
+                    return Err(Box::new(Error::InvalidConfiguration {
+                        detail: Arc::from(
+                            "Append mode requires either primary_key or time_column to be specified. \
+                            Please add one of these to your dataset configuration.",
+                        ),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
                 (true, true) => {
                     return Err(Box::new(Error::InvalidConfiguration {
                         detail: Arc::from(
-                            "Append mode cannot have both primary_key and time_column specified. \
+                            "Append mode currently cannot have both primary_key and time_column specified. \
                             Please specify only one of these in your dataset configuration.",
                         ),
                     })

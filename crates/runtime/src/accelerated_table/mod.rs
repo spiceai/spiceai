@@ -166,6 +166,11 @@ pub enum AcceleratedTableBuilderError {
     AppendStreamRequired,
 
     #[snafu(display(
+        "Append mode requires either `time_column` or `primary_key` to be specified in the dataset configuration. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+    ))]
+    NeitherTimeColumnNorPrimaryKey,
+
+    #[snafu(display(
         "A synchronized accelerated table requires full refresh mode. Set `refresh_mode` to 'full', and try again."
     ))]
     SynchronizedAcceleratedTableRequiresFullRefresh,
@@ -446,6 +451,11 @@ impl Builder {
                         self.accelerator.constraints().is_some_and(|constraints| {
                             !get_primary_keys_from_constraints(constraints, &schema).is_empty()
                         });
+
+                    // For Pepper tables, require either time_column or primary_key
+                    if is_pepper && !has_primary_key {
+                        return NeitherTimeColumnNorPrimaryKeySnafu.fail();
+                    }
 
                     if is_pepper || has_primary_key {
                         // Use append mode with primary key (e.g., Pepper) or for Pepper tables
