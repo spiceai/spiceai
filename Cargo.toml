@@ -265,8 +265,9 @@ datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "a
 datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "a10e8274a8d2705d349ef8ab9ae31b308405574d" }                               # spiceai/spiceai-49
 datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "a10e8274a8d2705d349ef8ab9ae31b308405574d" }                                    # spiceai/spiceai-49
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "a10e8274a8d2705d349ef8ab9ae31b308405574d" }                                    # spiceai/spiceai-49
-datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "a10e8274a8d2705d349ef8ab9ae31b308405574d" }                                        # spiceai/spiceai-49
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "50e8a479bcf35ec991753144864617efca0a4038" } # spiceai
+datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "a10e8274a8d2705d349ef8ab9ae31b308405574d" }
+                                        # spiceai/spiceai-49
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8a1e01040b6ef950031132e0d7fe29f2709db3b1" } # spiceai
 
 ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "8f3bd4f034c33ed86ab3d50d81038026ab9c4dd6"}                                      # spiceai/spiceai-49
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "8f3bd4f034c33ed86ab3d50d81038026ab9c4dd6"}                                 # spiceai/spiceai-49
