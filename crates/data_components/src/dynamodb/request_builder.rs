@@ -1,11 +1,11 @@
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, UserDefinedLogicalNode};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use derive_builder::Builder;
 use std::collections::HashMap;
-use datafusion::common::ScalarValue;
 
 #[derive(Clone, Debug)]
 pub enum DynamoDBRequestPlan {
@@ -106,8 +106,8 @@ impl DynamoDBRequestPlanBuilder {
         let mut query_params =
             QueryParamsBuilder::default().table_name(self.schema.table_name().to_string());
 
-        let (key_condition, mut key_values) = self
-            .build_key_condition_expression(partition_expr, sort_expr)?;
+        let (key_condition, mut key_values) =
+            self.build_key_condition_expression(partition_expr, sort_expr)?;
 
         query_params = query_params.key_condition_expression(key_condition);
 
@@ -282,9 +282,10 @@ impl DynamoDBRequestPlanBuilder {
 
                 Ok(format!("({left_str} {op_str} {right_str})"))
             }
-            Expr::Column(col) => self.schema
+            Expr::Column(col) => self
+                .schema
                 .get_column_alias(col.name())
-                .map(|alias| alias.to_string())
+                .map(std::string::ToString::to_string)
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!("Column {} not found", col.name))
                 }),
@@ -311,8 +312,8 @@ impl DynamoDBRequestPlanBuilder {
 
         if let Some((partition, sort, other)) = try_match_index(
             filters,
-            &self.schema.partition_key(),
-            self.schema.sort_key().as_deref(),
+            self.schema.partition_key(),
+            self.schema.sort_key(),
         ) {
             return (Some((partition, sort)), other);
         }
