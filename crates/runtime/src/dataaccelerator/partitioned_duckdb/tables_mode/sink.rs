@@ -24,6 +24,7 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{DisplayAs, DisplayFormatType, metrics::MetricsSet},
 };
+use datafusion_table_providers::duckdb::write::execute_analyze_sql;
 use datafusion_table_providers::duckdb::{
     DuckDB, RelationName, TableDefinition, TableManager, ViewCreator,
 };
@@ -378,6 +379,8 @@ fn insert_overwrite(
                     .map_err(to_retriable_data_write_error)
             })?;
 
+        execute_analyze_sql(&tx, &new_table.table_name().to_string());
+
         // partition still exists so should NOT be deleted
         candidates_to_drop.remove(&new_table.definition_name().to_string());
     }
@@ -454,6 +457,10 @@ fn insert_append(
         false,
     )
     .map_err(to_retriable_data_write_error)?;
+
+    for table in &tables {
+        execute_analyze_sql(&tx, &table.table_name().to_string());
+    }
 
     on_commit_transaction
         .try_recv()
