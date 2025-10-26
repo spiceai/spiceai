@@ -307,8 +307,8 @@ impl SpanExporter for TaskHistoryExporter {
             // Filter spans that need plan capture before cloning
             let should_capture_plan = |span: &TaskSpan| {
                 // Check min_plan_duration threshold
-                if let Some(min_duration) = min_plan_duration_ms
-                    && span.execution_duration_ms < min_duration
+                if !min_plan_duration_ms
+                    .is_none_or(|min_duration| span.execution_duration_ms >= min_duration)
                 {
                     return false;
                 }
@@ -349,35 +349,30 @@ impl SpanExporter for TaskHistoryExporter {
                     .await;
                 });
 
-                // Monitor the spawned task for failures without blocking
-                tokio::spawn(async move {
-                    match handle.await {
-                        Ok(()) => {
-                            tracing::trace!(
-                                "Plan capture completed successfully for {num_spans} queries"
-                            );
-                        }
-                        Err(e) if e.is_panic() => {
-                            tracing::error!(
-                                "Failed to capture query plans: internal error occurred. \
-                                Query plan capture has been disabled for affected queries. \
-                                Consider disabling plan capture in the spicepod if this error persists."
-                            );
-                            tracing::debug!("Plan capture panic details: {e}");
-                        }
-                        Err(e) if e.is_cancelled() => {
-                            tracing::debug!(
-                                "Query plan capture was cancelled (runtime shutting down)"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to capture query plans: {e}. \
-                                Query plan capture will be retried on subsequent queries."
-                            );
-                        }
+                match handle.await {
+                    Ok(()) => {
+                        tracing::trace!(
+                            "Plan capture completed successfully for {num_spans} queries"
+                        );
                     }
-                });
+                    Err(e) if e.is_panic() => {
+                        tracing::error!(
+                            "Failed to capture query plans: internal error occurred. \
+                            Query plan capture has been disabled for affected queries. \
+                            Consider disabling plan capture in the spicepod if this error persists."
+                        );
+                        tracing::debug!("Plan capture panic details: {e}");
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        tracing::debug!("Query plan capture was cancelled (runtime shutting down)");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to capture query plans: {e}. \
+                            Query plan capture will be retried on subsequent queries."
+                        );
+                    }
+                }
             }
 
             Ok(())
