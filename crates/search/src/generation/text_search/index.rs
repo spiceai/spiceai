@@ -468,6 +468,7 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use runtime_datafusion_index::Index;
 
+    /// Create a basic [`MemTable`] with fields: `id`, `content`.
     fn create_test_table() -> Arc<dyn TableProvider> {
         let batch = record_batch!(
             ("id", Int32, [1, 2, 3]),
@@ -485,6 +486,9 @@ mod tests {
         )
     }
 
+    /// Returns a [`RecordBatch`] where the fields are sorted into alphabetical order.
+    ///
+    /// An error is returned only if [`RecordBatch::try_new`] returns an error (which it should not).
     fn sort_columns_alphabetically(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
         let mut fields_with_indices: Vec<(usize, Field)> = batch
             .schema()
