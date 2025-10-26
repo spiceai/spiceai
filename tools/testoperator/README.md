@@ -4,6 +4,8 @@
 
 `testoperator` is a command-line tool for running and exporting Spicepod environments for testing purposes.
 
+While a test is executing, `testoperator` continuously probes the `/health` and `/v1/ready` endpoints on the running `spiced` instance. Responses that fail or take longer than 5 ms are recorded and surfaced after the test run; any such issues will cause the test to fail with a summary that includes the number of failures and the worst latency observed.
+
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
