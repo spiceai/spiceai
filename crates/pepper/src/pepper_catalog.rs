@@ -643,11 +643,11 @@ impl MetadataCatalog for PepperCatalog {
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            Ok::<_, rusqlite::Error>(delete_files)
+            Ok::<_, CatalogError>(delete_files)
         })
         .await?;
 
-        Ok(blocking_result?)
+        blocking_result
     }
 
     async fn get_table_stats(&self, _table_id: i64) -> CatalogResult<TableStats> {

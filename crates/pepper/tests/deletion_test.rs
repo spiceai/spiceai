@@ -57,6 +57,7 @@ async fn test_delete_with_primary_key() -> Result<(), Box<dyn std::error::Error>
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
@@ -197,6 +198,7 @@ async fn test_delete_without_primary_key() -> Result<(), Box<dyn std::error::Err
         schema: Arc::clone(&schema),
         primary_key: vec![], // NO primary key
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
@@ -298,6 +300,7 @@ async fn test_delete_all_rows() -> Result<(), Box<dyn std::error::Error>> {
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
@@ -376,6 +379,7 @@ async fn test_delete_then_insert() -> Result<(), Box<dyn std::error::Error>> {
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
@@ -482,6 +486,7 @@ async fn test_delete_with_complex_filter() -> Result<(), Box<dyn std::error::Err
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;

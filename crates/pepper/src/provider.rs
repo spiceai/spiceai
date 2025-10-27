@@ -166,10 +166,13 @@ impl futures::Stream for DeletionFilterStream {
                 std::task::Poll::Ready(Some(Ok(batch))) => {
                     let current_offset = self.global_row_offset;
                     let batch_size = batch.num_rows();
+
+                    // Validate batch size upfront to avoid redundant error handling in hot path
                     let batch_size_i64 = match convert_to_i64(batch_size, "batch size") {
                         Ok(value) => value,
                         Err(err) => return std::task::Poll::Ready(Some(Err(err))),
                     };
+
                     self.global_row_offset =
                         match self.global_row_offset.checked_add(batch_size_i64) {
                             Some(value) => value,
@@ -190,10 +193,9 @@ impl futures::Stream for DeletionFilterStream {
                     // Find which rows in this batch should be kept
                     let mut keep_indices = Vec::new();
                     for row_idx in 0..batch_size {
-                        let row_offset = match convert_to_i64(row_idx, "row index") {
-                            Ok(value) => value,
-                            Err(err) => return std::task::Poll::Ready(Some(Err(err))),
-                        };
+                        // Convert once - we've already validated batch_size fits in i64
+                        let row_offset =
+                            i64::try_from(row_idx).expect("row_idx < batch_size which fits in i64");
                         let Some(global_row_id) = current_offset.checked_add(row_offset) else {
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::Execution(
@@ -202,11 +204,7 @@ impl futures::Stream for DeletionFilterStream {
                             )));
                         };
                         if !self.deleted_row_ids.contains(&global_row_id) {
-                            let keep_index = match convert_to_u64(row_idx, "row index") {
-                                Ok(value) => value,
-                                Err(err) => return std::task::Poll::Ready(Some(Err(err))),
-                            };
-                            keep_indices.push(keep_index);
+                            keep_indices.push(row_idx as u64);
                         }
                     }
 
@@ -750,7 +748,16 @@ impl PepperTableProvider {
 
         Ok(())
     }
+
     /// Read deletion vectors from files and return a set of deleted row IDs.
+    ///
+    /// # Blocking I/O Warning
+    ///
+    /// This function performs **blocking file system I/O** operations using `std::fs::File::open`
+    /// and must be called from within `tokio::task::spawn_blocking` to avoid blocking the async
+    /// runtime. The caller is responsible for offloading this to a blocking task context.
+    ///
+    /// See: Project coding guidelines on Async/Blocking Patterns
     fn read_deletion_vectors(
         delete_files: Vec<super::metadata::DeleteFile>,
     ) -> datafusion_common::Result<std::collections::HashSet<i64>> {
@@ -1164,42 +1171,68 @@ impl PepperDeletionSink {
         let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
         let batches = collect(scan_plan, ctx.task_ctx()).await?;
 
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&self.schema),
-            vec![batches.clone()],
-        )?;
-
-        ctx.register_table("temp_delete_table", Arc::new(mem_table))?;
-
-        let mut df = ctx.sql("SELECT * FROM temp_delete_table").await?;
-
-        for filter in &self.filters {
-            df = df.filter(filter.clone())?;
+        // If no data, nothing to delete
+        if batches.is_empty() {
+            return Ok(0);
         }
 
-        let matching_batches = df.collect().await?;
+        // Flatten all batches into one for simpler processing
+        let concatenated_batch = arrow::compute::concat_batches(&self.schema, &batches)?;
+        let total_rows = concatenated_batch.num_rows();
 
+        // Create a batch with row_id column added
+        use arrow::array::Array;
+        use arrow::datatypes::{DataType, Field};
+
+        let row_id_array = arrow::array::Int64Array::from_iter_values(
+            0..convert_to_i64_box(total_rows, "total rows")?,
+        );
+
+        let mut fields = vec![Field::new("__row_id", DataType::Int64, false)];
+        for field in self.schema.fields() {
+            fields.push((**field).clone());
+        }
+        let schema_with_rowid = Arc::new(arrow::datatypes::Schema::new(fields));
+
+        let mut columns_with_rowid = vec![Arc::new(row_id_array) as Arc<dyn Array>];
+        columns_with_rowid.extend_from_slice(concatenated_batch.columns());
+
+        let batch_with_rowid =
+            arrow::array::RecordBatch::try_new(Arc::clone(&schema_with_rowid), columns_with_rowid)?;
+
+        // Create a new session context with the row_id data
+        let ctx_new = SessionContext::new();
+        let mem_table_with_rowid = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema_with_rowid),
+            vec![vec![batch_with_rowid]],
+        )?;
+        ctx_new.register_table("data_with_rowid", Arc::new(mem_table_with_rowid))?;
+
+        // Start with selecting all columns so filters can reference them
+        let mut filtered_df = ctx_new.sql("SELECT * FROM data_with_rowid").await?;
+
+        // Apply all filters
+        for filter in &self.filters {
+            filtered_df = filtered_df.filter(filter.clone())?;
+        }
+
+        // Now select just the row IDs
+        let row_ids_df = filtered_df.select_columns(&["__row_id"])?;
+
+        // Collect the filtered row IDs
+        let filtered_rowid_batches = row_ids_df.collect().await?;
         let mut row_ids = Vec::new();
-        let mut current_row_id = 0i64;
 
-        for (batch_idx, batch) in batches.iter().enumerate() {
-            let batch_size = batch.num_rows();
-
-            if batch_idx < matching_batches.len() {
-                let matching_batch = &matching_batches[batch_idx];
-                for row_idx in 0..matching_batch.num_rows() {
-                    let row_offset = convert_to_i64_box(row_idx, "matching row index")?;
-                    let row_id = current_row_id
-                        .checked_add(row_offset)
-                        .ok_or_else(|| row_id_overflow_error("adding matching row offset"))?;
-                    row_ids.push(row_id);
+        use arrow::array::AsArray;
+        for batch in filtered_rowid_batches {
+            let row_id_column = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            for i in 0..row_id_column.len() {
+                if !row_id_column.is_null(i) {
+                    row_ids.push(row_id_column.value(i));
                 }
             }
-
-            let batch_size_i64 = convert_to_i64_box(batch_size, "batch size")?;
-            current_row_id = current_row_id
-                .checked_add(batch_size_i64)
-                .ok_or_else(|| row_id_overflow_error("advancing current row offset"))?;
         }
 
         let deleted_count = convert_to_u64_box(row_ids.len(), "deleted row count")?;
@@ -1211,7 +1244,7 @@ impl PepperDeletionSink {
         let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
             .join(&self.table_metadata.current_snapshot_id)
             .join("deletions")
-            .join(format!("delete_{}.arrow", uuid::Uuid::now_v7()));
+            .join(format!("delete_{}.vortex", uuid::Uuid::now_v7()));
 
         self.write_deletion_vector(row_ids, &deletion_vector_path)
             .await?;
@@ -1320,30 +1353,34 @@ impl DeletionSink for PepperDeletionSink {
     }
 }
 
+/// Generic conversion function that handles type conversion with proper error handling.
+///
+/// This consolidates all conversion logic (i64, u64, with different error wrappers)
+/// into a single generic implementation to reduce code duplication.
+fn try_convert<T, U>(value: T, context: &str) -> datafusion_common::Result<U>
+where
+    T: TryInto<U> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    U: std::fmt::Display,
+{
+    value.try_into().map_err(|err| {
+        datafusion_common::DataFusionError::Execution(format!(
+            "Failed to convert {context} value {value} to {}: {err}",
+            std::any::type_name::<U>()
+        ))
+    })
+}
+
+/// Convert to i64 with DataFusion error
 fn convert_to_i64<T>(value: T, context: &str) -> datafusion_common::Result<i64>
 where
     T: TryInto<i64> + Copy + std::fmt::Display,
     T::Error: std::error::Error + Send + Sync + 'static,
 {
-    value.try_into().map_err(|err| {
-        datafusion_common::DataFusionError::Execution(format!(
-            "Failed to convert {context} value {value} to i64: {err}"
-        ))
-    })
+    try_convert(value, context)
 }
 
-fn convert_to_u64<T>(value: T, context: &str) -> datafusion_common::Result<u64>
-where
-    T: TryInto<u64> + Copy + std::fmt::Display,
-    T::Error: std::error::Error + Send + Sync + 'static,
-{
-    value.try_into().map_err(|err| {
-        datafusion_common::DataFusionError::Execution(format!(
-            "Failed to convert {context} value {value} to u64: {err}"
-        ))
-    })
-}
-
+/// Convert to i64 with boxed error
 fn convert_to_i64_box<T>(
     value: T,
     context: &str,
@@ -1356,6 +1393,7 @@ where
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
 }
 
+/// Convert to u64 with boxed error
 fn convert_to_u64_box<T>(
     value: T,
     context: &str,
@@ -1364,14 +1402,8 @@ where
     T: TryInto<u64> + Copy + std::fmt::Display,
     T::Error: std::error::Error + Send + Sync + 'static,
 {
-    convert_to_u64(value, context)
+    try_convert::<T, u64>(value, context)
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
-}
-
-fn row_id_overflow_error(context: &str) -> Box<dyn std::error::Error + Send + Sync> {
-    let message = format!("Row ID overflow encountered while {context}");
-    let df_error = datafusion_common::DataFusionError::Execution(message);
-    Box::new(df_error)
 }
 
 #[cfg(test)]

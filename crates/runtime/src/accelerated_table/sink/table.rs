@@ -30,20 +30,11 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct TableSink {
     pub(super) table_provider: Arc<dyn TableProvider>,
-    pub(super) retention_sql: Option<String>,
 }
 
 impl TableSink {
     pub fn new(table_provider: Arc<dyn TableProvider>) -> Self {
-        Self {
-            table_provider,
-            retention_sql: None,
-        }
-    }
-
-    pub fn with_retention_sql(mut self, retention_sql: Option<String>) -> Self {
-        self.retention_sql = retention_sql;
-        self
+        Self { table_provider }
     }
 
     pub async fn insert_into(
@@ -75,22 +66,6 @@ impl TableSink {
 
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
             return Err(retry_from_df_error(e));
-        }
-
-        // If retention_sql is specified and this is an append operation with on_conflict, execute the retention SQL
-        if let (Some(retention_sql), InsertOp::Append) = (&self.retention_sql, overwrite) {
-            tracing::debug!("Executing retention SQL after insert: {}", retention_sql);
-
-            // For DuckDB, we need to execute the retention SQL directly on the connection
-            // Since we can't easily access the DuckDB connection from here, we'll need to
-            // execute it via the table provider or use a different approach
-            //
-            // TODO: This is a placeholder for the actual retention SQL execution
-            // The proper implementation would require access to the DuckDB connection
-            // to execute the retention SQL within the same transaction as the insert
-            tracing::warn!(
-                "retention_sql execution after insert is not yet fully implemented for append mode with on_conflict"
-            );
         }
 
         Ok(())
