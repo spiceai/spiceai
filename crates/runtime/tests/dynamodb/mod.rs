@@ -479,10 +479,7 @@ fn get_test_dataset(from: &str, name: &str) -> Dataset {
                 "dynamodb_aws_secret_access_key".to_string(),
                 "${ env:AWS_DYNAMODB_SECRET }".to_string(),
             ),
-            (
-                "unnest_depth".to_string(),
-                "1".to_string(),
-            ),
+            ("unnest_depth".to_string(), "1".to_string()),
         ]
         .into_iter()
         .collect(),
