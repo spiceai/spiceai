@@ -5,12 +5,12 @@ use std::ops::Range;
 use std::sync::{Arc, Weak};
 
 use arrow_schema::{ArrowError, Field, SchemaRef};
+use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
-use datafusion_physical_expr::schema_rewriter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::{PhysicalExprRef, split_conjunction};
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
@@ -264,7 +264,7 @@ mod tests {
     use datafusion::datasource::schema_adapter::DefaultSchemaAdapterFactory;
     use datafusion::logical_expr::{col, lit};
     use datafusion::physical_expr::planner::logical2physical;
-    use datafusion::physical_expr::schema_rewriter::DefaultPhysicalExprAdapterFactory;
+    use datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
     use datafusion::scalar::ScalarValue;
     use futures::stream::BoxStream;
     use itertools::Itertools;

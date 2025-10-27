@@ -85,22 +85,26 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "ec48de2
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
-aws-config = "1.8.5"
-aws-credential-types = "1.2"
-aws-runtime = "1.5.10"
-aws-sdk-bedrockruntime = "1.55.0"
-aws-sdk-cognitoidentity = "1.80.0"
-aws-sdk-cognitoidentityprovider = "1.92.0"
-aws-sdk-dynamodb = "1.84.0"
-aws-sdk-glue = "1.90.0"
-aws-sdk-s3 = "1.101.0"
-aws-sdk-s3vectors = "1.3"
-aws-sdk-secretsmanager = "1.76.0"
-aws-sdk-sts = "1.78.0"
-aws-smithy-runtime = "1.8.6"
-aws-smithy-runtime-api = "1.8.7"
-aws-smithy-types = "1.3"
+aws-config = "1.8.8"
+aws-credential-types = "1.2.8"
+aws-runtime = "1.5.12"
+aws-sdk-bedrockruntime = "1.109.0"
+aws-sdk-cognitoidentity = "1.87.0"
+aws-sdk-cognitoidentityprovider = "1.100.0"
+aws-sdk-dynamodb = "1.95.0"
+aws-sdk-glue = "1.124.0"
+aws-sdk-s3 = "1.108.0"
+aws-sdk-s3vectors = "1.11"
+aws-sdk-secretsmanager = "1.90.0"
+aws-sdk-sts = "1.88.0"
+aws-smithy-runtime = "1.9.3"
+aws-smithy-runtime-api = "1.9.1"
+aws-smithy-types = "1.3.3"
 axum = { version = "0.8", features = ["macros"] }
+ballista = "50.0.0"
+ballista-core = "50.0.0"
+ballista-executor = "50.0.0"
+ballista-scheduler = { version = "50.0.0" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -115,30 +119,26 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
     "tls",
 ] }
 datafusion = "50.3.0"
+datafusion-catalog = "50.3.0"
 datafusion-common = "50.3.0"
 datafusion-common-runtime = "50.3.0"
-datafusion-catalog = "50.3.0"
 datafusion-datasource = "50.3.0"
 datafusion-execution = "50.3.0"
-datafusion-pruning = "50.3.0"
-datafusion-physical-plan = "50.3.0"
-datafusion-physical-expr = "50.3.0"
-datafusion-physical-expr-common = "50.3.0"
 datafusion-expr = "50.3.0"
 datafusion-federation = { version = "0.4.10", features = ["sql"] }
 datafusion-functions = "50.3.0"
 datafusion-functions-json = "0.49"
+datafusion-physical-expr = "50.3.0"
+datafusion-physical-expr-common = "50.3.0"
+datafusion-physical-plan = "50.3.0"
 datafusion-proto = { version = "50.3.0", features = ["json"] }
+datafusion-pruning = "50.3.0"
 datafusion-table-providers = "0.1"
-delta_kernel = { version = "0.14", features = [
-    "default-engine",
-    "arrow-55",
+delta_kernel = { version = "0.16", features = [
+    "default-engine-rustls",
+    "arrow-56",
     "internal-api",
 ] }
-ballista = "49.0.0"
-ballista-core = "49.0.0"
-ballista-scheduler = { version = "49.0.0" }
-ballista-executor = "49.0.0"
 dotenvy = "0.15"
 duckdb = "1.3.2"
 fundu = "2.0.1"
@@ -180,7 +180,7 @@ opentelemetry_sdk = { version = "0.27", default-features = false, features = [
     "rt-tokio",
     "trace",
 ] }
-parquet = "55.2"
+parquet = "56.0.0"
 paste = "1.0.15"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
@@ -221,8 +221,12 @@ tokio-postgres = { version = "0.7.15", features = [
 tokio-rusqlite = "0.5.1"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
-tonic = { version = "0.12", features = ["gzip", "tls"] }
-tonic-health = { version = "0.12" }
+tonic = { version = "0.13", features = [
+    "gzip",
+    "tls-ring",
+    "tls-native-roots",
+] }
+tonic-health = { version = "0.13" }
 tower = "0.5.2"
 tower-http = { version = "0.6.2", features = ["cors"] }
 tracing = "0.1.41"
@@ -232,8 +236,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 twox-hash = "2.1.2"
 url = "2.5"
 uuid = "1"
-vortex = "0.52.1"
-vortex-utils = "0.52.1"
+vortex = "0.54.0"
+vortex-utils = "0.54.0"
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "b2652f2331f8f1879d944b11afd6575140b6c07e" }
@@ -269,10 +273,10 @@ datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                        # spiceai/spiceai-50
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "83696e02d04a2ed6bdcbc6d4f8dd46d5d5da3ab1" } # spiceai
 
-ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"}                                      # spiceai/spiceai-50
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"}                                 # spiceai/spiceai-50
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"}                            # spiceai/spiceai-50
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"}                             # spiceai/spiceai-50
+ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }           # spiceai/spiceai-50
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }      # spiceai/spiceai-50
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }  # spiceai/spiceai-50
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" } # spiceai/spiceai-50
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "549829b7f9e7b7b9abc117477d574e58f8004f8b" } # spiceai-0.16.0
 
@@ -284,11 +288,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "02d35badf8fbecfe8254171b53e5bc16cdbd4848" }              # spiceai-0.7.0
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "02d35badf8fbecfe8254171b53e5bc16cdbd4848" } # spiceai-0.7.0
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "02d35badf8fbecfe8254171b53e5bc16cdbd4848" } # spiceai-0.7.0
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "02d35badf8fbecfe8254171b53e5bc16cdbd4848" }   # spiceai-0.7.0
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "02d35badf8fbecfe8254171b53e5bc16cdbd4848" }   # spiceai-0.7.0
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "358ce0d7c5f3b3e058fb7acd49e258860e2b19df" }              # spiceai-0.7.0
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "358ce0d7c5f3b3e058fb7acd49e258860e2b19df" } # spiceai-0.7.0
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "358ce0d7c5f3b3e058fb7acd49e258860e2b19df" } # spiceai-0.7.0
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "358ce0d7c5f3b3e058fb7acd49e258860e2b19df" }   # spiceai-0.7.0
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "358ce0d7c5f3b3e058fb7acd49e258860e2b19df" }   # spiceai-0.7.0
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
@@ -314,18 +318,18 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }      # spiceai-56
 
-aws-config = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-config" }                                           #"1.8.2"
-aws-credential-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-credential-types" }                       #"1.2"
-aws-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-runtime" }                                         #"1.5.10"
-aws-sdk-bedrockruntime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-bedrockruntime" }                   #"1.55.0"
-aws-sdk-cognitoidentity = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-cognitoidentity" }                 #"1.80.0"
-aws-sdk-cognitoidentityprovider = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-cognitoidentityprovider" } #"1.92.0"
-aws-sdk-dynamodb = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-dynamodb" }                               #"1.84.0"
-aws-sdk-glue = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-glue" }                                       #"1.90.0"
-aws-sdk-s3 = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-s3" }                                           # "1.101.0"
-aws-sdk-s3vectors = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-s3vectors" }                             # "1.3"
-aws-sdk-secretsmanager = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-secretsmanager" }                   #"1.76.0"
-aws-sdk-sts = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-sts" }                                         #"1.78.0"
-aws-smithy-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-runtime" }                           #"1.8.6"
-aws-smithy-runtime-api = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-runtime-api" }                   #"1.8.7"
-aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-types" }                               # "1.3"
+aws-config = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-config" }                                           # pinned from release-2025-10-08
+aws-credential-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-credential-types" }                       # pinned from release-2025-10-08
+aws-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-runtime" }                                         # pinned from release-2025-10-08
+aws-sdk-bedrockruntime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-bedrockruntime" }                   # pinned from release-2025-10-08
+aws-sdk-cognitoidentity = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-cognitoidentity" }                 # pinned from release-2025-10-08
+aws-sdk-cognitoidentityprovider = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-cognitoidentityprovider" } # pinned from release-2025-10-08
+aws-sdk-dynamodb = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-dynamodb" }                               # pinned from release-2025-10-08
+aws-sdk-glue = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-glue" }                                       # pinned from release-2025-10-08
+aws-sdk-s3 = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-s3" }                                           # pinned from release-2025-10-08
+aws-sdk-s3vectors = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-s3vectors" }                             # pinned from release-2025-10-08
+aws-sdk-secretsmanager = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-secretsmanager" }                   # pinned from release-2025-10-08
+aws-sdk-sts = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-sts" }                                         # pinned from release-2025-10-08
+aws-smithy-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-runtime" }                           # pinned from release-2025-10-08
+aws-smithy-runtime-api = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-runtime-api" }                   # pinned from release-2025-10-08
+aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-types" }                               # pinned from release-2025-10-08
