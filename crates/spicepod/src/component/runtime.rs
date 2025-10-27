@@ -200,6 +200,10 @@ pub struct TaskHistory {
     pub retention_check_interval: Arc<str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_sql_duration: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_plan: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_plan_duration: Option<Arc<str>>,
 }
 
 fn default_none() -> Arc<str> {
@@ -222,6 +226,8 @@ impl Default for TaskHistory {
             retention_period: default_retention_period(),
             retention_check_interval: default_retention_check_interval(),
             min_sql_duration: None,
+            captured_plan: None,
+            min_plan_duration: None,
         }
     }
 }
@@ -231,6 +237,14 @@ pub enum TaskHistoryCapturedOutput {
     #[default]
     None,
     Truncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum TaskHistoryCapturedPlan {
+    #[default]
+    None,
+    Explain,
+    ExplainAnalyze,
 }
 
 impl TaskHistory {
@@ -248,6 +262,24 @@ impl TaskHistory {
             self.captured_output
         )
         .into())
+    }
+
+    pub fn get_captured_plan(
+        &self,
+    ) -> Result<TaskHistoryCapturedPlan, Box<dyn Error + Send + Sync>> {
+        let Some(captured_plan) = &self.captured_plan else {
+            return Ok(TaskHistoryCapturedPlan::None);
+        };
+
+        match captured_plan.to_lowercase().as_str() {
+            "none" => Ok(TaskHistoryCapturedPlan::None),
+            "explain" => Ok(TaskHistoryCapturedPlan::Explain),
+            "explain analyze" => Ok(TaskHistoryCapturedPlan::ExplainAnalyze),
+            _ => Err(format!(
+                r#"Expected "none", "explain", or "explain analyze" for "captured_plan", but got: "{captured_plan}""#
+            )
+            .into()),
+        }
     }
 
     fn retention_value_as_secs(
@@ -285,6 +317,22 @@ impl TaskHistory {
 
         let duration =
             fundu::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
+
+        Ok(Some(duration.as_secs_f64() * 1000.0))
+    }
+
+    /// Parses the `min_plan_duration` field into milliseconds as f64. Returns `Ok(None)` if not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the duration string cannot be parsed.
+    pub fn min_plan_duration_as_millis(&self) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+        let Some(min_plan_duration) = &self.min_plan_duration else {
+            return Ok(None);
+        };
+
+        let duration =
+            fundu::parse_duration(min_plan_duration.as_ref()).map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -752,6 +800,8 @@ mod tests {
                 retention_period: "8h".into(),
                 retention_check_interval: "15m".into(),
                 min_sql_duration: Some(duration_str.into()),
+                captured_plan: None,
+                min_plan_duration: None,
             };
 
             let result = task_history
@@ -771,6 +821,8 @@ mod tests {
             retention_period: "8h".into(),
             retention_check_interval: "15m".into(),
             min_sql_duration: Some("invalid".into()),
+            captured_plan: None,
+            min_plan_duration: None,
         };
         assert!(
             task_history.min_sql_duration_as_millis().is_err(),
@@ -806,5 +858,183 @@ mod tests {
         ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, None);
+    }
+
+    #[test]
+    fn test_task_history_captured_plan() {
+        // Test default (None)
+        let task_history = TaskHistory::default();
+        assert_eq!(task_history.captured_plan, None);
+        assert_eq!(
+            task_history
+                .get_captured_plan()
+                .expect("should parse successfully"),
+            TaskHistoryCapturedPlan::None
+        );
+
+        // Test "none"
+        let task_history = TaskHistory {
+            enabled: true,
+            captured_output: "none".into(),
+            retention_period: "8h".into(),
+            retention_check_interval: "15m".into(),
+            min_sql_duration: None,
+            captured_plan: Some("none".into()),
+            min_plan_duration: None,
+        };
+        assert_eq!(
+            task_history.get_captured_plan().expect("should parse"),
+            TaskHistoryCapturedPlan::None
+        );
+
+        // Test "explain"
+        let task_history = TaskHistory {
+            enabled: true,
+            captured_output: "none".into(),
+            retention_period: "8h".into(),
+            retention_check_interval: "15m".into(),
+            min_sql_duration: None,
+            captured_plan: Some("explain".into()),
+            min_plan_duration: None,
+        };
+        assert_eq!(
+            task_history.get_captured_plan().expect("should parse"),
+            TaskHistoryCapturedPlan::Explain
+        );
+
+        // Test "explain analyze"
+        let task_history = TaskHistory {
+            enabled: true,
+            captured_output: "none".into(),
+            retention_period: "8h".into(),
+            retention_check_interval: "15m".into(),
+            min_sql_duration: None,
+            captured_plan: Some("explain analyze".into()),
+            min_plan_duration: None,
+        };
+        assert_eq!(
+            task_history.get_captured_plan().expect("should parse"),
+            TaskHistoryCapturedPlan::ExplainAnalyze
+        );
+
+        // Test invalid value
+        let task_history = TaskHistory {
+            enabled: true,
+            captured_output: "none".into(),
+            retention_period: "8h".into(),
+            retention_check_interval: "15m".into(),
+            min_sql_duration: None,
+            captured_plan: Some("invalid".into()),
+            min_plan_duration: None,
+        };
+        assert!(
+            task_history.get_captured_plan().is_err(),
+            "should fail for invalid captured_plan"
+        );
+    }
+
+    #[test]
+    fn test_task_history_min_plan_duration() {
+        // Test default (None)
+        let task_history = TaskHistory::default();
+        assert_eq!(task_history.min_plan_duration, None);
+        assert_eq!(
+            task_history
+                .min_plan_duration_as_millis()
+                .expect("should parse successfully"),
+            None
+        );
+
+        // Test with various duration formats
+        let test_cases = vec![
+            ("5ms", 5.0),
+            ("100ms", 100.0),
+            ("1s", 1000.0),
+            ("2.5s", 2500.0),
+            ("1m", 60_000.0),
+        ];
+
+        for (duration_str, expected_ms) in test_cases {
+            let task_history = TaskHistory {
+                enabled: true,
+                captured_output: "none".into(),
+                retention_period: "8h".into(),
+                retention_check_interval: "15m".into(),
+                min_sql_duration: None,
+                captured_plan: Some("explain".into()),
+                min_plan_duration: Some(duration_str.into()),
+            };
+
+            let result = task_history
+                .min_plan_duration_as_millis()
+                .expect("should parse successfully");
+            assert_eq!(
+                result,
+                Some(expected_ms),
+                "Failed for duration: {duration_str}"
+            );
+        }
+
+        // Test invalid duration
+        let task_history = TaskHistory {
+            enabled: true,
+            captured_output: "none".into(),
+            retention_period: "8h".into(),
+            retention_check_interval: "15m".into(),
+            min_sql_duration: None,
+            captured_plan: Some("explain".into()),
+            min_plan_duration: Some("invalid".into()),
+        };
+        assert!(
+            task_history.min_plan_duration_as_millis().is_err(),
+            "should fail for invalid duration"
+        );
+    }
+
+    #[test]
+    fn test_task_history_yaml_parsing_with_plan() {
+        // Test with captured_plan and min_plan_duration
+        let yaml = r"
+            task_history:
+                enabled: true
+                captured_plan: explain analyze
+                min_plan_duration: 100ms
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.task_history.captured_plan,
+            Some("explain analyze".into())
+        );
+        assert_eq!(runtime.task_history.min_plan_duration, Some("100ms".into()));
+        assert_eq!(
+            runtime
+                .task_history
+                .get_captured_plan()
+                .expect("should parse"),
+            TaskHistoryCapturedPlan::ExplainAnalyze
+        );
+        assert_eq!(
+            runtime
+                .task_history
+                .min_plan_duration_as_millis()
+                .expect("should parse"),
+            Some(100.0)
+        );
+
+        // Test with all options
+        let yaml = r"
+            task_history:
+                enabled: true
+                captured_output: truncated
+                retention_period: 8h
+                retention_check_interval: 15m
+                min_sql_duration: 10ms
+                captured_plan: explain
+                min_plan_duration: 50ms
+        ";
+        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
+        assert_eq!(runtime.task_history.captured_plan, Some("explain".into()));
+        assert_eq!(runtime.task_history.min_plan_duration, Some("50ms".into()));
     }
 }

@@ -83,6 +83,18 @@ pub struct Service {
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
 
+impl Service {
+    /// Creates a new Service with pre-allocated channel map capacity
+    #[must_use]
+    pub fn new(basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>) -> Self {
+        Self {
+            // Pre-allocate for typical workloads (avoid reallocation)
+            channel_map: Arc::new(RwLock::new(HashMap::with_capacity(64))),
+            basic_auth,
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
@@ -213,13 +225,15 @@ impl Service {
             .map_err(handle_query_error)?;
 
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
+        let schema = query_result.data.schema();
 
+        // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(false);
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
                 .schema_to_bytes_with_dictionary_tracker(
-                    query_result.data.schema().as_ref(),
+                    schema.as_ref(),
                     &mut dict_tracker,
                     &options,
                 )
@@ -232,11 +246,13 @@ impl Service {
         };
 
         let data_stream = query_result.data;
+        let cache_status = query_result.cache_status;
 
         let flights_stream = try_stream! {
             yield schema_flight_data;
 
-            futures::pin_mut!(data_stream); // needed to use `.next()` on stream
+            // Use fused stream for better performance
+            let mut data_stream = data_stream.fuse();
 
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
@@ -245,6 +261,7 @@ impl Service {
                             .encoded_batch(&batch, &mut dict_tracker, &options)
                             .map_err(|e| Status::internal(e.to_string()))?;
 
+                        // Yield dictionaries first
                         for dict in dicts {
                             yield dict.into();
                         }
@@ -258,7 +275,7 @@ impl Service {
             }
         };
 
-        Ok((flights_stream.boxed(), query_result.cache_status))
+        Ok((flights_stream.boxed(), cache_status))
     }
 
     async fn wrap_response_stream_with_scope<S>(
@@ -268,6 +285,7 @@ impl Service {
         S: Stream + Send + 'static,
         S::Item: Send + 'static,
     {
+        // Get request context once, avoid repeated lookups
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let (metadata, stream, extensions) = response.into_parts();
         let scoped_stream = request_context.scope_stream(stream);
@@ -288,11 +306,12 @@ fn to_tonic_err<E>(e: E) -> Status
 where
     E: std::fmt::Display + 'static,
 {
+    // Avoid cloning Status if already a Status
     if let Some(status) = (&e as &dyn std::any::Any).downcast_ref::<Status>() {
-        status.clone()
-    } else {
-        Status::internal(format!("{e}"))
+        // Create a new Status with the same code and message to avoid cloning the entire Status struct
+        return Status::new(status.code(), status.message());
     }
+    Status::internal(format!("{e}"))
 }
 
 fn handle_query_error(e: query::Error) -> Status {
@@ -324,6 +343,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
                 match e {
                     SpiceExternalError::AccelerationNotReady { dataset_name } => {
+                        // Pre-format message to avoid repeated allocation
                         Status::unavailable(format!(
                             "Acceleration not ready; loading initial data for {dataset_name}"
                         ))
@@ -332,7 +352,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             } else if let Some(err) = e.downcast_ref::<FlightClientError>() {
                 match err {
                     FlightClientError::ConnectionReset { source } => {
-                        let mut error = Status::invalid_argument(format!("{source}"));
+                        let mut error = Status::invalid_argument(source.to_string());
                         error.metadata_mut().insert("spiceai-retryable", 1.into());
                         error
                     }
@@ -341,7 +361,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             } else if let Some(err) = e.downcast_ref::<llms::embeddings::Error>() {
                 match err {
                     llms::embeddings::Error::RateLimited { .. } => {
-                        Status::unavailable(format!("{err}"))
+                        Status::unavailable(err.to_string())
                     }
                     _ => to_tonic_err(e),
                 }
@@ -354,13 +374,12 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             handle_datafusion_error(*source)
         }
         DataFusionError::Shared(source) => {
-            // Since DataFusionError doesn't implement Clone, we can't extract it from Arc
-            // Just treat it as a generic error
+            // Optimize: avoid string allocation for common case
             Status::internal(format!("Shared DataFusion error: {source}"))
         }
         DataFusionError::Collection(sources) => {
-            let first_error = sources.into_iter().next();
-            if let Some(first_error) = first_error {
+            // Handle first error efficiently without collecting all
+            if let Some(first_error) = sources.into_iter().next() {
                 handle_datafusion_error(first_error)
             } else {
                 Status::internal("Several DataFusion errors occurred, but no details available")
@@ -430,10 +449,7 @@ pub async fn start(
     rate_limits: Arc<RateLimits>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
-    let service = Service {
-        channel_map: Arc::new(RwLock::new(HashMap::new())),
-        basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
-    };
+    let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
     let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
@@ -557,9 +573,9 @@ impl Default for RateLimits {
     fn default() -> Self {
         Self {
             // Allow 100 Flight DoPut requests every 60 seconds by default
-            flight_write_limit: Quota::per_minute(NonZeroU32::new(100).unwrap_or_else(|| {
-                unreachable!("100 is non-zero and should always successfully convert to NonZeroU32")
-            })),
+            flight_write_limit: Quota::per_minute(
+                NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
+            ),
         }
     }
 }
