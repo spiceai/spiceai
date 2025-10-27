@@ -149,7 +149,7 @@ pub struct Args {
     pub tls_certificate_file: Option<String>,
 
     /// The TLS PEM-encoded private key.
-    #[arg(long, value_name = "-----BEGIN PRIVATE KEY-----...")]
+    #[arg(long)]
     pub tls_key: Option<String>,
 
     /// Path to the TLS PEM-encoded private key file.
