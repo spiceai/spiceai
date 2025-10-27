@@ -566,10 +566,7 @@ impl MetadataCatalog for PepperCatalog {
         let db_path_owned = self.db_path().to_string();
 
         let blocking_result = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open_with_flags(
-                &db_path_owned,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            )?;
+            let conn = Self::open_connection(&db_path_owned, false)?;
 
             // Begin transaction
             conn.execute("BEGIN TRANSACTION", [])?;
@@ -622,10 +619,7 @@ impl MetadataCatalog for PepperCatalog {
         let db_path_owned = self.db_path().to_string();
 
         let blocking_result = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open_with_flags(
-                &db_path_owned,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )?;
+            let conn = Self::open_connection(&db_path_owned, true)?;
 
             let mut stmt = conn.prepare(
                 "SELECT delete_file_id, table_id, data_file_id, path, path_is_relative, 
