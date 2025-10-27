@@ -433,34 +433,55 @@ impl Builder {
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
-                // If there is no time_column, check if the data connector supports streaming the append changes (i.e. Kafka Data Connector).
-                if self.refresh.time_column.is_none() {
-                    // Get the append stream
-                    let Some(append_stream) = self.append_stream else {
-                        return AppendStreamRequiredSnafu.fail();
-                    };
-                    (
-                        refresh::AccelerationRefreshMode::Changes(append_stream),
-                        None,
-                    )
-                } else {
-                    // Otherwise, append mode requires either time_column or primary_key
-                    let schema = self.accelerator.schema();
-                    let has_primary_key =
-                        self.accelerator.constraints().is_some_and(|constraints| {
-                            !get_primary_keys_from_constraints(constraints, &schema).is_empty()
-                        });
-
-                    if !has_primary_key {
-                        return NeitherTimeColumnNorPrimaryKeySnafu.fail();
+                enum AppendMode {
+                    TimeColumnOrPrimaryKey,
+                    ChangesStream,
+                }
+                impl AppendMode {
+                    fn try_new(
+                        has_time_column: bool,
+                        has_primary_key: bool,
+                        has_changes_stream: bool,
+                    ) -> AcceleratedTableBuilderResult<Self> {
+                        // If the data connector supports streaming the append changes (i.e. Kafka Data Connector), then prioritize that.
+                        if has_changes_stream {
+                            Ok(AppendMode::ChangesStream)
+                        } else if has_time_column || has_primary_key {
+                            Ok(AppendMode::TimeColumnOrPrimaryKey)
+                        } else {
+                            NeitherTimeColumnNorPrimaryKeySnafu.fail()
+                        }
                     }
+                }
 
-                    let (start_refresh, on_start_refresh) =
-                        mpsc::channel::<Option<RefreshOverrides>>(1);
-                    (
-                        refresh::AccelerationRefreshMode::Append(on_start_refresh),
-                        Some(start_refresh),
-                    )
+                let schema = self.accelerator.schema();
+                let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
+                    !get_primary_keys_from_constraints(constraints, &schema).is_empty()
+                });
+                let has_time_column = self.refresh.time_column.is_some();
+                let has_changes_stream = self.changes_stream.is_some();
+
+                let append_mode =
+                    AppendMode::try_new(has_time_column, has_primary_key, has_changes_stream)?;
+
+                match append_mode {
+                    AppendMode::ChangesStream => {
+                        let Some(append_stream) = self.append_stream else {
+                            return AppendStreamRequiredSnafu.fail();
+                        };
+                        (
+                            refresh::AccelerationRefreshMode::Changes(append_stream),
+                            None,
+                        )
+                    }
+                    AppendMode::TimeColumnOrPrimaryKey => {
+                        let (start_refresh, on_start_refresh) =
+                            mpsc::channel::<Option<RefreshOverrides>>(1);
+                        (
+                            refresh::AccelerationRefreshMode::Append(on_start_refresh),
+                            Some(start_refresh),
+                        )
+                    }
                 }
             }
             RefreshMode::Full => {
