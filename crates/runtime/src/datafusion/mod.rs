@@ -35,7 +35,6 @@ use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::Query;
-use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -79,6 +78,7 @@ use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
 use runtime_async::ManagedTokioRuntime;
+use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -99,7 +99,6 @@ pub mod builder;
 pub mod cluster;
 pub mod dialect;
 pub mod error;
-pub mod extension;
 pub mod filter_converter;
 pub mod managed_runtime;
 pub mod param_utils;

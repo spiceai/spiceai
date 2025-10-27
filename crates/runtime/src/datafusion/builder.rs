@@ -23,15 +23,12 @@ use std::{
 use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
-    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
-    schema::SpiceSchemaProvider,
 };
 #[cfg(feature = "cluster")]
 use crate::config::ClusterConfig;
-use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
+use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
-use datafusion::config::SpillCompression;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -48,9 +45,22 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::sql::federation_analyzer_rule;
-use datafusion_optimizer_rules::logical_plan::cache_invalidation::CacheInvalidationOptimizerRule;
-use datafusion_optimizer_rules::physical_plan::EmptyHashJoinExecPhysicalOptimization;
+use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
+use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_optimizer_rules::{
+    logical_plan::{
+        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+    },
+    physical_plan::EmptyHashJoinExecPhysicalOptimization,
+};
+use runtime_datafusion::{
+    extension::{
+        ExtensionPlanQueryPlanner,
+        bytes_processed::{BytesProcessedExtensionPlanner, BytesProcessedOptimizerRule},
+    },
+    schema_provider::SpiceSchemaProvider,
+};
+use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -222,8 +232,7 @@ impl DataFusionBuilder {
             .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(
-                SpiceQueryPlanner::new()
-                    .with_extension_planners(SpiceQueryPlanner::default_extension_planners()),
+                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
             ))
             .with_runtime_env(runtime_env(
                 self.memory_limit,
@@ -431,6 +440,18 @@ pub(crate) fn runtime_env(
             unreachable!("Tests ensure this should never fail: {e}");
         }
     }
+}
+
+pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+    vec![
+        Arc::new(IndexTableScanExtensionPlanner::new()),
+        Arc::new(FederatedPlanner::new()),
+        Arc::new(BytesProcessedExtensionPlanner::new(
+            Box::new(track_bytes_processed),
+            cfg!(feature = "cluster"),
+        )),
+        Arc::new(CacheInvalidationExtensionPlanner::new()),
+    ]
 }
 
 #[cfg(test)]

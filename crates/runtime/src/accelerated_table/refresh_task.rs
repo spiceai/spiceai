@@ -30,6 +30,8 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
+use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedExtensionPlanner;
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
@@ -45,20 +47,20 @@ use util::{RetryError, retry};
 
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
-use crate::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
+use crate::metrics::telemetry::track_bytes_processed;
 use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
     datafusion::{filter_converter::TimestampFilterConvert, schema},
     dataupdate::{StreamingDataUpdate, UpdateType},
-    execution_plan::schema_cast::EnsureSchema,
     status,
 };
+use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use runtime_object_store::registry::default_runtime_env;
 
 use super::metrics;
@@ -827,7 +829,10 @@ impl RefreshTask {
             .with_default_features();
 
         let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
-            Arc::new(SpiceExtensionPlanner::new()),
+            Arc::new(BytesProcessedExtensionPlanner::new(
+                Box::new(track_bytes_processed),
+                cfg!(feature = "cluster"),
+            )),
             Arc::new(IndexTableScanExtensionPlanner::new()),
         ];
 
@@ -841,10 +846,10 @@ impl RefreshTask {
             extension_planners.push(Arc::new(FederatedPlanner::new()));
         }
 
-        let query_planner = SpiceQueryPlanner::new().with_extension_planners(extension_planners);
-
         let mut state = state_builder
-            .with_query_planner(Arc::new(query_planner))
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::from_extension_planners(extension_planners),
+            ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
