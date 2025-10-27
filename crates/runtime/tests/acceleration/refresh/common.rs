@@ -146,41 +146,6 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
     Ok(db_conn)
 }
 
-/// Initialize `PostgreSQL` with Unix timestamp (INT) to work around Vortex v0.52.1 bugs
-/// Workarounds:
-/// 1. Uses INT instead of TIMESTAMP to avoid timestamp `ExtMetadata` encoding mismatch
-/// 2. Uses NOT NULL to avoid nullable/non-nullable schema mismatch in Vortex
-pub(crate) async fn initialize_postgres_vortex_workaround(
-    port: usize,
-) -> Result<PostgresConnection, anyhow::Error> {
-    let pool = common::get_postgres_connection_pool(port, None).await?;
-
-    let db_conn = pool
-        .connect_direct()
-        .await
-        .map_err(|e| anyhow::anyhow!("Error connecting: {}", e))?;
-
-    execute_ps_sql(
-        &db_conn,
-        "
-                CREATE TABLE test_table (
-                    id INT NOT NULL PRIMARY KEY,
-                    created_at INT NOT NULL
-                )",
-    )
-    .await?;
-
-    execute_ps_sql(
-        &db_conn,
-        "INSERT INTO test_table (id, created_at) VALUES (1, 1)",
-    )
-    .await?;
-
-    execute_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
-
-    Ok(db_conn)
-}
-
 pub(crate) async fn start_test_runtime(
     port: usize,
     acceleration: Acceleration,

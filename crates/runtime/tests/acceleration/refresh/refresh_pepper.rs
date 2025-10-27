@@ -15,8 +15,7 @@ limitations under the License.
 */
 use crate::acceleration::refresh::common::{
     execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    initialize_postgres, initialize_postgres_vortex_workaround, refresh_table, start_test_runtime,
-    start_test_runtime_no_time_column,
+    initialize_postgres, refresh_table, start_test_runtime, start_test_runtime_no_time_column,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
@@ -188,8 +187,7 @@ async fn test_pepper_append_mode_requires_constraint() -> Result<(), anyhow::Err
             let err_msg = result.expect_err("Expected error").to_string();
             assert!(
                 err_msg.contains("primary_key") || err_msg.contains("time_column"),
-                "Error message should mention primary_key or time_column requirement, got: {}",
-                err_msg
+                "Error message should mention primary_key or time_column requirement, got: {err_msg}"
             );
 
             tracing::info!("✓ Validation correctly rejects append mode without constraints");
