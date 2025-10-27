@@ -297,9 +297,6 @@ pub struct PepperTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
-    /// Whether retention SQL is configured. When true, we apply deletion vectors during scans.
-    /// When false (for full/append refreshes without retention), we skip the overhead.
-    retention_enabled: bool,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -418,7 +415,6 @@ impl PepperTableProvider {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
-            retention_enabled: false, // Default to false, can be updated via with_retention_enabled()
         })
     }
 
@@ -434,24 +430,6 @@ impl PepperTableProvider {
         let _table_id = catalog.create_table(options.clone()).await?;
         Self::new(&options.table_name, catalog).await
     }
-
-    /// Enable retention-based deletion vector filtering during scans.
-    ///
-    /// When enabled, the table provider will load and apply deletion vectors
-    /// at scan time to filter out deleted rows. This should only be enabled
-    /// when `retention_sql` is configured, as it adds overhead.
-    #[must_use]
-    pub fn with_retention_enabled(mut self, enabled: bool) -> Self {
-        self.retention_enabled = enabled;
-        self
-    }
-
-    /// Check if retention-based deletion vector filtering is enabled.
-    #[must_use]
-    pub fn is_retention_enabled(&self) -> bool {
-        self.retention_enabled
-    }
-
     /// Get a reference to the catalog.
     ///
     /// This is useful for testing and advanced use cases that need direct catalog access.
