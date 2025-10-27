@@ -28,11 +28,13 @@ use http::{
 use object_store::{
     ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    client::SpawnedReqwestConnector,
     http::{HttpBuilder, HttpStore},
     path::Path,
 };
 use serde::Deserialize;
 use snafu::prelude::*;
+use tokio::runtime::Handle;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,6 +81,7 @@ impl GitHubRawObjectStore {
         repo: impl Display,
         rev: impl Display,
         token: Option<&str>,
+        io_runtime: Handle,
     ) -> Result<Self, Error> {
         let mut headers = HeaderMap::with_capacity(1);
         if let Some(token) = token {
@@ -93,6 +96,7 @@ impl GitHubRawObjectStore {
                 "https://raw.githubusercontent.com/{org}/{repo}/{rev}"
             ))
             .with_client_options(ClientOptions::default().with_default_headers(headers))
+            .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
             .build()
             .context(HttpBuilderFailedSnafu)?;
         Ok(Self {
@@ -286,8 +290,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_opts() {
-        let store = GitHubRawObjectStore::try_new("spiceai", "spiceai", "refs/heads/trunk", None)
-            .expect("failed to create store");
+        let store = GitHubRawObjectStore::try_new(
+            "spiceai",
+            "spiceai",
+            "refs/heads/trunk",
+            None,
+            Handle::current(),
+        )
+        .expect("failed to create store");
         let result = store
             .get_opts(&Path::from("README.md"), GetOptions::default())
             .await

@@ -19,6 +19,7 @@ use test_framework::{anyhow, rustls};
 
 mod args;
 mod commands;
+mod health;
 mod metrics;
 
 use args::{

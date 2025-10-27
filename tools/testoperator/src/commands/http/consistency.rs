@@ -17,6 +17,7 @@ limitations under the License.
 use crate::{
     args::HttpConsistencyTestArgs,
     commands::{get_app_and_start_request, util::Color},
+    health::HealthMonitor,
     with_color,
 };
 use std::{sync::Arc, time::Duration};
@@ -50,6 +51,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     let test = SpiceTest::new(
         app.name.clone(),
@@ -79,35 +81,46 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
         .iter()
         .map(|minute| (minute.median_duration_ms, minute.percentile_95_duration_ms))
         .unzip();
+    let mut failure_messages = Vec::new();
     if p50.len() >= 2 {
         let increase = *p50.last().ok_or(anyhow!("no p50 data"))? as f64 / p50[0] as f64;
 
         if increase > args.increase_threshold {
-            return Err(anyhow::anyhow!(with_color!(
+            failure_messages.push(with_color!(
                 Color::RedBold,
                 "p50 increase threshold exceeded: {} > {}",
                 increase,
                 args.increase_threshold
-            )));
+            ));
         }
     }
 
     if p95.len() >= 2 {
         let increase = *p95.last().ok_or(anyhow!("no p95 data"))? as f64 / p95[0] as f64;
         if increase > args.increase_threshold {
-            return Err(anyhow::anyhow!(with_color!(
+            failure_messages.push(with_color!(
                 Color::RedBold,
                 "p95 increase threshold exceeded: {} > {}",
                 increase,
                 args.increase_threshold
-            )));
+            ));
         }
+    }
+
+    let health_report = health_monitor.stop().await;
+    spiced_instance.stop()?;
+    let health_report = health_report?;
+
+    if let Some(message) = health_report.failure_message() {
+        failure_messages.push(message);
+    }
+    if !failure_messages.is_empty() {
+        return Err(anyhow::anyhow!(failure_messages.join("\n")));
     }
 
     println!(
         "{}",
         with_color!(Color::Green, "Consistency test completed!")
     );
-    spiced_instance.stop()?;
     Ok(())
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use app::App;
 use async_trait::async_trait;
 use datafusion_table_providers::UnsupportedTypeAction;
-use tokio::sync::RwLock;
+use tokio::{runtime::Handle, sync::RwLock};
 
 use crate::{
     Runtime, catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY, parameters::Parameters,
@@ -47,6 +47,7 @@ pub struct ConnectorParams {
     pub(crate) component: ConnectorComponent,
     pub(crate) app: Option<Arc<App>>,
     pub(crate) runtime: Option<Arc<Runtime>>,
+    pub(crate) io_runtime: Handle,
 }
 
 pub struct ConnectorParamsBuilder {
@@ -66,6 +67,7 @@ impl ConnectorParamsBuilder {
     pub async fn build(
         self,
         secrets: Arc<RwLock<Secrets>>,
+        io_runtime: Handle,
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
@@ -134,6 +136,7 @@ impl ConnectorParamsBuilder {
             component: self.component,
             app,
             runtime,
+            io_runtime,
         })
     }
 }

@@ -222,21 +222,27 @@ impl CatalogConnector for Databricks {
         let mode = self.params.get("mode").expose().ok();
         let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
             (
-                Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>,
+                Arc::new(DeltaTableFactory::new(
+                    params.to_secret_map(),
+                    runtime.tokio_io_runtime(),
+                )) as Arc<dyn Read>,
                 table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
             )
         } else {
-            let dataset_databricks =
-                match DatabricksDataConnector::new(params, runtime.token_provider_registry())
-                    .await
-                    .map_err(|source| super::Error::UnableToGetCatalogProvider {
-                        connector: "databricks".to_string(),
-                        source: source.into(),
-                        connector_component: ConnectorComponent::from(catalog),
-                    }) {
-                    Ok(dataset_databricks) => dataset_databricks,
-                    Err(e) => return Err(e),
-                };
+            let dataset_databricks = match DatabricksDataConnector::new(
+                params,
+                runtime.tokio_io_runtime(),
+                runtime.token_provider_registry(),
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            }) {
+                Ok(dataset_databricks) => dataset_databricks,
+                Err(e) => return Err(e),
+            };
 
             (
                 dataset_databricks.read_provider(),

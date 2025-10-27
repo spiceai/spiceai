@@ -83,3 +83,4 @@ name = "model2vec-rs"
 version = "0.1.3"
 expression = "MIT"
 license-files = []
+

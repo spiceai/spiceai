@@ -24,6 +24,7 @@ otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
+runtime-async = { path = "../../crates/runtime-async" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 rustls.workspace = true
 rustls-pemfile.workspace = true
@@ -41,7 +42,6 @@ tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util" }
-vortex = "0.52.1"
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
@@ -52,6 +52,7 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
+cluster = ["runtime/cluster"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -82,7 +83,8 @@ default = [
     "mongodb",
     "iceberg-write",
     "turso",
-    "vortex"
+    "vortex",
+    "pepper"
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -114,4 +116,5 @@ sqlite = ["runtime/sqlite"]
 turso = ["runtime/turso"]
 tpc-extension = ["dep:tpc-extension"]
 vortex = ["runtime/vortex"]
+pepper = ["runtime/pepper"]
 xxhash = ["runtime/xxhash"]

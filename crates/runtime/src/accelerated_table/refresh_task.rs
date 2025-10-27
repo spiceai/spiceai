@@ -34,7 +34,11 @@ use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
 use snafu::{OptionExt, ResultExt};
-use tokio::time::Instant;
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex, RwLock, Semaphore, oneshot},
+    time::Instant,
+};
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -43,6 +47,7 @@ use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
 use crate::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
 use crate::datafusion::is_spice_internal_dataset;
+use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::timing::MultiTimeMeasurement;
@@ -64,7 +69,6 @@ use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 use crate::component::dataset::TimeFormat;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
-use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
 use super::refresh::Refresh;
 use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
@@ -80,6 +84,9 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use runtime_request_context::{AsyncMarker, RequestContext};
+use spicepod::metric::Metrics;
+use std::collections::HashSet;
 
 mod changes;
 mod streaming_append;
@@ -102,6 +109,9 @@ pub struct RefreshTaskBuilder {
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
+    metrics: Option<Metrics>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl RefreshTaskBuilder {
@@ -112,6 +122,7 @@ impl RefreshTaskBuilder {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -122,6 +133,9 @@ impl RefreshTaskBuilder {
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
             disable_federation: false,
             semaphore: None,
+            metrics: None,
+            cpu_runtime: None,
+            io_runtime,
         }
     }
 
@@ -139,10 +153,23 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> RefreshTaskBuilder {
+        self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
+        self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
@@ -152,6 +179,17 @@ impl RefreshTaskBuilder {
             sink: self.sink,
             disable_federation: self.disable_federation,
             semaphore,
+            enabled_metrics: self
+                .metrics
+                .as_ref()
+                .map(spicepod::metric::Metrics::enabled_metrics)
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .cloned()
+                .collect(),
+            cpu_runtime: self.cpu_runtime,
+            io_runtime: self.io_runtime,
         }
     }
 }
@@ -167,6 +205,9 @@ pub struct RefreshTask {
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Arc<Semaphore>,
+    enabled_metrics: HashSet<String>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl RefreshTask {
@@ -177,6 +218,7 @@ impl RefreshTask {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
     ) -> RefreshTaskBuilder {
         RefreshTaskBuilder::new(
             runtime_status,
@@ -184,6 +226,7 @@ impl RefreshTask {
             federated,
             federated_source,
             accelerator,
+            io_runtime,
         )
     }
 
@@ -258,7 +301,26 @@ impl RefreshTask {
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
-        let max_timestamp_before_refresh_ms = self.get_max_timestamp_before_refresh(refresh).await;
+        // max_timestamp_before_refresh is needed if at least one of the following metrics is enabled:
+        //  * METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS
+        //  * METRIC_REFRESH_LAG_MS
+        // max_timestamp_after_refresh is needed if at least one of the following metrics is enabled:
+        //  * METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS
+        //  * METRIC_REFRESH_LAG_MS
+        //  * METRIC_INGESTION_LAG_MS
+        let (need_max_timestamp_before_refresh, need_max_timestamp_after_refresh) = (
+            self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
+                || self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS),
+            self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
+                || self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS)
+                || self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS),
+        );
+
+        let max_timestamp_before_refresh_ms = if need_max_timestamp_before_refresh {
+            self.get_max_timestamp_before_refresh(refresh).await
+        } else {
+            None
+        };
 
         let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
@@ -294,20 +356,27 @@ impl RefreshTask {
             }
         };
 
-        let source_name = format!(
-            "{} {}",
-            self.component_type(),
-            include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref())
-        );
         let (streaming_data_update, max_timestamp_after_refresh_ms) =
-            with_find_max_timestamp_in_stream(
-                streaming_data_update,
-                self.federated.schema(),
-                refresh.time_column.clone(),
-                refresh.time_format,
-                source_name,
-            )
-            .await;
+            if need_max_timestamp_after_refresh {
+                let source_name = format!(
+                    "{} {}",
+                    self.component_type(),
+                    include_source_to_table_name(
+                        &self.dataset_name,
+                        self.federated_source.as_deref()
+                    )
+                );
+                with_find_max_timestamp_in_stream(
+                    streaming_data_update,
+                    self.federated.schema(),
+                    refresh.time_column.clone(),
+                    refresh.time_format,
+                    source_name,
+                )
+                .await
+            } else {
+                (streaming_data_update, None)
+            };
 
         self.write_streaming_data_update(
             Some(start_time),
@@ -342,9 +411,11 @@ impl RefreshTask {
         Ok(())
     }
 
-    #[allow(unreachable_code, unused_variables)]
+    fn is_metric_enabled(&self, metric_name: &str) -> bool {
+        self.enabled_metrics.contains(metric_name)
+    }
+
     async fn get_max_timestamp_before_refresh(&self, refresh: &Refresh) -> Option<i64> {
-        return None;
         if refresh.time_column.is_some() {
             match self.timestamp_nanos_for_append_query(refresh).await {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
@@ -373,34 +444,48 @@ impl RefreshTask {
         max_timestamp_before_refresh_ms: Option<i64>,
         max_timestamp_after_refresh_ms: Option<Arc<Mutex<Option<i64>>>>,
     ) {
-        if let (Some(max_timestamp_before_refresh_ms), Some(max_timestamp_after_refresh_ms)) = (
-            max_timestamp_before_refresh_ms,
-            max_timestamp_after_refresh_ms,
-        ) {
-            let max_timestamp_after_refresh_ms = {
-                let guard = max_timestamp_after_refresh_ms.lock().await;
+        let max_timestamp_after_refresh_ms_value = match &max_timestamp_after_refresh_ms {
+            Some(arc_mutex) => {
+                let guard = arc_mutex.lock().await;
                 *guard
-            };
+            }
+            None => None,
+        };
 
-            if let Some(max_timestamp_after_refresh_ms) = max_timestamp_after_refresh_ms {
-                #[allow(clippy::cast_possible_truncation)]
-                let current_time_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
+        #[allow(clippy::cast_possible_truncation)]
+        let current_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
 
-                let refresh_lag_ms =
-                    max_timestamp_after_refresh_ms - max_timestamp_before_refresh_ms;
-                let ingestion_lag_ms = current_time_ms - max_timestamp_after_refresh_ms;
+        for label_set in dataset_metrics_label_sets {
+            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
+                && let Some(val) = max_timestamp_before_refresh_ms
+            {
+                metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS.record(val, label_set);
+            }
 
-                for label_set in dataset_metrics_label_sets {
-                    metrics::MAX_TIMESTAMP_BEFORE_REFRESH_MS
-                        .record(max_timestamp_before_refresh_ms, label_set);
-                    metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS
-                        .record(max_timestamp_after_refresh_ms, label_set);
-                    metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
-                    metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
-                }
+            if self.is_metric_enabled(metrics::METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
+                && let Some(val) = max_timestamp_after_refresh_ms_value
+            {
+                metrics::MAX_TIMESTAMP_AFTER_REFRESH_MS.record(val, label_set);
+            }
+
+            if self.is_metric_enabled(metrics::METRIC_REFRESH_LAG_MS)
+                && let (Some(before), Some(after)) = (
+                    max_timestamp_before_refresh_ms,
+                    max_timestamp_after_refresh_ms_value,
+                )
+            {
+                let refresh_lag_ms = after - before;
+                metrics::REFRESH_LAG_MS.record(refresh_lag_ms, label_set);
+            }
+
+            if self.is_metric_enabled(metrics::METRIC_INGESTION_LAG_MS)
+                && let Some(after) = max_timestamp_after_refresh_ms_value
+            {
+                let ingestion_lag_ms = current_time_ms - after;
+                metrics::INGESTION_LAG_MS.record(ingestion_lag_ms, label_set);
             }
         }
     }
@@ -646,9 +731,7 @@ impl RefreshTask {
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
 
-        let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
         let dataset_name = self.dataset_name.clone();
-
         let update_type = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -658,12 +741,78 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
         };
 
+        if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
+            let dataset_name_for_runtime = dataset_name.clone();
+            let filters_for_runtime = filters.clone();
+            let update_type_for_runtime = update_type.clone();
+            let provider_for_runtime = Arc::clone(&federated_provider);
+            let sql_for_runtime = refresh.sql.clone();
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+            let span = Span::current();
+
+            // Capture necessary state to create ctx inside the closure
+            let dataset_name_for_ctx = self.dataset_name.clone();
+            let accelerator_for_ctx = Arc::clone(&self.accelerator);
+            let disable_federation = self.disable_federation;
+            let io_runtime = self.io_runtime.clone();
+
+            let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+                cpu_runtime_handle,
+                request_context,
+                span,
+                async move {
+                    // Create ctx inside the managed runtime to avoid creating it twice
+                    let mut ctx = Self::create_refresh_df_context(
+                        Arc::clone(&provider_for_runtime),
+                        &dataset_name_for_ctx,
+                        &accelerator_for_ctx,
+                        disable_federation,
+                        io_runtime,
+                    )
+                    .await;
+
+                    let data = get_data(
+                        &mut ctx,
+                        dataset_name_for_runtime,
+                        provider_for_runtime,
+                        sql_for_runtime,
+                        filters_for_runtime,
+                    )
+                    .await
+                    .map_err(check_and_mark_retriable_error)?;
+                    Ok((update_type_for_runtime, data))
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                ManagedRuntimeError::Future(df_err) => retry_from_df_error(df_err),
+                ManagedRuntimeError::DriverTaskEnded => {
+                    retry_from_df_error(DataFusionError::Execution(
+                        "Refresh driver task ended unexpectedly".to_string(),
+                    ))
+                }
+            })?;
+
+            let (update_type, stream) = managed_stream.into_parts();
+            return Ok(StreamingDataUpdate::new(stream, update_type));
+        }
+
+        // Create ctx only in the fallback path (no managed runtime)
+        let mut ctx = Self::create_refresh_df_context(
+            Arc::clone(&federated_provider),
+            &self.dataset_name,
+            &self.accelerator,
+            self.disable_federation,
+            self.io_runtime.clone(),
+        )
+        .await;
+
         let get_data_result = get_data(
             &mut ctx,
-            dataset_name.clone(),
+            dataset_name,
             federated_provider,
             refresh.sql.clone(),
-            filters.clone(),
+            filters,
         )
         .await
         .map_err(check_and_mark_retriable_error);
@@ -694,10 +843,19 @@ impl RefreshTask {
         )
     }
 
-    fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
+    /// Static helper method to create a `DataFusion` context for refresh operations.
+    /// This is separated from `refresh_df_context` to allow it to be called from async closures
+    /// without requiring `self`, avoiding the need to create the context twice.
+    async fn create_refresh_df_context(
+        federated_provider: Arc<dyn TableProvider>,
+        dataset_name: &TableReference,
+        accelerator: &Arc<dyn TableProvider>,
+        disable_federation: bool,
+        io_runtime: Handle,
+    ) -> SessionContext {
         let state_builder = SessionStateBuilder::new()
             .with_config(get_df_default_config())
-            .with_runtime_env(default_runtime_env())
+            .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
 
         let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
@@ -708,7 +866,7 @@ impl RefreshTask {
         let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
 
         // If federation is disabled, disable the federation analyzer rule and don't include the federated planner.
-        if self.disable_federation {
+        if disable_federation {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(false);
         } else {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(true);
@@ -723,6 +881,10 @@ impl RefreshTask {
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
 
+        state
+            .config_mut()
+            .set_extension(RequestContext::current(AsyncMarker::new().await));
+
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");
         }
@@ -730,31 +892,31 @@ impl RefreshTask {
         let default_catalog = state.config_options().catalog.default_catalog.clone();
         let ctx = SessionContext::new_with_state(state);
 
-        match schema::ensure_schema_exists(&ctx, &default_catalog, &self.dataset_name) {
+        match schema::ensure_schema_exists(&ctx, &default_catalog, dataset_name) {
             Ok(()) => (),
             Err(_) => {
                 unreachable!("The default catalog should always exist");
             }
         }
 
-        if let Err(e) = ctx.register_table(self.dataset_name.clone(), federated_provider) {
+        if let Err(e) = ctx.register_table(dataset_name.clone(), federated_provider) {
             tracing::error!("Unable to register federated table: {e}");
         }
 
         let mut acc_dataset_name = String::with_capacity(
-            self.dataset_name.table().len() + self.dataset_name.schema().map_or(0, str::len),
+            dataset_name.table().len() + dataset_name.schema().map_or(0, str::len),
         );
 
-        if let Some(schema) = self.dataset_name.schema() {
+        if let Some(schema) = dataset_name.schema() {
             acc_dataset_name.push_str(schema);
         }
 
         acc_dataset_name.push_str("accelerated_");
-        acc_dataset_name.push_str(self.dataset_name.table());
+        acc_dataset_name.push_str(dataset_name.table());
 
         if let Err(e) = ctx.register_table(
             TableReference::parse_str(&acc_dataset_name),
-            Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))),
+            Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");
         }
@@ -778,7 +940,14 @@ impl RefreshTask {
 
         let existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
-            &self.refresh_df_context(Arc::clone(&federated_provider)),
+            &Self::create_refresh_df_context(
+                Arc::clone(&federated_provider),
+                &self.dataset_name,
+                &self.accelerator,
+                self.disable_federation,
+                self.io_runtime.clone(),
+            )
+            .await,
         )
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
@@ -814,7 +983,14 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> super::Result<Option<u128>> {
         let federated = self.federated.table_provider().await;
-        let ctx = self.refresh_df_context(federated);
+        let ctx = Self::create_refresh_df_context(
+            federated,
+            &self.dataset_name,
+            &self.accelerator,
+            self.disable_federation,
+            self.io_runtime.clone(),
+        )
+        .await;
 
         refresh
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())

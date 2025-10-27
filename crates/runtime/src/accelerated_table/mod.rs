@@ -21,6 +21,11 @@ use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, Zer
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
+use crate::execution_plan::TableScanParams;
+use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
+use crate::execution_plan::schema_cast::SchemaCastScanExec;
+use crate::execution_plan::slice::SliceExec;
+use crate::execution_plan::tee::TeeExec;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::SchemaRef;
@@ -45,15 +50,11 @@ use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
-
-use crate::execution_plan::TableScanParams;
-use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
-use crate::execution_plan::schema_cast::SchemaCastScanExec;
-use crate::execution_plan::slice::SliceExec;
-use crate::execution_plan::tee::TeeExec;
 
 pub mod federation;
 mod metrics;
@@ -245,6 +246,9 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    metrics: Option<Metrics>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl Builder {
@@ -255,6 +259,7 @@ impl Builder {
         federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -277,6 +282,9 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            metrics: None,
+            cpu_runtime: None,
+            io_runtime,
         }
     }
 
@@ -312,6 +320,16 @@ impl Builder {
 
     pub fn refresh_semaphore(&mut self, refresh_semaphore: Arc<Semaphore>) -> &mut Self {
         self.refresh_semaphore = Some(refresh_semaphore);
+        self
+    }
+
+    pub fn metrics(&mut self, metrics: Metrics) -> &mut Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn cpu_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
+        self.cpu_runtime = runtime;
         self
     }
 
@@ -454,6 +472,8 @@ impl Builder {
             Some(self.federated_source),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
+            self.cpu_runtime.clone(),
+            self.io_runtime.clone(),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -461,6 +481,7 @@ impl Builder {
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
         refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_metrics(self.metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
         }
@@ -483,6 +504,7 @@ impl Builder {
                 Arc::clone(&self.accelerator),
                 retention,
                 self.caching.clone(),
+                self.io_runtime.clone(),
             ));
             handlers.push(retention_check_handle);
         }
@@ -517,6 +539,7 @@ impl AcceleratedTable {
         federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
+        io_runtime: Handle,
     ) -> Builder {
         Builder::new(
             runtime_status,
@@ -525,6 +548,7 @@ impl AcceleratedTable {
             federated_source,
             accelerator,
             refresh,
+            io_runtime,
         )
     }
 

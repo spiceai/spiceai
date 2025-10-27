@@ -20,6 +20,9 @@ use std::sync::{Arc, Weak};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::metrics;
+use super::refresh_task_runner::RefreshTaskRunner;
+use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
@@ -39,15 +42,13 @@ use runtime_acceleration::snapshot::{
 };
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
+use tokio::runtime::Handle;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
-
-use super::metrics;
-use super::refresh_task_runner::RefreshTaskRunner;
-use super::synchronized_table::SynchronizedTable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -419,6 +420,7 @@ pub(crate) enum AccelerationRefreshMode {
 pub struct Refresher {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
+    metrics: Option<Metrics>,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
@@ -436,6 +438,8 @@ pub struct Refresher {
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     on_complete_notification: Option<Arc<Notify>>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -451,6 +455,7 @@ impl std::fmt::Debug for Refresher {
 }
 
 impl Refresher {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
@@ -458,6 +463,8 @@ impl Refresher {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        cpu_runtime: Option<Handle>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -477,6 +484,9 @@ impl Refresher {
             on_complete_notification: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            metrics: None,
+            cpu_runtime,
+            io_runtime,
         }
     }
 
@@ -517,6 +527,11 @@ impl Refresher {
 
     pub fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
         self.on_complete_notification = Some(on_complete_notification);
+        self
+    }
+
+    pub fn with_metrics(&mut self, metrics: Option<Metrics>) -> &mut Self {
+        self.metrics = metrics;
         self
     }
 
@@ -614,12 +629,17 @@ impl Refresher {
             self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
+            self.io_runtime.clone(),
         )
         .with_disable_federation(self.disable_federation);
 
         if let Some(semaphore) = &self.semaphore {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
         }
+
+        refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
+
+        refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -785,8 +805,11 @@ impl Refresher {
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
+                self.io_runtime.clone(),
             )
             .with_disable_federation(self.disable_federation)
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_metrics(self.metrics.clone())
             .build(),
         );
 
@@ -817,8 +840,11 @@ impl Refresher {
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
+                self.io_runtime.clone(),
             )
             .with_disable_federation(self.disable_federation)
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_metrics(self.metrics.clone())
             .build(),
         );
 
@@ -987,6 +1013,8 @@ mod tests {
             Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
+            None,
+            Handle::current(),
         );
 
         refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1195,6 +1223,8 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1349,6 +1379,8 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1553,6 +1585,8 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
