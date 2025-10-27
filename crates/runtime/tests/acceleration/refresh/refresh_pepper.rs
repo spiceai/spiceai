@@ -192,7 +192,7 @@ async fn test_pepper_append_mode_requires_constraint() -> Result<(), anyhow::Err
                 err_msg
             );
 
-            println!("✓ Validation correctly rejects append mode without constraints");
+            tracing::info!("✓ Validation correctly rejects append mode without constraints");
 
             running_container.remove().await?;
             Ok(())

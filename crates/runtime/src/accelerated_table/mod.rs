@@ -47,8 +47,6 @@ use datafusion::{
     logical_expr::Expr,
 };
 use opentelemetry::KeyValue;
-#[cfg(feature = "pepper")]
-use pepper::PepperTableProvider;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::SnapshotBehavior;
