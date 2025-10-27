@@ -189,12 +189,6 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             cmd.options.insert("open".to_string(), duckdb_file);
         }
 
-        if let Some(recompute_statistics_on_write) = cmd.options.remove("on_refresh_recompute_statistics") {
-            // Translate Spice parameter to DuckDB write setting
-            cmd.options
-                .insert("recompute_statistics_on_write".to_string(), recompute_statistics_on_write.to_string());
-        }
-
         let schema = Arc::new(cmd.schema.as_arrow().clone());
         let creator = Arc::new(
             DuckDBPartitionCreator::new(
