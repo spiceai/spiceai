@@ -388,9 +388,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         )
         .await
         {
-            Ok((_, 0, from_cache)) => {
-                println!("No results{}.", if from_cache { " (cached)" } else { "" });
-            }
             Ok((records, total_rows, from_cache)) => {
                 display_records(&records, start_time, total_rows, from_cache)?;
             }
@@ -519,6 +516,8 @@ fn display_records(
     let mut limited_records = Vec::new();
     let mut rows_collected = 0;
 
+    let elapsed = start_time.elapsed();
+
     for batch in records {
         if rows_collected >= 500 {
             break;
@@ -542,15 +541,26 @@ fn display_records(
         }
     };
 
-    println!("{pretty_batches}");
+    if total_rows > 0 {
+        println!("{pretty_batches}");
+    } else {
+        println!("No results.");
+    }
 
-    let elapsed = start_time.elapsed();
     if rows_collected == total_rows {
-        println!(
-            "\nTime: {} seconds. {rows_collected} rows{}.",
-            elapsed.as_secs_f64(),
-            if from_cache { " (cached)" } else { "" }
-        );
+        if total_rows == 0 {
+            println!(
+                "\nTime: {} seconds{}.",
+                elapsed.as_secs_f64(),
+                if from_cache { " (cached)" } else { "" }
+            );
+        } else {
+            println!(
+                "\nTime: {} seconds. {rows_collected} rows{}.",
+                elapsed.as_secs_f64(),
+                if from_cache { " (cached)" } else { "" }
+            );
+        }
     } else {
         println!(
             "\nTime: {} seconds. {rows_collected}/{total_rows} rows displayed{}.",
