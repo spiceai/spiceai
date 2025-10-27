@@ -277,6 +277,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_size").description(
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
+    ParameterSpec::runtime("on_refresh_recompute_statistics"),
 ];
 
 #[async_trait]
@@ -360,6 +361,16 @@ impl DataAccelerator for DuckDBAccelerator {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
+        }
+
+        if let Some(recompute_statistics_on_write) =
+            cmd.options.remove("on_refresh_recompute_statistics")
+        {
+            // Translate Spice parameter to DuckDB write setting
+            cmd.options.insert(
+                "recompute_statistics_on_write".to_string(),
+                recompute_statistics_on_write.to_string(),
+            );
         }
 
         // Modify the `cmd` by adding options to attach other databases
