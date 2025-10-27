@@ -241,6 +241,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
+- criterion 0.5.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/bheisler/criterion.rs
+
 - croner 3.0.0, MIT 
   <br/>https://github.com/hexagon/croner-rust
 
@@ -460,6 +463,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - notify 8.2.0, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
+- num_cpus 1.16.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/seanmonstar/num_cpus
+
 - object_store 0.12.3, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs-object-store
 
@@ -571,7 +577,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rdkafka 0.38.0, MIT 
   <br/>https://github.com/fede1024/rust-rdkafka
 
-- regex 1.11.3, Apache-2.0 OR MIT 
+- regex 1.12.2, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/regex
 
 - reqwest 0.12.23, Apache-2.0 OR MIT 
@@ -718,7 +724,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokio 1.47.1, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
-- tokio-postgres 0.7.14, Apache-2.0 OR MIT 
+- tokio-postgres 0.7.15, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-postgres/rust-postgres
 
 - tokio-rusqlite 0.5.1, MIT 
