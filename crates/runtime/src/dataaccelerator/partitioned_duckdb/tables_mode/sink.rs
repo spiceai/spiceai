@@ -313,10 +313,10 @@ impl DuckDBPartitionedDataSink {
         self
     }
 
-    /// Sets the write settings for controlling DuckDB write behavior.
+    /// Sets the write settings for controlling `DuckDB` write behavior.
     ///
     /// # Arguments
-    /// * `write_settings` - DuckDB write settings including ANALYZE control
+    /// * `write_settings` - `DuckDB` write settings including ANALYZE control
     #[must_use]
     pub fn with_write_settings(mut self, write_settings: DuckDBWriteSettings) -> Self {
         self.write_settings = write_settings;
