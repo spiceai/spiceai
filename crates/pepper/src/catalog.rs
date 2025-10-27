@@ -184,6 +184,13 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Rollback a transaction.
     async fn rollback_transaction(&self) -> CatalogResult<()>;
+
+    /// Shutdown the catalog, performing any necessary cleanup operations.
+    ///
+    /// For SQLite-based catalogs, this includes:
+    /// - Truncating WAL (Write-Ahead Log) if enabled
+    /// - Running PRAGMA optimize for query optimization
+    async fn shutdown(&self) -> CatalogResult<()>;
 }
 
 /// Factory trait for creating catalog instances.

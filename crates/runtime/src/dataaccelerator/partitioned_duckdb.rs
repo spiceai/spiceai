@@ -318,6 +318,11 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         self.base_accelerator.parameters()
     }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::debug!("Partitioned DuckDB accelerator shutdown: delegating to base accelerator");
+        self.base_accelerator.shutdown().await
+    }
 }
 
 #[derive(Debug)]

@@ -167,6 +167,15 @@ impl AcceleratorEngineRegistry {
 
     pub async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
+
+        // Call shutdown on each accelerator before clearing
+        for (engine, accelerator) in registry.iter() {
+            tracing::debug!("Shutting down {engine:?} accelerator");
+            if let Err(e) = accelerator.shutdown().await {
+                tracing::error!("Failed to shutdown {engine:?} accelerator: {e}");
+            }
+        }
+
         registry.clear();
     }
 
@@ -367,6 +376,20 @@ pub trait DataAccelerator: Send + Sync {
         } else {
             false
         }
+    }
+
+    /// Shutdown the accelerator, performing any necessary cleanup operations.
+    ///
+    /// This method is called automatically by the runtime during shutdown,
+    /// giving the accelerator an opportunity to:
+    /// - Truncate WAL files
+    /// - Run optimization/compaction
+    /// - Checkpoint data
+    /// - Close connections gracefully
+    ///
+    /// Default implementation does nothing.
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
     }
 }
 

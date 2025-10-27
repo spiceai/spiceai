@@ -834,6 +834,36 @@ impl MetadataCatalog for PepperCatalog {
         // Implementation would rollback SQLite transaction
         Ok(())
     }
+
+    async fn shutdown(&self) -> CatalogResult<()> {
+        let db_path_owned = self.db_path().to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path_owned)?;
+
+            // Check if WAL mode is enabled
+            let journal_mode: String =
+                conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+
+            if journal_mode.eq_ignore_ascii_case("wal") {
+                tracing::info!("Truncating Pepper catalog WAL log");
+                // Truncate the WAL log to persist changes and reduce file size
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+            }
+
+            // Run optimize to improve query performance for future connections
+            tracing::info!("Running optimize on Pepper catalog");
+            conn.execute("PRAGMA optimize", [])?;
+
+            Ok::<(), CatalogError>(())
+        })
+        .await
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: format!("Failed to join shutdown task: {e}"),
+        })??;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
