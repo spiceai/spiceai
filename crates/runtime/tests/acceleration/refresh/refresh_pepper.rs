@@ -190,7 +190,6 @@ async fn test_pepper_append_mode_requires_constraint() -> Result<(), anyhow::Err
                 "Error message should mention primary_key or time_column requirement, got: {err_msg}"
             );
             tracing::info!("✓ Validation correctly rejects append mode without constraints");
-            tracing::info!("✓ Validation correctly rejects append mode without constraints");
 
             running_container.remove().await?;
             Ok(())
