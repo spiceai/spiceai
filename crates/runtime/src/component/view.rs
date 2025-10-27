@@ -249,6 +249,14 @@ impl AccelerationSource for View {
     fn name(&self) -> &TableReference {
         &self.name
     }
+
+    fn time_column(&self) -> Option<&str> {
+        None
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ViewBuilder {

@@ -93,7 +93,6 @@ pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
 pub mod embeddings;
-pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;

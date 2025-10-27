@@ -17,7 +17,10 @@ limitations under the License.
 //! `SQLite` implementation of the metadata catalog for Pepper.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use super::metadata::{CreateTableOptions, DataFile, DeleteFile, TableMetadata, TableStats};
+use super::metadata::{
+    CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
+    TableStats,
+};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
@@ -83,7 +86,8 @@ impl PepperCatalog {
             path_is_relative BOOLEAN NOT NULL,
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
-            current_snapshot_id TEXT NOT NULL DEFAULT ''
+            current_snapshot_id TEXT NOT NULL DEFAULT '',
+            partition_column TEXT
         )
     ";
 
@@ -92,13 +96,15 @@ impl PepperCatalog {
         CREATE TABLE IF NOT EXISTS pepper_data_file (
             data_file_id BIGINT PRIMARY KEY,
             table_id BIGINT NOT NULL,
+            partition_id BIGINT,
             file_order BIGINT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             file_format TEXT NOT NULL,
             record_count BIGINT NOT NULL,
             file_size_bytes BIGINT NOT NULL,
-            row_id_start BIGINT NOT NULL
+            row_id_start BIGINT NOT NULL,
+            FOREIGN KEY(partition_id) REFERENCES pepper_partition(partition_id) ON DELETE SET NULL
         )
     ";
 
@@ -116,15 +122,31 @@ impl PepperCatalog {
         )
     ";
 
+    /// Schema for the `pepper_partition` table.
+    const PARTITION_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS pepper_partition (
+            partition_id BIGINT PRIMARY KEY,
+            table_id BIGINT NOT NULL,
+            partition_column TEXT NOT NULL,
+            partition_value TEXT NOT NULL,
+            path TEXT NOT NULL,
+            path_is_relative BOOLEAN NOT NULL,
+            record_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0,
+            UNIQUE(table_id, partition_value)
+        )
+    ";
+
     /// Initialize metadata tables.
     fn initialize_schema(conn: &rusqlite::Connection) -> CatalogResult<()> {
         // Create tables in a transaction
         conn.execute_batch(&format!(
-            "{}; {}; {}; {};",
+            "{}; {}; {}; {}; {};",
             Self::METADATA_TABLE_DDL,
             Self::TABLE_TABLE_DDL,
             Self::DATA_FILE_TABLE_DDL,
-            Self::DELETE_FILE_TABLE_DDL
+            Self::DELETE_FILE_TABLE_DDL,
+            Self::PARTITION_TABLE_DDL
         ))?;
 
         // Initialize metadata with next IDs if not exists
@@ -134,6 +156,10 @@ impl PepperCatalog {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO pepper_metadata (key, value) VALUES ('next_file_id', 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO pepper_metadata (key, value) VALUES ('next_partition_id', 1)",
             [],
         )?;
 
@@ -207,6 +233,8 @@ impl MetadataCatalog for PepperCatalog {
             })?)
         };
 
+        let partition_column = options.partition_column.clone();
+
         let blocking_result = tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open_with_flags(
                 &db_path_owned,
@@ -238,8 +266,8 @@ impl MetadataCatalog for PepperCatalog {
                 INSERT INTO pepper_table (
                     table_id, table_uuid,
                     table_name, path, path_is_relative, schema_json, primary_key_json,
-                    current_snapshot_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    current_snapshot_id, partition_column
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ",
                 rusqlite::params![
                     table_id,
@@ -250,6 +278,7 @@ impl MetadataCatalog for PepperCatalog {
                     schema_json,
                     primary_key_json,
                     initial_snapshot_id, // All tables start with an initial snapshot
+                    partition_column,
                 ],
             )?;
 
@@ -297,7 +326,7 @@ impl MetadataCatalog for PepperCatalog {
                 r"
                 SELECT table_id, table_uuid,
                        table_name, path, path_is_relative, schema_json, primary_key_json,
-                       current_snapshot_id
+                       current_snapshot_id, partition_column
                 FROM pepper_table
                 WHERE table_name = ?1
                 LIMIT 1
@@ -314,6 +343,7 @@ impl MetadataCatalog for PepperCatalog {
                     let schema_json: String = row.get(5)?;
                     let primary_key_json: Option<String> = row.get(6)?;
                     let current_snapshot_id: String = row.get(7)?;
+                    let partition_column: Option<String> = row.get(8)?;
 
                     // Deserialize schema using Arrow IPC format
                     let schema = {
@@ -347,6 +377,7 @@ impl MetadataCatalog for PepperCatalog {
                         schema,
                         primary_key,
                         current_snapshot_id,
+                        partition_column,
                     })
                 })
                 .map_err(|e| match e {
@@ -449,6 +480,239 @@ impl MetadataCatalog for PepperCatalog {
     async fn get_table_stats(&self, _table_id: i64) -> CatalogResult<TableStats> {
         // Implementation would aggregate stats from data and delete files
         Ok(TableStats::default())
+    }
+
+    async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64> {
+        let db_path_owned = self.db_path().to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            )?;
+
+            // Start transaction
+            conn.execute("BEGIN TRANSACTION", [])?;
+
+            // Get next partition ID
+            let next_partition_id: i64 = conn.query_row(
+                "SELECT value FROM pepper_metadata WHERE key = 'next_partition_id'",
+                [],
+                |row| row.get(0),
+            )?;
+
+            let partition_id = next_partition_id;
+
+            // Insert partition metadata
+            conn.execute(
+                r"
+                INSERT INTO pepper_partition (
+                    partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ",
+                rusqlite::params![
+                    partition_id,
+                    partition.table_id,
+                    partition.partition_column,
+                    partition.partition_value,
+                    partition.path,
+                    partition.path_is_relative,
+                    partition.record_count,
+                    partition.file_size_bytes,
+                ],
+            )?;
+
+            // Update next_partition_id in metadata
+            conn.execute(
+                "UPDATE pepper_metadata SET value = ?1 WHERE key = 'next_partition_id'",
+                [next_partition_id + 1],
+            )?;
+
+            // Commit transaction
+            conn.execute("COMMIT", [])?;
+
+            Ok::<i64, CatalogError>(partition_id)
+        })
+        .await?
+    }
+
+    async fn get_partitions(&self, table_id: i64) -> CatalogResult<Vec<PartitionMetadata>> {
+        let db_path_owned = self.db_path().to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+
+            let mut stmt = conn.prepare(
+                r"
+                SELECT partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                FROM pepper_partition
+                WHERE table_id = ?1
+                ORDER BY partition_id
+                ",
+            )?;
+
+            let partitions = stmt
+                .query_map([table_id], |row| {
+                    Ok(PartitionMetadata {
+                        partition_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        partition_column: row.get(2)?,
+                        partition_value: row.get(3)?,
+                        path: row.get(4)?,
+                        path_is_relative: row.get(5)?,
+                        record_count: row.get(6)?,
+                        file_size_bytes: row.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok::<Vec<PartitionMetadata>, CatalogError>(partitions)
+        })
+        .await?
+    }
+
+    async fn get_partition(
+        &self,
+        table_id: i64,
+        partition_value: &str,
+    ) -> CatalogResult<Option<PartitionMetadata>> {
+        let db_path_owned = self.db_path().to_string();
+        let partition_value_owned = partition_value.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+
+            let mut stmt = conn.prepare(
+                r"
+                SELECT partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                FROM pepper_partition
+                WHERE table_id = ?1 AND partition_value = ?2
+                LIMIT 1
+                ",
+            )?;
+
+            match stmt.query_row(rusqlite::params![table_id, partition_value_owned], |row| {
+                Ok(PartitionMetadata {
+                    partition_id: row.get(0)?,
+                    table_id: row.get(1)?,
+                    partition_column: row.get(2)?,
+                    partition_value: row.get(3)?,
+                    path: row.get(4)?,
+                    path_is_relative: row.get(5)?,
+                    record_count: row.get(6)?,
+                    file_size_bytes: row.get(7)?,
+                })
+            }) {
+                Ok(partition) => Ok(Some(partition)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(CatalogError::from(e)),
+            }
+        })
+        .await?
+    }
+
+    async fn update_partition_stats(
+        &self,
+        partition_id: i64,
+        record_count: i64,
+        file_size_bytes: i64,
+    ) -> CatalogResult<()> {
+        let db_path_owned = self.db_path().to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            )?;
+
+            conn.execute(
+                r"
+                UPDATE pepper_partition 
+                SET record_count = ?1, file_size_bytes = ?2
+                WHERE partition_id = ?3
+                ",
+                rusqlite::params![record_count, file_size_bytes, partition_id],
+            )?;
+
+            Ok::<(), CatalogError>(())
+        })
+        .await?
+    }
+
+    async fn get_partition_stats(&self, partition_id: i64) -> CatalogResult<PartitionStats> {
+        let db_path_owned = self.db_path().to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+
+            let (record_count, file_size_bytes): (i64, i64) = conn.query_row(
+                r"
+                SELECT record_count, file_size_bytes
+                FROM pepper_partition
+                WHERE partition_id = ?1
+                ",
+                [partition_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+
+            Ok::<PartitionStats, CatalogError>(PartitionStats {
+                record_count,
+                file_size_bytes,
+            })
+        })
+        .await?
+    }
+
+    async fn get_partition_data_files(&self, partition_id: i64) -> CatalogResult<Vec<DataFile>> {
+        let db_path_owned = self.db_path().to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+
+            let mut stmt = conn.prepare(
+                r"
+                SELECT data_file_id, table_id, partition_id, file_order, path, path_is_relative,
+                       file_format, record_count, file_size_bytes, row_id_start
+                FROM pepper_data_file
+                WHERE partition_id = ?1
+                ORDER BY file_order
+                ",
+            )?;
+
+            let files = stmt
+                .query_map([partition_id], |row| {
+                    Ok(DataFile {
+                        data_file_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        partition_id: row.get(2)?,
+                        file_order: row.get(3)?,
+                        path: row.get(4)?,
+                        path_is_relative: row.get(5)?,
+                        file_format: row.get(6)?,
+                        record_count: row.get(7)?,
+                        file_size_bytes: row.get(8)?,
+                        row_id_start: row.get(9)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok::<Vec<DataFile>, CatalogError>(files)
+        })
+        .await?
     }
 
     async fn begin_transaction(&self) -> CatalogResult<()> {

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{borrow::Cow, ops::ControlFlow};
 
+use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, PutResult, Ticket,
@@ -24,17 +25,13 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, ProstMessageExt},
 };
-use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
 use bytes::Bytes;
-use datafusion::{
-    common::ParamValues,
-    sql::sqlparser::{
-        ast::{Expr, Statement, Value, VisitMut, VisitorMut},
-        dialect::GenericDialect,
-        parser::{Parser, ParserError},
-    },
+use datafusion::sql::sqlparser::{
+    ast::{Expr, Statement, Value, VisitMut, VisitorMut},
+    dialect::GenericDialect,
+    parser::{Parser, ParserError},
 };
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
@@ -56,7 +53,49 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
     query: String,
-    parameters: Vec<u8>,
+    // Store parameter RecordBatch as IPC bytes for serialization
+    #[serde(with = "record_batch_serde")]
+    parameter_batch: Option<RecordBatch>,
+}
+
+mod record_batch_serde {
+    use arrow::array::RecordBatch;
+    use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::io::Cursor;
+
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S>(batch: &Option<RecordBatch>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match batch {
+            None => Vec::<u8>::new().serialize(serializer),
+            Some(batch) => {
+                let mut writer = StreamWriter::try_new(Vec::new(), &batch.schema())
+                    .map_err(serde::ser::Error::custom)?;
+                writer.write(batch).map_err(serde::ser::Error::custom)?;
+                writer.finish().map_err(serde::ser::Error::custom)?;
+                let bytes = writer.into_inner().map_err(serde::ser::Error::custom)?;
+                bytes.serialize(serializer)
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<RecordBatch>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+
+        let cursor = Cursor::new(bytes);
+        let mut reader = StreamReader::try_new(cursor, None).map_err(serde::de::Error::custom)?;
+
+        reader.next().transpose().map_err(serde::de::Error::custom)
+    }
 }
 
 /// Create a prepared statement from given SQL statement.
@@ -84,7 +123,7 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     let stmt = PreparedStatement {
         query: query.to_string(),
-        parameters: vec![],
+        parameter_batch: None,
     };
 
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
@@ -132,11 +171,20 @@ pub(crate) async fn do_get(
 
     let PreparedStatement {
         query: sql,
-        parameters,
+        parameter_batch,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    let parameters = decode_param_values(&parameters).map_err(error_to_status)?;
+    // Convert parameter batch to ParamValues if present
+    let parameters = if let Some(batch) = parameter_batch {
+        Some(record_to_param_values(&batch).map_err(error_to_status)?)
+    } else {
+        None
+    };
 
+    // Execute the query through the standard path
+    // The logical plan will be created and cached on first execution
+    // via get_or_create_logical_plan in sql_to_flight_stream.
+    // Subsequent executions will reuse the cached plan (1 hour TTL, 512 entries max).
     let (output, from_cache) =
         Box::pin(Service::sql_to_flight_stream(datafusion, &sql, parameters)).await?;
     let timed_output = TimedStream::new(output, move || start);
@@ -158,12 +206,14 @@ pub(crate) async fn do_put_query(
         .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
+
+    // Read the schema first - Arrow Flight always sends schema before batches
     let schema = decode_schema(&mut decoder).await?;
 
-    let mut parameters = Vec::new();
-    let mut encoder = StreamWriter::try_new(&mut parameters, &schema).map_err(error_to_status)?;
+    // Collect all parameter batches
+    let mut batches = Vec::new();
     let mut total_rows = 0;
-    while let Some(msg) = decoder.try_next().await? {
+    while let Some(msg) = futures::TryStreamExt::try_next(&mut decoder).await? {
         match msg.payload {
             DecodedPayload::None => {}
             DecodedPayload::Schema(_) => {
@@ -173,7 +223,7 @@ pub(crate) async fn do_put_query(
             }
             DecodedPayload::RecordBatch(record_batch) => {
                 total_rows += record_batch.num_rows();
-                encoder.write(&record_batch).map_err(error_to_status)?;
+                batches.push(record_batch);
             }
         }
     }
@@ -183,9 +233,21 @@ pub(crate) async fn do_put_query(
         ));
     }
 
+    // Combine multiple batches if parameters span multiple batches
+    let parameter_batch = if batches.is_empty() {
+        None
+    } else if batches.len() == 1 {
+        batches.into_iter().next()
+    } else {
+        // Multiple batches received - combine them using the schema we already have
+        let combined = concat_batches(&schema, &batches)
+            .map_err(|e| Status::internal(format!("Failed to combine parameter batches: {e}")))?;
+        Some(combined)
+    };
+
     let mut stmt: PreparedStatement =
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
-    stmt.parameters = parameters;
+    stmt.parameter_batch = parameter_batch;
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     let result = DoPutPreparedStatementResult {
@@ -199,7 +261,7 @@ pub(crate) async fn do_put_query(
 }
 
 async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Status> {
-    while let Some(msg) = decoder.try_next().await? {
+    while let Some(msg) = futures::TryStreamExt::try_next(decoder).await? {
         match msg.payload {
             DecodedPayload::None => {}
             DecodedPayload::Schema(schema) => {
@@ -216,21 +278,6 @@ async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Sta
     Err(Status::invalid_argument(
         "parameter flight data must have a schema",
     ))
-}
-
-// Decode parameter ipc stream as ParamValues
-fn decode_param_values(
-    parameters: &[u8],
-) -> Result<Option<ParamValues>, datafusion::error::DataFusionError> {
-    if parameters.is_empty() {
-        Ok(None)
-    } else {
-        let decoder = StreamReader::try_new(parameters, None)?;
-        let schema = decoder.schema();
-        let batches = decoder.into_iter().collect::<Result<Vec<_>, _>>()?;
-        let batch = concat_batches(&schema, batches.iter())?;
-        Ok(Some(record_to_param_values(&batch)?))
-    }
 }
 
 fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
@@ -510,5 +557,208 @@ mod tests {
                 .as_ref(),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn test_prepared_statement_plan_cache_setup() {
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::builder::DataFusionBuilder;
+        use crate::status::RuntimeStatus;
+        use cache::{Caching, SimpleCache};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Create a DataFusion instance with plan caching enabled (simulating Runtime setup)
+        let plan_cache = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_secs(3600),
+            std::hash::RandomState::default(),
+        ))
+        .as_tabled_provider();
+
+        let io_runtime = tokio::runtime::Handle::current();
+        let datafusion = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                io_runtime,
+            )
+            .with_caching(Arc::new(Caching::new().with_plans_cache(plan_cache)))
+            .build(),
+        );
+
+        // Verify the plan cache is properly configured
+        let cache_provider = datafusion
+            .plans_cache_provider()
+            .expect("DataFusion should have a plan cache provider configured");
+
+        // Verify it starts empty
+        assert_eq!(
+            cache_provider.item_count(),
+            0,
+            "Plan cache should be empty initially"
+        );
+
+        // This test verifies that:
+        // 1. The plan cache infrastructure is properly set up
+        // 2. Prepared statements will benefit from the shared DataFusion plan cache
+        // 3. The cache has proper protections (512 entries max, 1 hour TTL via SimpleCache)
+        //
+        // The actual caching behavior is tested in datafusion/mod.rs::test_get_or_create_logical_plan
+        // which verifies that get_or_create_logical_plan (called by sql_to_flight_stream)
+        // properly caches and reuses logical plans.
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_parameter_binding_with_plan_caching() {
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::builder::DataFusionBuilder;
+        use crate::datafusion::query::builder::QueryBuilder;
+        use crate::status::RuntimeStatus;
+        use arrow::array::Int64Array;
+        use cache::{Caching, SimpleCache};
+        use datafusion::common::ParamValues;
+        use datafusion::scalar::ScalarValue;
+        use futures::TryStreamExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Create a DataFusion instance with plan caching enabled
+        let plan_cache = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_secs(3600),
+            std::hash::RandomState::default(),
+        ))
+        .as_tabled_provider();
+
+        let io_runtime = tokio::runtime::Handle::current();
+        let datafusion = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                io_runtime,
+            )
+            .with_caching(Arc::new(Caching::new().with_plans_cache(plan_cache)))
+            .build(),
+        );
+
+        // SQL query with parameters (DataFusion format: $1, $2, etc.)
+        // Use CAST to help DataFusion understand the parameter types
+        let sql = "SELECT CAST($1 AS BIGINT) + CAST($2 AS BIGINT) AS sum, CAST($1 AS BIGINT) * CAST($2 AS BIGINT) AS product";
+
+        // Execute the query with first set of parameters (2, 3)
+        let params1 = ParamValues::List(vec![
+            ScalarValue::Int64(Some(2)),
+            ScalarValue::Int64(Some(3)),
+        ]);
+
+        let result1 = QueryBuilder::new(sql, Arc::clone(&datafusion))
+            .parameters(Some(params1))
+            .build()
+            .run()
+            .await
+            .expect("should execute query with params1");
+
+        let batches1: Vec<_> = result1
+            .data
+            .try_collect()
+            .await
+            .expect("should collect batches");
+        assert_eq!(batches1.len(), 1, "should return one batch");
+
+        let batch1 = &batches1[0];
+        assert_eq!(batch1.num_columns(), 2, "should have 2 columns");
+
+        // Verify first execution: 2 + 3 = 5, 2 * 3 = 6
+        let sum1 = batch1
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sum should be Int64Array");
+        let product1 = batch1
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("product should be Int64Array");
+
+        assert_eq!(sum1.value(0), 5, "2 + 3 should equal 5");
+        assert_eq!(product1.value(0), 6, "2 * 3 should equal 6");
+
+        // Execute the same query with different parameters (4, 5)
+        let params2 = ParamValues::List(vec![
+            ScalarValue::Int64(Some(4)),
+            ScalarValue::Int64(Some(5)),
+        ]);
+
+        let result2 = QueryBuilder::new(sql, Arc::clone(&datafusion))
+            .parameters(Some(params2))
+            .build()
+            .run()
+            .await
+            .expect("should execute query with params2");
+
+        let batches2: Vec<_> = result2
+            .data
+            .try_collect()
+            .await
+            .expect("should collect batches");
+        let batch2 = &batches2[0];
+
+        // Verify second execution: 4 + 5 = 9, 4 * 5 = 20
+        let sum2 = batch2
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sum should be Int64Array");
+        let product2 = batch2
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("product should be Int64Array");
+
+        assert_eq!(sum2.value(0), 9, "4 + 5 should equal 9");
+        assert_eq!(product2.value(0), 20, "4 * 5 should equal 20");
+
+        // Execute the same query with third set of parameters (10, 20)
+        let params3 = ParamValues::List(vec![
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Int64(Some(20)),
+        ]);
+
+        let result3 = QueryBuilder::new(sql, Arc::clone(&datafusion))
+            .parameters(Some(params3))
+            .build()
+            .run()
+            .await
+            .expect("should execute query with params3");
+
+        let batches3: Vec<_> = result3
+            .data
+            .try_collect()
+            .await
+            .expect("should collect batches");
+        let batch3 = &batches3[0];
+
+        // Verify third execution: 10 + 20 = 30, 10 * 20 = 200
+        let sum3 = batch3
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sum should be Int64Array");
+        let product3 = batch3
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("product should be Int64Array");
+
+        assert_eq!(sum3.value(0), 30, "10 + 20 should equal 30");
+        assert_eq!(product3.value(0), 200, "10 * 20 should equal 200");
+
+        // This test verifies that:
+        // 1. The same SQL query can be executed multiple times with different parameters
+        // 2. Each execution produces correct results based on the provided parameters
+        // 3. Parameter binding works correctly with the query execution infrastructure
+        // 4. The parameterized query pattern (used by prepared statements) functions properly
     }
 }

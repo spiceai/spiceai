@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{RowCounts, get_app_and_start_request};
-use crate::{args::DatasetTestArgs, wait_test_and_memory};
+use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -34,6 +34,7 @@ use test_framework::{
     utils::observe_memory,
 };
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
@@ -47,6 +48,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     // baseline run
     println!("Running benchmark test");
@@ -133,13 +135,24 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
+    let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+    let health_report = health_report?;
+    let mut error_messages = Vec::new();
 
     if !test_succeeded {
-        return Err(anyhow::anyhow!(
+        error_messages.push(format!(
             "Benchmark test failed due to failed queries:\n{}",
             failures.join("\n")
         ));
+    }
+
+    if let Some(message) = health_report.failure_message() {
+        error_messages.push(message);
+    }
+
+    if !error_messages.is_empty() {
+        return Err(anyhow::anyhow!(error_messages.join("\n")));
     }
 
     Ok(row_counts)
