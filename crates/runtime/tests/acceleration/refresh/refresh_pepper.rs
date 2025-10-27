@@ -172,19 +172,19 @@ async fn test_pepper_append_mode_requires_constraint() -> Result<(), anyhow::Err
             let mut acceleration_config =
                 get_acceleration_config_append("pepper", Some(Params::from_string_map(params)));
             acceleration_config.mode = Mode::File;
-            
+
             // Remove both primary_key and time_column - this should cause an error
             acceleration_config.primary_key = None;
-            
+
             // Attempt to start runtime - should fail with validation error
             let result = start_test_runtime_no_time_column(port, acceleration_config).await;
-            
+
             // Verify that the runtime fails to start with appropriate error
             assert!(
                 result.is_err(),
                 "Expected error when neither primary_key nor time_column is specified for append mode"
             );
-            
+
             let err_msg = result.expect_err("Expected error").to_string();
             assert!(
                 err_msg.contains("primary_key") || err_msg.contains("time_column"),
