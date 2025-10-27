@@ -67,6 +67,7 @@ pub mod spice_cloud;
 pub mod sqlite;
 pub mod unity_catalog;
 
+pub mod git;
 pub mod github;
 pub mod rate_limit;
 
