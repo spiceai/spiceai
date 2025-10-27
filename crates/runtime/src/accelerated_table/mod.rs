@@ -433,8 +433,18 @@ impl Builder {
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
-                // append mode requires either time_column or primary_key
+                // If there is no time_column, check if the data connector supports streaming the append changes (i.e. Kafka Data Connector).
                 if self.refresh.time_column.is_none() {
+                    // Get the append stream
+                    let Some(append_stream) = self.append_stream else {
+                        return AppendStreamRequiredSnafu.fail();
+                    };
+                    (
+                        refresh::AccelerationRefreshMode::Changes(append_stream),
+                        None,
+                    )
+                } else {
+                    // Otherwise, append mode requires either time_column or primary_key
                     let schema = self.accelerator.schema();
                     let has_primary_key =
                         self.accelerator.constraints().is_some_and(|constraints| {
@@ -444,14 +454,14 @@ impl Builder {
                     if !has_primary_key {
                         return NeitherTimeColumnNorPrimaryKeySnafu.fail();
                     }
-                }
 
-                let (start_refresh, on_start_refresh) =
-                    mpsc::channel::<Option<RefreshOverrides>>(1);
-                (
-                    refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
-                    Some(start_refresh),
-                )
+                    let (start_refresh, on_start_refresh) =
+                        mpsc::channel::<Option<RefreshOverrides>>(1);
+                    (
+                        refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
+                        Some(start_refresh),
+                    )
+                }
             }
             RefreshMode::Full => {
                 let (start_refresh, on_start_refresh) =
