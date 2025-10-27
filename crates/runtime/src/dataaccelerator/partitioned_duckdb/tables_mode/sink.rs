@@ -45,7 +45,9 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use crate::dataaccelerator::partitioned_duckdb::tables_mode::insert::BatchPartitioner;
-use crate::dataaccelerator::partitioned_duckdb::tables_mode::partition_buffer::PartitionBuffer;
+use crate::dataaccelerator::partitioned_duckdb::tables_mode::partition_buffer::{
+    PartitionBufferConfig, PartitionBufferFactory, PartitionData,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -75,10 +77,6 @@ pub enum Error {
     },
 }
 
-// Buffering rows allows for much more efficient writes in `DuckDB`
-// 122_880 represents DuckDB default size of groups of rows - that are stored together at the storage level.
-const ROWS_PER_PARTITION_BUFFER: usize = 122_880;
-
 #[derive(Clone)]
 /// A `DataFusion` sink that writes partitioned data to separate `DuckDB` tables.
 ///
@@ -92,8 +90,8 @@ pub struct DuckDBPartitionedDataSink {
     on_conflict: Option<OnConflict>,
     schema: SchemaRef,
     partitioner: Arc<BatchPartitioner>,
-    rows_per_partition_buffer: Option<usize>,
     write_settings: DuckDBWriteSettings,
+    partition_buffer_config: PartitionBufferConfig,
 }
 
 #[async_trait]
@@ -123,8 +121,8 @@ impl DataSink for DuckDBPartitionedDataSink {
         let write_settings = self.write_settings.clone();
 
         let (batch_tx, batch_rx): (
-            Sender<(String, Vec<RecordBatch>)>,
-            Receiver<(String, Vec<RecordBatch>)>,
+            Sender<(String, PartitionData)>,
+            Receiver<(String, PartitionData)>,
         ) = mpsc::channel(10);
 
         // Since the main task/stream can be dropped or fail, we use a oneshot channel to signal that all data is received and we should commit the transaction
@@ -158,11 +156,12 @@ impl DataSink for DuckDBPartitionedDataSink {
                 Ok(num_rows)
             });
 
-        // Buffering rows allows for much more efficient writes in DuckDB
-        let buffer_size = self
-            .rows_per_partition_buffer
-            .unwrap_or(ROWS_PER_PARTITION_BUFFER);
-        let mut partition_buffer = PartitionBuffer::new(batch_tx, buffer_size);
+        let mut partition_buffer = PartitionBufferFactory::create_buffer(
+            &self.partition_buffer_config,
+            batch_tx,
+            Arc::clone(&self.schema),
+            &self.table_definition.name().to_string(),
+        )?;
 
         let partitioner = Arc::clone(&self.partitioner);
 
@@ -217,7 +216,8 @@ impl DataSink for DuckDBPartitionedDataSink {
             }
         }
 
-        if let Err(send_error) = partition_buffer.flush_all().await {
+        // Flbuffers and drop the sender to signal the receiver that no more data is coming
+        if let Err(send_error) = partition_buffer.finish().await {
             match duckdb_write_handle.await {
                 Err(join_error) => {
                     return Err(DataFusionError::Execution(format!(
@@ -240,9 +240,6 @@ impl DataSink for DuckDBPartitionedDataSink {
                 "Unable to send message to commit transaction to DuckDB writer.".to_string(),
             ));
         }
-
-        // Drop the sender to signal the receiver that no more data is coming
-        drop(partition_buffer);
 
         match duckdb_write_handle.await {
             Ok(result) => result,
@@ -295,22 +292,9 @@ impl DuckDBPartitionedDataSink {
             on_conflict,
             schema,
             partitioner,
-            rows_per_partition_buffer: None,
             write_settings: DuckDBWriteSettings::default(),
+            partition_buffer_config: PartitionBufferConfig::default(),
         }
-    }
-
-    /// Sets a custom buffer size for partition writes.
-    ///
-    /// This overrides the default `ROWS_PER_PARTITION_BUFFER` value to allow for tuning
-    /// write performance based on specific use cases or memory constraints.
-    ///
-    /// # Arguments
-    /// * `rows_per_partition_buffer` - Number of rows to buffer per partition before writing to `DuckDB`
-    #[must_use]
-    pub fn with_rows_per_partition_buffer(mut self, rows_per_partition_buffer: usize) -> Self {
-        self.rows_per_partition_buffer = Some(rows_per_partition_buffer);
-        self
     }
 
     /// Sets the write settings for controlling `DuckDB` write behavior.
@@ -320,6 +304,11 @@ impl DuckDBPartitionedDataSink {
     #[must_use]
     pub fn with_write_settings(mut self, write_settings: DuckDBWriteSettings) -> Self {
         self.write_settings = write_settings;
+        self
+    }
+
+    pub fn with_partition_buffer_config(mut self, buffer_config: PartitionBufferConfig) -> Self {
+        self.partition_buffer_config = buffer_config;
         self
     }
 }
@@ -340,7 +329,7 @@ impl DisplayAs for DuckDBPartitionedDataSink {
 fn insert_overwrite(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
-    batch_rx: Receiver<(String, Vec<RecordBatch>)>,
+    batch_rx: Receiver<(String, PartitionData)>,
     on_conflict: Option<&OnConflict>,
     mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
@@ -442,7 +431,7 @@ fn insert_overwrite(
 fn insert_append(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
-    batch_rx: Receiver<(String, Vec<RecordBatch>)>,
+    batch_rx: Receiver<(String, PartitionData)>,
     on_conflict: Option<&OnConflict>,
     mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
@@ -533,7 +522,7 @@ fn write_to_tables(
     table_definition: &Arc<TableDefinition>,
     tx: &Transaction<'_>,
     schema: &SchemaRef,
-    mut data_batches: Receiver<(String, Vec<RecordBatch>)>,
+    mut data_batches: Receiver<(String, PartitionData)>,
     on_conflict: Option<&OnConflict>,
     pool: &Arc<DuckDbConnectionPool>,
     with_internal: bool,
@@ -550,13 +539,8 @@ fn write_to_tables(
         table_definition.name()
     );
 
-    while let Some((partition, batch)) = data_batches.blocking_recv() {
+    while let Some((partition, data)) = data_batches.blocking_recv() {
         let start = SystemTime::now();
-        let batch_size_mb = batch
-            .iter()
-            .map(arrow::array::RecordBatch::get_array_memory_size)
-            .sum::<usize>()
-            / (1024 * 1024);
 
         // Check if partition table already exists or create it
         let partition_table = if let Some(existing_table) = created_partitions.get(&partition) {
@@ -581,13 +565,18 @@ fn write_to_tables(
             partition_table
         };
 
-        let rows_written = write_data_chunk_to_table(
-            &partition_table,
-            tx,
-            Arc::clone(schema),
-            batch,
-            on_conflict,
-        )?;
+        let rows_written = match data {
+            PartitionData::Batches(records) => write_data_chunk_to_table(
+                &partition_table,
+                tx,
+                Arc::clone(schema),
+                records,
+                on_conflict,
+            )?,
+            PartitionData::ParquetFile(file_path) => {
+                write_parquet_file_to_table(&partition_table, tx, &file_path)?
+            }
+        };
 
         total_rows += rows_written;
 
@@ -602,9 +591,7 @@ fn write_to_tables(
         } else {
             rows_written as f64
         };
-        tracing::trace!(
-            "Processed {rows_written} rows in {elapsed:?} ({rps:.2} rows/s, memory: {batch_size_mb:.2} MB)"
-        );
+        tracing::trace!("Processed {rows_written} rows in {elapsed:?} ({rps:.2} rows/s)");
     }
 
     let total_elapsed = start_main
@@ -653,6 +640,43 @@ fn write_data_chunk_to_table(
         .map_err(table_providers_duckdb_to_datafusion_error)?;
 
     Ok(rows as u64)
+}
+
+/// Inserts data from a Parquet file into a partition table using a parameterized query.
+///
+/// Note: does not currently supports conflict resolutions
+///
+/// # Returns
+/// The number of rows inserted from the Parquet file
+///
+/// # Errors
+/// Returns a `DataFusion` error if the SQL execution fails or if the file cannot be read
+fn write_parquet_file_to_table(
+    table: &TableManager,
+    tx: &Transaction<'_>,
+    file_path: &std::path::Path,
+) -> datafusion::common::Result<u64> {
+    let sql = format!(
+        r#"INSERT INTO "{table_name}" SELECT * FROM read_parquet(?, hive_partitioning=false)"#,
+        table_name = table.table_name()
+    );
+
+    let file_path_str = file_path.to_string_lossy();
+    let rows_written = tx.execute(&sql, [&*file_path_str]).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to insert from parquet file '{}': {e}",
+            file_path.display()
+        ))
+    })? as u64;
+
+    // Clean up the temporary file after successful insertion
+    if let Err(e) = std::fs::remove_file(file_path) {
+        tracing::warn!(
+            "Failed to remove temporary parquet file '{}': {e}",
+            file_path.display(),
+        );
+    }
+    Ok(rows_written)
 }
 
 /// Gets all existing partition tables for a given base table definition.

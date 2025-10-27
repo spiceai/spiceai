@@ -49,6 +49,7 @@ mod tracker;
 
 #[cfg(feature = "cluster")]
 use {
+    crate::ClusterMode,
     crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
     crate::datafusion::cluster::config::SpiceClusterConfig,
     crate::datafusion::extension::SpiceQueryPlanner,
@@ -66,7 +67,6 @@ use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
-use crate::config::ClusterMode;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
