@@ -18,6 +18,7 @@ limitations under the License.
 
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use pepper::metadata::CreateTableOptions;
@@ -93,10 +94,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     // 8. Query the data back
     let df = ctx.sql("SELECT * FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_rows: usize = results
-        .iter()
-        .map(arrow::array::RecordBatch::num_rows)
-        .sum();
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total_rows, 3, "Expected 3 rows after first insert");
     println!("✓ Query returned {total_rows} rows");
 
@@ -647,9 +645,10 @@ async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
 #[allow(clippy::too_many_lines)]
 async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::{
-        BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int8Array, LargeBinaryArray, LargeStringArray,
-        RecordBatch, TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+        Float32Array, Float64Array, Int16Array, Int32Array, Int8Array, LargeBinaryArray,
+        LargeStringArray, RecordBatch, TimestampMicrosecondArray, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array,
     };
     use arrow::datatypes::TimeUnit;
     use std::f32::consts::{E as F32_E, PI as F32_PI};
@@ -714,72 +713,71 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
         table_options,
     )
     .await?;
-    println!("✓ Table created with {} columns", schema.fields().len());
+    tracing::info!("✓ Table created with {} columns", schema.fields().len());
 
     let ctx = SessionContext::new();
     ctx.register_table("types_test", Arc::new(table))?;
 
     // Insert test data with various types
-    let batch = RecordBatch::try_new(
-        Arc::<arrow::datatypes::Schema>::clone(&schema),
-        vec![
-            Arc::new(Int8Array::from(vec![Some(127), Some(-128), None])),
-            Arc::new(Int16Array::from(vec![Some(32767), Some(-32768), None])),
-            Arc::new(Int32Array::from(vec![
-                Some(2_147_483_647),
-                Some(-2_147_483_648),
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(Int8Array::from(vec![Some(127), Some(-128), None])) as ArrayRef,
+        Arc::new(Int16Array::from(vec![Some(32_767), Some(-32_768), None])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![
+            Some(2_147_483_647),
+            Some(-2_147_483_648),
+            None,
+        ])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef, // Primary key, non-null
+        Arc::new(UInt8Array::from(vec![Some(255), Some(0), None])) as ArrayRef,
+        Arc::new(UInt16Array::from(vec![Some(65_535), Some(0), None])) as ArrayRef,
+        Arc::new(UInt32Array::from(vec![Some(4_294_967_295), Some(0), None])) as ArrayRef,
+        Arc::new(UInt64Array::from(vec![
+            Some(18_446_744_073_709_551_615),
+            Some(0),
+            None,
+        ])) as ArrayRef,
+        Arc::new(Float32Array::from(vec![Some(F32_PI), Some(-F32_E), None])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(F64_PI), Some(-F64_E), None])) as ArrayRef,
+        Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("Hello"), Some("World"), None])) as ArrayRef,
+        Arc::new(LargeStringArray::from(vec![
+            Some("Large"),
+            Some("String"),
+            None,
+        ])) as ArrayRef,
+        Arc::new(BinaryArray::from_vec(vec![
+            &b"binary"[..],
+            &b"data"[..],
+            &b""[..],
+        ])) as ArrayRef,
+        Arc::new(LargeBinaryArray::from_vec(vec![
+            &b"large"[..],
+            &b"binary"[..],
+            &b""[..],
+        ])) as ArrayRef,
+        Arc::new(Date32Array::from(vec![Some(18_993), Some(0), None])) as ArrayRef, // Days since epoch
+        Arc::new(Date64Array::from(vec![
+            Some(1_640_995_200_000),
+            Some(0),
+            None,
+        ])) as ArrayRef, // Milliseconds since epoch
+        Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1_640_995_200_000_000),
+            Some(0),
+            None,
+        ])) as ArrayRef,
+        Arc::new(
+            Decimal128Array::from(vec![
+                Some(314_159_265_358_i128),  // 3141.59265358
+                Some(-271_828_182_845_i128), // -2718.28182845
                 None,
-            ])),
-            Arc::new(Int64Array::from(vec![1, 2, 3])), // Primary key, non-null
-            Arc::new(UInt8Array::from(vec![Some(255), Some(0), None])),
-            Arc::new(UInt16Array::from(vec![Some(65535), Some(0), None])),
-            Arc::new(UInt32Array::from(vec![Some(4_294_967_295), Some(0), None])),
-            Arc::new(UInt64Array::from(vec![
-                Some(18_446_744_073_709_551_615),
-                Some(0),
-                None,
-            ])),
-            Arc::new(Float32Array::from(vec![Some(F32_PI), Some(-F32_E), None])),
-            Arc::new(Float64Array::from(vec![Some(F64_PI), Some(-F64_E), None])),
-            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
-            Arc::new(StringArray::from(vec![Some("Hello"), Some("World"), None])),
-            Arc::new(LargeStringArray::from(vec![
-                Some("Large"),
-                Some("String"),
-                None,
-            ])),
-            Arc::new(BinaryArray::from_vec(vec![
-                &b"binary"[..],
-                &b"data"[..],
-                &b""[..],
-            ])),
-            Arc::new(LargeBinaryArray::from_vec(vec![
-                &b"large"[..],
-                &b"binary"[..],
-                &b""[..],
-            ])),
-            Arc::new(Date32Array::from(vec![Some(18993), Some(0), None])), // Days since epoch
-            Arc::new(Date64Array::from(vec![
-                Some(1_640_995_200_000),
-                Some(0),
-                None,
-            ])), // Milliseconds since epoch
-            Arc::new(TimestampMicrosecondArray::from(vec![
-                Some(1_640_995_200_000_000),
-                Some(0),
-                None,
-            ])),
-            Arc::new(
-                Decimal128Array::from(vec![
-                    Some(314_159_265_358_i128),  // 3141.59265358
-                    Some(-271_828_182_845_i128), // -2718.28182845
-                    None,
-                ])
-                .with_precision_and_scale(38, 10)
-                .expect("valid decimal"),
-            ),
-        ],
-    )?;
+            ])
+            .with_precision_and_scale(38, 10)
+            .expect("valid decimal"),
+        ) as ArrayRef,
+    ];
+
+    let batch = RecordBatch::try_new(Arc::<arrow::datatypes::Schema>::clone(&schema), arrays)?;
 
     // Insert via DataFusion
     let df = ctx.read_batch(batch)?;

@@ -22,11 +22,6 @@ use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::get_primary_keys_from_constraints;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
-use crate::execution_plan::TableScanParams;
-use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
-use crate::execution_plan::schema_cast::SchemaCastScanExec;
-use crate::execution_plan::slice::SliceExec;
-use crate::execution_plan::tee::TeeExec;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::SchemaRef;
@@ -50,6 +45,11 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
+use runtime_datafusion::execution_plan::{
+    TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
+    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec,
+};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -433,25 +433,55 @@ impl Builder {
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
-                // append mode requires either time_column or primary_key
-                if self.refresh.time_column.is_none() {
-                    let schema = self.accelerator.schema();
-                    let has_primary_key =
-                        self.accelerator.constraints().is_some_and(|constraints| {
-                            !get_primary_keys_from_constraints(constraints, &schema).is_empty()
-                        });
-
-                    if !has_primary_key {
-                        return NeitherTimeColumnNorPrimaryKeySnafu.fail();
+                enum AppendMode {
+                    TimeColumnOrPrimaryKey,
+                    ChangesStream,
+                }
+                impl AppendMode {
+                    fn try_new(
+                        has_time_column: bool,
+                        has_primary_key: bool,
+                        has_append_stream: bool,
+                    ) -> AcceleratedTableBuilderResult<Self> {
+                        if has_append_stream {
+                            Ok(AppendMode::ChangesStream)
+                        } else if has_time_column || has_primary_key {
+                            Ok(AppendMode::TimeColumnOrPrimaryKey)
+                        } else {
+                            NeitherTimeColumnNorPrimaryKeySnafu.fail()
+                        }
                     }
                 }
 
-                let (start_refresh, on_start_refresh) =
-                    mpsc::channel::<Option<RefreshOverrides>>(1);
-                (
-                    refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
-                    Some(start_refresh),
-                )
+                let schema = self.accelerator.schema();
+                let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
+                    !get_primary_keys_from_constraints(constraints, &schema).is_empty()
+                });
+                let has_time_column = self.refresh.time_column.is_some();
+                let has_append_stream = self.append_stream.is_some();
+
+                let append_mode =
+                    AppendMode::try_new(has_time_column, has_primary_key, has_append_stream)?;
+
+                match append_mode {
+                    AppendMode::ChangesStream => {
+                        let Some(append_stream) = self.append_stream else {
+                            return AppendStreamRequiredSnafu.fail();
+                        };
+                        (
+                            refresh::AccelerationRefreshMode::Changes(append_stream),
+                            None,
+                        )
+                    }
+                    AppendMode::TimeColumnOrPrimaryKey => {
+                        let (start_refresh, on_start_refresh) =
+                            mpsc::channel::<Option<RefreshOverrides>>(1);
+                        (
+                            refresh::AccelerationRefreshMode::Append(on_start_refresh),
+                            Some(start_refresh),
+                        )
+                    }
+                }
             }
             RefreshMode::Full => {
                 let (start_refresh, on_start_refresh) =
@@ -704,12 +734,18 @@ impl TableProvider for AcceleratedTable {
             .scan(state, projection, filters, limit)
             .await?;
 
+        let federated = Arc::clone(&self.federated);
+        let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
+            let federated = Arc::clone(&federated);
+            Box::pin(async move { federated.table_provider().await })
+        });
+
         let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => input,
             ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
-                Arc::clone(&self.federated),
+                fallback_fn,
                 TableScanParams::new(state, projection, filters, limit),
             )),
         };

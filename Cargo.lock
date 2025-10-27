@@ -4674,7 +4674,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=8a1e01040b6ef950031132e0d7fe29f2709db3b1#8a1e01040b6ef950031132e0d7fe29f2709db3b1"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=83696e02d04a2ed6bdcbc6d4f8dd46d5d5da3ab1#83696e02d04a2ed6bdcbc6d4f8dd46d5d5da3ab1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -12766,6 +12766,7 @@ dependencies = [
  "runtime-acceleration",
  "runtime-async",
  "runtime-auth",
+ "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",
@@ -12878,6 +12879,25 @@ dependencies = [
  "pin-project",
  "tonic",
  "tower 0.5.2",
+ "tracing",
+]
+
+[[package]]
+name = "runtime-datafusion"
+version = "1.9.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow_tools",
+ "async-stream",
+ "async-trait",
+ "dashmap",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-federation",
+ "futures",
+ "opentelemetry 0.27.1",
+ "runtime-request-context",
+ "tokio",
  "tracing",
 ]
 

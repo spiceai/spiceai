@@ -30,6 +30,8 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
+use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedExtensionPlanner;
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
@@ -45,26 +47,26 @@ use util::{RetryError, retry};
 
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
-use crate::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
+use crate::metrics::telemetry::track_bytes_processed;
 use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
     datafusion::{filter_converter::TimestampFilterConvert, schema},
-    dataupdate::{DataUpdate, StreamingDataUpdate, UpdateType},
-    execution_plan::schema_cast::EnsureSchema,
+    dataupdate::{StreamingDataUpdate, UpdateType},
     status,
 };
+use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use runtime_object_store::registry::default_runtime_env;
 
+use super::metrics;
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
-use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 
 use crate::component::dataset::TimeFormat;
 use std::time::{Duration, UNIX_EPOCH};
@@ -89,7 +91,6 @@ use spicepod::metric::Metrics;
 use std::collections::HashSet;
 
 mod changes;
-mod streaming_append;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
@@ -639,37 +640,6 @@ impl RefreshTask {
         self.get_data_update(filters, &refresh).await
     }
 
-    async fn write_data_update(
-        &self,
-        sql: Option<String>,
-        start_time: Option<SystemTime>,
-        data_update: DataUpdate,
-    ) -> super::Result<()> {
-        if data_update.data.is_empty()
-            || data_update
-                .data
-                .first()
-                .is_some_and(|x| x.columns().is_empty())
-        {
-            if let Some(start_time) = start_time {
-                self.trace_load_completed(start_time, 0, 0).await;
-            }
-
-            self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Ready)
-                .await;
-
-            return Ok(());
-        }
-
-        let streaming_update = StreamingDataUpdate::try_from(data_update)
-            .map_err(find_datafusion_root)
-            .context(UnableToCreateMemTableFromUpdateSnafu)?;
-
-        self.write_streaming_data_update(start_time, streaming_update, sql.as_deref())
-            .await
-            .map_err(inner_err_from_retry)
-    }
-
     async fn get_incremental_append_update(
         &self,
         refresh: &Refresh,
@@ -877,7 +847,10 @@ impl RefreshTask {
             .with_default_features();
 
         let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
-            Arc::new(SpiceExtensionPlanner::new()),
+            Arc::new(BytesProcessedExtensionPlanner::new(
+                Box::new(track_bytes_processed),
+                cfg!(feature = "cluster"),
+            )),
             Arc::new(IndexTableScanExtensionPlanner::new()),
         ];
 
@@ -891,10 +864,10 @@ impl RefreshTask {
             extension_planners.push(Arc::new(FederatedPlanner::new()));
         }
 
-        let query_planner = SpiceQueryPlanner::new().with_extension_planners(extension_planners);
-
         let mut state = state_builder
-            .with_query_planner(Arc::new(query_planner))
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::from_extension_planners(extension_planners),
+            ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
@@ -1409,14 +1382,6 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     RetryError::permanent(super::Error::FailedToRefreshDataset {
         source: find_datafusion_root(error),
     })
-}
-
-fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
-    match error {
-        RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
-            inner_err
-        }
-    }
 }
 
 fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {

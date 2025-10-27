@@ -1,6 +1,5 @@
 use crate::Runtime;
-use crate::datafusion::extension::bytes_processed::BytesProcessedExec;
-use crate::execution_plan::schema_cast::SchemaCastScanExec;
+use crate::metrics::telemetry::track_bytes_processed;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use datafusion::common::{DataFusionError, Result, exec_err};
@@ -10,6 +9,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::ScalarUDF;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -82,7 +83,10 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
             Some("BytesProcessedExec") => {
                 // TODO: Make RequestContext serializable
-                Ok(Arc::new(BytesProcessedExec::new(Arc::clone(&inputs[0]))))
+                Ok(Arc::new(BytesProcessedExec::new(
+                    Arc::clone(&inputs[0]),
+                    Arc::new(Box::new(track_bytes_processed)),
+                )))
             }
             _ => exec_err!("Unsupported spice.exec.name"),
         }

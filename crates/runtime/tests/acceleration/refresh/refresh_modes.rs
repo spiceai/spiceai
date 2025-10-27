@@ -225,7 +225,7 @@ async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow:
 // Pepper (feature-gated)
 // Note: Pepper requires mode: file in addition to refresh_mode: append/full.
 // These tests need custom helpers that set both mode and refresh_mode.
-#[cfg(feature = "pepper")]
+#[cfg(all(feature = "pepper", not(windows)))]
 #[tokio::test]
 #[ignore = "Pepper requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_pepper_append_variant() {
@@ -235,7 +235,7 @@ async fn test_acceleration_refresh_pepper_append_variant() {
         .expect("Test should pass when mode: file is properly configured");
 }
 
-#[cfg(feature = "pepper")]
+#[cfg(all(feature = "pepper", not(windows)))]
 #[tokio::test]
 #[ignore = "Pepper requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_pepper_full_variant() {
