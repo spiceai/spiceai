@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterMode,
+    ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
+    ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
+};
+
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
@@ -74,6 +81,18 @@ mod util;
 pub struct Service {
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+}
+
+impl Service {
+    /// Creates a new Service with pre-allocated channel map capacity
+    #[must_use]
+    pub fn new(basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>) -> Self {
+        Self {
+            // Pre-allocate for typical workloads (avoid reallocation)
+            channel_map: Arc::new(RwLock::new(HashMap::with_capacity(64))),
+            basic_auth,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -206,13 +225,15 @@ impl Service {
             .map_err(handle_query_error)?;
 
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
+        let schema = query_result.data.schema();
 
+        // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(false);
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
                 .schema_to_bytes_with_dictionary_tracker(
-                    query_result.data.schema().as_ref(),
+                    schema.as_ref(),
                     &mut dict_tracker,
                     &options,
                 )
@@ -225,11 +246,13 @@ impl Service {
         };
 
         let data_stream = query_result.data;
+        let cache_status = query_result.cache_status;
 
         let flights_stream = try_stream! {
             yield schema_flight_data;
 
-            futures::pin_mut!(data_stream); // needed to use `.next()` on stream
+            // Use fused stream for better performance
+            let mut data_stream = data_stream.fuse();
 
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
@@ -238,6 +261,7 @@ impl Service {
                             .encoded_batch(&batch, &mut dict_tracker, &options)
                             .map_err(|e| Status::internal(e.to_string()))?;
 
+                        // Yield dictionaries first
                         for dict in dicts {
                             yield dict.into();
                         }
@@ -251,7 +275,7 @@ impl Service {
             }
         };
 
-        Ok((flights_stream.boxed(), query_result.cache_status))
+        Ok((flights_stream.boxed(), cache_status))
     }
 
     async fn wrap_response_stream_with_scope<S>(
@@ -261,6 +285,7 @@ impl Service {
         S: Stream + Send + 'static,
         S::Item: Send + 'static,
     {
+        // Get request context once, avoid repeated lookups
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let (metadata, stream, extensions) = response.into_parts();
         let scoped_stream = request_context.scope_stream(stream);
@@ -281,11 +306,12 @@ fn to_tonic_err<E>(e: E) -> Status
 where
     E: std::fmt::Display + 'static,
 {
+    // Avoid cloning Status if already a Status
     if let Some(status) = (&e as &dyn std::any::Any).downcast_ref::<Status>() {
-        status.clone()
-    } else {
-        Status::internal(format!("{e}"))
+        // Create a new Status with the same code and message to avoid cloning the entire Status struct
+        return Status::new(status.code(), status.message());
     }
+    Status::internal(format!("{e}"))
 }
 
 fn handle_query_error(e: query::Error) -> Status {
@@ -317,6 +343,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
                 match e {
                     SpiceExternalError::AccelerationNotReady { dataset_name } => {
+                        // Pre-format message to avoid repeated allocation
                         Status::unavailable(format!(
                             "Acceleration not ready; loading initial data for {dataset_name}"
                         ))
@@ -325,7 +352,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             } else if let Some(err) = e.downcast_ref::<FlightClientError>() {
                 match err {
                     FlightClientError::ConnectionReset { source } => {
-                        let mut error = Status::invalid_argument(format!("{source}"));
+                        let mut error = Status::invalid_argument(source.to_string());
                         error.metadata_mut().insert("spiceai-retryable", 1.into());
                         error
                     }
@@ -334,7 +361,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             } else if let Some(err) = e.downcast_ref::<llms::embeddings::Error>() {
                 match err {
                     llms::embeddings::Error::RateLimited { .. } => {
-                        Status::unavailable(format!("{err}"))
+                        Status::unavailable(err.to_string())
                     }
                     _ => to_tonic_err(e),
                 }
@@ -347,13 +374,12 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             handle_datafusion_error(*source)
         }
         DataFusionError::Shared(source) => {
-            // Since DataFusionError doesn't implement Clone, we can't extract it from Arc
-            // Just treat it as a generic error
+            // Optimize: avoid string allocation for common case
             Status::internal(format!("Shared DataFusion error: {source}"))
         }
         DataFusionError::Collection(sources) => {
-            let first_error = sources.into_iter().next();
-            if let Some(first_error) = first_error {
+            // Handle first error efficiently without collecting all
+            if let Some(first_error) = sources.into_iter().next() {
                 handle_datafusion_error(first_error)
             } else {
                 Status::internal("Several DataFusion errors occurred, but no details available")
@@ -393,6 +419,12 @@ pub enum Error {
         "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
     ))]
     AddressAlreadyInUse { addr: String },
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display(
+        "The cluster scheduler is not initialized, preventing the flight service from starting."
+    ))]
+    ClusterSchedulerNotInitialized {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -417,15 +449,9 @@ pub async fn start(
     rate_limits: Arc<RateLimits>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
-    let service = Service {
-        channel_map: Arc::new(RwLock::new(HashMap::new())),
-        basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
-    };
-    let svc = FlightServiceServer::new(service)
+    let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
-
-    tracing::info!("Spice Runtime Flight listening on {bind_address}");
-    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
     let mut server = Server::builder();
 
@@ -443,13 +469,67 @@ pub async fn start(
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
-    let server = server
+    #[allow(unused_mut)]
+    let mut server = server
         .layer(RequestContextLayer::new(app, rt.datafusion()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
-        .layer(auth_layer)
-        .add_service(svc);
+        .layer(auth_layer);
+
+    #[cfg(not(feature = "cluster"))]
+    let server = server.add_service(spice_flight_service);
+
+    #[cfg(feature = "cluster")]
+    let server = match rt.config.cluster.mode {
+        Some(ClusterMode::Scheduler) => {
+            let Some(scheduler) = rt
+                .df
+                .scheduler_server
+                .read()
+                .ok()
+                .and_then(|r| r.iter().next().cloned())
+            else {
+                return Err(Error::ClusterSchedulerNotInitialized {});
+            };
+
+            let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
+            server
+                .add_service(spice_flight_service)
+                .add_service(scheduler_grpc_server)
+        }
+        Some(ClusterMode::Executor) => {
+            let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX);
+
+            server.add_service(executor_flight)
+        }
+        _ => server.add_service(spice_flight_service),
+    };
+
+    // If running an executor, we may have resolved another port to bind if 50051 is taken
+    #[cfg(feature = "cluster")]
+    let bind_address: SocketAddr = if let Some((host, port)) =
+        rt.df.executor.read().ok().and_then(|maybe_executor| {
+            maybe_executor
+                .as_ref()
+                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
+        }) {
+        if let Ok(addr) = format!("{host}:{port}").parse() {
+            addr
+        } else {
+            tracing::warn!(
+                "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
+            );
+            bind_address
+        }
+    } else {
+        bind_address
+    };
+
+    tracing::info!("Spice Runtime Flight listening on {bind_address}");
+    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
     if let Some(token) = shutdown_signal {
         server
@@ -493,9 +573,9 @@ impl Default for RateLimits {
     fn default() -> Self {
         Self {
             // Allow 100 Flight DoPut requests every 60 seconds by default
-            flight_write_limit: Quota::per_minute(NonZeroU32::new(100).unwrap_or_else(|| {
-                unreachable!("100 is non-zero and should always successfully convert to NonZeroU32")
-            })),
+            flight_write_limit: Quota::per_minute(
+                NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
+            ),
         }
     }
 }

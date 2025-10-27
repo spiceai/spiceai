@@ -35,6 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use token_provider::registry::TokenProviderRegistry;
 use token_provider::{StaticTokenProvider, TokenProvider};
+use tokio::runtime::Handle;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -104,6 +105,7 @@ impl std::fmt::Debug for Databricks {
 impl Databricks {
     pub async fn new(
         params: Parameters,
+        io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
     ) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();
@@ -163,6 +165,7 @@ impl Databricks {
                     Endpoint(endpoint.to_string()),
                     storage_options,
                     token_provider,
+                    io_runtime,
                 );
 
                 Ok(Self {
@@ -466,8 +469,12 @@ impl DataConnectorFactory for DatabricksFactory {
             Box::pin(async move {
                 // Initialize the AWS SDK and make it available.
                 let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
-                let databricks =
-                    Databricks::new(params.parameters, runtime.token_provider_registry()).await?;
+                let databricks = Databricks::new(
+                    params.parameters,
+                    params.io_runtime,
+                    runtime.token_provider_registry(),
+                )
+                .await?;
                 Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
             })
         } else {

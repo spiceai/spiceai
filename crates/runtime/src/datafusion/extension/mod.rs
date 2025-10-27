@@ -23,6 +23,9 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
+use datafusion_federation::FederatedPlanner;
+use datafusion_optimizer_rules::logical_plan::CacheInvalidationExtensionPlanner;
+use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use std::sync::Arc;
 
 pub mod bytes_processed;
@@ -46,6 +49,16 @@ impl SpiceQueryPlanner {
         SpiceQueryPlanner {
             extension_planners: vec![],
         }
+    }
+
+    #[must_use]
+    pub fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+        vec![
+            Arc::new(FederatedPlanner::new()),
+            Arc::new(SpiceExtensionPlanner::new()),
+            Arc::new(IndexTableScanExtensionPlanner::new()),
+            Arc::new(CacheInvalidationExtensionPlanner::new()),
+        ]
     }
 
     #[must_use]
@@ -122,6 +135,7 @@ mod tests {
     use futures::TryStreamExt;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -135,6 +149,7 @@ mod tests {
         let mut builder = DataFusionBuilder::new(
             RuntimeStatus::new(),
             Arc::new(AcceleratorEngineRegistry::new()),
+            Handle::current(),
         );
 
         // Add cache if provided

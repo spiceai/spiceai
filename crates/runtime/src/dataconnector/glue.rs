@@ -43,7 +43,7 @@ use super::{
     DataConnector, DataConnectorFactory,
     parameters::{
         ConnectorParams,
-        aws::{self, load_config},
+        aws::{self, initiate_config_with_credentials},
     },
     s3::S3,
 };
@@ -101,12 +101,16 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
     params: Parameters,
+    tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl GlueDataConnector {
     #[must_use]
-    pub fn new(params: Parameters) -> Self {
-        Self { params }
+    pub fn new(params: Parameters, tokio_io_runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            params,
+            tokio_io_runtime,
+        }
     }
 
     async fn create_table_provider(
@@ -187,7 +191,14 @@ impl GlueDataConnector {
             }
         })? {
             input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
-                create_s3_provider(input_format, dataset.clone(), self.params.clone(), &table).await
+                create_s3_provider(
+                    input_format,
+                    dataset.clone(),
+                    self.params.clone(),
+                    &table,
+                    self.tokio_io_runtime.clone(),
+                )
+                .await
             }
             InputFormat::Iceberg => {
                 create_iceberg_provider(dataset, &config, database.to_string(), &table).await
@@ -198,15 +209,16 @@ impl GlueDataConnector {
 
 impl GlueDataConnector {
     async fn config(&self) -> Result<SdkConfig, aws::Error> {
-        let config = load_config(
+        let config = initiate_config_with_credentials(
             "GlueCatalogConnector",
             "region",
             "key",
             "secret",
             "session_token",
             &self.params,
-        )
-        .await?;
+        )?
+        .load()
+        .await;
 
         Ok(config)
     }
@@ -239,7 +251,7 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let glue = GlueDataConnector::new(params.parameters);
+            let glue = GlueDataConnector::new(params.parameters, params.io_runtime);
             Ok(Arc::new(glue) as Arc<dyn DataConnector>)
         })
     }
@@ -451,6 +463,7 @@ async fn create_s3_provider(
     mut dataset: Dataset,
     mut params: Parameters,
     table: &Table,
+    tokio_io_runtime: tokio::runtime::Handle,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
     let Some(storage_descriptor) = table.storage_descriptor() else {
         let e = Error::MissingStorageDescriptor {
@@ -502,6 +515,7 @@ async fn create_s3_provider(
     let s3 = S3 {
         params,
         runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+        tokio_io_runtime,
     };
 
     dataset.from = from;

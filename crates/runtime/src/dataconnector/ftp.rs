@@ -102,6 +102,10 @@ impl ListingTableConnector for FTP {
         &self.params
     }
 
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        tokio::runtime::Handle::current()
+    }
+
     fn get_object_store_url(
         &self,
         dataset: &Dataset,

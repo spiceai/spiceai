@@ -19,7 +19,7 @@ use crate::{
     component::{
         dataset::{
             Dataset,
-            acceleration::{Engine, Mode},
+            acceleration::{Acceleration, Engine, Mode},
         },
         view::View,
     },
@@ -57,7 +57,7 @@ use super::{AccelerationSource, DataAccelerator};
 
 pub(crate) mod settings;
 
-const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
+pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -137,7 +137,7 @@ impl DuckDBAccelerator {
                     &source.app(),
                     source.runtime(),
                 );
-                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let max_size = Self::get_pool_max_size(num_accelerating_datasets, acceleration);
                 let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
                     .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
@@ -151,7 +151,7 @@ impl DuckDBAccelerator {
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
-                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let max_size = Self::get_pool_max_size(num_accelerating_datasets, acceleration);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
                     .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
@@ -207,8 +207,14 @@ impl DuckDBAccelerator {
         instance_usage
     }
 
-    fn get_max_size(num_accelerating_datasets: u32) -> u32 {
-        max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets)
+    fn get_pool_max_size(num_accelerating_datasets: u32, acceleration: &Acceleration) -> u32 {
+        let pool_size_param = acceleration
+            .params
+            .get("connection_pool_size")
+            .and_then(|size_str| size_str.parse::<u32>().ok());
+
+        pool_size_param
+            .unwrap_or_else(|| max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets))
     }
 }
 
@@ -268,6 +274,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("index_scan_max_count"),
     ParameterSpec::runtime("partition_mode"),
     ParameterSpec::component("partitioned_write_flush_threshold"),
+    ParameterSpec::runtime("connection_pool_size").description(
+        "The maximum number of client connections created in the duckdb connection pool.",
+    ),
 ];
 
 #[async_trait]
