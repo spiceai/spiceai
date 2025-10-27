@@ -458,7 +458,7 @@ impl Builder {
                     let (start_refresh, on_start_refresh) =
                         mpsc::channel::<Option<RefreshOverrides>>(1);
                     (
-                        refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
+                        refresh::AccelerationRefreshMode::Append(on_start_refresh),
                         Some(start_refresh),
                     )
                 }
