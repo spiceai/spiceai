@@ -107,7 +107,6 @@ pub struct RefreshTaskBuilder {
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
     disable_federation: bool,
-    retention_sql: Option<String>,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
@@ -132,7 +131,6 @@ impl RefreshTaskBuilder {
             federated_source,
             accelerator,
             disable_federation: false,
-            retention_sql: None,
             semaphore: None,
             metrics: None,
             cpu_runtime: None,
@@ -144,13 +142,6 @@ impl RefreshTaskBuilder {
     #[must_use]
     pub fn with_disable_federation(mut self, disable: bool) -> RefreshTaskBuilder {
         self.disable_federation = disable;
-        self
-    }
-
-    /// Sets the `retention_sql` to be executed after inserts in append mode with `on_conflict`
-    #[must_use]
-    pub fn with_retention_sql(mut self, retention_sql: Option<String>) -> RefreshTaskBuilder {
-        self.retention_sql = retention_sql;
         self
     }
 
@@ -177,17 +168,6 @@ impl RefreshTaskBuilder {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
-
-        let sink = if let Some(retention_sql) = &self.retention_sql {
-            Arc::new(RwLock::new(AccelerationSink::new_with_retention_sql(
-                Arc::clone(&self.accelerator),
-                Some(retention_sql.clone()),
-            )))
-        } else {
-            Arc::new(RwLock::new(AccelerationSink::new(Arc::clone(
-                &self.accelerator,
-            ))))
-        };
 
         RefreshTask {
             runtime_status: self.runtime_status,
