@@ -441,10 +441,10 @@ impl Builder {
                     fn try_new(
                         has_time_column: bool,
                         has_primary_key: bool,
-                        has_changes_stream: bool,
+                        has_append_stream: bool,
                     ) -> AcceleratedTableBuilderResult<Self> {
                         // If the data connector supports streaming the append changes (i.e. Kafka Data Connector), then prioritize that.
-                        if has_changes_stream {
+                        if has_append_stream {
                             Ok(AppendMode::ChangesStream)
                         } else if has_time_column || has_primary_key {
                             Ok(AppendMode::TimeColumnOrPrimaryKey)
@@ -459,10 +459,10 @@ impl Builder {
                     !get_primary_keys_from_constraints(constraints, &schema).is_empty()
                 });
                 let has_time_column = self.refresh.time_column.is_some();
-                let has_changes_stream = self.changes_stream.is_some();
+                let has_append_stream = self.append_stream.is_some();
 
                 let append_mode =
-                    AppendMode::try_new(has_time_column, has_primary_key, has_changes_stream)?;
+                    AppendMode::try_new(has_time_column, has_primary_key, has_append_stream)?;
 
                 match append_mode {
                     AppendMode::ChangesStream => {
