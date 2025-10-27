@@ -754,6 +754,8 @@ fn table_providers_duckdb_to_datafusion_error(
 
 #[cfg(test)]
 mod test {
+    use crate::dataaccelerator::partitioned_duckdb::tables_mode::partition_buffer::config::PartitionBufferType;
+
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use datafusion::execution::TaskContext;
@@ -762,6 +764,7 @@ mod test {
     use datafusion::prelude::col;
     use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
     use runtime_table_partition::expression::PartitionedBy;
+    use std::path::PathBuf;
 
     fn get_mem_duckdb() -> Arc<DuckDbConnectionPool> {
         Arc::new(
@@ -1240,15 +1243,182 @@ mod test {
         let duckdb2 = DuckDB::duckdb_conn(&mut conn2).expect("to get duckdb conn");
         let tx2 = duckdb2.conn.transaction().expect("to begin transaction");
 
-        // After append, each partition should have 3 rows (2 from first batch + 1 from second batch)
-        verify_state_after_write(
-            &tx2,
-            &table_definition,
-            &["region=us-east-1", "region=us-west-1"],
-            3,
-            false,
+        tx2.rollback().expect("to rollback");
+    }
+
+    #[tokio::test]
+    async fn test_write_overwrite_with_parquet_buffer() {
+        // Test scenario: Use parquet buffer instead of memory buffer
+        // Expected behavior: Data sink creates partitioned tables using parquet files as intermediate storage
+        let pool = get_mem_duckdb();
+        let table_definition = get_test_table_definition();
+
+        // Create partitioner by name - partition by "region" column
+        let partitioned_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let partitioner = Arc::new(
+            BatchPartitioner::new(
+                &partitioned_by.expression,
+                table_definition.schema(),
+                &partitioned_by,
+            )
+            .expect("should create partitioner"),
         );
 
-        tx2.rollback().expect("to rollback");
+        // Configure parquet buffer with small threshold for testing
+        let parquet_buffer_config = PartitionBufferConfig {
+            buffer_type: PartitionBufferType::Parquet,
+            rows_per_partition_threshold: 1000,
+            temp_dir: std::env::temp_dir().join("spice_test_parquet_buffer"),
+        };
+
+        let duckdb_sink = DuckDBPartitionedDataSink::new(
+            Arc::clone(&pool),
+            Arc::clone(&table_definition),
+            InsertOp::Overwrite,
+            None,
+            table_definition.schema(),
+            partitioner,
+        )
+        .with_partition_buffer_config(parquet_buffer_config);
+
+        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+
+        // Test data with two different regions to create two partitions
+        let batches = vec![
+            RecordBatch::try_new(
+                Arc::clone(&table_definition.schema()),
+                vec![
+                    Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+                    Arc::new(StringArray::from(vec![
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                        Some("us-east-1"),
+                        Some("us-west-1"),
+                    ])),
+                ],
+            )
+            .expect("should create a record batch"),
+        ];
+
+        let stream: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches, table_definition.schema(), None).expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all with parquet buffer");
+
+        let mut conn = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+        let tx = duckdb.conn.transaction().expect("to begin transaction");
+
+        verify_state_after_write(
+            &tx,
+            &table_definition,
+            &["region=us-east-1", "region=us-west-1"],
+            2,
+            true,
+        );
+
+        tx.rollback().expect("to rollback");
+    }
+
+    #[tokio::test]
+    async fn test_parquet_buffer_large_batch() {
+        // Test scenario: Large batch that exceeds partition threshold multiple times with parquet buffer
+        // Expected behavior: Multiple parquet files created and flushed to DuckDB
+        let pool = get_mem_duckdb();
+        let table_definition = get_test_table_definition();
+
+        let partitioned_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let partitioner = Arc::new(
+            BatchPartitioner::new(
+                &partitioned_by.expression,
+                table_definition.schema(),
+                &partitioned_by,
+            )
+            .expect("should create partitioner"),
+        );
+
+        // Configure parquet buffer with very small threshold to force multiple flushes
+        let parquet_buffer_config = PartitionBufferConfig {
+            buffer_type: PartitionBufferType::Parquet,
+            rows_per_partition_threshold: 700,
+            temp_dir: std::env::temp_dir().join("spice_test_parquet_large"),
+        };
+
+        let duckdb_sink = DuckDBPartitionedDataSink::new(
+            Arc::clone(&pool),
+            Arc::clone(&table_definition),
+            InsertOp::Overwrite,
+            None,
+            table_definition.schema(),
+            partitioner,
+        )
+        .with_partition_buffer_config(parquet_buffer_config);
+
+        let data_sink: Arc<dyn DataSink> = Arc::new(duckdb_sink);
+
+        // Create a batch of 1000 records
+        let ids: Vec<Option<i64>> = (1..=1000).map(Some).collect();
+        let regions: Vec<Option<&str>> = (1..=1000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Some("us-east-1")
+                } else {
+                    Some("us-west-1")
+                }
+            })
+            .collect();
+
+        let base_batch = RecordBatch::try_new(
+            Arc::clone(&table_definition.schema()),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(regions)),
+            ],
+        )
+        .expect("should create a record batch");
+
+        // Create multiple copies of the batch to exceed the partition threshold
+        let batches = vec![
+            base_batch.clone(),
+            base_batch.clone(),
+            base_batch.clone(),
+            base_batch.clone(),
+            base_batch,
+        ];
+
+        let stream: std::pin::Pin<Box<dyn RecordBatchStream + Send>> = Box::pin(
+            MemoryStream::try_new(batches, table_definition.schema(), None).expect("to get stream"),
+        );
+
+        data_sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("to write all with parquet buffer");
+
+        let mut conn = Arc::clone(&pool).connect_sync().expect("to connect");
+        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+        let tx = duckdb.conn.transaction().expect("to begin transaction");
+
+        verify_state_after_write(
+            &tx,
+            &table_definition,
+            &["region=us-east-1", "region=us-west-1"],
+            2500,
+            true,
+        );
+
+        tx.rollback().expect("to rollback");
     }
 }

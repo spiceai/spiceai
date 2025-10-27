@@ -126,3 +126,169 @@ impl PartitionBufferConfig {
         config
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_partition_buffer_type_parse_str() {
+        assert_eq!(
+            PartitionBufferType::parse_str("memory"),
+            PartitionBufferType::Memory
+        );
+        assert_eq!(
+            PartitionBufferType::parse_str("Memory"),
+            PartitionBufferType::Memory
+        );
+        assert_eq!(
+            PartitionBufferType::parse_str("MEMORY"),
+            PartitionBufferType::Memory
+        );
+
+        assert_eq!(
+            PartitionBufferType::parse_str("parquet"),
+            PartitionBufferType::Parquet
+        );
+        assert_eq!(
+            PartitionBufferType::parse_str("Parquet"),
+            PartitionBufferType::Parquet
+        );
+        assert_eq!(
+            PartitionBufferType::parse_str("PARQUET"),
+            PartitionBufferType::Parquet
+        );
+
+        // Test unknown/invalid values default to Memory
+        assert_eq!(
+            PartitionBufferType::parse_str("unknown"),
+            PartitionBufferType::Memory
+        );
+        assert_eq!(
+            PartitionBufferType::parse_str(""),
+            PartitionBufferType::Memory
+        );
+        assert_eq!(
+            PartitionBufferType::parse_str("invalid"),
+            PartitionBufferType::Memory
+        );
+    }
+
+    #[test]
+    fn test_partition_buffer_config_default() {
+        let config = PartitionBufferConfig::default();
+        assert_eq!(config.buffer_type, PartitionBufferType::Memory);
+        assert_eq!(
+            config.rows_per_partition_threshold,
+            ROWS_PER_PARTITION_BUFFER
+        );
+        assert_eq!(config.temp_dir, PathBuf::from(spice_data_base_path()));
+    }
+
+    #[test]
+    fn test_config_from_params_empty() {
+        let config = PartitionBufferConfig::from_params(None);
+        assert_eq!(config.buffer_type, PartitionBufferType::Memory);
+        assert_eq!(
+            config.rows_per_partition_threshold,
+            ROWS_PER_PARTITION_BUFFER
+        );
+        assert_eq!(config.temp_dir, PathBuf::from(spice_data_base_path()));
+    }
+
+    #[test]
+    fn test_config_from_params_parquet_buffer() {
+        let mut params = HashMap::new();
+        params.insert(
+            "partitioned_write_buffer".to_string(),
+            "parquet".to_string(),
+        );
+
+        let config = PartitionBufferConfig::from_params(Some(&params));
+        assert_eq!(config.buffer_type, PartitionBufferType::Parquet);
+        assert_eq!(
+            config.rows_per_partition_threshold,
+            ROWS_PER_PARTITION_BUFFER
+        );
+    }
+
+    #[test]
+    fn test_config_from_params_custom_threshold() {
+        let mut params = HashMap::new();
+        params.insert(
+            "duckdb_partitioned_write_flush_threshold".to_string(),
+            "50000".to_string(),
+        );
+
+        let config = PartitionBufferConfig::from_params(Some(&params));
+        assert_eq!(config.rows_per_partition_threshold, 50000);
+        assert_eq!(config.buffer_type, PartitionBufferType::Memory);
+    }
+
+    #[test]
+    fn test_config_from_params_invalid_threshold() {
+        let mut params = HashMap::new();
+        params.insert(
+            "duckdb_partitioned_write_flush_threshold".to_string(),
+            "not_a_number".to_string(),
+        );
+
+        let config = PartitionBufferConfig::from_params(Some(&params));
+        // Should fallback to default when invalid
+        assert_eq!(
+            config.rows_per_partition_threshold,
+            ROWS_PER_PARTITION_BUFFER
+        );
+    }
+
+    #[test]
+    fn test_config_from_params_duckdb_data_dir() {
+        let mut params = HashMap::new();
+        params.insert(
+            "duckdb_data_dir".to_string(),
+            "/custom/data/dir".to_string(),
+        );
+
+        let config = PartitionBufferConfig::from_params(Some(&params));
+        assert_eq!(config.temp_dir, PathBuf::from("/custom/data/dir"));
+    }
+
+    #[test]
+    fn test_config_from_params_duckdb_file() {
+        let mut params = HashMap::new();
+        params.insert(
+            "duckdb_file".to_string(),
+            "/path/to/database/my.duckdb".to_string(),
+        );
+
+        let config = PartitionBufferConfig::from_params(Some(&params));
+        assert_eq!(config.temp_dir, PathBuf::from("/path/to/database"));
+    }
+
+    #[test]
+    fn test_config_from_params_duckdb_file_root() {
+        let mut params = HashMap::new();
+        params.insert("duckdb_file".to_string(), "/my.duckdb".to_string());
+
+        let config = PartitionBufferConfig::from_params(Some(&params));
+        assert_eq!(config.temp_dir, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn test_config_from_params_priority_data_dir_over_file() {
+        let mut params = HashMap::new();
+        params.insert(
+            "duckdb_data_dir".to_string(),
+            "/priority/data/dir".to_string(),
+        );
+        params.insert(
+            "duckdb_file".to_string(),
+            "/secondary/path/db.duckdb".to_string(),
+        );
+
+        let config = PartitionBufferConfig::from_params(Some(&params));
+        // duckdb_data_dir should take priority over duckdb_file
+        assert_eq!(config.temp_dir, PathBuf::from("/priority/data/dir"));
+    }
+}
