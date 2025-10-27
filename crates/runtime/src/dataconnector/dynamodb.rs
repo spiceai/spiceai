@@ -141,7 +141,7 @@ impl DataConnector for DynamoDB {
         let schema_infer_max_records = i32::from_str(schema_infer_max_records_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
             dataconnector: "dynamodb".to_string(),
             message: format!(
-                "DynamoDB parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
+                "DynamoDB parameter 'schema_infer_max_records' must be an integer, not {schema_infer_max_records_str}"),
             connector_component: ConnectorComponent::from(dataset)
         })?;
 
