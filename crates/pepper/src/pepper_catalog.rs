@@ -485,9 +485,42 @@ impl MetadataCatalog for PepperCatalog {
         Ok(vec![])
     }
 
-    async fn get_table_delete_files(&self, _table_id: i64) -> CatalogResult<Vec<DeleteFile>> {
-        // Implementation would query all delete files for table
-        Ok(vec![])
+    async fn get_table_delete_files(&self, table_id: i64) -> CatalogResult<Vec<DeleteFile>> {
+        let db_path_owned = self.db_path().to_string();
+
+        let blocking_result = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+
+            let mut stmt = conn.prepare(
+                "SELECT delete_file_id, table_id, data_file_id, path, path_is_relative, 
+                        format, delete_count, file_size_bytes 
+                 FROM pepper_delete_file 
+                 WHERE table_id = ?1",
+            )?;
+
+            let delete_files = stmt
+                .query_map([table_id], |row| {
+                    Ok(DeleteFile {
+                        delete_file_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        data_file_id: row.get(2)?,
+                        path: row.get(3)?,
+                        path_is_relative: row.get(4)?,
+                        format: row.get(5)?,
+                        delete_count: row.get(6)?,
+                        file_size_bytes: row.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok::<_, rusqlite::Error>(delete_files)
+        })
+        .await?;
+
+        Ok(blocking_result?)
     }
 
     async fn get_table_stats(&self, _table_id: i64) -> CatalogResult<TableStats> {

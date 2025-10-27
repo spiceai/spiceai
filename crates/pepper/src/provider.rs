@@ -57,6 +57,196 @@ use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 use vortex_datafusion::VortexFormat;
 
+/// Execution plan that filters out deleted rows based on deletion vectors.
+///
+/// This wraps another execution plan and removes rows whose positions
+/// match the deleted row IDs loaded from deletion vector files.
+struct DeletionFilterExec {
+    input: Arc<dyn ExecutionPlan>,
+    deleted_row_ids: std::collections::HashSet<i64>,
+    properties: datafusion_physical_plan::PlanProperties,
+}
+
+impl DeletionFilterExec {
+    fn new(input: Arc<dyn ExecutionPlan>, deleted_row_ids: std::collections::HashSet<i64>) -> Self {
+        let properties = input.properties().clone();
+        Self {
+            input,
+            deleted_row_ids,
+            properties,
+        }
+    }
+}
+
+impl std::fmt::Debug for DeletionFilterExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DeletionFilterExec")
+    }
+}
+
+impl DisplayAs for DeletionFilterExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "DeletionFilterExec: filtered_rows={}",
+            self.deleted_row_ids.len()
+        )
+    }
+}
+
+impl ExecutionPlan for DeletionFilterExec {
+    fn name(&self) -> &'static str {
+        "DeletionFilterExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(datafusion_common::DataFusionError::Plan(
+                "DeletionFilterExec requires exactly 1 child".to_string(),
+            ));
+        }
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            self.deleted_row_ids.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion_execution::TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let deleted_row_ids = self.deleted_row_ids.clone();
+        let schema = input_stream.schema();
+
+        Ok(Box::pin(DeletionFilterStream {
+            input: input_stream,
+            deleted_row_ids,
+            schema,
+            global_row_offset: 0,
+        }))
+    }
+}
+
+/// Stream that filters out deleted rows from an input stream.
+struct DeletionFilterStream {
+    input: SendableRecordBatchStream,
+    deleted_row_ids: std::collections::HashSet<i64>,
+    schema: arrow_schema::SchemaRef,
+    global_row_offset: i64,
+}
+
+impl futures::Stream for DeletionFilterStream {
+    type Item = datafusion_common::Result<arrow::array::RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            match std::pin::Pin::new(&mut self.input).poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(batch))) => {
+                    let current_offset = self.global_row_offset;
+                    let batch_size = batch.num_rows();
+                    self.global_row_offset += batch_size as i64;
+
+                    tracing::debug!(
+                        "DeletionFilterStream: processing batch with {} rows, offset {}, deleted_ids: {:?}",
+                        batch_size, current_offset, self.deleted_row_ids
+                    );
+
+                    // Find which rows in this batch should be kept
+                    let mut keep_indices = Vec::new();
+                    for row_idx in 0..batch_size {
+                        let global_row_id = current_offset + row_idx as i64;
+                        if !self.deleted_row_ids.contains(&global_row_id) {
+                            keep_indices.push(row_idx as u64);
+                        }
+                    }
+
+                    tracing::debug!(
+                        "DeletionFilterStream: keeping {} of {} rows",
+                        keep_indices.len(),
+                        batch_size
+                    );
+
+                    // If all rows are deleted, skip this batch and continue to next
+                    if keep_indices.is_empty() {
+                        continue;
+                    }
+
+                    // If no rows are deleted, return the batch as-is
+                    if keep_indices.len() == batch_size {
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+
+                    // Filter the batch using take kernel
+                    let indices = arrow::array::UInt64Array::from(keep_indices);
+                    let filtered_columns: datafusion_common::Result<Vec<_>> = batch
+                        .columns()
+                        .iter()
+                        .map(|col| {
+                            arrow::compute::take(col.as_ref(), &indices, None).map_err(|e| {
+                                datafusion_common::DataFusionError::ArrowError(Box::new(e), None)
+                            })
+                        })
+                        .collect();
+
+                    match filtered_columns {
+                        Ok(columns) => {
+                            match arrow::array::RecordBatch::try_new(batch.schema(), columns) {
+                                Ok(filtered_batch) => {
+                                    return std::task::Poll::Ready(Some(Ok(filtered_batch)));
+                                }
+                                Err(e) => {
+                                    return std::task::Poll::Ready(Some(Err(
+                                        datafusion_common::DataFusionError::ArrowError(
+                                            Box::new(e),
+                                            None,
+                                        ),
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => return std::task::Poll::Ready(Some(Err(e))),
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                std::task::Poll::Ready(None) => {
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Pending => {
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl datafusion_execution::RecordBatchStream for DeletionFilterStream {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 /// Pepper table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -70,7 +260,7 @@ pub struct PepperTableProvider {
     /// Table metadata from the catalog
     table_metadata: TableMetadata,
     /// Reference to the metadata catalog for file operations
-    _catalog: Arc<dyn MetadataCatalog>,
+    catalog: Arc<dyn MetadataCatalog>,
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
@@ -79,6 +269,9 @@ pub struct PepperTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    /// Whether retention SQL is configured. When true, we apply deletion vectors during scans.
+    /// When false (for full/append refreshes without retention), we skip the overhead.
+    retention_enabled: bool,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -195,8 +388,9 @@ impl PepperTableProvider {
 
         Ok(Self {
             table_metadata,
-            _catalog: catalog,
+            catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
+            retention_enabled: false, // Default to false, can be updated via with_retention_enabled()
         })
     }
 
@@ -211,6 +405,31 @@ impl PepperTableProvider {
     ) -> CatalogResult<Self> {
         let _table_id = catalog.create_table(options.clone()).await?;
         Self::new(&options.table_name, catalog).await
+    }
+
+    /// Enable retention-based deletion vector filtering during scans.
+    ///
+    /// When enabled, the table provider will load and apply deletion vectors
+    /// at scan time to filter out deleted rows. This should only be enabled
+    /// when `retention_sql` is configured, as it adds overhead.
+    #[must_use]
+    pub fn with_retention_enabled(mut self, enabled: bool) -> Self {
+        self.retention_enabled = enabled;
+        self
+    }
+
+    /// Check if retention-based deletion vector filtering is enabled.
+    #[must_use]
+    pub fn is_retention_enabled(&self) -> bool {
+        self.retention_enabled
+    }
+
+    /// Get a reference to the catalog.
+    ///
+    /// This is useful for testing and advanced use cases that need direct catalog access.
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<dyn MetadataCatalog> {
+        &self.catalog
     }
 
     /// Get the table metadata.
@@ -501,6 +720,79 @@ impl PepperTableProvider {
 
         Ok(())
     }
+
+    /// Read deletion vectors from files and return a set of deleted row IDs.
+    async fn read_deletion_vectors(
+        &self,
+        delete_files: &[super::metadata::DeleteFile],
+    ) -> datafusion_common::Result<std::collections::HashSet<i64>> {
+        use arrow::array::Array;
+        use arrow::ipc::reader::FileReader;
+        use std::collections::HashSet;
+
+        let mut deleted_row_ids = HashSet::new();
+
+        tracing::debug!(
+            "read_deletion_vectors: processing {} delete files",
+            delete_files.len()
+        );
+
+        for delete_file in delete_files {
+            let path = std::path::Path::new(&delete_file.path);
+            tracing::debug!("read_deletion_vectors: reading file {:?}", path);
+
+            // Read deletion vector file
+            let file = std::fs::File::open(path).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to open deletion vector file {:?}: {e}",
+                    path
+                ))
+            })?;
+
+            let reader = FileReader::try_new(file, None).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read deletion vector file {:?}: {e}",
+                    path
+                ))
+            })?;
+
+            // Read all batches and extract row IDs
+            for batch_result in reader {
+                let batch = batch_result.map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to read batch from deletion vector: {e}"
+                    ))
+                })?;
+
+                // Get row_id column (first column)
+                let row_id_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "Expected Int64Array for row_id column".to_string(),
+                        )
+                    })?;
+
+                // Add all row IDs to the set
+                for i in 0..row_id_array.len() {
+                    if !row_id_array.is_null(i) {
+                        let row_id = row_id_array.value(i);
+                        deleted_row_ids.insert(row_id);
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Loaded {} deleted row IDs from {} deletion vector files",
+            deleted_row_ids.len(),
+            delete_files.len()
+        );
+
+        Ok(deleted_row_ids)
+    }
 }
 
 #[async_trait]
@@ -528,15 +820,7 @@ impl TableProvider for PepperTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // TODO: Apply deletion vectors during scan
-        // 1. Load all deletion files for this table from catalog
-        // 2. Build a set of deleted row IDs from all deletion vectors
-        // 3. Wrap the execution plan with a filter that excludes deleted rows
-        //
-        // For now, we just delegate to the underlying listing table.
-        // Deleted rows will not be filtered out until this is implemented.
-
-        // Delegate to the underlying listing table
+        // Delegate to the underlying listing table first
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
             let guard = self.listing_table.read().map_err(|e| {
@@ -546,7 +830,44 @@ impl TableProvider for PepperTableProvider {
             })?;
             Arc::clone(&guard)
         };
-        listing_table.scan(state, projection, filters, limit).await
+        let plan = listing_table
+            .scan(state, projection, filters, limit)
+            .await?;
+
+        // Only apply deletion vector filtering if retention is enabled
+        if self.retention_enabled {
+            // Load deletion vectors from catalog
+            let delete_files = self
+                .catalog
+                .get_table_delete_files(self.table_metadata.table_id)
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to load deletion vectors: {e}"
+                    ))
+                })?;
+
+            // If there are any deletion vectors, load and apply filtering
+            if !delete_files.is_empty() {
+                let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
+                tracing::debug!(
+                    "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
+                    delete_files.len(),
+                    total_deleted,
+                    self.table_metadata.table_name
+                );
+
+                // Read all deletion vectors and build a set of deleted row IDs
+                let deleted_row_ids = self.read_deletion_vectors(&delete_files).await?;
+
+                if !deleted_row_ids.is_empty() {
+                    // Wrap the plan with our deletion filter
+                    return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+                }
+            }
+        }
+
+        Ok(plan)
     }
 
     fn supports_filters_pushdown(
@@ -629,7 +950,7 @@ impl TableProvider for PepperTableProvider {
                 .await?;
 
             // Update the catalog to point to the new snapshot
-            self._catalog
+            self.catalog
                 .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
                 .await
                 .map_err(|e| {
@@ -696,7 +1017,7 @@ impl DeletionTableProvider for PepperTableProvider {
         Ok(Arc::new(DeletionExec::new(
             Arc::new(PepperDeletionSink::new(
                 self.table_metadata.clone(),
-                Arc::clone(&self._catalog),
+                Arc::clone(&self.catalog),
                 Arc::clone(&self.listing_table),
                 Arc::clone(&self.table_metadata.schema),
                 filters,
@@ -741,13 +1062,17 @@ impl PepperDeletionSink {
         ]))
     }
 
-    /// Write deletion vector to a Vortex file.
+    /// Write deletion vector to a file.
+    ///
+    /// Currently writes as Arrow IPC format for simplicity and compatibility.
+    /// Row IDs represent the logical position of rows in the table (0-indexed).
     async fn write_deletion_vector(
         &self,
         row_ids: Vec<i64>,
         output_path: &std::path::Path,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         use arrow::array::{Int64Array, RecordBatch};
+        use arrow::ipc::writer::FileWriter;
 
         if row_ids.is_empty() {
             return Ok(0);
@@ -762,7 +1087,7 @@ impl PepperDeletionSink {
 
         // Create RecordBatch
         let schema = Self::deletion_vector_schema();
-        let _batch = RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(row_id_array) as Arc<dyn arrow::array::Array>,
@@ -775,14 +1100,18 @@ impl PepperDeletionSink {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // TODO: Write to actual Vortex file format
-        // For now, we'll write as Arrow IPC (similar format) which Vortex can read
-        // This requires implementing VortexFormat file writing, which will be added
-        // in a future iteration. For now, we just create the deletion metadata.
+        // Write as Arrow IPC file format
+        let file = std::fs::File::create(output_path)?;
+        let mut writer = FileWriter::try_new(file, &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
 
-        tracing::info!(
-            "Deletion vector created (not yet persisted to Vortex file): {} row(s) at {:?}",
+        let file_size = tokio::fs::metadata(output_path).await?.len();
+
+        tracing::debug!(
+            "Deletion vector written: {} row(s), {} bytes at {:?}",
             deleted_count,
+            file_size,
             output_path
         );
 
@@ -832,6 +1161,12 @@ impl DeletionSink for PepperDeletionSink {
                 .write_deletion_vector(row_ids, &deletion_vector_path)
                 .await?;
 
+            // Get file size
+            let file_size = tokio::fs::metadata(&deletion_vector_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+
             // Register deletion file in catalog
             let delete_file = super::metadata::DeleteFile {
                 delete_file_id: 0, // Will be assigned by catalog
@@ -839,9 +1174,9 @@ impl DeletionSink for PepperDeletionSink {
                 data_file_id: 0, // Applies to all data files
                 path: deletion_vector_path.to_string_lossy().to_string(),
                 path_is_relative: false,
-                format: "vortex".to_string(),
+                format: "arrow_ipc".to_string(),
                 delete_count: deleted_count as i64,
-                file_size_bytes: 0, // Will be calculated
+                file_size_bytes: file_size as i64,
             };
 
             self.catalog
@@ -899,14 +1234,20 @@ impl DeletionSink for PepperDeletionSink {
         let deleted_count = row_ids.len() as u64;
 
         if deleted_count > 0 {
-            // Write deletion vector to a Vortex file
+            // Write deletion vector to a file
             let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
                 .join(&self.table_metadata.current_snapshot_id)
                 .join("deletions")
-                .join(format!("delete_{}.vortex", uuid::Uuid::now_v7()));
+                .join(format!("delete_{}.arrow", uuid::Uuid::now_v7()));
 
             self.write_deletion_vector(row_ids, &deletion_vector_path)
                 .await?;
+
+            // Get file size
+            let file_size = tokio::fs::metadata(&deletion_vector_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
 
             // Register deletion file in catalog
             let delete_file = super::metadata::DeleteFile {
@@ -915,9 +1256,9 @@ impl DeletionSink for PepperDeletionSink {
                 data_file_id: 0, // Applies to all data files for now
                 path: deletion_vector_path.to_string_lossy().to_string(),
                 path_is_relative: false,
-                format: "vortex".to_string(),
+                format: "arrow_ipc".to_string(),
                 delete_count: deleted_count as i64,
-                file_size_bytes: 0, // Will be calculated
+                file_size_bytes: file_size as i64,
             };
 
             self.catalog
