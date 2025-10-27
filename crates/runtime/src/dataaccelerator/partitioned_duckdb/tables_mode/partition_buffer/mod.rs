@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! This module provides different buffering strategies for partitioned data:
 //! - Memory-based buffering for smaller datasets
-//! - Parquest file-based buffering for larger datasets with better memory efficiency and faster ingestion.
+//! - Parquet file-based buffering for larger datasets with better memory efficiency and faster ingestion.
 //!
 
 use std::fmt;
