@@ -62,15 +62,26 @@ pub struct DynamoDBTableProvider {
     client: Arc<Client>,
     table_schema: DynamoDBTableSchema,
     request_plan_builder: DynamoDBRequestPlanBuilder,
+    unnest_depth: Option<usize>,
 }
 
 type DynamoDBItemStream =
     dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
 
 impl DynamoDBTableProvider {
-    pub async fn try_new(client: Arc<Client>, table_name: Arc<str>) -> Result<Self, Error> {
-        let (table_schema, partition_key, sort_key) =
-            Self::fetch_table_metadata(Arc::clone(&client), &table_name).await?;
+    pub async fn try_new(
+        client: Arc<Client>,
+        table_name: Arc<str>,
+        unnest_depth: Option<usize>,
+        schema_infer_max_records: i32,
+    ) -> Result<Self, Error> {
+        let (table_schema, partition_key, sort_key) = Self::fetch_table_metadata(
+            Arc::clone(&client),
+            &table_name,
+            unnest_depth,
+            schema_infer_max_records,
+        )
+        .await?;
 
         let table_schema =
             DynamoDBTableSchema::new(table_name, table_schema, partition_key, sort_key);
@@ -78,12 +89,15 @@ impl DynamoDBTableProvider {
             client,
             table_schema: table_schema.clone(),
             request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
+            unnest_depth,
         })
     }
 
     async fn fetch_table_metadata(
         client: Arc<Client>,
         table_name: &str,
+        unnest_depth: Option<usize>,
+        schema_infer_max_records: i32,
     ) -> Result<(SchemaRef, String, Option<String>)> {
         let response = client
             .describe_table()
@@ -122,14 +136,12 @@ impl DynamoDBTableProvider {
         }
 
         let Some(partition_key) = partition_key else {
-            unreachable!("Table must have a partition key")
+            unreachable!("Partition keys are enforced by DynamoDB")
         };
 
         let mut request = client.scan().table_name(table_name);
 
-        if let Some(limit) = Some(10) {
-            request = request.limit(limit);
-        }
+        request = request.limit(schema_infer_max_records);
 
         let items: Vec<_> = request
             .send()
@@ -139,7 +151,7 @@ impl DynamoDBTableProvider {
             .items()
             .to_vec();
 
-        let unnested_items = match Some(1) {
+        let unnested_items = match unnest_depth {
             None | Some(0) => items,
             Some(unnest_depth) => unnest_dynamodb_items(items, unnest_depth)?,
         };
@@ -191,6 +203,7 @@ impl TableProvider for DynamoDBTableProvider {
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             Arc::clone(&self.client),
             request_plan,
+            self.unnest_depth,
             projected_schema,
         )))
     }
@@ -207,6 +220,7 @@ pub struct DynamoDBTableProviderExec {
     client: Arc<Client>,
     request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
+    unnest_depth: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -215,12 +229,14 @@ impl DynamoDBTableProviderExec {
     pub fn new(
         client: Arc<Client>,
         request_plan: DynamoDBRequestPlan,
+        unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
     ) -> Self {
         Self {
             client,
             request_plan,
             projected_schema: Arc::clone(&projected_schema),
+            unnest_depth,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
@@ -282,7 +298,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let schema = Arc::clone(&self.projected_schema);
         let client = Arc::clone(&self.client);
         let request_plan = self.request_plan.clone();
-        let unnest_depth = Some(1);
+        let unnest_depth = self.unnest_depth;
 
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
