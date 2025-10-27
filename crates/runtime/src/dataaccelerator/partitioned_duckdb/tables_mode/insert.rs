@@ -33,7 +33,8 @@ use datafusion_datasource::sink::DataSinkExec;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_optimizer_rules::pass_thru::PassThruExec;
 use datafusion_table_providers::{
-    duckdb::TableDefinition, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
+    duckdb::{TableDefinition, write_settings::DuckDBWriteSettings},
+    sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
     util::on_conflict::OnConflict,
 };
 use futures::StreamExt;
@@ -53,6 +54,7 @@ pub struct DuckDBPartitionedInsertStrategy {
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
     rows_per_partition_buffer: Option<usize>,
+    write_settings: DuckDBWriteSettings,
 }
 
 impl DuckDBPartitionedInsertStrategy {
@@ -65,11 +67,29 @@ impl DuckDBPartitionedInsertStrategy {
     ) -> Self {
         let rows_per_partition_buffer = get_rows_per_partition_buffer(source);
 
+        let write_settings = if let Some(acceleration) = source.acceleration() {
+            let mut params = acceleration.params.clone();
+
+            // Translate Spice parameter to DuckDB write setting
+            if let Some(recompute_statistics_value) =
+                params.remove("on_refresh_recompute_statistics")
+            {
+                params.insert(
+                    "recompute_statistics_on_write".to_string(),
+                    recompute_statistics_value,
+                );
+            }
+            DuckDBWriteSettings::from_params(&params)
+        } else {
+            DuckDBWriteSettings::default()
+        };
+
         Self {
             pool,
             table_definition,
             on_conflict,
             rows_per_partition_buffer,
+            write_settings,
         }
     }
 
@@ -172,7 +192,8 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             self.on_conflict.clone(),
             schema,
             partitioner,
-        );
+        )
+        .with_write_settings(self.write_settings.clone());
 
         // Apply the buffer size configuration if available
         if let Some(buffer_size) = self.rows_per_partition_buffer {

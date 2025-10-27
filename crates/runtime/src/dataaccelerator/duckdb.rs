@@ -268,6 +268,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("index_scan_max_count"),
     ParameterSpec::runtime("partition_mode"),
     ParameterSpec::component("partitioned_write_flush_threshold"),
+    ParameterSpec::runtime("on_refresh_recompute_statistics"),
 ];
 
 #[async_trait]
@@ -351,6 +352,12 @@ impl DataAccelerator for DuckDBAccelerator {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
+        }
+
+        if let Some(recompute_statistics_on_write) = cmd.options.remove("on_refresh_recompute_statistics") {
+            // Translate Spice parameter to DuckDB write setting
+            cmd.options
+                .insert("recompute_statistics_on_write".to_string(), recompute_statistics_on_write.to_string());
         }
 
         // Modify the `cmd` by adding options to attach other databases

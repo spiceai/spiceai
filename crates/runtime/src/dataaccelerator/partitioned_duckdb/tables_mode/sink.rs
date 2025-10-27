@@ -25,6 +25,7 @@ use datafusion::{
     physical_plan::{DisplayAs, DisplayFormatType, metrics::MetricsSet},
 };
 use datafusion_table_providers::duckdb::write::execute_analyze_sql;
+use datafusion_table_providers::duckdb::write_settings::DuckDBWriteSettings;
 use datafusion_table_providers::duckdb::{
     DuckDB, RelationName, TableDefinition, TableManager, ViewCreator,
 };
@@ -92,6 +93,7 @@ pub struct DuckDBPartitionedDataSink {
     schema: SchemaRef,
     partitioner: Arc<BatchPartitioner>,
     rows_per_partition_buffer: Option<usize>,
+    write_settings: DuckDBWriteSettings,
 }
 
 #[async_trait]
@@ -118,6 +120,7 @@ impl DataSink for DuckDBPartitionedDataSink {
         let table_definition = Arc::clone(&self.table_definition);
         let overwrite = self.overwrite;
         let on_conflict = self.on_conflict.clone();
+        let write_settings = self.write_settings.clone();
 
         let (batch_tx, batch_rx): (
             Sender<(String, Vec<RecordBatch>)>,
@@ -139,6 +142,7 @@ impl DataSink for DuckDBPartitionedDataSink {
                         on_conflict.as_ref(),
                         on_commit_transaction,
                         &schema,
+                        &write_settings,
                     )?,
                     InsertOp::Append | InsertOp::Replace => insert_append(
                         pool,
@@ -147,6 +151,7 @@ impl DataSink for DuckDBPartitionedDataSink {
                         on_conflict.as_ref(),
                         on_commit_transaction,
                         &schema,
+                        &write_settings,
                     )?,
                 };
 
@@ -291,6 +296,7 @@ impl DuckDBPartitionedDataSink {
             schema,
             partitioner,
             rows_per_partition_buffer: None,
+            write_settings: DuckDBWriteSettings::default(),
         }
     }
 
@@ -304,6 +310,16 @@ impl DuckDBPartitionedDataSink {
     #[must_use]
     pub fn with_rows_per_partition_buffer(mut self, rows_per_partition_buffer: usize) -> Self {
         self.rows_per_partition_buffer = Some(rows_per_partition_buffer);
+        self
+    }
+
+    /// Sets the write settings for controlling DuckDB write behavior.
+    ///
+    /// # Arguments
+    /// * `write_settings` - DuckDB write settings including ANALYZE control
+    #[must_use]
+    pub fn with_write_settings(mut self, write_settings: DuckDBWriteSettings) -> Self {
+        self.write_settings = write_settings;
         self
     }
 }
@@ -328,6 +344,7 @@ fn insert_overwrite(
     on_conflict: Option<&OnConflict>,
     mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
+    write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
     let cloned_pool = Arc::clone(&pool);
     let mut db_conn = pool
@@ -379,7 +396,9 @@ fn insert_overwrite(
                     .map_err(to_retriable_data_write_error)
             })?;
 
-        execute_analyze_sql(&tx, &new_table.table_name().to_string());
+        if write_settings.recompute_statistics_on_write {
+            execute_analyze_sql(&tx, &new_table.table_name().to_string());
+        }
 
         // partition still exists so should NOT be deleted
         candidates_to_drop.remove(&new_table.definition_name().to_string());
@@ -427,6 +446,7 @@ fn insert_append(
     on_conflict: Option<&OnConflict>,
     mut on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
+    write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
     let cloned_pool = Arc::clone(&pool);
     let mut db_conn = pool
@@ -458,8 +478,10 @@ fn insert_append(
     )
     .map_err(to_retriable_data_write_error)?;
 
-    for table in &tables {
-        execute_analyze_sql(&tx, &table.table_name().to_string());
+    if write_settings.recompute_statistics_on_write {
+        for table in &tables {
+            execute_analyze_sql(&tx, &table.table_name().to_string());
+        }
     }
 
     on_commit_transaction
