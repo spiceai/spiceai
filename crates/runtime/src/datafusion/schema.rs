@@ -14,81 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use crate::embeddings::table::EmbeddingTable;
 use arrow_schema::SchemaRef;
-use async_trait::async_trait;
-use dashmap::DashMap;
 use datafusion::{
-    catalog::SchemaProvider,
-    datasource::TableProvider,
-    error::{DataFusionError, Result},
-    execution::context::SessionContext,
+    datasource::TableProvider, error::Result, execution::context::SessionContext,
     sql::TableReference,
 };
+use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use snafu::prelude::*;
-
-// Copy of default MemorySchemaProvider that allows `register_table` to atomically overwrite any existing tables
-// https://github.com/apache/datafusion/blob/deebda78a34251b2bddf0c5f66edfaa112c4559b/datafusion/core/src/catalog/schema.rs#L84
-#[derive(Debug)]
-pub struct SpiceSchemaProvider {
-    tables: DashMap<String, Arc<dyn TableProvider>>,
-}
-
-impl SpiceSchemaProvider {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            tables: DashMap::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn table_sync(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        self.tables.get(name).map(|table| Arc::clone(table.value()))
-    }
-}
-
-impl Default for SpiceSchemaProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl SchemaProvider for SpiceSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn table_names(&self) -> Vec<String> {
-        self.tables
-            .iter()
-            .map(|table| table.key().clone())
-            .collect()
-    }
-
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        Ok(self.table_sync(name))
-    }
-
-    fn register_table(
-        &self,
-        name: String,
-        table: Arc<dyn TableProvider>,
-    ) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.insert(name, table))
-    }
-
-    fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.remove(name).map(|(_, table)| table))
-    }
-
-    fn table_exist(&self, name: &str) -> bool {
-        self.tables.contains_key(name)
-    }
-}
 
 #[allow(clippy::result_large_err)]
 pub(crate) fn ensure_schema_exists(

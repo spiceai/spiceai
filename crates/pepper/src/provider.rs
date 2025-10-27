@@ -89,6 +89,86 @@ impl std::fmt::Debug for PepperTableProvider {
 }
 
 impl PepperTableProvider {
+    /// Construct the path to a snapshot directory.
+    ///
+    /// Directory structure: `[table_path]/[table_id]/[snapshot_id]/`
+    ///
+    /// # Arguments
+    ///
+    /// * `table_path` - The base path for the table
+    /// * `table_id` - The unique identifier for the table
+    /// * `snapshot_id` - The snapshot identifier
+    fn snapshot_dir_path(table_path: &str, table_id: i64, snapshot_id: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(table_path)
+            .join(table_id.to_string())
+            .join(snapshot_id)
+    }
+
+    /// Convert a directory path to a `DataFusion`-compatible URL string with trailing slash.
+    ///
+    /// `DataFusion` requires directory URLs to end with a trailing slash.
+    fn dir_to_url_string(dir: &std::path::Path) -> String {
+        let mut url_str = dir.to_string_lossy().to_string();
+        if !url_str.ends_with('/') {
+            url_str.push('/');
+        }
+        url_str
+    }
+
+    /// Create a new `ListingTable` for a snapshot directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot_dir` - Path to the snapshot directory
+    /// * `schema` - Arrow schema for the table
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table cannot be created.
+    fn create_listing_table(
+        snapshot_dir: &std::path::Path,
+        schema: SchemaRef,
+    ) -> CatalogResult<Arc<ListingTable>> {
+        let dir_url_str = Self::dir_to_url_string(snapshot_dir);
+
+        let table_url = ListingTableUrl::parse(&dir_url_str).map_err(|e| {
+            super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to parse table URL: {e}"),
+            }
+        })?;
+
+        let format = Arc::new(VortexFormat::default());
+        let listing_options = ListingOptions::new(format);
+
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(listing_options)
+            .with_schema(schema);
+
+        let listing_table = ListingTable::try_new(config).map_err(|e| {
+            super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to create listing table: {e}"),
+            }
+        })?;
+
+        Ok(Arc::new(listing_table))
+    }
+
+    /// Ensure a snapshot directory exists, creating it if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created.
+    async fn ensure_snapshot_dir_exists(
+        snapshot_dir: &std::path::Path,
+    ) -> datafusion_common::Result<()> {
+        if !snapshot_dir.exists() {
+            tokio::fs::create_dir_all(snapshot_dir)
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
     /// Create a new Pepper table provider.
     ///
     /// # Errors
@@ -101,39 +181,21 @@ impl PepperTableProvider {
         // Construct path to current snapshot
         // Directory structure: [table_path]/[table_id]/[snapshot_id]/
         // All tables have a snapshot ID (created on table initialization)
-        let snapshot_dir = std::path::PathBuf::from(&table_metadata.path)
-            .join(table_metadata.table_id.to_string())
-            .join(&table_metadata.current_snapshot_id);
+        let snapshot_dir = Self::snapshot_dir_path(
+            &table_metadata.path,
+            table_metadata.table_id,
+            &table_metadata.current_snapshot_id,
+        );
 
-        // DataFusion requires trailing slash for directory URLs
-        let mut dir_url_str = snapshot_dir.to_string_lossy().to_string();
-        if !dir_url_str.ends_with('/') {
-            dir_url_str.push('/');
-        }
-
-        let table_url = ListingTableUrl::parse(&dir_url_str).map_err(|e| {
-            super::catalog::CatalogError::InvalidOperation {
-                message: e.to_string(),
-            }
-        })?;
-
-        let format = Arc::new(VortexFormat::default());
-        let listing_options = ListingOptions::new(format);
-
-        let config = ListingTableConfig::new(table_url)
-            .with_listing_options(listing_options)
-            .with_schema(Arc::<arrow_schema::Schema>::clone(&table_metadata.schema));
-
-        let listing_table = ListingTable::try_new(config).map_err(|e| {
-            super::catalog::CatalogError::InvalidOperation {
-                message: e.to_string(),
-            }
-        })?;
+        let listing_table = Self::create_listing_table(
+            &snapshot_dir,
+            Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
+        )?;
 
         Ok(Self {
             table_metadata,
             _catalog: catalog,
-            listing_table: Arc::new(RwLock::new(Arc::new(listing_table))),
+            listing_table: Arc::new(RwLock::new(listing_table)),
         })
     }
 
@@ -356,6 +418,11 @@ impl PepperTableProvider {
 
         tracing::debug!("Insert completed, wrote {} rows to Vortex", row_count);
 
+        // Refresh the listing table to pick up new files and update statistics
+        // This ensures that query plans have access to up-to-date table statistics
+        // after the insert operation completes
+        self.refresh_listing_table()?;
+
         Ok(row_count)
     }
 
@@ -393,6 +460,45 @@ impl PepperTableProvider {
         Err(super::catalog::CatalogError::InvalidOperation {
             message: "Update not yet implemented".to_string(),
         })
+    }
+
+    /// Refresh the underlying `ListingTable` to pick up new files and update statistics.
+    ///
+    /// This method should be called after insert operations to ensure that:
+    /// - The `ListingTable` discovers newly written Vortex files
+    /// - Table statistics (row counts, column stats) are updated
+    /// - Query plans can use fresh statistics for optimization
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table cannot be refreshed.
+    fn refresh_listing_table(&self) -> CatalogResult<()> {
+        // Construct path to current snapshot
+        let snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &self.table_metadata.current_snapshot_id,
+        );
+
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir,
+            Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
+        )?;
+
+        // Update the listing table with write lock
+        let mut guard = self.listing_table.write().map_err(|e| {
+            super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to acquire write lock for listing table refresh: {e}"),
+            }
+        })?;
+        *guard = new_listing_table;
+
+        tracing::debug!(
+            "Refreshed listing table for {} to pick up new files and update statistics",
+            self.table_metadata.table_name
+        );
+
+        Ok(())
     }
 }
 
@@ -495,33 +601,23 @@ impl TableProvider for PepperTableProvider {
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
 
             // Create snapshot directory: [table_path]/[table_id]/[snapshot_id]/
-            let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
-                .join(self.table_metadata.table_id.to_string())
-                .join(&new_snapshot_id);
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
 
             // Create the snapshot directory
-            tokio::fs::create_dir_all(&snapshot_dir)
-                .await
-                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-
-            // DataFusion requires trailing slash for directory URLs
-            let mut snapshot_dir_str = snapshot_dir.to_string_lossy().to_string();
-            if !snapshot_dir_str.ends_with('/') {
-                snapshot_dir_str.push('/');
-            }
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
 
             // Create a new ListingTable pointing to the snapshot directory
-            let table_url = ListingTableUrl::parse(&snapshot_dir_str)
-                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-
-            let format = Arc::new(VortexFormat::default());
-            let listing_options = ListingOptions::new(format);
-
-            let config = ListingTableConfig::new(table_url)
-                .with_listing_options(listing_options)
-                .with_schema(Arc::clone(&self.table_metadata.schema));
-
-            let new_listing_table = Arc::new(ListingTable::try_new(config)?);
+            let new_listing_table =
+                Self::create_listing_table(&snapshot_dir, Arc::clone(&self.table_metadata.schema))
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to create listing table for new snapshot: {e}"
+                        ))
+                    })?;
 
             // Perform the insert using the new listing table with append mode
             // (Vortex only supports append at the file level)
@@ -553,15 +649,13 @@ impl TableProvider for PepperTableProvider {
 
         // For regular appends, use the existing snapshot and listing table
         // Ensure the snapshot directory exists (it might not if this is the first write to a newly created table)
-        let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
-            .join(self.table_metadata.table_id.to_string())
-            .join(&self.table_metadata.current_snapshot_id);
+        let snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &self.table_metadata.current_snapshot_id,
+        );
 
-        if !snapshot_dir.exists() {
-            tokio::fs::create_dir_all(&snapshot_dir)
-                .await
-                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-        }
+        Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
 
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
@@ -572,9 +666,19 @@ impl TableProvider for PepperTableProvider {
             })?;
             Arc::clone(&guard)
         };
-        listing_table
+        let result = listing_table
             .insert_into(state, input, InsertOp::Append)
-            .await
+            .await?;
+
+        // Refresh the listing table to pick up new files and update statistics
+        // This ensures query plans have access to up-to-date statistics after the insert
+        self.refresh_listing_table().map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to refresh listing table after insert: {e}"
+            ))
+        })?;
+
+        Ok(result)
     }
 }
 

@@ -19,7 +19,24 @@ pub(crate) fn get_acceleration_config_append(
     engine: &str,
     acceleration_params: Option<Params>,
 ) -> Acceleration {
-    let mut acceleration = Acceleration {
+    // Arrow engine doesn't support indexes, primary keys, or on_conflict
+    let (primary_key, on_conflict, indexes) = if engine == "arrow" {
+        (None, HashMap::new(), HashMap::new())
+    } else {
+        (
+            Some("id".to_string()),
+            [("id".to_string(), OnConflictBehavior::Upsert)]
+                .iter()
+                .cloned()
+                .collect::<HashMap<String, OnConflictBehavior>>(),
+            [("id".to_string(), IndexType::Unique)]
+                .iter()
+                .cloned()
+                .collect::<HashMap<String, IndexType>>(),
+        )
+    };
+
+    Acceleration {
         enabled: true,
         params: acceleration_params,
         engine: Some(engine.to_string()),
@@ -28,24 +45,11 @@ pub(crate) fn get_acceleration_config_append(
             "select * from test_table where created_at > now() - INTERVAL '10 years'".to_string(),
         ),
         refresh_check_interval: Some("5h".to_string()),
+        primary_key,
+        on_conflict,
+        indexes,
         ..Acceleration::default()
-    };
-
-    // Arrow engine doesn't support indexes, primary_key, or on_conflict
-    // Only add these for engines that support them (duckdb, sqlite, postgres)
-    if engine != "arrow" {
-        acceleration.primary_key = Some("id".to_string());
-        acceleration.on_conflict = [("id".to_string(), OnConflictBehavior::Upsert)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, OnConflictBehavior>>();
-        acceleration.indexes = [("id".to_string(), IndexType::Unique)]
-            .iter()
-            .cloned()
-            .collect::<HashMap<String, IndexType>>();
     }
-
-    acceleration
 }
 
 pub(crate) fn get_acceleration_config_full(
@@ -70,7 +74,35 @@ pub(crate) fn get_dataset(port: usize) -> Dataset {
             .collect::<HashMap<String, String>>(),
     ));
     ds.time_column = Some("created_at".to_string());
-    ds.time_format = Some(TimeFormat::Timestamptz);
+    // Use Timestamp instead of Timestamptz because Arrow reads Postgres TIMESTAMPTZ as Timestamp(Nanosecond, None)
+    ds.time_format = Some(TimeFormat::Timestamp);
+    ds
+}
+
+pub(crate) fn get_dataset_no_time_column(port: usize) -> Dataset {
+    let mut ds = Dataset::new("postgres:test_table", "test_table");
+    ds.params = Some(Params::from_string_map(
+        get_pg_params(port)
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect::<HashMap<String, String>>(),
+    ));
+    // No time_column set - for testing append without constraints
+    ds
+}
+
+/// Get dataset with Unix timestamp column (INT) to work around Vortex v0.52.1 timestamp metadata bug
+#[allow(dead_code)]
+pub(crate) fn get_dataset_unix_time(port: usize) -> Dataset {
+    let mut ds = Dataset::new("postgres:test_table", "test_table");
+    ds.params = Some(Params::from_string_map(
+        get_pg_params(port)
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect::<HashMap<String, String>>(),
+    ));
+    ds.time_column = Some("created_at".to_string());
+    ds.time_format = Some(TimeFormat::UnixSeconds);
     ds
 }
 
@@ -98,14 +130,14 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
         "
                 CREATE TABLE test_table (
                     id SERIAL PRIMARY KEY,
-                    created_at TIMESTAMP WITH TIME ZONE
+                    created_at TIMESTAMP(3) WITH TIME ZONE
                 )",
     )
     .await?;
 
     execute_ps_sql(
         &db_conn,
-        "INSERT INTO test_table (created_at) VALUES (now())",
+        "INSERT INTO test_table (created_at) VALUES (date_trunc('milliseconds', now()))",
     )
     .await?;
 
@@ -118,8 +150,29 @@ pub(crate) async fn start_test_runtime(
     port: usize,
     acceleration: Acceleration,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
-    let mut dataset = get_dataset(port);
+    start_test_runtime_with_dataset(port, acceleration, get_dataset(port)).await
+}
 
+pub(crate) async fn start_test_runtime_no_time_column(
+    port: usize,
+    acceleration: Acceleration,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    start_test_runtime_with_dataset(port, acceleration, get_dataset_no_time_column(port)).await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn start_test_runtime_unix_time(
+    port: usize,
+    acceleration: Acceleration,
+) -> Result<Arc<Runtime>, anyhow::Error> {
+    start_test_runtime_with_dataset(port, acceleration, get_dataset_unix_time(port)).await
+}
+
+async fn start_test_runtime_with_dataset(
+    _port: usize,
+    acceleration: Acceleration,
+    mut dataset: Dataset,
+) -> Result<Arc<Runtime>, anyhow::Error> {
     dataset.acceleration = Some(acceleration);
     let app = AppBuilder::new("test_acceleration_refresh")
         .with_dataset(dataset)

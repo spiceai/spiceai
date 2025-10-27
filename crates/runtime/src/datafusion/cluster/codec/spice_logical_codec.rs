@@ -1,5 +1,4 @@
 use crate::Runtime;
-use crate::datafusion::extension::bytes_processed::BytesProcessedNode;
 use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
 use datafusion::catalog::TableProvider;
@@ -8,6 +7,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{Extension, LogicalPlan, ScalarUDF};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedNode;
 use std::fmt::Debug;
 use std::sync::Arc;
 
