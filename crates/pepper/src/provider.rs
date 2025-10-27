@@ -438,12 +438,15 @@ impl TableProvider for PepperTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
-        let listing_table = self.listing_table.read().map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to acquire read lock on listing table: {e}"
-            ))
-        })?;
+        // Synchronous method - clone Arc quickly and release lock immediately
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire read lock on listing table: {e}"
+                ))
+            })?;
+            Arc::clone(&guard)
+        };
         listing_table.supports_filters_pushdown(filters)
     }
 
@@ -463,8 +466,11 @@ impl TableProvider for PepperTableProvider {
         // Note: Statistics are cached by the ListingTable and may not reflect
         // very recent writes until the table metadata is refreshed.
         //
-        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
-        let listing_table = self.listing_table.read().ok()?;
+        // Clone Arc quickly and release lock immediately to minimize contention
+        let listing_table = {
+            let guard = self.listing_table.read().ok()?;
+            Arc::clone(&guard)
+        };
         listing_table.statistics()
     }
 
