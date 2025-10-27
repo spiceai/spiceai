@@ -72,6 +72,11 @@ pub enum Error {
         "Delta Lake Table checkpoint files are missing or incorrect. Recreate the checkpoint for the Delta Lake Table and try again. {source}"
     ))]
     DeltaCheckpointError { source: delta_kernel::Error },
+
+    #[snafu(display(
+        "Failed to plan or execute a Delta Lake table due to the following error: {source}"
+    ))]
+    DeltaTableExecutionError { source: DataFusionError },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -231,7 +236,7 @@ impl DeltaTable {
         parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
         partitioned_files: &[PartitionedFile],
         physical_expr: &Arc<dyn PhysicalExpr>,
-    ) -> Arc<dyn ExecutionPlan> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         // this is needed to pass the plan_extension
         let projection = Some(
             projection
@@ -261,8 +266,15 @@ impl DeltaTable {
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
+        let object_store_url = ObjectStoreUrl::parse(format!(
+            "{}://{}",
+            self.table_url.scheme(),
+            self.table_url.authority()
+        ))
+        .context(DeltaTableExecutionSnafu)?;
+
         let file_scan_config_builder = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
+            object_store_url,
             Arc::clone(schema),
             Arc::new(parquet_source),
         )
@@ -271,7 +283,9 @@ impl DeltaTable {
         .with_table_partition_cols(partition_cols.to_vec())
         .with_file_group(FileGroup::new(partitioned_files.to_vec()));
 
-        DataSourceExec::from_data_source(file_scan_config_builder.build())
+        Ok(DataSourceExec::from_data_source(
+            file_scan_config_builder.build(),
+        ))
     }
 }
 
@@ -557,15 +571,17 @@ impl TableProvider for DeltaTable {
                 .collect::<Vec<_>>(),
         )?;
 
-        Ok(self.create_parquet_exec(
-            projection,
-            limit,
-            &Arc::new(schema),
-            &partition_cols,
-            &parquet_file_reader_factory,
-            &filtered_partitioned_files,
-            &physical_expr,
-        ))
+        Ok(self
+            .create_parquet_exec(
+                projection,
+                limit,
+                &Arc::new(schema),
+                &partition_cols,
+                &parquet_file_reader_factory,
+                &filtered_partitioned_files,
+                &physical_expr,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?)
     }
 }
 
