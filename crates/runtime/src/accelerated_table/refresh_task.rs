@@ -105,7 +105,6 @@ pub struct RefreshTaskBuilder {
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
-    sink: Arc<RwLock<AccelerationSink>>,
     disable_federation: bool,
     retention_sql: Option<String>,
     // Used to control how many parallel refreshes the runtime performs.
@@ -130,8 +129,7 @@ impl RefreshTaskBuilder {
             dataset_name,
             federated,
             federated_source,
-            accelerator: Arc::clone(&accelerator),
-            sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
+            accelerator,
             disable_federation: false,
             retention_sql: None,
             semaphore: None,
@@ -148,7 +146,7 @@ impl RefreshTaskBuilder {
         self
     }
 
-    /// Sets the `retention_sql` to be executed after inserts in append mode with on_conflict
+    /// Sets the `retention_sql` to be executed after inserts in append mode with `on_conflict`
     #[must_use]
     pub fn with_retention_sql(mut self, retention_sql: Option<String>) -> RefreshTaskBuilder {
         self.retention_sql = retention_sql;

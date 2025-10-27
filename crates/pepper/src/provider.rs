@@ -54,7 +54,9 @@ use datafusion_physical_plan::ExecutionPlan;
 use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
+use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
+use tokio::task;
 use vortex_datafusion::VortexFormat;
 
 /// Execution plan that filters out deleted rows based on deletion vectors.
@@ -164,7 +166,21 @@ impl futures::Stream for DeletionFilterStream {
                 std::task::Poll::Ready(Some(Ok(batch))) => {
                     let current_offset = self.global_row_offset;
                     let batch_size = batch.num_rows();
-                    self.global_row_offset += batch_size as i64;
+                    let batch_size_i64 = match convert_to_i64(batch_size, "batch size") {
+                        Ok(value) => value,
+                        Err(err) => return std::task::Poll::Ready(Some(Err(err))),
+                    };
+                    self.global_row_offset =
+                        match self.global_row_offset.checked_add(batch_size_i64) {
+                            Some(value) => value,
+                            None => {
+                                return std::task::Poll::Ready(Some(Err(
+                                    datafusion_common::DataFusionError::Execution(
+                                        "Row ID overflow while updating global offset".to_string(),
+                                    ),
+                                )))
+                            }
+                        };
 
                     tracing::debug!(
                         "DeletionFilterStream: processing batch with {} rows, offset {}, deleted_ids: {:?}",
@@ -174,9 +190,23 @@ impl futures::Stream for DeletionFilterStream {
                     // Find which rows in this batch should be kept
                     let mut keep_indices = Vec::new();
                     for row_idx in 0..batch_size {
-                        let global_row_id = current_offset + row_idx as i64;
+                        let row_offset = match convert_to_i64(row_idx, "row index") {
+                            Ok(value) => value,
+                            Err(err) => return std::task::Poll::Ready(Some(Err(err))),
+                        };
+                        let Some(global_row_id) = current_offset.checked_add(row_offset) else {
+                            return std::task::Poll::Ready(Some(Err(
+                                datafusion_common::DataFusionError::Execution(
+                                    "Row ID overflow while calculating global row id".to_string(),
+                                ),
+                            )));
+                        };
                         if !self.deleted_row_ids.contains(&global_row_id) {
-                            keep_indices.push(row_idx as u64);
+                            let keep_index = match convert_to_u64(row_idx, "row index") {
+                                Ok(value) => value,
+                                Err(err) => return std::task::Poll::Ready(Some(Err(err))),
+                            };
+                            keep_indices.push(keep_index);
                         }
                     }
 
@@ -722,19 +752,19 @@ impl PepperTableProvider {
     }
 
     /// Read deletion vectors from files and return a set of deleted row IDs.
-    async fn read_deletion_vectors(
-        &self,
-        delete_files: &[super::metadata::DeleteFile],
+    fn read_deletion_vectors(
+        delete_files: Vec<super::metadata::DeleteFile>,
     ) -> datafusion_common::Result<std::collections::HashSet<i64>> {
         use arrow::array::Array;
         use arrow::ipc::reader::FileReader;
         use std::collections::HashSet;
 
         let mut deleted_row_ids = HashSet::new();
+        let file_count = delete_files.len();
 
         tracing::debug!(
             "read_deletion_vectors: processing {} delete files",
-            delete_files.len()
+            file_count
         );
 
         for delete_file in delete_files {
@@ -744,15 +774,15 @@ impl PepperTableProvider {
             // Read deletion vector file
             let file = std::fs::File::open(path).map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to open deletion vector file {:?}: {e}",
-                    path
+                    "Failed to open deletion vector file {}: {e}",
+                    path.display()
                 ))
             })?;
 
             let reader = FileReader::try_new(file, None).map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read deletion vector file {:?}: {e}",
-                    path
+                    "Failed to read deletion vector file {}: {e}",
+                    path.display()
                 ))
             })?;
 
@@ -788,7 +818,7 @@ impl PepperTableProvider {
         tracing::debug!(
             "Loaded {} deleted row IDs from {} deletion vector files",
             deleted_row_ids.len(),
-            delete_files.len()
+            file_count
         );
 
         Ok(deleted_row_ids)
@@ -858,7 +888,16 @@ impl TableProvider for PepperTableProvider {
                 );
 
                 // Read all deletion vectors and build a set of deleted row IDs
-                let deleted_row_ids = self.read_deletion_vectors(&delete_files).await?;
+                let delete_files_for_read = delete_files.clone();
+                let deleted_row_ids = task::spawn_blocking(move || {
+                    Self::read_deletion_vectors(delete_files_for_read)
+                })
+                .await
+                .map_err(|err| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Deletion vector reader task failed: {err}"
+                    ))
+                })??;
 
                 if !deleted_row_ids.is_empty() {
                     // Wrap the plan with our deletion filter
@@ -1062,6 +1101,142 @@ impl PepperDeletionSink {
         ]))
     }
 
+    async fn delete_all_rows(
+        &self,
+        ctx: &SessionContext,
+        listing_table: Arc<ListingTable>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
+        let batches = collect(scan_plan, ctx.task_ctx()).await?;
+        let total_rows: usize = batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        let total_rows_i64 = convert_to_i64_box(total_rows, "total row count")?;
+
+        let row_ids: Vec<i64> = (0..total_rows_i64).collect();
+
+        let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
+            .join(&self.table_metadata.current_snapshot_id)
+            .join("deletions")
+            .join(format!("delete_{}.vortex", uuid::Uuid::now_v7()));
+
+        let deleted_count = self
+            .write_deletion_vector(row_ids, &deletion_vector_path)
+            .await?;
+
+        let file_size = tokio::fs::metadata(&deletion_vector_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let deleted_count_i64 = convert_to_i64_box(deleted_count, "deleted row count")?;
+        let file_size_i64 = convert_to_i64_box(file_size, "deletion vector file size")?;
+
+        let delete_file = super::metadata::DeleteFile {
+            delete_file_id: 0,
+            table_id: self.table_metadata.table_id,
+            data_file_id: 0,
+            path: deletion_vector_path.to_string_lossy().to_string(),
+            path_is_relative: false,
+            format: "arrow_ipc".to_string(),
+            delete_count: deleted_count_i64,
+            file_size_bytes: file_size_i64,
+        };
+
+        self.catalog
+            .add_delete_file(delete_file)
+            .await
+            .map_err(|e| format!("Failed to register deletion file: {e}"))?;
+
+        Ok(deleted_count)
+    }
+
+    async fn delete_filtered_rows(
+        &self,
+        ctx: &SessionContext,
+        listing_table: Arc<ListingTable>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
+        let batches = collect(scan_plan, ctx.task_ctx()).await?;
+
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&self.schema),
+            vec![batches.clone()],
+        )?;
+
+        ctx.register_table("temp_delete_table", Arc::new(mem_table))?;
+
+        let mut df = ctx.sql("SELECT * FROM temp_delete_table").await?;
+
+        for filter in &self.filters {
+            df = df.filter(filter.clone())?;
+        }
+
+        let matching_batches = df.collect().await?;
+
+        let mut row_ids = Vec::new();
+        let mut current_row_id = 0i64;
+
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            let batch_size = batch.num_rows();
+
+            if batch_idx < matching_batches.len() {
+                let matching_batch = &matching_batches[batch_idx];
+                for row_idx in 0..matching_batch.num_rows() {
+                    let row_offset = convert_to_i64_box(row_idx, "matching row index")?;
+                    let row_id = current_row_id
+                        .checked_add(row_offset)
+                        .ok_or_else(|| row_id_overflow_error("adding matching row offset"))?;
+                    row_ids.push(row_id);
+                }
+            }
+
+            let batch_size_i64 = convert_to_i64_box(batch_size, "batch size")?;
+            current_row_id = current_row_id
+                .checked_add(batch_size_i64)
+                .ok_or_else(|| row_id_overflow_error("advancing current row offset"))?;
+        }
+
+        let deleted_count = convert_to_u64_box(row_ids.len(), "deleted row count")?;
+
+        if deleted_count == 0 {
+            return Ok(0);
+        }
+
+        let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
+            .join(&self.table_metadata.current_snapshot_id)
+            .join("deletions")
+            .join(format!("delete_{}.arrow", uuid::Uuid::now_v7()));
+
+        self.write_deletion_vector(row_ids, &deletion_vector_path)
+            .await?;
+
+        let file_size = tokio::fs::metadata(&deletion_vector_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let deleted_count_i64 = convert_to_i64_box(deleted_count, "deleted row count")?;
+        let file_size_i64 = convert_to_i64_box(file_size, "deletion vector file size")?;
+
+        let delete_file = super::metadata::DeleteFile {
+            delete_file_id: 0,
+            table_id: self.table_metadata.table_id,
+            data_file_id: 0,
+            path: deletion_vector_path.to_string_lossy().to_string(),
+            path_is_relative: false,
+            format: "arrow_ipc".to_string(),
+            delete_count: deleted_count_i64,
+            file_size_bytes: file_size_i64,
+        };
+
+        self.catalog
+            .add_delete_file(delete_file)
+            .await
+            .map_err(|e| format!("Failed to register deletion file: {e}"))?;
+
+        Ok(deleted_count)
+    }
+
     /// Write deletion vector to a file.
     ///
     /// Currently writes as Arrow IPC format for simplicity and compatibility.
@@ -1122,16 +1297,8 @@ impl PepperDeletionSink {
 #[async_trait]
 impl DeletionSink for PepperDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        // Deletion vector approach:
-        // 1. Scan all data and identify rows that match the delete filters
-        // 2. Collect row IDs of matching rows
-        // 3. Write deletion vector to a Vortex file
-        // 4. Register the deletion vector in the catalog
-        // 5. Future scans will apply the deletion vector to filter out deleted rows
-
         let ctx = SessionContext::new();
 
-        // Get the current listing table
         let listing_table = {
             let guard = self
                 .listing_table
@@ -1140,135 +1307,66 @@ impl DeletionSink for PepperDeletionSink {
             Arc::clone(&guard)
         };
 
-        // If no filters provided, we're deleting all rows
-        // In this case, we can create a deletion vector for all rows
         if self.filters.is_empty() {
-            // Scan to get total row count
-            let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
-            let batches = collect(scan_plan, ctx.task_ctx()).await?;
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-
-            // Create deletion vector for all rows (0..total_rows)
-            let row_ids: Vec<i64> = (0..total_rows as i64).collect();
-
-            // Write deletion vector
-            let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
-                .join(&self.table_metadata.current_snapshot_id)
-                .join("deletions")
-                .join(format!("delete_{}.vortex", uuid::Uuid::now_v7()));
-
-            let deleted_count = self
-                .write_deletion_vector(row_ids, &deletion_vector_path)
-                .await?;
-
-            // Get file size
-            let file_size = tokio::fs::metadata(&deletion_vector_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-
-            // Register deletion file in catalog
-            let delete_file = super::metadata::DeleteFile {
-                delete_file_id: 0, // Will be assigned by catalog
-                table_id: self.table_metadata.table_id,
-                data_file_id: 0, // Applies to all data files
-                path: deletion_vector_path.to_string_lossy().to_string(),
-                path_is_relative: false,
-                format: "arrow_ipc".to_string(),
-                delete_count: deleted_count as i64,
-                file_size_bytes: file_size as i64,
-            };
-
-            self.catalog
-                .add_delete_file(delete_file)
-                .await
-                .map_err(|e| format!("Failed to register deletion file: {e}"))?;
-
-            return Ok(deleted_count);
+            return self.delete_all_rows(&ctx, Arc::clone(&listing_table)).await;
         }
 
-        // Scan all current data and identify matching rows
-        let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
-
-        let batches = collect(scan_plan, ctx.task_ctx()).await?;
-
-        // Create a temporary table with the data to evaluate filters
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&self.schema),
-            vec![batches.clone()],
-        )?;
-
-        ctx.register_table("temp_delete_table", Arc::new(mem_table))?;
-
-        // Build a query that finds rows matching the delete conditions
-        let mut df = ctx.sql("SELECT * FROM temp_delete_table").await?;
-
-        // Apply filters to find rows to delete
-        for filter in &self.filters {
-            df = df.filter(filter.clone())?;
-        }
-
-        // Collect matching rows
-        let matching_batches = df.collect().await?;
-
-        // Extract row IDs of matching rows
-        // In a real implementation, we'd need a row ID column in the data
-        // For now, we'll calculate row IDs based on row positions
-        let mut row_ids = Vec::new();
-        let mut current_row_id = 0i64;
-
-        for (batch_idx, batch) in batches.iter().enumerate() {
-            let batch_size = batch.num_rows();
-
-            // Check if any rows in the matching batches correspond to this batch
-            if batch_idx < matching_batches.len() {
-                let matching_batch = &matching_batches[batch_idx];
-                for row_idx in 0..matching_batch.num_rows() {
-                    row_ids.push(current_row_id + row_idx as i64);
-                }
-            }
-
-            current_row_id += batch_size as i64;
-        }
-
-        let deleted_count = row_ids.len() as u64;
-
-        if deleted_count > 0 {
-            // Write deletion vector to a file
-            let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
-                .join(&self.table_metadata.current_snapshot_id)
-                .join("deletions")
-                .join(format!("delete_{}.arrow", uuid::Uuid::now_v7()));
-
-            self.write_deletion_vector(row_ids, &deletion_vector_path)
-                .await?;
-
-            // Get file size
-            let file_size = tokio::fs::metadata(&deletion_vector_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-
-            // Register deletion file in catalog
-            let delete_file = super::metadata::DeleteFile {
-                delete_file_id: 0, // Will be assigned by catalog
-                table_id: self.table_metadata.table_id,
-                data_file_id: 0, // Applies to all data files for now
-                path: deletion_vector_path.to_string_lossy().to_string(),
-                path_is_relative: false,
-                format: "arrow_ipc".to_string(),
-                delete_count: deleted_count as i64,
-                file_size_bytes: file_size as i64,
-            };
-
-            self.catalog
-                .add_delete_file(delete_file)
-                .await
-                .map_err(|e| format!("Failed to register deletion file: {e}"))?;
-        }
-
-        Ok(deleted_count)
+        self.delete_filtered_rows(&ctx, listing_table).await
     }
+}
+
+fn convert_to_i64<T>(value: T, context: &str) -> datafusion_common::Result<i64>
+where
+    T: TryInto<i64> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    value.try_into().map_err(|err| {
+        datafusion_common::DataFusionError::Execution(format!(
+            "Failed to convert {context} value {value} to i64: {err}"
+        ))
+    })
+}
+
+fn convert_to_u64<T>(value: T, context: &str) -> datafusion_common::Result<u64>
+where
+    T: TryInto<u64> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    value.try_into().map_err(|err| {
+        datafusion_common::DataFusionError::Execution(format!(
+            "Failed to convert {context} value {value} to u64: {err}"
+        ))
+    })
+}
+
+fn convert_to_i64_box<T>(
+    value: T,
+    context: &str,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: TryInto<i64> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    convert_to_i64(value, context)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+fn convert_to_u64_box<T>(
+    value: T,
+    context: &str,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: TryInto<u64> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    convert_to_u64(value, context)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+fn row_id_overflow_error(context: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    let message = format!("Row ID overflow encountered while {context}");
+    let df_error = datafusion_common::DataFusionError::Execution(message);
+    Box::new(df_error)
 }
 
 #[cfg(test)]

@@ -65,7 +65,7 @@ async fn test_delete_with_primary_key() -> Result<(), Box<dyn std::error::Error>
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_delete_pk", table.clone() as _)?;
+    ctx.register_table("test_delete_pk", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
     ctx.sql("INSERT INTO test_delete_pk VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Charlie', 300), (4, 'Diana', 400), (5, 'Eve', 500)")
@@ -123,7 +123,9 @@ async fn test_delete_with_primary_key() -> Result<(), Box<dyn std::error::Error>
         .expect("count column")
         .value(0);
 
-    println!("⚠️  Row count after delete: {count} (expected 4, but read-time filtering not yet implemented)");
+    println!(
+        "⚠️  Row count after delete: {count} (expected 4, but read-time filtering not yet implemented)"
+    );
     // TODO: Once read-time filtering is implemented, uncomment:
     // assert_eq!(count, 4, "Expected 4 rows after deleting 1");
 
@@ -203,7 +205,7 @@ async fn test_delete_without_primary_key() -> Result<(), Box<dyn std::error::Err
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_delete_no_pk", table.clone() as _)?;
+    ctx.register_table("test_delete_no_pk", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
     ctx.sql("INSERT INTO test_delete_no_pk VALUES (1, 'A', 100), (2, 'B', 200), (3, 'A', 300), (4, 'C', 400)")
@@ -259,7 +261,9 @@ async fn test_delete_without_primary_key() -> Result<(), Box<dyn std::error::Err
         .expect("count column")
         .value(0);
 
-    println!("⚠️  Row count after delete: {count} (expected 2, but read-time filtering not yet implemented)");
+    println!(
+        "⚠️  Row count after delete: {count} (expected 2, but read-time filtering not yet implemented)"
+    );
     // TODO: Once read-time filtering is implemented, uncomment:
     // assert_eq!(count, 2, "Expected 2 rows after deleting category='A' (id=1, id=3)");
 
@@ -301,7 +305,7 @@ async fn test_delete_all_rows() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_delete_all", table.clone() as _)?;
+    ctx.register_table("test_delete_all", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
     ctx.sql("INSERT INTO test_delete_all VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
@@ -335,7 +339,9 @@ async fn test_delete_all_rows() -> Result<(), Box<dyn std::error::Error>> {
         .expect("count column")
         .value(0);
 
-    println!("⚠️  Row count after delete all: {count} (expected 0, but read-time filtering not yet implemented)");
+    println!(
+        "⚠️  Row count after delete all: {count} (expected 0, but read-time filtering not yet implemented)"
+    );
     // TODO: Once read-time filtering is implemented, uncomment:
     // assert_eq!(count, 0, "Expected 0 rows after DELETE all");
 
@@ -377,7 +383,7 @@ async fn test_delete_then_insert() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_delete_insert", table.clone() as _)?;
+    ctx.register_table("test_delete_insert", Arc::clone(&table) as _)?;
 
     // 4. Insert initial data
     ctx.sql("INSERT INTO test_delete_insert VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
@@ -414,7 +420,9 @@ async fn test_delete_then_insert() -> Result<(), Box<dyn std::error::Error>> {
         .expect("count column")
         .value(0);
 
-    println!("⚠️  Row count after delete: {count} (expected 2, but read-time filtering not yet implemented)");
+    println!(
+        "⚠️  Row count after delete: {count} (expected 2, but read-time filtering not yet implemented)"
+    );
     // TODO: Once read-time filtering is implemented, uncomment:
     // assert_eq!(count, 2, "Expected 2 rows after deletion");
 
@@ -481,7 +489,7 @@ async fn test_delete_with_complex_filter() -> Result<(), Box<dyn std::error::Err
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_delete_complex", table.clone() as _)?;
+    ctx.register_table("test_delete_complex", Arc::clone(&table) as _)?;
 
     // 4. Insert test data
     ctx.sql(
@@ -535,7 +543,9 @@ async fn test_delete_with_complex_filter() -> Result<(), Box<dyn std::error::Err
         .expect("count column")
         .value(0);
 
-    println!("⚠️  Row count after delete: {count} (expected 5, but read-time filtering not yet implemented)");
+    println!(
+        "⚠️  Row count after delete: {count} (expected 5, but read-time filtering not yet implemented)"
+    );
     // TODO: Once read-time filtering is implemented, uncomment:
     // assert_eq!(count, 5, "Expected 5 rows after complex DELETE");
 

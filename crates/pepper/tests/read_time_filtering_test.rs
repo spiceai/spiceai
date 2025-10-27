@@ -17,7 +17,7 @@ limitations under the License.
 //! Tests for read-time filtering based on retention configuration.
 //!
 //! These tests verify that deletion vector filtering is only applied
-//! when retention_sql is configured, avoiding performance overhead
+//! when `retention_sql` is configured, avoiding performance overhead
 //! for full/append refreshes where data is known to be complete.
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -30,19 +30,21 @@ use pepper::{metadata::CreateTableOptions, MetadataCatalog, PepperCatalog, Peppe
 use std::sync::Arc;
 use tempfile::TempDir;
 
+type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 async fn setup_test_table(
     retention_enabled: bool,
-) -> (Arc<PepperTableProvider>, SessionContext, TempDir, TempDir) {
+) -> TestResult<(Arc<PepperTableProvider>, SessionContext, TempDir, TempDir)> {
     // Create temporary directories for data and metadata
-    let data_dir = TempDir::new().expect("Failed to create temp data directory");
-    let metadata_dir = TempDir::new().expect("Failed to create temp metadata directory");
+    let data_dir = TempDir::new()?;
+    let metadata_dir = TempDir::new()?;
 
     // Create catalog
     let catalog = Arc::new(PepperCatalog::new(format!(
         "sqlite://{}/test.db",
         metadata_dir.path().display()
     )));
-    catalog.init().await.expect("Failed to initialize catalog");
+    catalog.init().await?;
 
     // Create schema
     let schema = Arc::new(Schema::new(vec![
@@ -60,9 +62,7 @@ async fn setup_test_table(
     };
 
     // Create table provider
-    let mut table_provider = PepperTableProvider::create_table(catalog, table_options)
-        .await
-        .expect("Failed to create table");
+    let mut table_provider = PepperTableProvider::create_table(catalog, table_options).await?;
 
     // Configure retention filtering
     if retention_enabled {
@@ -76,13 +76,12 @@ async fn setup_test_table(
     ctx.register_table(
         "test_table",
         Arc::clone(&table_provider) as Arc<dyn TableProvider>,
-    )
-    .expect("Failed to register table");
+    )?;
 
-    (table_provider, ctx, data_dir, metadata_dir)
+    Ok((table_provider, ctx, data_dir, metadata_dir))
 }
 
-async fn insert_test_data(table_provider: &Arc<PepperTableProvider>) -> u64 {
+async fn insert_test_data(table_provider: &Arc<PepperTableProvider>) -> TestResult<u64> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
@@ -98,8 +97,7 @@ async fn insert_test_data(table_provider: &Arc<PepperTableProvider>) -> u64 {
             ])),
             Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
         ],
-    )
-    .expect("Failed to create record batch");
+    )?;
 
     let stream = futures::stream::once(async { Ok(batch) });
     let boxed_stream: datafusion_execution::SendableRecordBatchStream = Box::pin(
@@ -112,21 +110,19 @@ async fn insert_test_data(table_provider: &Arc<PepperTableProvider>) -> u64 {
     table_provider
         .insert(boxed_stream)
         .await
-        .expect("Failed to insert data")
+        .map_err(Into::into)
 }
 
-async fn delete_records(table_provider: &Arc<PepperTableProvider>, filter: Expr) -> u64 {
+async fn delete_records(
+    table_provider: &Arc<PepperTableProvider>,
+    filter: Expr,
+) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table_provider
-        .delete_from(&ctx.state(), &[filter])
-        .await
-        .expect("Failed to create delete plan");
+    let plan = table_provider.delete_from(&ctx.state(), &[filter]).await?;
 
-    let results = datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("Failed to execute delete");
+    let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 
-    results
+    Ok(results
         .first()
         .and_then(|batch| {
             batch
@@ -136,31 +132,28 @@ async fn delete_records(table_provider: &Arc<PepperTableProvider>, filter: Expr)
         })
         .and_then(|array| array.values().first())
         .copied()
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 #[tokio::test]
-async fn test_scan_without_retention_does_not_check_deletion_vectors() {
+async fn test_scan_without_retention_does_not_check_deletion_vectors() -> TestResult<()> {
     // Setup table WITHOUT retention enabled
-    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table(false).await;
+    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table(false).await?;
 
     // Insert data
-    let inserted = insert_test_data(&table_provider).await;
+    let inserted = insert_test_data(&table_provider).await?;
     assert_eq!(inserted, 5, "Should insert 5 rows");
 
     // Delete some records
     let filter = col("id").lt_eq(lit(2i64));
-    let deleted = delete_records(&table_provider, filter).await;
+    let deleted = delete_records(&table_provider, filter).await?;
     assert_eq!(deleted, 2, "Should delete 2 rows (id 1 and 2)");
 
     // Query the table - deletion vectors should NOT be applied
     // since retention is disabled (performance optimization)
-    let df = ctx
-        .sql("SELECT COUNT(*) as count FROM test_table")
-        .await
-        .expect("Failed to query");
+    let df = ctx.sql("SELECT COUNT(*) as count FROM test_table").await?;
 
-    let results = df.collect().await.expect("Failed to collect results");
+    let results = df.collect().await?;
     let count = results
         .first()
         .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
@@ -173,53 +166,56 @@ async fn test_scan_without_retention_does_not_check_deletion_vectors() {
         count, 5,
         "Without retention enabled, deleted rows should still be visible"
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_scan_with_retention_checks_deletion_vectors() {
+async fn test_scan_with_retention_checks_deletion_vectors() -> TestResult<()> {
     // Setup table WITH retention enabled
-    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table(true).await;
+    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table(true).await?;
 
     // Insert data
-    let inserted = insert_test_data(&table_provider).await;
+    let inserted = insert_test_data(&table_provider).await?;
     assert_eq!(inserted, 5, "Should insert 5 rows");
 
     // Delete some records
     let filter = col("id").lt_eq(lit(2i64));
-    let deleted = delete_records(&table_provider, filter).await;
+    let deleted = delete_records(&table_provider, filter).await?;
     assert_eq!(deleted, 2, "Should delete 2 rows (id 1 and 2)");
 
     // Query the table - deletion vectors SHOULD be checked and applied
-    let df = ctx
-        .sql("SELECT * FROM test_table")
-        .await
-        .expect("Failed to query");
+    let df = ctx.sql("SELECT * FROM test_table").await?;
 
-    let results = df.collect().await.expect("Failed to collect results");
+    let results = df.collect().await?;
 
     // Count total rows across all batches
-    let total_rows: usize = results.iter().map(|batch| batch.num_rows()).sum();
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
 
     // With retention enabled and deletion vectors applied, we should see 3 rows
     // (we deleted rows with id <= 2, leaving rows 3, 4, 5)
     assert_eq!(
         total_rows, 3,
-        "With retention enabled, deleted rows should be filtered out (expected 3, got {})",
-        total_rows
+        "With retention enabled, deleted rows should be filtered out (expected 3, got {total_rows})"
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_retention_flag_can_be_toggled() {
+async fn test_retention_flag_can_be_toggled() -> TestResult<()> {
     // Create table without retention
-    let data_dir = TempDir::new().expect("Failed to create temp data directory");
-    let metadata_dir = TempDir::new().expect("Failed to create temp metadata directory");
+    let data_dir = TempDir::new()?;
+    let metadata_dir = TempDir::new()?;
 
     let catalog = Arc::new(PepperCatalog::new(format!(
         "sqlite://{}/test.db",
         metadata_dir.path().display()
     )));
-    catalog.init().await.expect("Failed to initialize catalog");
+    catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -233,9 +229,7 @@ async fn test_retention_flag_can_be_toggled() {
         base_path: data_dir.path().to_string_lossy().to_string(),
     };
 
-    let table_provider = PepperTableProvider::create_table(catalog, table_options)
-        .await
-        .expect("Failed to create table");
+    let table_provider = PepperTableProvider::create_table(catalog, table_options).await?;
 
     // Initially false
     assert!(
@@ -256,23 +250,24 @@ async fn test_retention_flag_can_be_toggled() {
         !table_provider.is_retention_enabled(),
         "Retention should be disabled after calling with_retention_enabled(false)"
     );
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_get_table_delete_files_works() {
+async fn test_get_table_delete_files_works() -> TestResult<()> {
     // Setup table with retention enabled
-    let (table_provider, _ctx, _data_dir, _metadata_dir) = setup_test_table(true).await;
+    let (table_provider, _ctx, _data_dir, _metadata_dir) = setup_test_table(true).await?;
 
     // Insert data
-    let inserted = insert_test_data(&table_provider).await;
+    let inserted = insert_test_data(&table_provider).await?;
     assert_eq!(inserted, 5, "Should insert 5 rows");
 
     // Verify no deletion files initially
     let delete_files = table_provider
         .catalog()
         .get_table_delete_files(table_provider.metadata().table_id)
-        .await
-        .expect("Failed to get delete files");
+        .await?;
     assert_eq!(
         delete_files.len(),
         0,
@@ -281,15 +276,14 @@ async fn test_get_table_delete_files_works() {
 
     // Delete some records
     let filter = col("id").lt_eq(lit(2i64));
-    let deleted = delete_records(&table_provider, filter).await;
+    let deleted = delete_records(&table_provider, filter).await?;
     assert_eq!(deleted, 2, "Should delete 2 rows");
 
     // Verify deletion file was registered
     let delete_files = table_provider
         .catalog()
         .get_table_delete_files(table_provider.metadata().table_id)
-        .await
-        .expect("Failed to get delete files");
+        .await?;
     assert_eq!(
         delete_files.len(),
         1,
@@ -299,4 +293,6 @@ async fn test_get_table_delete_files_works() {
         delete_files[0].delete_count, 2,
         "Delete file should track 2 deleted rows"
     );
+
+    Ok(())
 }

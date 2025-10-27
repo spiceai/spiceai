@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Test retention_sql for Pepper
+//! Test `retention_sql` for Pepper
 //!
-//! These tests verify that Pepper can delete data based on retention_sql expressions.
+//! These tests verify that Pepper can delete data based on `retention_sql` expressions.
 
 use arrow::datatypes::{DataType, Field, Schema};
 use data_components::delete::DeletionTableProvider;
@@ -24,6 +24,7 @@ use datafusion::prelude::*;
 use datafusion_physical_plan::collect;
 use pepper::metadata::CreateTableOptions;
 use pepper::{MetadataCatalog, PepperCatalog, PepperTableProvider};
+use std::convert::TryFrom;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -65,23 +66,24 @@ async fn test_retention_sql_basic() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_retention", table.clone() as _)?;
+    ctx.register_table("test_retention", Arc::clone(&table) as _)?;
 
     // 4. Insert test data (some active, some inactive)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )?;
     let old_timestamp = now - (30 * 24 * 60 * 60); // 30 days ago
     let recent_timestamp = now - (5 * 24 * 60 * 60); // 5 days ago
 
     ctx.sql(&format!(
         "INSERT INTO test_retention VALUES \
-         (1, 'Alice', true, {}), \
-         (2, 'Bob', false, {}), \
-         (3, 'Charlie', true, {}), \
-         (4, 'Diana', false, {}), \
-         (5, 'Eve', true, {})",
-        recent_timestamp, old_timestamp, recent_timestamp, old_timestamp, recent_timestamp
+         (1, 'Alice', true, {recent_timestamp}), \
+         (2, 'Bob', false, {old_timestamp}), \
+         (3, 'Charlie', true, {recent_timestamp}), \
+         (4, 'Diana', false, {old_timestamp}), \
+         (5, 'Eve', true, {recent_timestamp})"
     ))
     .await?
     .collect()
@@ -160,12 +162,14 @@ async fn test_retention_sql_time_based() -> Result<(), Box<dyn std::error::Error
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_time_retention", table.clone() as _)?;
+    ctx.register_table("test_time_retention", Arc::clone(&table) as _)?;
 
     // 4. Insert test data with different timestamps
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )?;
 
     let very_old = now - (60 * 24 * 60 * 60); // 60 days ago
     let old = now - (20 * 24 * 60 * 60); // 20 days ago
@@ -173,12 +177,11 @@ async fn test_retention_sql_time_based() -> Result<(), Box<dyn std::error::Error
 
     ctx.sql(&format!(
         "INSERT INTO test_time_retention VALUES \
-         (1, 'very_old', {}), \
-         (2, 'old', {}), \
-         (3, 'recent', {}), \
-         (4, 'old2', {}), \
-         (5, 'recent2', {})",
-        very_old, old, recent, old, recent
+         (1, 'very_old', {very_old}), \
+         (2, 'old', {old}), \
+         (3, 'recent', {recent}), \
+         (4, 'old2', {old}), \
+         (5, 'recent2', {recent})"
     ))
     .await?
     .collect()
@@ -248,7 +251,7 @@ async fn test_retention_sql_complex() -> Result<(), Box<dyn std::error::Error>> 
 
     // 3. Register with DataFusion
     let ctx = SessionContext::new();
-    ctx.register_table("test_complex_retention", table.clone() as _)?;
+    ctx.register_table("test_complex_retention", Arc::clone(&table) as _)?;
 
     // 4. Insert test data
     ctx.sql(

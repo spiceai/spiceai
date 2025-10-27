@@ -358,8 +358,7 @@ impl PepperAccelerator {
         // Enable retention filtering if retention_sql or retention_period is configured
         let retention_enabled = source
             .acceleration()
-            .map(|acc| acc.retention_sql.is_some() || acc.retention_period.is_some())
-            .unwrap_or(false);
+            .is_some_and(|acc| acc.retention_sql.is_some() || acc.retention_period.is_some());
 
         if retention_enabled {
             pepper_table = pepper_table.with_retention_enabled(true);

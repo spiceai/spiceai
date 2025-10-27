@@ -649,9 +649,11 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
     use arrow::array::{
         BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
         Float64Array, Int16Array, Int32Array, Int8Array, LargeBinaryArray, LargeStringArray,
-        TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        RecordBatch, TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow::datatypes::TimeUnit;
+    use std::f32::consts::{E as F32_E, PI as F32_PI};
+    use std::f64::consts::{E as F64_E, PI as F64_PI};
 
     println!("\n🧪 Testing Pepper core data type support...");
 
@@ -718,37 +720,27 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
     ctx.register_table("types_test", Arc::new(table))?;
 
     // Insert test data with various types
-    use arrow::array::RecordBatch;
-
     let batch = RecordBatch::try_new(
         Arc::<arrow::datatypes::Schema>::clone(&schema),
         vec![
             Arc::new(Int8Array::from(vec![Some(127), Some(-128), None])),
             Arc::new(Int16Array::from(vec![Some(32767), Some(-32768), None])),
             Arc::new(Int32Array::from(vec![
-                Some(2147483647),
-                Some(-2147483648),
+                Some(2_147_483_647),
+                Some(-2_147_483_648),
                 None,
             ])),
             Arc::new(Int64Array::from(vec![1, 2, 3])), // Primary key, non-null
             Arc::new(UInt8Array::from(vec![Some(255), Some(0), None])),
             Arc::new(UInt16Array::from(vec![Some(65535), Some(0), None])),
-            Arc::new(UInt32Array::from(vec![Some(4294967295), Some(0), None])),
+            Arc::new(UInt32Array::from(vec![Some(4_294_967_295), Some(0), None])),
             Arc::new(UInt64Array::from(vec![
-                Some(18446744073709551615),
+                Some(18_446_744_073_709_551_615),
                 Some(0),
                 None,
             ])),
-            Arc::new(Float32Array::from(vec![
-                Some(3.14_f32),
-                Some(-2.71_f32),
-                None,
-            ])),
-            Arc::new(Float64Array::from(vec![
-                Some(3.141592653589793_f64),
-                Some(-2.718281828459045_f64),
-                None,
-            ])),
+            Arc::new(Float32Array::from(vec![Some(F32_PI), Some(-F32_E), None])),
+            Arc::new(Float64Array::from(vec![Some(F64_PI), Some(-F64_E), None])),
             Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
             Arc::new(StringArray::from(vec![Some("Hello"), Some("World"), None])),
             Arc::new(LargeStringArray::from(vec![
@@ -767,16 +759,20 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
                 &b""[..],
             ])),
             Arc::new(Date32Array::from(vec![Some(18993), Some(0), None])), // Days since epoch
-            Arc::new(Date64Array::from(vec![Some(1640995200000), Some(0), None])), // Milliseconds since epoch
+            Arc::new(Date64Array::from(vec![
+                Some(1_640_995_200_000),
+                Some(0),
+                None,
+            ])), // Milliseconds since epoch
             Arc::new(TimestampMicrosecondArray::from(vec![
-                Some(1640995200000000),
+                Some(1_640_995_200_000_000),
                 Some(0),
                 None,
             ])),
             Arc::new(
                 Decimal128Array::from(vec![
-                    Some(314159265358_i128),  // 3141.59265358
-                    Some(-271828182845_i128), // -2718.28182845
+                    Some(314_159_265_358_i128),  // 3141.59265358
+                    Some(-271_828_182_845_i128), // -2718.28182845
                     None,
                 ])
                 .with_precision_and_scale(38, 10)
@@ -850,7 +846,7 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
         .as_any()
         .downcast_ref::<Float32Array>()
         .expect("Float32 column");
-    assert!((float32_col.value(0) - 3.14_f32).abs() < 0.01);
+    assert!((float32_col.value(0) - F32_PI).abs() < 0.01);
     println!("  ✓ Float32: {}", float32_col.value(0));
 
     // Boolean
@@ -900,7 +896,7 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
         .expect("Timestamp column");
-    assert_eq!(ts_col.value(0), 1640995200000000);
+    assert_eq!(ts_col.value(0), 1_640_995_200_000_000);
     println!("  ✓ Timestamp: {}", ts_col.value(0));
 
     // Decimal128
@@ -909,7 +905,7 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .expect("Decimal128 column");
-    assert_eq!(dec_col.value(0), 314159265358_i128);
+    assert_eq!(dec_col.value(0), 314_159_265_358_i128);
     println!("  ✓ Decimal128: {}", dec_col.value(0));
 
     println!("\n✅ Core data types test passed!");
