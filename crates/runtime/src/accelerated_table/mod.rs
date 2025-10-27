@@ -435,54 +435,25 @@ impl Builder {
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
+                // append mode requires either time_column or primary_key
                 if self.refresh.time_column.is_none() {
-                    // Check if this is a Pepper table or if there's a primary key constraint
-                    #[cfg(feature = "pepper")]
-                    let is_pepper = self
-                        .accelerator
-                        .as_any()
-                        .downcast_ref::<PepperTableProvider>()
-                        .is_some();
-                    #[cfg(not(feature = "pepper"))]
-                    let is_pepper = false;
-
                     let schema = self.accelerator.schema();
                     let has_primary_key =
                         self.accelerator.constraints().is_some_and(|constraints| {
                             !get_primary_keys_from_constraints(constraints, &schema).is_empty()
                         });
 
-                    // For Pepper tables, require either time_column or primary_key
-                    if is_pepper && !has_primary_key {
+                    if !has_primary_key {
                         return NeitherTimeColumnNorPrimaryKeySnafu.fail();
                     }
-
-                    if is_pepper || has_primary_key {
-                        // Use append mode with primary key (e.g., Pepper) or for Pepper tables
-                        let (start_refresh, on_start_refresh) =
-                            mpsc::channel::<Option<RefreshOverrides>>(1);
-                        (
-                            refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
-                            Some(start_refresh),
-                        )
-                    } else {
-                        // Get the append stream
-                        let Some(append_stream) = self.append_stream else {
-                            return AppendStreamRequiredSnafu.fail();
-                        };
-                        (
-                            refresh::AccelerationRefreshMode::Changes(append_stream),
-                            None,
-                        )
-                    }
-                } else {
-                    let (start_refresh, on_start_refresh) =
-                        mpsc::channel::<Option<RefreshOverrides>>(1);
-                    (
-                        refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
-                        Some(start_refresh),
-                    )
                 }
+
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
+                (
+                    refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
+                    Some(start_refresh),
+                )
             }
             RefreshMode::Full => {
                 let (start_refresh, on_start_refresh) =
