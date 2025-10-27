@@ -19,16 +19,12 @@ use super::{
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
 };
 use crate::component::dataset::Dataset;
-use crate::dataconnector::kafka::Error;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
-use datafusion_datasource::file_compression_type::FileCompressionType;
 use runtime_parameters::ExposedParamLookup;
-use secrecy::SecretString;
 use snafu::ResultExt;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
