@@ -159,8 +159,13 @@ pub(crate) fn init_tracing_with_task_history(
 
     let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
 
-    let task_history_exporter =
-        TaskHistoryExporter::new(rt.datafusion(), TaskHistoryCapturedOutput::Truncated, None);
+    let task_history_exporter = TaskHistoryExporter::new(
+        rt.datafusion(),
+        TaskHistoryCapturedOutput::Truncated,
+        None, // min_sql_duration_ms
+        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
+        None, // min_plan_duration_ms
+    );
 
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
     let provider = TracerProvider::builder()
