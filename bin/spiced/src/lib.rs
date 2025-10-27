@@ -261,7 +261,7 @@ pub async fn run(args: Args) -> Result<()> {
     .context(UnableToInitializeTracingSnafu)?;
 
     // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
-    match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool") {
+    match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
             let tokio_runtime = ManagedTokioRuntime::try_new()
@@ -275,9 +275,9 @@ pub async fn run(args: Args) -> Result<()> {
                 "Dedicated SQL engine thread pool is disabled via runtime parameter `runtime.params.dedicated_thread_pool`."
             );
         }
-        other => {
+        Some(other) => {
             tracing::warn!(
-                "Invalid runtime parameter value for `runtime.params.dedicated_thread_pool`: `{other}`. Set to `disabled` or `sql_engine`."
+                "Invalid runtime parameter value for `runtime.params.dedicated_thread_pool`: `{other}`. Set to `disabled` or `sql_engine`. Continuing with dedicated SQL engine thread pool."
             );
         }
     }
