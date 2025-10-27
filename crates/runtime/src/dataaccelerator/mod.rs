@@ -47,7 +47,7 @@ use self::duckdb::DuckDBAccelerator;
 use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(feature = "pepper")]
+#[cfg(all(feature = "pepper", not(windows)))]
 use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
@@ -59,7 +59,7 @@ pub mod arrow;
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(feature = "pepper")]
+#[cfg(all(feature = "pepper", not(windows)))]
 pub mod pepper;
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -160,7 +160,7 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
             .await;
-        #[cfg(feature = "pepper")]
+        #[cfg(all(feature = "pepper", not(windows)))]
         self.register_accelerator_engine(Engine::Pepper, Arc::new(PepperAccelerator::new()))
             .await;
     }
@@ -783,7 +783,7 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
-            #[cfg(feature = "pepper")]
+            #[cfg(all(feature = "pepper", not(windows)))]
             (Engine::Pepper, "file", None), // Pepper only supports file mode
         ];
 
@@ -904,7 +904,7 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                #[cfg(feature = "pepper")]
+                #[cfg(all(feature = "pepper", not(windows)))]
                 Engine::Pepper => {
                     use crate::component::dataset::builder::DatasetBuilder;
                     use crate::dataaccelerator::pepper::PepperAccelerator;
@@ -2125,7 +2125,7 @@ mod accelerator_compat_tests {
                             .await
                             .expect("Arrow table should be created")
                     }
-                    #[cfg(feature = "pepper")]
+                    #[cfg(all(feature = "pepper", not(windows)))]
                     Engine::Pepper => {
                         use crate::component::dataset::builder::DatasetBuilder;
                         use crate::dataaccelerator::pepper::PepperAccelerator; // Clean up any existing files and metadata

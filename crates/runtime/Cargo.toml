@@ -178,11 +178,8 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
-vortex-datafusion = { path = "../vortex-datafusion", optional = true }
-vortex = { workspace = true, optional = true }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
-pepper = { path = "../pepper" }
 
 [dev-dependencies]
 anyhow = "1.0.99"
@@ -278,8 +275,13 @@ sqlite = [
     "dep:rusqlite",
 ]
 turso = []
-pepper = ["dep:vortex-datafusion", "dep:vortex"]
+pepper = ["dep:pepper", "dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
+
+[target.'cfg(not(windows))'.dependencies]
+pepper = { path = "../pepper", optional = true }
+vortex-datafusion = { path = "../vortex-datafusion", optional = true }
+vortex = { workspace = true, optional = true }
 
 [[bench]]
 name = "prepared_statement"
