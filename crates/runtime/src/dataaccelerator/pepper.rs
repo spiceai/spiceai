@@ -17,11 +17,18 @@ limitations under the License.
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::CreateExternalTable;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{CreateExternalTable, ExprSchemable, TableProviderFilterPushDown};
+use datafusion::prelude::Expr;
+use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
+use runtime_table_partition::Partition;
+use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
+use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 use std::any::Any;
 use std::path::PathBuf;
@@ -64,6 +71,11 @@ pub enum Error {
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
     UnsupportedDataTypes { details: String },
+
+    #[snafu(display(
+        "A single partition by expression is required for Partitioned Pepper acceleration"
+    ))]
+    PartitionByRequired,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -345,6 +357,7 @@ impl PepperAccelerator {
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
             primary_key: vec![], // No PK by default, can be set by caller
             base_path: dir_path.to_string(),
+            partition_column: None, // Non-partitioned table
         };
 
         // Create PepperTableProvider
@@ -479,20 +492,14 @@ impl DataAccelerator for PepperAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    /// Pepper only supports file mode and creates an empty file with the given schema.
+    /// Pepper supports file mode and can optionally partition data.
+    #[allow(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        ensure!(
-            partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
-                msg: "Pepper data accelerator does not support the `partition_by` parameter but it was provided".to_string()
-            }
-        );
-
         // Pepper requires a source for file mode with directory-based storage
         let source = source.ok_or_else(|| {
             Box::new(Error::InvalidConfiguration {
@@ -501,9 +508,7 @@ impl DataAccelerator for PepperAccelerator {
         })?;
 
         let dir_path = self.resolve_storage_config(source).boxed()?;
-
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
-
         let _ = Self::ensure_directory(&dir_path).boxed()?;
 
         // Validate append mode configuration: requires either none, primary_key or time_column, but not both
@@ -562,7 +567,7 @@ impl DataAccelerator for PepperAccelerator {
         // Get the table name from the source
         let table_name = source.name().to_string();
 
-        // Use PepperTableProvider as top-level TableProvider
+        // Always create the base Pepper table provider
         let pepper_table = Self::create_pepper_table_provider(
             &table_name,
             &dir_path,
@@ -572,7 +577,63 @@ impl DataAccelerator for PepperAccelerator {
         .await
         .boxed()?;
 
-        Ok(pepper_table)
+        // If partitioning is requested, wrap with PartitionTableProvider
+        if partition_by.is_empty() {
+            // Non-partitioned table - return base provider directly
+            Ok(pepper_table)
+        } else {
+            let partition_by_first = partition_by.first().cloned().ok_or_else(|| {
+                Box::new(Error::PartitionByRequired) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+
+            // Get metadata catalog for partition tracking
+            let metadata_dir = if let Some(acceleration) = source.acceleration() {
+                if let Some(custom_dir) = acceleration.params.get("pepper_metadata_dir") {
+                    custom_dir.clone()
+                } else {
+                    format!("{}/metadata", crate::spice_data_base_path())
+                }
+            } else {
+                format!("{}/metadata", crate::spice_data_base_path())
+            };
+
+            let catalog = Arc::new(pepper::PepperCatalog::new(format!(
+                "sqlite://{metadata_dir}/pepper.db"
+            )));
+
+            // Cast to trait object for partition creator
+            let catalog_trait: Arc<dyn pepper::MetadataCatalog> = catalog;
+
+            // Get or create table_id from catalog
+            let table_metadata = catalog_trait.get_table(&table_name).await.map_err(|e| {
+                Error::AccelerationCreationFailed {
+                    source: Box::new(e),
+                }
+            })?;
+
+            // Create partition creator
+            let unsupported_type_action = Self::get_unsupported_type_action(source);
+            let creator = Arc::new(PepperPartitionCreator::new(
+                table_name,
+                PathBuf::from(&dir_path),
+                partition_by_first,
+                Arc::clone(&arrow_schema),
+                catalog_trait,
+                table_metadata.table_id,
+                unsupported_type_action,
+            ));
+
+            // Wrap the base table provider with partitioning logic
+            let table_provider = Arc::new(
+                PartitionTableProvider::new(creator, partition_by, arrow_schema)
+                    .await
+                    .map_err(|e| Error::AccelerationCreationFailed {
+                        source: Box::new(e),
+                    })?,
+            );
+
+            Ok(table_provider as Arc<dyn TableProvider>)
+        }
     }
 
     fn prefix(&self) -> &'static str {
@@ -581,6 +642,209 @@ impl DataAccelerator for PepperAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+}
+
+/// Partition creator for Pepper accelerator
+struct PepperPartitionCreator {
+    table_name: String,
+    base_path: PathBuf,
+    partition_by: PartitionedBy,
+    schema: SchemaRef,
+    catalog: Arc<dyn pepper::MetadataCatalog>,
+    table_id: i64,
+    unsupported_type_action: UnsupportedTypeAction,
+}
+
+impl std::fmt::Debug for PepperPartitionCreator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PepperPartitionCreator")
+            .field("table_name", &self.table_name)
+            .field("base_path", &self.base_path)
+            .field("partition_by", &self.partition_by)
+            .field("schema", &self.schema)
+            .field("catalog", &"<dyn MetadataCatalog>")
+            .field("table_id", &self.table_id)
+            .field("unsupported_type_action", &self.unsupported_type_action)
+            .finish()
+    }
+}
+
+impl PepperPartitionCreator {
+    fn new(
+        table_name: String,
+        base_path: PathBuf,
+        partition_by: PartitionedBy,
+        schema: SchemaRef,
+        catalog: Arc<dyn pepper::MetadataCatalog>,
+        table_id: i64,
+        unsupported_type_action: UnsupportedTypeAction,
+    ) -> Self {
+        Self {
+            table_name,
+            base_path,
+            partition_by,
+            schema,
+            catalog,
+            table_id,
+            unsupported_type_action,
+        }
+    }
+
+    fn partition_column_label(&self) -> &str {
+        match &self.partition_by.expression {
+            Expr::Column(col) => col.name.as_str(),
+            _ => self.partition_by.name.as_str(),
+        }
+    }
+
+    fn partition_table_name(&self, partition_value: &str) -> String {
+        format!("{}_{}", self.table_name, partition_value)
+    }
+
+    fn partition_data_type(&self) -> Result<DataType, creator::Error> {
+        if let Ok(field) = self.schema.field_with_name(self.partition_column_label()) {
+            return Ok(field.data_type().clone());
+        }
+
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).map_err(|e| {
+            creator::Error::InferringPartitions {
+                source: Box::new(e),
+            }
+        })?;
+
+        self.partition_by
+            .expression
+            .data_type_and_nullable(&df_schema)
+            .map(|(data_type, _)| data_type)
+            .map_err(|e| creator::Error::InferringPartitions {
+                source: Box::new(e),
+            })
+    }
+
+    /// Generate partition directory path from partition value
+    fn partition_dir(&self, partition_value: &ScalarValue) -> PathBuf {
+        let partition_str = partition_value.to_string();
+        let partition_column_name = self.partition_column_label();
+
+        // Use Hive-style partitioning: partition_column=value
+        let partition_name = format!("{partition_column_name}={partition_str}");
+        self.base_path.join(partition_name)
+    }
+}
+
+#[async_trait]
+impl PartitionCreator for PepperPartitionCreator {
+    async fn create_partition(
+        &self,
+        partition_value: ScalarValue,
+    ) -> Result<Partition, creator::Error> {
+        let partition_dir = self.partition_dir(&partition_value);
+        let partition_path = partition_dir.to_string_lossy().to_string();
+
+        tracing::debug!("creating Pepper partition at {partition_path}");
+
+        // Create the partition directory
+        std::fs::create_dir_all(&partition_dir).map_err(|e| creator::Error::CreatePartition {
+            source: Box::new(e),
+        })?;
+
+        // Create partition metadata in catalog
+        let partition_value_str = partition_value.to_string();
+        let partition_column_name = self.partition_column_label().to_string();
+
+        let partition_metadata = pepper::PartitionMetadata {
+            partition_id: 0, // Will be assigned by catalog
+            table_id: self.table_id,
+            partition_column: partition_column_name,
+            partition_value: partition_value_str.clone(),
+            path: partition_path.clone(),
+            path_is_relative: false,
+            record_count: 0,    // Will be updated as data is written
+            file_size_bytes: 0, // Will be updated as data is written
+        };
+
+        self.catalog
+            .add_partition(partition_metadata)
+            .await
+            .map_err(|e| creator::Error::CreatePartition {
+                source: Box::new(e),
+            })?;
+
+        // Create table options for this partition
+        let table_options = pepper::metadata::CreateTableOptions {
+            table_name: self.partition_table_name(&partition_value_str),
+            schema: Arc::clone(&self.schema),
+            primary_key: vec![],
+            base_path: partition_path.clone(),
+            partition_column: None, // Partitions themselves are not partitioned
+        };
+
+        // Create Pepper table provider for this partition
+        let pepper_table =
+            pepper::PepperTableProvider::create_table(Arc::clone(&self.catalog), table_options)
+                .await
+                .map_err(|e| creator::Error::CreatePartition {
+                    source: Box::new(e),
+                })?;
+
+        Ok(Partition {
+            partition_value,
+            table_provider: Arc::new(pepper_table),
+        })
+    }
+
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
+        // Query catalog for existing partitions
+        let partitions = self
+            .catalog
+            .get_partitions(self.table_id)
+            .await
+            .map_err(|e| creator::Error::InferringPartitions {
+                source: Box::new(e),
+            })?;
+
+        let mut result = Vec::new();
+
+        let partition_data_type = self.partition_data_type()?;
+
+        for partition_meta in partitions {
+            // Parse partition value
+            let partition_value = ScalarValue::try_from_string(
+                partition_meta.partition_value.clone(),
+                &partition_data_type,
+            )
+            .map_err(|e| creator::Error::InferringPartitions {
+                source: Box::new(e),
+            })?;
+
+            // Create Pepper table provider for this partition
+            let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
+            let pepper_table =
+                pepper::PepperTableProvider::new(&partition_table_name, Arc::clone(&self.catalog))
+                    .await
+                    .map_err(|e| creator::Error::InferringPartitions {
+                        source: Box::new(e),
+                    })?;
+
+            result.push(Partition {
+                partition_value,
+                table_provider: Arc::new(pepper_table),
+            });
+        }
+
+        Ok(result)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        // Pepper doesn't support filter pushdown yet, but partition pruning works
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
     }
 }
 

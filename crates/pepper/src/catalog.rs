@@ -20,7 +20,10 @@ limitations under the License.
 //! and file references. It can be implemented by different RDBMS backends
 //! (`SQLite`, `PostgreSQL`, etc.).
 
-use super::metadata::{CreateTableOptions, DataFile, DeleteFile, TableMetadata, TableStats};
+use super::metadata::{
+    CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
+    TableStats,
+};
 use async_trait::async_trait;
 use snafu::Snafu;
 use std::sync::Arc;
@@ -145,6 +148,33 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get statistics for a table.
     async fn get_table_stats(&self, table_id: i64) -> CatalogResult<TableStats>;
+
+    /// Add a partition to a table.
+    async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64>;
+
+    /// Get all partitions for a table.
+    async fn get_partitions(&self, table_id: i64) -> CatalogResult<Vec<PartitionMetadata>>;
+
+    /// Get a specific partition by table ID and partition value.
+    async fn get_partition(
+        &self,
+        table_id: i64,
+        partition_value: &str,
+    ) -> CatalogResult<Option<PartitionMetadata>>;
+
+    /// Update partition statistics (record count and file size).
+    async fn update_partition_stats(
+        &self,
+        partition_id: i64,
+        record_count: i64,
+        file_size_bytes: i64,
+    ) -> CatalogResult<()>;
+
+    /// Get partition statistics.
+    async fn get_partition_stats(&self, partition_id: i64) -> CatalogResult<PartitionStats>;
+
+    /// Get data files belonging to a specific partition.
+    async fn get_partition_data_files(&self, partition_id: i64) -> CatalogResult<Vec<DataFile>>;
 
     /// Begin a transaction.
     async fn begin_transaction(&self) -> CatalogResult<()>;
