@@ -16,8 +16,9 @@ limitations under the License.
 
 //! Simple integration test for Pepper with Vortex
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use pepper::metadata::CreateTableOptions;
@@ -93,10 +94,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     // 8. Query the data back
     let df = ctx.sql("SELECT * FROM test_table ORDER BY id").await?;
     let results = df.collect().await?;
-    let total_rows: usize = results
-        .iter()
-        .map(arrow::array::RecordBatch::num_rows)
-        .sum();
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total_rows, 3, "Expected 3 rows after first insert");
     println!("✓ Query returned {total_rows} rows");
 
@@ -640,5 +638,282 @@ async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\n✅ Statistics tracking test passed!");
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::{
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+        Float32Array, Float64Array, Int16Array, Int32Array, Int8Array, LargeBinaryArray,
+        LargeStringArray, TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
+    };
+    use arrow::datatypes::TimeUnit;
+
+    println!("\n🧪 Testing Pepper core data type support...");
+
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("types_test.db");
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path)?;
+
+    let catalog = Arc::new(PepperCatalog::new(format!(
+        "sqlite://{}",
+        db_path.to_string_lossy()
+    )));
+    catalog.init().await?;
+
+    // Create table with all core supported data types
+    let schema = Arc::new(Schema::new(vec![
+        // Integer types
+        Field::new("col_int8", DataType::Int8, true),
+        Field::new("col_int16", DataType::Int16, true),
+        Field::new("col_int32", DataType::Int32, true),
+        Field::new("col_int64", DataType::Int64, false), // Primary key
+        Field::new("col_uint8", DataType::UInt8, true),
+        Field::new("col_uint16", DataType::UInt16, true),
+        Field::new("col_uint32", DataType::UInt32, true),
+        Field::new("col_uint64", DataType::UInt64, true),
+        // Float types
+        Field::new("col_float32", DataType::Float32, true),
+        Field::new("col_float64", DataType::Float64, true),
+        // Boolean
+        Field::new("col_bool", DataType::Boolean, true),
+        // String types
+        Field::new("col_utf8", DataType::Utf8, true),
+        Field::new("col_large_utf8", DataType::LargeUtf8, true),
+        // Binary types
+        Field::new("col_binary", DataType::Binary, true),
+        Field::new("col_large_binary", DataType::LargeBinary, true),
+        // Date/Time types
+        Field::new("col_date32", DataType::Date32, true),
+        Field::new("col_date64", DataType::Date64, true),
+        Field::new(
+            "col_timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        // Decimal types
+        Field::new("col_decimal128", DataType::Decimal128(38, 10), true),
+    ]));
+
+    let table_options = CreateTableOptions {
+        table_name: "types_test".to_string(),
+        schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
+        primary_key: vec!["col_int64".to_string()],
+        base_path: data_path.to_string_lossy().to_string(),
+    };
+
+    let table = PepperTableProvider::create_table(
+        Arc::<pepper::PepperCatalog>::clone(&catalog),
+        table_options,
+    )
+    .await?;
+    tracing::info!("✓ Table created with {} columns", schema.fields().len());
+
+    let ctx = SessionContext::new();
+    ctx.register_table("types_test", Arc::new(table))?;
+
+    // Insert test data with various types
+
+    let batch = RecordBatch::try_new(
+        Arc::<arrow::datatypes::Schema>::clone(&schema),
+        vec![
+            Arc::new(Int8Array::from(vec![Some(127), Some(-128), None])) as ArrayRef,
+            Arc::new(Int16Array::from(vec![Some(32_767), Some(-32_768), None])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![
+                Some(2_147_483_647),
+                Some(-2_147_483_648),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef, // Primary key, non-null
+            Arc::new(UInt8Array::from(vec![Some(255), Some(0), None])) as ArrayRef,
+            Arc::new(UInt16Array::from(vec![Some(65_535), Some(0), None])) as ArrayRef,
+            Arc::new(UInt32Array::from(vec![Some(4_294_967_295), Some(0), None])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![
+                Some(18_446_744_073_709_551_615),
+                Some(0),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Float32Array::from(vec![
+                Some(std::f32::consts::PI),
+                Some(-2.71_f32),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                Some(std::f64::consts::PI),
+                Some(-std::f64::consts::E),
+                None,
+            ])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("Hello"), Some("World"), None])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![
+                Some("Large"),
+                Some("String"),
+                None,
+            ])) as ArrayRef,
+            Arc::new(BinaryArray::from_vec(vec![
+                &b"binary"[..],
+                &b"data"[..],
+                &b""[..],
+            ])) as ArrayRef,
+            Arc::new(LargeBinaryArray::from_vec(vec![
+                &b"large"[..],
+                &b"binary"[..],
+                &b""[..],
+            ])) as ArrayRef,
+            Arc::new(Date32Array::from(vec![Some(18_993), Some(0), None])) as ArrayRef, // Days since epoch
+            Arc::new(Date64Array::from(vec![
+                Some(1_640_995_200_000),
+                Some(0),
+                None,
+            ])) as ArrayRef, // Milliseconds since epoch
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_640_995_200_000_000),
+                Some(0),
+                None,
+            ])) as ArrayRef,
+            Arc::new(
+                Decimal128Array::from(vec![
+                    Some(314_159_265_358_i128),  // 3141.59265358
+                    Some(-271_828_182_845_i128), // -2718.28182845
+                    None,
+                ])
+                .with_precision_and_scale(38, 10)
+                .expect("valid decimal"),
+            ) as ArrayRef,
+        ],
+    )?;
+
+    // Insert via DataFusion
+    let df = ctx.read_batch(batch)?;
+    df.write_table(
+        "types_test",
+        datafusion::dataframe::DataFrameWriteOptions::default(),
+    )
+    .await?;
+    println!("✓ Inserted 3 rows with all data types");
+
+    // Query back and verify
+    let df = ctx
+        .sql("SELECT * FROM types_test ORDER BY col_int64")
+        .await?;
+    let results = df.collect().await?;
+    assert_eq!(results.len(), 1, "Expected 1 result batch");
+    let result_batch = &results[0];
+    assert_eq!(result_batch.num_rows(), 3, "Expected 3 rows");
+    assert_eq!(result_batch.num_columns(), 19, "Expected 19 columns");
+    println!(
+        "✓ Query returned {} rows with {} columns",
+        result_batch.num_rows(),
+        result_batch.num_columns()
+    );
+
+    // Verify specific values for each data type
+    println!("\n📊 Verifying data types:");
+
+    // Int8
+    let int8_col = result_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .expect("Int8 column");
+    assert_eq!(int8_col.value(0), 127);
+    assert_eq!(int8_col.value(1), -128);
+    assert!(int8_col.is_null(2));
+    println!(
+        "  ✓ Int8: max={}, min={}, null={}",
+        int8_col.value(0),
+        int8_col.value(1),
+        int8_col.is_null(2)
+    );
+
+    // Int64 (primary key)
+    let int64_col = result_batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64 column");
+    assert_eq!(int64_col.value(0), 1);
+    assert_eq!(int64_col.value(1), 2);
+    assert_eq!(int64_col.value(2), 3);
+    println!(
+        "  ✓ Int64: {}, {}, {}",
+        int64_col.value(0),
+        int64_col.value(1),
+        int64_col.value(2)
+    );
+
+    // Float32
+    let float32_col = result_batch
+        .column(8)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("Float32 column");
+    assert!((float32_col.value(0) - std::f32::consts::PI).abs() < 0.01);
+    println!("  ✓ Float32: {}", float32_col.value(0));
+
+    // Boolean
+    let bool_col = result_batch
+        .column(10)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("Boolean column");
+    assert!(bool_col.value(0));
+    assert!(!bool_col.value(1));
+    assert!(bool_col.is_null(2));
+    println!(
+        "  ✓ Boolean: {}, {}, null={}",
+        bool_col.value(0),
+        bool_col.value(1),
+        bool_col.is_null(2)
+    );
+
+    // String
+    let str_col = result_batch
+        .column(11)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("String column");
+    assert_eq!(str_col.value(0), "Hello");
+    assert_eq!(str_col.value(1), "World");
+    assert!(str_col.is_null(2));
+    println!(
+        "  ✓ Utf8: '{}', '{}', null={}",
+        str_col.value(0),
+        str_col.value(1),
+        str_col.is_null(2)
+    );
+
+    // Binary
+    let bin_col = result_batch
+        .column(13)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("Binary column");
+    assert_eq!(bin_col.value(0), b"binary");
+    println!("  ✓ Binary: {} bytes", bin_col.value(0).len());
+
+    // Timestamp
+    let ts_col = result_batch
+        .column(17)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("Timestamp column");
+    assert_eq!(ts_col.value(0), 1_640_995_200_000_000);
+    println!("  ✓ Timestamp: {}", ts_col.value(0));
+
+    // Decimal128
+    let dec_col = result_batch
+        .column(18)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("Decimal128 column");
+    assert_eq!(dec_col.value(0), 314_159_265_358_i128);
+    println!("  ✓ Decimal128: {}", dec_col.value(0));
+
+    println!("\n✅ Core data types test passed!");
     Ok(())
 }

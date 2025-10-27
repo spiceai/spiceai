@@ -23,7 +23,7 @@ use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -35,7 +35,6 @@ use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::Query;
-use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -79,6 +78,7 @@ use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
 use runtime_async::ManagedTokioRuntime;
+use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -99,7 +99,6 @@ pub mod builder;
 pub mod cluster;
 pub mod dialect;
 pub mod error;
-pub mod extension;
 pub mod filter_converter;
 pub mod managed_runtime;
 pub mod param_utils;
@@ -1147,7 +1146,12 @@ impl DataFusion {
             }
         }
 
-        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+        // For append mode without time_column, check if source provides append_stream
+        // Skip this check for Pepper which has its own validation (supports primary_key or time_column)
+        if refresh_mode == RefreshMode::Append
+            && dataset.time_column.is_none()
+            && acceleration_settings.engine != Engine::Pepper
+        {
             let append_stream = source.append_stream(source_table_provider);
             if let Some(append_stream) = append_stream {
                 accelerated_table_builder.append_stream(append_stream);

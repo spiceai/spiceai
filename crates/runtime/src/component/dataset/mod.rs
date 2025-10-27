@@ -777,6 +777,14 @@ impl AccelerationSource for Dataset {
     fn name(&self) -> &TableReference {
         &self.name
     }
+
+    fn time_column(&self) -> Option<&str> {
+        self.time_column.as_deref()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]

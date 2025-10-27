@@ -12765,6 +12765,7 @@ dependencies = [
  "runtime-acceleration",
  "runtime-async",
  "runtime-auth",
+ "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",
@@ -12877,6 +12878,25 @@ dependencies = [
  "pin-project",
  "tonic",
  "tower 0.5.2",
+ "tracing",
+]
+
+[[package]]
+name = "runtime-datafusion"
+version = "1.9.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow_tools",
+ "async-stream",
+ "async-trait",
+ "dashmap",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-federation",
+ "futures",
+ "opentelemetry 0.27.1",
+ "runtime-request-context",
+ "tokio",
  "tracing",
 ]
 
