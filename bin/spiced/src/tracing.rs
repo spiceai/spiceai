@@ -183,11 +183,25 @@ where
         .transpose()?
         .flatten();
 
+    let captured_plan = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.get_captured_plan())
+        .transpose()?
+        .unwrap_or_default();
+
+    let min_plan_duration_ms = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.min_plan_duration_as_millis())
+        .transpose()?
+        .flatten();
+
     let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
         task_history::otel_exporter::TaskHistoryExporter::new(
             df,
             captured_output,
             min_sql_duration_ms,
+            captured_plan,
+            min_plan_duration_ms,
         ),
     )];
 

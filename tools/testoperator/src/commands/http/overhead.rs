@@ -17,6 +17,7 @@ limitations under the License.
 use crate::{
     args::HttpOverheadTestArgs,
     commands::{get_app_and_start_request, util::Color},
+    health::HealthMonitor,
     with_color,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -53,6 +54,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     let baseline_cfg = construct_baseline_cfg(args, &component, &payloads)?;
 
@@ -79,7 +81,9 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     print_batches(&records)?;
 
     let mut spiced_instance = test.end()?;
+    let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+    let health_report = health_report?;
 
     let Some(baseline) = results
         .metrics
@@ -96,24 +100,39 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
         return Err(anyhow::anyhow!("Spice results not found"));
     };
 
-    check_threshold(
+    let mut failure_messages = Vec::new();
+    if let Err(err) = check_threshold(
         spice.median_duration_ms,
         baseline.median_duration_ms,
         args.increase_threshold,
         "median",
-    )?;
-    check_threshold(
+    ) {
+        failure_messages.push(err.to_string());
+    }
+    if let Err(err) = check_threshold(
         spice.percentile_90_duration_ms,
         baseline.percentile_90_duration_ms,
         args.increase_threshold,
         "p90",
-    )?;
-    check_threshold(
+    ) {
+        failure_messages.push(err.to_string());
+    }
+    if let Err(err) = check_threshold(
         spice.percentile_95_duration_ms,
         baseline.percentile_95_duration_ms,
         args.increase_threshold,
         "p95",
-    )?;
+    ) {
+        failure_messages.push(err.to_string());
+    }
+
+    if let Some(message) = health_report.failure_message() {
+        failure_messages.push(message);
+    }
+
+    if !failure_messages.is_empty() {
+        return Err(anyhow::anyhow!(failure_messages.join("\n")));
+    }
 
     Ok(())
 }
