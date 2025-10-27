@@ -130,7 +130,7 @@ impl DataConnector for DynamoDB {
 
         let schema_infer_max_records_str =
             match self.params.get("schema_infer_max_records").expose() {
-                ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str.clone(),
+                ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str,
                 ExposedParamLookup::Absent(_) => DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR,
             };
 
@@ -150,9 +150,6 @@ impl DataConnector for DynamoDB {
             })?),
             ExposedParamLookup::Absent(_) => None,
         };
-
-        println!("unnest_depth: {:?}", unnest_depth);
-        println!("schema_infer_max_records: {:?}", schema_infer_max_records);
 
         let provider = DynamoDBTableProvider::try_new(
             Arc::new(client),

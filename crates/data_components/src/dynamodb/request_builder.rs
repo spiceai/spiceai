@@ -77,8 +77,6 @@ impl DynamoDBRequestPlanBuilder {
     ) -> DataFusionResult<DynamoDBRequestPlan> {
         // Separate key filters from other filters
         let (key_filters, other_filters) = self.separate_key_filters(filters);
-        println!("key_filters: {key_filters:?}");
-        println!("other_filters: {other_filters:?}");
 
         let mut attribute_names = self.extract_attribute_names(filters);
         self.add_projection_aliases(projection_schema, &mut attribute_names);

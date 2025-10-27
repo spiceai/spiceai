@@ -86,8 +86,6 @@ impl DynamoDBTableSchema {
                 op_supported && self.is_filter_supported(left) && self.is_filter_supported(right)
             }
             Expr::Column(col) => {
-                println!("Column: {:?}", col.name);
-                println!("Column: {:?}", self.column_to_alias_map.keys());
                 self.column_to_alias_map.contains_key(col.name.as_str())
             }
             Expr::Literal(scalar, _) => matches!(

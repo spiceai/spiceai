@@ -224,7 +224,7 @@ async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
 
             run_and_snapshot_query(
                 &rt,
-                "SELECT COUNT(*) as total_count FROM test_dynamodb;",
+                "SELECT COUNT(*) as total_count, MAX(col_timestamp) as max_timestamp FROM test_dynamodb;",
                 "aggregation",
             )
             .await?;
@@ -386,10 +386,51 @@ async fn dynamodb_collections() -> Result<(), anyhow::Error> {
 
             run_and_snapshot_query(
                 &rt,
-                "SELECT id, col_string_set, col_number_set_int, col_list \
+                "SELECT id, array_sort(col_string_set), array_sort(col_number_set_int), array_sort(col_list) \
                  FROM test_dynamodb \
                  WHERE id = 1;",
                 "collections",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_timestamp_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, col_timestamp, col_date \
+                 FROM test_dynamodb \
+                 WHERE col_timestamp > '2010-01-01';",
+                "timestamp_filter",
             )
             .await?;
 
@@ -437,6 +478,10 @@ fn get_test_dataset(from: &str, name: &str) -> Dataset {
             (
                 "dynamodb_aws_secret_access_key".to_string(),
                 "${ env:AWS_DYNAMODB_SECRET }".to_string(),
+            ),
+            (
+                "unnest_depth".to_string(),
+                "1".to_string(),
             ),
         ]
         .into_iter()
