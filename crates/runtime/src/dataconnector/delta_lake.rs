@@ -74,6 +74,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
         .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description("The AWS session token to use for S3 storage.")
+        .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
         .secret(),
