@@ -38,6 +38,8 @@ pub struct TableMetadata {
     /// Current snapshot ID (`UUIDv7`, changes on overwrite/delete operations)
     /// All tables are created with an initial snapshot.
     pub current_snapshot_id: String,
+    /// Partition column name (if this is a partitioned table)
+    pub partition_column: Option<String>,
 }
 
 /// Represents a data file containing table rows.
@@ -52,6 +54,8 @@ pub struct DataFile {
     pub data_file_id: i64,
     /// Table this file belongs to
     pub table_id: i64,
+    /// Partition this file belongs to (None for non-partitioned tables)
+    pub partition_id: Option<i64>,
     /// Ordering of this file within the table
     pub file_order: i64,
     /// Path to the directory containing the `ListingTable`'s Vortex files
@@ -90,6 +94,36 @@ pub struct DeleteFile {
     pub file_size_bytes: i64,
 }
 
+/// Metadata about a partition in a table.
+#[derive(Debug, Clone)]
+pub struct PartitionMetadata {
+    /// Unique identifier for this partition
+    pub partition_id: i64,
+    /// Table this partition belongs to
+    pub table_id: i64,
+    /// Name of the partition column
+    pub partition_column: String,
+    /// Partition value (serialized as string for storage)
+    pub partition_value: String,
+    /// Path to the partition's data directory
+    pub path: String,
+    /// Whether the path is relative to the table's base path
+    pub path_is_relative: bool,
+    /// Total number of records in this partition
+    pub record_count: i64,
+    /// Total size of data files in this partition (bytes)
+    pub file_size_bytes: i64,
+}
+
+/// Statistics about a partition for query optimization.
+#[derive(Debug, Clone, Default)]
+pub struct PartitionStats {
+    /// Total number of records
+    pub record_count: i64,
+    /// Total file size in bytes
+    pub file_size_bytes: i64,
+}
+
 /// Options for creating a new Pepper table.
 #[derive(Debug, Clone)]
 pub struct CreateTableOptions {
@@ -101,6 +135,8 @@ pub struct CreateTableOptions {
     pub primary_key: Vec<String>,
     /// Base path for storing table data
     pub base_path: String,
+    /// Optional partition column name (for partitioned tables)
+    pub partition_column: Option<String>,
 }
 
 /// Statistics about a table.
