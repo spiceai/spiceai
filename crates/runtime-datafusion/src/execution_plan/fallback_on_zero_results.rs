@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -29,12 +30,19 @@ use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use std::any::Any;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
-use crate::federated_table::FederatedTable;
 
 use super::TableScanParams;
+
+/// [`FallbackAsyncTableProvider`] is a generic function type that allows the deferred construction of a [`TableProvider`].
+pub type FallbackAsyncTableProvider = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Arc<dyn TableProvider>> + Send + Sync + 'static>>
+        + Send
+        + Sync,
+>;
 
 /// `FallbackOnZeroResultsScanExec` takes an input `ExecutionPlan` and a fallback `TableProvider`.
 /// If the input `ExecutionPlan` returns 0 rows, the fallback `TableProvider.scan()` is executed.
@@ -44,8 +52,7 @@ pub struct FallbackOnZeroResultsScanExec {
     table_name: TableReference,
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,
-    /// A closure to get the fallback execution plan if needed.
-    fallback_table_provider: Arc<FederatedTable>,
+    fallback_table_provider: FallbackAsyncTableProvider,
     fallback_scan_params: TableScanParams,
     properties: PlanProperties,
 }
@@ -55,7 +62,7 @@ impl FallbackOnZeroResultsScanExec {
     pub fn new(
         table_name: TableReference,
         mut input: Arc<dyn ExecutionPlan>,
-        fallback_table_provider: Arc<FederatedTable>,
+        fallback_table_provider: FallbackAsyncTableProvider,
         fallback_scan_params: TableScanParams,
     ) -> Self {
         let eq_properties = input.equivalence_properties().clone();
@@ -156,7 +163,6 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         let mut input_stream = filtered_input.execute(0, Arc::clone(&context))?;
         let schema = input_stream.schema();
         let scan_params = self.fallback_scan_params.clone();
-        let fallback_provider = Arc::clone(&self.fallback_table_provider);
         let table_name = self.table_name.clone();
         let fallback_msg = format!(
             r#"Accelerated table "{}" returned 0 results for query with filter [{}], sending query to federated table..."#,
@@ -169,6 +175,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 .join(", ")
         );
 
+        let federated_provider_callback = Arc::clone(&self.fallback_table_provider);
         let potentially_fallback_stream = stream::once(async move {
             let context = Arc::clone(&context);
             let schema = input_stream.schema();
@@ -195,7 +202,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
                 tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
-                let federated_provider = fallback_provider.table_provider().await;
+                let federated_provider = federated_provider_callback().await;
                 let fallback_plan = match federated_provider
                     .scan(
                         &scan_params.state,
@@ -262,7 +269,6 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use data_components::arrow::write::MemTable;
     use datafusion::execution::context::SessionContext;
     use std::sync::Arc;
 
@@ -273,8 +279,17 @@ mod tests {
         ]))
     }
 
+    fn create_fallback_provider(
+        table_provider: Arc<dyn TableProvider>,
+    ) -> FallbackAsyncTableProvider {
+        Arc::new(move || {
+            let table_provider = Arc::clone(&table_provider);
+            Box::pin(async move { Arc::clone(&table_provider) })
+        })
+    }
+
     mod empty_fallback {
-        use datafusion::catalog::TableProvider;
+        use datafusion::catalog::{MemTable, TableProvider};
         use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
 
         use super::*;
@@ -311,7 +326,7 @@ mod tests {
             let exec = FallbackOnZeroResultsScanExec::new(
                 TableReference::bare("test"),
                 empty_memory_exec(),
-                Arc::new(FederatedTable::new_unchecked(memory_table_provider())),
+                create_fallback_provider(memory_table_provider()),
                 TableScanParams {
                     state: ctx.state(),
                     projection: None,
@@ -334,7 +349,7 @@ mod tests {
 
     mod non_empty_filtered_fallback {
         use datafusion::{
-            catalog::TableProvider,
+            catalog::{MemTable, TableProvider},
             logical_expr::{Expr, Operator, binary_expr, col},
             scalar::ScalarValue,
         };
@@ -385,8 +400,6 @@ mod tests {
             let ctx = SessionContext::new();
 
             let input_plan = memory_exec();
-            let fallback_provider =
-                Arc::new(FederatedTable::new_unchecked(memory_table_provider()));
             let fallback_scan_params = TableScanParams {
                 state: ctx.state(),
                 projection: None,
@@ -401,7 +414,7 @@ mod tests {
             let exec = FallbackOnZeroResultsScanExec::new(
                 TableReference::bare("test"),
                 input_plan,
-                fallback_provider,
+                create_fallback_provider(memory_table_provider()),
                 fallback_scan_params,
             );
 

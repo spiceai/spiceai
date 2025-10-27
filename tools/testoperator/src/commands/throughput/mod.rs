@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::DatasetTestArgs, wait_test_and_memory};
+use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -48,6 +48,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     // baseline run
     println!("Running baseline test");
@@ -97,7 +98,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let records = metrics.build_records()?;
     print_batches(&records)?;
     metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
+    let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+    let health_report = health_report?;
+
+    if let Some(message) = health_report.failure_message() {
+        return Err(anyhow::anyhow!(message));
+    }
 
     println!(
         "Throughput test completed with throughput: {} Queries per hour * Scale Factor",

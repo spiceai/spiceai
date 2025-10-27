@@ -462,55 +462,277 @@ fn parse_json_array(
 mod tests {
 
     use super::*;
-    use arrow::{
-        array::{Int32Array, StringArray},
-        datatypes::{DataType, Field, Schema},
-    };
+    use arrow::{array::record_batch, util::pretty::pretty_format_batches};
+    use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
+    use futures::{StreamExt, TryStreamExt};
     use runtime_datafusion_index::Index;
 
+    /// Create a basic [`MemTable`] with fields: `id`, `content`.
     fn create_test_table() -> Arc<dyn TableProvider> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![
-                    "test content 1",
-                    "test content 2",
-                    "test content 3",
-                ])),
-            ],
+        let batch = record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            (
+                "content",
+                Utf8,
+                ["test content 1", "test content 2", "test content 3"]
+            )
         )
         .expect("Failed to create test batch");
 
-        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("Failed to create test table"))
+        Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]])
+                .expect("Failed to create test table"),
+        )
+    }
+
+    /// Returns a [`RecordBatch`] where the fields are sorted into alphabetical order.
+    ///
+    /// An error is returned only if [`RecordBatch::try_new`] returns an error (which it should not).
+    fn sort_columns_alphabetically(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+        let mut fields_with_indices: Vec<(usize, Field)> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| (idx, field.as_ref().clone()))
+            .collect();
+
+        fields_with_indices.sort_by(|a, b| a.1.name().cmp(b.1.name()));
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(
+                fields_with_indices
+                    .iter()
+                    .map(|(_, field)| field.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            fields_with_indices
+                .iter()
+                .map(|(original_idx, _)| Arc::clone(batch.column(*original_idx)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    //
+    async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
+        let rb: Vec<RecordBatch> = idx
+            .search(query.into(), &[], 1000)
+            .await
+            .expect("Failed to search")
+            .map(|res| match res {
+                Ok(rb) => sort_columns_alphabetically(&rb)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+                Err(e) => Err(e),
+            })
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+
+        format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    #[tokio::test]
+    async fn test_updates_overwrites_on_compute_index() {
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        // Initial table
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3]),
+                    (
+                        "content",
+                        Utf8,
+                        ["test content 1", "test content 2", "test content 3"]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        // Initial table as expected
+        {
+            let index_read = index.index.read().await;
+            let search_index = FullTextSearchFieldIndex::try_new(
+                &index_read,
+                "content".to_string(),
+                vec!["id".to_string()],
+            )
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+            insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
+            +----------------+----+---------------------+----------------+
+            | content        | id | score               | value          |
+            +----------------+----+---------------------+----------------+
+            | test content 1 | 1  | 0.26706287264823914 | test content 1 |
+            | test content 2 | 2  | 0.26706287264823914 | test content 2 |
+            | test content 3 | 3  | 0.26706287264823914 | test content 3 |
+            +----------------+----+---------------------+----------------+
+            ");
+        }
+
+        // With an update
+        {
+            index
+                .compute_index(vec![
+                    record_batch!(
+                        ("id", Int32, [1, 3]), // 1 & 3 are existing keys.
+                        ("content", Utf8, ["new content 1", "new content 3"])
+                    )
+                    .expect("Failed to create test record_batch"),
+                ])
+                .await
+                .expect("failed to compute_index");
+
+            let index_read = index.index.read().await;
+            let search_index = FullTextSearchFieldIndex::try_new(
+                &index_read,
+                "content".to_string(),
+                vec!["id".to_string()],
+            )
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+            // First, ensure old data is no longer existent.
+            insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
+            +----------------+----+--------------------+----------------+
+            | content        | id | score              | value          |
+            +----------------+----+--------------------+----------------+
+            | test content 2 | 2  | 0.5389965176582336 | test content 2 |
+            +----------------+----+--------------------+----------------+
+            ");
+
+            // Second, ensure new data is searchable.
+            insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
+            +---------------+----+--------------------+---------------+
+            | content       | id | score              | value         |
+            +---------------+----+--------------------+---------------+
+            | new content 1 | 1  | 0.8754687905311584 | new content 1 |
+            | new content 3 | 3  | 0.8754687905311584 | new content 3 |
+            +---------------+----+--------------------+---------------+
+            ");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_updates_overwrites_on_compute_index_composite_pk() {
+        let batch = record_batch!(
+            ("id1", Utf8, ["a", "a", "b"]),
+            ("id2", Int32, [1, 2, 1]),
+            (
+                "content",
+                Utf8,
+                ["test content 1", "test content 2", "test content 3"]
+            )
+        )
+        .expect("Failed to create test batch");
+
+        let index = FullTextDatabaseIndex::try_new(
+            Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                    .expect("Failed to create test table"),
+            ),
+            vec!["content".to_string()],
+            Some(vec!["id1".to_string(), "id2".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        // Initial table
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        // Initial table as expected
+        {
+            let index_read = index.index.read().await;
+            let search_index = FullTextSearchFieldIndex::try_new(
+                &index_read,
+                "content".to_string(),
+                vec!["id1".to_string(), "id2".to_string()],
+            )
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+            insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
+            +----------------+-----+-----+---------------------+----------------+
+            | content        | id1 | id2 | score               | value          |
+            +----------------+-----+-----+---------------------+----------------+
+            | test content 1 | a   | 1   | 0.26706287264823914 | test content 1 |
+            | test content 2 | a   | 2   | 0.26706287264823914 | test content 2 |
+            | test content 3 | b   | 1   | 0.26706287264823914 | test content 3 |
+            +----------------+-----+-----+---------------------+----------------+
+            ");
+        }
+
+        // With an update
+        {
+            index
+                .compute_index(vec![
+                    record_batch!(
+                        ("id1", Utf8, ["a", "b"]),
+                        ("id2", Int32, [1, 1]),
+                        ("content", Utf8, ["new content 1", "new content 3"])
+                    )
+                    .expect("Failed to create test record_batch"),
+                ])
+                .await
+                .expect("failed to compute_index");
+
+            let index_read = index.index.read().await;
+            let search_index = FullTextSearchFieldIndex::try_new(
+                &index_read,
+                "content".to_string(),
+                vec!["id1".to_string(), "id2".to_string()],
+            )
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+            // First, ensure old data is no longer existent.
+            insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
+            +----------------+-----+-----+--------------------+----------------+
+            | content        | id1 | id2 | score              | value          |
+            +----------------+-----+-----+--------------------+----------------+
+            | test content 2 | a   | 2   | 0.5389965176582336 | test content 2 |
+            +----------------+-----+-----+--------------------+----------------+
+            ");
+
+            // Second, ensure new data is searchable.
+            insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
+            +---------------+-----+-----+--------------------+---------------+
+            | content       | id1 | id2 | score              | value         |
+            +---------------+-----+-----+--------------------+---------------+
+            | new content 1 | a   | 1   | 0.8754687905311584 | new content 1 |
+            | new content 3 | b   | 1   | 0.8754687905311584 | new content 3 |
+            +---------------+-----+-----+--------------------+---------------+
+            ");
+        }
     }
 
     #[tokio::test]
     async fn test_compute_index_returns_batches_unchanged() {
-        let table = create_test_table();
-        let search_fields = vec!["content".to_string()];
-        let primary_key = Some(vec!["id".to_string()]);
-
-        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key, None, &[])
-            .expect("Failed to create index");
-
-        let input_batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("content", DataType::Utf8, false),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![4, 5])),
-                Arc::new(StringArray::from(vec!["new content 1", "new content 2"])),
-            ],
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &[],
         )
-        .expect("Failed to create input batch");
+        .expect("Failed to create index");
+
+        let input_batch = record_batch!(
+            ("id", Int32, [4, 5]),
+            ("content", Utf8, ["new content 1", "new content 2"])
+        )
+        .expect("Failed to create test batch");
 
         let input_batches = vec![input_batch.clone()];
         let result_batches = index

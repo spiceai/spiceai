@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::DatasetTestArgs, wait_test_and_memory};
+use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType,
@@ -61,6 +61,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     let append_test = append_test
         .with_spiced_instance(spiced_instance)
@@ -71,17 +72,24 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let mut spiced_instance = test.end()?;
     let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
-    check_table_counts(
+    let table_count_result = check_table_counts(
         &spiced_instance,
         query_set,
         args.scale_factor.unwrap_or(1.0),
     )
-    .await?;
+    .await;
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
+    let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+    let health_report = health_report?;
+
+    table_count_result?;
+    if let Some(message) = health_report.failure_message() {
+        return Err(anyhow::anyhow!(message));
+    }
     Ok(())
 }
 

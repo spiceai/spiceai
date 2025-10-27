@@ -17,6 +17,7 @@ limitations under the License.
 use crate::args::EvalsTestArgs;
 
 use super::get_app_and_start_request;
+use crate::health::HealthMonitor;
 use serde_json::json;
 use spiceai::Client as SpiceClient;
 use std::time::{Duration, SystemTime};
@@ -110,6 +111,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     println!("Executing {eval} eval benchmark for model {model}. It might take several minutes...");
 
@@ -133,7 +135,16 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let response_msq = response.text().await?;
 
     if !response_status.is_success() {
-        return Err(anyhow::anyhow!("Failed to execute evals: {response_msq}"));
+        let health_report = health_monitor.stop().await;
+        spiced_instance.stop()?;
+        let health_report = health_report?;
+
+        let mut failure_messages = vec![format!("Failed to execute evals: {response_msq}")];
+        if let Some(message) = health_report.failure_message() {
+            failure_messages.push(message);
+        }
+
+        return Err(anyhow::anyhow!(failure_messages.join("\n")));
     }
 
     println!("Evals completed:\n{response_msq}");
@@ -188,11 +199,21 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 
     telemetry.emit().await?;
 
+    let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+    let health_report = health_report?;
 
     // Report unsuccessful evaluation run as an error
+    let mut failure_messages = Vec::new();
     if matches!(metrics.status, EvalStatus::Failed) {
-        return Err(anyhow::anyhow!("Evaluation run failed"));
+        failure_messages.push("Evaluation run failed".to_string());
+    }
+    if let Some(message) = health_report.failure_message() {
+        failure_messages.push(message);
+    }
+
+    if !failure_messages.is_empty() {
+        return Err(anyhow::anyhow!(failure_messages.join("\n")));
     }
 
     println!("Benchmark completed successfully!");
