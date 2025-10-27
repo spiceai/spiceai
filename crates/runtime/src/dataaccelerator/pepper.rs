@@ -320,9 +320,7 @@ impl PepperAccelerator {
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<dyn TableProvider>> {
-        use pepper::{
-            MetadataCatalog, PepperCatalog, PepperTableProvider, metadata::CreateTableOptions,
-        };
+        use pepper::{PepperTableProvider, metadata::CreateTableOptions};
 
         // Use custom metadata directory if provided (for testing), otherwise use shared directory
         let metadata_dir = if let Some(acceleration) = source.acceleration() {
@@ -340,9 +338,10 @@ impl PepperAccelerator {
             source: Box::new(e),
         })?;
 
-        let catalog = Arc::new(PepperCatalog::new(format!(
+        // Create a new catalog - it will use WAL mode and busy timeout internally
+        let catalog = Arc::new(pepper::PepperCatalog::new(format!(
             "sqlite://{metadata_dir}/pepper.db"
-        )));
+        ))) as Arc<dyn pepper::MetadataCatalog>;
 
         // Initialize the catalog (creates tables if needed)
         catalog
@@ -597,15 +596,28 @@ impl DataAccelerator for PepperAccelerator {
                 format!("{}/metadata", crate::spice_data_base_path())
             };
 
+            // Ensure metadata directory exists
+            std::fs::create_dir_all(&metadata_dir).map_err(|e| {
+                Error::AccelerationCreationFailed {
+                    source: Box::new(e),
+                }
+            })?;
+
+            // Create a new catalog - it will use WAL mode and busy timeout internally
             let catalog = Arc::new(pepper::PepperCatalog::new(format!(
                 "sqlite://{metadata_dir}/pepper.db"
-            )));
+            ))) as Arc<dyn pepper::MetadataCatalog>;
 
-            // Cast to trait object for partition creator
-            let catalog_trait: Arc<dyn pepper::MetadataCatalog> = catalog;
+            // Initialize the catalog (creates tables if needed)
+            catalog
+                .init()
+                .await
+                .map_err(|e| Error::AccelerationInitializationFailed {
+                    source: Box::new(e),
+                })?;
 
             // Get or create table_id from catalog
-            let table_metadata = catalog_trait.get_table(&table_name).await.map_err(|e| {
+            let table_metadata = catalog.get_table(&table_name).await.map_err(|e| {
                 Error::AccelerationCreationFailed {
                     source: Box::new(e),
                 }
@@ -618,7 +630,7 @@ impl DataAccelerator for PepperAccelerator {
                 PathBuf::from(&dir_path),
                 partition_by_first,
                 Arc::clone(&arrow_schema),
-                catalog_trait,
+                catalog,
                 table_metadata.table_id,
                 unsupported_type_action,
             ));
