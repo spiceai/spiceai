@@ -582,9 +582,9 @@ impl DataAccelerator for PepperAccelerator {
             // Non-partitioned table - return base provider directly
             Ok(pepper_table)
         } else {
-            let Some(partition_by_first) = partition_by.first().cloned() else {
-                unreachable!("partition_by is non-empty due to preceding check");
-            };
+            let partition_by_first = partition_by.first().cloned().ok_or_else(|| {
+                Box::new(Error::PartitionByRequired) as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
             // Get metadata catalog for partition tracking
             let metadata_dir = if let Some(acceleration) = source.acceleration() {
@@ -702,20 +702,24 @@ impl PepperPartitionCreator {
         format!("{}_{}", self.table_name, partition_value)
     }
 
-    fn partition_data_type(&self) -> DataType {
+    fn partition_data_type(&self) -> Result<DataType, creator::Error> {
         if let Ok(field) = self.schema.field_with_name(self.partition_column_label()) {
-            return field.data_type().clone();
+            return Ok(field.data_type().clone());
         }
 
-        let Ok(df_schema) = DFSchema::try_from(Arc::clone(&self.schema)) else {
-            return DataType::Utf8;
-        };
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).map_err(|e| {
+            creator::Error::InferringPartitions {
+                source: Box::new(e),
+            }
+        })?;
 
         self.partition_by
             .expression
             .data_type_and_nullable(&df_schema)
             .map(|(data_type, _)| data_type)
-            .unwrap_or(DataType::Utf8)
+            .map_err(|e| creator::Error::InferringPartitions {
+                source: Box::new(e),
+            })
     }
 
     /// Generate partition directory path from partition value
@@ -802,7 +806,7 @@ impl PartitionCreator for PepperPartitionCreator {
 
         let mut result = Vec::new();
 
-        let partition_data_type = self.partition_data_type();
+        let partition_data_type = self.partition_data_type()?;
 
         for partition_meta in partitions {
             // Parse partition value

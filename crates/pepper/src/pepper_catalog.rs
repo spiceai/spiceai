@@ -104,7 +104,7 @@ impl PepperCatalog {
             record_count BIGINT NOT NULL,
             file_size_bytes BIGINT NOT NULL,
             row_id_start BIGINT NOT NULL,
-            FOREIGN KEY(partition_id) REFERENCES pepper_partition(partition_id)
+            FOREIGN KEY(partition_id) REFERENCES pepper_partition(partition_id) ON DELETE SET NULL
         )
     ";
 
