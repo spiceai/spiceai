@@ -429,11 +429,55 @@ impl MetadataCatalog for PepperCatalog {
         Ok(vec![])
     }
 
-    async fn add_delete_file(&self, _delete_file: DeleteFile) -> CatalogResult<i64> {
-        // Implementation would insert into pepper_delete_file
-        Err(CatalogError::InvalidOperation {
-            message: "Not yet implemented".to_string(),
+    async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<i64> {
+        let db_path_owned = self.db_path().to_string();
+
+        let blocking_result = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path_owned,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+
+            // Begin transaction
+            conn.execute("BEGIN TRANSACTION", [])?;
+
+            // Get next delete_file_id
+            let next_delete_file_id: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM pepper_delete_file",
+                [],
+                |row| row.get(0),
+            )?;
+
+            let delete_file_id = next_delete_file_id;
+
+            // Insert delete file record
+            conn.execute(
+                r"
+                INSERT INTO pepper_delete_file (
+                    delete_file_id, table_id, data_file_id, path, path_is_relative,
+                    format, delete_count, file_size_bytes
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ",
+                rusqlite::params![
+                    delete_file_id,
+                    delete_file.table_id,
+                    delete_file.data_file_id,
+                    delete_file.path,
+                    delete_file.path_is_relative,
+                    delete_file.format,
+                    delete_file.delete_count,
+                    delete_file.file_size_bytes,
+                ],
+            )?;
+
+            // Commit transaction
+            conn.execute("COMMIT", [])?;
+
+            Ok::<i64, CatalogError>(delete_file_id)
         })
+        .await??;
+
+        Ok(blocking_result)
     }
 
     async fn get_delete_files(&self, _data_file_id: i64) -> CatalogResult<Vec<DeleteFile>> {

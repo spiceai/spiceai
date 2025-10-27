@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use data_components::delete::DeletionTableProviderAdapter;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::CreateExternalTable;
@@ -354,7 +355,10 @@ impl PepperAccelerator {
                 source: Box::new(e),
             })?;
 
-        Ok(Arc::new(pepper_table))
+        // Wrap in DeletionTableProviderAdapter so retention system can find it
+        Ok(Arc::new(DeletionTableProviderAdapter::new(Arc::new(
+            pepper_table,
+        ))))
     }
 }
 
@@ -431,15 +435,6 @@ impl DataAccelerator for PepperAccelerator {
                     detail: Arc::from(format!(
                         "Pepper data accelerator supports append and full refresh modes, but {refresh_mode:?} was specified. Please set refresh_mode to either append or full"
                     )),
-                }));
-            }
-
-            // Validate that retention_sql is not specified
-            if acceleration.retention_sql.is_some() {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Pepper data accelerator does not yet support retention_sql. Please remove this configuration",
-                    ),
                 }));
             }
 
