@@ -83,7 +83,6 @@ default = [
     "mongodb",
     "iceberg-write",
     "turso",
-    "vortex",
     "pepper"
 ]
 delta_lake = ["runtime/delta_lake"]
