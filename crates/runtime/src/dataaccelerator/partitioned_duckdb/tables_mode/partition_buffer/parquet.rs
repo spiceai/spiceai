@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Parquet-based partition buffer implementation for large datasets.
+//! Parquet-based partition buffer implementation.
 //!
 //! This buffer writes partition data to temporary Parquet files on disk,
-//! providing memory-efficient handling of large datasets at the cost of
-//! increased I/O operations.
+//! providing memory-efficient handling of large datasets.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -95,7 +94,7 @@ impl From<ParquetBufferError> for DataFusionError {
 
 /// Parquet-based partition buffer that writes data to temporary files.
 /// When the configured row threshold is reached, the file is closed and its path
-/// is sent to for ingestion.
+/// is sent for ingestion.
 #[derive(Debug)]
 pub struct ParquetPartitionBuffer {
     /// Channel sender for communicating with `DuckDB` writer (None when finished)

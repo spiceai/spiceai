@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! This module provides different buffering strategies for partitioned data:
 //! - Memory-based buffering for smaller datasets
-//! - Parquest file-based buffering for larger datasets with better memory efficiency
+//! - Parquest file-based buffering for larger datasets with better memory efficiency and faster ingestion.
 //!
 
 use std::fmt;
@@ -54,19 +54,12 @@ pub enum PartitionData {
 #[async_trait]
 pub trait PartitionBuffer: Send + fmt::Debug {
     /// Process batches for a specific partition.
-    ///
-    /// The buffer implementation decides when to flush based on internal thresholds
-    /// (e.g., row count, memory usage, file size).
     async fn process(
         &mut self,
         partition_id: String,
         batches: Vec<RecordBatch>,
     ) -> datafusion::common::Result<()>;
 
-    /// Flush all buffered data for all partitions and signal completion.
-    ///
-    /// This should be called at the end of the write operation to ensure
-    /// all remaining data is persisted and the sender channel is closed
-    /// to signal that no more data will be sent.
+    /// Complete writing by flushing all remaining buffered data and closing the sender.
     async fn finish(&mut self) -> datafusion::common::Result<()>;
 }

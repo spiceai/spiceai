@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Configuration types for partition buffers.
+//! artition buffers configurations.
 
 use std::{collections::HashMap, fmt, path::PathBuf};
 
@@ -27,9 +27,9 @@ const ROWS_PER_PARTITION_BUFFER: usize = 122_880;
 /// Configuration for partition buffer type selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionBufferType {
-    /// Use in-memory buffers (existing behavior)
+    /// Use in-memory buffers (default behavior)
     Memory,
-    /// Use Parquet file-based buffers for better memory efficiency
+    /// Use Parquet file-based buffers
     Parquet,
 }
 

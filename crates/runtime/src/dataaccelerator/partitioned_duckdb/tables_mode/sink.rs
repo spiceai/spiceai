@@ -216,7 +216,7 @@ impl DataSink for DuckDBPartitionedDataSink {
             }
         }
 
-        // Flbuffers and drop the sender to signal the receiver that no more data is coming
+        // Flush buffers and drop the sender to signal the receiver that no more data is coming
         if let Err(send_error) = partition_buffer.finish().await {
             match duckdb_write_handle.await {
                 Err(join_error) => {
@@ -642,9 +642,9 @@ fn write_data_chunk_to_table(
     Ok(rows as u64)
 }
 
-/// Inserts data from a Parquet file into a partition table using a parameterized query.
+/// Inserts data from a Parquet file into a partition table.
 ///
-/// Note: does not currently supports conflict resolutions
+/// Note: does not currently support conflict resolutions
 ///
 /// # Returns
 /// The number of rows inserted from the Parquet file

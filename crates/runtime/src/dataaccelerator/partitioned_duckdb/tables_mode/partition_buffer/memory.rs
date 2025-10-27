@@ -105,7 +105,7 @@ impl PartitionBuffer for MemoryPartitionBuffer {
         Ok(())
     }
 
-    /// Flush all remaining buffered data for all partitions.
+    /// Complete writing by flushing all remaining buffered data and closing the sender.
     async fn finish(&mut self) -> datafusion::common::Result<()> {
         let partition_ids: Vec<String> = self.buffers.keys().cloned().collect();
         for partition_id in partition_ids {
@@ -113,7 +113,7 @@ impl PartitionBuffer for MemoryPartitionBuffer {
         }
 
         // Drop the sender to signal completion
-        tracing::debug!("Dropping sender for memory partition buffer after flush_all");
+        tracing::debug!("Dropping sender for memory partition buffer");
         self.sender = None;
 
         Ok(())
