@@ -243,14 +243,27 @@ impl MetadataCatalog for PepperCatalog {
 
     #[allow(clippy::too_many_lines)]
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<i64> {
+        /// Result of attempting to create a table in the catalog
+        enum CreateTableResult {
+            /// Table was created successfully with the given snapshot ID
+            Created {
+                table_id: i64,
+                snapshot_id: String,
+                base_path: String,
+            },
+            /// Table already existed with the given ID
+            AlreadyExists { table_id: i64 },
+        }
+
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
+        let db_path_owned = self.db_path().to_string();
 
         // Check if table already exists first (read-only check)
-        let db_path_owned = self.db_path().to_string();
+        let db_path_for_check = db_path_owned.clone();
         let table_name_check = table_name.clone();
         let existing_table_id: Option<i64> = tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&db_path_owned, true)?;
+            let conn = Self::open_connection(&db_path_for_check, true)?;
             match conn.query_row(
                 "SELECT table_id FROM pepper_table WHERE table_name = ?1",
                 [&table_name_check],
@@ -300,8 +313,7 @@ impl MetadataCatalog for PepperCatalog {
 
         let partition_column = options.partition_column.clone();
 
-        let db_path_owned = self.db_path().to_string();
-        let blocking_result = tokio::task::spawn_blocking(move || {
+        let create_result = tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&db_path_owned, false)?;
 
             // Start transaction with IMMEDIATE to acquire write lock upfront
@@ -318,7 +330,9 @@ impl MetadataCatalog for PepperCatalog {
                 Ok(id) => {
                     // Another thread created it, return that ID
                     conn.execute("COMMIT", [])?;
-                    Ok::<(i64, String, String), CatalogError>((id, String::new(), base_path))
+                    Ok::<CreateTableResult, CatalogError>(CreateTableResult::AlreadyExists {
+                        table_id: id,
+                    })
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
                     // Proceed with creation
@@ -368,34 +382,41 @@ impl MetadataCatalog for PepperCatalog {
                     // Commit transaction
                     conn.execute("COMMIT", [])?;
 
-                    Ok::<(i64, String, String), CatalogError>((
+                    Ok::<CreateTableResult, CatalogError>(CreateTableResult::Created {
                         table_id,
-                        initial_snapshot_id,
+                        snapshot_id: initial_snapshot_id,
                         base_path,
-                    ))
+                    })
                 }
                 Err(e) => Err(CatalogError::from(e)),
             }
         })
         .await??;
 
-        // Destructure the return value from spawn_blocking
-        let (table_id, initial_snapshot_id, base_path) = blocking_result;
+        // Handle the result - only create snapshot directory if table was newly created
+        match create_result {
+            CreateTableResult::Created {
+                table_id,
+                snapshot_id,
+                base_path,
+            } => {
+                // Create the initial snapshot directory
+                // Directory structure: [base_path]/[table_id]/[snapshot_id]/
+                let snapshot_dir = std::path::PathBuf::from(&base_path)
+                    .join(table_id.to_string())
+                    .join(&snapshot_id);
 
-        // Only create snapshot directory if we actually created a new table
-        if !initial_snapshot_id.is_empty() {
-            // Create the initial snapshot directory
-            // Directory structure: [base_path]/[table_id]/[snapshot_id]/
-            let snapshot_dir = std::path::PathBuf::from(&base_path)
-                .join(table_id.to_string())
-                .join(&initial_snapshot_id);
+                tokio::fs::create_dir_all(&snapshot_dir)
+                    .await
+                    .map_err(|e| CatalogError::Io { source: e })?;
 
-            tokio::fs::create_dir_all(&snapshot_dir)
-                .await
-                .map_err(|e| CatalogError::Io { source: e })?;
+                Ok(table_id)
+            }
+            CreateTableResult::AlreadyExists { table_id } => {
+                // Table already exists, no need to create snapshot directory
+                Ok(table_id)
+            }
         }
-
-        Ok(table_id)
     }
 
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
