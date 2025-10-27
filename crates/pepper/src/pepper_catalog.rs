@@ -598,7 +598,7 @@ impl MetadataCatalog for PepperCatalog {
                 ",
             )?;
 
-            match stmt.query_row([&table_id.to_string(), &partition_value_owned], |row| {
+            match stmt.query_row(rusqlite::params![table_id, partition_value_owned], |row| {
                 Ok(PartitionMetadata {
                     partition_id: row.get(0)?,
                     table_id: row.get(1)?,

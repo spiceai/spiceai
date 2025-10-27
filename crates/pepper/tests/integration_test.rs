@@ -54,6 +54,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     // 3. Create Pepper table provider
@@ -591,6 +592,7 @@ async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(
@@ -704,6 +706,7 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec!["col_int64".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(
