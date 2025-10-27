@@ -848,45 +848,41 @@ impl TableProvider for PepperTableProvider {
             .scan(state, projection, filters, limit)
             .await?;
 
-        // Only apply deletion vector filtering if retention is enabled
-        if self.retention_enabled {
-            // Load deletion vectors from catalog
-            let delete_files = self
-                .catalog
-                .get_table_delete_files(self.table_metadata.table_id)
-                .await
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to load deletion vectors: {e}"
-                    ))
-                })?;
+        // Load deletion vectors from catalog
+        let delete_files = self
+            .catalog
+            .get_table_delete_files(self.table_metadata.table_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to load deletion vectors: {e}"
+                ))
+            })?;
 
-            // If there are any deletion vectors, load and apply filtering
-            if !delete_files.is_empty() {
-                let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
-                tracing::debug!(
-                    "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
-                    delete_files.len(),
-                    total_deleted,
-                    self.table_metadata.table_name
-                );
+        // If there are any deletion vectors, load and apply filtering
+        if !delete_files.is_empty() {
+            let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
+            tracing::debug!(
+                "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
+                delete_files.len(),
+                total_deleted,
+                self.table_metadata.table_name
+            );
 
-                // Read all deletion vectors and build a set of deleted row IDs
-                let delete_files_for_read = delete_files.clone();
-                let deleted_row_ids = task::spawn_blocking(move || {
-                    Self::read_deletion_vectors(delete_files_for_read)
-                })
-                .await
-                .map_err(|err| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Deletion vector reader task failed: {err}"
-                    ))
-                })??;
+            // Read all deletion vectors and build a set of deleted row IDs
+            let delete_files_for_read = delete_files.clone();
+            let deleted_row_ids =
+                task::spawn_blocking(move || Self::read_deletion_vectors(delete_files_for_read))
+                    .await
+                    .map_err(|err| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Deletion vector reader task failed: {err}"
+                        ))
+                    })??;
 
-                if !deleted_row_ids.is_empty() {
-                    // Wrap the plan with our deletion filter
-                    return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
-                }
+            if !deleted_row_ids.is_empty() {
+                // Wrap the plan with our deletion filter
+                return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
             }
         }
 
