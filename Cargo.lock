@@ -17034,7 +17034,7 @@ dependencies = [
  "vortex-scan",
  "vortex-sequence",
  "vortex-sparse",
- "vortex-utils",
+ "vortex-utils 0.52.1",
  "vortex-zigzag",
  "vortex-zstd",
 ]
@@ -17056,7 +17056,7 @@ dependencies = [
  "vortex-fastlanes",
  "vortex-mask",
  "vortex-scalar",
- "vortex-utils",
+ "vortex-utils 0.52.1",
 ]
 
 [[package]]
@@ -17103,7 +17103,7 @@ dependencies = [
  "vortex-flatbuffers",
  "vortex-mask",
  "vortex-scalar",
- "vortex-utils",
+ "vortex-utils 0.52.1",
 ]
 
 [[package]]
@@ -17134,7 +17134,7 @@ dependencies = [
  "vortex-scalar",
  "vortex-sequence",
  "vortex-sparse",
- "vortex-utils",
+ "vortex-utils 0.52.1",
  "vortex-zigzag",
 ]
 
@@ -17201,7 +17201,7 @@ dependencies = [
  "tracing",
  "uuid 1.18.0",
  "vortex",
- "vortex-utils",
+ "vortex-utils 0.54.0",
  "walkdir",
 ]
 
@@ -17253,7 +17253,7 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-scalar",
- "vortex-utils",
+ "vortex-utils 0.52.1",
 ]
 
 [[package]]
@@ -17276,7 +17276,7 @@ dependencies = [
  "vortex-error",
  "vortex-flatbuffers",
  "vortex-proto",
- "vortex-utils",
+ "vortex-utils 0.52.1",
 ]
 
 [[package]]
@@ -17314,7 +17314,7 @@ dependencies = [
  "vortex-mask",
  "vortex-proto",
  "vortex-scalar",
- "vortex-utils",
+ "vortex-utils 0.52.1",
 ]
 
 [[package]]
@@ -17380,7 +17380,7 @@ dependencies = [
  "vortex-scan",
  "vortex-sequence",
  "vortex-sparse",
- "vortex-utils",
+ "vortex-utils 0.52.1",
  "vortex-zigzag",
  "vortex-zstd",
 ]
@@ -17486,7 +17486,7 @@ dependencies = [
  "vortex-pco",
  "vortex-scalar",
  "vortex-sequence",
- "vortex-utils",
+ "vortex-utils 0.52.1",
  "vortex-zstd",
 ]
 
@@ -17574,7 +17574,7 @@ dependencies = [
  "vortex-dtype",
  "vortex-error",
  "vortex-proto",
- "vortex-utils",
+ "vortex-utils 0.52.1",
 ]
 
 [[package]]
@@ -17643,6 +17643,16 @@ name = "vortex-utils"
 version = "0.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92033bef3d63b4a576d8f3e877423aef5326c2aee9a6d2dd937c692b89410f37"
+dependencies = [
+ "dashmap",
+ "hashbrown 0.16.0",
+]
+
+[[package]]
+name = "vortex-utils"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b777956c0533cec4d3151071002ee2b8d0a8addd45a53a0ca62d0e4f7980f0a"
 dependencies = [
  "dashmap",
  "hashbrown 0.16.0",

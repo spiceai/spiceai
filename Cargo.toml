@@ -233,7 +233,7 @@ twox-hash = "2.1.2"
 url = "2.5"
 uuid = "1"
 vortex = "0.52.1"
-vortex-utils = "0.52.1"
+vortex-utils = "0.54.0"
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "b2652f2331f8f1879d944b11afd6575140b6c07e" }
