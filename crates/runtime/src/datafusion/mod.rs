@@ -40,6 +40,7 @@ use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
 use crate::federated_table::FederatedTable;
+use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
@@ -1542,11 +1543,25 @@ impl DataFusion {
                 }
             };
 
+            let tbl_provider = if view.has_full_text_column() {
+                match add_full_text_search_to_table(Arc::new(view_table), &view.columns, &view.name)
+                {
+                    Ok(idx) => Arc::new(idx) as Arc<dyn TableProvider>,
+                    Err(e) => {
+                        tracing::error!("Failed to full-text search for view '{}': {e}", view.name);
+                        status.update_view(table, status::ComponentStatus::Error);
+                        return None;
+                    }
+                }
+            } else {
+                Arc::new(view_table) as Arc<dyn TableProvider>
+            };
+
             if let Some(acceleration) = &view.acceleration
                 && acceleration.enabled
             {
                 match df_ref
-                    .create_accelerated_view(&view, view_table, secrets)
+                    .create_accelerated_view(&view, tbl_provider, secrets)
                     .await
                 {
                     Ok(is_ready) => {
@@ -1561,7 +1576,7 @@ impl DataFusion {
             }
 
             // non-accelerated view
-            if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
+            if let Err(e) = ctx.register_table(table.clone(), tbl_provider) {
                 tracing::error!("Failed to create view {table}: {e}");
                 status.update_view(table, status::ComponentStatus::Error);
                 return None;
@@ -1578,7 +1593,7 @@ impl DataFusion {
     pub async fn create_accelerated_view(
         self: &Arc<Self>,
         view: &View,
-        view_table: ViewTable,
+        view_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<Option<Arc<Notify>>> {
         let table = &view.name;
@@ -1591,8 +1606,6 @@ impl DataFusion {
                 })?;
 
         let schema = view_table.schema();
-        let federated_table =
-            FederatedTable::new_unchecked(Arc::new(view_table) as Arc<dyn TableProvider>);
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()
@@ -1633,7 +1646,7 @@ impl DataFusion {
         let mut builder = AcceleratedTable::builder(
             self.runtime_status(),
             table.clone(),
-            federated_table.into(),
+            Arc::new(FederatedTable::new_unchecked(view_table)),
             "view".to_string(),
             accelerated_table_provider,
             refresh,

@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::changes::{Indexes, index_change_envelope};
+use crate::component::column::full_text_search_config;
 use crate::component::{
     ComponentInitialization,
     dataset::{Dataset, FullTextSearchDatasetConfig, acceleration::RefreshMode},
@@ -34,6 +35,7 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::make_spice_data_sub_directory;
+use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::util::find_index_in_table_provider;
 use futures::StreamExt;
 
@@ -59,7 +61,7 @@ impl FullTextConnector {
             index_path,
             search_fields,
             primary_key,
-        }) = dataset.full_text_search_config()
+        }) = full_text_search_config(&dataset.columns, &dataset.name)
         else {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: dataset.source().to_string(),
@@ -190,7 +192,18 @@ impl DataConnector for FullTextConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        Self::wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
+        add_full_text_search_to_table(
+            self.inner_connector.read_provider(dataset).await?,
+            &dataset.columns,
+            &dataset.name,
+        )
+        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: e,
+        })
     }
 
     async fn read_write_provider(
@@ -198,7 +211,16 @@ impl DataConnector for FullTextConnector {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(Self::wrap_table(inner, dataset)),
+            Some(Ok(inner)) => Some(
+                add_full_text_search_to_table(inner, &dataset.columns, &dataset.name)
+                    .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+                    .map_err(|e| DataConnectorError::InvalidConfiguration {
+                        dataconnector: dataset.source().to_string(),
+                        message: e.to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    }),
+            ),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }

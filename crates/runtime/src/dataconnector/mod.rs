@@ -44,6 +44,7 @@ use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use parameters::ConnectorParams;
+use runtime_datafusion_index::IndexedTableProvider;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
