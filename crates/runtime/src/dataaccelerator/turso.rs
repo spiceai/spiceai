@@ -45,7 +45,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use data_components::turso::TursoTableProvider;
-use datafusion::{datasource::TableProvider, logical_expr::CreateExternalTable};
+use datafusion::{
+    common::utils::quote_identifier, datasource::TableProvider, logical_expr::CreateExternalTable,
+};
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
@@ -111,6 +113,94 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 // All Turso data components (TursoConnectionPool, TursoTableProvider, TursoExec,
 // TursoDataSink, TursoDeletionSink) are now imported from data_components::turso
 
+fn sanitize_identifier(identifier: &str, context: &str) -> Result<String> {
+    let trimmed = identifier.trim();
+    ensure!(
+        !trimmed.is_empty(),
+        InvalidConfigurationSnafu {
+            detail: Arc::from(format!("{context} identifier cannot be empty"))
+        }
+    );
+
+    Ok(quote_identifier(trimmed).into_owned())
+}
+
+fn sanitize_column_reference(column_ref: &str) -> Result<Vec<String>> {
+    let trimmed = column_ref.trim();
+    ensure!(
+        !trimmed.is_empty(),
+        InvalidConfigurationSnafu {
+            detail: Arc::from("Index column reference cannot be empty")
+        }
+    );
+
+    let inner = if trimmed.starts_with('(') {
+        ensure!(
+            trimmed.ends_with(')'),
+            InvalidConfigurationSnafu {
+                detail: Arc::from(format!(
+                    "Compound index reference '{trimmed}' must end with ')'"
+                ))
+            }
+        );
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    let mut sanitized_columns = Vec::new();
+    for column in inner
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let mut parts = column.split_whitespace();
+        let name = parts.next().unwrap_or_default();
+        ensure!(
+            !name.is_empty(),
+            InvalidConfigurationSnafu {
+                detail: Arc::from(format!("Invalid index column reference '{column}'"))
+            }
+        );
+        let mut sanitized = sanitize_identifier(name, "Column")?;
+
+        if let Some(order) = parts.next() {
+            let upper = order.to_ascii_uppercase();
+            ensure!(
+                upper == "ASC" || upper == "DESC",
+                InvalidConfigurationSnafu {
+                    detail: Arc::from(format!(
+                        "Unsupported index column ordering '{order}' in reference '{column}'"
+                    ))
+                }
+            );
+            sanitized.push(' ');
+            sanitized.push_str(&upper);
+        }
+
+        ensure!(
+            parts.next().is_none(),
+            InvalidConfigurationSnafu {
+                detail: Arc::from(format!(
+                    "Unexpected tokens in index column reference '{column}'"
+                ))
+            }
+        );
+
+        sanitized_columns.push(sanitized);
+    }
+
+    ensure!(
+        !sanitized_columns.is_empty(),
+        InvalidConfigurationSnafu {
+            detail: Arc::from(format!(
+                "Index column reference '{trimmed}' did not contain any columns"
+            ))
+        }
+    );
+
+    Ok(sanitized_columns)
+}
 // Re-export for use within the runtime crate
 pub use data_components::turso::TursoConnectionPool;
 
@@ -452,6 +542,7 @@ impl DataAccelerator for TursoAccelerator {
         // Create the table if it doesn't exist
         let conn = pool.connect().await?;
         let table_name = cmd.name.table().to_string();
+        let quoted_table_name = sanitize_identifier(&table_name, "Table")?;
 
         // Build CREATE TABLE statement from schema
         let mut columns = Vec::new();
@@ -493,12 +584,13 @@ impl DataAccelerator for TursoAccelerator {
                 _ => "TEXT",
             };
             let nullable = if field.is_nullable() { "" } else { " NOT NULL" };
-            columns.push(format!("{} {}{}", field.name(), col_type, nullable));
+            let column_name = sanitize_identifier(field.name(), "Column")?;
+            columns.push(format!("{column_name} {col_type}{nullable}"));
         }
 
         let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS {} ({})",
-            table_name,
+            quoted_table_name,
             columns.join(", ")
         );
 
@@ -531,13 +623,17 @@ impl DataAccelerator for TursoAccelerator {
                         table_name,
                         column_ref_str.replace(['(', ')', ' ', ','], "_")
                     );
+                    let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
                     let unique_clause = match &index_type {
                         crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
                         crate::component::dataset::acceleration::IndexType::Enabled => "",
                     };
 
+                    let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
+                    let column_list = format!("({})", sanitized_columns.join(", "));
+
                     let create_index_sql = format!(
-                        "CREATE {unique_clause}INDEX IF NOT EXISTS {index_name} ON {table_name} ({column_ref_str})"
+                        "CREATE {unique_clause}INDEX IF NOT EXISTS {quoted_index_name} ON {quoted_table_name} {column_list}"
                     );
 
                     conn.execute(&create_index_sql, ()).await.map_err(|e| {
