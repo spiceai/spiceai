@@ -12883,7 +12883,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.9.0-unstable"
+version = "1.9.0-enterprise-beta"
 dependencies = [
  "arrow",
  "arrow_tools",
