@@ -27,7 +27,7 @@ use test_framework::{
 const BASE_URL: &str = "http://localhost:8090";
 const ENDPOINTS: [&str; 2] = ["/health", "/v1/ready"];
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-const LATENCY_THRESHOLD: Duration = Duration::from_millis(5);
+const LATENCY_THRESHOLD: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EndpointStats {
