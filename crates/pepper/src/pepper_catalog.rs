@@ -59,6 +59,39 @@ impl PepperCatalog {
         }
     }
 
+    /// Handle the result of a `spawn_blocking` task with explicit error messages.
+    ///
+    /// This helper function separates the two types of errors that can occur:
+    /// 1. `JoinError` - The blocking task panicked or was cancelled
+    /// 2. `CatalogError` - The actual operation in the blocking task failed
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - The result from `spawn_blocking().await`
+    /// * `operation` - Description of what operation was being performed (e.g., "schema initialization")
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let result = tokio::task::spawn_blocking(move || {
+    ///     // ... blocking SQLite operations
+    ///     Ok::<_, CatalogError>(value)
+    /// })
+    /// .await;
+    ///
+    /// Self::handle_blocking_result(result, "table creation")?;
+    /// ```
+    fn handle_blocking_result<T>(
+        result: Result<CatalogResult<T>, tokio::task::JoinError>,
+        operation: &str,
+    ) -> CatalogResult<T> {
+        result
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: format!("{operation} task panicked or was cancelled: {err}"),
+            })?
+            .map_err(|err| err)
+    }
+
     /// Get the database file path from the connection string.
     fn db_path(&self) -> &str {
         self.connection_string
@@ -231,12 +264,14 @@ impl MetadataCatalog for PepperCatalog {
 
         // Initialize schema using connection with WAL mode
         let db_path_owned = self.db_path().to_string();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&db_path_owned, false)?;
             Self::initialize_schema(&conn)?;
             Ok::<(), CatalogError>(())
         })
-        .await??;
+        .await;
+
+        Self::handle_blocking_result(result, "Schema initialization")?;
 
         Ok(())
     }
@@ -262,7 +297,7 @@ impl MetadataCatalog for PepperCatalog {
         // Check if table already exists first (read-only check)
         let db_path_for_check = db_path_owned.clone();
         let table_name_check = table_name.clone();
-        let existing_table_id: Option<i64> = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&db_path_for_check, true)?;
             match conn.query_row(
                 "SELECT table_id FROM pepper_table WHERE table_name = ?1",
@@ -274,7 +309,9 @@ impl MetadataCatalog for PepperCatalog {
                 Err(e) => Err(CatalogError::from(e)),
             }
         })
-        .await??;
+        .await;
+
+        let existing_table_id: Option<i64> = Self::handle_blocking_result(result, "Table lookup")?;
 
         if let Some(table_id) = existing_table_id {
             // Table already exists, return its ID
@@ -313,7 +350,7 @@ impl MetadataCatalog for PepperCatalog {
 
         let partition_column = options.partition_column.clone();
 
-        let create_result = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&db_path_owned, false)?;
 
             // Start transaction with IMMEDIATE to acquire write lock upfront
@@ -391,7 +428,9 @@ impl MetadataCatalog for PepperCatalog {
                 Err(e) => Err(CatalogError::from(e)),
             }
         })
-        .await??;
+        .await;
+
+        let create_result = Self::handle_blocking_result(result, "Table creation")?;
 
         // Handle the result - only create snapshot directory if table was newly created
         match create_result {
@@ -605,7 +644,9 @@ impl MetadataCatalog for PepperCatalog {
 
             Ok::<i64, CatalogError>(delete_file_id)
         })
-        .await??;
+        .await;
+
+        let blocking_result = Self::handle_blocking_result(result, "Delete file registration")?;
 
         Ok(blocking_result)
     }
@@ -928,10 +969,9 @@ impl MetadataCatalog for PepperCatalog {
 
             Ok::<(), CatalogError>(())
         })
-        .await
-        .map_err(|e| CatalogError::InvalidOperation {
-            message: format!("Failed to join shutdown task: {e}"),
-        })??;
+        .await;
+
+        Self::handle_blocking_result(result, "Catalog shutdown")?;
 
         Ok(())
     }
