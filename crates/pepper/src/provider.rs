@@ -1298,12 +1298,31 @@ impl PepperDeletionSink {
         }
 
         // Write as Arrow IPC file format
-        let file = std::fs::File::create(output_path)?;
-        let mut writer = FileWriter::try_new(file, &schema)?;
-        writer.write(&batch)?;
-        writer.finish()?;
+        let output_path_owned = output_path.to_path_buf();
+        let schema_for_write = Arc::clone(&schema);
+        let batch_for_write = batch;
+        let blocking_result = tokio::task::spawn_blocking(move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+            let file = std::fs::File::create(&output_path_owned)
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+            let mut writer = FileWriter::try_new(file, &schema_for_write)
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+            writer
+                .write(&batch_for_write)
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+            writer
+                .finish()
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
 
-        let file_size = tokio::fs::metadata(output_path).await?.len();
+            let file_size = std::fs::metadata(&output_path_owned)
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?
+                .len();
+
+            Ok(file_size)
+        })
+        .await
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+
+        let file_size = blocking_result?;
 
         tracing::debug!(
             "Deletion vector written: {} row(s), {} bytes at {:?}",
