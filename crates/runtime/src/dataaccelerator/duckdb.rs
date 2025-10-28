@@ -540,7 +540,7 @@ mod tests {
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
-        common::{Constraints, TableReference, ToDFSchema},
+        common::{Constraint, Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
@@ -634,6 +634,162 @@ mod tests {
         }
 
         assert_eq!(values, vec![5, 7]);
+    }
+
+    #[tokio::test]
+    async fn retention_sql_fails_with_internal_tables() {
+        use datafusion_table_providers::duckdb::DuckDB;
+        use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+        use tempfile::TempDir;
+
+        // This test reproduces the bug where retention SQL fails with internal tables.
+        //
+        // When DuckDB uses internal tables (for indexes/constraints via preserve_insertion_order),
+        // the write completion handler receives the internal table name (like __data_table_123)
+        // from table_manager.table_name(), but the retention SQL references the logical table name.
+        //
+        // DuckDB's error: "Can only delete from base table!" occurs because DELETE statements
+        // must target the base/view table name, not the internal table directly.
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let db_path = temp_dir.path().join("test_retention.db");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+
+        let mut options = HashMap::new();
+        // Use file mode to enable full DuckDB features
+        options.insert(
+            "open".to_string(),
+            db_path.to_str().expect("path").to_string(),
+        );
+        // Enable preserve_insertion_order which triggers internal table creation
+        options.insert("preserve_insertion_order".to_string(), "true".to_string());
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("taxi_trips"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+
+        // The retention SQL references the logical table name "taxi_trips"
+        let handler = super::make_retention_write_handler(
+            "taxi_trips".to_string(),
+            "DELETE FROM taxi_trips WHERE value < 5".to_string(),
+        );
+
+        let table = super::create_table_provider(
+            &duckdb_accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        // Insert initial data
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![1, 3, 5, 7])),
+            ],
+        )
+        .expect("record batch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
+
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+
+        // First insert should succeed
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("first insert should succeed");
+
+        // Verify internal tables were created by checking DuckDB directly
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_file(
+                db_path.to_str().expect("path"),
+                &duckdb::AccessMode::ReadWrite,
+            )
+            .expect("create pool"),
+        );
+
+        let mut conn = pool.connect_sync().expect("connect");
+        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("get duckdb conn");
+
+        // Check for internal tables (they follow the pattern __data_*)
+        let internal_tables: Vec<String> = duckdb_conn
+            .get_underlying_conn_mut()
+            .prepare(
+                "SELECT table_name FROM information_schema.tables WHERE table_name LIKE '__data_%'",
+            )
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+
+        if internal_tables.is_empty() {
+            eprintln!(
+                "WARNING: No internal tables found. Test may not be validating the bug correctly."
+            );
+            eprintln!(
+                "This could mean preserve_insertion_order didn't trigger internal table creation."
+            );
+            return;
+        }
+
+        eprintln!("Found internal tables: {:?}", internal_tables);
+
+        // Now try to insert more data - this should trigger the retention SQL
+        // and fail because it tries to DELETE from the internal table name
+        let exec2 = Arc::new(MockExec::new(vec![Ok(input)], schema));
+
+        let insert_plan2 = table
+            .insert_into(&write_ctx.state(), exec2, InsertOp::Append)
+            .await
+            .expect("insert plan");
+
+        let result = collect(insert_plan2, write_ctx.task_ctx()).await;
+
+        // This should fail with "Can only delete from base table!"
+        assert!(
+            result.is_err(),
+            "Expected an error due to retention SQL targeting internal table, but insert succeeded"
+        );
+
+        let error_msg = result.expect_err("Expected error").to_string();
+        assert!(
+            error_msg.contains("Can only delete from base table")
+                || error_msg.contains("Binder Error")
+                || error_msg.contains("Failed to apply retention SQL"),
+            "Expected error about deleting from base table, got: {error_msg}"
+        );
+
+        eprintln!("✓ Test correctly reproduced the error: {error_msg}");
     }
 
     #[tokio::test]
