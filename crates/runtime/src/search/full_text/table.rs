@@ -25,7 +25,6 @@ use std::sync::Arc;
 use crate::component::column::full_text_search_config;
 use crate::component::dataset::FullTextSearchDatasetConfig;
 use crate::make_spice_data_sub_directory;
-use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -42,7 +41,7 @@ pub(crate) fn add_full_text_search_to_table(
         index_path,
         search_fields,
         primary_key,
-    }) = full_text_search_config(&columns, &tbl)
+    }) = full_text_search_config(columns, tbl)
     else {
         return Err(Box::from(format!(
             "Attempted to add full text search functionality to '{tbl}', but configuration not available"

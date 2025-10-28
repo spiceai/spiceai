@@ -39,11 +39,10 @@ use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
 use crate::federated_table::FederatedTable;
-use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
-use crate::view::create_view_table;
+use crate::view::prepare_view;
 use crate::{status, view};
 
 #[cfg(feature = "cluster")]
@@ -64,7 +63,7 @@ use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
-use datafusion::datasource::{TableProvider, ViewTable};
+use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
@@ -1537,33 +1536,14 @@ impl DataFusion {
             // If view depends on other tables, wait until they are ready
             wait_until_dependent_tables_are_ready(table, &dependent_table_names, &status).await;
 
-            let view_table = match create_view_table(&ctx, &statements[0], view.sql.as_ref()).await
-            {
-                Ok(view_table) => view_table,
+            let tbl_provider = match prepare_view(&ctx, &statements[0], &view).await {
+                Ok(tbl) => tbl,
                 Err(e) => {
                     tracing::error!("Failed to create view {table}: {e}");
                     status.update_view(table, status::ComponentStatus::Error);
                     return None;
                 }
             };
-
-            let tbl_provider = if view.has_full_text_column() {
-                match add_full_text_search_to_table(Arc::new(view_table), &view.columns, &view.name)
-                {
-                    Ok(idx) => Arc::new(idx) as Arc<dyn TableProvider>,
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to add full-text search for view '{}': {e}",
-                            view.name
-                        );
-                        status.update_view(table, status::ComponentStatus::Error);
-                        return None;
-                    }
-                }
-            } else {
-                Arc::new(view_table) as Arc<dyn TableProvider>
-            };
-
             if let Some(acceleration) = &view.acceleration
                 && acceleration.enabled
             {
