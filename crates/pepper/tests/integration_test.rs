@@ -649,10 +649,12 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
     use arrow::array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
         Float32Array, Float64Array, Int16Array, Int32Array, Int8Array, LargeBinaryArray,
-        LargeStringArray, TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array,
-        UInt8Array,
+        LargeStringArray, RecordBatch, TimestampMicrosecondArray, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array,
     };
     use arrow::datatypes::TimeUnit;
+    use std::f32::consts::{E as F32_E, PI as F32_PI};
+    use std::f64::consts::{E as F64_E, PI as F64_PI};
 
     println!("\n🧪 Testing Pepper core data type support...");
 
@@ -720,75 +722,65 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
     ctx.register_table("types_test", Arc::new(table))?;
 
     // Insert test data with various types
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(Int8Array::from(vec![Some(127), Some(-128), None])) as ArrayRef,
+        Arc::new(Int16Array::from(vec![Some(32_767), Some(-32_768), None])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![
+            Some(2_147_483_647),
+            Some(-2_147_483_648),
+            None,
+        ])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef, // Primary key, non-null
+        Arc::new(UInt8Array::from(vec![Some(255), Some(0), None])) as ArrayRef,
+        Arc::new(UInt16Array::from(vec![Some(65_535), Some(0), None])) as ArrayRef,
+        Arc::new(UInt32Array::from(vec![Some(4_294_967_295), Some(0), None])) as ArrayRef,
+        Arc::new(UInt64Array::from(vec![
+            Some(18_446_744_073_709_551_615),
+            Some(0),
+            None,
+        ])) as ArrayRef,
+        Arc::new(Float32Array::from(vec![Some(F32_PI), Some(-F32_E), None])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(F64_PI), Some(-F64_E), None])) as ArrayRef,
+        Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("Hello"), Some("World"), None])) as ArrayRef,
+        Arc::new(LargeStringArray::from(vec![
+            Some("Large"),
+            Some("String"),
+            None,
+        ])) as ArrayRef,
+        Arc::new(BinaryArray::from_vec(vec![
+            &b"binary"[..],
+            &b"data"[..],
+            &b""[..],
+        ])) as ArrayRef,
+        Arc::new(LargeBinaryArray::from_vec(vec![
+            &b"large"[..],
+            &b"binary"[..],
+            &b""[..],
+        ])) as ArrayRef,
+        Arc::new(Date32Array::from(vec![Some(18_993), Some(0), None])) as ArrayRef, // Days since epoch
+        Arc::new(Date64Array::from(vec![
+            Some(1_640_995_200_000),
+            Some(0),
+            None,
+        ])) as ArrayRef, // Milliseconds since epoch
+        Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1_640_995_200_000_000),
+            Some(0),
+            None,
+        ])) as ArrayRef,
+        Arc::new(
+            Decimal128Array::from(vec![
+                Some(314_159_265_358_i128),  // 3141.59265358
+                Some(-271_828_182_845_i128), // -2718.28182845
+                None,
+            ])
+            .with_precision_and_scale(38, 10)
+            .expect("valid decimal"),
+        ) as ArrayRef,
+    ];
 
-    let batch = RecordBatch::try_new(
-        Arc::<arrow::datatypes::Schema>::clone(&schema),
-        vec![
-            Arc::new(Int8Array::from(vec![Some(127), Some(-128), None])) as ArrayRef,
-            Arc::new(Int16Array::from(vec![Some(32_767), Some(-32_768), None])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![
-                Some(2_147_483_647),
-                Some(-2_147_483_648),
-                None,
-            ])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef, // Primary key, non-null
-            Arc::new(UInt8Array::from(vec![Some(255), Some(0), None])) as ArrayRef,
-            Arc::new(UInt16Array::from(vec![Some(65_535), Some(0), None])) as ArrayRef,
-            Arc::new(UInt32Array::from(vec![Some(4_294_967_295), Some(0), None])) as ArrayRef,
-            Arc::new(UInt64Array::from(vec![
-                Some(18_446_744_073_709_551_615),
-                Some(0),
-                None,
-            ])) as ArrayRef,
-            Arc::new(Float32Array::from(vec![
-                Some(std::f32::consts::PI),
-                Some(-2.71_f32),
-                None,
-            ])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![
-                Some(std::f64::consts::PI),
-                Some(-std::f64::consts::E),
-                None,
-            ])) as ArrayRef,
-            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef,
-            Arc::new(StringArray::from(vec![Some("Hello"), Some("World"), None])) as ArrayRef,
-            Arc::new(LargeStringArray::from(vec![
-                Some("Large"),
-                Some("String"),
-                None,
-            ])) as ArrayRef,
-            Arc::new(BinaryArray::from_vec(vec![
-                &b"binary"[..],
-                &b"data"[..],
-                &b""[..],
-            ])) as ArrayRef,
-            Arc::new(LargeBinaryArray::from_vec(vec![
-                &b"large"[..],
-                &b"binary"[..],
-                &b""[..],
-            ])) as ArrayRef,
-            Arc::new(Date32Array::from(vec![Some(18_993), Some(0), None])) as ArrayRef, // Days since epoch
-            Arc::new(Date64Array::from(vec![
-                Some(1_640_995_200_000),
-                Some(0),
-                None,
-            ])) as ArrayRef, // Milliseconds since epoch
-            Arc::new(TimestampMicrosecondArray::from(vec![
-                Some(1_640_995_200_000_000),
-                Some(0),
-                None,
-            ])) as ArrayRef,
-            Arc::new(
-                Decimal128Array::from(vec![
-                    Some(314_159_265_358_i128),  // 3141.59265358
-                    Some(-271_828_182_845_i128), // -2718.28182845
-                    None,
-                ])
-                .with_precision_and_scale(38, 10)
-                .expect("valid decimal"),
-            ) as ArrayRef,
-        ],
-    )?;
+    let batch = RecordBatch::try_new(Arc::<arrow::datatypes::Schema>::clone(&schema), arrays)?;
 
     // Insert via DataFusion
     let df = ctx.read_batch(batch)?;
@@ -855,7 +847,7 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
         .as_any()
         .downcast_ref::<Float32Array>()
         .expect("Float32 column");
-    assert!((float32_col.value(0) - std::f32::consts::PI).abs() < 0.01);
+    assert!((float32_col.value(0) - F32_PI).abs() < 0.01);
     println!("  ✓ Float32: {}", float32_col.value(0));
 
     // Boolean

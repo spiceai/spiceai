@@ -452,8 +452,17 @@ impl DataAccelerator for PepperAccelerator {
             }));
         }
 
-        // Validate refresh_mode - append and full are supported
         if let Some(acceleration) = source.acceleration() {
+            // Validate that retention_sql is not specified
+            if acceleration.retention_sql.is_some() {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Pepper data accelerator does not yet support retention_sql. Please remove this configuration",
+                    ),
+                }));
+            }
+
+            // Validate refresh_mode - append and full are supported
             if let Some(refresh_mode) = acceleration.refresh_mode
                 && refresh_mode != RefreshMode::Append
                 && refresh_mode != RefreshMode::Full
@@ -462,15 +471,6 @@ impl DataAccelerator for PepperAccelerator {
                     detail: Arc::from(format!(
                         "Pepper data accelerator supports append and full refresh modes, but {refresh_mode:?} was specified. Please set refresh_mode to either append or full"
                     )),
-                }));
-            }
-
-            // Validate that retention_sql is not specified
-            if acceleration.retention_sql.is_some() {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Pepper data accelerator does not yet support retention_sql. Please remove this configuration",
-                    ),
                 }));
             }
 
