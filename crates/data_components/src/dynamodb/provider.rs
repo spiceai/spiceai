@@ -136,7 +136,7 @@ impl DynamoDBTableProvider {
         }
 
         let Some(partition_key) = partition_key else {
-            unreachable!("Partition keys are enforced by DynamoDB")
+            return Err(Error::MissingPartitionKey);
         };
 
         let mut request = client.scan().table_name(table_name);
@@ -152,12 +152,13 @@ impl DynamoDBTableProvider {
             .to_vec();
 
         let unnested_items = match unnest_depth {
-            None | Some(0) => items,
-            Some(unnest_depth) => unnest_dynamodb_items(items, unnest_depth)?,
+            None => items,
+            Some(t) if t <= 0 => items,
+            Some(depth) => unnest_dynamodb_items(items, depth)?,
         };
 
         Ok((
-            infer_arrow_schema_from_items(&unnested_items),
+            infer_arrow_schema_from_items(&unnested_items)?,
             partition_key,
             sort_key,
         ))
@@ -199,6 +200,8 @@ impl TableProvider for DynamoDBTableProvider {
         let request_plan =
             self.request_plan_builder
                 .build_request_plan(filters, &projected_schema, limit)?;
+
+        println!("request_plan: {request_plan:?}");
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             Arc::clone(&self.client),
@@ -312,7 +315,8 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
                 let items = items?;
 
                 let unnested_items = match unnest_depth {
-                    None | Some(0) => items,
+                    None => items,
+                    Some(t) if t <= 0 => items,
                     Some(depth) => {
                         unnest_dynamodb_items(items, depth).map_err(to_execution_error)?
                     }
