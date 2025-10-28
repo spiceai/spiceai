@@ -260,7 +260,7 @@ impl PartitionBuffer for ParquetPartitionBuffer {
         // Drop the sender to signal completion
         if let Some(sender) = self.sender.take() {
             drop(sender);
-            tracing::debug!("Dropped sender for ParquetPartitionBuffer after flush_all");
+            tracing::debug!("Dropped sender for ParquetPartitionBuffer after finish");
         }
 
         Ok(())
