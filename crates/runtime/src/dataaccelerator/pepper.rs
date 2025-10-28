@@ -211,7 +211,7 @@ fn transform_schema_for_vortex(
 
 pub struct PepperAccelerator {
     /// Shared metadata catalog for all Pepper tables.
-    /// Wrapped in RwLock to allow lazy initialization on first use.
+    /// Wrapped in `RwLock` to allow lazy initialization on first use.
     catalog: Arc<tokio::sync::RwLock<Option<Arc<pepper::PepperCatalog>>>>,
 }
 
@@ -436,17 +436,17 @@ impl DataAccelerator for PepperAccelerator {
             }));
         }
 
-        // Validate that retention_sql is not specified
-        if acceleration.retention_sql.is_some() {
-            return Err(Box::new(Error::InvalidConfiguration {
-                detail: Arc::from(
-                    "Pepper data accelerator does not yet support retention_sql. Please remove this configuration",
-                ),
-            }));
-        }
-
-        // Validate refresh_mode - append and full are supported
         if let Some(acceleration) = source.acceleration() {
+            // Validate that retention_sql is not specified
+            if acceleration.retention_sql.is_some() {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Pepper data accelerator does not yet support retention_sql. Please remove this configuration",
+                    ),
+                }));
+            }
+
+            // Validate refresh_mode - append and full are supported
             if let Some(refresh_mode) = acceleration.refresh_mode
                 && refresh_mode != RefreshMode::Append
                 && refresh_mode != RefreshMode::Full

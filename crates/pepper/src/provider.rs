@@ -194,8 +194,12 @@ impl futures::Stream for DeletionFilterStream {
                     let mut keep_indices = Vec::new();
                     for row_idx in 0..batch_size {
                         // Convert once - we've already validated batch_size fits in i64
-                        let row_offset =
-                            i64::try_from(row_idx).expect("row_idx < batch_size which fits in i64");
+                        let row_offset = match convert_to_i64(row_idx, "row index") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                return std::task::Poll::Ready(Some(Err(err)));
+                            }
+                        };
                         let Some(global_row_id) = current_offset.checked_add(row_offset) else {
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::Execution(
@@ -297,6 +301,8 @@ pub struct PepperTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    /// Whether read-time deletion vector filtering is enabled (controlled by retention settings)
+    retention_enabled: bool,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -415,6 +421,7 @@ impl PepperTableProvider {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
+            retention_enabled: false,
         })
     }
 
@@ -442,6 +449,19 @@ impl PepperTableProvider {
     #[must_use]
     pub fn metadata(&self) -> &TableMetadata {
         &self.table_metadata
+    }
+
+    /// Returns whether retention-based read filtering is enabled.
+    #[must_use]
+    pub fn is_retention_enabled(&self) -> bool {
+        self.retention_enabled
+    }
+
+    /// Enable or disable retention-based read filtering, returning the updated provider.
+    #[must_use]
+    pub fn with_retention_enabled(mut self, enabled: bool) -> Self {
+        self.retention_enabled = enabled;
+        self
     }
 
     /// Insert data from a record batch stream.
@@ -860,7 +880,7 @@ impl TableProvider for PepperTableProvider {
             })?;
 
         // If there are any deletion vectors, load and apply filtering
-        if !delete_files.is_empty() {
+        if self.retention_enabled && !delete_files.is_empty() {
             let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
             tracing::debug!(
                 "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
@@ -1142,6 +1162,9 @@ impl PepperDeletionSink {
         ctx: &SessionContext,
         listing_table: Arc<ListingTable>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{DataType, Field};
+
         let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
         let batches = collect(scan_plan, ctx.task_ctx()).await?;
 
@@ -1155,9 +1178,6 @@ impl PepperDeletionSink {
         let total_rows = concatenated_batch.num_rows();
 
         // Create a batch with row_id column added
-        use arrow::array::Array;
-        use arrow::datatypes::{DataType, Field};
-
         let row_id_array = arrow::array::Int64Array::from_iter_values(
             0..convert_to_i64_box(total_rows, "total rows")?,
         );
@@ -1197,7 +1217,6 @@ impl PepperDeletionSink {
         let filtered_rowid_batches = row_ids_df.collect().await?;
         let mut row_ids = Vec::new();
 
-        use arrow::array::AsArray;
         for batch in filtered_rowid_batches {
             let row_id_column = batch
                 .column(0)
@@ -1345,7 +1364,7 @@ where
     })
 }
 
-/// Convert to i64 with DataFusion error
+/// Convert to i64 with `DataFusion` error
 fn convert_to_i64<T>(value: T, context: &str) -> datafusion_common::Result<i64>
 where
     T: TryInto<i64> + Copy + std::fmt::Display,

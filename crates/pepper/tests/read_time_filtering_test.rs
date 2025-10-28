@@ -59,6 +59,7 @@ async fn setup_test_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_dir.path().to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     // Create table provider
@@ -227,6 +228,7 @@ async fn test_retention_flag_can_be_toggled() -> TestResult<()> {
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: data_dir.path().to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table_provider = PepperTableProvider::create_table(catalog, table_options).await?;

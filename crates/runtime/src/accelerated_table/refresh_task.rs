@@ -168,6 +168,9 @@ impl RefreshTaskBuilder {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
+        let sink = Arc::new(RwLock::new(AccelerationSink::new(Arc::clone(
+            &self.accelerator,
+        ))));
 
         RefreshTask {
             runtime_status: self.runtime_status,
