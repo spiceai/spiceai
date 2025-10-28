@@ -66,6 +66,44 @@ impl PepperCatalog {
             .unwrap_or(&self.connection_string)
     }
 
+    /// Handle the result of a `spawn_blocking` task with explicit error messages.
+    ///
+    /// This helper function separates the two types of errors that can occur:
+    /// 1. `JoinError` - The blocking task panicked or was cancelled
+    /// 2. `CatalogError` - The actual operation in the blocking task failed
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - The result from `spawn_blocking().await`
+    /// * `operation` - Description of what operation was being performed (e.g., "schema initialization")
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let result = tokio::task::spawn_blocking(move || {
+    ///     // ... blocking SQLite operations
+    ///     Ok::<_, CatalogError>(value)
+    /// })
+    /// .await;
+    ///
+    /// Self::handle_blocking_result(result, "table creation")?;
+    /// ```
+    fn handle_blocking_result<T>(
+        result: Result<CatalogResult<T>, tokio::task::JoinError>,
+        operation: &str,
+    ) -> CatalogResult<T> {
+        result.map_err(|err| {
+            let message = if err.is_panic() {
+                format!("{operation} task panicked: {err}")
+            } else if err.is_cancelled() {
+                format!("{operation} task was cancelled: {err}")
+            } else {
+                format!("{operation} task failed: {err}")
+            };
+            CatalogError::InvalidOperation { message }
+        })?
+    }
+
     /// Open a `SQLite` connection configured for concurrent access.
     ///
     /// Applies performance optimizations based on `SQLite` best practices:
@@ -832,6 +870,35 @@ impl MetadataCatalog for PepperCatalog {
 
     async fn rollback_transaction(&self) -> CatalogResult<()> {
         // Implementation would rollback SQLite transaction
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> CatalogResult<()> {
+        let db_path_owned = self.db_path().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path_owned)?;
+
+            // Check if WAL mode is enabled
+            let journal_mode: String =
+                conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+
+            if journal_mode.eq_ignore_ascii_case("wal") {
+                tracing::info!("Truncating Pepper catalog WAL log");
+                // Truncate the WAL log to persist changes and reduce file size
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+            }
+
+            // Run optimize to improve query performance for future connections
+            tracing::info!("Running optimize on Pepper catalog");
+            conn.execute("PRAGMA optimize", [])?;
+
+            Ok::<(), CatalogError>(())
+        })
+        .await;
+
+        Self::handle_blocking_result(result, "Catalog shutdown")?;
+
         Ok(())
     }
 }
