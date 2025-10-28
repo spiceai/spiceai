@@ -96,7 +96,17 @@ func getRustArch() string {
 }
 
 // GPU versions that are supported via dedicated CUDA builds
-var supportedCudaVersionsBinaries = []string{"80", "86", "87", "89", "90"}
+// Minimum: A10G (8.6 Ampere) to Maximum: DGX Spark (12.1 Blackwell)
+// 86: Ampere - A10G, A40, A10, A16, A2, RTX 30 series
+// 87: Ampere - Jetson AGX Orin, Jetson Orin NX/Nano
+// 89: Ada Lovelace - L4, L40, L40S, RTX 40 series
+// 90: Hopper - H100, H200, GH200
+// 100: Blackwell - B200, GB200
+// 103: Blackwell - B300, GB300
+// 110: Jetson T5000, T4000
+// 120: Blackwell - RTX 50 series, RTX PRO Blackwell series
+// 121: Blackwell - GB10 (DGX Spark)
+var supportedCudaVersionsBinaries = []string{"86", "87", "89", "90", "100", "103", "110", "120", "121"}
 
 func checkCudaVersionSupported(computeCap string) bool {
 	for _, version := range supportedCudaVersionsBinaries {
@@ -119,7 +129,7 @@ func get_ai_accelerator() (string, bool) {
 		}
 	}
 
-	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+	if runtime.GOOS == "linux" {
 		version, err := get_cuda_version()
 		if err != nil {
 			slog.Debug("Failed to check for CUDA device", "error", err)
@@ -157,7 +167,7 @@ func has_metal_device() (bool, error) {
 }
 
 func get_cuda_version() (*string, error) {
-	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+	if runtime.GOOS != "linux" {
 		return nil, nil
 	}
 

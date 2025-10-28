@@ -30,26 +30,21 @@ on:
 
   workflow_dispatch:
     inputs:
-      platform_option:
-        description: 'Which platform do you want to run on? (Default is ALL)'
-        required: false
-        type: choice
-        options:
-          - 'all'
-          - 'Linux x64'
-          - 'Windows x64'
-        default: 'all'
       compute_cap:
         description: 'Which CUDA compute capability to build for? (Default is ALL)'
         required: false
         type: choice
         options:
           - 'all'
-          - '80'
-          - '86'
-          - '87'
-          - '89'
-          - '90'
+          - '86' # Ampere: A10G, A40, A10, RTX 30 series
+          - '87' # Ampere: Jetson AGX Orin
+          - '89' # Ada Lovelace: L4, L40, RTX 40 series
+          - '90' # Hopper: H100, H200
+          - '100' # Blackwell: B200, GB200
+          - '103' # Blackwell: B300, GB300
+          - '110' # Jetson T5000, T4000
+          - '120' # Blackwell: RTX 50 series, RTX PRO
+          - '121' # Blackwell: GB10 (DGX Spark)
         default: 'all'
       profile_option:
         description: 'Which Rust build profile to use? (Default is release)'
@@ -74,79 +69,75 @@ jobs:
         with:
           script: |
             const matrix = [
-              {
-                compute_cap: "80",
-                runner: "spiceai-large-runners",
-                target_os: "linux",
-                target_arch: "x86_64"
-              },
+              // Ampere: A10G, A40, A10, A16, A2, RTX 30 series
               {
                 compute_cap: "86",
                 runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Ampere: Jetson AGX Orin, Jetson Orin NX/Nano
               {
                 compute_cap: "87",
                 runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Ada Lovelace: L4, L40, L40S, RTX 40 series
               {
                 compute_cap: "89",
                 runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Hopper: H100, H200, GH200
               {
                 compute_cap: "90",
                 runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Blackwell: B200, GB200
               {
-                compute_cap: "80",
-                runner: "windows-latest-8core",
-                target_os: "windows",
+                compute_cap: "100",
+                runner: "spiceai-large-runners",
+                target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Blackwell: B300, GB300
               {
-                compute_cap: "86",
-                runner: "windows-latest-8core",
-                target_os: "windows",
+                compute_cap: "103",
+                runner: "spiceai-large-runners",
+                target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Jetson T5000, T4000
               {
-                compute_cap: "87",
-                runner: "windows-latest-8core",
-                target_os: "windows",
+                compute_cap: "110",
+                runner: "spiceai-large-runners",
+                target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Blackwell: RTX 50 series, RTX PRO Blackwell series
               {
-                compute_cap: "89",
-                runner: "windows-latest-8core",
-                target_os: "windows",
+                compute_cap: "120",
+                runner: "spiceai-large-runners",
+                target_os: "linux",
                 target_arch: "x86_64"
               },
+              // Blackwell: GB10 (DGX Spark)
               {
-                compute_cap: "90",
-                runner: "windows-latest-8core",
-                target_os: "windows",
+                compute_cap: "121",
+                runner: "spiceai-large-runners",
+                target_os: "linux",
                 target_arch: "x86_64"
               }
             ];
 
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
-              const platform_option = context.payload.inputs.platform_option;
               const compute_cap = context.payload.inputs.compute_cap;
               let filtered = matrix;
-
-              // Filter by platform if specified
-              if (platform_option !== 'all') {
-                const target_os = platform_option === 'Linux x64' ? 'linux' : 'windows';
-                filtered = filtered.filter(m => m.target_os === target_os);
-              }
 
               // Filter by compute capability if specified
               if (compute_cap !== 'all') {

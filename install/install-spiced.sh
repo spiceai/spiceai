@@ -66,12 +66,13 @@ verifySupported() {
         if [ "$osarch" == "$current_osarch" ]; then
             # Validate CUDA variant combinations
             if [ "$VARIANT" == "cuda" ]; then
-                if [ "$OS" != "linux" ] && [ "$OS" != "windows" ]; then
-                    echo "CUDA variants are only supported on Linux and Windows"
+                if [ "$OS" != "linux" ]; then
+                    echo "CUDA variants are only supported on Linux"
                     exit 1
                 fi
                 if [ -z "$CUDA_VERSION" ]; then
-                    echo "CUDA_VERSION must be set when using CUDA variant (e.g., 80, 86, 87, 89, 90)"
+                    echo "CUDA_VERSION must be set when using CUDA variant (e.g., 86, 87, 89, 90, 100, 103, 110, 120, 121)"
+                    echo "Supported range: A10G (86) to DGX Spark (121)"
                     exit 1
                 fi
             fi
