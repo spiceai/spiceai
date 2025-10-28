@@ -135,7 +135,7 @@ jobs:
           ls -l test/arrow-types/
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

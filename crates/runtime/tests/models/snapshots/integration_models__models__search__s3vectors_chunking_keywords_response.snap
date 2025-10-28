@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 1277
+      },
+      "score": 0.55
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
+      },
+      "primary_key": {
+        "id": 484
+      },
+      "score": 0.53
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "4, 2))^3 \\times 40}\\)"
+      },
+      "primary_key": {
+        "id": 450
+      },
+      "score": 0.52
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Since there are 50 equal numbers, each number is equal to \\("
+      },
+      "primary_key": {
+        "id": 507
+      },
+      "score": 0.51
+    }
+  ]
+}
