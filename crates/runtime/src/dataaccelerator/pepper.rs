@@ -338,18 +338,36 @@ impl PepperAccelerator {
             source: Box::new(e),
         })?;
 
-        // Create a new catalog - it will use WAL mode and busy timeout internally
-        let catalog = Arc::new(pepper::PepperCatalog::new(format!(
-            "sqlite://{metadata_dir}/pepper.db"
-        ))) as Arc<dyn pepper::MetadataCatalog>;
+        // Get or create the shared catalog (lazy initialization)
+        let catalog = {
+            let catalog_lock = self.catalog.read().await;
+            if let Some(existing_catalog) = catalog_lock.as_ref() {
+                Arc::clone(existing_catalog)
+            } else {
+                drop(catalog_lock);
+                let mut catalog_lock = self.catalog.write().await;
 
-        // Initialize the catalog (creates tables if needed)
-        catalog
-            .init()
-            .await
-            .map_err(|e| Error::AccelerationInitializationFailed {
-                source: Box::new(e),
-            })?;
+                // Double-check after acquiring write lock
+                if let Some(existing_catalog) = catalog_lock.as_ref() {
+                    Arc::clone(existing_catalog)
+                } else {
+                    // Create a new catalog - it will use WAL mode and busy timeout internally
+                    let new_catalog = Arc::new(pepper::PepperCatalog::new(format!(
+                        "sqlite://{metadata_dir}/pepper.db"
+                    )));
+
+                    // Initialize the catalog (creates tables if needed)
+                    new_catalog.init().await.map_err(|e| {
+                        Error::AccelerationInitializationFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+
+                    *catalog_lock = Some(Arc::clone(&new_catalog));
+                    new_catalog
+                }
+            }
+        };
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
