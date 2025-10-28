@@ -384,22 +384,22 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: download artifacts - spice_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spice_linux_x86_64
 
       - name: download artifacts - spiced_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_linux_x86_64
 
       - name: download artifacts - spiced_models_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_models_linux_x86_64
 
       - name: download artifacts - spiced_odbc_models_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_odbc_models_linux_x86_64
 
@@ -438,42 +438,42 @@ jobs:
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
@@ -481,7 +481,7 @@ jobs:
       # macOS metal
       - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'darwin'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}

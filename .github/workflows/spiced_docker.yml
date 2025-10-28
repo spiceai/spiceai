@@ -304,14 +304,14 @@ jobs:
     steps:
       - name: Download AMD64 artifacts
         if: needs.setup.outputs.run_amd64 == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: images-amd64
           path: /tmp
 
       - name: Download ARM64 artifacts
         if: needs.setup.outputs.run_arm64 == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: images-arm64
           path: /tmp
@@ -413,7 +413,7 @@ jobs:
       PUBLISH: ${{ needs.setup.outputs.publish }}
     steps:
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: images-amd64-cuda
           path: /tmp
