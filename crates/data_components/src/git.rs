@@ -88,11 +88,11 @@ impl GitTableProvider {
         rate_limiter: Arc<dyn RateLimiter>,
         cache_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let client = GitClient::new(repo_url, reference, rate_limiter, cache_path).await?;
+        let client = GitClient::new(repo_url, reference, rate_limiter, cache_path);
 
         let mut fields = vec![
-            Field::new("name", DataType::Utf8, true),
             Field::new("path", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
             Field::new("size", DataType::Int64, true),
             Field::new("sha", DataType::Utf8, true),
             Field::new("mode", DataType::Utf8, true),
@@ -188,12 +188,13 @@ pub struct GitClient {
 }
 
 impl GitClient {
-    pub async fn new(
+    #[must_use]
+    pub fn new(
         repo_url: &str,
         reference: Option<&str>,
         rate_limiter: Arc<dyn RateLimiter>,
         cache_path: Option<PathBuf>,
-    ) -> Result<Self> {
+    ) -> Self {
         let cache_path = cache_path.unwrap_or_else(|| {
             std::env::temp_dir().join("spice_git_cache").join(
                 repo_url
@@ -203,12 +204,12 @@ impl GitClient {
             )
         });
 
-        Ok(Self {
+        Self {
             repo_url: repo_url.to_string(),
             reference: reference.map(ToString::to_string),
             cache_path,
             rate_limiter,
-        })
+        }
     }
 
     /// Clone or open the repository, ensuring it's up to date
@@ -270,10 +271,10 @@ impl GitClient {
 
             tree.walk(TreeWalkMode::PreOrder, |root, entry| {
                 // Apply limit if specified
-                if let Some(limit) = limit {
-                    if count >= limit {
-                        return TreeWalkResult::Abort;
-                    }
+                if let Some(limit) = limit
+                    && count >= limit
+                {
+                    return TreeWalkResult::Abort;
                 }
 
                 // Only process blob entries (files)
@@ -289,10 +290,10 @@ impl GitClient {
                 };
 
                 // Apply glob filtering
-                if let Some(ref glob_set) = include {
-                    if !glob_set.is_match(&full_path) {
-                        return TreeWalkResult::Ok;
-                    }
+                if let Some(ref glob_set) = include
+                    && !glob_set.is_match(&full_path)
+                {
+                    return TreeWalkResult::Ok;
                 }
 
                 let object = match entry.to_object(&repo) {
@@ -303,25 +304,20 @@ impl GitClient {
                     }
                 };
 
-                let blob = match object.as_blob() {
-                    Some(b) => b,
-                    None => return TreeWalkResult::Ok,
+                let Some(blob) = object.as_blob() else {
+                    return TreeWalkResult::Ok;
                 };
 
-                let size = blob.size() as i64;
+                let size = i64::try_from(blob.size()).unwrap_or(i64::MAX);
                 let sha = entry.id().to_string();
                 let mode = format!("{:o}", entry.filemode());
 
                 let content = if fetch_content {
-                    match std::str::from_utf8(blob.content()) {
-                        Ok(text) => Some(text.to_string()),
-                        Err(_) => {
-                            tracing::debug!(
-                                "File {} is not valid UTF-8, skipping content",
-                                full_path
-                            );
-                            None
-                        }
+                    if let Ok(text) = std::str::from_utf8(blob.content()) {
+                        Some(text.to_string())
+                    } else {
+                        tracing::debug!("File {} is not valid UTF-8, skipping content", full_path);
+                        None
                     }
                 } else {
                     None
@@ -356,10 +352,10 @@ impl GitClient {
         .context(SpawnBlockingSnafu)??;
 
         // Convert entries to RecordBatch
-        self.entries_to_record_batch(&entries, schema)
+        Self::entries_to_record_batch(&entries, schema)
     }
 
-    /// Blocking version of resolve_reference for use in spawn_blocking
+    /// Blocking version of `resolve_reference` for use in `spawn_blocking`
     fn resolve_reference_blocking(repo: &Repository, reference: Option<&str>) -> Result<Oid> {
         let reference = reference.unwrap_or("HEAD");
 
@@ -414,9 +410,8 @@ impl GitClient {
         path: &str,
         start_commit: Oid,
     ) -> (Option<i64>, Option<i64>) {
-        let mut revwalk = match repo.revwalk() {
-            Ok(rw) => rw,
-            Err(_) => return (None, None),
+        let Ok(mut revwalk) = repo.revwalk() else {
+            return (None, None);
         };
 
         if revwalk.push(start_commit).is_err() {
@@ -427,15 +422,11 @@ impl GitClient {
         let mut last_commit_time = None;
 
         for oid in revwalk.flatten() {
-            let commit = match repo.find_commit(oid) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let Ok(commit) = repo.find_commit(oid) else {
+                continue;
             };
 
-            let tree = match commit.tree() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            let Ok(tree) = commit.tree() else { continue };
 
             // Check if this commit contains the file
             if tree.get_path(Path::new(path)).is_ok() {
@@ -451,14 +442,13 @@ impl GitClient {
         (first_commit_time, last_commit_time)
     }
 
-    /// Convert file entries to Arrow RecordBatch
+    /// Convert file entries to Arrow `RecordBatch`
     fn entries_to_record_batch(
-        &self,
         entries: &[GitFileEntry],
         schema: SchemaRef,
     ) -> Result<Vec<RecordBatch>> {
-        let mut name_builder = StringBuilder::new();
         let mut path_builder = StringBuilder::new();
+        let mut name_builder = StringBuilder::new();
         let mut size_builder = Int64Builder::new();
         let mut sha_builder = StringBuilder::new();
         let mut mode_builder = StringBuilder::new();
@@ -474,8 +464,8 @@ impl GitClient {
         };
 
         for entry in entries {
-            name_builder.append_value(&entry.name);
             path_builder.append_value(&entry.path);
+            name_builder.append_value(&entry.name);
             size_builder.append_value(entry.size);
             sha_builder.append_value(&entry.sha);
             mode_builder.append_value(&entry.mode);
@@ -515,8 +505,8 @@ impl GitClient {
         }
 
         let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(name_builder.finish()),
             Arc::new(path_builder.finish()),
+            Arc::new(name_builder.finish()),
             Arc::new(size_builder.finish()),
             Arc::new(sha_builder.finish()),
             Arc::new(mode_builder.finish()),

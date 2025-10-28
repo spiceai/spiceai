@@ -71,10 +71,26 @@ Files from a specific release tag, useful for version comparisons.
 
 Documentation files only (Markdown files in docs/ directory).
 
+## Embeddings and Search Example
+
+The `spicepod-embeddings.yaml` file demonstrates automatic content fetching for embeddings and full-text search. When you configure embeddings or full-text search on the `content` column, the Git connector automatically fetches file content without requiring the `fetch_content` parameter.
+
+To try this example:
+
+```bash
+spice run --spicepod spicepod-embeddings.yaml
+```
+
+This demonstrates:
+
+- **Automatic Content Fetching**: Content is fetched when embeddings are configured
+- **Semantic Search**: Use embeddings for semantic search over documentation
+- **Full-Text Search**: Use full-text search for keyword-based search
+
 ## Key Features Demonstrated
 
-1. **File Filtering**: Using `git_include` parameter with glob patterns
-2. **Content Fetching**: Enabling `git_fetch_content` to query file contents
+1. **File Filtering**: Using `include` parameter with glob patterns
+2. **Content Fetching**: Enabling `fetch_content` to query file contents
 3. **Version Tracking**: Querying specific branches, tags, or commits
 4. **Version Comparison**: Comparing files between different versions
 5. **Git Metadata**: Accessing SHA, tree SHA, commit info, and timestamps
@@ -108,16 +124,16 @@ Append `@<reference>` to query specific branches, tags, or commits:
 
 ### Parameters
 
-- `git_include`: Glob patterns to filter files (semicolon or comma separated)
-- `git_fetch_content`: Set to `"true"` to fetch file content
-- `git_cache_path`: Custom location for repository cache
+- `include`: Glob patterns to filter files (semicolon or comma separated)
+- `fetch_content`: Set to `"true"` to fetch file content (also automatically enabled when embeddings or full-text search is configured on the `content` column)
+- `cache_path`: Custom location for repository cache
 
 ## Performance Tips
 
 1. **First Query**: The initial clone may take time for large repositories
 2. **Subsequent Queries**: Fast, as they read from the local cache
 3. **Content Fetching**: Only enable when needed, as it increases memory usage
-4. **File Filtering**: Use `git_include` patterns to limit files processed
+4. **File Filtering**: Use `include` patterns to limit files processed
 5. **Refreshes**: Refreshing fetches updates incrementally (not a full re-clone)
 
 ## Use Cases
@@ -140,12 +156,12 @@ Append `@<reference>` to query specific branches, tags, or commits:
 ### Slow First Query
 
 - Large repositories take time to clone initially
-- Consider using `git_include` to filter files
+- Consider using `include` to filter files
 - Subsequent queries will be fast
 
 ### Content Not Available
 
-- Ensure `git_fetch_content: "true"` is set
+- Ensure `fetch_content: "true"` is set
 - Only UTF-8 encoded files can have content fetched
 - Binary files will have `NULL` content
 

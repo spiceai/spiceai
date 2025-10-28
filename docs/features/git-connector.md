@@ -53,11 +53,11 @@ datasets:
 
 ### Parameters
 
-| Parameter           | Type    | Default     | Description                                                                 |
-| ------------------- | ------- | ----------- | --------------------------------------------------------------------------- |
-| `git_include`       | string  | none        | Glob pattern(s) to filter files. Separate multiple patterns with `;` or `,` |
-| `git_fetch_content` | boolean | `false`     | Whether to fetch file content into the `content` column                     |
-| `git_cache_path`    | string  | System temp | Custom path for the local repository cache                                  |
+| Parameter       | Type    | Default     | Description                                                                                                                                                                 |
+| --------------- | ------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `include`       | string  | none        | Glob pattern(s) to filter files. Separate multiple patterns with `;` or `,`                                                                                                 |
+| `fetch_content` | boolean | `false`     | Whether to fetch file content into the `content` column. **Note**: Content is automatically fetched if embeddings or full-text search is configured on the `content` column |
+| `cache_path`    | string  | System temp | Custom path for the local repository cache                                                                                                                                  |
 
 ### Example with Parameters
 
@@ -67,8 +67,8 @@ datasets:
     name: rust_files
     description: Only Rust source files from the repository
     params:
-      git_include: '**/*.rs'
-      git_fetch_content: 'true'
+      include: '**/*.rs'
+      fetch_content: 'true'
 ```
 
 ### Multiple File Patterns
@@ -78,26 +78,46 @@ datasets:
   - from: git:https://github.com/spiceai/spiceai.git
     name: config_files
     params:
-      git_include: '**/*.yaml;**/*.toml;**/*.json'
+      include: '**/*.yaml;**/*.toml;**/*.json'
 ```
+
+### Embeddings and Full-Text Search
+
+The Git connector automatically detects when embeddings or full-text search is configured on the `content` column and will automatically fetch file content, even if `fetch_content` is not explicitly set:
+
+```yaml
+datasets:
+  - from: git:https://github.com/spiceai/spiceai.git@trunk
+    name: docs
+    description: Documentation files with embeddings for semantic search
+    params:
+      include: 'docs/**/*.md;README.md'
+    columns:
+      - name: content
+        embeddings:
+          - from: openai
+            model: text-embedding-3-small
+```
+
+In this example, the `content` column will be automatically fetched because embeddings are configured, without needing to set `fetch_content: 'true'`.
 
 ## Schema
 
 The Git connector provides the following columns:
 
-| Column       | Type      | Description                                                      |
-| ------------ | --------- | ---------------------------------------------------------------- |
-| `name`       | String    | File name                                                        |
-| `path`       | String    | Full path to the file in the repository                          |
-| `size`       | Int64     | File size in bytes                                               |
-| `sha`        | String    | Git object SHA of the file (blob SHA)                            |
-| `mode`       | String    | File mode (e.g., "100644" for regular file)                      |
-| `tree_sha`   | String    | SHA of the tree containing this file                             |
-| `commit_sha` | String    | SHA of the commit being queried                                  |
-| `version`    | String    | Short version of the commit SHA (first 7 characters)             |
-| `created_at` | Timestamp | First commit time for this file (milliseconds since epoch)       |
-| `updated_at` | Timestamp | Most recent commit time for this file (milliseconds since epoch) |
-| `content`    | String    | File content (only if `git_fetch_content: "true"`)               |
+| Column       | Type      | Description                                                                                                   |
+| ------------ | --------- | ------------------------------------------------------------------------------------------------------------- |
+| `path`       | String    | Full path to the file in the repository                                                                       |
+| `name`       | String    | File name                                                                                                     |
+| `size`       | Int64     | File size in bytes                                                                                            |
+| `sha`        | String    | Git object SHA of the file (blob SHA)                                                                         |
+| `mode`       | String    | File mode (e.g., "100644" for regular file)                                                                   |
+| `tree_sha`   | String    | SHA of the tree containing this file                                                                          |
+| `commit_sha` | String    | SHA of the commit being queried                                                                               |
+| `version`    | String    | Short version of the commit SHA (first 7 characters)                                                          |
+| `created_at` | Timestamp | First commit time for this file (milliseconds since epoch)                                                    |
+| `updated_at` | Timestamp | Most recent commit time for this file (milliseconds since epoch)                                              |
+| `content`    | String    | File content (only if `fetch_content: "true"` or if embeddings/full-text search is configured on this column) |
 
 ## Example Queries
 
@@ -173,12 +193,12 @@ WHERE c.sha != v.sha;
 - **First Query**: May take time to clone large repositories
 - **Subsequent Queries**: Fast, reading from local cache
 - **Refresh**: Only fetches updates, not a full re-clone
-- **Content Fetching**: Enabling `git_fetch_content` increases memory usage and query time
-- **Large Repositories**: Consider using `git_include` patterns to limit the files processed
+- **Content Fetching**: Enabling `fetch_content` increases memory usage and query time
+- **Large Repositories**: Consider using `include` patterns to limit the files processed
 
 ## Limitations
 
-- File content is only available for UTF-8 encoded files when `git_fetch_content` is enabled
+- File content is only available for UTF-8 encoded files when `fetch_content` is enabled
 - Very large repositories may take time to clone initially
 - Commit history walking for timestamps can be slow on repositories with deep history
 

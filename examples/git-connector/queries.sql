@@ -83,7 +83,7 @@ FROM spiceai_rust_files
 GROUP BY top_level_dir
 ORDER BY rust_file_count DESC;
 
--- Search for patterns in Rust code (requires git_fetch_content: true)
+-- Search for patterns in Rust code (requires fetch_content: true)
 SELECT 
   path,
   LENGTH(content) AS content_length

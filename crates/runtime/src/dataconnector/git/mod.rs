@@ -20,11 +20,10 @@ use crate::dataconnector::{
     DataConnectorResult, ParameterSpec, Parameters,
 };
 use async_trait::async_trait;
-use data_components::git::{GitClient, GitTableProvider};
+use data_components::git::GitTableProvider;
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use snafu::ResultExt;
 use std::path::PathBuf;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
@@ -97,7 +96,7 @@ impl Git {
         // Parse include patterns if provided
         let include = dataset
             .params
-            .get("git_include")
+            .get("include")
             .map(|patterns| {
                 parse_globs(&component, patterns).map_err(|e| {
                     DataConnectorError::UnableToGetReadProvider {
@@ -110,14 +109,23 @@ impl Git {
             .transpose()?;
 
         // Check if content fetching is enabled
-        let fetch_content = dataset
+        // Content should be fetched if:
+        // 1. fetch_content parameter is explicitly set to true, OR
+        // 2. The dataset has embeddings or full_text_search configured on the "content" column
+        let explicit_fetch_content = dataset
             .params
-            .get("git_fetch_content")
+            .get("fetch_content")
             .map(|v| v.parse::<bool>().unwrap_or(false))
             .unwrap_or(false);
 
+        let has_content_embeddings_or_search = dataset.columns.iter().any(|col| {
+            col.name == "content" && (!col.embeddings.is_empty() || col.full_text_search.is_some())
+        });
+
+        let fetch_content = explicit_fetch_content || has_content_embeddings_or_search;
+
         // Get cache path if specified
-        let cache_path = dataset.params.get("git_cache_path").map(PathBuf::from);
+        let cache_path = dataset.params.get("cache_path").map(PathBuf::from);
 
         // Create a no-op rate limiter (Git operations are local after initial clone)
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(NoOpRateLimiter);
@@ -214,17 +222,14 @@ pub fn parse_globs(
         let trimmed_pattern = pattern.trim();
         if !trimmed_pattern.is_empty() {
             builder.add(Glob::new(trimmed_pattern).map_err(|e| {
-                format!(
-                    "Invalid glob pattern '{}' for {}: {}",
-                    trimmed_pattern, component, e
-                )
+                format!("Invalid glob pattern '{trimmed_pattern}' for {component}: {e}")
             })?);
         }
     }
 
     let glob_set = builder
         .build()
-        .map_err(|e| format!("Failed to build glob set for {}: {}", component, e))?;
+        .map_err(|e| format!("Failed to build glob set for {component}: {e}"))?;
 
     Ok(Arc::new(glob_set))
 }
