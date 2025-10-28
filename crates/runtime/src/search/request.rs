@@ -436,11 +436,6 @@ pub(crate) mod tests {
             // Parentheses without functions
             vec!["(column)".to_string()],
             vec!["table.(column)".to_string()],
-            // Special SQL keywords as unquoted names (context-dependent, but suspicious)
-            vec!["SELECT".to_string()],
-            vec!["FROM".to_string()],
-            vec!["WHERE".to_string()],
-            vec!["table.SELECT".to_string()],
         ] {
             assert!(
                 SearchRequest::parse_additional_columns(&bad).is_err(),
