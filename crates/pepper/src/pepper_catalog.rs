@@ -950,7 +950,7 @@ impl MetadataCatalog for PepperCatalog {
     async fn shutdown(&self) -> CatalogResult<()> {
         let db_path_owned = self.db_path().to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open(&db_path_owned)?;
 
             // Check if WAL mode is enabled

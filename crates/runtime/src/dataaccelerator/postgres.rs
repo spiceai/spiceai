@@ -185,11 +185,4 @@ impl DataAccelerator for PostgresAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
-
-    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::debug!("PostgreSQL accelerator shutdown: cleanup complete");
-        // PostgreSQL connection pools handle cleanup automatically when dropped.
-        // No explicit shutdown actions needed.
-        Ok(())
-    }
 }

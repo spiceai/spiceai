@@ -317,7 +317,6 @@ impl PepperAccelerator {
     }
 
     async fn create_pepper_table_provider(
-        &self,
         table_name: &str,
         dir_path: &str,
         schema: Arc<Schema>,
@@ -570,10 +569,14 @@ impl DataAccelerator for PepperAccelerator {
         let table_name = source.name().to_string();
 
         // Always create the base Pepper table provider
-        let pepper_table = self
-            .create_pepper_table_provider(&table_name, &dir_path, Arc::clone(&arrow_schema), source)
-            .await
-            .boxed()?;
+        let pepper_table = Self::create_pepper_table_provider(
+            &table_name,
+            &dir_path,
+            Arc::clone(&arrow_schema),
+            source,
+        )
+        .await
+        .boxed()?;
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
@@ -653,31 +656,6 @@ impl DataAccelerator for PepperAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
-    }
-
-    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use pepper::MetadataCatalog;
-
-        tracing::debug!("Pepper accelerator shutdown: starting catalog shutdown");
-
-        // Get the catalog if it was initialized
-        let catalog = {
-            let catalog_lock = self.catalog.read().await;
-            catalog_lock.as_ref().map(Arc::clone)
-        };
-
-        if let Some(catalog) = catalog {
-            // Run shutdown on the catalog to flush WAL and optimize
-            catalog.shutdown().await.map_err(|e| {
-                tracing::warn!("Failed to shutdown Pepper catalog: {e}");
-                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-            tracing::debug!("Pepper accelerator shutdown: complete");
-        } else {
-            tracing::debug!("Pepper catalog was never initialized, skipping shutdown");
-        }
-
-        Ok(())
     }
 }
 
