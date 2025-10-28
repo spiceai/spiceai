@@ -7,7 +7,7 @@ Spice.ai has released 1.0-stable 🎉
 In the latest major version, the last 2 minor versions are supported for security updates.
 
 | Version | Supported          |
-|---------| ------------------ |
+| ------- | ------------------ |
 | 1.8.3   | :white_check_mark: |
 | 1.8.2   | :white_check_mark: |
 | 1.8.1   | :white_check_mark: |
