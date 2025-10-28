@@ -126,7 +126,6 @@ pub fn validate_refresh_sql(
                     ensure_no_expr!(offset.is_none(), "OFFSET", expected_table);
                 }
 
-                ensure_no_expr!(query.limit_clause.is_none(), "LIMIT BY", expected_table);
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
 
