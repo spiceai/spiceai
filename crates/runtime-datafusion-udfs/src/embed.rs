@@ -83,15 +83,31 @@ macro_rules! string_array_iter {
     }};
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Embed {
     model_store: Arc<RwLock<EmbeddingModelStore>>,
+    ptr: u64,
+}
+
+impl PartialEq for Embed {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+impl Eq for Embed {}
+
+impl std::hash::Hash for Embed {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ptr.hash(state);
+    }
 }
 
 impl Embed {
     #[must_use]
     pub fn new(model_store: Arc<RwLock<EmbeddingModelStore>>) -> Self {
-        Self { model_store }
+        let ptr = Arc::as_ptr(&model_store).addr() as u64;
+        Self { model_store, ptr }
     }
 
     fn embed_single(

@@ -12,8 +12,8 @@ use object_store::{ObjectMeta, ObjectStore};
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
 use vortex::error::{VortexError, VortexResult, vortex_err};
-use vortex::file::segments::SegmentCache;
 use vortex::file::{Footer, SegmentSpec, VortexFile, VortexOpenOptions};
+use vortex::layout::segments::SegmentCache;
 use vortex::layout::segments::SegmentId;
 use vortex::session::VortexSession;
 use vortex::stats::{Precision, Stat};
@@ -85,7 +85,7 @@ impl VortexFileCache {
         self.file_cache
             .try_get_with(
                 file_key.clone(),
-                VortexOpenOptions::file()
+                VortexOpenOptions::new()
                     // FIXME(ngates): we don't really want to clone on every open...
                     .with_array_registry(Arc::new(self.session.arrays().clone()))
                     .with_layout_registry(Arc::new(self.session.layouts().clone()))

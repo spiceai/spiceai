@@ -52,7 +52,7 @@ use tonic::Response;
 use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
-use tonic::service::interceptor;
+use tonic::service::InterceptorLayer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_health::pb::health_server::Health;
 use tonic_health::pb::health_server::HealthServer;
@@ -205,7 +205,7 @@ impl MetricsService for Service {
 }
 
 async fn create_health_service() -> HealthServer<impl Health> {
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<MetricsServiceServer<Service>>()
         .await;
@@ -615,7 +615,7 @@ pub async fn start(
     }
 
     let server = server
-        .layer(interceptor(make_interceptor(grpc_auth)))
+        .layer(InterceptorLayer::new(make_interceptor(grpc_auth)))
         .add_service(create_health_service().await)
         .add_service(svc);
 

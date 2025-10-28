@@ -78,7 +78,7 @@ arrow-csv = "56.0.0"
 arrow-flight = "56.0.0"
 arrow-ipc = "56.0.0"
 arrow-json = "56.0.0"
-arrow-odbc = "16"
+arrow-odbc = "18"
 arrow-schema = "56.0.0"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "ec48de2d31ecc021a1962c629199ca11cf645fab", features = [
     "byot",
@@ -125,22 +125,23 @@ datafusion-common-runtime = "50.3.0"
 datafusion-datasource = "50.3.0"
 datafusion-execution = "50.3.0"
 datafusion-expr = "50.3.0"
-datafusion-federation = { version = "0.4.10", features = ["sql"] }
+datafusion-federation = { version = "0.4.2", features = ["sql"] }
 datafusion-functions = "50.3.0"
-datafusion-functions-json = "0.49"
+datafusion-functions-json = "0.50"
 datafusion-physical-expr = "50.3.0"
 datafusion-physical-expr-common = "50.3.0"
 datafusion-physical-plan = "50.3.0"
 datafusion-proto = { version = "50.3.0", features = ["json"] }
 datafusion-pruning = "50.3.0"
 datafusion-table-providers = "0.1"
-delta_kernel = { version = "0.16", features = [
+delta_kernel = { version = "0.14", features = [
     "default-engine-rustls",
     "arrow-56",
     "internal-api",
 ] }
 dotenvy = "0.15"
 duckdb = "1.3.2"
+dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.16"
@@ -202,7 +203,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.6"
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "8933be547cb8ed17f2fc221ba7b283376cf2c9ab" } # spiceai
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "85f6ceb72f13ea7701fd9a0ee03afe7f03cd6a97" } # spiceai
 sqlparser = "0.58.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "5.3.1", features = ["async"] }
@@ -240,7 +241,7 @@ vortex = "0.54.0"
 vortex-utils = "0.54.0"
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "b2652f2331f8f1879d944b11afd6575140b6c07e" }
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
 
 [profile.release-lto]
 inherits = "release"
@@ -261,7 +262,7 @@ datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                  # spiceai/spiceai-50
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                       # spiceai/spiceai-50
 datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                # spiceai/spiceai-50
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a09f9a702f26c59df6b60ad16640dfb8856707e1" }                      # spiceai-50
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "234b7fa578ab145bba4f80ac2e1d98f62f939355" }                      # spiceai-50
 datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                  # spiceai/spiceai-50
 datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                              # spiceai/spiceai-50
 datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                       # spiceai/spiceai-50
@@ -271,14 +272,14 @@ datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", r
 datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                    # spiceai/spiceai-50
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                    # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "cd6b2f85c4b1d9d0b450aacd7f3498a1dea48ec4" }                                        # spiceai/spiceai-50
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "83696e02d04a2ed6bdcbc6d4f8dd46d5d5da3ab1" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "374083cdccbb3f4e6ab7fa3ee6d1b6a87393f563" } # spiceai
 
 ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }           # spiceai/spiceai-50
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }      # spiceai/spiceai-50
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }  # spiceai/spiceai-50
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" } # spiceai/spiceai-50
 
-delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "549829b7f9e7b7b9abc117477d574e58f8004f8b" } # spiceai-0.16.0
+delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "283730fdfcec53575aa14fb1ab084004a16db69c" } # spiceai-0.16.0
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "dd02045c3aa77895723e873222cbe30f5c8f77a9" } # spiceai-1.3.2
 

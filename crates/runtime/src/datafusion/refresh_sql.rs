@@ -103,11 +103,10 @@ pub fn validate_refresh_sql(
         Statement::Statement(statement) => match statement.as_ref() {
             SQLStatement::Query(query) => {
                 ensure_no_expr!(query.fetch.is_none(), "FETCH", expected_table);
-                ensure_no_expr!(query.offset.is_none(), "OFFSET", expected_table);
                 ensure_no_expr!(query.with.is_none(), "WITH", expected_table);
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
-                ensure_no_expr!(query.limit_by.is_empty(), "LIMIT BY", expected_table);
+                ensure_no_expr!(query.limit_clause.is_none(), "LIMIT BY", expected_table);
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
 
