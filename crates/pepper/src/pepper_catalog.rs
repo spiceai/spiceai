@@ -59,37 +59,6 @@ impl PepperCatalog {
         }
     }
 
-    /// Handle the result of a `spawn_blocking` task with explicit error messages.
-    ///
-    /// This helper function separates the two types of errors that can occur:
-    /// 1. `JoinError` - The blocking task panicked or was cancelled
-    /// 2. `CatalogError` - The actual operation in the blocking task failed
-    ///
-    /// # Arguments
-    ///
-    /// * `result` - The result from `spawn_blocking().await`
-    /// * `operation` - Description of what operation was being performed (e.g., "schema initialization")
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let result = tokio::task::spawn_blocking(move || {
-    ///     // ... blocking SQLite operations
-    ///     Ok::<_, CatalogError>(value)
-    /// })
-    /// .await;
-    ///
-    /// Self::handle_blocking_result(result, "table creation")?;
-    /// ```
-    fn handle_blocking_result<T>(
-        result: Result<CatalogResult<T>, tokio::task::JoinError>,
-        operation: &str,
-    ) -> CatalogResult<T> {
-        result.map_err(|err| CatalogError::InvalidOperation {
-            message: format!("{operation} task panicked or was cancelled: {err}"),
-        })?
-    }
-
     /// Get the database file path from the connection string.
     fn db_path(&self) -> &str {
         self.connection_string
