@@ -690,7 +690,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Remote Turso databases are not supported")
+                .contains("Remote Turso databases (turso_url, turso_auth_token) are not supported")
         );
 
         // Test with turso_auth_token
@@ -720,7 +720,7 @@ mod tests {
         assert!(
             error2
                 .to_string()
-                .contains("Remote Turso databases are not supported")
+                .contains("Remote Turso databases (turso_url, turso_auth_token) are not supported")
         );
     }
 

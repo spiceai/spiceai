@@ -283,7 +283,7 @@ async fn acceleration_connection(
                 .await
                 .context(PostgresPoolSnafu)?;
 
-        Ok(AccelerationConnection::Postgres(pool))
+            Ok(AccelerationConnection::Postgres(pool))
         }
         #[cfg(not(feature = "postgres"))]
         Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
@@ -318,7 +318,7 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "turso"))]
         Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
-        Engine::Arrow | Engine::Vortex | Engine::Pepper => UnsupportedEngineSnafu {
+        Engine::Arrow | Engine::Pepper => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }
         .fail(),
