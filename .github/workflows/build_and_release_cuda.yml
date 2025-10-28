@@ -37,7 +37,6 @@ on:
         options:
           - 'all'
           - 'Linux x64'
-          - 'Windows x64'
         default: 'all'
       compute_cap:
         description: 'Which CUDA compute capability to build for? (Default is ALL)'
@@ -103,36 +102,6 @@ jobs:
                 runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
-              },
-              {
-                compute_cap: "80",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "86",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "87",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "89",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "90",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
               }
             ];
 
@@ -144,8 +113,7 @@ jobs:
 
               // Filter by platform if specified
               if (platform_option !== 'all') {
-                const target_os = platform_option === 'Linux x64' ? 'linux' : 'windows';
-                filtered = filtered.filter(m => m.target_os === target_os);
+                filtered = filtered.filter(m => m.target_os === 'linux');
               }
 
               // Filter by compute capability if specified
@@ -182,10 +150,6 @@ jobs:
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Install Visual Studio Build Tools
-        if: matrix.target.target_os == 'windows'
-        uses: ./.github/actions/install-vs-buildtools
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

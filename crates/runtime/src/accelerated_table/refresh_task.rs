@@ -57,16 +57,16 @@ use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
     datafusion::{filter_converter::TimestampFilterConvert, schema},
-    dataupdate::{DataUpdate, StreamingDataUpdate, UpdateType},
+    dataupdate::{StreamingDataUpdate, UpdateType},
     status,
 };
 use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use runtime_object_store::registry::default_runtime_env;
 
+use super::metrics;
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
-use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 
 use crate::component::dataset::TimeFormat;
 use std::time::{Duration, UNIX_EPOCH};
@@ -91,7 +91,6 @@ use spicepod::metric::Metrics;
 use std::collections::HashSet;
 
 mod changes;
-mod streaming_append;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
@@ -621,37 +620,6 @@ impl RefreshTask {
         }
 
         self.get_data_update(filters, &refresh).await
-    }
-
-    async fn write_data_update(
-        &self,
-        sql: Option<String>,
-        start_time: Option<SystemTime>,
-        data_update: DataUpdate,
-    ) -> super::Result<()> {
-        if data_update.data.is_empty()
-            || data_update
-                .data
-                .first()
-                .is_some_and(|x| x.columns().is_empty())
-        {
-            if let Some(start_time) = start_time {
-                self.trace_load_completed(start_time, 0, 0).await;
-            }
-
-            self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Ready)
-                .await;
-
-            return Ok(());
-        }
-
-        let streaming_update = StreamingDataUpdate::try_from(data_update)
-            .map_err(find_datafusion_root)
-            .context(UnableToCreateMemTableFromUpdateSnafu)?;
-
-        self.write_streaming_data_update(start_time, streaming_update, sql.as_deref())
-            .await
-            .map_err(inner_err_from_retry)
     }
 
     async fn get_incremental_append_update(
@@ -1396,14 +1364,6 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     RetryError::permanent(super::Error::FailedToRefreshDataset {
         source: find_datafusion_root(error),
     })
-}
-
-fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
-    match error {
-        RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
-            inner_err
-        }
-    }
 }
 
 fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {

@@ -23,7 +23,7 @@ use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -1146,7 +1146,12 @@ impl DataFusion {
             }
         }
 
-        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+        // For append mode without time_column, check if source provides append_stream
+        // Skip this check for Pepper which has its own validation (supports primary_key or time_column)
+        if refresh_mode == RefreshMode::Append
+            && dataset.time_column.is_none()
+            && acceleration_settings.engine != Engine::Pepper
+        {
             let append_stream = source.append_stream(source_table_provider);
             if let Some(append_stream) = append_stream {
                 accelerated_table_builder.append_stream(append_stream);

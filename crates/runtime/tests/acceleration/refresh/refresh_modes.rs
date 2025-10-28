@@ -24,26 +24,26 @@ use crate::acceleration::refresh::common::{
     initialize_postgres, refresh_table, start_test_runtime,
 };
 use crate::postgres::common;
-use crate::postgres::common::{PG_PASSWORD, get_random_port};
+use crate::postgres::common::get_random_port;
 use crate::{init_tracing, utils::test_request_context};
 use spicepod::param::Params;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Get acceleration parameters for postgres engine
 fn get_postgres_acceleration_params(port: usize) -> Params {
-    let acceleration_params: HashMap<String, String> = [
-        ("pg_host".to_string(), "localhost".to_string()),
-        ("pg_user".to_string(), "postgres".to_string()),
-        ("pg_pass".to_string(), PG_PASSWORD.to_string()),
-        ("pg_db".to_string(), "acceleration".to_string()),
-        ("pg_sslmode".to_string(), "disable".to_string()),
-        ("pg_port".to_string(), port.to_string()),
-    ]
-    .iter()
-    .cloned()
-    .collect();
-    Params::from_string_map(acceleration_params)
+    let mut params = common::get_pg_params(port);
+    // Override pg_db to use the acceleration database instead of the default
+    params.insert(
+        "pg_db".to_string(),
+        secrecy::SecretString::from("acceleration".to_string()),
+    );
+
+    Params::from_string_map(
+        params
+            .into_iter()
+            .map(|(k, v)| (k, secrecy::ExposeSecret::expose_secret(&v).to_string()))
+            .collect(),
+    )
 }
 
 /// Helper function to test append mode for a given engine
