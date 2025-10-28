@@ -687,7 +687,7 @@ impl SnapshotManager {
         match upload.complete().await {
             Ok(_) => {
                 let checksum_bytes = hasher.finalize();
-                let checksum = encode_hex_lower(checksum_bytes.as_slice());
+                let checksum = encode_hex_lower(checksum_bytes.as_ref());
 
                 self.update_metadata_after_upload(
                     &location,
@@ -1089,7 +1089,7 @@ impl SnapshotManager {
         }
 
         let checksum_bytes = hasher.finalize();
-        let actual_checksum = encode_hex_lower(checksum_bytes.as_slice());
+        let actual_checksum = encode_hex_lower(checksum_bytes.as_ref());
         let expected_checksum = entry.snapshot_checksum.to_lowercase();
         if expected_checksum != actual_checksum {
             let _ = fs::remove_file(&self.local_path).await;
@@ -1297,7 +1297,7 @@ impl SnapshotManager {
 #[cfg(test)]
 fn compute_sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    encode_hex_lower(digest.as_slice())
+    encode_hex_lower(digest.as_ref())
 }
 
 fn encode_hex_lower(bytes: &[u8]) -> String {

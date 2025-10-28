@@ -369,11 +369,10 @@ impl SpiceTest<Completed> {
         for (query, counts) in &self.state.row_counts {
             let first = counts
                 .first()
-                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {}", query))?;
+                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {query}"))?;
             if !counts.iter().all(|count| count == first) {
                 return Err(anyhow::anyhow!(
-                    "Row counts for query {} are inconsistent",
-                    query
+                    "Row counts for query {query} are inconsistent"
                 ));
             }
 

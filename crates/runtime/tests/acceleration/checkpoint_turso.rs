@@ -74,13 +74,13 @@ async fn test_acceleration_turso_checkpoint() -> Result<(), anyhow::Error> {
                 .map(DatasetBuilder::try_from)
                 .map(move |ds_builder| {
                     ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
                         .and_then(|ds_builder| {
                             ds_builder
                                 .with_app(Arc::clone(app))
                                 .with_runtime(Arc::clone(&cloned_rt))
                                 .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -106,10 +106,10 @@ async fn test_acceleration_turso_checkpoint() -> Result<(), anyhow::Error> {
             let db = turso::Builder::new_local("./decimal_turso.db")
                 .build()
                 .await
-                .map_err(|e| anyhow!("Failed to build libsql database: {}", e))?;
+                .map_err(|e| anyhow!("Failed to build libsql database: {e}"))?;
             let conn = db
                 .connect()
-                .map_err(|e| anyhow!("Failed to connect to libsql database: {}", e))?;
+                .map_err(|e| anyhow!("Failed to connect to libsql database: {e}"))?;
 
             // Query checkpoint table
             let checkpoint_result = query_to_record_batches(
@@ -151,11 +151,11 @@ async fn query_to_record_batches(
     let mut stmt = conn
         .prepare(query)
         .await
-        .map_err(|e| anyhow!("Failed to prepare statement: {}", e))?;
+        .map_err(|e| anyhow!("Failed to prepare statement: {e}"))?;
     let mut rows = stmt
         .query(())
         .await
-        .map_err(|e| anyhow!("Failed to query: {}", e))?;
+        .map_err(|e| anyhow!("Failed to query: {e}"))?;
 
     let mut all_rows: Vec<Vec<turso::Value>> = Vec::new();
 
@@ -163,14 +163,14 @@ async fn query_to_record_batches(
     while let Some(row) = rows
         .next()
         .await
-        .map_err(|e| anyhow!("Failed to fetch row: {}", e))?
+        .map_err(|e| anyhow!("Failed to fetch row: {e}"))?
     {
         let column_count = row.column_count();
         let mut row_values = Vec::with_capacity(column_count);
         for i in 0..column_count {
             let value = row
                 .get_value(i)
-                .map_err(|e| anyhow!("Failed to get value: {}", e))?;
+                .map_err(|e| anyhow!("Failed to get value: {e}"))?;
             row_values.push(value);
         }
         all_rows.push(row_values);
@@ -203,7 +203,7 @@ async fn query_to_record_batches(
     let stmt = conn
         .prepare(query)
         .await
-        .map_err(|e| anyhow!("Failed to prepare statement for column names: {}", e))?;
+        .map_err(|e| anyhow!("Failed to prepare statement for column names: {e}"))?;
 
     let columns = stmt.columns();
 
@@ -276,7 +276,7 @@ async fn query_to_record_batches(
     }
 
     let batch = RecordBatch::try_new(schema, columns)
-        .map_err(|e| anyhow!("Failed to create record batch: {}", e))?;
+        .map_err(|e| anyhow!("Failed to create record batch: {e}"))?;
 
     Ok(vec![batch])
 }
