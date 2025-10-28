@@ -16,9 +16,7 @@ limitations under the License.
 
 //! Tests for read-time filtering based on retention configuration.
 //!
-//! These tests verify that deletion vector filtering is only applied
-//! when `retention_sql` is configured, avoiding performance overhead
-//! for full/append refreshes where data is known to be complete.
+//! These tests verify that deletion vector filtering is applied during reads.
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -33,7 +31,6 @@ use tempfile::TempDir;
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn setup_test_table(
-    retention_enabled: bool,
 ) -> TestResult<(Arc<PepperTableProvider>, SessionContext, TempDir, TempDir)> {
     // Create temporary directories for data and metadata
     let data_dir = TempDir::new()?;
@@ -63,14 +60,7 @@ async fn setup_test_table(
     };
 
     // Create table provider
-    let mut table_provider = PepperTableProvider::create_table(catalog, table_options).await?;
-
-    // Configure retention filtering
-    if retention_enabled {
-        table_provider = table_provider.with_retention_enabled(true);
-    }
-
-    let table_provider = Arc::new(table_provider);
+    let table_provider = Arc::new(PepperTableProvider::create_table(catalog, table_options).await?);
 
     // Create session context for queries
     let ctx = SessionContext::new();
@@ -137,9 +127,8 @@ async fn delete_records(
 }
 
 #[tokio::test]
-async fn test_scan_without_retention_does_not_check_deletion_vectors() -> TestResult<()> {
-    // Setup table WITHOUT retention enabled
-    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table(false).await?;
+async fn test_scan_filters_deleted_rows_via_count() -> TestResult<()> {
+    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table().await?;
 
     // Insert data
     let inserted = insert_test_data(&table_provider).await?;
@@ -150,8 +139,7 @@ async fn test_scan_without_retention_does_not_check_deletion_vectors() -> TestRe
     let deleted = delete_records(&table_provider, filter).await?;
     assert_eq!(deleted, 2, "Should delete 2 rows (id 1 and 2)");
 
-    // Query the table - deletion vectors should NOT be applied
-    // since retention is disabled (performance optimization)
+    // Query the table - deletion vectors should be applied
     let df = ctx.sql("SELECT COUNT(*) as count FROM test_table").await?;
 
     let results = df.collect().await?;
@@ -162,19 +150,18 @@ async fn test_scan_without_retention_does_not_check_deletion_vectors() -> TestRe
         .copied()
         .unwrap_or(0);
 
-    // Should still see all 5 rows because read-time filtering is disabled
+    // Should see only 3 rows because read-time filtering removes deleted rows
     assert_eq!(
-        count, 5,
-        "Without retention enabled, deleted rows should still be visible"
+        count, 3,
+        "With deletion vectors applied, only non-deleted rows should be visible"
     );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_scan_with_retention_checks_deletion_vectors() -> TestResult<()> {
-    // Setup table WITH retention enabled
-    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table(true).await?;
+async fn test_scan_filters_deleted_rows() -> TestResult<()> {
+    let (table_provider, ctx, _data_dir, _metadata_dir) = setup_test_table().await?;
 
     // Insert data
     let inserted = insert_test_data(&table_provider).await?;
@@ -196,61 +183,10 @@ async fn test_scan_with_retention_checks_deletion_vectors() -> TestResult<()> {
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
 
-    // With retention enabled and deletion vectors applied, we should see 3 rows
-    // (we deleted rows with id <= 2, leaving rows 3, 4, 5)
+    // With deletion vectors applied, we should see 3 rows (rows with id <= 2 are deleted)
     assert_eq!(
         total_rows, 3,
-        "With retention enabled, deleted rows should be filtered out (expected 3, got {total_rows})"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_retention_flag_can_be_toggled() -> TestResult<()> {
-    // Create table without retention
-    let data_dir = TempDir::new()?;
-    let metadata_dir = TempDir::new()?;
-
-    let catalog = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}/test.db",
-        metadata_dir.path().display()
-    )));
-    catalog.init().await?;
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("value", DataType::Int64, false),
-    ]));
-
-    let table_options = CreateTableOptions {
-        table_name: "test_table".to_string(),
-        schema: Arc::clone(&schema),
-        primary_key: vec![],
-        base_path: data_dir.path().to_string_lossy().to_string(),
-        partition_column: None,
-    };
-
-    let table_provider = PepperTableProvider::create_table(catalog, table_options).await?;
-
-    // Initially false
-    assert!(
-        !table_provider.is_retention_enabled(),
-        "Retention should be disabled by default"
-    );
-
-    // Enable retention
-    let table_provider = table_provider.with_retention_enabled(true);
-    assert!(
-        table_provider.is_retention_enabled(),
-        "Retention should be enabled after calling with_retention_enabled(true)"
-    );
-
-    // Disable retention
-    let table_provider = table_provider.with_retention_enabled(false);
-    assert!(
-        !table_provider.is_retention_enabled(),
-        "Retention should be disabled after calling with_retention_enabled(false)"
+        "Deletion vectors should filter out deleted rows (expected 3, got {total_rows})"
     );
 
     Ok(())
@@ -258,8 +194,7 @@ async fn test_retention_flag_can_be_toggled() -> TestResult<()> {
 
 #[tokio::test]
 async fn test_get_table_delete_files_works() -> TestResult<()> {
-    // Setup table with retention enabled
-    let (table_provider, _ctx, _data_dir, _metadata_dir) = setup_test_table(true).await?;
+    let (table_provider, _ctx, _data_dir, _metadata_dir) = setup_test_table().await?;
 
     // Insert data
     let inserted = insert_test_data(&table_provider).await?;

@@ -293,7 +293,7 @@ pub struct PepperTableProvider {
     table_metadata: TableMetadata,
     /// Reference to the metadata catalog for file operations
     catalog: Arc<dyn MetadataCatalog>,
-    /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory
+    /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory.
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
     /// Wrapped in `RwLock` to allow updating the listing table on overwrite operations.
@@ -301,8 +301,6 @@ pub struct PepperTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
-    /// Whether read-time deletion vector filtering is enabled (controlled by retention settings)
-    retention_enabled: bool,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -421,7 +419,6 @@ impl PepperTableProvider {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
-            retention_enabled: false,
         })
     }
 
@@ -449,19 +446,6 @@ impl PepperTableProvider {
     #[must_use]
     pub fn metadata(&self) -> &TableMetadata {
         &self.table_metadata
-    }
-
-    /// Returns whether retention-based read filtering is enabled.
-    #[must_use]
-    pub fn is_retention_enabled(&self) -> bool {
-        self.retention_enabled
-    }
-
-    /// Enable or disable retention-based read filtering, returning the updated provider.
-    #[must_use]
-    pub fn with_retention_enabled(mut self, enabled: bool) -> Self {
-        self.retention_enabled = enabled;
-        self
     }
 
     /// Insert data from a record batch stream.
@@ -880,7 +864,7 @@ impl TableProvider for PepperTableProvider {
             })?;
 
         // If there are any deletion vectors, load and apply filtering
-        if self.retention_enabled && !delete_files.is_empty() {
+        if !delete_files.is_empty() {
             let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
             tracing::debug!(
                 "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
