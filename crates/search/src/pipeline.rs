@@ -243,7 +243,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         }),
     ) = (*expr.clone(), *pattern.clone())
     {
-        if id.value.to_lowercase() != target_column {
+        if id.value != target_column {
             tracing::trace!(
                 "failed to parse 'keywords' for search. expected {target_column}, but got {}",
                 id.value
@@ -289,6 +289,21 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn test_search_request_prepare_keywords() {
+        let keywords = vec![
+            "keyword1".to_string(),
+            "\"key word2\"".to_string(),
+            "key word3".to_string(),
+            "keYwOrD4".to_string(),
+        ];
+        // Test all lowercase
+        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hello")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+
+        // Test with casing
+        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hElLo")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+    }
 
     #[test]
     fn test_search_request_parse_keywords() {

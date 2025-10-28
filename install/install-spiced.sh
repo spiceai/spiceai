@@ -66,8 +66,8 @@ verifySupported() {
         if [ "$osarch" == "$current_osarch" ]; then
             # Validate CUDA variant combinations
             if [ "$VARIANT" == "cuda" ]; then
-                if [ "$OS" != "linux" ] && [ "$OS" != "windows" ]; then
-                    echo "CUDA variants are only supported on Linux and Windows"
+                if [ "$OS" != "linux" ]; then
+                    echo "CUDA variants are only supported on Linux"
                     exit 1
                 fi
                 if [ -z "$CUDA_VERSION" ]; then
@@ -225,7 +225,7 @@ downloadFile() {
     
     if [ "$asset_id" = "null" ] || [ -z "$asset_id" ]; then
         echo "ERROR: version not found $LATEST_RELEASE_TAG or artifact $SPICED_ARTIFACT not found"
-        echo "Available variants: default, models, cuda (with CUDA_VERSION), metal"
+        echo "Available variants: default, models, cuda (Linux only, requires CUDA_VERSION), metal"
         exit 1
     fi
 
