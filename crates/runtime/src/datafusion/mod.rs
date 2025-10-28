@@ -38,6 +38,7 @@ use crate::datafusion::query::Query;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
+use crate::embeddings::table::EmbeddingTable;
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
@@ -82,6 +83,7 @@ use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
@@ -1546,19 +1548,46 @@ impl DataFusion {
                     return None;
                 }
             };
+            let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
 
-            let tbl_provider = if view.has_full_text_column() {
-                match add_full_text_search_to_table(Arc::new(view_table), &view.columns, &view.name)
+            if view.has_embeddings() {
+                match EmbeddingTable::from_spicepod_columns(
+                    tbl_provider,
+                    view.columns
+                        .iter()
+                        .flat_map(|col| {
+                            col.embeddings.iter().map(|emb| ColumnEmbeddingConfig {
+                                column: col.name.clone(),
+                                model: emb.model.clone(),
+                                primary_keys: emb.row_ids.clone(),
+                                chunking: emb.chunking.clone(),
+                                vector_size: emb.vector_size,
+                            })
+                        })
+                        .collect(),
+                    &view.runtime.embeds(),
+                    None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
+                )
+                .await
                 {
-                    Ok(idx) => Arc::new(idx) as Arc<dyn TableProvider>,
+                    Ok(tbl) => tbl_provider = tbl,
+                    Err(e) => {
+                        tracing::error!("Failed to load embedding for view '{}': {e}", view.name);
+                        status.update_view(table, status::ComponentStatus::Error);
+                        return None;
+                    }
+                };
+            };
+
+            if view.has_full_text_column() {
+                match add_full_text_search_to_table(tbl_provider, &view.columns, &view.name) {
+                    Ok(idx) => tbl_provider = Arc::new(idx) as Arc<dyn TableProvider>,
                     Err(e) => {
                         tracing::error!("Failed to full-text search for view '{}': {e}", view.name);
                         status.update_view(table, status::ComponentStatus::Error);
                         return None;
                     }
                 }
-            } else {
-                Arc::new(view_table) as Arc<dyn TableProvider>
             };
 
             if let Some(acceleration) = &view.acceleration
