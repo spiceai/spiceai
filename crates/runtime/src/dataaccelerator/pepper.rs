@@ -33,6 +33,7 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 use super::{AccelerationSource, DataAccelerator};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
@@ -210,7 +211,7 @@ fn transform_schema_for_vortex(
 }
 
 pub struct PepperAccelerator {
-    catalog: Arc<tokio::sync::RwLock<Option<Arc<pepper::PepperCatalog>>>>,
+    catalog: Arc<OnceCell<Arc<dyn pepper::MetadataCatalog>>>,
 }
 
 impl Default for PepperAccelerator {
@@ -223,7 +224,7 @@ impl PepperAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            catalog: Arc::new(tokio::sync::RwLock::new(None)),
+            catalog: Arc::new(OnceCell::new()),
         }
     }
 
@@ -314,6 +315,33 @@ impl PepperAccelerator {
         Ok(path_buf)
     }
 
+    async fn get_or_create_catalog(
+        &self,
+        metadata_dir: &str,
+    ) -> Result<Arc<dyn pepper::MetadataCatalog>> {
+        let connection_string = format!("sqlite://{metadata_dir}/pepper.db");
+
+        self.catalog
+            .get_or_try_init(move || {
+                let connection_string = connection_string.clone();
+                async move {
+                    let catalog = Arc::new(pepper::PepperCatalog::new(connection_string))
+                        as Arc<dyn pepper::MetadataCatalog>;
+
+                    catalog
+                        .init()
+                        .await
+                        .map_err(|e| Error::AccelerationInitializationFailed {
+                            source: Box::new(e),
+                        })?;
+
+                    Ok::<Arc<dyn pepper::MetadataCatalog>, Error>(catalog)
+                }
+            })
+            .await
+            .map(Arc::clone)
+    }
+
     async fn create_pepper_table_provider(
         &self,
         table_name: &str,
@@ -321,7 +349,7 @@ impl PepperAccelerator {
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<dyn TableProvider>> {
-        use pepper::{MetadataCatalog, PepperTableProvider, metadata::CreateTableOptions};
+        use pepper::{PepperTableProvider, metadata::CreateTableOptions};
 
         // Use custom metadata directory if provided (for testing), otherwise use shared directory
         let metadata_dir = if let Some(acceleration) = source.acceleration() {
@@ -340,35 +368,7 @@ impl PepperAccelerator {
         })?;
 
         // Get or create the shared catalog (lazy initialization)
-        let catalog = {
-            let catalog_lock = self.catalog.read().await;
-            if let Some(existing_catalog) = catalog_lock.as_ref() {
-                Arc::clone(existing_catalog)
-            } else {
-                drop(catalog_lock);
-                let mut catalog_lock = self.catalog.write().await;
-
-                // Double-check after acquiring write lock
-                if let Some(existing_catalog) = catalog_lock.as_ref() {
-                    Arc::clone(existing_catalog)
-                } else {
-                    // Create a new catalog - it will use WAL mode and busy timeout internally
-                    let new_catalog = Arc::new(pepper::PepperCatalog::new(format!(
-                        "sqlite://{metadata_dir}/pepper.db"
-                    )));
-
-                    // Initialize the catalog (creates tables if needed)
-                    new_catalog.init().await.map_err(|e| {
-                        Error::AccelerationInitializationFailed {
-                            source: Box::new(e),
-                        }
-                    })?;
-
-                    *catalog_lock = Some(Arc::clone(&new_catalog));
-                    new_catalog
-                }
-            }
-        };
+        let catalog = self.get_or_create_catalog(&metadata_dir).await?;
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -672,15 +672,10 @@ impl DataAccelerator for PepperAccelerator {
     }
 
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use pepper::MetadataCatalog;
-
         tracing::debug!("Pepper accelerator shutdown: starting catalog shutdown");
 
         // Get the catalog if it was initialized
-        let catalog = {
-            let catalog_lock = self.catalog.read().await;
-            catalog_lock.as_ref().map(Arc::clone)
-        };
+        let catalog = self.catalog.get().map(Arc::clone);
 
         if let Some(catalog) = catalog {
             // Run shutdown on the catalog to flush WAL and optimize

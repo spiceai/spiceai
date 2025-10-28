@@ -92,8 +92,15 @@ impl PepperCatalog {
         result: Result<CatalogResult<T>, tokio::task::JoinError>,
         operation: &str,
     ) -> CatalogResult<T> {
-        result.map_err(|err| CatalogError::InvalidOperation {
-            message: format!("{operation} task panicked or was cancelled: {err}"),
+        result.map_err(|err| {
+            let message = if err.is_panic() {
+                format!("{operation} task panicked: {err}")
+            } else if err.is_cancelled() {
+                format!("{operation} task was cancelled: {err}")
+            } else {
+                format!("{operation} task failed: {err}")
+            };
+            CatalogError::InvalidOperation { message }
         })?
     }
 
