@@ -764,7 +764,6 @@ mod test {
     use datafusion::prelude::col;
     use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
     use runtime_table_partition::expression::PartitionedBy;
-    use std::path::PathBuf;
 
     fn get_mem_duckdb() -> Arc<DuckDbConnectionPool> {
         Arc::new(
