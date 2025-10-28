@@ -193,12 +193,28 @@ impl FileOpener for VortexOpener {
                         (0..rb.num_rows().div_ceil(batch_size * 2))
                             .flat_map(move |block_idx| {
                                 let offset = block_idx * batch_size * 2;
+                                let num_rows = rb.num_rows();
+
+                                // Validate offset is within bounds before slicing
+                                if offset >= num_rows {
+                                    return [None, None].into_iter();
+                                }
 
                                 // If we have less than two batches worth of rows left, we keep them together as a single batch.
-                                if rb.num_rows() - offset < 2 * batch_size {
-                                    let length = rb.num_rows() - offset;
+                                if num_rows - offset < 2 * batch_size {
+                                    let length = num_rows - offset;
+                                    // Safety check: ensure we don't slice beyond bounds
+                                    if offset + length > num_rows {
+                                        return [None, None].into_iter();
+                                    }
                                     [Some(rb.slice(offset, length)), None].into_iter()
                                 } else {
+                                    // Safety check: ensure both slices are within bounds
+                                    if offset + batch_size > num_rows
+                                        || offset + batch_size * 2 > num_rows
+                                    {
+                                        return [None, None].into_iter();
+                                    }
                                     let first = rb.slice(offset, batch_size);
                                     let second = rb.slice(offset + batch_size, batch_size);
                                     [Some(first), Some(second)].into_iter()
