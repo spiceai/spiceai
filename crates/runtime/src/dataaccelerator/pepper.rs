@@ -210,9 +210,7 @@ fn transform_schema_for_vortex(
 }
 
 pub struct PepperAccelerator {
-    /// Shared metadata catalog for all Pepper tables.
-    /// Wrapped in `RwLock` to allow lazy initialization on first use.
-    catalog: Arc<tokio::sync::RwLock<Option<Arc<pepper::PepperCatalog>>>>,
+    _marker: std::marker::PhantomData<()>,
 }
 
 impl Default for PepperAccelerator {
@@ -225,7 +223,7 @@ impl PepperAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            catalog: Arc::new(tokio::sync::RwLock::new(None)),
+            _marker: std::marker::PhantomData,
         }
     }
 

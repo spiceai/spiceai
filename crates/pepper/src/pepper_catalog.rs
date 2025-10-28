@@ -85,11 +85,9 @@ impl PepperCatalog {
         result: Result<CatalogResult<T>, tokio::task::JoinError>,
         operation: &str,
     ) -> CatalogResult<T> {
-        result
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("{operation} task panicked or was cancelled: {err}"),
-            })?
-            .map_err(|err| err)
+        result.map_err(|err| CatalogError::InvalidOperation {
+            message: format!("{operation} task panicked or was cancelled: {err}"),
+        })?
     }
 
     /// Get the database file path from the connection string.
@@ -242,6 +240,45 @@ impl PepperCatalog {
             "INSERT OR IGNORE INTO pepper_metadata (key, value) VALUES ('next_partition_id', 1)",
             [],
         )?;
+
+        Ok(())
+    }
+
+    /// Perform catalog shutdown maintenance tasks.
+    ///
+    /// Runs a WAL checkpoint and `PRAGMA optimize` to ensure the catalog is in
+    /// a clean state before shutdown, preventing large WAL files from lingering
+    /// between runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError`] if the catalog cannot be opened or if the
+    /// maintenance pragma statements fail to execute.
+    pub async fn shutdown(&self) -> CatalogResult<()> {
+        let db_path_owned = self.db_path().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path_owned)?;
+
+            // Check if WAL mode is enabled
+            let journal_mode: String =
+                conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+
+            if journal_mode.eq_ignore_ascii_case("wal") {
+                tracing::info!("Truncating Pepper catalog WAL log");
+                // Truncate the WAL log to persist changes and reduce file size
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+            }
+
+            // Run optimize to improve query performance for future connections
+            tracing::info!("Running optimize on Pepper catalog");
+            conn.execute("PRAGMA optimize", [])?;
+
+            Ok::<(), CatalogError>(())
+        })
+        .await;
+
+        Self::handle_blocking_result(result, "Catalog shutdown")?;
 
         Ok(())
     }
@@ -604,7 +641,7 @@ impl MetadataCatalog for PepperCatalog {
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<i64> {
         let db_path_owned = self.db_path().to_string();
 
-        let blocking_result = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&db_path_owned, false)?;
 
             // Begin transaction
@@ -646,9 +683,9 @@ impl MetadataCatalog for PepperCatalog {
         })
         .await;
 
-        let blocking_result = Self::handle_blocking_result(result, "Delete file registration")?;
+        let delete_file_id = Self::handle_blocking_result(result, "Delete file registration")?;
 
-        Ok(blocking_result)
+        Ok(delete_file_id)
     }
 
     async fn get_delete_files(&self, _data_file_id: i64) -> CatalogResult<Vec<DeleteFile>> {
@@ -944,35 +981,6 @@ impl MetadataCatalog for PepperCatalog {
 
     async fn rollback_transaction(&self) -> CatalogResult<()> {
         // Implementation would rollback SQLite transaction
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> CatalogResult<()> {
-        let db_path_owned = self.db_path().to_string();
-
-        let result = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open(&db_path_owned)?;
-
-            // Check if WAL mode is enabled
-            let journal_mode: String =
-                conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-
-            if journal_mode.eq_ignore_ascii_case("wal") {
-                tracing::info!("Truncating Pepper catalog WAL log");
-                // Truncate the WAL log to persist changes and reduce file size
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
-            }
-
-            // Run optimize to improve query performance for future connections
-            tracing::info!("Running optimize on Pepper catalog");
-            conn.execute("PRAGMA optimize", [])?;
-
-            Ok::<(), CatalogError>(())
-        })
-        .await;
-
-        Self::handle_blocking_result(result, "Catalog shutdown")?;
-
         Ok(())
     }
 }
