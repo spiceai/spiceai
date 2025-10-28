@@ -33,6 +33,7 @@ use snafu::prelude::*;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 use super::{AccelerationSource, DataAccelerator};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
@@ -210,7 +211,7 @@ fn transform_schema_for_vortex(
 }
 
 pub struct PepperAccelerator {
-    _marker: std::marker::PhantomData<()>,
+    catalog: Arc<OnceCell<Arc<dyn pepper::MetadataCatalog>>>,
 }
 
 impl Default for PepperAccelerator {
@@ -223,7 +224,7 @@ impl PepperAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            _marker: std::marker::PhantomData,
+            catalog: Arc::new(OnceCell::new()),
         }
     }
 
@@ -314,7 +315,35 @@ impl PepperAccelerator {
         Ok(path_buf)
     }
 
+    async fn get_or_create_catalog(
+        &self,
+        metadata_dir: &str,
+    ) -> Result<Arc<dyn pepper::MetadataCatalog>> {
+        let connection_string = format!("sqlite://{metadata_dir}/pepper.db");
+
+        self.catalog
+            .get_or_try_init(move || {
+                let connection_string = connection_string.clone();
+                async move {
+                    let catalog = Arc::new(pepper::PepperCatalog::new(connection_string))
+                        as Arc<dyn pepper::MetadataCatalog>;
+
+                    catalog
+                        .init()
+                        .await
+                        .map_err(|e| Error::AccelerationInitializationFailed {
+                            source: Box::new(e),
+                        })?;
+
+                    Ok::<Arc<dyn pepper::MetadataCatalog>, Error>(catalog)
+                }
+            })
+            .await
+            .map(Arc::clone)
+    }
+
     async fn create_pepper_table_provider(
+        &self,
         table_name: &str,
         dir_path: &str,
         schema: Arc<Schema>,
@@ -338,18 +367,8 @@ impl PepperAccelerator {
             source: Box::new(e),
         })?;
 
-        // Create a new catalog - it will use WAL mode and busy timeout internally
-        let catalog = Arc::new(pepper::PepperCatalog::new(format!(
-            "sqlite://{metadata_dir}/pepper.db"
-        ))) as Arc<dyn pepper::MetadataCatalog>;
-
-        // Initialize the catalog (creates tables if needed)
-        catalog
-            .init()
-            .await
-            .map_err(|e| Error::AccelerationInitializationFailed {
-                source: Box::new(e),
-            })?;
+        // Get or create the shared catalog (lazy initialization)
+        let catalog = self.get_or_create_catalog(&metadata_dir).await?;
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -567,14 +586,10 @@ impl DataAccelerator for PepperAccelerator {
         let table_name = source.name().to_string();
 
         // Always create the base Pepper table provider
-        let pepper_table = Self::create_pepper_table_provider(
-            &table_name,
-            &dir_path,
-            Arc::clone(&arrow_schema),
-            source,
-        )
-        .await
-        .boxed()?;
+        let pepper_table = self
+            .create_pepper_table_provider(&table_name, &dir_path, Arc::clone(&arrow_schema), source)
+            .await
+            .boxed()?;
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
@@ -654,6 +669,26 @@ impl DataAccelerator for PepperAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::debug!("Pepper accelerator shutdown: starting catalog shutdown");
+
+        // Get the catalog if it was initialized
+        let catalog = self.catalog.get().map(Arc::clone);
+
+        if let Some(catalog) = catalog {
+            // Run shutdown on the catalog to flush WAL and optimize
+            catalog.shutdown().await.map_err(|e| {
+                tracing::warn!("Failed to shutdown Pepper catalog: {e}");
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            tracing::debug!("Pepper accelerator shutdown: complete");
+        } else {
+            tracing::debug!("Pepper catalog was never initialized, skipping shutdown");
+        }
+
+        Ok(())
     }
 }
 
