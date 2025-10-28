@@ -63,6 +63,7 @@ pub struct DynamoDBTableProvider {
     table_schema: DynamoDBTableSchema,
     request_plan_builder: DynamoDBRequestPlanBuilder,
     unnest_depth: Option<usize>,
+    partitions: usize,
 }
 
 type DynamoDBItemStream =
@@ -74,6 +75,7 @@ impl DynamoDBTableProvider {
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
+        partitions: usize,
     ) -> Result<Self, Error> {
         let (table_schema, partition_key, sort_key) = Self::fetch_table_metadata(
             Arc::clone(&client),
@@ -90,6 +92,7 @@ impl DynamoDBTableProvider {
             table_schema: table_schema.clone(),
             request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
             unnest_depth,
+            partitions,
         })
     }
 
@@ -208,6 +211,7 @@ impl TableProvider for DynamoDBTableProvider {
             request_plan,
             self.unnest_depth,
             projected_schema,
+            self.partitions,
         )))
     }
 
@@ -234,6 +238,7 @@ impl DynamoDBTableProviderExec {
         request_plan: DynamoDBRequestPlan,
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
+        partitions: usize,
     ) -> Self {
         Self {
             client,
@@ -242,7 +247,7 @@ impl DynamoDBTableProviderExec {
             unnest_depth,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
-                Partitioning::UnknownPartitioning(1),
+                Partitioning::UnknownPartitioning(partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
@@ -292,7 +297,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.projected_schema), 2);
@@ -303,10 +308,15 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
 
+        let total_partitions = match self.properties.partitioning {
+            Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _)=> 1,
+            Partitioning::UnknownPartitioning(partitions) => partitions
+        };
+
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
 
-            let item_stream = build_stream_from_plan(&client, request_plan);
+            let item_stream = build_stream_from_plan(&client, request_plan, partition, total_partitions);
             let chunked_stream = item_stream.chunks(CHUNK_SIZE);
             pin_mut!(chunked_stream);
 
@@ -339,6 +349,8 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 fn build_stream_from_plan(
     client: &Arc<Client>,
     request: DynamoDBRequestPlan,
+    partition: usize,
+    total_partitions: usize,
 ) -> Pin<Box<DynamoDBItemStream>> {
     match request {
         DynamoDBRequestPlan::Query(QueryParams {
@@ -380,7 +392,7 @@ fn build_stream_from_plan(
             projection_expression,
             limit,
         }) => {
-            let request = client
+            let mut request = client
                 .scan()
                 .table_name(table_name)
                 .set_filter_expression(filter_expression)
@@ -388,6 +400,13 @@ fn build_stream_from_plan(
                 .set_expression_attribute_names(expression_attribute_names)
                 .set_projection_expression(projection_expression)
                 .set_limit(limit);
+
+            println!("segment: {:?}, total_segments: {:?}", partition, total_partitions);
+            if total_partitions > 1 {
+                request = request
+                    .segment(partition as i32)
+                    .total_segments(total_partitions as i32);
+            }
 
             let pagination_stream = TryFlatMap::new(request.into_paginator().send())
                 .flat_map(|output| output.items().to_vec());

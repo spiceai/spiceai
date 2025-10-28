@@ -49,6 +49,7 @@ impl DynamoDBFactory {
 }
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
+const DEFAULT_PARTITIONS_STR: &str = "1";
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
@@ -70,6 +71,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_infer_max_records")
         .description("Number of documents to use to infer the schema. Defaults to 10.")
         .default(DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR),
+    ParameterSpec::runtime("partitions")
+        .description("Number of partitions. 1 by default.")
+        .default(DEFAULT_PARTITIONS_STR),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -141,6 +145,19 @@ impl DataConnector for DynamoDB {
             connector_component: ConnectorComponent::from(dataset)
         })?;
 
+        let partitions_str =
+            match self.params.get("partitions").expose() {
+                ExposedParamLookup::Present(partitions_str) => partitions_str,
+                ExposedParamLookup::Absent(_) => DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR,
+            };
+
+        let partitions = usize::from_str(partitions_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            dataconnector: "dynamodb".to_string(),
+            message: format!(
+                "DynamoDB parameter 'partitions' must be an integer, not {partitions_str}"),
+            connector_component: ConnectorComponent::from(dataset)
+        })?;
+
         let unnest_depth = match self.params.get("unnest_depth").expose() {
             ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                 dataconnector: "dynamodb".to_string(),
@@ -156,6 +173,7 @@ impl DataConnector for DynamoDB {
             Arc::from(table_name),
             unnest_depth,
             schema_infer_max_records,
+            partitions,
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
