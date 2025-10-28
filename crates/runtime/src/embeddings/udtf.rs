@@ -148,6 +148,8 @@ impl VectorSearchTableFuncArgs {
 pub struct VectorSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
+
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
     df_ptr: u64,
 
     explicit_pks: HashMap<TableReference, Vec<String>>,

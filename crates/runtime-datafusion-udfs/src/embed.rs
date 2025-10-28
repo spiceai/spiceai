@@ -86,6 +86,7 @@ macro_rules! string_array_iter {
 #[derive(Debug)]
 pub struct Embed {
     model_store: Arc<RwLock<EmbeddingModelStore>>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `RwLock<EmbeddingModelStore>` implement them.
     ptr: u64,
 }
 

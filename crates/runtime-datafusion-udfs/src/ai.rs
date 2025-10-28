@@ -92,6 +92,7 @@ pub type ChatModelStore = HashMap<String, Arc<dyn Chat>>;
 
 pub struct Ai {
     model_store: Arc<RwLock<ChatModelStore>>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `RwLock<ChatModelStore>` implement them.
     ptr: u64,
 }
 

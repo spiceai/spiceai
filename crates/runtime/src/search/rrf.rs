@@ -250,6 +250,7 @@ impl Debug for ReciprocalRankFusion {
 
 pub struct ReciprocalRankFusion {
     pub session_context: Arc<SessionContext>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `SessionContext` implement them.
     session_ptr: u64,
     df: Option<DataFrame>,
 }
