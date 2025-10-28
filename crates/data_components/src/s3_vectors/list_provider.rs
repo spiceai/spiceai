@@ -36,7 +36,7 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, exec_err},
+    common::{Constraints, exec_err, project_schema},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -44,6 +44,7 @@ use datafusion::{
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        empty::EmptyExec,
         execution_plan::{Boundedness, EmissionType},
         limit::GlobalLimitExec,
         stream::RecordBatchReceiverStream,
@@ -196,16 +197,21 @@ async fn create_partition_plan(
         }
     }
 
-    if index_plans.len() == 1 {
-        return Ok(Arc::clone(&index_plans[0]));
-    }
+    let num_plans = index_plans.len();
 
-    let union_plan = Arc::new(UnionExec::new(index_plans));
+    let scan_plan = if num_plans == 0 {
+        Arc::new(EmptyExec::new(project_schema(&table.schema(), projection)?))
+    } else if num_plans == 1 {
+        Arc::clone(&index_plans[0])
+    } else {
+        Arc::new(UnionExec::new(index_plans))
+    };
+
     if let Some(limit) = limit {
-        let limit_plan = Arc::new(GlobalLimitExec::new(union_plan, 0, Some(limit)));
+        let limit_plan = Arc::new(GlobalLimitExec::new(scan_plan, 0, Some(limit)));
         Ok(limit_plan)
     } else {
-        Ok(union_plan)
+        Ok(scan_plan)
     }
 }
 

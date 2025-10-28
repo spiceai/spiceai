@@ -170,6 +170,7 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
 tract-core = "0.22.0"
+turso = { workspace = true, optional = true }
 twox-hash = { workspace = true, optional = true }
 url = "2.5.4"
 util = { path = "../util" }
@@ -287,7 +288,15 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
-turso = []
+turso = [
+    "dep:turso",
+    "dep:tokio-rusqlite",
+    "db_connection_pool/sqlite",
+    "data_components/sqlite",
+    "data_components/turso",
+    "dep:rusqlite",
+]
+vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]

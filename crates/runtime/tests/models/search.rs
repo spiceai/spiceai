@@ -96,7 +96,7 @@ async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
 
     let response_str = http_post(&format!("{base_url}/v1/sql").to_string(), sql, headers).await?;
     serde_json::from_str(&response_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse 'v1/sql' HTTP response: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to parse 'v1/sql' HTTP response: {e}"))
 }
 
 pub async fn run_search_test(

@@ -114,7 +114,7 @@ pub(crate) async fn execute_ps_sql(
         .conn
         .execute(sql, &[])
         .await
-        .map_err(|e| anyhow::anyhow!("Error running sql: {}", e))
+        .map_err(|e| anyhow::anyhow!("Error running sql: {e}"))
 }
 
 pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnection, anyhow::Error> {
@@ -123,7 +123,7 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
     let db_conn = pool
         .connect_direct()
         .await
-        .map_err(|e| anyhow::anyhow!("Error connecting: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Error connecting: {e}"))?;
 
     execute_ps_sql(
         &db_conn,

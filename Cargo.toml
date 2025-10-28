@@ -111,6 +111,12 @@ bb8-postgres = "0.9"
 bigdecimal = "0.4.7"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
+candle = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-core" }
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-kernels" }
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-metal-kernels" }
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
 charset = "0.1.5"
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive", "env"] }
@@ -144,7 +150,10 @@ duckdb = "1.3.2"
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
-git2 = { version = "0.19", default-features = false, features = ["https", "ssh"] }
+git2 = { version = "0.20", default-features = false, features = [
+    "https",
+    "ssh",
+] }
 globset = "0.4.16"
 governor = "0.10.1"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
@@ -235,6 +244,7 @@ tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+turso = "0.3.0-pre.4"
 twox-hash = "2.1.2"
 url = "2.5"
 uuid = "1"
@@ -300,8 +310,11 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
 # Override candle-core v0.8.x to use matching cudarc version 0.12.2 to satisfy candle-cublaslt requirement
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }          # spiceai-0.8.4-cudarc-0.12
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" } # spiceai-0.8.4-cudarc-0.12
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }                                          # spiceai-0.8.4-cudarc-0.12
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-kernels" }           # spiceai-0.8.4-cudarc-0.12
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }                                 # spiceai-0.8.4-cudarc-0.12
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }                     # spiceai-0.8.4-cudarc-0.12
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" } # spiceai-0.8.4-cudarc-0.12
 
 # Use patched arrow-rs 55.2 until next release
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }        # spiceai-56
@@ -333,6 +346,10 @@ aws-sdk-s3 = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58
 aws-sdk-s3vectors = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-s3vectors" }                             # pinned from release-2025-10-08
 aws-sdk-secretsmanager = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-secretsmanager" }                   # pinned from release-2025-10-08
 aws-sdk-sts = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-sts" }                                         # pinned from release-2025-10-08
+aws-sigv4 = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sigv4" }                                             # pinned from release-2025-10-08
 aws-smithy-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-runtime" }                           # pinned from release-2025-10-08
 aws-smithy-runtime-api = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-runtime-api" }                   # pinned from release-2025-10-08
 aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-types" }                               # pinned from release-2025-10-08
+
+# Required until Turso releases 0.23 without the GPL dependency
+turso = { git = "https://github.com/tursodatabase/turso", rev = "ae60b78d828dc08c6bcdc070d7ec71c4d61bd007" }

@@ -299,7 +299,7 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                     .ok_or_else(|| anyhow!("Failed to downcast TimestampSecondArray"))?
                     .value(index);
                 let dt = DateTime::from_timestamp(ts, 0)
-                    .ok_or_else(|| anyhow!("Invalid timestamp for seconds={}", ts))?;
+                    .ok_or_else(|| anyhow!("Invalid timestamp for seconds={ts}"))?;
                 Ok(Some(dt.format("%Y-%m-%d %H:%M:%S").to_string()))
             }
             TimeUnit::Millisecond => {
