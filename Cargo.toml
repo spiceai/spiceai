@@ -324,6 +324,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" }      # spiceai-55.2
 
+# Required until Turso releases 0.23 without the GPL dependency
+turso = { git = "https://github.com/tursodatabase/turso", rev = "ae60b78d828dc08c6bcdc070d7ec71c4d61bd007" }
+
 aws-config = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-config" }                                           #"1.8.2"
 aws-credential-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-credential-types" }                       #"1.2"
 aws-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-runtime" }                                         #"1.5.10"
