@@ -106,7 +106,6 @@ pub struct RefreshTaskBuilder {
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
-    sink: Arc<RwLock<AccelerationSink>>,
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
@@ -130,8 +129,7 @@ impl RefreshTaskBuilder {
             dataset_name,
             federated,
             federated_source,
-            accelerator: Arc::clone(&accelerator),
-            sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
+            accelerator,
             disable_federation: false,
             semaphore: None,
             metrics: None,
@@ -171,13 +169,32 @@ impl RefreshTaskBuilder {
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
 
+        // Create the acceleration sink at build time rather than storing it in the builder.
+        //
+        // Design rationale: While this creates the sink even if the RefreshTask is never used,
+        // this approach is necessary because:
+        // 1. The sink requires the accelerator Arc, which the builder owns
+        // 2. Storing the sink in the builder would require the builder to be mutable or use
+        //    interior mutability (e.g., `Option<Arc<RwLock<AccelerationSink>>>`)
+        // 3. In practice, RefreshTask is always used immediately after building - it's not a
+        //    speculative construction pattern
+        // 4. The sink itself is lightweight (just wraps an Arc to the accelerator)
+        //
+        // Trade-off: This creates a small amount of overhead (one Arc + RwLock allocation) even
+        // if the task is never executed, but simplifies the builder API and ownership model.
+        // The alternative of lazy initialization would add complexity without meaningful benefit
+        // given the typical usage pattern.
+        let sink = Arc::new(RwLock::new(AccelerationSink::new(Arc::clone(
+            &self.accelerator,
+        ))));
+
         RefreshTask {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
             federated: self.federated,
             federated_source: self.federated_source,
             accelerator: self.accelerator,
-            sink: self.sink,
+            sink,
             disable_federation: self.disable_federation,
             semaphore,
             enabled_metrics: self

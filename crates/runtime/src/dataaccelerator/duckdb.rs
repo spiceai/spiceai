@@ -265,9 +265,9 @@ impl Default for DuckDBAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("file"),
     ParameterSpec::component("data_dir"),
-    ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),

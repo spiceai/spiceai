@@ -858,6 +858,15 @@ pub(crate) fn basic_vector_search_tests(prefix: &'static str) -> Vec<SearchTestC
             })),
         ),
         SearchTestCase::new(
+            format!("{prefix}_keywords"),
+            SearchTestType::Http(json!({
+                "text": "second",
+                "limit": 4,
+                "datasets": ["qs"],
+                "keywords": ["number"],
+            })),
+        ),
+        SearchTestCase::new(
             format!("{prefix}_additional_columns"),
             SearchTestType::Http(json!({
                 "text": "second",

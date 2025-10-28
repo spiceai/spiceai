@@ -205,13 +205,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spiced.exe --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -245,13 +245,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'models')
         run: ./spiced.exe --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'models')
         with:
           name: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'models')
         with:
           name: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -274,7 +274,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         with:
           name: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -297,7 +297,7 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'darwin'
         with:
           name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -329,13 +329,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice.exe version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}

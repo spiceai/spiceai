@@ -93,7 +93,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -101,7 +101,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os == 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |

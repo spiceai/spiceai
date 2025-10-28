@@ -144,6 +144,7 @@ duckdb = "1.3.2"
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
+git2 = { version = "0.19", default-features = false, features = ["https", "ssh"] }
 globset = "0.4.16"
 governor = "0.10.1"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
@@ -199,7 +200,7 @@ rustls = "0.23"
 rustls-pemfile = "2.1.3"
 schemars = "0.9.0"
 secrecy = "0.10.3"
-serde = { version = "1.0.219", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.6"

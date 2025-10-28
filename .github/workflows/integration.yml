@@ -135,35 +135,35 @@ jobs:
 
       # Upload the test archive as an artifact
       - name: Upload test archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: integration-test-archive
           path: ./integration.tar.zst
           retention-days: 1
 
       - name: Upload AWS SDK test archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
           retention-days: 1
 
       - name: Upload AWS SDK credential bridge test archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
           retention-days: 1
 
       - name: Upload partition table test archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
           retention-days: 1
 
       - name: Upload data components test archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
@@ -301,7 +301,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz

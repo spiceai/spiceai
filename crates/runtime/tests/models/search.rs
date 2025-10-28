@@ -418,6 +418,15 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
                 })),
             ),
             SearchTestCase::new(
+                "multi_column_keywords",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "keywords": ["number"],
+                })),
+            ),
+            SearchTestCase::new(
                 "multi_column_additional_columns".to_string(),
                 SearchTestType::Http(json!({
                     "text": "second",
@@ -582,6 +591,15 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
                 })),
             ),
             SearchTestCase::new(
+                "hybrid_single_column_keywords",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "keywords": ["number"],
+                })),
+            ),
+            SearchTestCase::new(
                 "hybrid_single_column_additional_columns",
                 SearchTestType::Http(json!({
                     "text": "second",
@@ -643,6 +661,15 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                "hybrid_multiple_column_keywords",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "keywords": ["number"],
                 })),
             ),
             SearchTestCase::new(
@@ -760,6 +787,15 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_keywords",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "keywords": ["number"],
                 })),
             ),
             SearchTestCase::new(
@@ -931,6 +967,15 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                "multi_text_column_keywords",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "keywords": ["number"],
                 })),
             ),
             SearchTestCase::new(

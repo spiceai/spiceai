@@ -159,7 +159,7 @@ jobs:
           echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - *build-arm64-image
       - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
@@ -229,7 +229,7 @@ jobs:
           echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - *build-amd64-image
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
