@@ -880,9 +880,16 @@ impl TableProvider for PepperTableProvider {
                     .await
                     .map_err(|err| {
                         datafusion_common::DataFusionError::Execution(format!(
-                            "Deletion vector reader task failed: {err}"
+                            "Deletion vector reader task panicked or was cancelled: {err}"
                         ))
-                    })??;
+                    })
+                    .and_then(|result| {
+                        result.map_err(|err| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to read deletion vectors: {err}"
+                            ))
+                        })
+                    })?;
 
             if !deleted_row_ids.is_empty() {
                 // Wrap the plan with our deletion filter
