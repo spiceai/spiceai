@@ -28,6 +28,7 @@ use search::aggregation;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
@@ -45,7 +46,7 @@ pub enum Error {
 
     #[snafu(display("Error occurred interacting with datafusion: {source}"))]
     DataFusionError {
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: datafusion::error::DataFusionError,
     },
 
     #[snafu(display("Error occurred in search pipeline: {source}"))]

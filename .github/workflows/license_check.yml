@@ -52,8 +52,7 @@ jobs:
           os: macos
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.18.3 || true
-        # TODO: Unpin cargo-deny version after upgrading to Rust 1.88.0
+        run: cargo install cargo-deny || true
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
@@ -71,6 +70,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - name: Install go-licences
         run: go get github.com/google/go-licenses

@@ -1,0 +1,12 @@
+---
+source: crates/runtime/src/dataaccelerator/partitioned_duckdb/tables_mode/mod.rs
+expression: result_pretty
+---
++----+-----------+
+| id | region    |
++----+-----------+
+| 1  | us-east-1 |
+| 2  | us-west-1 |
+| 3  | us-east-1 |
+| 4  | us-west-1 |
++----+-----------+

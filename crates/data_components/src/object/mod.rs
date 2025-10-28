@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{path::PathBuf, sync::Arc};
 
+pub mod filter;
 pub mod metadata;
 pub mod text;
 

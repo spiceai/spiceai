@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
@@ -23,7 +23,7 @@ use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -35,7 +35,6 @@ use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::Query;
-use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -45,6 +44,14 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::create_view_table;
 use crate::{status, view};
+
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterConfig,
+    ballista_executor::executor::Executor,
+    ballista_scheduler::scheduler_server::SchedulerServer,
+    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
+};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -60,8 +67,8 @@ use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -70,8 +77,12 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
+use runtime_async::ManagedTokioRuntime;
+use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
+use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -82,11 +93,14 @@ use util::{RetryError, retry};
 
 pub mod query;
 
+pub mod app_context_extension;
 pub mod builder;
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod dialect;
 pub mod error;
-pub mod extension;
 pub mod filter_converter;
+pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;
@@ -230,6 +244,14 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    UnableToLockWritableSchedulerHandle {},
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    UnableToLockWritableExecutorHandle {},
+
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
     ))]
@@ -318,6 +340,17 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    io_runtime: Handle,
+    metrics: Option<Metrics>,
+
+    pub temp_directory: Option<String>,
+    #[cfg(feature = "cluster")]
+    pub cluster_config: Arc<ClusterConfig>,
+    #[cfg(feature = "cluster")]
+    pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
+    #[cfg(feature = "cluster")]
+    pub executor: RwLock<Option<Arc<Executor>>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -337,8 +370,9 @@ impl DataFusion {
     pub fn builder(
         status: Arc<status::RuntimeStatus>,
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+        io_runtime: Handle,
     ) -> DataFusionBuilder {
-        DataFusionBuilder::new(status, accelerator_engine_registry)
+        DataFusionBuilder::new(status, accelerator_engine_registry, io_runtime)
     }
 
     #[must_use]
@@ -571,6 +605,20 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.cpu_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn cpu_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
     }
 
     async fn get_table_provider(
@@ -1014,15 +1062,6 @@ impl DataFusion {
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
-        let mut accelerated_table_builder = AcceleratedTable::builder(
-            Arc::clone(&self.runtime_status),
-            dataset.name.clone(),
-            Arc::clone(&source_table_provider),
-            dataset.source().to_string(),
-            accelerated_table_provider,
-            refresh,
-        );
-
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => Some(
                 retention_sql::parse_retention_sql(
@@ -1034,6 +1073,22 @@ impl DataFusion {
             ),
             None => None,
         };
+
+        let retention_fetch_expr = retention_delete_expr
+            .as_ref()
+            .map(|expr| Expr::Not(Box::new(expr.clone())));
+        refresh = refresh.retention_expr(retention_fetch_expr);
+
+        let mut accelerated_table_builder = AcceleratedTable::builder(
+            Arc::clone(&self.runtime_status),
+            dataset.name.clone(),
+            Arc::clone(&source_table_provider),
+            dataset.source().to_string(),
+            accelerated_table_provider,
+            refresh,
+            self.io_runtime.clone(),
+        );
+        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
 
         let retention = Retention::builder()
             .time_column(dataset.time_column.clone())
@@ -1084,6 +1139,10 @@ impl DataFusion {
             accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
+        if let Some(metrics) = &self.metrics {
+            accelerated_table_builder.metrics(metrics.clone());
+        }
+
         if refresh_mode == RefreshMode::Changes {
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
@@ -1092,7 +1151,12 @@ impl DataFusion {
             }
         }
 
-        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+        // For append mode without time_column, check if source provides append_stream
+        // Skip this check for Pepper which has its own validation (supports primary_key or time_column)
+        if refresh_mode == RefreshMode::Append
+            && dataset.time_column.is_none()
+            && acceleration_settings.engine != Engine::Pepper
+        {
             let append_stream = source.append_stream(source_table_provider);
             if let Some(append_stream) = append_stream {
                 accelerated_table_builder.append_stream(append_stream);
@@ -1582,7 +1646,9 @@ impl DataFusion {
             "view".to_string(),
             accelerated_table_provider,
             refresh,
+            self.io_runtime.clone(),
         );
+        builder.cpu_runtime(self.cpu_runtime().cloned());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
@@ -1784,6 +1850,29 @@ impl DataFusion {
             }
         }
     }
+
+    #[cfg(feature = "cluster")]
+    pub fn bind_scheduler_server(
+        &self,
+        server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
+    ) -> Result<()> {
+        let mut scheduler_server = self
+            .scheduler_server
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
+        *scheduler_server = Some(server);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
+        let mut executor_handle = self
+            .executor
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableExecutorHandle {})?;
+        *executor_handle = Some(executor);
+        Ok(())
+    }
 }
 
 #[must_use]
@@ -1799,6 +1888,10 @@ pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
+pub(crate) fn resolved_equality(a: TableReference, b: TableReference) -> bool {
+    resolve_table_reference(a) == resolve_table_reference(b)
 }
 
 #[must_use]
@@ -1883,6 +1976,7 @@ mod tests {
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
+                Handle::current(),
             )
             .with_caching(Arc::new(
                 Caching::new().with_plans_cache(plan_cache_provider),

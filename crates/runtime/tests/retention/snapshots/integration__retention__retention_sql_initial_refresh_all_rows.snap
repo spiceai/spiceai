@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/retention/mod.rs
+expression: all_results_str
+---
++----+---------+
+| id | status  |
++----+---------+
+| 1  | active  |
+| 2  | expired |
+| 3  | active  |
+| 4  | expired |
++----+---------+

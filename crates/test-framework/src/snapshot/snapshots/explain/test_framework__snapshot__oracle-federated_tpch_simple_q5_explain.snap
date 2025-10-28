@@ -21,19 +21,19 @@ description: "Query: tpch_simple_q5"
 |               |     ProjectionExec: expr=[sum(O.O_TOTALPRICE)@1 as TOTAL_PRICE, L_LINESTATUS@0 as L_LINESTATUS]                                                 |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[L_LINESTATUS@0 as L_LINESTATUS], aggr=[sum(O.O_TOTALPRICE)]                                    |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                             |
-|               |           RepartitionExec: partitioning=Hash([L_LINESTATUS@0], 16), input_partitions=16                                                         |
+|               |           RepartitionExec: partitioning=Hash([L_LINESTATUS@0], 32), input_partitions=32                                                         |
 |               |             AggregateExec: mode=Partial, gby=[L_LINESTATUS@1 as L_LINESTATUS], aggr=[sum(O.O_TOTALPRICE)]                                       |
 |               |               CoalesceBatchesExec: target_batch_size=8192                                                                                       |
 |               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(O_ORDERKEY@0, L_ORDERKEY@0)], projection=[O_TOTALPRICE@1, L_LINESTATUS@3] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                     RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 16), input_partitions=16                                                 |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
+|               |                     RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 32), input_partitions=32                                                 |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
 |               |                         BytesProcessedExec                                                                                                      |
 |               |                           CooperativeExec                                                                                                       |
 |               |                             OracleExec sql=SELECT "O_ORDERKEY", "O_TOTALPRICE" FROM "TPCH_SF1"."ORDERS"                                         |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                     RepartitionExec: partitioning=Hash([L_ORDERKEY@0], 16), input_partitions=16                                                 |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
+|               |                     RepartitionExec: partitioning=Hash([L_ORDERKEY@0], 32), input_partitions=32                                                 |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
 |               |                         BytesProcessedExec                                                                                                      |
 |               |                           CooperativeExec                                                                                                       |
 |               |                             OracleExec sql=SELECT "L_ORDERKEY", "L_LINESTATUS" FROM "TPCH_SF1"."LINEITEM"                                       |

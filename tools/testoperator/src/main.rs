@@ -19,6 +19,7 @@ use test_framework::{anyhow, rustls};
 
 mod args;
 mod commands;
+mod health;
 mod metrics;
 
 use args::{
@@ -90,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
             commands::env_export(&args.common).await?;
         }
         Commands::Run(TestCommands::Search(args)) => {
-            Box::pin(commands::search::run(&args)).await?;
+            commands::search::run(&args).await?;
         }
     }
 

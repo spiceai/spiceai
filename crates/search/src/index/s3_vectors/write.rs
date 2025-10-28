@@ -124,7 +124,6 @@ pub async fn write(
         Arc::clone(&index.compute_query),
     )
     .await?;
-
     let metadata = extract_and_format_metadata(
         index.name(),
         &index

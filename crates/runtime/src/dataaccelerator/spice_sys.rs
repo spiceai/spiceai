@@ -29,6 +29,8 @@ use {
     datafusion_table_providers::util::secrets::to_secret_map,
 };
 
+#[cfg(feature = "turso")]
+use super::turso::{Error as TursoError, TursoAccelerator};
 #[cfg(feature = "duckdb")]
 use {
     super::duckdb::{DuckDBAccelerator, Error as DuckDbError},
@@ -58,6 +60,8 @@ enum AccelerationConnection {
     Postgres(PostgresConnectionPool),
     #[cfg(feature = "sqlite")]
     SQLite(SqliteConnectionPool),
+    #[cfg(feature = "turso")]
+    Turso(Arc<super::turso::TursoConnectionPool>),
 }
 
 #[derive(Debug, Snafu)]
@@ -112,6 +116,22 @@ pub enum Error {
     #[snafu(display("Spice wasn't built with PostgreSQL support enabled"))]
     PostgresFeatureNotEnabled,
 
+    #[cfg(feature = "turso")]
+    #[snafu(display("Failed to resolve Turso file path: {source}"))]
+    TursoFilePath { source: TursoError },
+
+    #[cfg(feature = "turso")]
+    #[snafu(display("Turso file does not exist at {path}"))]
+    TursoFileMissing { path: String },
+
+    #[cfg(feature = "turso")]
+    #[snafu(display("Unable to create Turso connection: {source}"))]
+    TursoConnection { source: TursoError },
+
+    #[cfg(not(feature = "turso"))]
+    #[snafu(display("Spice wasn't built with Turso support enabled"))]
+    TursoFeatureNotEnabled,
+
     #[snafu(display("{engine} acceleration not supported"))]
     UnsupportedEngine { engine: Engine },
 
@@ -141,6 +161,7 @@ pub enum OpenOption {
     OpenExisting,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     open_option: OpenOption,
@@ -197,8 +218,33 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::DuckDB(pool))
         }
+        #[cfg(feature = "duckdb")]
+        Engine::TableModePartitionedDuckDB => {
+            use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
+
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::TableModePartitionedDuckDB,
+                })?;
+            let duckdb_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<TablesModePartitionedDuckDBAccelerator>()
+                .context(DowncastFailedSnafu {
+                    target: "TableModePartitionedDuckDBAccelerator",
+                })?;
+
+            let pool = duckdb_accelerator
+                .get_shared_pool(source)
+                .await
+                .context(PartitionedDuckDbPoolSnafu)?;
+
+            Ok(AccelerationConnection::DuckDB(pool))
+        }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB | Engine::PartitionedDuckDB => DuckDbFeatureNotEnabledSnafu.fail(),
+        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+            DuckDbFeatureNotEnabledSnafu.fail()
+        }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
             let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
@@ -241,7 +287,38 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "postgres"))]
         Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
-        Engine::Arrow | Engine::Vortex => UnsupportedEngineSnafu {
+
+        #[cfg(feature = "turso")]
+        Engine::Turso => {
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::Turso,
+                })?;
+            let turso_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<TursoAccelerator>()
+                .context(DowncastFailedSnafu {
+                    target: "TursoAccelerator",
+                })?;
+
+            let turso_file = turso_accelerator
+                .turso_file_path(source)
+                .context(TursoFilePathSnafu)?;
+            if open_option == OpenOption::OpenExisting && !Path::new(&turso_file).exists() {
+                return TursoFileMissingSnafu { path: turso_file }.fail();
+            }
+
+            let pool = turso_accelerator
+                .get_shared_pool(source)
+                .await
+                .context(TursoConnectionSnafu)?;
+
+            Ok(AccelerationConnection::Turso(pool))
+        }
+        #[cfg(not(feature = "turso"))]
+        Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
+        Engine::Arrow | Engine::Pepper => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }
         .fail(),

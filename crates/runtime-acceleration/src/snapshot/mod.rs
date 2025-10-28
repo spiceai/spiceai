@@ -29,7 +29,7 @@ use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::StreamExt;
 use object_store::{
     ClientOptions, ObjectStore, PutMode, PutPayload, UpdateVersion, aws::AmazonS3Builder,
-    path::Path as ObjectPath,
+    client::SpawnedReqwestConnector, path::Path as ObjectPath,
 };
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
@@ -41,6 +41,7 @@ use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    runtime::Handle,
     sync::RwLock,
 };
 use url::Url;
@@ -505,14 +506,16 @@ impl SnapshotManager {
         snapshots: SnapshotBehavior,
         local_path: PathBuf,
     ) -> Option<Self> {
-        let (snapshot_config, secrets) = match snapshots {
+        let (snapshot_config, secrets, io_runtime) = match snapshots {
             SnapshotBehavior::Disabled => {
                 tracing::debug!("Snapshots are disabled for {dataset_name}");
                 return None;
             }
-            SnapshotBehavior::Enabled(s, secrets)
-            | SnapshotBehavior::BootstrapOnly(s, secrets)
-            | SnapshotBehavior::CreateOnly(s, secrets) => (s, secrets.upgrade()?),
+            SnapshotBehavior::Enabled(s, secrets, io_runtime)
+            | SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime)
+            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime) => {
+                (s, secrets.upgrade()?, io_runtime)
+            }
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
 
@@ -543,6 +546,7 @@ impl SnapshotManager {
                     &snapshots_location_url,
                     secrets,
                     snapshot_config.params.as_ref().map(Params::as_string_map),
+                    io_runtime,
                 )
                 .await
                 .inspect_err(|e| {
@@ -683,7 +687,7 @@ impl SnapshotManager {
         match upload.complete().await {
             Ok(_) => {
                 let checksum_bytes = hasher.finalize();
-                let checksum = encode_hex_lower(checksum_bytes.as_slice());
+                let checksum = encode_hex_lower(checksum_bytes.as_ref());
 
                 self.update_metadata_after_upload(
                     &location,
@@ -1085,7 +1089,7 @@ impl SnapshotManager {
         }
 
         let checksum_bytes = hasher.finalize();
-        let actual_checksum = encode_hex_lower(checksum_bytes.as_slice());
+        let actual_checksum = encode_hex_lower(checksum_bytes.as_ref());
         let expected_checksum = entry.snapshot_checksum.to_lowercase();
         if expected_checksum != actual_checksum {
             let _ = fs::remove_file(&self.local_path).await;
@@ -1293,7 +1297,7 @@ impl SnapshotManager {
 #[cfg(test)]
 fn compute_sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    encode_hex_lower(digest.as_slice())
+    encode_hex_lower(digest.as_ref())
 }
 
 fn encode_hex_lower(bytes: &[u8]) -> String {
@@ -1349,6 +1353,7 @@ async fn build_s3_object_store(
     snapshots_url: &Url,
     secrets: Arc<RwLock<Secrets>>,
     params: Option<HashMap<String, String>>,
+    io_runtime: Handle,
 ) -> Result<Box<dyn ObjectStore>, S3ObjectStoreError> {
     let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref()).await;
 
@@ -1365,6 +1370,7 @@ async fn build_s3_object_store(
 
     let mut s3_builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
+        .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
         .with_allow_http(allow_http);
     let mut client_options = ClientOptions::default();
 

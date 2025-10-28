@@ -29,6 +29,10 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
+ballista = { workspace = true, optional = true }
+ballista-core = { workspace = true, optional = true }
+ballista-scheduler = { workspace = true, optional = true }
+ballista-executor = { workspace = true, optional = true }
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
 base64.workspace = true
 byte-unit.workspace = true
@@ -47,7 +51,9 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
+datafusion-proto = { workspace = true, optional = true }
 datafusion-table-providers = { workspace = true }
+datafusion-optimizer-rules = {path ="../datafusion-optimizer-rules"}
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
@@ -122,6 +128,7 @@ rmcp = { workspace = true, optional = true, features = [
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-async = { path = "../runtime-async" }
+runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
@@ -131,6 +138,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
+turso = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 s3_vectors = { path = "../s3_vectors", optional = true }
@@ -172,8 +180,6 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
-vortex-datafusion = { path = "../vortex-datafusion", optional = true }
-vortex = { workspace = true, optional = true }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
@@ -185,6 +191,7 @@ azure_core = "0.28.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 dirs = "6.0.0"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
@@ -216,6 +223,7 @@ clickhouse = [
     "arrow_sql_gen/clickhouse",
     "data_components/clickhouse",
 ]
+cluster = ["dep:ballista", "dep:ballista-core", "dep:ballista-scheduler", "dep:ballista-executor", "dep:datafusion-proto"]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
@@ -225,6 +233,7 @@ default = [
     "aws-secrets-manager",
     "sharepoint",
     "bedrock",
+    "dep:datafusion-proto"
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
@@ -267,6 +276,23 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
-turso = []
+turso = [
+    "dep:turso",
+    "dep:tokio-rusqlite",
+    "db_connection_pool/sqlite",
+    "data_components/sqlite",
+    "data_components/turso",
+    "dep:rusqlite",
+]
 vortex = ["dep:vortex-datafusion", "dep:vortex"]
+pepper = ["dep:pepper", "dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
+
+[target.'cfg(not(windows))'.dependencies]
+pepper = { path = "../pepper", optional = true }
+vortex-datafusion = { path = "../vortex-datafusion", optional = true }
+vortex = { workspace = true, optional = true }
+
+[[bench]]
+name = "prepared_statement"
+harness = false

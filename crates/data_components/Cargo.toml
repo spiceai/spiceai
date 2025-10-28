@@ -47,6 +47,7 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+git2 = { workspace = true }
 globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
@@ -85,6 +86,7 @@ tokio-postgres = { workspace = true, features = [
 ], optional = true }
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
+turso = { workspace = true, optional = true }
 twox-hash = { workspace = true, optional = true }
 tracing.workspace = true
 url = "2.5.4"
@@ -128,6 +130,7 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
+turso = ["dep:turso"]
 
 test_hadoop_catalog_docker = []
 

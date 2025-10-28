@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
-
+use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
@@ -23,11 +22,9 @@ use crate::{
     dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
-    embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc},
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
-    search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc},
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -35,7 +32,9 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 use util::in_tracing_context;
 
@@ -51,9 +50,11 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
+    io_runtime: Option<Handle>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
+    runtime_config: Arc<Config>,
 }
 
 impl RuntimeBuilder {
@@ -68,9 +69,11 @@ impl RuntimeBuilder {
             autoload_extensions: HashMap::new(),
             runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
+            io_runtime: None,
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
+            runtime_config: Arc::new(Config::default()),
         }
     }
 
@@ -81,6 +84,11 @@ impl RuntimeBuilder {
 
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
+        self
+    }
+
+    pub fn with_runtime_config(mut self, config: Config) -> Self {
+        self.runtime_config = Arc::new(config);
         self
     }
 
@@ -133,6 +141,11 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
+        self.io_runtime = Some(io_runtime);
+        self
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
@@ -154,6 +167,11 @@ impl RuntimeBuilder {
             .unwrap_or_default();
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
+
+        let metrics = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.metrics.clone());
 
         let dataset_parallelism = self
             .app
@@ -183,16 +201,27 @@ impl RuntimeBuilder {
         }
 
         let caching = Runtime::init_caching(Some(&caching_config));
+        #[cfg(feature = "cluster")]
+        let cluster_config = Arc::new(self.runtime_config.cluster.clone());
+
+        let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
+            io_runtime.clone(),
         )
         .memory_limit(memory_limit)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
-        .with_caching(caching);
+        .with_caching(caching)
+        .with_metrics(metrics);
+
+        #[cfg(feature = "cluster")]
+        {
+            df_builder = df_builder.with_cluster_config(cluster_config);
+        };
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
@@ -205,16 +234,6 @@ impl RuntimeBuilder {
         }
 
         let df = Arc::new(df);
-
-        // UDFs that require a weak reference to the DataFusion instance defined here.
-        df.ctx.register_udtf(
-            TEXT_SEARCH_UDTF_NAME,
-            Arc::new(TextSearchTableFunc::new(Arc::downgrade(&df))),
-        );
-        df.ctx.register_udtf(
-            VECTOR_SEARCH_UDTF_NAME,
-            Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&df))),
-        );
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self
@@ -258,11 +277,13 @@ impl RuntimeBuilder {
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
+            io_runtime,
             status: self.runtime_status,
             tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            config: Arc::clone(&self.runtime_config),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -277,7 +298,7 @@ impl RuntimeBuilder {
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
 
-        register_udfs(&rt);
+        register_udfs(&rt).await;
 
         rt
     }

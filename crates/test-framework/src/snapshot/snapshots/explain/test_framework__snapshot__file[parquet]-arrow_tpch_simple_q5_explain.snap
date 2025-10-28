@@ -2,38 +2,38 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q5"
 ---
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                            |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: total_price DESC NULLS FIRST                                                                                                              |
-|               |   Projection: sum(o.o_totalprice) AS total_price, l.l_linestatus                                                                                |
-|               |     Aggregate: groupBy=[[l.l_linestatus]], aggr=[[sum(o.o_totalprice)]]                                                                         |
-|               |       Projection: o.o_totalprice, l.l_linestatus                                                                                                |
-|               |         Inner Join: o.o_orderkey = l.l_orderkey                                                                                                 |
-|               |           SubqueryAlias: o                                                                                                                      |
-|               |             BytesProcessedNode                                                                                                                  |
-|               |               TableScan: orders projection=[o_orderkey, o_totalprice]                                                                           |
-|               |           SubqueryAlias: l                                                                                                                      |
-|               |             BytesProcessedNode                                                                                                                  |
-|               |               TableScan: lineitem projection=[l_orderkey, l_linestatus]                                                                         |
-| physical_plan | SortPreservingMergeExec: [total_price@0 DESC]                                                                                                   |
-|               |   SortExec: expr=[total_price@0 DESC], preserve_partitioning=[true]                                                                             |
-|               |     ProjectionExec: expr=[sum(o.o_totalprice)@1 as total_price, l_linestatus@0 as l_linestatus]                                                 |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[l_linestatus@0 as l_linestatus], aggr=[sum(o.o_totalprice)]                                    |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                             |
-|               |           RepartitionExec: partitioning=Hash([l_linestatus@0], 16), input_partitions=16                                                         |
-|               |             AggregateExec: mode=Partial, gby=[l_linestatus@1 as l_linestatus], aggr=[sum(o.o_totalprice)]                                       |
-|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                       |
-|               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_totalprice@1, l_linestatus@3] |
-|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 16), input_partitions=16                                                 |
-|               |                       BytesProcessedExec                                                                                                        |
-|               |                         SchemaCastScanExec                                                                                                      |
-|               |                           DataSourceExec: partitions=16, partition_sizes=[12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11]       |
-|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                                 |
-|               |                       BytesProcessedExec                                                                                                        |
-|               |                         SchemaCastScanExec                                                                                                      |
-|               |                           DataSourceExec: partitions=16, partition_sizes=[46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 45, 45, 45]       |
-|               |                                                                                                                                                 |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                      |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: total_price DESC NULLS FIRST                                                                                                                                                                        |
+|               |   Projection: sum(o.o_totalprice) AS total_price, l.l_linestatus                                                                                                                                          |
+|               |     Aggregate: groupBy=[[l.l_linestatus]], aggr=[[sum(o.o_totalprice)]]                                                                                                                                   |
+|               |       Projection: o.o_totalprice, l.l_linestatus                                                                                                                                                          |
+|               |         Inner Join: o.o_orderkey = l.l_orderkey                                                                                                                                                           |
+|               |           SubqueryAlias: o                                                                                                                                                                                |
+|               |             BytesProcessedNode                                                                                                                                                                            |
+|               |               TableScan: orders projection=[o_orderkey, o_totalprice]                                                                                                                                     |
+|               |           SubqueryAlias: l                                                                                                                                                                                |
+|               |             BytesProcessedNode                                                                                                                                                                            |
+|               |               TableScan: lineitem projection=[l_orderkey, l_linestatus]                                                                                                                                   |
+| physical_plan | SortPreservingMergeExec: [total_price@0 DESC]                                                                                                                                                             |
+|               |   SortExec: expr=[total_price@0 DESC], preserve_partitioning=[true]                                                                                                                                       |
+|               |     ProjectionExec: expr=[sum(o.o_totalprice)@1 as total_price, l_linestatus@0 as l_linestatus]                                                                                                           |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[l_linestatus@0 as l_linestatus], aggr=[sum(o.o_totalprice)]                                                                                              |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                       |
+|               |           RepartitionExec: partitioning=Hash([l_linestatus@0], 32), input_partitions=32                                                                                                                   |
+|               |             AggregateExec: mode=Partial, gby=[l_linestatus@1 as l_linestatus], aggr=[sum(o.o_totalprice)]                                                                                                 |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                 |
+|               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_totalprice@1, l_linestatus@3]                                                           |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                             |
+|               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                                                                           |
+|               |                       BytesProcessedExec                                                                                                                                                                  |
+|               |                         SchemaCastScanExec                                                                                                                                                                |
+|               |                           DataSourceExec: partitions=32, partition_sizes=[6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5, 5, 5]                                 |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                             |
+|               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 32), input_partitions=32                                                                                                           |
+|               |                       BytesProcessedExec                                                                                                                                                                  |
+|               |                         SchemaCastScanExec                                                                                                                                                                |
+|               |                           DataSourceExec: partitions=32, partition_sizes=[23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 22, 22, 22] |
+|               |                                                                                                                                                                                                           |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

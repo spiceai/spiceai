@@ -65,8 +65,11 @@ pub mod spark_connect;
 pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(feature = "turso")]
+pub mod turso;
 pub mod unity_catalog;
 
+pub mod git;
 pub mod github;
 pub mod rate_limit;
 

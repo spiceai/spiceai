@@ -8,12 +8,15 @@ assignees: ''
 
 ## DRIs
 
-| Role    | DRI |
-| ------- | --- |
-| Endgame |     |
-| QA      |     |
-| Docs    |     |
-| Comms   |     |
+| Role           | DRI          |
+|----------------|--------------|
+| Primary        |              |
+| QA + Secondary |              |
+| Docs           |              |
+| Comms          | @wyattwenzel |
+
+**Note**: Until this endgame is closed, whenever Primary DRI goes offline, he/she should clearly handoff control of the release to the Secondary DRI in the
+release coordination channel. Secondary DRI should positively acknowledge the handoff.
 
 ## Milestone Release Timeline
 
@@ -39,6 +42,7 @@ assignees: ''
 - [ ] Create `release/X.Y` from `trunk` one day before release.
   - Refer to [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md).
 - [ ] Lock the branch to critical fixes only and notify the team.
+- [ ] (Docs DRI) Create `release/X.Y.Z` in [spiceai/docs](https://github.com/spiceai/docs). All PRs should target the release branch until the release goes live.
 
 ## Pre-Release Testing & Validation
 
@@ -184,12 +188,13 @@ assignees: ''
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
 - [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
-- [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version & image.tag) in the release branch (not in trunk).
+  - [ ] (Docs DRI) Create and merge PR from `release/X.Y.Z` into `trunk`.
+  - [ ] (Docs DRI) Tag the merged `trunk` commit `vX.Y.Z`.
+- [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced_docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) so Docker images are built from the published artifacts.
+  - [ ] Monitor the spiced_docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
+- [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).
   - [ ] If this is a **minor** release, replace the `ghcr.io/spiceai/spiceai-nightly` repository in `values.yaml` with `spiceai/spiceai` and change the tag to the release version (e.g. `1.0.0`).
-  - [ ] Docker build for the release branch completes (~2 hours).
   - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
-
-- [ ] Mark the [release](https://github.com/spiceai/spiceai/releases) as official once all binaries and Docker images finish building.
 - [ ] Perform a final test pass on the released binaries and Docker images.
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
@@ -199,7 +204,7 @@ assignees: ''
       - Branch: `trunk`
       - Build the CLI: `false`
       - Release Version: the version tag released.
-- [ ] Notify that the OSS release is complete and ready for communications.
+- [ ] Notify that the OSS release is complete and ready for communications in the release coordination channel.
 
 ## Post-Release Housekeeping
 

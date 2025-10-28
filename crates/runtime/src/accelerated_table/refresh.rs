@@ -20,6 +20,9 @@ use std::sync::{Arc, Weak};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::metrics;
+use super::refresh_task_runner::RefreshTaskRunner;
+use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
@@ -30,6 +33,7 @@ use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
@@ -39,15 +43,13 @@ use runtime_acceleration::snapshot::{
 };
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
+use tokio::runtime::Handle;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
-
-use super::metrics;
-use super::refresh_task_runner::RefreshTaskRunner;
-use super::synchronized_table::SynchronizedTable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -82,6 +84,7 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
+    pub(crate) retention_expr: Option<Expr>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -185,6 +188,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn retention_expr(mut self, retention_expr: Option<Expr>) -> Self {
+        self.retention_expr = retention_expr;
         self
     }
 
@@ -405,6 +414,7 @@ impl Default for Refresh {
             append_overlap: None,
             retry_enabled: false,
             retry_max_attempts: None,
+            retention_expr: None,
         }
     }
 }
@@ -412,13 +422,14 @@ impl Default for Refresh {
 pub(crate) enum AccelerationRefreshMode {
     Disabled,
     Full(Receiver<Option<RefreshOverrides>>),
-    Append(Option<Receiver<Option<RefreshOverrides>>>),
+    Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
 }
 
 pub struct Refresher {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
+    metrics: Option<Metrics>,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
@@ -436,6 +447,8 @@ pub struct Refresher {
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     on_complete_notification: Option<Arc<Notify>>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -451,6 +464,7 @@ impl std::fmt::Debug for Refresher {
 }
 
 impl Refresher {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
@@ -458,6 +472,8 @@ impl Refresher {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        cpu_runtime: Option<Handle>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -477,6 +493,9 @@ impl Refresher {
             on_complete_notification: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            metrics: None,
+            cpu_runtime,
+            io_runtime,
         }
     }
 
@@ -517,6 +536,11 @@ impl Refresher {
 
     pub fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
         self.on_complete_notification = Some(on_complete_notification);
+        self
+    }
+
+    pub fn with_metrics(&mut self, metrics: Option<Metrics>) -> &mut Self {
+        self.metrics = metrics;
         self
     }
 
@@ -597,11 +621,10 @@ impl Refresher {
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return None,
-            (AccelerationRefreshMode::Append(Some(receiver)), Some(_))
-            | (AccelerationRefreshMode::Full(receiver), _) => receiver,
-            (AccelerationRefreshMode::Append(_), _) => {
-                return Some(self.start_streaming_append());
-            }
+            (
+                AccelerationRefreshMode::Append(receiver) | AccelerationRefreshMode::Full(receiver),
+                _,
+            ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
                 return Some(self.start_changes_stream(stream));
             }
@@ -614,12 +637,17 @@ impl Refresher {
             self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
+            self.io_runtime.clone(),
         )
         .with_disable_federation(self.disable_federation);
 
         if let Some(semaphore) = &self.semaphore {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
         }
+
+        refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
+
+        refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -777,35 +805,6 @@ impl Refresher {
         }
     }
 
-    fn start_streaming_append(&mut self) -> tokio::task::JoinHandle<()> {
-        let refresh_task = Arc::new(
-            RefreshTask::builder(
-                Arc::clone(&self.runtime_status),
-                self.dataset_name.clone(),
-                Arc::clone(&self.federated),
-                self.federated_source.clone(),
-                Arc::clone(&self.accelerator),
-            )
-            .with_disable_federation(self.disable_federation)
-            .build(),
-        );
-
-        let refresh_defaults = Arc::clone(&self.refresh);
-
-        let caching = self.caching.clone();
-        let initial_load_completed = Arc::clone(&self.initial_load_completed);
-
-        let notifier = self.on_complete_notification.clone();
-        tokio::spawn(async move {
-            if let Err(err) = refresh_task
-                .start_streaming_append(caching, notifier, refresh_defaults, initial_load_completed)
-                .await
-            {
-                tracing::error!("Append refresh failed with error: {err}");
-            }
-        })
-    }
-
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
@@ -817,8 +816,11 @@ impl Refresher {
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
+                self.io_runtime.clone(),
             )
             .with_disable_federation(self.disable_federation)
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_metrics(self.metrics.clone())
             .build(),
         );
 
@@ -987,6 +989,8 @@ mod tests {
             Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
+            None,
+            Handle::current(),
         );
 
         refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1195,12 +1199,14 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
             let refresh_handle = refresher.start(acceleration_refresh_mode).await;
 
             trigger
@@ -1349,12 +1355,14 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
             let refresh_handle = refresher.start(acceleration_refresh_mode).await;
 
             trigger
@@ -1553,12 +1561,14 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
             let refresh_handle = refresher.start(acceleration_refresh_mode).await;
             trigger
                 .send(None)
