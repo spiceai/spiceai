@@ -260,23 +260,25 @@ pub async fn run(args: Args) -> Result<()> {
     .await
     .context(UnableToInitializeTracingSnafu)?;
 
-    if let Some(dedicated_thread_pool) =
-        App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool")
-    {
-        match dedicated_thread_pool.trim() {
-            "sql_engine" => {
-                // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-                let tokio_runtime = ManagedTokioRuntime::try_new()
-                    .boxed()
-                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+    // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
+    match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
+        Some("sql_engine") | None => {
+            // This needs to be created after tracing is set up, or else task_history events aren't emitted.
+            let tokio_runtime = ManagedTokioRuntime::try_new()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-                rt.datafusion().set_cpu_runtime(tokio_runtime);
-            }
-            other => {
-                tracing::warn!(
-                    "Invalid runtime parameter value for `runtime.params.dedicated_thread_pool`: `{other}`. Set it to `sql_engine` to enable the dedicated SQL engine thread pool."
-                );
-            }
+            rt.datafusion().set_cpu_runtime(tokio_runtime);
+        }
+        Some("disabled") => {
+            tracing::info!(
+                "Dedicated SQL engine thread pool is disabled via runtime parameter `runtime.params.dedicated_thread_pool`."
+            );
+        }
+        Some(other) => {
+            tracing::warn!(
+                "Invalid runtime parameter value for `runtime.params.dedicated_thread_pool`: `{other}`. Set to `disabled` or `sql_engine`. Continuing with dedicated SQL engine thread pool."
+            );
         }
     }
 

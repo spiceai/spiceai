@@ -19,6 +19,12 @@ use std::{panic, sync::Arc};
 use crate::{flight::query_to_batches, queries::Query};
 use spiceai::Client as SpiceClient;
 
+const PEPPER_PATH_FILTER_PATTERN: &str =
+    r"(/data/[A-Za-z0-9_\-\[\]]+)(?:/[A-Za-z0-9_\-\.\[\]]+)+\.vortex";
+const PEPPER_PATH_FILTER_REPLACEMENT: &str = "$1/<PEPPER_PATH>.vortex";
+const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
+const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
+
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
 }
@@ -57,6 +63,8 @@ pub async fn record_explain_plan(
         snapshot_path => "snapshots/explain",
         filters => vec![
             (path_filter_pattern.as_str(), "/data"),
+            (PEPPER_PATH_FILTER_PATTERN, PEPPER_PATH_FILTER_REPLACEMENT),
+            (VORTEX_RANGE_FILTER_PATTERN, VORTEX_RANGE_FILTER_REPLACEMENT),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
             (r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#, "<GROUPING_PAIR>"),
             (r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#, "<GROUPING_PAIR>")
@@ -122,6 +130,31 @@ mod tests {
             let result = regex.replace(input, "/data");
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pepper_file_filters() -> Result<(), String> {
+        let input = "/data/customer/5/019a22d7-f162-7be0-975f-417b334a95c6/tD0GMdUfbVhRvA6E_0.vortex:0..368070";
+
+        let path_regex =
+            regex::Regex::new(super::PEPPER_PATH_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        let range_regex =
+            regex::Regex::new(super::VORTEX_RANGE_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+
+        let path_redacted = path_regex.replace_all(input, super::PEPPER_PATH_FILTER_REPLACEMENT);
+        let fully_redacted = range_regex
+            .replace_all(
+                path_redacted.as_ref(),
+                super::VORTEX_RANGE_FILTER_REPLACEMENT,
+            )
+            .into_owned();
+
+        assert_eq!(
+            fully_redacted,
+            "/data/customer/<PEPPER_PATH>.vortex:<RANGE>"
+        );
 
         Ok(())
     }

@@ -47,7 +47,7 @@ use self::duckdb::DuckDBAccelerator;
 use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(feature = "pepper")]
+#[cfg(all(feature = "pepper", not(windows)))]
 use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
@@ -59,7 +59,7 @@ pub mod arrow;
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(feature = "pepper")]
+#[cfg(all(feature = "pepper", not(windows)))]
 pub mod pepper;
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -160,7 +160,7 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
             .await;
-        #[cfg(feature = "pepper")]
+        #[cfg(all(feature = "pepper", not(windows)))]
         self.register_accelerator_engine(Engine::Pepper, Arc::new(PepperAccelerator::new()))
             .await;
     }
@@ -368,6 +368,12 @@ pub trait DataAccelerator: Send + Sync {
             false
         }
     }
+
+    /// Shutdown the accelerator, performing any necessary cleanup
+    /// Default implementation does nothing
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 pub struct AcceleratorExternalTableBuilder {
@@ -522,6 +528,13 @@ pub trait AccelerationSource: Send + Sync {
 
     /// Returns the name of this source
     fn name(&self) -> &TableReference;
+
+    /// Returns the time column name if configured, None otherwise
+    /// Views always return None as they don't support time-based append mode
+    fn time_column(&self) -> Option<&str>;
+
+    /// Returns a reference to `Any` for downcasting
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub async fn acceleration_file_path(
@@ -540,7 +553,10 @@ pub async fn acceleration_file_path(
     Ok(PathBuf::from(file))
 }
 
-fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaRef) -> Vec<String> {
+pub(crate) fn get_primary_keys_from_constraints(
+    constraints: &Constraints,
+    schema: &SchemaRef,
+) -> Vec<String> {
     constraints
         .iter()
         .filter_map(|constraint| {
@@ -783,7 +799,7 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None),
             (Engine::Arrow, "memory", None),
-            #[cfg(feature = "pepper")]
+            #[cfg(all(feature = "pepper", not(windows)))]
             (Engine::Pepper, "file", None), // Pepper only supports file mode
         ];
 
@@ -904,7 +920,7 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                #[cfg(feature = "pepper")]
+                #[cfg(all(feature = "pepper", not(windows)))]
                 Engine::Pepper => {
                     use crate::component::dataset::builder::DatasetBuilder;
                     use crate::dataaccelerator::pepper::PepperAccelerator;
@@ -2125,7 +2141,7 @@ mod accelerator_compat_tests {
                             .await
                             .expect("Arrow table should be created")
                     }
-                    #[cfg(feature = "pepper")]
+                    #[cfg(all(feature = "pepper", not(windows)))]
                     Engine::Pepper => {
                         use crate::component::dataset::builder::DatasetBuilder;
                         use crate::dataaccelerator::pepper::PepperAccelerator; // Clean up any existing files and metadata
