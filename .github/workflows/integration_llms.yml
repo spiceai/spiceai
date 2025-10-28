@@ -105,7 +105,7 @@ jobs:
           cp $TEST_BINARY_PATH ./llms_integration_test
 
       - name: Upload test binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: llms-integration-test-binary
           path: ./llms_integration_test

@@ -90,7 +90,7 @@ jobs:
           chmod +x spice
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         if: matrix.target_os != 'windows'
         with:
           name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
