@@ -4336,7 +4336,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=234b7fa578ab145bba4f80ac2e1d98f62f939355#234b7fa578ab145bba4f80ac2e1d98f62f939355"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=d6e7ebd853463acafaf8132dced23c98c45f7947#d6e7ebd853463acafaf8132dced23c98c45f7947"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -4710,7 +4710,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=374083cdccbb3f4e6ab7fa3ee6d1b6a87393f563#374083cdccbb3f4e6ab7fa3ee6d1b6a87393f563"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=31c3c5032537dd043169a6a3e4b0885d4383d6f1#31c3c5032537dd043169a6a3e4b0885d4383d6f1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -7242,7 +7242,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=358ce0d7c5f3b3e058fb7acd49e258860e2b19df#358ce0d7c5f3b3e058fb7acd49e258860e2b19df"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d26277512b5e0de8d9f9a8321c16dc981ef69729#d26277512b5e0de8d9f9a8321c16dc981ef69729"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -7298,7 +7298,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=358ce0d7c5f3b3e058fb7acd49e258860e2b19df#358ce0d7c5f3b3e058fb7acd49e258860e2b19df"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d26277512b5e0de8d9f9a8321c16dc981ef69729#d26277512b5e0de8d9f9a8321c16dc981ef69729"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7313,7 +7313,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=358ce0d7c5f3b3e058fb7acd49e258860e2b19df#358ce0d7c5f3b3e058fb7acd49e258860e2b19df"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d26277512b5e0de8d9f9a8321c16dc981ef69729#d26277512b5e0de8d9f9a8321c16dc981ef69729"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7339,7 +7339,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=358ce0d7c5f3b3e058fb7acd49e258860e2b19df#358ce0d7c5f3b3e058fb7acd49e258860e2b19df"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d26277512b5e0de8d9f9a8321c16dc981ef69729#d26277512b5e0de8d9f9a8321c16dc981ef69729"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7354,7 +7354,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=358ce0d7c5f3b3e058fb7acd49e258860e2b19df#358ce0d7c5f3b3e058fb7acd49e258860e2b19df"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d26277512b5e0de8d9f9a8321c16dc981ef69729#d26277512b5e0de8d9f9a8321c16dc981ef69729"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -14276,7 +14276,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=a31a0ea3d67449f130791f0ce033649265bff108#a31a0ea3d67449f130791f0ce033649265bff108"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=8b5495f2ed6eaf8b647b09cc1504a39bdb9bbed8#8b5495f2ed6eaf8b647b09cc1504a39bdb9bbed8"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -14296,7 +14296,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=a31a0ea3d67449f130791f0ce033649265bff108#a31a0ea3d67449f130791f0ce033649265bff108"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=8b5495f2ed6eaf8b647b09cc1504a39bdb9bbed8#8b5495f2ed6eaf8b647b09cc1504a39bdb9bbed8"
 dependencies = [
  "spark-connect-core",
 ]
