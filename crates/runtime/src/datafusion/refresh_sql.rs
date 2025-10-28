@@ -116,7 +116,7 @@ pub fn validate_refresh_sql(
                     } = limit
                     else {
                         return UnexpectedExpressionSnafu {
-                            expr: "LIMIT WITH OFFSET",
+                            expr: "LIMIT <offset>, <limit>",
                             expected_table,
                         }
                         .fail();
