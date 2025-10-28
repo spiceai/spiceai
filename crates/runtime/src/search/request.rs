@@ -282,7 +282,8 @@ impl SearchRequest {
                     });
                 }
 
-                let col = Column::from_qualified_name(c);
+                // `..._ignore_case` actually means preserve case.
+                let col = Column::from_qualified_name_ignore_case(c);
 
                 // Check equality whilst ignoring quotation.
                 let mut parts = col.relation.as_ref().map(TableReference::to_vec).unwrap_or_default();
@@ -362,6 +363,22 @@ pub(crate) mod tests {
         insta::assert_snapshot!(
             run_parse_additional_columns(&["schema.\"table with spaces\".column"]).as_str(),
             @r#"[Column { relation: Some(Partial { schema: "schema", table: "table with spaces" }), name: "column" }]"#
+        );
+    }
+
+    #[test]
+    fn test_parse_additional_columns_casing() {
+        insta::assert_snapshot!(
+            run_parse_additional_columns(&["CoLuMn"]).as_str(),
+            @r#"[Column { relation: None, name: "CoLuMn" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.\"QuOtEd.WiTh_DoT\""]).as_str(),
+            @r#"[Column { relation: Some(Full { catalog: "CaTaLoG", schema: "sChEmA", table: "tBl" }), name: "QuOtEd.WiTh_DoT" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.CoLuMn"]).as_str(),
+            @r#"[Column { relation: Some(Full { catalog: "CaTaLoG", schema: "sChEmA", table: "tBl" }), name: "CoLuMn" }]"#
         );
     }
 

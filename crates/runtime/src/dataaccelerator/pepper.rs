@@ -346,19 +346,6 @@ impl PepperAccelerator {
             "sqlite://{metadata_dir}/pepper.db"
         ))) as Arc<dyn pepper::MetadataCatalog>;
 
-                // Initialize the catalog (creates tables if needed)
-                new_catalog
-                    .init()
-                    .await
-                    .map_err(|e| Error::AccelerationInitializationFailed {
-                        source: Box::new(e),
-                    })?;
-
-                *catalog_lock = Some(Arc::clone(&new_catalog));
-                new_catalog
-            }
-        };
-
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
