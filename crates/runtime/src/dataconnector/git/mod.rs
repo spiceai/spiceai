@@ -43,24 +43,27 @@ impl Git {
     /// - git:https://github.com/spiceai/spiceai.git
     /// - git:git@github.com:spiceai/spiceai.git
     fn parse_git_url(path: &str) -> Result<(String, Option<String>), String> {
-        let path = path.strip_prefix("git:").unwrap_or(path);
+        let path = path.strip_prefix("git:").unwrap_or(path).trim();
+        if path.is_empty() {
+            return Err("Git path is empty".to_string());
+        }
 
         // Check for reference specification (e.g., @branch or @tag or @commit)
         if let Some(at_pos) = path.rfind('@') {
             // Check if this @ is part of git@github.com (SSH format)
             // In SSH format, @ appears before the colon
-            if let Some(colon_pos) = path.find(':') {
-                if at_pos < colon_pos {
-                    // This is SSH format like git@github.com:org/repo
-                    // Check for a second @ for reference
-                    if let Some(ref_pos) = path[at_pos + 1..].rfind('@') {
-                        let actual_ref_pos = at_pos + 1 + ref_pos;
-                        let url = path[..actual_ref_pos].to_string();
-                        let reference = path[actual_ref_pos + 1..].to_string();
-                        return Ok((url, Some(reference)));
-                    }
-                    return Ok((path.to_string(), None));
+            if let Some(colon_pos) = path.find(':')
+                && at_pos < colon_pos
+            {
+                // This is SSH format like git@github.com:org/repo
+                // Check for a second @ for reference
+                if let Some(ref_pos) = path[at_pos + 1..].rfind('@') {
+                    let actual_ref_pos = at_pos + 1 + ref_pos;
+                    let url = path[..actual_ref_pos].to_string();
+                    let reference = path[actual_ref_pos + 1..].to_string();
+                    return Ok((url, Some(reference)));
                 }
+                return Ok((path.to_string(), None));
             }
 
             // Otherwise, @ is a reference separator
@@ -94,11 +97,16 @@ impl Git {
         );
 
         // Parse include patterns if provided
-        let include = dataset
-            .params
-            .get("include")
+        let include_patterns = dataset.params.get("git_include").cloned().or_else(|| {
+            self.params
+                .get("include")
+                .expose()
+                .ok()
+                .map(ToString::to_string)
+        });
+        let include = include_patterns
             .map(|patterns| {
-                parse_globs(&component, patterns).map_err(|e| {
+                parse_globs(&component, &patterns).map_err(|e| {
                     DataConnectorError::UnableToGetReadProvider {
                         dataconnector: "git".to_string(),
                         connector_component: component.clone(),
@@ -109,23 +117,32 @@ impl Git {
             .transpose()?;
 
         // Check if content fetching is enabled
-        // Content should be fetched if:
-        // 1. fetch_content parameter is explicitly set to true, OR
-        // 2. The dataset has embeddings or full_text_search configured on the "content" column
-        let explicit_fetch_content = dataset
+        let fetch_content = dataset
             .params
-            .get("fetch_content")
-            .map(|v| v.parse::<bool>().unwrap_or(false))
+            .get("git_fetch_content")
+            .and_then(|v| v.parse::<bool>().ok())
+            .or_else(|| {
+                self.params
+                    .get("fetch_content")
+                    .expose()
+                    .ok()
+                    .and_then(|v| v.parse::<bool>().ok())
+            })
             .unwrap_or(false);
 
-        let has_content_embeddings_or_search = dataset.columns.iter().any(|col| {
-            col.name == "content" && (!col.embeddings.is_empty() || col.full_text_search.is_some())
-        });
-
-        let fetch_content = explicit_fetch_content || has_content_embeddings_or_search;
-
         // Get cache path if specified
-        let cache_path = dataset.params.get("cache_path").map(PathBuf::from);
+        let cache_path = dataset
+            .params
+            .get("git_cache_path")
+            .cloned()
+            .or_else(|| {
+                self.params
+                    .get("cache_path")
+                    .expose()
+                    .ok()
+                    .map(ToString::to_string)
+            })
+            .map(PathBuf::from);
 
         // Create a no-op rate limiter (Git operations are local after initial clone)
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(NoOpRateLimiter);

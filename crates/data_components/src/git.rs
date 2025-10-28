@@ -88,11 +88,11 @@ impl GitTableProvider {
         rate_limiter: Arc<dyn RateLimiter>,
         cache_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let client = GitClient::new(repo_url, reference, rate_limiter, cache_path);
+        let client = GitClient::new(repo_url, reference, rate_limiter, cache_path)?;
 
         let mut fields = vec![
-            Field::new("path", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, true),
+            Field::new("path", DataType::Utf8, true),
             Field::new("size", DataType::Int64, true),
             Field::new("sha", DataType::Utf8, true),
             Field::new("mode", DataType::Utf8, true),
@@ -188,13 +188,12 @@ pub struct GitClient {
 }
 
 impl GitClient {
-    #[must_use]
     pub fn new(
         repo_url: &str,
         reference: Option<&str>,
         rate_limiter: Arc<dyn RateLimiter>,
         cache_path: Option<PathBuf>,
-    ) -> Self {
+    ) -> Result<Self> {
         let cache_path = cache_path.unwrap_or_else(|| {
             std::env::temp_dir().join("spice_git_cache").join(
                 repo_url
@@ -204,12 +203,12 @@ impl GitClient {
             )
         });
 
-        Self {
+        Ok(Self {
             repo_url: repo_url.to_string(),
             reference: reference.map(ToString::to_string),
             cache_path,
             rate_limiter,
-        }
+        })
     }
 
     /// Clone or open the repository, ensuring it's up to date
@@ -308,7 +307,14 @@ impl GitClient {
                     return TreeWalkResult::Ok;
                 };
 
-                let size = i64::try_from(blob.size()).unwrap_or(i64::MAX);
+                let Ok(size) = i64::try_from(blob.size()) else {
+                    tracing::warn!(
+                        "File {} is too large to represent ({} bytes), skipping",
+                        full_path,
+                        blob.size()
+                    );
+                    return TreeWalkResult::Ok;
+                };
                 let sha = entry.id().to_string();
                 let mode = format!("{:o}", entry.filemode());
 
@@ -426,7 +432,9 @@ impl GitClient {
                 continue;
             };
 
-            let Ok(tree) = commit.tree() else { continue };
+            let Ok(tree) = commit.tree() else {
+                continue;
+            };
 
             // Check if this commit contains the file
             if tree.get_path(Path::new(path)).is_ok() {
@@ -447,8 +455,8 @@ impl GitClient {
         entries: &[GitFileEntry],
         schema: SchemaRef,
     ) -> Result<Vec<RecordBatch>> {
-        let mut path_builder = StringBuilder::new();
         let mut name_builder = StringBuilder::new();
+        let mut path_builder = StringBuilder::new();
         let mut size_builder = Int64Builder::new();
         let mut sha_builder = StringBuilder::new();
         let mut mode_builder = StringBuilder::new();
@@ -464,8 +472,8 @@ impl GitClient {
         };
 
         for entry in entries {
-            path_builder.append_value(&entry.path);
             name_builder.append_value(&entry.name);
+            path_builder.append_value(&entry.path);
             size_builder.append_value(entry.size);
             sha_builder.append_value(&entry.sha);
             mode_builder.append_value(&entry.mode);
@@ -505,8 +513,8 @@ impl GitClient {
         }
 
         let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(path_builder.finish()),
             Arc::new(name_builder.finish()),
+            Arc::new(path_builder.finish()),
             Arc::new(size_builder.finish()),
             Arc::new(sha_builder.finish()),
             Arc::new(mode_builder.finish()),
