@@ -9,6 +9,7 @@ definitions:
     dynamodb_aws_region: ap-northeast-2
     dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
     dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+    partitions: 16
   - &acceleration
     enabled: true
     engine: duckdb
