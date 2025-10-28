@@ -2,6 +2,7 @@ use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use derive_builder::Builder;
@@ -377,7 +378,7 @@ fn scalar_to_attribute_value(scalar: &ScalarValue) -> datafusion::error::Result<
     }
 }
 
-/// Attempts to match filters against a specific index (base table or GSI)
+/// Attempts to match filters against a primary index
 fn try_match_index(
     filters: &[Expr],
     partition_key: &str,
@@ -412,12 +413,14 @@ fn try_match_index(
 }
 
 fn contains_or(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            matches!(op, Operator::Or) || contains_or(left) || contains_or(right)
+    expr.apply(|expr| {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) if matches!(op, Operator::Or) => {
+                Err(DataFusionError::External("".into()))
+            }
+            _ => Ok(TreeNodeRecursion::Continue),
         }
-        _ => false,
-    }
+    }).is_err()
 }
 
 /// Extracts key filter if the expression matches the specified partition or sort key
