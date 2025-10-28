@@ -168,6 +168,22 @@ impl RefreshTaskBuilder {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
+
+        // Create the acceleration sink at build time rather than storing it in the builder.
+        //
+        // Design rationale: While this creates the sink even if the RefreshTask is never used,
+        // this approach is necessary because:
+        // 1. The sink requires the accelerator Arc, which the builder owns
+        // 2. Storing the sink in the builder would require the builder to be mutable or use
+        //    interior mutability (e.g., `Option<Arc<RwLock<AccelerationSink>>>`)
+        // 3. In practice, RefreshTask is always used immediately after building - it's not a
+        //    speculative construction pattern
+        // 4. The sink itself is lightweight (just wraps an Arc to the accelerator)
+        //
+        // Trade-off: This creates a small amount of overhead (one Arc + RwLock allocation) even
+        // if the task is never executed, but simplifies the builder API and ownership model.
+        // The alternative of lazy initialization would add complexity without meaningful benefit
+        // given the typical usage pattern.
         let sink = Arc::new(RwLock::new(AccelerationSink::new(Arc::clone(
             &self.accelerator,
         ))));
