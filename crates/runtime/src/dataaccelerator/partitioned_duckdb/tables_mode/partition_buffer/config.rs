@@ -95,9 +95,7 @@ impl Default for PartitionBufferConfig {
 impl PartitionBufferConfig {
     /// Parse buffer configuration from parameters.
     pub fn from_params(params: Option<&HashMap<String, String>>) -> PartitionBufferConfig {
-        let mut config = PartitionBufferConfig {
-            ..Default::default()
-        };
+        let mut config = PartitionBufferConfig::default();
 
         if let Some(params) = params {
             if let Some(rows_threshold_str) = params.get("duckdb_partitioned_write_flush_threshold")
