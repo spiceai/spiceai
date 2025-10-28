@@ -368,6 +368,12 @@ pub trait DataAccelerator: Send + Sync {
             false
         }
     }
+
+    /// Shutdown the accelerator, performing any necessary cleanup
+    /// Default implementation does nothing
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 pub struct AcceleratorExternalTableBuilder {
