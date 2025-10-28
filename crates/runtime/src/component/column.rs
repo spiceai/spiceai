@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-
-use datafusion::sql::TableReference;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -16,6 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use std::collections::HashSet;
+
+use datafusion::sql::TableReference;
 use spicepod::semantic::{Column, FullTextSearchConfig, IndexStore};
 
 use crate::component::dataset::FullTextSearchDatasetConfig;

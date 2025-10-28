@@ -1552,7 +1552,10 @@ impl DataFusion {
                 {
                     Ok(idx) => Arc::new(idx) as Arc<dyn TableProvider>,
                     Err(e) => {
-                        tracing::error!("Failed to full-text search for view '{}': {e}", view.name);
+                        tracing::error!(
+                            "Failed to add full-text search for view '{}': {e}",
+                            view.name
+                        );
                         status.update_view(table, status::ComponentStatus::Error);
                         return None;
                     }
