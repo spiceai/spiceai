@@ -31,12 +31,16 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter},
+    duckdb::{
+        DuckDBSettingsRegistry, DuckDBTableProviderFactory,
+        write::{DuckDBTableWriter, WriteCompletionHandler},
+    },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
@@ -439,7 +443,19 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        Ok(create_table_provider(&self.duckdb_factory, &cmd).await?)
+        let write_completion_handler = source.and_then(|src| {
+            let retention_sql = src
+                .acceleration()
+                .and_then(|acc| acc.retention_sql.as_deref())
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())?
+                .to_string();
+
+            let dataset_name = src.name().to_string();
+            Some(make_retention_write_handler(dataset_name, retention_sql))
+        });
+
+        Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -454,6 +470,7 @@ impl DataAccelerator for DuckDBAccelerator {
 pub(crate) async fn create_table_provider(
     duckdb_factory: &DuckDBTableProviderFactory,
     cmd: &CreateExternalTable,
+    on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
     let table_provider = duckdb_factory
@@ -467,7 +484,10 @@ pub(crate) async fn create_table_provider(
     };
 
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
-    let duckdb_writer = Arc::new(duckdb_writer.clone());
+    let duckdb_writer = match on_data_written {
+        Some(handler) => Arc::new(duckdb_writer.clone().with_on_data_written_handler(handler)),
+        None => Arc::new(duckdb_writer.clone()),
+    };
     let cloned_writer = Arc::clone(&duckdb_writer);
 
     let table_provider = Arc::new(PolyTableProvider::new(
@@ -479,6 +499,36 @@ pub(crate) async fn create_table_provider(
     Ok(table_provider)
 }
 
+fn make_retention_write_handler(
+    dataset_name: String,
+    retention_sql: String,
+) -> WriteCompletionHandler {
+    Arc::new(move |tx, table_manager, _schema, inserted_rows| {
+        let table_name = table_manager.table_name().to_string();
+        tracing::debug!(
+            dataset = %dataset_name,
+            table = %table_name,
+            inserted_rows,
+            "Applying retention SQL before commit"
+        );
+
+        match tx.execute(retention_sql.as_str(), []) {
+            Ok(affected_rows) => {
+                tracing::debug!(
+                    dataset = %dataset_name,
+                    table = %table_name,
+                    affected_rows,
+                    "Retention SQL applied before commit"
+                );
+                Ok(())
+            }
+            Err(err) => Err(DataFusionError::Execution(format!(
+                "Failed to apply retention SQL for dataset {dataset_name} (table {table_name}): {err}"
+            ))),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -486,7 +536,7 @@ mod tests {
     use crate::component::dataset::builder::DatasetBuilder;
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
-        datatypes::{DataType, Schema},
+        datatypes::{DataType, Field, Schema},
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
@@ -501,6 +551,90 @@ mod tests {
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
+
+    #[tokio::test]
+    async fn retention_sql_applies_before_commit() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("retention_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let handler = super::make_retention_write_handler(
+            "retention_dataset".to_string(),
+            "DELETE FROM retention_table WHERE value < 5".to_string(),
+        );
+
+        let table = super::create_table_provider(
+            &duckdb_accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 3, 5, 7]))],
+        )
+        .expect("record batch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input)], schema));
+
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("insert succeeds");
+
+        let read_ctx = SessionContext::new();
+        let scan_plan = table
+            .scan(&read_ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+
+        let batches = collect(scan_plan, read_ctx.task_ctx())
+            .await
+            .expect("scan succeeds");
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            values.extend((0..column.len()).map(|idx| column.value(idx)));
+        }
+
+        assert_eq!(values, vec![5, 7]);
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
