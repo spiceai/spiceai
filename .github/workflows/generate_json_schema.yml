@@ -43,7 +43,7 @@ jobs:
           fi
 
       - name: Upload JSON schema artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: spicepod.schema
           path: .schema/spicepod.schema.json

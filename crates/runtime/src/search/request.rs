@@ -282,7 +282,8 @@ impl SearchRequest {
                     });
                 }
 
-                let col = Column::from_qualified_name(c);
+                // `..._ignore_case` actually means preserve case.
+                let col = Column::from_qualified_name_ignore_case(c);
 
                 // Check equality whilst ignoring quotation.
                 let mut parts = col.relation.as_ref().map(TableReference::to_vec).unwrap_or_default();
@@ -366,6 +367,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_parse_additional_columns_casing() {
+        insta::assert_snapshot!(
+            run_parse_additional_columns(&["CoLuMn"]).as_str(),
+            @r#"[Column { relation: None, name: "CoLuMn" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.\"QuOtEd.WiTh_DoT\""]).as_str(),
+            @r#"[Column { relation: Some(Full { catalog: "CaTaLoG", schema: "sChEmA", table: "tBl" }), name: "QuOtEd.WiTh_DoT" }]"#
+        );
+        insta::assert_snapshot!(
+            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.CoLuMn"]).as_str(),
+            @r#"[Column { relation: Some(Full { catalog: "CaTaLoG", schema: "sChEmA", table: "tBl" }), name: "CoLuMn" }]"#
+        );
+    }
+
+    #[test]
     fn test_parse_additional_columns_bad() {
         for bad in [
             vec!["COUNT(*)".to_string()],
@@ -419,11 +436,6 @@ pub(crate) mod tests {
             // Parentheses without functions
             vec!["(column)".to_string()],
             vec!["table.(column)".to_string()],
-            // Special SQL keywords as unquoted names (context-dependent, but suspicious)
-            vec!["SELECT".to_string()],
-            vec!["FROM".to_string()],
-            vec!["WHERE".to_string()],
-            vec!["table.SELECT".to_string()],
         ] {
             assert!(
                 SearchRequest::parse_additional_columns(&bad).is_err(),

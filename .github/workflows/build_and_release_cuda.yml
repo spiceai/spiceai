@@ -199,7 +199,7 @@ jobs:
 
       # Download all Linux CUDA artifacts
       - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         continue-on-error: true
         with:
           pattern: spiced_models_cuda_*_linux_x86_64
@@ -242,7 +242,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}
