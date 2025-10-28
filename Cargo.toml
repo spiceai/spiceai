@@ -284,7 +284,7 @@ ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "8f3bd4f034c33ed86ab3d50d81038026ab9c4dd6"}                             # spiceai/spiceai-49
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "0e5d8bca9b6f76087b88d7554c09a6cc43e87183" } # spiceai-0.14.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a257db767404ca712a1786991a612d5dd21a06ed" } # spiceai-1.4.1
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a257db767404ca712a1786991a612d5dd21a06ed", features = ["json", "parquet"] } # spiceai-1.4.1
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af725caf5d3e952e349746706e00d0ea5" }
 
