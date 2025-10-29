@@ -82,7 +82,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    let ready_wait_duration = Instant::elapsed();
+    let ready_wait_duration = ready_wait_start.elapsed();
     let health_monitor = HealthMonitor::spawn()?;
 
     // baseline run
