@@ -54,6 +54,33 @@ impl Runtime {
             ),
         };
 
+        // Log task history configuration details
+        let mut config_details = format!(
+            "Task history enabled: retention_period={retention_period_secs}s, retention_check_interval={retention_check_interval_secs}s"
+        );
+
+        if let Some(app) = app.as_ref() {
+            use std::fmt::Write;
+
+            // Add min_sql_duration if configured
+            if let Some(min_sql_duration) = &app.runtime.task_history.min_sql_duration {
+                let _ = write!(config_details, ", min_sql_duration={min_sql_duration}");
+            }
+
+            // Add captured_plan and min_plan_duration if configured
+            if let Some(captured_plan) = &app.runtime.task_history.captured_plan
+                && captured_plan.as_ref() != "none"
+            {
+                let _ = write!(config_details, ", captured_plan={captured_plan}");
+
+                if let Some(min_plan_duration) = &app.runtime.task_history.min_plan_duration {
+                    let _ = write!(config_details, ", min_plan_duration={min_plan_duration}");
+                }
+            }
+        }
+
+        tracing::info!("{}", config_details);
+
         match task_history::TaskSpan::instantiate_table(
             self.status(),
             retention_period_secs,

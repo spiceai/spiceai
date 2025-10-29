@@ -49,9 +49,10 @@ mod tracker;
 
 #[cfg(feature = "cluster")]
 use {
+    crate::config::ClusterMode,
+    crate::datafusion::builder::default_extension_planners,
     crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
     crate::datafusion::cluster::config::SpiceClusterConfig,
-    crate::datafusion::extension::SpiceQueryPlanner,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
     datafusion::execution::SessionStateBuilder,
@@ -66,7 +67,6 @@ use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
-use crate::config::ClusterMode;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
@@ -168,9 +168,7 @@ impl Query {
                 self.df.cluster_config.scheduler_url.to_string(),
                 cfg.ballista_config(),
                 SpiceLogicalCodec::new_codec(),
-                DefaultPhysicalPlanner::with_extension_planners(
-                    SpiceQueryPlanner::default_extension_planners(),
-                ),
+                DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
             );
 
         SessionStateBuilder::new_from_existing(self.df.ctx.state())
