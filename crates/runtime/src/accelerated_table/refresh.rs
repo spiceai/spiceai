@@ -33,7 +33,6 @@ use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::logical_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
@@ -84,7 +83,6 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
-    pub(crate) retention_expr: Option<Expr>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -188,12 +186,6 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
-        self
-    }
-
-    #[must_use]
-    pub fn retention_expr(mut self, retention_expr: Option<Expr>) -> Self {
-        self.retention_expr = retention_expr;
         self
     }
 
@@ -416,7 +408,6 @@ impl Default for Refresh {
             append_overlap: None,
             retry_enabled: false,
             retry_max_attempts: None,
-            retention_expr: None,
         }
     }
 }
