@@ -67,8 +67,8 @@ use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -1062,17 +1062,6 @@ impl DataFusion {
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
-        let mut accelerated_table_builder = AcceleratedTable::builder(
-            Arc::clone(&self.runtime_status),
-            dataset.name.clone(),
-            Arc::clone(&source_table_provider),
-            dataset.source().to_string(),
-            accelerated_table_provider,
-            refresh,
-            self.io_runtime.clone(),
-        );
-        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
-
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => Some(
                 retention_sql::parse_retention_sql(
@@ -1084,6 +1073,22 @@ impl DataFusion {
             ),
             None => None,
         };
+
+        let retention_fetch_expr = retention_delete_expr
+            .as_ref()
+            .map(|expr| Expr::Not(Box::new(expr.clone())));
+        refresh = refresh.retention_expr(retention_fetch_expr);
+
+        let mut accelerated_table_builder = AcceleratedTable::builder(
+            Arc::clone(&self.runtime_status),
+            dataset.name.clone(),
+            Arc::clone(&source_table_provider),
+            dataset.source().to_string(),
+            accelerated_table_provider,
+            refresh,
+            self.io_runtime.clone(),
+        );
+        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
 
         let retention = Retention::builder()
             .time_column(dataset.time_column.clone())

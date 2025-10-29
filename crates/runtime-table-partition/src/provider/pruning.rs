@@ -22,6 +22,7 @@ use datafusion::{
         Column, ToDFSchema as _,
         tree_node::{Transformed, TreeNode as _},
     },
+    config::ConfigOptions,
     error::DataFusionError,
     execution::context::ExecutionProps,
     logical_expr::{
@@ -377,6 +378,7 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
         arg_fields: vec![],
         number_rows: 1,
         return_field,
+        config_options: Arc::new(ConfigOptions::default()),
     };
 
     let ColumnarValue::Scalar(bucket_value) = f.invoke_with_args(args)? else {

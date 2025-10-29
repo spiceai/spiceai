@@ -149,7 +149,24 @@ pub struct VectorSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
 
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
+    df_ptr: u64,
+
     explicit_pks: HashMap<TableReference, Vec<String>>,
+}
+
+impl PartialEq for VectorSearchTableFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.df_ptr == other.df_ptr && self.explicit_pks == other.explicit_pks
+    }
+}
+
+impl Eq for VectorSearchTableFunc {}
+
+impl std::hash::Hash for VectorSearchTableFunc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.df_ptr.hash(state);
+    }
 }
 
 pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
@@ -174,7 +191,12 @@ pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> 
 impl VectorSearchTableFunc {
     #[must_use]
     pub fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
-        Self { df, explicit_pks }
+        let ptr = df.as_ptr().addr() as u64;
+        Self {
+            df,
+            explicit_pks,
+            df_ptr: ptr,
+        }
     }
 
     fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {

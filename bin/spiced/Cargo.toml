@@ -83,8 +83,8 @@ default = [
     "mongodb",
     "xxhash",
     "iceberg-write",
+    "turso",
     "pepper"
-
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -113,6 +113,7 @@ snowflake = ["runtime/snowflake"]
 snapshots = ["runtime/snapshots"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
+turso = ["runtime/turso"]
 tpc-extension = ["dep:tpc-extension"]
 pepper = ["runtime/pepper"]
 xxhash = ["runtime/xxhash"]

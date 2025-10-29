@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -130,6 +129,7 @@ impl AppendableSource for FileAppendableSource {
                     dest_conn.execute_batch(setup_sql)?;
                 }
                 QuerySet::ParameterizedTpch => todo!(),
+                QuerySet::ParameterizedSaffron => todo!(),
             }
 
             drop(dest_conn);
@@ -210,6 +210,7 @@ impl AppendableSource for FileAppendableSource {
                     dest_conn.execute_batch(&sql)?;
                 }
                 QuerySet::ParameterizedTpch => todo!(),
+                QuerySet::ParameterizedSaffron => todo!(),
             }
 
             Ok::<(), anyhow::Error>(())

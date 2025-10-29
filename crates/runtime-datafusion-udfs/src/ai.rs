@@ -48,7 +48,9 @@ use llms::chat::Chat;
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 // Security and performance constants
@@ -90,6 +92,8 @@ pub type ChatModelStore = HashMap<String, Arc<dyn Chat>>;
 
 pub struct Ai {
     model_store: Arc<RwLock<ChatModelStore>>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `RwLock<ChatModelStore>` implement them.
+    ptr: u64,
 }
 
 impl std::fmt::Debug for Ai {
@@ -100,10 +104,25 @@ impl std::fmt::Debug for Ai {
     }
 }
 
+impl PartialEq for Ai {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+impl Eq for Ai {}
+
+impl Hash for Ai {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ptr.hash(state);
+    }
+}
+
 impl Ai {
     #[must_use]
     pub fn new(model_store: Arc<RwLock<ChatModelStore>>) -> Self {
-        Self { model_store }
+        let ptr = Arc::as_ptr(&model_store).addr() as u64;
+        Self { model_store, ptr }
     }
 
     #[must_use]
@@ -156,10 +175,7 @@ impl AsyncScalarUDFImpl for Ai {
     async fn invoke_async_with_args(
         &self,
         args: ScalarFunctionArgs,
-        config: &datafusion::config::ConfigOptions,
-    ) -> DataFusionResult<ArrayRef> {
-        use std::time::Instant;
-
+    ) -> DataFusionResult<ColumnarValue> {
         // Start timing for explain analyze metrics
         let start_time = Instant::now();
 
@@ -214,7 +230,7 @@ impl AsyncScalarUDFImpl for Ai {
         };
 
         // Use target_partitions from config for parallelism control
-        let max_parallelism = config.execution.target_partitions;
+        let max_parallelism = args.config_options.execution.target_partitions;
 
         // Format the input to show the full UDF call: ai('message', 'model')
         let input = if args.args.len() == 2 {
@@ -262,7 +278,7 @@ impl AsyncScalarUDFImpl for Ai {
             "ai UDF execution metrics"
         );
 
-        result
+        Ok(ColumnarValue::from(result?))
     }
 }
 
@@ -488,6 +504,7 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
     use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
+    use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{ScalarFunctionArgs, ScalarUDFImpl, Volatility};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -748,6 +765,7 @@ mod tests {
             arg_fields: vec![],
             number_rows: 0,
             return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
 
         let result = udf.invoke_with_args(args);
@@ -1233,12 +1251,11 @@ mod tests {
             arg_fields: vec![],
             number_rows: 3,
             return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
 
         // This should not fail with "all columns in a record batch must have the same length"
-        let result = udf
-            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
-            .await;
+        let result = udf.invoke_async_with_args(args).await;
 
         assert!(
             result.is_ok(),
@@ -1247,6 +1264,10 @@ mod tests {
         );
 
         let response_array = result.expect("should get result");
+        let ColumnarValue::Array(response_array) = response_array else {
+            panic!("expected Array result");
+        };
+
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
@@ -1278,12 +1299,11 @@ mod tests {
             arg_fields: vec![],
             number_rows: 5,
             return_field: Arc::new(Field::new("result", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
 
         // This should not fail with "all columns in a record batch must have the same length"
-        let result = udf
-            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
-            .await;
+        let result = udf.invoke_async_with_args(args).await;
 
         assert!(
             result.is_ok(),
@@ -1292,6 +1312,10 @@ mod tests {
         );
 
         let response_array = result.expect("should get result");
+        let ColumnarValue::Array(response_array) = response_array else {
+            panic!("expected Array result");
+        };
+
         let string_array = response_array
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
@@ -1664,14 +1688,19 @@ mod tests {
             arg_fields: vec![],
             number_rows: 1,
             return_field: Arc::new(arrow_schema::Field::new("result", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
 
         let result = udf
-            .invoke_async_with_args(args, &datafusion::config::ConfigOptions::default())
+            .invoke_async_with_args(args)
             .await
             .expect("UDF should execute successfully");
 
         // Verify we got a result back
+        let ColumnarValue::Array(result) = result else {
+            panic!("expected Array result");
+        };
+
         let string_array = result
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()

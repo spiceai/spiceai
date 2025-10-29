@@ -226,7 +226,10 @@ pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
         // There is no direct mapping for Float16 in DataFusion SQL, so we use REAL.
         DataType::Float16 | DataType::Float32 => "REAL",
         DataType::Float64 => "DOUBLE",
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL",
+        DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => "DECIMAL",
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR",
         DataType::Timestamp(_, _) => "TIMESTAMP",
         DataType::Date32 | DataType::Date64 => "DATE",

@@ -119,6 +119,7 @@ macro_rules! add_tpcds_query_overrides {
         }
     }
 }
+
 macro_rules! generate_clickbench_queries {
   ( $( $i:literal ),* ) => {
       vec![
@@ -145,6 +146,20 @@ macro_rules! generate_clickbench_query_overrides {
           ),*
       ]
   }
+}
+
+macro_rules! generate_saffron_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("saffron_q", stringify!($i)).into(),
+                    include_str!(concat!("./saffron/q", stringify!($i), ".sql")).into(),
+                    false
+                )
+            ),*
+        ]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +211,8 @@ pub enum QuerySet {
     Clickbench,
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
+    #[serde(rename = "saffron[parameterized]")]
+    ParameterizedSaffron,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +249,7 @@ impl QuerySet {
             QuerySet::Tpch => get_tpch_test_queries(overrides),
             QuerySet::Tpcds => get_tpcds_test_queries(overrides),
             QuerySet::Clickbench => get_clickbench_test_queries(overrides),
+            QuerySet::ParameterizedSaffron => get_saffron_test_queries(overrides),
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
                     "parameterized",
@@ -311,6 +329,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
+            QuerySet::ParameterizedSaffron => [].iter().map(TableWithRowCount::from).collect(),
         }
     }
 
@@ -363,6 +382,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
+            QuerySet::ParameterizedSaffron => [].iter().map(TableWithTimeColumn::from).collect(),
         }
     }
 }
@@ -374,6 +394,7 @@ impl Display for QuerySet {
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
+            QuerySet::ParameterizedSaffron => write!(f, "saffron[parameterized]"),
         }
     }
 }
@@ -712,4 +733,96 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     }
 
     queries
+}
+
+#[must_use]
+pub fn get_saffron_test_queries(_overrides: Option<QueryOverrides>) -> Vec<Query> {
+    let queries = generate_saffron_queries!(1, 2, 3, 4, 5, 6);
+    add_saffron_parameters(queries)
+}
+
+/// Defines parameters for Saffron queries based on typical telephony use cases
+#[must_use]
+pub fn add_saffron_parameters(queries: Vec<Query>) -> Vec<Query> {
+    queries
+        .into_iter()
+        .map(|q| {
+            let mut q = q;
+            match q.name.replace("saffron_", "").as_str() {
+                "q1" => {
+                    q.parameters = Some(vec![
+                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
+                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
+                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid
+                        ParameterValue::String("sms".into()), // Capability
+                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
+                    ]);
+                }
+                "q2" => {
+                    q.parameters = Some(vec![
+                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
+                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
+                        ParameterValue::String("tf".into()), // NumberType (IN clause)
+                        ParameterValue::Number(49),          // MaxRate filter
+                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+                        ParameterValue::Number(0), // selectA2pNumber flag (0 = false)
+                        ParameterValue::String("sms".into()), // Capability
+                        ParameterValue::Number(0), // LIMIT offset
+                    ]);
+                }
+                "q3" => {
+                    q.parameters = Some(vec![
+                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
+                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
+                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
+                        ParameterValue::String("tf".into()), // NumberType (IN clause)
+                        ParameterValue::String("212".into()), // AreaCodeRegion (IN clause)
+                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+                        ParameterValue::String("sms".into()), // Capability
+                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
+                    ]);
+                }
+                "q4" => {
+                    q.parameters = Some(vec![
+                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
+                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
+                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
+                        ParameterValue::String("tf".into()), // NumberType (IN clause)
+                        ParameterValue::String("212".into()), // AreaCodeRegion (IN clause)
+                        ParameterValue::Number(49),          // MaxRate filter
+                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+                        ParameterValue::String("sms".into()), // Capability
+                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
+                        ParameterValue::Number(0),            // LIMIT offset
+                    ]);
+                }
+                "q5" => {
+                    q.parameters = Some(vec![
+                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
+                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
+                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
+                        ParameterValue::String("tf".into()), // NumberType (IN clause)
+                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+                        ParameterValue::String("sms".into()), // Capability
+                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
+                    ]);
+                }
+                "q6" => {
+                    q.parameters = Some(vec![
+                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
+                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
+                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
+                        ParameterValue::String("tf".into()), // NumberType (IN clause)
+                        ParameterValue::Number(49),          // MaxRate filter
+                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+                        ParameterValue::Number(0), // selectA2pNumber flag (0 = false)
+                        ParameterValue::String("sms".into()), // Capability
+                        ParameterValue::Number(0), // LIMIT offset
+                    ]);
+                }
+                _ => {}
+            }
+            q
+        })
+        .collect()
 }
