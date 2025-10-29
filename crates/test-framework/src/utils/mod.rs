@@ -153,7 +153,7 @@ pub fn recursively_get_dir_size(dir: &PathBuf) -> anyhow::Result<usize> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
-                total_size += entry.metadata()?.len() as usize;
+                total_size += usize::try_from(entry.metadata()?.len())?;
             } else if entry.file_type()?.is_dir() {
                 total_size += recursively_get_dir_size(&entry.path())?;
             }
