@@ -17,7 +17,7 @@ limitations under the License.
 use super::{RowCounts, get_app_and_start_request};
 use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::{
-    path::PathBuf,
+    path::Path,
     time::{Duration, Instant},
 };
 use test_framework::{
@@ -39,7 +39,7 @@ use test_framework::{
     utils::{observe_memory, recursively_get_dir_size},
 };
 
-fn emit_acceleration_size_if_applicable(app: &App, app_path: PathBuf) -> anyhow::Result<()> {
+fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::Result<()> {
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
         ds.acceleration.as_ref().is_some_and(|accel| {
@@ -167,7 +167,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
-    emit_acceleration_size_if_applicable(&app, spiced_instance.get_tempdir_path())?;
+    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path())?;
 
     telemetry.emit().await?;
 
