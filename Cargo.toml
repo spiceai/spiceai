@@ -354,3 +354,4 @@ aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887
 
 # Required until Turso releases 0.23 without the GPL dependency
 turso = { git = "https://github.com/tursodatabase/turso", rev = "ae60b78d828dc08c6bcdc070d7ec71c4d61bd007" }
+
