@@ -68,7 +68,7 @@ impl TestFixture {
         };
 
         let catalog = Arc::new(PepperCatalog::new(connection_string));
-        catalog.as_ref().init().await?;
+        catalog.init().await?;
 
         Ok(Self {
             temp_dir,
