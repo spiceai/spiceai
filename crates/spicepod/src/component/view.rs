@@ -53,6 +53,9 @@ pub struct View {
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<VectorStore>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
@@ -77,6 +80,7 @@ impl View {
             acceleration: None,
             ready_state: ReadyState::default(),
             depends_on: Vec::default(),
+            vectors: None,
         }
     }
 
@@ -113,11 +117,12 @@ impl WithDependsOn<View> for View {
             name: self.name.clone(),
             description: self.description.clone(),
             metadata: self.metadata.clone(),
-            columns: vec![],
+            columns: self.columns.clone(),
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             acceleration: self.acceleration.clone(),
             ready_state: self.ready_state,
+            vectors: self.vectors.clone(),
             depends_on: depends_on.to_vec(),
         }
     }
