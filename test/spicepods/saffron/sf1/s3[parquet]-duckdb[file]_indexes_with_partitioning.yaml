@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-turso[file]
+name: s3[parquet]-duckdb[file]_indexes_with_partitioning
 
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
@@ -16,14 +16,26 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
       enabled: true
-      engine: turso
+      engine: duckdb
       mode: file
       refresh_mode: append
+      params:
+        duckdb_preserve_insertion_order: false
+      indexes:
+        '(AccountSid, NumberPoolSid)': enabled
+      partition_by:
+        - bucket(32, AccountSid)
   
   - from: s3://benchmarks/saffron/number_caps_sf1
     name: number_caps
     params: *params_s3
     acceleration:
       enabled: true
-      engine: turso
+      engine: duckdb
       mode: file
+      params:
+        duckdb_preserve_insertion_order: false
+      indexes:
+        NumberSid: enabled
+      partition_by:
+        - bucket(32, NumberSid)
