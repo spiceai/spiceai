@@ -109,7 +109,8 @@ impl DuckDBAccelerator {
                     DuckDBSettingsRegistry::new()
                         .with_setting(Box::new(OrderByNonIntegerLiteral))
                         .with_setting(Box::new(settings::IndexScanPercentage))
-                        .with_setting(Box::new(settings::IndexScanMaxCount)),
+                        .with_setting(Box::new(settings::IndexScanMaxCount))
+                        .with_setting(Box::new(settings::TimeZone)),
                 ),
         }
     }
