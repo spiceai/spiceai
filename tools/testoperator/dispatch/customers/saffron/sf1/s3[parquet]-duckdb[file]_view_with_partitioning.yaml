@@ -1,0 +1,5 @@
+tests:
+  bench:
+    spicepod_path: saffron/sf1/s3[parquet]-duckdb[file]_view_with_partitioning.yaml
+    query_set: tpch
+    runner_type: spicehq-dev-runners
