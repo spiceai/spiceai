@@ -39,15 +39,15 @@ use test_framework::{
     utils::{observe_memory, recursively_get_dir_size},
 };
 
-async fn emit_acceleration_size_if_applicable(app: &App, app_path: PathBuf) -> anyhow::Result<()> {
+fn emit_acceleration_size_if_applicable(app: &App, app_path: PathBuf) -> anyhow::Result<()> {
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
-        ds.acceleration.as_ref().map_or(false, |accel| {
+        ds.acceleration.as_ref().is_some_and(|accel| {
             accel.mode == Mode::File
                 && accel.enabled
                 && matches!(
                     accel.engine.as_deref(),
-                    Some("sqlite") | Some("duckdb") | Some("pepper")
+                    Some("sqlite" | "duckdb" | "pepper")
                 )
         })
     }) {
@@ -58,7 +58,7 @@ async fn emit_acceleration_size_if_applicable(app: &App, app_path: PathBuf) -> a
     let spice_dir = app_path.join(".spice");
     let total_size = recursively_get_dir_size(&spice_dir)?;
 
-    println!("Total acceleration size on disk: {} bytes", total_size);
+    println!("Total acceleration size on disk: {total_size} bytes");
 
     crate::metrics::ACCELERATION_SIZE_BYTES.record(total_size.try_into().unwrap_or_default(), &[]);
 
@@ -82,7 +82,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    let ready_wait_duration = Instant::now() - ready_wait_start;
+    let ready_wait_duration = Instant::elapsed();
     let health_monitor = HealthMonitor::spawn()?;
 
     // baseline run
@@ -167,7 +167,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
-    emit_acceleration_size_if_applicable(&app, spiced_instance.get_tempdir_path()).await?;
+    emit_acceleration_size_if_applicable(&app, spiced_instance.get_tempdir_path())?;
 
     telemetry.emit().await?;
 
