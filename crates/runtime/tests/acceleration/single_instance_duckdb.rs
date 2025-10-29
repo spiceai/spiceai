@@ -87,13 +87,13 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 .map(DatasetBuilder::try_from)
                 .map(move |ds_builder| {
                     ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
                         .and_then(|ds_builder| {
                             ds_builder
                                 .with_app(Arc::clone(app))
                                 .with_runtime(Arc::clone(&cloned_rt))
                                 .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;

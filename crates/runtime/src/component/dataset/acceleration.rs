@@ -140,6 +140,7 @@ pub enum Engine {
     PartitionedDuckDB,
     TableModePartitionedDuckDB,
     Sqlite,
+    Turso,
     PostgreSQL,
     Pepper,
 }
@@ -152,6 +153,7 @@ impl Display for Engine {
                 write!(f, "duckdb")
             }
             Engine::Sqlite => write!(f, "sqlite"),
+            Engine::Turso => write!(f, "turso"),
             Engine::PostgreSQL => write!(f, "postgres"),
             Engine::Pepper => write!(f, "pepper"),
         }
@@ -166,6 +168,7 @@ impl TryFrom<&str> for Engine {
             "arrow" => Ok(Engine::Arrow),
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
+            "turso" => Ok(Engine::Turso),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
             "pepper" | "vortex" => Ok(Engine::Pepper),
             _ => crate::AcceleratorEngineNotAvailableSnafu {

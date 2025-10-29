@@ -229,15 +229,14 @@ fn parse_headers(headers: &[String]) -> Result<HeaderMap, anyhow::Error> {
 
             let header_name = key
                 .parse::<HeaderName>()
-                .map_err(|_| anyhow!("Invalid header key: {}", key))?;
+                .map_err(|_| anyhow!("Invalid header key: {key}"))?;
             let header_value = HeaderValue::from_str(&value)
-                .map_err(|_| anyhow!("Invalid header value for key: {}", key))?;
+                .map_err(|_| anyhow!("Invalid header value for key: {key}"))?;
 
             header_map.insert(header_name, header_value);
         } else {
             return Err(anyhow!(
-                "Invalid header format: {}. Expected format: 'Key: Value'",
-                h
+                "Invalid header format: {h}. Expected format: 'Key: Value'"
             ));
         }
     }

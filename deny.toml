@@ -58,3 +58,22 @@ license-files = []
 name = "text-embeddings-backend-candle"
 expression = "Apache-2.0"
 license-files = []
+
+[[licenses.clarify]]
+name = "candle-cublaslt"
+version = "0.2.2"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "candle-layer-norm"
+version = "0.0.1"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "model2vec-rs"
+version = "0.1.3"
+expression = "MIT"
+license-files = []
+

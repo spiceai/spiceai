@@ -44,7 +44,10 @@ use runtime_table_partition::{
 };
 
 use crate::dataaccelerator::{
-    AccelerationSource, partitioned_duckdb::tables_mode::sink::DuckDBPartitionedDataSink,
+    AccelerationSource,
+    partitioned_duckdb::tables_mode::{
+        partition_buffer::PartitionBufferConfig, sink::DuckDBPartitionedDataSink,
+    },
 };
 
 /// Strategy for handling `DuckDB` table-based partition insertions.
@@ -53,8 +56,8 @@ pub struct DuckDBPartitionedInsertStrategy {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
-    rows_per_partition_buffer: Option<usize>,
     write_settings: DuckDBWriteSettings,
+    partition_buffer_config: PartitionBufferConfig,
 }
 
 impl DuckDBPartitionedInsertStrategy {
@@ -65,8 +68,6 @@ impl DuckDBPartitionedInsertStrategy {
         on_conflict: Option<OnConflict>,
         source: &dyn AccelerationSource,
     ) -> Self {
-        let rows_per_partition_buffer = get_rows_per_partition_buffer(source);
-
         let write_settings = if let Some(acceleration) = source.acceleration() {
             let mut params = acceleration.params.clone();
 
@@ -84,12 +85,15 @@ impl DuckDBPartitionedInsertStrategy {
             DuckDBWriteSettings::default()
         };
 
+        let partition_buffer_config =
+            PartitionBufferConfig::from_params(source.acceleration().map(|acc| &acc.params));
+
         Self {
             pool,
             table_definition,
             on_conflict,
-            rows_per_partition_buffer,
             write_settings,
+            partition_buffer_config,
         }
     }
 
@@ -154,21 +158,6 @@ impl DuckDBPartitionedInsertStrategy {
     }
 }
 
-fn get_rows_per_partition_buffer(source: &dyn AccelerationSource) -> Option<usize> {
-    source
-        .acceleration()?
-        .params
-        .get("duckdb_partitioned_write_flush_threshold")
-        .and_then(|v| {
-            v.parse::<usize>().ok().or_else(|| {
-                tracing::warn!(
-                    "Invalid `duckdb_partitioned_write_flush_threshold` parameter '{v}': must be a positive integer"
-                );
-                None
-            })
-        })
-}
-
 #[async_trait]
 impl InsertStrategy for DuckDBPartitionedInsertStrategy {
     async fn execute_insert(
@@ -185,7 +174,7 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             &ctx.partition_by,
         )?);
 
-        let mut data_sink = DuckDBPartitionedDataSink::new(
+        let data_sink = DuckDBPartitionedDataSink::new(
             Arc::clone(&self.pool),
             Arc::clone(&self.table_definition),
             insert_op,
@@ -193,12 +182,8 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             schema,
             partitioner,
         )
-        .with_write_settings(self.write_settings.clone());
-
-        // Apply the buffer size configuration if available
-        if let Some(buffer_size) = self.rows_per_partition_buffer {
-            data_sink = data_sink.with_rows_per_partition_buffer(buffer_size);
-        }
+        .with_write_settings(self.write_settings.clone())
+        .with_partition_buffer_config(self.partition_buffer_config.clone());
 
         let data_sink_exec = Arc::new(DataSinkExec::new(input, Arc::new(data_sink), None));
 

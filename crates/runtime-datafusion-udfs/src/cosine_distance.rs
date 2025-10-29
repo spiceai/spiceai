@@ -77,7 +77,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct CosineDistance {
     signature: Signature,
 }

@@ -184,6 +184,12 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Rollback a transaction.
     async fn rollback_transaction(&self) -> CatalogResult<()>;
+
+    /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
+    /// Default implementation does nothing.
+    async fn shutdown(&self) -> CatalogResult<()> {
+        Ok(())
+    }
 }
 
 /// Factory trait for creating catalog instances.
