@@ -117,7 +117,13 @@ pub async fn try_from_dataset(
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
     let batch_write_rows = string_from_params(&params, "batch_write_rows")
-        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|s| match s.parse::<usize>() {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::warn!("Invalid value for 's3_vectors_batch_write_rows': {s}. Error: {e}. Falling back to default: {DEFAULT_BATCH_WRITE_ROWS}");
+                None
+            },
+        })
         .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
 
     let table = try_vector_table(
