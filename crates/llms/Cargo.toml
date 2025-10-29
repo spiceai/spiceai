@@ -38,6 +38,7 @@ serde_json.workspace = true
 spicepod = { path = "../spicepod" }
 tokenizers = "0.21.2"
 tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util" }

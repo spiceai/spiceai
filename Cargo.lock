@@ -8519,6 +8519,7 @@ dependencies = [
  "token_provider",
  "tokenizers",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-futures",
  "tracing-opentelemetry",

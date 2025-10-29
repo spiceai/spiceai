@@ -12,7 +12,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
+use super::{Chat, Error as ChatError, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -33,8 +33,8 @@ use llama_cpp_2::{
     send_logs_to_tracing,
 };
 use secrecy::SecretString;
-use snafu::ResultExt;
 use std::{
+    fmt::Write,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -44,9 +44,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::streaming_utils::generate_stream_id;
 
+/// Type alias for streaming result
+type StreamResult = Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>;
+
 /// Initialize llama.cpp logging once globally.
 ///
-/// By default, llama.cpp/ggml logs are filtered out (via OFF_FILTERS in bin/spiced/src/tracing.rs).
+/// By default, llama.cpp/ggml logs are filtered out (via `OFF_FILTERS` in bin/spiced/src/tracing.rs).
 /// To enable llama.cpp logs, set the `SPICED_LOG` or `RUST_LOG` environment variable to include
 /// `llama_cpp_2`, `llama.cpp`, or `ggml`. For example:
 /// - `SPICED_LOG=llama_cpp_2=debug` - Enable debug logs from llama-cpp-2 bindings
@@ -103,7 +106,7 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
-    /// Create sampling parameters from an OpenAI chat completion request
+    /// Create sampling parameters from an `OpenAI` chat completion request
     fn from_request(req: &CreateChatCompletionRequest) -> Self {
         let mut params = Self::default();
 
@@ -115,10 +118,14 @@ impl SamplingParams {
             params.top_p = top_p;
         }
 
-        if let Some(max_tokens) = req.max_tokens {
-            params.max_tokens = max_tokens as usize;
-        } else if let Some(max_completion_tokens) = req.max_completion_tokens {
+        // Prefer max_completion_tokens (new field) over max_tokens (deprecated)
+        if let Some(max_completion_tokens) = req.max_completion_tokens {
             params.max_tokens = max_completion_tokens as usize;
+        } else {
+            #[allow(deprecated)]
+            if let Some(max_tokens) = req.max_tokens {
+                params.max_tokens = max_tokens as usize;
+            }
         }
 
         if let Some(freq_penalty) = req.frequency_penalty {
@@ -134,12 +141,13 @@ impl SamplingParams {
 
     /// Create a sampler chain from these parameters
     fn create_sampler(&self) -> LlamaSampler {
+        const EPSILON: f32 = 1e-6;
         let mut samplers = Vec::new();
 
         // Add penalties if configured
-        if self.repeat_penalty != 1.0
-            || self.frequency_penalty != 0.0
-            || self.presence_penalty != 0.0
+        if (self.repeat_penalty - 1.0).abs() > EPSILON
+            || self.frequency_penalty.abs() > EPSILON
+            || self.presence_penalty.abs() > EPSILON
         {
             // penalty_last_n: number of tokens to consider for repetition penalty (64 is reasonable)
             // penalty_repeat: base repetition penalty
@@ -175,10 +183,11 @@ impl SamplingParams {
         if samplers.is_empty() {
             LlamaSampler::greedy()
         } else if samplers.len() == 1 {
-            // Safe to expect: we just checked that samplers has exactly one element
-            samplers
-                .pop()
-                .expect("samplers.len() == 1 guarantees element exists")
+            // We've verified samplers.len() == 1, so pop() is guaranteed to return Some
+            match samplers.pop() {
+                Some(sampler) => sampler,
+                None => unreachable!("samplers.len() == 1 guarantees pop() returns Some"),
+            }
         } else {
             LlamaSampler::chain_simple(samplers)
         }
@@ -238,8 +247,14 @@ impl LlamaCpp {
     }
 
     /// Create from `HuggingFace` model ID
+    ///
+    /// Note: llama.cpp engine does not support automatic model downloading from `HuggingFace`.
+    /// The `model_id` parameter is accepted for API consistency but is not used.
+    /// Users must pre-download GGUF files and specify the local path via `gguf_filename`.
+    /// The `hf_token_literal` is also unused as no downloading occurs.
     pub async fn from_hf(
         _model_id: &str,
+        _hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         // llama.cpp requires local GGUF files
@@ -287,7 +302,7 @@ impl LlamaCpp {
                             text
                         }
                     };
-                    prompt.push_str(&format!("System: {content_str}\n\n"));
+                    let _ = write!(prompt, "System: {content_str}\n\n");
                 }
                 async_openai::types::ChatCompletionRequestMessage::User(msg) => {
                     let content = match &msg.content {
@@ -306,7 +321,7 @@ impl LlamaCpp {
                             text
                         }
                     };
-                    prompt.push_str(&format!("User: {content}\n\n"));
+                    let _ = write!(prompt, "User: {content}\n\n");
                 }
                 async_openai::types::ChatCompletionRequestMessage::Assistant(msg) => {
                     if let Some(content) = &msg.content {
@@ -322,7 +337,7 @@ impl LlamaCpp {
                                 text
                             }
                         };
-                        prompt.push_str(&format!("Assistant: {content_str}\n\n"));
+                        let _ = write!(prompt, "Assistant: {content_str}\n\n");
                     }
                 }
                 _ => {} // Ignore other message types for now
@@ -373,7 +388,10 @@ impl LlamaCpp {
 
             for (i, &token) in tokens.iter().enumerate() {
                 let is_last = i == n_prompt_tokens - 1;
-                batch.add(token, i as i32, &[0], is_last).map_err(|e| {
+                let i_i32 = i32::try_from(i).map_err(|e| ChatError::FailedToRunModel {
+                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                })?;
+                batch.add(token, i_i32, &[0], is_last).map_err(|e| {
                     ChatError::FailedToRunModel {
                         source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
                     }
@@ -391,7 +409,10 @@ impl LlamaCpp {
 
             let mut output = String::new();
             let mut n_generated = 0;
-            let mut n_cur = n_prompt_tokens as i32;
+            let mut n_cur =
+                i32::try_from(n_prompt_tokens).map_err(|e| ChatError::FailedToRunModel {
+                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                })?;
 
             // Generate tokens
             while n_generated < params_clone.max_tokens {
@@ -439,17 +460,13 @@ impl LlamaCpp {
     }
 
     /// Internal method for streaming inference with configurable sampling parameters
-    async fn stream_with_params(
-        &self,
-        prompt: String,
-        params: &SamplingParams,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
+    fn stream_with_params(&self, prompt: String, params: &SamplingParams) -> StreamResult {
         let model = Arc::clone(&self.model);
         let backend = Arc::clone(&self.backend);
         let params_clone = params.clone();
 
         // Create a channel to send tokens from the blocking thread
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Option<String>>>(100);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Option<String>>>(100);
 
         tokio::task::spawn_blocking(move || {
             // Create context for inference with configured context size
@@ -489,7 +506,16 @@ impl LlamaCpp {
 
             for (i, &token) in tokens.iter().enumerate() {
                 let is_last = i == n_prompt_tokens - 1;
-                if let Err(e) = batch.add(token, i as i32, &[0], is_last) {
+                let i_i32 = match i32::try_from(i) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
+                            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                        }));
+                        return;
+                    }
+                };
+                if let Err(e) = batch.add(token, i_i32, &[0], is_last) {
                     let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
                         source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
                     }));
@@ -509,7 +535,15 @@ impl LlamaCpp {
             let mut sampler = params_clone.create_sampler();
 
             let mut n_generated = 0;
-            let mut n_cur = n_prompt_tokens as i32;
+            let mut n_cur = match i32::try_from(n_prompt_tokens) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(ChatError::FailedToRunModel {
+                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                    }));
+                    return;
+                }
+            };
 
             // Generate and stream tokens
             while n_generated < params_clone.max_tokens {
@@ -560,7 +594,7 @@ impl LlamaCpp {
         // Create stream from receiver using ReceiverStream (avoids async_stream::stream! macro)
         let stream = ReceiverStream::new(rx);
 
-        Ok(Box::pin(stream))
+        Box::pin(stream)
     }
 }
 
@@ -602,7 +636,7 @@ impl Chat for LlamaCpp {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
         // Use default sampling parameters for trait method
         let params = SamplingParams::default();
-        self.stream_with_params(_prompt, &params).await
+        Ok(self.stream_with_params(_prompt, &params))
     }
 
     async fn run(&self, _prompt: String) -> Result<Option<String>> {
@@ -624,17 +658,7 @@ impl Chat for LlamaCpp {
         let params = SamplingParams::from_request(&req);
 
         // Use the stream() method with parameters
-        let stream = self
-            .stream_with_params(prompt, &params)
-            .await
-            .map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: e.to_string(),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?;
+        let stream = self.stream_with_params(prompt, &params);
 
         Ok(crate::streaming_utils::string_stream_to_chat_stream(
             model_id, stream,
@@ -658,7 +682,7 @@ impl Chat for LlamaCpp {
             match tokio::task::spawn_blocking(move || {
                 model
                     .str_to_token(&prompt_clone, AddBos::Always)
-                    .map(|tokens| tokens.len() as u32)
+                    .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
             })
             .await
             {
@@ -698,7 +722,7 @@ impl Chat for LlamaCpp {
             match tokio::task::spawn_blocking(move || {
                 model
                     .str_to_token(&content_clone, AddBos::Never)
-                    .map(|tokens| tokens.len() as u32)
+                    .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
             })
             .await
             {
@@ -717,10 +741,13 @@ impl Chat for LlamaCpp {
             }
         };
 
-        let created = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
-            .as_secs() as u32;
+        let created = u32::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
+                .as_secs(),
+        )
+        .unwrap_or(0);
 
         let stream_id = generate_stream_id(&self.model_name);
 
