@@ -106,19 +106,17 @@ pub async fn write(
     index: &S3Vector,
     table: &S3VectorsTable,
     record: RecordBatch,
+    batch_write_rows: usize,
 ) -> Result<RecordBatch, Error> {
-    // Process in 100k row chunks to control memory usage
-    const MAX_CHUNK_ROWS: usize = 100_000;
-
-    if record.num_rows() <= MAX_CHUNK_ROWS {
+    if record.num_rows() <= batch_write_rows {
         return process_single_batch(index, table, record).await;
     }
 
-    let mut result_batches = Vec::with_capacity(record.num_rows().div_ceil(MAX_CHUNK_ROWS));
+    let mut result_batches = Vec::with_capacity(record.num_rows().div_ceil(batch_write_rows));
     let schema = record.schema();
 
-    for chunk_start in (0..record.num_rows()).step_by(MAX_CHUNK_ROWS) {
-        let chunk_end = (chunk_start + MAX_CHUNK_ROWS).min(record.num_rows());
+    for chunk_start in (0..record.num_rows()).step_by(batch_write_rows) {
+        let chunk_end = (chunk_start + batch_write_rows).min(record.num_rows());
         let chunk_length = chunk_end - chunk_start;
 
         let chunk_columns: Vec<Arc<dyn Array>> = record
