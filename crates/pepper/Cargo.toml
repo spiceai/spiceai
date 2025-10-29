@@ -1,11 +1,11 @@
 [package]
-name = "pepper"
-version = "0.1.0"
-edition = "2021"
 authors = ["Spice.ai OSS Authors"]
 description = "Pepper: A DuckLake-inspired lakehouse format using SQLite for metadata and Vortex files for data storage"
+edition = "2021"
 license = "Apache-2.0"
+name = "pepper"
 repository = "https://github.com/spiceai/spiceai"
+version = "0.1.0"
 
 [dependencies]
 arrow = { workspace = true }
@@ -33,7 +33,7 @@ snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 uuid = { version = "1.11", features = ["v7"] }
-vortex-datafusion = { path = "../vortex-datafusion" }
+vortex-datafusion = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

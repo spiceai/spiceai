@@ -414,9 +414,6 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
-    #[snafu(display("Full text search is not supported for views."))]
-    FullTextSearchNotSupportedForView,
-
     #[cfg(feature = "cluster")]
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
