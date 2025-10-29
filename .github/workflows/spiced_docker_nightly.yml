@@ -2,7 +2,7 @@ name: spiced_docker_nightly
 
 on:
   schedule:
-    - cron: '0 9 * * *' # Runs the workflow at 9:00 AM UTC (1AM PT) every day
+    - cron: "0 9 * * *" # Runs the workflow at 9:00 AM UTC (1AM PT) every day
 
   workflow_dispatch:
     inputs:
@@ -12,13 +12,13 @@ on:
         type: boolean
         default: false
       profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
+        description: "Which Rust build profile to use? (Default is release)"
         required: false
         type: choice
         options:
-          - 'release'
-          - 'release-lto'
-        default: 'release'
+          - "release"
+          - "release-lto"
+        default: "release"
 
 permissions:
   packages: write
@@ -132,7 +132,7 @@ jobs:
             INSTALL_ORACLE_ODPIC=true
 
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
@@ -144,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           path: /tmp
           pattern: images-*

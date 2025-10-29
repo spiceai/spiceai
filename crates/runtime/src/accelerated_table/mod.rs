@@ -443,7 +443,6 @@ impl Builder {
                         has_primary_key: bool,
                         has_append_stream: bool,
                     ) -> AcceleratedTableBuilderResult<Self> {
-                        // If the data connector supports streaming the append changes (i.e. Kafka Data Connector), then prioritize that.
                         if has_append_stream {
                             Ok(AppendMode::ChangesStream)
                         } else if has_time_column || has_primary_key {

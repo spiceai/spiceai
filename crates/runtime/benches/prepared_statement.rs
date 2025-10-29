@@ -1,10 +1,10 @@
 #![allow(clippy::expect_used)]
 
-use std::sync::Arc;
+use std::{hint::black_box, sync::Arc};
 
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::prelude::SessionContext;
 
 /// Benchmark parameter binding time (`RecordBatch` → `ParamValues` conversion)

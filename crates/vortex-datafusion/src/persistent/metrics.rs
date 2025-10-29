@@ -132,7 +132,7 @@ fn metric_value_to_datafusion(name: &str, metric: &Metric) -> Vec<DatafusionMetr
             if let Some(p95) = f_to_u(snapshot.value(0.95)) {
                 res.push(df_gauge(format!("{name}_p95"), p95));
             }
-            if let Some(p99) = f_to_u(snapshot.value(0.95)) {
+            if let Some(p99) = f_to_u(snapshot.value(0.99)) {
                 res.push(df_gauge(format!("{name}_p99"), p99));
             }
             res

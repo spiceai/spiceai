@@ -1,0 +1,68 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-turso[file-many]
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/customer.db
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/lineitem.db
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/nation.db
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/orders.db
+  - from: file:data/part.parquet
+    name: part
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/part.db
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/partsupp.db
+  - from: file:data/region.parquet
+    name: region
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/region.db
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/supplier.db

@@ -63,7 +63,7 @@ jobs:
 
       - name: Upload OpenAPI artifact
         if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: openapi.json
           path: .schema/openapi.json

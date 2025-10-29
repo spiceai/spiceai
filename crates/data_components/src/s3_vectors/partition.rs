@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(result, "idx.col.abcde.12345");
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Hash, PartialEq, Eq)]
     struct Bucket {
         signature: Signature,
     }
