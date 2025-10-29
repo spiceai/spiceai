@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! SQLite implementation of the metastore backend.
+//! `SQLite` implementation of the metastore backend.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreValue, QueryParams,
@@ -24,13 +24,13 @@ use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::path::Path;
 
-/// SQLite-based metastore backend.
+/// `SQLite`-based metastore backend.
 pub struct SqliteMetastore {
     connection_string: String,
 }
 
 impl SqliteMetastore {
-    /// Create a new SQLite metastore.
+    /// Create a new `SQLite` metastore.
     pub fn new(connection_string: impl Into<String>) -> Self {
         Self {
             connection_string: connection_string.into(),
@@ -44,9 +44,9 @@ impl SqliteMetastore {
             .unwrap_or(&self.connection_string)
     }
 
-    /// Open a SQLite connection configured for concurrent access.
+    /// Open a `SQLite` connection configured for concurrent access.
     ///
-    /// Applies performance optimizations based on SQLite best practices:
+    /// Applies performance optimizations based on `SQLite` best practices:
     /// - WAL mode for non-blocking reads/writes
     /// - Busy timeout to reduce lock contention errors
     /// - NORMAL synchronous mode (safe with WAL)
@@ -171,7 +171,7 @@ impl SqliteMetastore {
     ";
 }
 
-/// SQLite row wrapper implementing `MetastoreRow`.
+/// `SQLite` row wrapper implementing `MetastoreRow`.
 struct SqliteRow {
     values: Vec<MetastoreValue>,
 }
@@ -228,7 +228,7 @@ impl MetastoreRow for SqliteRow {
     }
 }
 
-/// Convert rusqlite::Value to MetastoreValue.
+/// Convert `rusqlite::Value` to `MetastoreValue`.
 fn convert_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> MetastoreValue {
     match value {
         rusqlite::types::ValueRef::Null => MetastoreValue::Null,
@@ -247,7 +247,7 @@ fn convert_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> MetastoreValue 
     }
 }
 
-/// Convert MetastoreValue to rusqlite parameter.
+/// Convert `MetastoreValue` to rusqlite parameter.
 fn to_sqlite_param(value: &MetastoreValue) -> Box<dyn rusqlite::ToSql> {
     match value {
         MetastoreValue::Integer(i) => Box::new(*i),
@@ -321,8 +321,10 @@ impl MetastoreBackend for SqliteMetastore {
             let params_refs: Vec<Box<dyn rusqlite::ToSql>> =
                 param_values.iter().map(to_sqlite_param).collect();
 
-            let params_slice: Vec<&dyn rusqlite::ToSql> =
-                params_refs.iter().map(|p| p.as_ref()).collect();
+            let params_slice: Vec<&dyn rusqlite::ToSql> = params_refs
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
 
             conn.execute(&sql, params_slice.as_slice())?;
 
@@ -366,8 +368,10 @@ impl MetastoreBackend for SqliteMetastore {
             let params_refs: Vec<Box<dyn rusqlite::ToSql>> =
                 param_values.iter().map(to_sqlite_param).collect();
 
-            let params_slice: Vec<&dyn rusqlite::ToSql> =
-                params_refs.iter().map(|p| p.as_ref()).collect();
+            let params_slice: Vec<&dyn rusqlite::ToSql> = params_refs
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
 
             conn.query_row(&sql, params_slice.as_slice(), |row| {
                 let column_count = row.as_ref().column_count();
@@ -403,8 +407,10 @@ impl MetastoreBackend for SqliteMetastore {
             let params_refs: Vec<Box<dyn rusqlite::ToSql>> =
                 param_values.iter().map(to_sqlite_param).collect();
 
-            let params_slice: Vec<&dyn rusqlite::ToSql> =
-                params_refs.iter().map(|p| p.as_ref()).collect();
+            let params_slice: Vec<&dyn rusqlite::ToSql> = params_refs
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
 
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_slice.as_slice(), |row| {
@@ -430,30 +436,6 @@ impl MetastoreBackend for SqliteMetastore {
         .await;
 
         Self::handle_blocking_result(result, "Query rows")
-    }
-
-    async fn begin_transaction(&self) -> CatalogResult<()> {
-        self.execute(ExecuteParams {
-            sql: "BEGIN TRANSACTION",
-            params: vec![],
-        })
-        .await
-    }
-
-    async fn commit_transaction(&self) -> CatalogResult<()> {
-        self.execute(ExecuteParams {
-            sql: "COMMIT",
-            params: vec![],
-        })
-        .await
-    }
-
-    async fn rollback_transaction(&self) -> CatalogResult<()> {
-        self.execute(ExecuteParams {
-            sql: "ROLLBACK",
-            params: vec![],
-        })
-        .await
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {

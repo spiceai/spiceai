@@ -52,7 +52,7 @@ enum MetastoreImpl {
 ///
 /// ## Concurrency Model
 ///
-/// The catalog uses a metastore backend (SQLite or Turso) with WAL mode which allows:
+/// The catalog uses a metastore backend (`SQLite` or Turso) with WAL mode which allows:
 /// - Multiple concurrent readers
 /// - One writer at a time (serialized by the backend)
 ///
@@ -66,9 +66,14 @@ impl PepperCatalog {
     /// Create a new Pepper catalog with the appropriate metastore backend.
     ///
     /// The connection string determines which backend to use:
-    /// - `sqlite://path` - SQLite backend
+    /// - `sqlite://path` - `SQLite` backend
     /// - `libsql://path` - Turso backend (requires `turso` feature)
-    pub fn new(connection_string: impl Into<String>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidOperation`] if the `libsql://` scheme is used
+    /// but the `turso` feature is not enabled.
+    pub fn new(connection_string: impl Into<String>) -> CatalogResult<Self> {
         let connection_string = connection_string.into();
         let metastore = if connection_string.starts_with("libsql://") {
             #[cfg(feature = "turso")]
@@ -77,16 +82,18 @@ impl PepperCatalog {
             }
             #[cfg(not(feature = "turso"))]
             {
-                panic!("Turso backend requested but 'turso' feature is not enabled. Enable with --features turso");
+                return Err(CatalogError::InvalidOperation {
+                    message: "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso".to_string(),
+                });
             }
         } else {
             MetastoreImpl::Sqlite(SqliteMetastore::new(&connection_string))
         };
 
-        Self {
+        Ok(Self {
             connection_string,
             metastore,
-        }
+        })
     }
 
     /// Get the database file path from the connection string.
@@ -159,10 +166,10 @@ impl PepperCatalog {
 }
 
 impl PepperCatalog {
-    /// Helper to query a single row from metastore, working with both SQLite and Turso
+    /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     async fn query_row_helper<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
     where
-        F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static + Copy,
+        F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
         match &self.metastore {
@@ -172,7 +179,7 @@ impl PepperCatalog {
         }
     }
 
-    /// Helper to execute a statement on metastore, working with both SQLite and Turso
+    /// Helper to execute a statement on metastore, working with both `SQLite` and Turso
     async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
         match &self.metastore {
             MetastoreImpl::Sqlite(m) => m.execute(params).await,
@@ -181,7 +188,7 @@ impl PepperCatalog {
         }
     }
 
-    /// Helper to query multiple rows from metastore, working with both SQLite and Turso
+    /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
     async fn query_helper<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
     where
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
@@ -297,63 +304,62 @@ impl MetadataCatalog for PepperCatalog {
             )
             .await;
 
-        let create_result: CreateTableResult = match double_check {
-            Ok(id) => CreateTableResult::AlreadyExists { table_id: id },
-            Err(_) => {
-                // Get next catalog ID (for table_id)
-                let next_catalog_id: i64 = self
-                    .query_row_helper(
-                        QueryRowParams {
-                            sql: "SELECT value FROM pepper_metadata WHERE key = 'next_catalog_id'",
-                            params: vec![],
-                        },
-                        |row| row.get_i64(0),
-                    )
-                    .await?;
-
-                let table_id = next_catalog_id;
-
-                // Generate table UUID
-                let table_uuid = uuid::Uuid::now_v7().to_string();
-
-                // Generate initial snapshot UUID
-                let initial_snapshot_id = uuid::Uuid::now_v7().to_string();
-
-                // Insert table metadata with initial snapshot
-                self.execute_helper(ExecuteParams {
-                    sql: r"
-                        INSERT INTO pepper_table (
-                            table_id, table_uuid,
-                            table_name, path, path_is_relative, schema_json, primary_key_json,
-                            current_snapshot_id, partition_column
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    ",
-                    params: vec![
-                        MetastoreValue::Integer(table_id),
-                        MetastoreValue::Text(table_uuid),
-                        MetastoreValue::Text(table_name.clone()),
-                        MetastoreValue::Text(base_path.clone()),
-                        MetastoreValue::Bool(false), // path_is_relative
-                        MetastoreValue::Text(schema_json),
-                        primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
-                        MetastoreValue::Text(initial_snapshot_id.clone()),
-                        partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
-                    ],
-                })
+        let create_result: CreateTableResult = if let Ok(id) = double_check {
+            CreateTableResult::AlreadyExists { table_id: id }
+        } else {
+            // Get next catalog ID (for table_id)
+            let next_catalog_id: i64 = self
+                .query_row_helper(
+                    QueryRowParams {
+                        sql: "SELECT value FROM pepper_metadata WHERE key = 'next_catalog_id'",
+                        params: vec![],
+                    },
+                    |row| row.get_i64(0),
+                )
                 .await?;
 
-                // Update next_catalog_id in metadata
-                self.execute_helper(ExecuteParams {
-                    sql: "UPDATE pepper_metadata SET value = ?1 WHERE key = 'next_catalog_id'",
-                    params: vec![MetastoreValue::Integer(next_catalog_id + 1)],
-                })
-                .await?;
+            let table_id = next_catalog_id;
 
-                CreateTableResult::Created {
-                    table_id,
-                    snapshot_id: initial_snapshot_id,
-                    base_path: base_path.clone(),
-                }
+            // Generate table UUID
+            let table_uuid = uuid::Uuid::now_v7().to_string();
+
+            // Generate initial snapshot UUID
+            let initial_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+            // Insert table metadata with initial snapshot
+            self.execute_helper(ExecuteParams {
+                sql: r"
+                    INSERT INTO pepper_table (
+                        table_id, table_uuid,
+                        table_name, path, path_is_relative, schema_json, primary_key_json,
+                        current_snapshot_id, partition_column
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params: vec![
+                    MetastoreValue::Integer(table_id),
+                    MetastoreValue::Text(table_uuid),
+                    MetastoreValue::Text(table_name.clone()),
+                    MetastoreValue::Text(base_path.clone()),
+                    MetastoreValue::Bool(false), // path_is_relative
+                    MetastoreValue::Text(schema_json),
+                    primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                    MetastoreValue::Text(initial_snapshot_id.clone()),
+                    partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                ],
+            })
+            .await?;
+
+            // Update next_catalog_id in metadata
+            self.execute_helper(ExecuteParams {
+                sql: "UPDATE pepper_metadata SET value = ?1 WHERE key = 'next_catalog_id'",
+                params: vec![MetastoreValue::Integer(next_catalog_id + 1)],
+            })
+            .await?;
+
+            CreateTableResult::Created {
+                table_id,
+                snapshot_id: initial_snapshot_id,
+                base_path: base_path.clone(),
             }
         };
 
@@ -783,21 +789,6 @@ impl MetadataCatalog for PepperCatalog {
         )
         .await
     }
-
-    async fn begin_transaction(&self) -> CatalogResult<()> {
-        // Implementation would begin SQLite transaction
-        Ok(())
-    }
-
-    async fn commit_transaction(&self) -> CatalogResult<()> {
-        // Implementation would commit SQLite transaction
-        Ok(())
-    }
-
-    async fn rollback_transaction(&self) -> CatalogResult<()> {
-        // Implementation would rollback SQLite transaction
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -806,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_creation() {
-        let _catalog = PepperCatalog::new("sqlite://./test.db");
+        let _catalog = PepperCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
         // Tests will be added once implementation is complete
     }
 }

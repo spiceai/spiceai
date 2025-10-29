@@ -29,7 +29,7 @@ pub enum BackendType {
 }
 
 impl BackendType {
-    pub fn name(&self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             BackendType::Sqlite => "SQLite",
             #[cfg(feature = "turso")]
@@ -77,11 +77,6 @@ impl TestFixture {
             backend_type: backend,
         })
     }
-
-    /// Get the database path for SQLite-specific verification
-    pub fn db_path(&self) -> std::path::PathBuf {
-        self.temp_dir.path().join("test.db")
-    }
 }
 
 /// Run a test with all available backends
@@ -91,14 +86,14 @@ macro_rules! test_with_backends {
         paste::paste! {
             #[tokio::test]
             async fn [<$test_fn _sqlite>]() -> Result<(), Box<dyn std::error::Error>> {
-                println!("\n🔧 Running {} with SQLite backend", stringify!($test_fn));
+                tracing::debug!("\n🔧 Running {} with SQLite backend", stringify!($test_fn));
                 common::run_with_backend(common::BackendType::Sqlite, $test_fn).await
             }
 
             #[cfg(feature = "turso")]
             #[tokio::test]
             async fn [<$test_fn _turso>]() -> Result<(), Box<dyn std::error::Error>> {
-                println!("\n🔧 Running {} with Turso backend", stringify!($test_fn));
+                tracing::debug!("\n🔧 Running {} with Turso backend", stringify!($test_fn));
                 common::run_with_backend(common::BackendType::Turso, $test_fn).await
             }
         }

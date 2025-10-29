@@ -17,7 +17,7 @@ limitations under the License.
 //! Metastore backend abstraction for Pepper catalog storage.
 //!
 //! This module provides a trait-based abstraction over different database backends
-//! that can be used to store Pepper metadata. This allows swapping between SQLite,
+//! that can be used to store Pepper metadata. This allows swapping between `SQLite`,
 //! Turso, or other storage implementations.
 
 pub mod sqlite;
@@ -195,10 +195,71 @@ impl<T: MetastoreGetValue> MetastoreGetValue for Option<T> {
     }
 }
 
+// Transaction support is backend-specific and cannot be expressed as a trait object
+// due to generic methods. Each backend should provide its own concrete transaction type.
+//
+// For example:
+// - SqliteMetastore provides SqliteTransaction
+// - TursoMetastore provides TursoTransaction
+//
+// These concrete types should follow the RAII pattern:
+// - Automatically rollback on drop unless explicitly committed
+// - Provide execute(), query_row(), query() methods matching the MetastoreBackend API
+// - Provide commit() and rollback() methods
+/// The transaction must be explicitly committed via `commit()`, otherwise it will
+/// automatically rollback when dropped.
+#[async_trait]
+pub trait MetastoreTransaction: Send + Sync {
+    /// Execute a SQL statement that modifies data within the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement cannot be executed.
+    async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()>;
+
+    /// Query a single row from the database within the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or returns no rows.
+    async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
+    where
+        F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
+        T: Send + 'static;
+
+    /// Query multiple rows from the database within the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    async fn query<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
+    where
+        F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
+        T: Send + 'static;
+
+    /// Commit the transaction.
+    ///
+    /// After calling this, the transaction guard will not rollback on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be committed.
+    async fn commit(self) -> CatalogResult<()>;
+
+    /// Explicitly rollback the transaction.
+    ///
+    /// This is optional as the transaction will automatically rollback on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be rolled back.
+    async fn rollback(self) -> CatalogResult<()>;
+}
+
 /// Trait for metastore backend implementations.
 ///
 /// This trait abstracts the database layer for the Pepper catalog, allowing
-/// different storage backends (SQLite, Turso, etc.) to be used interchangeably.
+/// different storage backends (`SQLite`, Turso, etc.) to be used interchangeably.
 #[async_trait]
 pub trait MetastoreBackend: Send + Sync {
     /// Initialize the metastore schema (create tables if they don't exist).
@@ -241,27 +302,6 @@ pub trait MetastoreBackend: Send + Sync {
     where
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static;
-
-    /// Begin a transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the transaction cannot be started.
-    async fn begin_transaction(&self) -> CatalogResult<()>;
-
-    /// Commit the current transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the transaction cannot be committed.
-    async fn commit_transaction(&self) -> CatalogResult<()>;
-
-    /// Rollback the current transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the transaction cannot be rolled back.
-    async fn rollback_transaction(&self) -> CatalogResult<()>;
 
     /// Shutdown the metastore, performing any necessary cleanup.
     ///

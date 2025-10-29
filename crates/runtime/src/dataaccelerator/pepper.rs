@@ -329,8 +329,12 @@ impl PepperAccelerator {
             .get_or_try_init(move || {
                 let connection_string = connection_string.clone();
                 async move {
-                    let catalog = Arc::new(pepper::PepperCatalog::new(connection_string))
-                        as Arc<dyn pepper::MetadataCatalog>;
+                    let catalog =
+                        Arc::new(pepper::PepperCatalog::new(connection_string).map_err(|e| {
+                            Error::AccelerationInitializationFailed {
+                                source: Box::new(e),
+                            }
+                        })?) as Arc<dyn pepper::MetadataCatalog>;
 
                     catalog
                         .init()
@@ -367,8 +371,7 @@ impl PepperAccelerator {
             let metastore_type = acceleration
                 .params
                 .get("pepper_metastore")
-                .map(|s| s.as_str())
-                .unwrap_or("sqlite");
+                .map_or("sqlite", std::string::String::as_str);
 
             (metadata_dir, metastore_type.to_string())
         } else {
@@ -640,9 +643,13 @@ impl DataAccelerator for PepperAccelerator {
             })?;
 
             // Create a new catalog - it will use WAL mode and busy timeout internally
-            let catalog = Arc::new(pepper::PepperCatalog::new(format!(
-                "sqlite://{metadata_dir}/pepper.db"
-            ))) as Arc<dyn pepper::MetadataCatalog>;
+            let catalog = Arc::new(
+                pepper::PepperCatalog::new(format!("sqlite://{metadata_dir}/pepper.db")).map_err(
+                    |e| Error::AccelerationInitializationFailed {
+                        source: Box::new(e),
+                    },
+                )?,
+            ) as Arc<dyn pepper::MetadataCatalog>;
 
             // Initialize the catalog (creates tables if needed)
             catalog

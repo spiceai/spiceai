@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+#![allow(clippy::clone_on_ref_ptr)]
+
 //! Test DELETE operations for Pepper
 //!
 //! These tests work at the API level by calling `delete_from()` directly,
@@ -26,9 +29,8 @@ use data_components::delete::DeletionTableProvider;
 use datafusion::prelude::*;
 use datafusion_physical_plan::collect;
 use pepper::metadata::CreateTableOptions;
-use pepper::{MetadataCatalog, PepperCatalog, PepperTableProvider};
+use pepper::{MetadataCatalog, PepperTableProvider};
 use std::sync::Arc;
-use tempfile::TempDir;
 
 // Generate test variants for each backend
 test_with_backends!(test_delete_with_primary_key_impl);
@@ -42,10 +44,7 @@ async fn test_delete_with_primary_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend_name = fixture.backend_type.name();
-    println!(
-        "\n🧪 Testing DELETE with primary key using {}...",
-        backend_name
-    );
+    println!("\n🧪 Testing DELETE with primary key using {backend_name}...");
 
     // 1. Setup test environment
     let data_path = fixture.data_path;
@@ -180,10 +179,7 @@ async fn test_delete_without_primary_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend_name = fixture.backend_type.name();
-    println!(
-        "\n🧪 Testing DELETE without primary key using {}...",
-        backend_name
-    );
+    println!("\n🧪 Testing DELETE without primary key using {backend_name}...");
 
     // 1. Setup test environment
     let temp_dir = &fixture.temp_dir;
@@ -284,7 +280,7 @@ async fn test_delete_all_rows_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend_name = fixture.backend_type.name();
-    println!("\n🧪 Testing DELETE all rows using {}...", backend_name);
+    println!("\n🧪 Testing DELETE all rows using {backend_name}...");
 
     // 1. Setup test environment
     let temp_dir = &fixture.temp_dir;
@@ -360,10 +356,7 @@ async fn test_delete_then_insert_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend_name = fixture.backend_type.name();
-    println!(
-        "\n🧪 Testing DELETE followed by INSERT using {}...",
-        backend_name
-    );
+    println!("\n🧪 Testing DELETE followed by INSERT using {backend_name}...");
 
     // 1. Setup test environment
     let temp_dir = &fixture.temp_dir;
@@ -466,10 +459,7 @@ async fn test_delete_with_complex_filter_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend_name = fixture.backend_type.name();
-    println!(
-        "\n🧪 Testing DELETE with complex filter using {}...",
-        backend_name
-    );
+    println!("\n🧪 Testing DELETE with complex filter using {backend_name}...");
 
     // 1. Setup test environment
     let temp_dir = &fixture.temp_dir;

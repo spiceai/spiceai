@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 //! Simple integration test for Pepper with Vortex
 
 mod common;
@@ -38,7 +40,7 @@ async fn test_pepper_basic_workflow_impl(
     let data_path = &fixture.data_path;
     let backend_name = fixture.backend_type.name();
 
-    println!("✓ Catalog initialized with {} backend", backend_name);
+    println!("✓ Catalog initialized with {backend_name} backend");
 
     // 2. Create table schema
     let schema = Arc::new(Schema::new(vec![
@@ -56,7 +58,7 @@ async fn test_pepper_basic_workflow_impl(
 
     // 3. Create Pepper table provider
     let table = PepperTableProvider::create_table(
-        Arc::<pepper::PepperCatalog>::clone(&catalog),
+        Arc::<pepper::PepperCatalog>::clone(catalog),
         table_options,
     )
     .await?;
@@ -163,7 +165,7 @@ async fn test_pepper_basic_workflow_impl(
 
     // 13. Verify metastore after first insert (SQLite only)
     if fixture.backend_type == common::BackendType::Sqlite {
-        verify_sqlite_metadata(&fixture.db_path(), &data_path)?;
+        verify_sqlite_metadata(&fixture.db_path(), data_path)?;
         println!("✓ SQLite metastore verification successful (round 1)");
     }
 
@@ -259,7 +261,7 @@ async fn test_pepper_basic_workflow_impl(
 
     // 20. Verify metastore after second insert (SQLite only)
     if fixture.backend_type == common::BackendType::Sqlite {
-        verify_sqlite_metadata(&fixture.db_path(), &data_path)?;
+        verify_sqlite_metadata(&fixture.db_path(), data_path)?;
         println!("✓ SQLite metastore verification successful (round 2)");
     }
 
@@ -553,25 +555,19 @@ async fn test_pepper_catalog_persistence_impl(
 
     // Create catalog and initialize
     {
-        let catalog = pepper::PepperCatalog::new(connection_string.clone());
+        let catalog = pepper::PepperCatalog::new(connection_string.clone())?;
         catalog.init().await?;
-        println!("✓ First initialization complete with {}", backend_name);
+        println!("✓ First initialization complete with {backend_name}");
     }
 
     // Re-open and verify it doesn't fail
     {
-        let catalog = pepper::PepperCatalog::new(connection_string);
+        let catalog = pepper::PepperCatalog::new(connection_string)?;
         catalog.init().await?;
-        println!(
-            "✓ Second initialization complete (idempotent) with {}",
-            backend_name
-        );
+        println!("✓ Second initialization complete (idempotent) with {backend_name}");
     }
 
-    println!(
-        "\n✅ Catalog persistence test passed with {}!",
-        backend_name
-    );
+    println!("\n✅ Catalog persistence test passed with {backend_name}!");
     Ok(())
 }
 
@@ -590,10 +586,7 @@ async fn test_pepper_statistics_impl(
     use std::sync::Arc;
 
     let backend_name = fixture.backend_type.name();
-    println!(
-        "\n🧪 Testing Pepper statistics tracking with {}...",
-        backend_name
-    );
+    println!("\n🧪 Testing Pepper statistics tracking with {backend_name}...");
 
     // 1. Setup test environment
     let catalog = fixture.catalog;
@@ -657,10 +650,7 @@ async fn test_pepper_statistics_impl(
         println!("  • Statistics provide query optimizer information for better performance");
     }
 
-    println!(
-        "\n✅ Statistics tracking test passed with {}!",
-        backend_name
-    );
+    println!("\n✅ Statistics tracking test passed with {backend_name}!");
     Ok(())
 }
 
@@ -682,10 +672,7 @@ async fn test_pepper_core_data_types_impl(
     use std::f64::consts::{E as F64_E, PI as F64_PI};
 
     let backend_name = fixture.backend_type.name();
-    println!(
-        "\n🧪 Testing Pepper core data type support with {}...",
-        backend_name
-    );
+    println!("\n🧪 Testing Pepper core data type support with {backend_name}...");
 
     let catalog = fixture.catalog;
     let data_path = fixture.data_path;
@@ -930,6 +917,6 @@ async fn test_pepper_core_data_types_impl(
     assert_eq!(dec_col.value(0), 314_159_265_358_i128);
     println!("  ✓ Decimal128: {}", dec_col.value(0));
 
-    println!("\n✅ Core data types test passed with {}!", backend_name);
+    println!("\n✅ Core data types test passed with {backend_name}!");
     Ok(())
 }
