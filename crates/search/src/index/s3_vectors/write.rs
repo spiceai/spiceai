@@ -114,7 +114,8 @@ pub async fn write(
         return process_single_batch(index, table, record).await;
     }
 
-    let mut result_batches = Vec::new();
+    let mut result_batches =
+        Vec::with_capacity((record.num_rows() + MAX_CHUNK_ROWS - 1) / MAX_CHUNK_ROWS);
     let schema = record.schema();
 
     for chunk_start in (0..record.num_rows()).step_by(MAX_CHUNK_ROWS) {
