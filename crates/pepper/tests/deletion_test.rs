@@ -19,32 +19,36 @@ limitations under the License.
 //! These tests work at the API level by calling `delete_from()` directly,
 //! rather than using SQL DELETE statements (which require runtime-level integration).
 
+mod common;
+
 use arrow::datatypes::{DataType, Field, Schema};
 use data_components::delete::DeletionTableProvider;
 use datafusion::prelude::*;
 use datafusion_physical_plan::collect;
 use pepper::metadata::CreateTableOptions;
-use pepper::{MetadataCatalog, PepperCatalog, PepperTableProvider};
+use pepper::{MetadataCatalog, PepperTableProvider};
 use std::sync::Arc;
-use tempfile::TempDir;
 
-#[tokio::test]
+// Generate test variants for each backend
+test_with_backends!(test_delete_with_primary_key_impl);
+test_with_backends!(test_delete_without_primary_key_impl);
+test_with_backends!(test_delete_all_rows_impl);
+test_with_backends!(test_delete_then_insert_impl);
+test_with_backends!(test_delete_with_complex_filter_impl);
+
 #[allow(clippy::too_many_lines)]
-async fn test_delete_with_primary_key() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🧪 Testing DELETE with primary key...");
+async fn test_delete_with_primary_key_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_name = fixture.backend_type.name();
+    println!(
+        "\n🧪 Testing DELETE with primary key using {}...",
+        backend_name
+    );
 
     // 1. Setup test environment
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("delete_pk_test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
-
-    // 2. Create catalog and table with primary key
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
+    let catalog: Arc<dyn MetadataCatalog> = fixture.catalog;
+    let data_path = fixture.data_path;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
