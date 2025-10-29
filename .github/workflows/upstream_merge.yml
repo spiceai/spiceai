@@ -146,7 +146,8 @@ jobs:
         if: steps.merge.outputs.conflicts == 'true' && (env.RUN_CONFLICT_RESOLUTION != 'true' || steps.llm.outputs.status != 'resolved')
         run: |
           CONFLICT_FILES=$(git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' || true)
-          git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' | xargs -r git add
+          git diff --name-only --diff-filter=U | grep '^\.github/workflows/' | xargs -r git restore
+          git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' | xargs -r git add          
           
           if [ -n "$CONFLICT_FILES" ]; then
             FILES_LIST=$(echo "$CONFLICT_FILES" | tr '\n' ',' | sed 's/,$//')
