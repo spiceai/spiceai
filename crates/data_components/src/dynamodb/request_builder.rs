@@ -359,9 +359,10 @@ impl DynamoDBRequestPlanBuilder {
 
             if self.schema.is_flattened_field(field_name) {
                 if let Some(top_level) = field_name.split('.').next()
-                    && seen_top_level.insert(top_level) {
-                        projection_expr.push(format!("#{top_level}"));
-                    }
+                    && seen_top_level.insert(top_level)
+                {
+                    projection_expr.push(format!("#{top_level}"));
+                }
             } else {
                 // Also track non-flattened top-level fields
                 let top_level = field_name.split('.').next().unwrap_or(field_name);
@@ -391,9 +392,10 @@ impl DynamoDBRequestPlanBuilder {
             if self.schema.is_flattened_field(field_name) {
                 // For flattened fields, add only top-level segment
                 if let Some(top_level) = field_name.split('.').next()
-                    && seen_top_level.insert(top_level) {
-                        attribute_names.insert(format!("#{top_level}"), top_level.to_string());
-                    }
+                    && seen_top_level.insert(top_level)
+                {
+                    attribute_names.insert(format!("#{top_level}"), top_level.to_string());
+                }
             } else {
                 // For non-flattened fields, add the full name
                 attribute_names.insert(format!("#{field_name}"), field_name.to_string());
