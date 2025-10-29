@@ -1455,9 +1455,7 @@ impl DataFusion {
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<JoinHandle<Option<Arc<Notify>>>> {
         tracing::info!("Initializing view {}", &view.name);
-
-        let table_exists = self.ctx.table_exist(view.name.clone()).unwrap_or(false);
-        if table_exists {
+        if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
             return TableAlreadyExistsSnafu.fail();
         }
         ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &view.name)?;
@@ -1480,10 +1478,8 @@ impl DataFusion {
         let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
 
-        tracing::debug!(
-            "Creating view {} with dependent tables {dependent_table_names:?}",
-            view.name
-        );
+        let table = view.name.clone();
+        tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
         let register_task: JoinHandle<Option<Arc<Notify>>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
@@ -1492,7 +1488,6 @@ impl DataFusion {
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<TableReference> = None;
-            let table = &view.name;
 
             for dependent_table_name in &dependent_table_names {
                 let mut attempts = 0;
@@ -1529,18 +1524,18 @@ impl DataFusion {
                 tracing::error!(
                     "Failed to create view {table}. Dependent table {missing_table} does not exist."
                 );
-                status.update_view(table, status::ComponentStatus::Error);
+                status.update_view(&table, status::ComponentStatus::Error);
                 return None;
             }
 
             // If view depends on other tables, wait until they are ready
-            wait_until_dependent_tables_are_ready(table, &dependent_table_names, &status).await;
+            wait_until_dependent_tables_are_ready(&table, &dependent_table_names, &status).await;
 
             let tbl_provider = match prepare_view(&ctx, &statements[0], &view).await {
                 Ok(tbl) => tbl,
                 Err(e) => {
                     tracing::error!("Failed to create view {table}: {e}");
-                    status.update_view(table, status::ComponentStatus::Error);
+                    status.update_view(&table, status::ComponentStatus::Error);
                     return None;
                 }
             };
@@ -1556,7 +1551,7 @@ impl DataFusion {
                     }
                     Err(e) => {
                         tracing::error!("Failed to create view {table}: {e}");
-                        status.update_view(table, status::ComponentStatus::Error);
+                        status.update_view(&table, status::ComponentStatus::Error);
                         return None;
                     }
                 }
@@ -1565,11 +1560,11 @@ impl DataFusion {
             // non-accelerated view
             if let Err(e) = ctx.register_table(table.clone(), tbl_provider) {
                 tracing::error!("Failed to create view {table}: {e}");
-                status.update_view(table, status::ComponentStatus::Error);
+                status.update_view(&table, status::ComponentStatus::Error);
                 return None;
             }
-            tracing::info!("{}", view_registered_trace(table, None));
-            status.update_view(table, status::ComponentStatus::Ready);
+            tracing::info!("{}", view_registered_trace(&table, None));
+            status.update_view(&table, status::ComponentStatus::Ready);
 
             None
         });
