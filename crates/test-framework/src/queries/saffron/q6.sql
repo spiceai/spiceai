@@ -16,4 +16,4 @@ WHERE A.AccountSid = ?
   AND (CASE WHEN ? THEN A.AvailableForNumberSelection = 1 ELSE A.AvailableForNumberSelection IN (1, 0) END)
   AND A.Capability = ?
 ORDER BY A.NumberSid
-LIMIT ?, 1
+LIMIT 1 OFFSET ?

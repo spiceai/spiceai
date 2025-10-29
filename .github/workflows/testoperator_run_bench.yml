@@ -22,6 +22,7 @@ on:
           - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
+          - 'saffron[parameterized]'
       query_overrides:
         description: 'Query overrides'
         required: false

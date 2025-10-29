@@ -59,7 +59,7 @@
          "--query-set",
         "saffron[parameterized]",
         "-p",
-        "./test/spicepods/customers/saffron/sf1/s3[parquet]-duckdb[file]_view_with_partitioning.yaml"
+        "./test/spicepods/saffron/sf1/s3[parquet]-duckdb[file]_view_with_partitioning.yaml"
       ],
       "env": {},
       "cwd": "${workspaceFolder}",
