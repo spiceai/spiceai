@@ -45,7 +45,7 @@ impl TursoMetastore {
     /// Get the database file path from the connection string.
     fn db_path(&self) -> &str {
         self.connection_string
-            .strip_prefix("turso://")
+            .strip_prefix("libsql://")
             .unwrap_or(&self.connection_string)
     }
 
