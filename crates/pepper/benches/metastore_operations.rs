@@ -88,18 +88,16 @@ fn bench_insert_single(c: &mut Criterion) {
                 MetastoreValue::Integer(100),
                 MetastoreValue::Bool(true),
             ];
-            
+
             // Measure only the insert operation
             rt.block_on(async {
                 let _: () = metastore
-                .execute(ExecuteParams { sql, params })
-                .await
-                .expect("Failed to insert");
-                black_box(
-                    (),
-                );
+                    .execute(ExecuteParams { sql, params })
+                    .await
+                    .expect("Failed to insert");
+                black_box(());
             });
-            
+
             // Cleanup (not measured as part of the benchmark)
             rt.block_on(async {
                 metastore
@@ -131,7 +129,7 @@ fn bench_insert_single(c: &mut Criterion) {
                 MetastoreValue::Integer(100),
                 MetastoreValue::Bool(true),
             ];
-            
+
             // Measure only the insert operation
             rt.block_on(async {
                 black_box(
@@ -141,7 +139,7 @@ fn bench_insert_single(c: &mut Criterion) {
                         .expect("Failed to insert"),
                 );
             });
-            
+
             // Cleanup (not measured as part of the benchmark)
             rt.block_on(async {
                 metastore
@@ -190,7 +188,7 @@ fn bench_insert_batch(c: &mut Criterion) {
                         black_box(());
                     }
                 });
-                
+
                 // Cleanup (not measured as part of the benchmark)
                 rt.block_on(async {
                     metastore.execute(ExecuteParams {
@@ -225,7 +223,7 @@ fn bench_insert_batch(c: &mut Criterion) {
                         }).await.expect("Failed to insert"));
                     }
                 });
-                
+
                 // Cleanup (not measured as part of the benchmark)
                 rt.block_on(async {
                     metastore.execute(ExecuteParams {
