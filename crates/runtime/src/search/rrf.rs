@@ -250,15 +250,34 @@ impl Debug for ReciprocalRankFusion {
 
 pub struct ReciprocalRankFusion {
     pub session_context: Arc<SessionContext>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `SessionContext` implement them.
+    session_ptr: u64,
     df: Option<DataFrame>,
+}
+
+impl PartialEq for ReciprocalRankFusion {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_ptr == other.session_ptr
+    }
+}
+
+impl Eq for ReciprocalRankFusion {}
+
+impl std::hash::Hash for ReciprocalRankFusion {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.session_ptr.hash(state);
+    }
 }
 
 // TODO: DF support for nested UDTF calls without ScalarUDF "hack"
 impl ReciprocalRankFusion {
     #[must_use]
     pub fn from_ctx(session_context: &Arc<SessionContext>) -> Self {
+        let ptr = Arc::as_ptr(session_context) as u64;
+
         Self {
             session_context: Arc::clone(session_context),
+            session_ptr: ptr,
             df: None,
         }
     }

@@ -86,12 +86,29 @@ macro_rules! string_array_iter {
 #[derive(Debug)]
 pub struct Embed {
     model_store: Arc<RwLock<EmbeddingModelStore>>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `RwLock<EmbeddingModelStore>` implement them.
+    ptr: u64,
+}
+
+impl PartialEq for Embed {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+impl Eq for Embed {}
+
+impl std::hash::Hash for Embed {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ptr.hash(state);
+    }
 }
 
 impl Embed {
     #[must_use]
     pub fn new(model_store: Arc<RwLock<EmbeddingModelStore>>) -> Self {
-        Self { model_store }
+        let ptr = Arc::as_ptr(&model_store).addr() as u64;
+        Self { model_store, ptr }
     }
 
     fn embed_single(
@@ -245,6 +262,7 @@ mod tests {
     use arrow::array::{FixedSizeListBuilder, LargeStringBuilder};
     use arrow_schema::{DataType, Field};
     use datafusion::common::cast::{as_float32_array, as_list_array};
+    use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
     use llms::model2vec::Model2Vec;
     use std::sync::Arc;
@@ -329,6 +347,7 @@ mod tests {
             arg_fields,
             number_rows,
             return_field: Arc::new(Field::new("embed", return_type, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         }
     }
 

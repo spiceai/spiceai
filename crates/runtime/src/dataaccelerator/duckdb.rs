@@ -109,7 +109,8 @@ impl DuckDBAccelerator {
                     DuckDBSettingsRegistry::new()
                         .with_setting(Box::new(OrderByNonIntegerLiteral))
                         .with_setting(Box::new(settings::IndexScanPercentage))
-                        .with_setting(Box::new(settings::IndexScanMaxCount)),
+                        .with_setting(Box::new(settings::IndexScanMaxCount))
+                        .with_setting(Box::new(settings::TimeZone)),
                 ),
         }
     }
@@ -265,9 +266,9 @@ impl Default for DuckDBAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("file"),
     ParameterSpec::component("data_dir"),
-    ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
@@ -278,6 +279,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
+    ParameterSpec::runtime("partitioned_write_buffer"),
 ];
 
 #[async_trait]

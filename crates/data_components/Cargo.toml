@@ -15,9 +15,9 @@ arrow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
+arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
-arrow_tools = { path = "../arrow_tools" }
 aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
@@ -49,6 +49,7 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+git2 = { workspace = true }
 globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
@@ -76,7 +77,7 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "3044f8188176f050d930a0930f68c6c893f04362", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "8b5495f2ed6eaf8b647b09cc1504a39bdb9bbed8", features = [
     "tls",
 ], optional = true } # spiceai
 tiberius = { workspace = true, optional = true }
@@ -87,8 +88,9 @@ tokio-postgres = { workspace = true, features = [
 ], optional = true }
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
-twox-hash = { workspace = true, optional = true }
 tracing.workspace = true
+turso = { workspace = true, optional = true }
+twox-hash = { workspace = true, optional = true }
 url = "2.5.4"
 util = { path = "../util" }
 uuid.workspace = true
@@ -100,7 +102,6 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 clickhouse = ["dep:clickhouse-rs"]
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka"]
-kafka = ["dep:rdkafka"]
 delta_lake = ["dep:delta_kernel"]
 duckdb = [
     "dep:duckdb",
@@ -111,7 +112,8 @@ duckdb = [
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-async", "dep:derive_builder"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
-mongodb = ["datafusion-table-providers/mongodb",]
+kafka = ["dep:rdkafka"]
+mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []
@@ -121,7 +123,11 @@ postgres = [
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]
-s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter", "dep:twox-hash"]
+s3_vectors = [
+    "dep:s3_vectors",
+    "dep:s3_vectors_metadata_filter",
+    "dep:twox-hash",
+]
 sharepoint = ["dep:graph-rs-sdk"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
@@ -130,6 +136,7 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
+turso = ["dep:turso"]
 
 test_hadoop_catalog_docker = []
 

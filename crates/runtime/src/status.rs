@@ -243,6 +243,12 @@ impl RuntimeStatus {
         self.get_statuses_of_prefix("dataset:")
     }
 
+    /// Returns the status of all registered views.
+    #[must_use]
+    pub fn get_view_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        self.get_statuses_of_prefix("view:")
+    }
+
     /// Returns the status of all registered workers.
     #[must_use]
     pub fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
