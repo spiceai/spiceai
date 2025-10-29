@@ -278,10 +278,10 @@ pub fn get_mega_science_view(
     });
 
     let mut v3 = View::new("v3".to_string());
-    v3.sql = Some("SELECT id, question, answer, reference_answer, source, subject FROM mega_science_ds where subject='math'".to_string());
+    v3.sql = Some("SELECT * FROM mega_science_ds where subject='math'".to_string());
 
     let mut v = View::new(spice_name.unwrap_or("megascience").to_string());
-    v.sql = Some("SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id UNION ALL (SELECT * FROM v3)".to_string());
+    v.sql = Some("SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id UNION ALL (SELECT id, question, reference_answer, answer, source, subject FROM v3)".to_string());
 
     v.acceleration = Some(Acceleration {
         enabled: true,

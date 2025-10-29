@@ -317,6 +317,7 @@ pub(crate) async fn run_search_w_explain(
                         api_config.flight_bind_address
                     )
                 });
+
             for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
@@ -838,7 +839,7 @@ async fn test_text_search_view() -> Result<(), anyhow::Error> {
     let mut app = AppBuilder::new("search_app").with_dataset(ds);
     for v in views {
         app = app.with_view(v);
-    };
+    }
 
     run_search(app.build(),
         vec![
