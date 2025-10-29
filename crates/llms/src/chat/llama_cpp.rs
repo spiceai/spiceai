@@ -240,7 +240,6 @@ impl LlamaCpp {
     /// Create from `HuggingFace` model ID
     pub async fn from_hf(
         _model_id: &str,
-        _hf_token: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         // llama.cpp requires local GGUF files
