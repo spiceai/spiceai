@@ -206,8 +206,6 @@ impl TableProvider for DynamoDBTableProvider {
             self.request_plan_builder
                 .build_request_plan(filters, &projected_schema, limit)?;
 
-        println!("request_plan: {request_plan:?}");
-
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             Arc::clone(&self.client),
             request_plan,

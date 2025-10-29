@@ -25,11 +25,9 @@ fn unnest_dynamodb_item(
     item: &HashMap<String, AttributeValue>,
     depth: usize,
 ) -> Result<(HashMap<String, AttributeValue>, HashSet<String>)> {
-    println!("item: {item:?}");
     let mut new_item = HashMap::new();
     let mut flattened_fields = HashSet::new();
     flatten_item_recursive(item, "", &mut new_item, &mut flattened_fields, depth, 0)?;
-    println!("flattened_item: {new_item:?}");
     Ok((new_item, flattened_fields))
 }
 
