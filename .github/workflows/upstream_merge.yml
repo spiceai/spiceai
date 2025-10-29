@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ env.DEFAULT_BRANCH }}
+          ref: ${{ github.ref_name }}
 
       - name: Resolve workflow inputs
         run: |
@@ -143,9 +143,17 @@ jobs:
           uv run --with openai python scripts/automation/auto_resolve_conflicts.py
 
       - name: Mark unresolved files for commit
+        id: mark_conflicts
         if: steps.merge.outputs.conflicts == 'true' && (env.RUN_CONFLICT_RESOLUTION != 'true' || steps.llm.outputs.status != 'resolved')
         run: |
-          git diff --name-only --diff-filter=U | xargs -r git add
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' || true)
+          git diff --name-only --diff-filter=U | grep '^\.github/workflows/' | xargs -r git restore  --theirs
+          git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' | xargs -r git add          
+          
+          if [ -n "$CONFLICT_FILES" ]; then
+            FILES_LIST=$(echo "$CONFLICT_FILES" | tr '\n' ',' | sed 's/,$//')
+            echo "conflict_files=$FILES_LIST" >> $GITHUB_OUTPUT
+          fi
 
       - name: Finalise merge commit
         if: steps.check_pr.outputs.has_open == 'false'
@@ -163,6 +171,18 @@ jobs:
           echo "* Base branch: ${DEFAULT_BRANCH} (${BASE_SHA})" >> "$pr_body"
           echo "* Upstream branch: ${UPSTREAM_REPO} @ ${UPSTREAM_SHA}" >> "$pr_body"
           echo "* Generated at: $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$pr_body"
+
+          if [ -n "${{ steps.mark_conflicts.outputs.conflict_files }}" ]; then
+            echo "### ⚠️ Conflicting Workflow Files" >> "$pr_body"
+            echo "" >> "$pr_body"
+            echo "The following files have conflicts that need manual resolution:" >> "$pr_body"
+            echo "" >> "$pr_body"
+            echo "${{ steps.mark_conflicts.outputs.conflict_files }}" | tr ',' '\n' | while read -r file; do
+              echo "* \`$file\`" >> "$pr_body"
+            done
+            echo "" >> "$pr_body"
+          fi
+          
           if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
             echo "* Conflict handling: $([[ -n "${{ steps.llm.outputs.status }}" ]] && echo "${{ steps.llm.outputs.status }}" || echo "manual")" >> "$pr_body"
           else
