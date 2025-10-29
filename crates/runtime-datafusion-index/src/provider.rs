@@ -118,7 +118,9 @@ impl TableProvider for IndexedTableProvider {
     }
 
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.underlying.get_logical_plan()
+        // Cannot use underlying `get_logical_plan` as `IndexedTableProvider` will be replaced
+        // with the `LogicalPlan` during indexing.
+        None
     }
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {

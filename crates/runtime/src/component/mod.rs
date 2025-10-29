@@ -30,6 +30,7 @@ pub enum Error {
 
 pub mod access;
 pub mod catalog;
+pub mod column;
 pub mod dataset;
 pub mod metrics;
 pub mod view;

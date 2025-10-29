@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
-use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
+use crate::models::{
+    create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
+};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
@@ -315,6 +317,7 @@ pub(crate) async fn run_search_w_explain(
                         api_config.flight_bind_address
                     )
                 });
+
             for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
@@ -768,7 +771,6 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
     ).await
 }
 
-// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_text_search() -> Result<(), anyhow::Error> {
@@ -849,6 +851,93 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             ),
             SearchTestCase::new(
                 "text_search_sql_text_search_random",
+                SearchTestType::Sql(
+                    "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+            ),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_text_search_view() -> Result<(), anyhow::Error> {
+    let (ds, views) = get_mega_science_view(
+        Some("qs"),
+        None,
+        Some(
+            Column::new("answer")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+        ),
+    );
+
+    let mut app = AppBuilder::new("search_app").with_dataset(ds);
+    for v in views {
+        app = app.with_view(v);
+    }
+
+    run_search(app.build(),
+        vec![
+            SearchTestCase::new(
+                "text_search_view_basic",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_view_additional_columns",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_view_with_where",
+                SearchTestType::Http(json!({
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_view_basic_without_defined_dataset",
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                })),
+            ),
+            SearchTestCase::new(
+                "text_search_view_sql_text_search_basic",
+                SearchTestType::Sql(
+                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "text_search_view_sql_text_search_projection",
+                SearchTestType::Sql(
+                    "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "text_search_view_sql_text_search_filters",
+                SearchTestType::Sql(
+                    "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "text_search_view_sql_text_search_no_score",
+                SearchTestType::Sql(
+                    "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "text_search_view_sql_text_search_random",
                 SearchTestType::Sql(
                     "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),

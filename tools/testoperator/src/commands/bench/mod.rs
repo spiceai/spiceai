@@ -16,23 +16,54 @@ limitations under the License.
 
 use super::{RowCounts, get_app_and_start_request};
 use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
-use std::time::Duration;
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 use test_framework::{
     TestType, anyhow,
+    app::App,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
+    spicepod::acceleration::Mode,
     spicetest::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
-    utils::observe_memory,
+    utils::{observe_memory, recursively_get_dir_size},
 };
+
+fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::Result<()> {
+    // determine if any dataset has acceleration enabled with a file mode engine
+    if !app.datasets.iter().any(|ds| {
+        ds.acceleration.as_ref().is_some_and(|accel| {
+            accel.mode == Mode::File
+                && accel.enabled
+                && matches!(
+                    accel.engine.as_deref(),
+                    Some("sqlite" | "duckdb" | "pepper")
+                )
+        })
+    }) {
+        return Ok(());
+    }
+
+    // calculate the total size of all files inside .spice
+    let spice_dir = app_path.join(".spice");
+    let total_size = recursively_get_dir_size(&spice_dir)?;
+
+    println!("Total acceleration size on disk: {total_size} bytes");
+
+    crate::metrics::ACCELERATION_SIZE_BYTES.record(total_size.try_into().unwrap_or_default(), &[]);
+
+    Ok(())
+}
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
@@ -42,12 +73,16 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let ready_wait_start = Instant::now();
+
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process().watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+
+    let ready_wait_duration = ready_wait_start.elapsed();
     let health_monitor = HealthMonitor::spawn()?;
 
     // baseline run
@@ -126,10 +161,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         crate::metrics::ROW_COUNT.record((*row_count).try_into()?, &attributes);
     }
 
+    crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+
+    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path())?;
 
     telemetry.emit().await?;
 
