@@ -143,6 +143,7 @@ jobs:
           uv run --with openai python scripts/automation/auto_resolve_conflicts.py
 
       - name: Mark unresolved files for commit
+        id: mark_conflicts
         if: steps.merge.outputs.conflicts == 'true' && (env.RUN_CONFLICT_RESOLUTION != 'true' || steps.llm.outputs.status != 'resolved')
         run: |
           CONFLICT_FILES=$(git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' || true)
