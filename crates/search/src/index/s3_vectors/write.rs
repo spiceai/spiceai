@@ -20,6 +20,7 @@ use arrow::array::{
     Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
     StringViewArray,
 };
+use arrow::compute::concat_batches;
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field, Schema};
 use data_components::s3_vectors::S3VectorsTable;
@@ -102,6 +103,54 @@ pub enum Error {
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
 #[allow(clippy::too_many_lines)]
 pub async fn write(
+    index: &S3Vector,
+    table: &S3VectorsTable,
+    record: RecordBatch,
+) -> Result<RecordBatch, Error> {
+    // Process in 100k row chunks to control memory usage
+    const MAX_CHUNK_ROWS: usize = 100_000;
+
+    if record.num_rows() <= MAX_CHUNK_ROWS {
+        return process_single_batch(index, table, record).await;
+    }
+
+    let mut result_batches = Vec::new();
+    let schema = record.schema();
+
+    for chunk_start in (0..record.num_rows()).step_by(MAX_CHUNK_ROWS) {
+        let chunk_end = (chunk_start + MAX_CHUNK_ROWS).min(record.num_rows());
+        let chunk_length = chunk_end - chunk_start;
+
+        let chunk_columns: Vec<Arc<dyn Array>> = record
+            .columns()
+            .iter()
+            .map(|col| col.slice(chunk_start, chunk_length))
+            .collect();
+
+        let chunk_batch = RecordBatch::try_new(schema.clone(), chunk_columns).context(
+            IssueWithArrowProcessingSnafu {
+                index: index.name(),
+            },
+        )?;
+
+        let processed_chunk = process_single_batch(index, table, chunk_batch).await?;
+        result_batches.push(processed_chunk);
+    }
+
+    if result_batches.is_empty() {
+        return Ok(record);
+    }
+
+    let schema = result_batches[0].schema();
+    let concatenated =
+        concat_batches(&schema, &result_batches).context(IssueWithArrowProcessingSnafu {
+            index: index.name(),
+        })?;
+
+    Ok(concatenated)
+}
+
+async fn process_single_batch(
     index: &S3Vector,
     table: &S3VectorsTable,
     record: RecordBatch,
