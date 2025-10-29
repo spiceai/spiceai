@@ -413,7 +413,7 @@ impl PepperAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path"),
     ParameterSpec::component("metastore")
-        .description("Metastore backend for Pepper catalog. Options: 'sqlite' (default, uses SQLite), 'turso' (uses Turso/libSQL)")
+        .description("Metastore backend for Pepper catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
         .default("sqlite"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("unsupported_type_action")
