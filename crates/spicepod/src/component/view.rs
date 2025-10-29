@@ -95,6 +95,7 @@ impl View {
     /// Find any primary keys explicitly defined in the [`View`]. Order of precedence:
     ///  1. Primary key defined in `.columns[].embeddings[].row_id`
     ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
+    #[must_use]
     pub fn primary_key_override(&self) -> Option<Vec<String>> {
         self.columns
             .iter()
