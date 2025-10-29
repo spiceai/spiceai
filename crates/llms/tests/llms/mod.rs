@@ -366,7 +366,7 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
     let (_, model_cache) = TEST_MODELS
         .iter()
         .find(|(name, _)| *name == model_name)
-        .ok_or_else(|| anyhow::anyhow!("model {} not found in TEST_MODELS", model_name))?;
+        .ok_or_else(|| anyhow::anyhow!("model {model_name} not found in TEST_MODELS"))?;
 
     // Check if model is already cached
     {
@@ -382,7 +382,7 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
     let (_, creator) = TEST_MODEL_CREATORS
         .iter()
         .find(|(name, _)| *name == model_name)
-        .ok_or_else(|| anyhow::anyhow!("model creator {} not found", model_name))?;
+        .ok_or_else(|| anyhow::anyhow!("model creator {model_name} not found"))?;
 
     let model = creator().await?;
 

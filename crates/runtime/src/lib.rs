@@ -477,6 +477,8 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+
+    #[allow(dead_code)] // used in "cluster" feature
     config: Arc<Config>,
 }
 

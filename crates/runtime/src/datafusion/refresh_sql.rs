@@ -24,6 +24,7 @@ use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{TableReference, sqlparser};
+use datafusion_expr::sqlparser::ast::LimitClause;
 use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
@@ -103,11 +104,28 @@ pub fn validate_refresh_sql(
         Statement::Statement(statement) => match statement.as_ref() {
             SQLStatement::Query(query) => {
                 ensure_no_expr!(query.fetch.is_none(), "FETCH", expected_table);
-                ensure_no_expr!(query.offset.is_none(), "OFFSET", expected_table);
                 ensure_no_expr!(query.with.is_none(), "WITH", expected_table);
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
-                ensure_no_expr!(query.limit_by.is_empty(), "LIMIT BY", expected_table);
+
+                if let Some(limit) = &query.limit_clause {
+                    let LimitClause::LimitOffset {
+                        limit: _,
+                        offset,
+                        limit_by,
+                    } = limit
+                    else {
+                        return UnexpectedExpressionSnafu {
+                            expr: "LIMIT <offset>, <limit>",
+                            expected_table,
+                        }
+                        .fail();
+                    };
+
+                    ensure_no_expr!(limit_by.is_empty(), "LIMIT BY", expected_table);
+                    ensure_no_expr!(offset.is_none(), "OFFSET", expected_table);
+                }
+
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
 

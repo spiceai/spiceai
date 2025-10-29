@@ -69,7 +69,7 @@ impl From<BucketError> for DataFusionError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct Bucket {
     signature: Signature,
 }
@@ -196,6 +196,7 @@ mod tests {
     use super::*;
     use arrow::array::StringArray;
     use arrow_schema::Field;
+    use datafusion::config::ConfigOptions;
     use insta::assert_snapshot;
 
     #[test]
@@ -209,6 +210,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         assert_snapshot!("bucket_scalar", result);
@@ -225,6 +227,7 @@ mod tests {
             number_rows: 3,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         assert_snapshot!("bucket_array", result);
@@ -245,6 +248,7 @@ mod tests {
                     number_rows: 1,
                     arg_fields: vec![],
                     return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+                    config_options: Arc::new(ConfigOptions::default()),
                 };
                 udf.invoke_with_args(args)
                     .unwrap_or_else(|_| panic!("invoke UDF {i}"))
@@ -283,6 +287,7 @@ mod tests {
                     number_rows: 3,
                     arg_fields: vec![],
                     return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+                    config_options: Arc::new(ConfigOptions::default()),
                 };
                 udf.invoke_with_args(args)
                     .unwrap_or_else(|_| panic!("invoke UDF {i}"))
@@ -332,6 +337,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
         assert!(result.is_err());
@@ -348,6 +354,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
         assert!(result.is_err());
@@ -364,6 +371,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("null_input", result);
@@ -380,6 +388,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("decimal_input", result);
@@ -396,6 +405,7 @@ mod tests {
             number_rows: 0,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("empty_array", result);
@@ -416,6 +426,7 @@ mod tests {
             number_rows: 3,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("null_array_input", result);
