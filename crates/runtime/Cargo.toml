@@ -302,7 +302,7 @@ xxhash = ["dep:twox-hash", "cache/xxhash"]
 [target.'cfg(not(windows))'.dependencies]
 pepper = { path = "../pepper", optional = true }
 vortex = { workspace = true, optional = true }
-vortex-datafusion = { path = "../vortex-datafusion", optional = true }
+vortex-datafusion = { workspace = true, optional = true }
 
 [[bench]]
 harness = false
