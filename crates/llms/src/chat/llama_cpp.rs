@@ -94,6 +94,9 @@ impl Default for SamplingParams {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_penalty: 1.1,
+            // Default context size for llama.cpp models.
+            // 2048 is a common default for many LLMs, balancing memory usage and context length.
+            // This value is currently not user-configurable; making it user-settable is a planned future enhancement.
             n_ctx: 2048,
         }
     }
@@ -172,11 +175,10 @@ impl SamplingParams {
         if samplers.is_empty() {
             LlamaSampler::greedy()
         } else if samplers.len() == 1 {
-            // Safe to unwrap: we just checked that samplers has exactly one element
-            match samplers.into_iter().next() {
-                Some(sampler) => sampler,
-                None => unreachable!("samplers.len() == 1 guarantees one element exists"),
-            }
+            // Safe to expect: we just checked that samplers has exactly one element
+            samplers
+                .pop()
+                .expect("samplers.len() == 1 guarantees element exists")
         } else {
             LlamaSampler::chain_simple(samplers)
         }
@@ -226,11 +228,12 @@ impl LlamaCpp {
         Ok(Self {
             model: Arc::new(model),
             backend,
+            // Extract model name from file path for display/logging purposes.
+            // Falls back to "unknown" if the path has no filename or contains invalid UTF-8.
             model_name: model_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string(),
+                .map_or_else(|| "unknown".to_string(), ToString::to_string),
         })
     }
 
@@ -653,14 +656,26 @@ impl Chat for LlamaCpp {
         let prompt_tokens = {
             let model = Arc::clone(&self.model);
             let prompt_clone = prompt.clone();
-            tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 model
                     .str_to_token(&prompt_clone, AddBos::Always)
                     .map(|tokens| tokens.len() as u32)
-                    .unwrap_or(0)
             })
             .await
-            .unwrap_or(0)
+            {
+                Ok(Ok(count)) => count,
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to tokenize prompt for token counting: {}", e);
+                    0
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to spawn blocking task for prompt tokenization: {}",
+                        e
+                    );
+                    0
+                }
+            }
         };
 
         // Use the run() method with parameters to get the completion
@@ -673,20 +688,34 @@ impl Chat for LlamaCpp {
             })
         })?;
 
-        let content = response_text.unwrap_or_else(|| String::new());
+        // response_text is Option<String> from run_with_params.
+        // None indicates empty generation (e.g., immediate EOS token).
+        let content = response_text.unwrap_or_default();
 
         // Count completion tokens
         let completion_tokens = {
             let model = Arc::clone(&self.model);
             let content_clone = content.clone();
-            tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 model
                     .str_to_token(&content_clone, AddBos::Never)
                     .map(|tokens| tokens.len() as u32)
-                    .unwrap_or(0)
             })
             .await
-            .unwrap_or(0)
+            {
+                Ok(Ok(count)) => count,
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to tokenize completion for token counting: {}", e);
+                    0
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to spawn blocking task for completion tokenization: {}",
+                        e
+                    );
+                    0
+                }
+            }
         };
 
         let created = SystemTime::now()
