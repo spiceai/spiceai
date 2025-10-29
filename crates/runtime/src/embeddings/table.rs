@@ -151,7 +151,7 @@ impl EmbeddingTable {
         let embedding_table = EmbeddingTable::try_new(
             base_table,
             embed_columns,
-            Arc::clone(&embedding_models),
+            Arc::clone(embedding_models),
             embed_chunker_config,
         )
         .await?;

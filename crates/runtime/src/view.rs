@@ -130,7 +130,7 @@ pub(crate) async fn prepare_view(
         .await
         .boxed()
         .map_err(DataFusionError::External)?;
-    };
+    }
 
     if view.has_full_text_column() {
         tbl_provider = Arc::new(add_full_text_search_to_table(
@@ -138,7 +138,7 @@ pub(crate) async fn prepare_view(
             &view.columns,
             &view.name,
         )?) as Arc<dyn TableProvider>;
-    };
+    }
     Ok(tbl_provider)
 }
 
