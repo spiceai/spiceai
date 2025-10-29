@@ -129,6 +129,7 @@ impl AppendableSource for FileAppendableSource {
                     dest_conn.execute_batch(setup_sql)?;
                 }
                 QuerySet::ParameterizedTpch => todo!(),
+                QuerySet::ParameterizedSaffron => todo!(),
             }
 
             drop(dest_conn);
@@ -209,6 +210,7 @@ impl AppendableSource for FileAppendableSource {
                     dest_conn.execute_batch(&sql)?;
                 }
                 QuerySet::ParameterizedTpch => todo!(),
+                QuerySet::ParameterizedSaffron => todo!(),
             }
 
             Ok::<(), anyhow::Error>(())

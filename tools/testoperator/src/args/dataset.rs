@@ -56,6 +56,8 @@ pub enum QuerySetArg {
     Clickbench,
     #[value(name = "tpch[parameterized]")]
     ParameterizedTpch,
+    #[value(name = "saffron[parameterized]")]
+    ParameterizedSaffron,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
@@ -103,6 +105,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
+            QuerySetArg::ParameterizedSaffron => QuerySet::ParameterizedSaffron,
         }
     }
 }
