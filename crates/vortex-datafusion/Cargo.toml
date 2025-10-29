@@ -1,5 +1,4 @@
 [package]
-name = "vortex-datafusion"
 authors = ["Vortex Authors <hello@vortex.dev>"]
 categories = ["database-implementations", "data-structures", "compression"]
 description = "Apache Datafusion integration for Vortex"
@@ -7,6 +6,7 @@ edition = "2024"
 homepage = "https://github.com/spiraldb/vortex"
 keywords = ["vortex"]
 license = "Apache-2.0"
+name = "vortex-datafusion"
 repository = "https://github.com/spiraldb/vortex"
 rust-version = "1.89"
 version = "0.54.0"
@@ -16,6 +16,7 @@ arrow = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+datafusion = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-common-runtime = { workspace = true }
@@ -46,4 +47,3 @@ rstest = "0.26"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 walkdir = "2.5.0"
-

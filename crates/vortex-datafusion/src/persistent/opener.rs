@@ -4,18 +4,20 @@
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 
+use arrow::array::{AsArray, RecordBatch};
 use arrow_schema::{ArrowError, Field, SchemaRef};
+use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{FileRange, PartitionedFile};
-use datafusion_physical_expr::schema_rewriter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::{PhysicalExprRef, split_conjunction};
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use object_store::ObjectStore;
 use object_store::path::Path;
+use vortex::arrow::compute::to_arrow_preferred;
 use vortex::dtype::FieldName;
 use vortex::error::VortexError;
 use vortex::expr::{root, select};
@@ -182,8 +184,12 @@ impl FileOpener for VortexOpener {
                 .with_metrics(metrics)
                 .with_projection(projection_expr)
                 .with_some_filter(filter)
-                .map(|chunk| chunk.to_struct().into_record_batch())
-                .into_tokio_stream()
+                .map(|chunk| {
+                    let v = chunk.to_struct();
+                    let array_ref = to_arrow_preferred(v.as_ref())?;
+                    Ok(RecordBatch::from(array_ref.as_struct()))
+                })
+                .into_stream()
                 .map_err(|e| {
                     DataFusionError::Execution(format!("Failed to create Vortex stream: {e}"))
                 })?
@@ -264,7 +270,7 @@ mod tests {
     use datafusion::datasource::schema_adapter::DefaultSchemaAdapterFactory;
     use datafusion::logical_expr::{col, lit};
     use datafusion::physical_expr::planner::logical2physical;
-    use datafusion::physical_expr::schema_rewriter::DefaultPhysicalExprAdapterFactory;
+    use datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
     use datafusion::scalar::ScalarValue;
     use futures::stream::BoxStream;
     use itertools::Itertools;
@@ -273,6 +279,7 @@ mod tests {
     use rstest::rstest;
     use vortex::arrow::FromArrowArray;
     use vortex::file::VortexWriteOptions;
+    use vortex::io::{ObjectStoreWriter, VortexWrite};
     use vortex::session::VortexSession;
 
     use super::*;
@@ -327,15 +334,18 @@ mod tests {
         let array = ArrayRef::from_arrow(rb, false);
         let path = Path::parse(path)?;
 
-        VortexWriteOptions::default()
-            .write_object_store(&object_store, &path, array.to_array_stream())
-            .await?;
+        let mut write = ObjectStoreWriter::new(object_store, &path).await?;
 
-        Ok(object_store.head(&path).await?.size)
+        let summary = VortexWriteOptions::default()
+            .write(&mut write, array.to_array_stream())
+            .await?;
+        write.shutdown().await?;
+
+        Ok(summary.size())
     }
 
     async fn count_data(
-        mut stream: BoxStream<'static, Result<RecordBatch, ArrowError>>,
+        mut stream: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
     ) -> anyhow::Result<(usize, usize)> {
         let mut batches = vec![];
 

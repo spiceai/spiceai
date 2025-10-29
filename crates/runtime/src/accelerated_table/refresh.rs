@@ -379,6 +379,8 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::Struct(_)
         | arrow::datatypes::DataType::Union(_, _)
         | arrow::datatypes::DataType::Dictionary(_, _)
+        | arrow::datatypes::DataType::Decimal32(_, _)
+        | arrow::datatypes::DataType::Decimal64(_, _)
         | arrow::datatypes::DataType::Decimal128(_, _)
         | arrow::datatypes::DataType::Decimal256(_, _)
         | arrow::datatypes::DataType::Map(_, _)
