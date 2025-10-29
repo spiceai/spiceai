@@ -23,23 +23,52 @@ use async_openai::{
 use async_trait::async_trait;
 use futures::Stream;
 use llama_cpp_2::{
+    LogOptions,
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::params::LlamaModelParams,
     model::{AddBos, LlamaModel, Special},
     sampling::LlamaSampler,
+    send_logs_to_tracing,
 };
 use secrecy::SecretString;
 use snafu::ResultExt;
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::SystemTime,
 };
 
 use crate::streaming_utils::generate_stream_id;
+
+/// Initialize llama.cpp logging once globally.
+///
+/// By default, llama.cpp/ggml logs are filtered out (via OFF_FILTERS in bin/spiced/src/tracing.rs).
+/// To enable llama.cpp logs, set the `SPICED_LOG` or `RUST_LOG` environment variable to include
+/// `llama_cpp_2`, `llama.cpp`, or `ggml`. For example:
+/// - `SPICED_LOG=llama_cpp_2=debug` - Enable debug logs from llama-cpp-2 bindings
+/// - `SPICED_LOG=llama.cpp=info` - Enable info logs from llama.cpp library
+/// - `SPICED_LOG=ggml=trace` - Enable trace logs from ggml library
+fn init_llama_logging() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        // Check if verbose logging is enabled via SPICED_LOG or RUST_LOG
+        let verbose = std::env::var("SPICED_LOG")
+            .or_else(|_| std::env::var("RUST_LOG"))
+            .map(|log_config| {
+                // Enable llama.cpp logs if llama_cpp_2 is explicitly enabled in the log config
+                log_config.contains("llama_cpp_2")
+                    || log_config.contains("llama.cpp")
+                    || log_config.contains("ggml")
+            })
+            .unwrap_or(false);
+
+        // Send logs to tracing, but they'll be filtered by OFF_FILTERS unless explicitly enabled
+        send_logs_to_tracing(LogOptions::default().with_logs_enabled(verbose));
+    });
+}
 
 /// Sampling parameters for llama.cpp inference
 #[derive(Debug, Clone)]
@@ -158,6 +187,9 @@ pub struct LlamaCpp {
 impl LlamaCpp {
     /// Create a new `LlamaCpp` instance from a model file path
     pub async fn from_file(model_path: &Path) -> Result<Self> {
+        // Initialize logging configuration once
+        init_llama_logging();
+
         if !model_path.exists() {
             return Err(ChatError::LocalModelNotFound {
                 expected_path: model_path.to_string_lossy().to_string(),
