@@ -91,11 +91,12 @@ fn bench_insert_single(c: &mut Criterion) {
             
             // Measure only the insert operation
             rt.block_on(async {
+                let _: () = metastore
+                .execute(ExecuteParams { sql, params })
+                .await
+                .expect("Failed to insert");
                 black_box(
-                    metastore
-                        .execute(ExecuteParams { sql, params })
-                        .await
-                        .expect("Failed to insert"),
+                    (),
                 );
             });
             
@@ -182,10 +183,11 @@ fn bench_insert_batch(c: &mut Criterion) {
                             MetastoreValue::Integer(i * 10),
                             MetastoreValue::Bool(i % 2 == 0),
                         ];
-                        black_box(metastore.execute(ExecuteParams {
+                        let _: () = metastore.execute(ExecuteParams {
                             sql: "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)",
                             params
-                        }).await.expect("Failed to insert"));
+                        }).await.expect("Failed to insert");
+                        black_box(());
                     }
                 });
                 
