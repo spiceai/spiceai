@@ -18,6 +18,7 @@ use std::{borrow::Cow, ops::ControlFlow};
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
+use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, PutResult, Ticket,
     decode::{DecodedPayload, FlightDataDecoder},
@@ -28,6 +29,7 @@ use arrow_flight::{
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
 use bytes::Bytes;
+use datafusion::common::ParamValues;
 use datafusion::sql::sqlparser::{
     ast::{Expr, Statement, Value, VisitMut, VisitorMut},
     dialect::GenericDialect,
@@ -119,10 +121,6 @@ pub(crate) struct PreparedStatement {
     /// This schema provides type information for each parameter (e.g., Int64, Utf8, etc.)
     /// and is used to create a properly typed logical plan during execution
     pub(super) parameter_schema: Option<Vec<u8>>,
-    query: String,
-    // Store parameter RecordBatch as IPC bytes for serialization
-    #[serde(with = "record_batch_serde")]
-    parameter_batch: Option<RecordBatch>,
 }
 
 mod record_batch_serde {
@@ -214,7 +212,6 @@ pub(crate) async fn do_action_create_prepared_statement(
         query: query.to_string(),
         parameters: vec![],
         parameter_schema: None,
-        parameter_batch: None,
     };
 
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
@@ -339,22 +336,6 @@ pub(crate) async fn do_get(
         param_values,
     ))
     .await?;
-        parameter_batch,
-    } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
-
-    // Convert parameter batch to ParamValues if present
-    let parameters = if let Some(batch) = parameter_batch {
-        Some(record_to_param_values(&batch).map_err(error_to_status)?)
-    } else {
-        None
-    };
-
-    // Execute the query through the standard path
-    // The logical plan will be created and cached on first execution
-    // via get_or_create_logical_plan in sql_to_flight_stream.
-    // Subsequent executions will reuse the cached plan (1 hour TTL, 512 entries max).
-    let (output, from_cache) =
-        Box::pin(Service::sql_to_flight_stream(datafusion, &sql, parameters)).await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
@@ -414,6 +395,8 @@ pub(crate) async fn do_put_query(
             .map_err(error_to_status)?;
         writer.finish().map_err(error_to_status)?;
         bytes
+    };
+
     // Combine multiple batches if parameters span multiple batches
     let parameter_batch = if batches.is_empty() {
         None
@@ -430,7 +413,7 @@ pub(crate) async fn do_put_query(
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
     stmt.parameters = parameters;
     stmt.parameter_schema = Some(schema_bytes);
-    stmt.parameter_batch = parameter_batch;
+    // stmt.parameter_batch = parameter_batch;  // Field not in struct
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     let result = DoPutPreparedStatementResult {
@@ -479,7 +462,6 @@ pub(super) fn decode_param_values(
 }
 
 pub(super) fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
-fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
     Status::internal(format!("{err:?}"))
 }
 
