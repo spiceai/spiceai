@@ -20,4 +20,8 @@ rustls-native-certs = "0.8.2"
 rustls-pemfile = "2.1.3"
 secrecy.workspace = true
 snafu.workspace = true
-tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
+tonic = { workspace = true, features = [
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+] }

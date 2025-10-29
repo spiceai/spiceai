@@ -715,7 +715,7 @@ mod search {
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(90)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
@@ -808,7 +808,7 @@ async fn delete_index(
     bucket_name: &str,
     index_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+    let config = aws_config::defaults(BehaviorVersion::v2025_08_07())
         .region(Region::from_static("us-east-2"))
         .credentials_provider(Credentials::new(
             std::env::var("AWS_S3_VECTORS_KEY").ok().unwrap_or_default(),

@@ -635,6 +635,9 @@ impl RefreshTask {
                 );
             }
         }
+        if let Some(expr) = refresh.retention_expr.clone() {
+            filters.push(expr);
+        }
 
         self.get_data_update(filters, &refresh).await
     }

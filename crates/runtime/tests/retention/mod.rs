@@ -16,12 +16,14 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use app::AppBuilder;
 
 use runtime::Runtime;
-use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
+use spicepod::{acceleration::Acceleration, component::dataset::Dataset, param::Params};
+use tempfile::TempDir;
+use tokio::fs;
 
 use crate::{
     configure_test_datafusion, init_tracing,
@@ -61,6 +63,24 @@ fn make_s3_dataset(
         ..Default::default()
     });
     ds
+}
+
+fn make_local_csv_dataset(path: &Path, name: &str, retention_sql: Option<&str>) -> Dataset {
+    let mut dataset = Dataset::new(format!("file://{}", path.display()), name.to_string());
+
+    let mut params = HashMap::new();
+    params.insert("file_format".to_string(), "csv".to_string());
+    params.insert("csv_has_header".to_string(), "true".to_string());
+    dataset.params = Some(Params::from_string_map(params));
+
+    let mut acceleration = Acceleration {
+        engine: Some("arrow".to_string()),
+        ..Default::default()
+    };
+    acceleration.retention_sql = retention_sql.map(std::string::ToString::to_string);
+    dataset.acceleration = Some(acceleration);
+
+    dataset
 }
 
 #[tokio::test]
@@ -125,6 +145,80 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                     arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
                 insta::assert_snapshot!(snapshot_name, results_str);
             }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_retention_sql_initial_refresh_filters_data() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = TempDir::new()?;
+            let csv_path = temp_dir.path().join("retention_sample.csv");
+            fs::write(
+                &csv_path,
+                "id,status\n1,active\n2,expired\n3,active\n4,expired\n",
+            )
+            .await?;
+
+            let retained_dataset_name = "retained_records";
+            let retention_sql =
+                format!("DELETE FROM {retained_dataset_name} WHERE status = 'expired'");
+
+            let retained_dataset =
+                make_local_csv_dataset(&csv_path, retained_dataset_name, Some(&retention_sql));
+            let full_dataset = make_local_csv_dataset(&csv_path, "all_records", None);
+
+            let app = AppBuilder::new("retention_sql_initial_refresh")
+                .with_dataset(retained_dataset)
+                .with_dataset(full_dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = rt
+                .datafusion()
+                .query_builder("SELECT id, status FROM retained_records ORDER BY id")
+                .build()
+                .run()
+                .await?;
+
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("retention_sql_initial_refresh_filtered", results_str);
+
+            let all_query = rt
+                .datafusion()
+                .query_builder("SELECT id, status FROM all_records ORDER BY id")
+                .build()
+                .run()
+                .await?;
+
+            let all_results: Vec<RecordBatch> =
+                all_query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let all_results_str =
+                arrow::util::pretty::pretty_format_batches(&all_results).expect("pretty batches");
+            insta::assert_snapshot!("retention_sql_initial_refresh_all_rows", all_results_str);
 
             Ok(())
         })

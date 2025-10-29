@@ -209,11 +209,13 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `duckdb`   | Embedded [DuckDB][duckdb]        | Stable            | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres]  | Release Candidate | N/A              |
 | `sqlite`   | Embedded [SQLite][sqlite]        | Release Candidate | `memory`, `file` |
+| `turso`    | Embedded [Turso][turso]          | Alpha             | `memory`, `file` |
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [duckdb]: https://spiceai.org/docs/components/data-accelerators/duckdb
 [postgres]: https://spiceai.org/docs/components/data-accelerators/postgres
 [sqlite]: https://spiceai.org/docs/components/data-accelerators/sqlite
+[turso]: https://github.com/tursodatabase/turso
 
 ## Supported Model Providers
 
