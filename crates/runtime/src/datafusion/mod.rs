@@ -1492,16 +1492,13 @@ impl DataFusion {
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<TableReference> = None;
-
             let table = &view.name;
 
             for dependent_table_name in &dependent_table_names {
                 let mut attempts = 0;
-
                 if unresolved_dependent_table.is_some() {
                     break;
                 }
-
                 loop {
                     if !ctx
                         .table_exist(dependent_table_name.clone())
@@ -1524,7 +1521,7 @@ impl DataFusion {
                     break;
                 }
                 if attempts > 0 {
-                    tracing::warn!("Dependent table {dependent_table_name} for view {table} found");
+                    tracing::info!("Dependent table {dependent_table_name} for view {table} found");
                 }
             }
 
