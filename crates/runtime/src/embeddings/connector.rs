@@ -52,7 +52,6 @@ use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::semantic::MetadataType;
 use spicepod::vector::VectorStore;
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

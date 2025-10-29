@@ -241,15 +241,47 @@ fn mega_science_dataset(spice_name: Option<&str>, accelerate: bool) -> Dataset {
 // This dataset view is derived from https://huggingface.co/datasets/MegaScience/MegaScience, with the following alterations:
 //  - Any `question` or `answer` > 256 characters is removed.
 //  - An arbitrary but unique `id` integer column is added.
+//
+// ```sql
+//   SELECT *
+//   FROM (
+//      SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'
+//   ) v1
+//   INNER JOIN (
+//     SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'
+//   ) v2
+//   ON v1.id = v2.id
+//   UNION ALL (
+//     SELECT id, question, answer, reference_answer, source, subject FROM mega_science_ds where subject='math'
+//   )
+// ```
 pub fn get_mega_science_view(
     spice_name: Option<&str>,
     question_column: Option<spicepod::semantic::Column>,
     answer_column: Option<spicepod::semantic::Column>,
-) -> (Dataset, View) {
-    let mut dataset = mega_science_dataset(Some("mega_science_ds"), false);
+) -> (Dataset, Vec<View>) {
+    let ds = mega_science_dataset(Some("mega_science_ds"), false);
+
+    let mut v1 = View::new("v1".to_string());
+    v1.sql = Some(
+        "SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'"
+            .to_string(),
+    );
+
+    let mut v2 = View::new("v2".to_string());
+    v2.sql = Some(
+        "SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'".to_string(),
+    );
+    v2.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+
+    let mut v3 = View::new("v3".to_string());
+    v3.sql = Some("SELECT * FROM mega_science_ds where subject='math'".to_string());
 
     let mut v = View::new(spice_name.unwrap_or("megascience").to_string());
-    v.sql = Some("SELECT * FROM mega_science_ds".to_string());
+    v.sql = Some("SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id UNION ALL (SELECT id, question, reference_answer, answer, source, subject FROM v3)".to_string());
 
     v.acceleration = Some(Acceleration {
         enabled: true,
@@ -260,7 +292,7 @@ pub fn get_mega_science_view(
         .flatten()
         .collect();
 
-    (dataset, v)
+    (ds, vec![v1, v2, v3, v])
 }
 
 pub fn get_tpcds_dataset(

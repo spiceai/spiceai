@@ -1,0 +1,31 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 361,
+    "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\).",
+    "array_length(vector_search(qs, Utf8(\"second\"), question).question_embedding)": 64,
+    "round(vector_search(qs, Utf8(\"second\"), question).score,Int64(1))": 0.8
+  },
+  {
+    "id": 462,
+    "answer": "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14.",
+    "array_length(vector_search(qs, Utf8(\"second\"), question).question_embedding)": 64,
+    "round(vector_search(qs, Utf8(\"second\"), question).score,Int64(1))": 0.8
+  },
+  {
+    "id": 464,
+    "answer": "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25.",
+    "array_length(vector_search(qs, Utf8(\"second\"), question).question_embedding)": 64,
+    "round(vector_search(qs, Utf8(\"second\"), question).score,Int64(1))": 0.8
+  },
+  {
+    "id": 463,
+    "answer": "To find how many groups of 3 are in 18, divide 18 by 3.  \n\\[ 18 \\div 3 = 6 \\]  \nThus, there are $\\boxed{6}$ groups of 3 in 18.",
+    "array_length(vector_search(qs, Utf8(\"second\"), question).question_embedding)": 64,
+    "round(vector_search(qs, Utf8(\"second\"), question).score,Int64(1))": 0.8
+  }
+]

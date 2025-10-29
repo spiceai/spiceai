@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
+use crate::models::s3_vectors::basic_vector_search_tests;
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
 };
@@ -303,6 +304,7 @@ pub(crate) async fn run_search_w_explain(
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
+    tracing::error!("{}", serde_json::to_string_pretty(&app).expect("mah"));
     test_request_context()
         .scope(async {
             let api_config = start_app(app).await?;
@@ -317,6 +319,7 @@ pub(crate) async fn run_search_w_explain(
                         api_config.flight_bind_address
                     )
                 });
+
             for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
@@ -380,25 +383,102 @@ pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
 }
 
 #[tokio::test]
+async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
+    let (ds, views) = get_mega_science_view(
+        Some("qs"),
+        Some(Column::new("question").with_embeddings(vec![
+            ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+        ])),
+        Some(Column::new("answer").with_embeddings(vec![
+            ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+        ])),
+    );
+
+    let mut app = AppBuilder::new("search_app")
+        .with_dataset(ds)
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ));
+
+    for v in views {
+        app = app.with_view(v);
+    }
+
+    run_search_w_explain(
+        app.build(),
+        [
+        basic_vector_search_tests("multi_column_view_answer"),
+        vec![
+            SearchTestCase::new(
+                "multi_column_view_basic".to_string(),
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                })),
+            ),
+            SearchTestCase::new(
+                "multi_column_view_additional_columns".to_string(),
+                SearchTestType::Http(json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                })),
+            ),
+            SearchTestCase::new(
+                "multi_column_view_with_where".to_string(),
+                SearchTestType::Http(json!({
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject='math'",
+                    "limit": 1,
+                })),
+            ),
+            SearchTestCase::new(
+                "multi_column_view_question_vector_search_sql_filters".to_string(),
+                SearchTestType::Sql(
+                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "multi_column_view_question_vector_search_sql_no_score".to_string(),
+                SearchTestType::Sql(
+                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "multi_column_view_question_vector_search_sql_random".to_string(),
+                SearchTestType::Sql(
+                    "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+                ),
+            ),
+            SearchTestCase::new(
+                "multi_column_view_question_vector_search_sql_vectors".to_string(),
+                SearchTestType::Sql(
+                    "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+                ),
+            ),
+        ]
+        ].concat(),
+        true
+    )
+    .await
+}
+
+#[tokio::test]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let ds = get_mega_science_dataset(
         Some("qs"),
-        Some(
-            Column::new("question").with_embeddings(vec![ColumnLevelEmbeddingConfig {
-                model: "hf_minilm".to_string(),
-                row_ids: Some(vec!["id".to_string()]),
-                chunking: None,
-                vector_size: None,
-            }]),
-        ),
-        Some(
-            Column::new("answer").with_embeddings(vec![ColumnLevelEmbeddingConfig {
-                model: "hf_minilm".to_string(),
-                row_ids: Some(vec!["id".to_string()]),
-                chunking: Some(EmbeddingChunkConfig::enabled().target_chunk_size(64)),
-                vector_size: None,
-            }]),
-        ),
+        Some(Column::new("question").with_embeddings(vec![
+            ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+        ])),
+        Some(Column::new("answer").with_embeddings(vec![
+                ColumnLevelEmbeddingConfig::model("hf_minilm")
+                    .with_row_id("id")
+                    .chunking(EmbeddingChunkConfig::enabled().target_chunk_size(64)),
+            ])),
     );
 
     let app = AppBuilder::new("search_app")
@@ -826,7 +906,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_text_search_view() -> Result<(), anyhow::Error> {
-    let (ds, view) = get_mega_science_view(
+    let (ds, views) = get_mega_science_view(
         Some("qs"),
         None,
         Some(
@@ -834,11 +914,13 @@ async fn test_text_search_view() -> Result<(), anyhow::Error> {
                 .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
         ),
     );
-    run_search(
-        AppBuilder::new("search_app")
-            .with_dataset(ds)
-            .with_view(view)
-            .build(),
+
+    let mut app = AppBuilder::new("search_app").with_dataset(ds);
+    for v in views {
+        app = app.with_view(v);
+    }
+
+    run_search_w_explain(app.build(),
         vec![
             SearchTestCase::new(
                 "text_search_view_basic",
@@ -904,6 +986,7 @@ async fn test_text_search_view() -> Result<(), anyhow::Error> {
                 ),
             ),
         ],
+        true
     )
     .await
 }
