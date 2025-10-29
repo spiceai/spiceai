@@ -1,0 +1,55 @@
+version: v1
+kind: Spicepod
+name: dynamodb-arrow
+
+# Define common anchors
+definitions:
+  # Common dynamodb parameters
+  - &dynamodb_params
+    dynamodb_aws_region: ap-northeast-2
+    dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+    dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+  - &acceleration
+    enabled: true
+    engine: arrow
+
+datasets:
+  - from: dynamodb:customer
+    name: customer
+    params: *dynamodb_params
+    acceleration: *acceleration
+
+  - from: dynamodb:lineitem
+    name: lineitem
+    params: *dynamodb_params
+    acceleration: *acceleration
+
+  - from: dynamodb:nation
+    name: nation
+    params: *dynamodb_params
+    acceleration: *acceleration
+
+  - from: dynamodb:orders
+    name: orders
+    params: *dynamodb_params
+    acceleration: *acceleration
+
+  - from: dynamodb:part
+    name: part
+    params: *dynamodb_params
+    acceleration: *acceleration
+
+  - from: dynamodb:partsupp
+    name: partsupp
+    params: *dynamodb_params
+    acceleration: *acceleration
+
+  - from: dynamodb:region
+    name: region
+    params: *dynamodb_params
+    acceleration: *acceleration
+
+  - from: dynamodb:supplier
+    name: supplier
+    params: *dynamodb_params
+    acceleration: *acceleration
