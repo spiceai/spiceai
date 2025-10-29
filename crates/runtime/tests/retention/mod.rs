@@ -14,41 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::RecordBatch;
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
-use arrow::array::{BooleanArray, StringArray, TimestampNanosecondArray};
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
+use arrow::array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
 use datafusion::common::TableReference;
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
-use futures::StreamExt;
-use futures::TryStreamExt;
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
-use std::collections::HashMap;
-use std::{sync::Arc, time::Duration};
+use futures::{StreamExt, TryStreamExt};
+use secrecy::ExposeSecret;
+use spicepod::{
+    acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
+    component::dataset::{Dataset, TimeFormat},
+    param::Params,
+};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
 
 use runtime::Runtime;
-use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
-use spicepod::{
-    acceleration::{Mode, OnConflictBehavior, RefreshMode},
-    component::dataset::TimeFormat,
-    param::Params,
-};
-
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
-use secrecy::ExposeSecret;
-
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
-use crate::postgres::common::{
-    get_pg_params, get_postgres_connection_pool, get_random_port, start_postgres_docker_container,
-};
 
 use crate::{
     configure_test_datafusion, init_tracing,
+    postgres::common::{
+        get_pg_params, get_postgres_connection_pool, get_random_port,
+        start_postgres_docker_container,
+    },
     utils::{runtime_ready_check, test_request_context},
 };
 
@@ -87,7 +74,6 @@ fn make_s3_dataset(
     ds
 }
 
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<(String, i64, bool)>, anyhow::Error> {
     let mut rows = Vec::new();
 
@@ -120,22 +106,20 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<(String, i64, bool)>
     Ok(rows)
 }
 
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 struct TimezoneGuard {
     original: Option<String>,
 }
 
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 unsafe extern "C" {
     fn tzset();
 }
 
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 impl TimezoneGuard {
     fn new(tz: &str) -> Self {
         let original = std::env::var("TZ").ok();
+        // Change the TZ environment variable; this is process-wide but scoped by the guard.
         unsafe {
-            // Safety: Changing the TZ environment variable is process-wide but acceptable in this scoped test helper.
+            // Safety: Modifying TZ is process-wide but controlled via the guard.
             std::env::set_var("TZ", tz);
         }
         unsafe {
@@ -145,16 +129,15 @@ impl TimezoneGuard {
     }
 }
 
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 impl Drop for TimezoneGuard {
     fn drop(&mut self) {
         match &self.original {
             Some(value) => unsafe {
-                // Safety: Restoring the original TZ value for the process.
+                // Safety: Restoring original TZ value captured by the guard.
                 std::env::set_var("TZ", value);
             },
             None => unsafe {
-                // Safety: Clearing TZ to restore original process state.
+                // Safety: Clearing TZ resets process state to original value.
                 std::env::remove_var("TZ");
             },
         }
@@ -164,7 +147,6 @@ impl Drop for TimezoneGuard {
     }
 }
 
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
 async fn execute_rt_sql(rt: Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let mut result = rt.datafusion().query_builder(sql).build().run().await?;
 
@@ -176,7 +158,6 @@ async fn execute_rt_sql(rt: Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>,
     Ok(results)
 }
 
-#[cfg(all(feature = "duckdb", feature = "postgres"))]
 async fn refresh_table(rt: Arc<Runtime>, table_name: &str) -> Result<(), anyhow::Error> {
     let notifier = rt
         .datafusion()
@@ -257,11 +238,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
         .await
 }
 
-#[cfg_attr(
-    all(unix, feature = "duckdb", feature = "postgres"),
-    allow(clippy::too_many_lines)
-)]
-#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -373,6 +350,9 @@ SET
             }
 
             runtime_ready_check(&rt).await;
+
+            // Ensure the accelerator processes an initial refresh before validation.
+            refresh_table(Arc::clone(&rt), "widgets").await?;
 
             let initial_batches = execute_rt_sql(
                 Arc::clone(&rt),
