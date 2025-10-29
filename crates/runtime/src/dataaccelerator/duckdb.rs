@@ -109,7 +109,8 @@ impl DuckDBAccelerator {
                     DuckDBSettingsRegistry::new()
                         .with_setting(Box::new(OrderByNonIntegerLiteral))
                         .with_setting(Box::new(settings::IndexScanPercentage))
-                        .with_setting(Box::new(settings::IndexScanMaxCount)),
+                        .with_setting(Box::new(settings::IndexScanMaxCount))
+                        .with_setting(Box::new(settings::TimeZone)),
                 ),
         }
     }
@@ -278,6 +279,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
+    ParameterSpec::runtime("partitioned_write_buffer"),
 ];
 
 #[async_trait]

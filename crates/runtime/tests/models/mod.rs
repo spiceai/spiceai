@@ -24,6 +24,7 @@ use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
+use spicepod::component::view::View;
 use spicepod::{component::dataset::Dataset, param::Params};
 use std::sync::Arc;
 use std::{
@@ -206,6 +207,17 @@ pub fn get_mega_science_dataset(
     question_column: Option<spicepod::semantic::Column>,
     answer_column: Option<spicepod::semantic::Column>,
 ) -> Dataset {
+    let mut dataset = mega_science_dataset(spice_name, true);
+
+    dataset.columns = [question_column, answer_column]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    dataset
+}
+
+fn mega_science_dataset(spice_name: Option<&str>, accelerate: bool) -> Dataset {
     let mut dataset = Dataset::new(
         // Can use this to run efficiently, locally:
         // "file:../../data/mega-science-small.jsonl",
@@ -217,17 +229,70 @@ pub fn get_mega_science_dataset(
             .into_iter()
             .collect(),
     ));
+
     dataset.acceleration = Some(Acceleration {
+        enabled: accelerate,
+        ..Default::default()
+    });
+
+    dataset
+}
+
+// This dataset view is derived from https://huggingface.co/datasets/MegaScience/MegaScience, with the following alterations:
+//  - Any `question` or `answer` > 256 characters is removed.
+//  - An arbitrary but unique `id` integer column is added.
+//
+// ```sql
+//   SELECT *
+//   FROM (
+//      SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'
+//   ) v1
+//   INNER JOIN (
+//     SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'
+//   ) v2
+//   ON v1.id = v2.id
+//   UNION ALL (
+//     SELECT id, question, answer, reference_answer, source, subject FROM mega_science_ds where subject='math'
+//   )
+// ```
+pub fn get_mega_science_view(
+    spice_name: Option<&str>,
+    question_column: Option<spicepod::semantic::Column>,
+    answer_column: Option<spicepod::semantic::Column>,
+) -> (Dataset, Vec<View>) {
+    let ds = mega_science_dataset(Some("mega_science_ds"), false);
+
+    let mut v1 = View::new("v1".to_string());
+    v1.sql = Some(
+        "SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'"
+            .to_string(),
+    );
+
+    let mut v2 = View::new("v2".to_string());
+    v2.sql = Some(
+        "SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'".to_string(),
+    );
+    v2.acceleration = Some(Acceleration {
         enabled: true,
         ..Default::default()
     });
 
-    dataset.columns = [question_column, answer_column]
+    let mut v3 = View::new("v3".to_string());
+    v3.sql = Some("SELECT * FROM mega_science_ds where subject='math'".to_string());
+
+    let mut v = View::new(spice_name.unwrap_or("megascience").to_string());
+    v.sql = Some("SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id UNION ALL (SELECT id, question, reference_answer, answer, source, subject FROM v3)".to_string());
+
+    v.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    v.columns = [question_column, answer_column]
         .into_iter()
         .flatten()
         .collect();
 
-    dataset
+    (ds, vec![v1, v2, v3, v])
 }
 
 pub fn get_tpcds_dataset(

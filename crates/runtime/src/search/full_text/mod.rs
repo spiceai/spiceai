@@ -21,6 +21,7 @@ use search::generation::{CandidateGeneration, text_search::index::FullTextDataba
 use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
 
 pub mod connector;
+pub mod table;
 pub mod udtf;
 
 /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].

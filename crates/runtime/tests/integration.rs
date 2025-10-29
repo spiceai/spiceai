@@ -83,6 +83,7 @@ mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
+#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
 #[cfg(feature = "postgres")]

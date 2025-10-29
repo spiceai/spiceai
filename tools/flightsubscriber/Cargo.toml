@@ -13,6 +13,10 @@ arrow-flight.workspace = true
 clap.workspace = true
 futures.workspace = true
 tokio.workspace = true
-tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
+tonic = { workspace = true, features = [
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
