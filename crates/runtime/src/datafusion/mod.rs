@@ -1523,6 +1523,9 @@ impl DataFusion {
                     }
                     break;
                 }
+                if attempts > 0 {
+                    tracing::warn!("Dependent table {dependent_table_name} for view {table} found");
+                }
             }
 
             if let Some(missing_table) = unresolved_dependent_table {
@@ -1922,8 +1925,9 @@ async fn wait_until_dependent_tables_are_ready(
         .collect::<Vec<_>>();
 
     let _ = retry(retry_strategy, || async {
-        let statuses = runtime_status
-            .get_dataset_statuses()
+        let mut table_statuses = runtime_status.get_dataset_statuses();
+        table_statuses.extend(runtime_status.get_view_statuses());
+        let statuses = table_statuses
             .into_iter()
             .map(|(key, value)| (resolve_table_reference(key), value))
             .collect::<std::collections::HashMap<_, _>>();

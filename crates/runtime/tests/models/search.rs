@@ -826,7 +826,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_text_search_view() -> Result<(), anyhow::Error> {
-    let (ds, view) = get_mega_science_view(
+    let (ds, views) = get_mega_science_view(
         Some("qs"),
         None,
         Some(
@@ -834,11 +834,13 @@ async fn test_text_search_view() -> Result<(), anyhow::Error> {
                 .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
         ),
     );
-    run_search(
-        AppBuilder::new("search_app")
-            .with_dataset(ds)
-            .with_view(view)
-            .build(),
+
+    let mut app = AppBuilder::new("search_app").with_dataset(ds);
+    for v in views {
+        app = app.with_view(v);
+    };
+
+    run_search(app.build(),
         vec![
             SearchTestCase::new(
                 "text_search_view_basic",
