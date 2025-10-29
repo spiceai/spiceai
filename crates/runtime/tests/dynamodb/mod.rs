@@ -39,7 +39,7 @@ async fn dynamodb_schema() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     let table_name = "spice_integration_test";
-    // init_test_table(table_name).await;
+    // init_test_table(table_name).await?;
 
     test_request_context()
         .scope(async {
@@ -438,6 +438,88 @@ async fn dynamodb_timestamp_filter() -> Result<(), anyhow::Error> {
         })
         .await
 }
+#[tokio::test]
+async fn dynamodb_nested_projection_no_nested_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                r#"SELECT id, "col_map_fully_unnested.age", "col_map_fully_unnested.balance", "col_map_fully_unnested.is_active", "col_map_fully_unnested.name", "col_map_partially_unnested.foo", "col_map_partially_unnested.nested_lvl_1"
+                 FROM test_dynamodb
+                 "#,
+                "nested_projection_no_nested_filter",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_nested_projection_with_nested_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                r#"SELECT id, "col_map_fully_unnested.age", "col_map_fully_unnested.balance", "col_map_fully_unnested.is_active", "col_map_fully_unnested.name", "col_map_partially_unnested.foo", "col_map_partially_unnested.nested_lvl_1"
+                 FROM test_dynamodb
+                 WHERE "col_map_fully_unnested.age" = 30
+                 "#,
+                "nested_projection_with_nested_filter",
+            )
+                .await?;
+
+            Ok(())
+        })
+        .await
+}
 
 async fn run_and_snapshot_query(
     rt: &Runtime,
@@ -625,15 +707,29 @@ async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
     );
 
     // Map (nested object)
-    let mut map = HashMap::new();
-    map.insert("name".to_string(), AttributeValue::S("John".to_string()));
-    map.insert("age".to_string(), AttributeValue::N("30".to_string()));
-    map.insert("is_active".to_string(), AttributeValue::Bool(true));
-    map.insert(
+    let mut fully_unnested_map = HashMap::new();
+    fully_unnested_map.insert("name".to_string(), AttributeValue::S("John".to_string()));
+    fully_unnested_map.insert("age".to_string(), AttributeValue::N("30".to_string()));
+    fully_unnested_map.insert("is_active".to_string(), AttributeValue::Bool(true));
+    fully_unnested_map.insert(
         "balance".to_string(),
         AttributeValue::N("1234.56".to_string()),
     );
-    item1.insert("col_map".to_string(), AttributeValue::M(map));
+
+    // Map (nested object)
+    let mut partially_unnested_map = HashMap::new();
+    let mut nested_lvl_1 = HashMap::new();
+    nested_lvl_1.insert("foo".to_string(), AttributeValue::S("baz".to_string()));
+    partially_unnested_map.insert("nested_lvl_1".to_string(), AttributeValue::M(nested_lvl_1));
+    partially_unnested_map.insert("foo".to_string(), AttributeValue::S("bar".to_string()));
+    item1.insert(
+        "col_map_fully_unnested".to_string(),
+        AttributeValue::M(fully_unnested_map),
+    );
+    item1.insert(
+        "col_map_partially_unnested".to_string(),
+        AttributeValue::M(partially_unnested_map),
+    );
 
     // Temporal types (stored as strings)
     item1.insert(
@@ -677,7 +773,15 @@ async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
     );
     item2.insert("col_binary_set".to_string(), AttributeValue::Null(true));
     item2.insert("col_list".to_string(), AttributeValue::Null(true));
-    item2.insert("col_map".to_string(), AttributeValue::Null(true));
+    item2.insert(
+        "col_map_fully_unnested".to_string(),
+        AttributeValue::M(HashMap::new()),
+    );
+    item2.insert(
+        "col_map_partially_unnested".to_string(),
+        AttributeValue::M(HashMap::new()),
+    );
+
     item2.insert("col_timestamp".to_string(), AttributeValue::Null(true));
     item2.insert("col_date".to_string(), AttributeValue::Null(true));
     item2.insert("col_time".to_string(), AttributeValue::Null(true));

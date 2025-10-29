@@ -1,7 +1,7 @@
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::scalar::ScalarValue;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Encapsulates `DynamoDB` table schema, keys, and expression conversion logic.
@@ -12,7 +12,7 @@ pub struct DynamoDBTableSchema {
     table_schema: SchemaRef,
     partition_key: String,
     sort_key: Option<String>,
-    column_to_alias_map: HashMap<String, String>, // actual_name -> #c0
+    flattened_fields: HashSet<String>,
 }
 
 impl DynamoDBTableSchema {
@@ -21,15 +21,14 @@ impl DynamoDBTableSchema {
         table_schema: SchemaRef,
         partition_key: String,
         sort_key: Option<String>,
+        flattened_fields: HashSet<String>,
     ) -> Self {
-        let column_to_alias_map = build_column_alias_maps(&table_schema);
-
         Self {
             table_name,
             table_schema,
             partition_key,
             sort_key,
-            column_to_alias_map,
+            flattened_fields,
         }
     }
 
@@ -49,10 +48,22 @@ impl DynamoDBTableSchema {
         self.sort_key.as_deref()
     }
 
-    pub fn get_column_alias(&self, column_name: &str) -> Option<&str> {
-        self.column_to_alias_map
-            .get(column_name)
-            .map(String::as_str)
+    pub fn is_flattened_field(&self, field_name: &str) -> bool {
+        if self.flattened_fields.contains(field_name) {
+            return true;
+        }
+
+        // Check if any parent prefix is flattened
+        let mut parts: Vec<&str> = field_name.split('.').collect();
+        while parts.len() > 1 {
+            parts.pop();
+            let parent = parts.join(".");
+            if self.flattened_fields.contains(&parent) {
+                return true;
+            }
+        }
+
+        false
     }
 
     pub fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
@@ -85,7 +96,7 @@ impl DynamoDBTableSchema {
 
                 op_supported && self.is_filter_supported(left) && self.is_filter_supported(right)
             }
-            Expr::Column(col) => self.column_to_alias_map.contains_key(col.name.as_str()),
+            Expr::Column(col) => self.table_schema.field_with_name(&col.name).is_ok(),
             Expr::Literal(scalar, _) => matches!(
                 scalar,
                 ScalarValue::Utf8(_)
@@ -106,26 +117,12 @@ impl DynamoDBTableSchema {
     }
 }
 
-fn build_column_alias_maps(schema: &SchemaRef) -> HashMap<String, String> {
-    let mut column_to_alias_map = HashMap::new();
-    let mut alias_to_column_map = HashMap::new();
-
-    for (i, field) in schema.fields().iter().enumerate() {
-        let column_name = field.name().clone();
-        let alias = format!("#c{i}");
-
-        column_to_alias_map.insert(column_name.clone(), alias.clone());
-        alias_to_column_map.insert(alias, column_name);
-    }
-
-    column_to_alias_map
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{Operator, col, lit};
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     fn create_test_schema() -> DynamoDBTableSchema {
@@ -142,39 +139,85 @@ mod tests {
             schema,
             "id".to_string(),
             Some("sort_key".to_string()),
+            HashSet::new(),
+        )
+    }
+
+    fn create_test_schema_with_flattened() -> DynamoDBTableSchema {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("metadata.name", DataType::Utf8, true),
+            Field::new("metadata.tags.version", DataType::Utf8, true),
+        ]));
+
+        let mut flattened = HashSet::new();
+        flattened.insert("metadata".to_string());
+
+        DynamoDBTableSchema::new(
+            Arc::from("test_table"),
+            schema,
+            "id".to_string(),
+            None,
+            flattened,
         )
     }
 
     #[test]
-    fn test_new_creates_schema_with_aliases() {
+    fn test_new_and_getters() {
         let schema = create_test_schema();
 
         assert_eq!(schema.table_name(), "test_table");
         assert_eq!(schema.partition_key(), "id");
         assert_eq!(schema.sort_key(), Some("sort_key"));
-        assert_eq!(schema.column_to_alias_map.len(), 5);
-    }
-
-    #[test]
-    fn test_column_alias_mapping() {
-        let schema = create_test_schema();
-
-        assert_eq!(schema.get_column_alias("id"), Some("#c0"));
-        assert_eq!(schema.get_column_alias("sort_key"), Some("#c1"));
-        assert_eq!(schema.get_column_alias("age"), Some("#c2"));
-        assert_eq!(schema.get_column_alias("name"), Some("#c3"));
-        assert_eq!(schema.get_column_alias("active"), Some("#c4"));
-        assert_eq!(schema.get_column_alias("nonexistent"), None);
+        assert_eq!(schema.schema().fields().len(), 5);
     }
 
     #[test]
     fn test_sort_key_optional() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
 
-        let table_schema =
-            DynamoDBTableSchema::new(Arc::from("test_table"), schema, "id".to_string(), None);
+        let table_schema = DynamoDBTableSchema::new(
+            Arc::from("test_table"),
+            schema,
+            "id".to_string(),
+            None,
+            HashSet::new(),
+        );
 
         assert_eq!(table_schema.sort_key(), None);
+    }
+
+    #[test]
+    fn test_is_flattened_field_direct_match() {
+        let schema = create_test_schema_with_flattened();
+
+        assert!(schema.is_flattened_field("metadata"));
+    }
+
+    #[test]
+    fn test_is_flattened_field_nested() {
+        let schema = create_test_schema_with_flattened();
+
+        // If parent is flattened, children should also be considered flattened
+        assert!(schema.is_flattened_field("metadata.name"));
+        assert!(schema.is_flattened_field("metadata.tags"));
+        assert!(schema.is_flattened_field("metadata.tags.version"));
+    }
+
+    #[test]
+    fn test_is_flattened_field_not_flattened() {
+        let schema = create_test_schema_with_flattened();
+
+        assert!(!schema.is_flattened_field("id"));
+        assert!(!schema.is_flattened_field("other.field"));
+    }
+
+    #[test]
+    fn test_is_flattened_field_empty_set() {
+        let schema = create_test_schema();
+
+        assert!(!schema.is_flattened_field("id"));
+        assert!(!schema.is_flattened_field("metadata.name"));
     }
 
     #[test]
@@ -212,14 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_filter_supported_nonexistent_column() {
-        let schema = create_test_schema();
-
-        let expr = col("nonexistent").eq(lit(25i64));
-        assert!(!schema.is_filter_supported(&expr));
-    }
-
-    #[test]
     fn test_is_filter_supported_different_scalar_types() {
         let schema = create_test_schema();
 
@@ -230,32 +265,76 @@ mod tests {
     }
 
     #[test]
+    fn test_is_filter_supported_unsupported_operators() {
+        let schema = create_test_schema();
+
+        // These operators should not be supported
+        let unsupported_ops = vec![
+            Operator::Plus,
+            Operator::Minus,
+            Operator::Multiply,
+            Operator::Divide,
+            Operator::Modulo,
+        ];
+
+        for op in unsupported_ops {
+            let expr = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col("age")),
+                op,
+                right: Box::new(lit(5i64)),
+            });
+            assert!(!schema.is_filter_supported(&expr));
+        }
+    }
+
+    #[test]
+    fn test_is_filter_supported_complex_nested() {
+        let schema = create_test_schema();
+
+        // (age > 18 AND active = true) OR (age < 10 AND name = "child")
+        let expr = col("age")
+            .gt(lit(18i64))
+            .and(col("active").eq(lit(true)))
+            .or(col("age").lt(lit(10i64)).and(col("name").eq(lit("child"))));
+
+        assert!(schema.is_filter_supported(&expr));
+    }
+
+    #[test]
     fn test_supports_filters_pushdown() {
         let schema = create_test_schema();
 
         let supported_filter = col("age").eq(lit(25i64));
-        let unsupported_filter = col("nonexistent").eq(lit(25i64));
 
-        let filters = vec![&supported_filter, &unsupported_filter];
+        let filters = vec![&supported_filter];
+        let result = schema.supports_filters_pushdown(&filters);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+    }
+
+    #[test]
+    fn test_supports_filters_pushdown_empty() {
+        let schema = create_test_schema();
+
+        let filters: Vec<&Expr> = vec![];
+        let result = schema.supports_filters_pushdown(&filters);
+
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_supports_filters_pushdown_all_supported() {
+        let schema = create_test_schema();
+
+        let f1 = col("age").eq(lit(25i64));
+        let f2 = col("name").eq(lit("John"));
+
+        let filters = vec![&f1, &f2];
         let result = schema.supports_filters_pushdown(&filters);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
-        assert_eq!(result[1], TableProviderFilterPushDown::Unsupported);
-    }
-
-    #[test]
-    fn test_build_column_alias_maps() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("col1", DataType::Utf8, false),
-            Field::new("col2", DataType::Int64, false),
-            Field::new("col3", DataType::Boolean, false),
-        ]));
-
-        let col_to_alias = build_column_alias_maps(&schema);
-
-        assert_eq!(col_to_alias.get("col1"), Some(&"#c0".to_string()));
-        assert_eq!(col_to_alias.get("col2"), Some(&"#c1".to_string()));
-        assert_eq!(col_to_alias.get("col3"), Some(&"#c2".to_string()));
+        assert_eq!(result[1], TableProviderFilterPushDown::Exact);
     }
 }

@@ -55,4 +55,13 @@ pub enum Error {
 
     #[snafu(display("Invalid item access: {message}"))]
     InvalidItemAccess { message: String },
+
+    #[snafu(display("Type {unsupported_type_name} is not supported"))]
+    UnsupportedType { unsupported_type_name: String },
+
+    #[snafu(display("DynamoDB returned value of 'Unknown' type"))]
+    UnknownType,
+
+    #[snafu(display("Table has no partition key"))]
+    MissingPartitionKey,
 }

@@ -19,7 +19,11 @@ use super::{
     TableStatusIsNotActiveSnafu,
 };
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
+use crate::dynamodb::request_builder::{
+    DynamoDBRequestPlan, DynamoDBRequestPlanBuilder, QueryParams, ScanParams,
+};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
+use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -30,6 +34,7 @@ use aws_sdk_dynamodb::{
     types::{AttributeValue, TableStatus},
 };
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::project_schema,
@@ -44,18 +49,13 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use snafu::prelude::*;
-use std::pin::Pin;
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
-
-use crate::dynamodb::request_builder::{
-    DynamoDBRequestPlan, DynamoDBRequestPlanBuilder, QueryParams, ScanParams,
-};
-use crate::dynamodb::table_schema::DynamoDBTableSchema;
-use datafusion::logical_expr::TableProviderFilterPushDown;
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
+use snafu::prelude::*;
+use std::collections::HashSet;
+use std::pin::Pin;
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
@@ -75,7 +75,7 @@ impl DynamoDBTableProvider {
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
     ) -> Result<Self, Error> {
-        let (table_schema, partition_key, sort_key) = Self::fetch_table_metadata(
+        let (table_schema, partition_key, sort_key, flattened_fields) = Self::fetch_table_metadata(
             Arc::clone(&client),
             &table_name,
             unnest_depth,
@@ -83,8 +83,13 @@ impl DynamoDBTableProvider {
         )
         .await?;
 
-        let table_schema =
-            DynamoDBTableSchema::new(table_name, table_schema, partition_key, sort_key);
+        let table_schema = DynamoDBTableSchema::new(
+            table_name,
+            table_schema,
+            partition_key,
+            sort_key,
+            flattened_fields,
+        );
         Ok(Self {
             client,
             table_schema: table_schema.clone(),
@@ -98,7 +103,7 @@ impl DynamoDBTableProvider {
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
-    ) -> Result<(SchemaRef, String, Option<String>)> {
+    ) -> Result<(SchemaRef, String, Option<String>, HashSet<String>)> {
         let response = client
             .describe_table()
             .table_name(table_name)
@@ -136,7 +141,7 @@ impl DynamoDBTableProvider {
         }
 
         let Some(partition_key) = partition_key else {
-            unreachable!("Partition keys are enforced by DynamoDB")
+            return Err(Error::MissingPartitionKey);
         };
 
         let mut request = client.scan().table_name(table_name);
@@ -151,15 +156,16 @@ impl DynamoDBTableProvider {
             .items()
             .to_vec();
 
-        let unnested_items = match unnest_depth {
-            None | Some(0) => items,
-            Some(unnest_depth) => unnest_dynamodb_items(items, unnest_depth)?,
+        let (unnested_items, flattened_fields) = match unnest_depth {
+            None => (items, HashSet::new()),
+            Some(depth) => unnest_dynamodb_items(items, depth)?,
         };
 
         Ok((
-            infer_arrow_schema_from_items(&unnested_items),
+            infer_arrow_schema_from_items(&unnested_items)?,
             partition_key,
             sort_key,
+            flattened_fields,
         ))
     }
 }
@@ -199,6 +205,8 @@ impl TableProvider for DynamoDBTableProvider {
         let request_plan =
             self.request_plan_builder
                 .build_request_plan(filters, &projected_schema, limit)?;
+
+        println!("request_plan: {request_plan:?}");
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             Arc::clone(&self.client),
@@ -311,8 +319,8 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
                 let items: Result<Vec<_>, _> = chunk.into_iter().collect();
                 let items = items?;
 
-                let unnested_items = match unnest_depth {
-                    None | Some(0) => items,
+                let (unnested_items, _) = match unnest_depth {
+                    None => (items, HashSet::new()),
                     Some(depth) => {
                         unnest_dynamodb_items(items, depth).map_err(to_execution_error)?
                     }
