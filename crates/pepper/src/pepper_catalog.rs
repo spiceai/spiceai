@@ -14,22 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `SQLite` implementation of the metadata catalog for Pepper.
+//! Metadata catalog implementation for Pepper.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
     CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
     TableStats,
 };
+use super::metastore::sqlite::SqliteMetastore;
+#[cfg(feature = "turso")]
+use super::metastore::turso::TursoMetastore;
+use super::metastore::{
+    ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreValue, QueryParams, QueryRowParams,
+};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
 
-/// `SQLite`-based metadata catalog for Pepper.
+/// Metastore backend enum to support different implementations.
+enum MetastoreImpl {
+    Sqlite(SqliteMetastore),
+    #[cfg(feature = "turso")]
+    Turso(TursoMetastore),
+}
+
+/// Metadata catalog for Pepper with pluggable metastore backends.
 ///
 /// The catalog manages metadata for tables and their "virtual files". In Pepper,
 /// a "file" is not a single physical file, but rather a Vortex `ListingTable` at a
-/// unique directory. The `SQLite` database tracks:
+/// unique directory. The metastore database tracks:
 /// - Tables and their schemas
 /// - `DataFile` entries (metadata for each `ListingTable`/virtual file)
 /// - `DeleteFile` entries (deletion vectors for each virtual file)
@@ -39,23 +52,40 @@ use std::sync::Arc;
 ///
 /// ## Concurrency Model
 ///
-/// The catalog uses `SQLite` with WAL (Write-Ahead Logging) mode which allows:
+/// The catalog uses a metastore backend (SQLite or Turso) with WAL mode which allows:
 /// - Multiple concurrent readers
-/// - One writer at a time (serialized by `SQLite` itself)
+/// - One writer at a time (serialized by the backend)
 ///
-/// Each async operation opens a new connection with proper configuration (WAL mode,
-/// busy timeout, etc.). `SQLite`'s internal locking with the 5-second busy timeout
-/// handles write serialization automatically, eliminating the need for application-level
-/// locks.
+/// The backend handles locking and concurrency automatically.
 pub struct PepperCatalog {
     connection_string: String,
+    metastore: MetastoreImpl,
 }
 
 impl PepperCatalog {
-    /// Create a new Pepper catalog.
+    /// Create a new Pepper catalog with the appropriate metastore backend.
+    ///
+    /// The connection string determines which backend to use:
+    /// - `sqlite://path` - SQLite backend
+    /// - `libsql://path` - Turso backend (requires `turso` feature)
     pub fn new(connection_string: impl Into<String>) -> Self {
+        let connection_string = connection_string.into();
+        let metastore = if connection_string.starts_with("libsql://") {
+            #[cfg(feature = "turso")]
+            {
+                MetastoreImpl::Turso(TursoMetastore::new(&connection_string))
+            }
+            #[cfg(not(feature = "turso"))]
+            {
+                panic!("Turso backend requested but 'turso' feature is not enabled. Enable with --features turso");
+            }
+        } else {
+            MetastoreImpl::Sqlite(SqliteMetastore::new(&connection_string))
+        };
+
         Self {
-            connection_string: connection_string.into(),
+            connection_string,
+            metastore,
         }
     }
 
@@ -63,85 +93,8 @@ impl PepperCatalog {
     fn db_path(&self) -> &str {
         self.connection_string
             .strip_prefix("sqlite://")
+            .or_else(|| self.connection_string.strip_prefix("libsql://"))
             .unwrap_or(&self.connection_string)
-    }
-
-    /// Handle the result of a `spawn_blocking` task with explicit error messages.
-    ///
-    /// This helper function separates the two types of errors that can occur:
-    /// 1. `JoinError` - The blocking task panicked or was cancelled
-    /// 2. `CatalogError` - The actual operation in the blocking task failed
-    ///
-    /// # Arguments
-    ///
-    /// * `result` - The result from `spawn_blocking().await`
-    /// * `operation` - Description of what operation was being performed (e.g., "schema initialization")
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let result = tokio::task::spawn_blocking(move || {
-    ///     // ... blocking SQLite operations
-    ///     Ok::<_, CatalogError>(value)
-    /// })
-    /// .await;
-    ///
-    /// Self::handle_blocking_result(result, "table creation")?;
-    /// ```
-    fn handle_blocking_result<T>(
-        result: Result<CatalogResult<T>, tokio::task::JoinError>,
-        operation: &str,
-    ) -> CatalogResult<T> {
-        result.map_err(|err| {
-            let message = if err.is_panic() {
-                format!("{operation} task panicked: {err}")
-            } else if err.is_cancelled() {
-                format!("{operation} task was cancelled: {err}")
-            } else {
-                format!("{operation} task failed: {err}")
-            };
-            CatalogError::InvalidOperation { message }
-        })?
-    }
-
-    /// Open a `SQLite` connection configured for concurrent access.
-    ///
-    /// Applies performance optimizations based on `SQLite` best practices:
-    /// - WAL mode for non-blocking reads/writes
-    /// - Busy timeout to reduce lock contention errors
-    /// - NORMAL synchronous mode (safe with WAL)
-    /// - Memory cache and temp storage for performance
-    /// - Foreign keys enabled
-    fn open_connection(db_path: &str, read_only: bool) -> CatalogResult<rusqlite::Connection> {
-        let flags = if read_only {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-        } else {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-        };
-
-        let conn = rusqlite::Connection::open_with_flags(db_path, flags)?;
-
-        // Enable WAL mode for better concurrent access (allows multiple readers with one writer)
-        if !read_only {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-        }
-
-        // SQLite will wait 5 seconds to obtain a lock before returning SQLITE_BUSY errors
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-
-        // NORMAL synchronous mode is safe with WAL and more performant than FULL
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-
-        // 32MB cache size (negative number means kilobytes)
-        conn.pragma_update(None, "cache_size", -32000)?;
-
-        // Enable foreign keys (disabled by default for historical reasons)
-        conn.pragma_update(None, "foreign_keys", true)?;
-
-        // Store temporary tables in memory for better performance
-        conn.pragma_update(None, "temp_store", "memory")?;
-
-        Ok(conn)
     }
 
     /// Generate a unique directory path for a new virtual file (`ListingTable`).
@@ -151,104 +104,6 @@ impl PepperCatalog {
     #[allow(dead_code)]
     fn generate_file_path(file_id: i64) -> String {
         format!("file_{file_id:06}/")
-    }
-
-    /// Schema for the `pepper_metadata` table that tracks next IDs.
-    const METADATA_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS pepper_metadata (
-            key TEXT PRIMARY KEY,
-            value BIGINT NOT NULL
-        )
-    ";
-
-    /// Schema for the `pepper_table` table.
-    const TABLE_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS pepper_table (
-            table_id BIGINT PRIMARY KEY,
-            table_uuid TEXT NOT NULL,
-            table_name TEXT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            schema_json TEXT NOT NULL,
-            primary_key_json TEXT,
-            current_snapshot_id TEXT NOT NULL DEFAULT '',
-            partition_column TEXT
-        )
-    ";
-
-    /// Schema for the `pepper_data_file` table.
-    const DATA_FILE_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS pepper_data_file (
-            data_file_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            partition_id BIGINT,
-            file_order BIGINT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            file_format TEXT NOT NULL,
-            record_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL,
-            row_id_start BIGINT NOT NULL,
-            FOREIGN KEY(partition_id) REFERENCES pepper_partition(partition_id) ON DELETE SET NULL
-        )
-    ";
-
-    /// Schema for the `pepper_delete_file` table.
-    const DELETE_FILE_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS pepper_delete_file (
-            delete_file_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            data_file_id BIGINT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            format TEXT NOT NULL,
-            delete_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL
-        )
-    ";
-
-    /// Schema for the `pepper_partition` table.
-    const PARTITION_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS pepper_partition (
-            partition_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            partition_column TEXT NOT NULL,
-            partition_value TEXT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            record_count BIGINT NOT NULL DEFAULT 0,
-            file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            UNIQUE(table_id, partition_value)
-        )
-    ";
-
-    /// Initialize metadata tables.
-    fn initialize_schema(conn: &rusqlite::Connection) -> CatalogResult<()> {
-        // Create tables in a transaction
-        conn.execute_batch(&format!(
-            "{}; {}; {}; {}; {};",
-            Self::METADATA_TABLE_DDL,
-            Self::TABLE_TABLE_DDL,
-            Self::DATA_FILE_TABLE_DDL,
-            Self::DELETE_FILE_TABLE_DDL,
-            Self::PARTITION_TABLE_DDL
-        ))?;
-
-        // Initialize metadata with next IDs if not exists
-        conn.execute(
-            "INSERT OR IGNORE INTO pepper_metadata (key, value) VALUES ('next_catalog_id', 1)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO pepper_metadata (key, value) VALUES ('next_file_id', 1)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO pepper_metadata (key, value) VALUES ('next_partition_id', 1)",
-            [],
-        )?;
-
-        Ok(())
     }
 
     /// Perform catalog shutdown maintenance tasks.
@@ -262,39 +117,88 @@ impl PepperCatalog {
     /// Returns [`CatalogError`] if the catalog cannot be opened or if the
     /// maintenance pragma statements fail to execute.
     pub async fn shutdown(&self) -> CatalogResult<()> {
-        let db_path_owned = self.db_path().to_string();
+        // Only SQLite supports WAL checkpoint and optimize pragmas
+        // Turso handles optimization automatically
+        match &self.metastore {
+            MetastoreImpl::Sqlite(_) => {
+                let db_path_owned = self.db_path().to_string();
 
-        let result = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open(&db_path_owned)?;
+                tokio::task::spawn_blocking(move || {
+                    let conn = rusqlite::Connection::open(&db_path_owned)?;
 
-            // Check if WAL mode is enabled
-            let journal_mode: String =
-                conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+                    // Check if WAL mode is enabled
+                    let journal_mode: String =
+                        conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
-            if journal_mode.eq_ignore_ascii_case("wal") {
-                tracing::info!("Truncating Pepper catalog WAL log");
-                // Truncate the WAL log to persist changes and reduce file size
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+                    if journal_mode.eq_ignore_ascii_case("wal") {
+                        tracing::info!("Truncating Pepper catalog WAL log");
+                        // Truncate the WAL log to persist changes and reduce file size
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+                    }
+
+                    // Run optimize to improve query performance for future connections
+                    tracing::info!("Running optimize on Pepper catalog");
+                    conn.execute("PRAGMA optimize", [])?;
+
+                    Ok::<(), CatalogError>(())
+                })
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: format!("Catalog shutdown task panicked: {e}"),
+                })??;
             }
-
-            // Run optimize to improve query performance for future connections
-            tracing::info!("Running optimize on Pepper catalog");
-            conn.execute("PRAGMA optimize", [])?;
-
-            Ok::<(), CatalogError>(())
-        })
-        .await;
-
-        Self::handle_blocking_result(result, "Catalog shutdown")?;
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(_) => {
+                // Turso handles optimization automatically, no action needed
+                tracing::debug!("Turso backend handles optimization automatically");
+            }
+        }
 
         Ok(())
+    }
+}
+
+impl PepperCatalog {
+    /// Helper to query a single row from metastore, working with both SQLite and Turso
+    async fn query_row_helper<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
+    where
+        F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static + Copy,
+        T: Send + 'static,
+    {
+        match &self.metastore {
+            MetastoreImpl::Sqlite(m) => m.query_row(params, f).await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.query_row(params, f).await,
+        }
+    }
+
+    /// Helper to execute a statement on metastore, working with both SQLite and Turso
+    async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
+        match &self.metastore {
+            MetastoreImpl::Sqlite(m) => m.execute(params).await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.execute(params).await,
+        }
+    }
+
+    /// Helper to query multiple rows from metastore, working with both SQLite and Turso
+    async fn query_helper<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
+    where
+        F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match &self.metastore {
+            MetastoreImpl::Sqlite(m) => m.query(params, f).await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.query(params, f).await,
+        }
     }
 }
 
 #[async_trait]
 impl MetadataCatalog for PepperCatalog {
     async fn init(&self) -> CatalogResult<()> {
-        // Create database file if it doesn't exist
+        // Create database directory if it doesn't exist
         let db_path = self.db_path();
         let db_dir = Path::new(db_path)
             .parent()
@@ -306,16 +210,12 @@ impl MetadataCatalog for PepperCatalog {
             tokio::fs::create_dir_all(db_dir).await?;
         }
 
-        // Initialize schema using connection with WAL mode
-        let db_path_owned = self.db_path().to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&db_path_owned, false)?;
-            Self::initialize_schema(&conn)?;
-            Ok::<(), CatalogError>(())
-        })
-        .await;
-
-        Self::handle_blocking_result(result, "Schema initialization")?;
+        // Initialize schema using the appropriate metastore backend
+        match &self.metastore {
+            MetastoreImpl::Sqlite(metastore) => metastore.init_schema().await?,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(metastore) => metastore.init_schema().await?,
+        }
 
         Ok(())
     }
@@ -336,26 +236,18 @@ impl MetadataCatalog for PepperCatalog {
 
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
-        let db_path_owned = self.db_path().to_string();
 
         // Check if table already exists first (read-only check)
-        let db_path_for_check = db_path_owned.clone();
-        let table_name_check = table_name.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&db_path_for_check, true)?;
-            match conn.query_row(
-                "SELECT table_id FROM pepper_table WHERE table_name = ?1",
-                [&table_name_check],
-                |row| row.get(0),
-            ) {
-                Ok(id) => Ok(Some(id)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(CatalogError::from(e)),
-            }
-        })
-        .await;
-
-        let existing_table_id: Option<i64> = Self::handle_blocking_result(result, "Table lookup")?;
+        let existing_table_id: Option<i64> = self
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT table_id FROM pepper_table WHERE table_name = ?1",
+                    params: vec![MetastoreValue::Text(table_name.clone())],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .ok();
 
         if let Some(table_id) = existing_table_id {
             // Table already exists, return its ID
@@ -394,87 +286,76 @@ impl MetadataCatalog for PepperCatalog {
 
         let partition_column = options.partition_column.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&db_path_owned, false)?;
+        // Double-check if table was created by another thread while we were preparing
+        let double_check = self
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT table_id FROM pepper_table WHERE table_name = ?1",
+                    params: vec![MetastoreValue::Text(table_name.clone())],
+                },
+                |row| row.get_i64(0),
+            )
+            .await;
 
-            // Start transaction with IMMEDIATE to acquire write lock upfront
-            conn.execute("BEGIN IMMEDIATE TRANSACTION", [])?;
+        let create_result: CreateTableResult = match double_check {
+            Ok(id) => CreateTableResult::AlreadyExists { table_id: id },
+            Err(_) => {
+                // Get next catalog ID (for table_id)
+                let next_catalog_id: i64 = self
+                    .query_row_helper(
+                        QueryRowParams {
+                            sql: "SELECT value FROM pepper_metadata WHERE key = 'next_catalog_id'",
+                            params: vec![],
+                        },
+                        |row| row.get_i64(0),
+                    )
+                    .await?;
 
-            // Double-check if table was created by another thread while we were preparing
-            let existing: Result<i64, rusqlite::Error> = conn.query_row(
-                "SELECT table_id FROM pepper_table WHERE table_name = ?1",
-                [&table_name],
-                |row| row.get(0),
-            );
+                let table_id = next_catalog_id;
 
-            match existing {
-                Ok(id) => {
-                    // Another thread created it, return that ID
-                    conn.execute("COMMIT", [])?;
-                    Ok::<CreateTableResult, CatalogError>(CreateTableResult::AlreadyExists {
-                        table_id: id,
-                    })
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    // Proceed with creation
-                    // Get next catalog ID (for table_id)
-                    let next_catalog_id: i64 = conn.query_row(
-                        "SELECT value FROM pepper_metadata WHERE key = 'next_catalog_id'",
-                        [],
-                        |row| row.get(0),
-                    )?;
+                // Generate table UUID
+                let table_uuid = uuid::Uuid::now_v7().to_string();
 
-                    let table_id = next_catalog_id;
+                // Generate initial snapshot UUID
+                let initial_snapshot_id = uuid::Uuid::now_v7().to_string();
 
-                    // Generate table UUID
-                    let table_uuid = uuid::Uuid::now_v7().to_string();
-
-                    // Generate initial snapshot UUID
-                    let initial_snapshot_id = uuid::Uuid::now_v7().to_string();
-
-                    // Insert table metadata with initial snapshot
-                    conn.execute(
-                        r"
+                // Insert table metadata with initial snapshot
+                self.execute_helper(ExecuteParams {
+                    sql: r"
                         INSERT INTO pepper_table (
                             table_id, table_uuid,
                             table_name, path, path_is_relative, schema_json, primary_key_json,
                             current_snapshot_id, partition_column
                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                        ",
-                        rusqlite::params![
-                            table_id,
-                            table_uuid,
-                            table_name,
-                            base_path,
-                            false, // path_is_relative - using absolute paths for now
-                            schema_json,
-                            primary_key_json,
-                            initial_snapshot_id, // All tables start with an initial snapshot
-                            partition_column,
-                        ],
-                    )?;
+                    ",
+                    params: vec![
+                        MetastoreValue::Integer(table_id),
+                        MetastoreValue::Text(table_uuid),
+                        MetastoreValue::Text(table_name.clone()),
+                        MetastoreValue::Text(base_path.clone()),
+                        MetastoreValue::Bool(false), // path_is_relative
+                        MetastoreValue::Text(schema_json),
+                        primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                        MetastoreValue::Text(initial_snapshot_id.clone()),
+                        partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                    ],
+                })
+                .await?;
 
-                    // Update next_catalog_id in metadata
-                    conn.execute(
-                        "UPDATE pepper_metadata SET value = ?1 WHERE key = 'next_catalog_id'",
-                        [next_catalog_id + 1],
-                    )?;
+                // Update next_catalog_id in metadata
+                self.execute_helper(ExecuteParams {
+                    sql: "UPDATE pepper_metadata SET value = ?1 WHERE key = 'next_catalog_id'",
+                    params: vec![MetastoreValue::Integer(next_catalog_id + 1)],
+                })
+                .await?;
 
-                    // Commit transaction
-                    conn.execute("COMMIT", [])?;
-
-                    Ok::<CreateTableResult, CatalogError>(CreateTableResult::Created {
-                        table_id,
-                        snapshot_id: initial_snapshot_id,
-                        base_path,
-                    })
+                CreateTableResult::Created {
+                    table_id,
+                    snapshot_id: initial_snapshot_id,
+                    base_path: base_path.clone(),
                 }
-                Err(e) => Err(CatalogError::from(e)),
             }
-        })
-        .await;
-
-        let create_result = Self::handle_blocking_result(result, "Table creation")?;
+        };
 
         // Handle the result - only create snapshot directory if table was newly created
         match create_result {
@@ -491,7 +372,7 @@ impl MetadataCatalog for PepperCatalog {
 
                 tokio::fs::create_dir_all(&snapshot_dir)
                     .await
-                    .map_err(|e| CatalogError::Io { source: e })?;
+                    .map_err(|e| CatalogError::Io { source: e})?;
 
                 Ok(table_id)
             }
