@@ -304,7 +304,6 @@ pub(crate) async fn run_search_w_explain(
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    tracing::error!("{}", serde_json::to_string_pretty(&app).expect("mah"));
     test_request_context()
         .scope(async {
             let api_config = start_app(app).await?;
