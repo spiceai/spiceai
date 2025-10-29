@@ -33,10 +33,14 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
+    catalog::TableProviderFactory,
+    datasource::TableProvider,
+    execution::context::SessionContext,
     logical_expr::CreateExternalTable,
-    sql::parser::{DFParser, Statement},
-    sql::sqlparser::{ast::{Delete, Ident, ObjectName, Statement as SQLStatement}, dialect::PostgreSqlDialect},
+    sql::sqlparser::ast::{
+        Delete, FromTable, Ident, ObjectName, ObjectNamePart, Statement as SQLStatement,
+        TableFactor,
+    },
 };
 use datafusion_table_providers::{
     duckdb::{
@@ -455,10 +459,17 @@ impl DataAccelerator for DuckDBAccelerator {
                 .to_string();
 
             let dataset_name = src.name().to_string();
-            
-            // Parse the retention SQL once at initialization time to prepare for reconstruction
-            match parse_retention_sql_for_duckdb(&retention_sql, &dataset_name) {
-                Ok(parsed_delete) => Some(make_retention_write_handler(dataset_name, parsed_delete)),
+            let schema = Arc::new(cmd.schema.as_arrow().clone());
+
+            match crate::datafusion::retention_sql::parse_retention_sql(
+                src.name(),
+                &retention_sql,
+                schema,
+            ) {
+                Ok(parsed_sql) => Some(make_retention_write_handler(
+                    dataset_name,
+                    parsed_sql.delete_statement,
+                )),
                 Err(e) => {
                     tracing::warn!(
                         "Failed to parse retention_sql for dataset {}: {}. Retention SQL will not be applied.",
@@ -513,111 +524,33 @@ pub(crate) async fn create_table_provider(
     Ok(table_provider)
 }
 
-/// Parse the retention SQL and extract the DELETE statement for later reconstruction.
-/// This is done once at initialization time rather than on every write.
-fn parse_retention_sql_for_duckdb(
-    retention_sql: &str,
-    dataset_name: &str,
-) -> Result<Delete, String> {
-    // Parse the SQL statement
-    let mut statements = DFParser::parse_sql_with_dialect(retention_sql, &PostgreSqlDialect {})
-        .map_err(|e| format!("Failed to parse retention SQL: {e}"))?;
-
-    if statements.len() != 1 {
-        return Err(format!(
-            "Expected exactly one SQL statement in retention_sql, found {}",
-            statements.len()
-        ));
-    }
-
-    let statement = statements
-        .pop_front()
-        .ok_or_else(|| "No statement found in retention_sql".to_string())?;
-
-    match statement {
-        Statement::Statement(statement) => match statement.as_ref() {
-            SQLStatement::Delete(delete) => {
-                // Extract table name from FromTable enum
-                use datafusion::sql::sqlparser::ast::FromTable;
-                let from_tables = match &delete.from {
-                    FromTable::WithFromKeyword(tables) => tables,
-                    _ => return Err("DELETE statement must use FROM keyword".to_string()),
-                };
-
-                if from_tables.is_empty() {
-                    return Err("No table specified in DELETE statement".to_string());
-                }
-
-                // Validate that the table name matches the dataset name
-                let table_name = &from_tables[0].relation;
-                validate_table_name_matches(table_name, dataset_name)?;
-                
-                Ok(delete.clone())
-            }
-            _ => Err("retention_sql must be a DELETE statement".to_string()),
-        },
-        _ => Err("retention_sql must be a DELETE statement".to_string()),
-    }
-}
-
-/// Validate that the table name in the DELETE statement matches the dataset name.
-fn validate_table_name_matches(table_name: &datafusion::sql::sqlparser::ast::TableFactor, dataset_name: &str) -> Result<(), String> {
-    use datafusion::sql::sqlparser::ast::TableFactor;
-    
-    let object_name = match table_name {
-        TableFactor::Table { name, .. } => name,
-        _ => return Err("DELETE statement must reference a simple table".to_string()),
-    };
-
-    let table_str = object_name.to_string();
-    
-    // Handle schema-qualified names (e.g., "schema.table") by checking if the last part matches
-    let last_part = object_name.0.last()
-        .ok_or_else(|| "Empty table name in DELETE statement".to_string())?;
-    
-    let last_part_str = match last_part {
-        datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(ident) => &ident.value,
-        _ => return Err("Unsupported table name format in DELETE statement".to_string()),
-    };
-    
-    if last_part_str == dataset_name || table_str == dataset_name {
-        Ok(())
-    } else {
-        Err(format!(
-            "Table name in retention_sql '{}' does not match dataset name '{}'",
-            table_str, dataset_name
-        ))
-    }
-}
-
-/// Reconstruct the DELETE statement with the internal DuckDB table name.
+/// Reconstruct the DELETE statement with the internal `DuckDB` table name.
 fn reconstruct_retention_sql_with_table_name(
     delete: &Delete,
     internal_table_name: &str,
 ) -> Result<String, String> {
     // Clone the delete statement and modify the table name
     let mut modified_delete = delete.clone();
-    
+
     // Replace the table name with the internal table name
     // DuckDB internal table names should be used as-is without schema qualification
-    use datafusion::sql::sqlparser::ast::{FromTable, ObjectNamePart, TableFactor};
-    
-    let from_tables = match &mut modified_delete.from {
-        FromTable::WithFromKeyword(tables) => tables,
-        _ => return Err("DELETE statement must use FROM keyword".to_string()),
+    let FromTable::WithFromKeyword(from_tables) = &mut modified_delete.from else {
+        return Err("DELETE statement must use FROM keyword".to_string());
     };
 
-    if from_tables.is_empty() {
-        return Err("No table specified in DELETE statement".to_string());
-    }
-
     // Replace the first table's name, keeping all other properties
-    if let TableFactor::Table { name, .. } = &mut from_tables[0].relation {
-        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(internal_table_name))]);
+    let Some(table_relation) = from_tables.first_mut() else {
+        return Err("No table specified in DELETE statement".to_string());
+    };
+
+    if let TableFactor::Table { name, .. } = &mut table_relation.relation {
+        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+            internal_table_name,
+        ))]);
     } else {
         return Err("DELETE statement must reference a simple table".to_string());
     }
-    
+
     // Simply convert the AST to string using Display trait
     let statement = SQLStatement::Delete(modified_delete);
     Ok(statement.to_string())
@@ -629,7 +562,7 @@ fn make_retention_write_handler(
 ) -> WriteCompletionHandler {
     Arc::new(move |tx, table_manager, _schema, inserted_rows| {
         let internal_table_name = table_manager.table_name().to_string();
-        
+
         tracing::debug!(
             dataset = %dataset_name,
             table = %internal_table_name,
@@ -638,15 +571,16 @@ fn make_retention_write_handler(
         );
 
         // Reconstruct the SQL with the internal table name
-        let reconstructed_sql = match reconstruct_retention_sql_with_table_name(&parsed_delete, &internal_table_name) {
-            Ok(sql) => sql,
-            Err(e) => {
-                return Err(DataFusionError::Execution(format!(
-                    "Failed to reconstruct retention SQL for dataset {dataset_name}: {e}"
-                )));
-            }
-        };
-        
+        let reconstructed_sql =
+            match reconstruct_retention_sql_with_table_name(&parsed_delete, &internal_table_name) {
+                Ok(sql) => sql,
+                Err(e) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to reconstruct retention SQL for dataset {dataset_name}: {e}"
+                    )));
+                }
+            };
+
         tracing::debug!(
             dataset = %dataset_name,
             table = %internal_table_name,
@@ -682,7 +616,7 @@ mod tests {
     };
     use data_components::delete::get_deletion_provider;
     use datafusion::{
-        common::{Constraint, Constraints, TableReference, ToDFSchema},
+        common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
@@ -721,12 +655,15 @@ mod tests {
 
         let duckdb_accelerator = DuckDBAccelerator::new();
         let retention_sql = "DELETE FROM retention_table WHERE value < 5";
-        let parsed_delete = super::parse_retention_sql_for_duckdb(retention_sql, "retention_table")
-            .expect("should parse retention SQL");
-        let handler = super::make_retention_write_handler(
-            "retention_dataset".to_string(),
-            parsed_delete,
-        );
+        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("retention_table"),
+            retention_sql,
+            Arc::clone(&schema),
+        )
+        .expect("should parse retention SQL")
+        .delete_statement;
+        let handler =
+            super::make_retention_write_handler("retention_dataset".to_string(), parsed_delete);
 
         let table = super::create_table_provider(
             &duckdb_accelerator.duckdb_factory,
@@ -782,6 +719,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn retention_sql_fails_with_internal_tables() {
         use datafusion_table_providers::duckdb::DuckDB;
         use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -834,12 +772,14 @@ mod tests {
 
         // The retention SQL references the logical table name "taxi_trips"
         let retention_sql = "DELETE FROM taxi_trips WHERE value < 5";
-        let parsed_delete = super::parse_retention_sql_for_duckdb(retention_sql, "taxi_trips")
-            .expect("should parse retention SQL");
-        let handler = super::make_retention_write_handler(
-            "taxi_trips".to_string(),
-            parsed_delete,
-        );
+        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("taxi_trips"),
+            retention_sql,
+            Arc::clone(&schema),
+        )
+        .expect("should parse retention SQL")
+        .delete_statement;
+        let handler = super::make_retention_write_handler("taxi_trips".to_string(), parsed_delete);
 
         let table = super::create_table_provider(
             &duckdb_accelerator.duckdb_factory,
@@ -910,7 +850,7 @@ mod tests {
             return;
         }
 
-        eprintln!("Found internal tables: {:?}", internal_tables);
+        eprintln!("Found internal tables: {internal_tables:?}");
 
         // Now try to insert more data - this should trigger the retention SQL
         // and fail because it tries to DELETE from the internal table name
@@ -1186,6 +1126,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_retention_sql_with_duckdb_accelerator() {
         use tempfile::TempDir;
 
@@ -1216,12 +1157,20 @@ mod tests {
             column_defaults: HashMap::default(),
             temporary: false,
         };
-        external_table.options.insert("open".to_string(), db_path.to_str().expect("path").to_string());
+        external_table.options.insert(
+            "open".to_string(),
+            db_path.to_str().expect("path").to_string(),
+        );
 
         // Parse retention SQL and create handler
         let retention_sql = "DELETE FROM retention_test_dataset WHERE value < 5";
-        let parsed_delete = super::parse_retention_sql_for_duckdb(retention_sql, "retention_test_dataset")
-            .expect("should parse retention SQL");
+        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("retention_test_dataset"),
+            retention_sql,
+            Arc::clone(&schema),
+        )
+        .expect("should parse retention SQL")
+        .delete_statement;
         let handler = super::make_retention_write_handler(
             "retention_test_dataset".to_string(),
             parsed_delete,
@@ -1296,16 +1245,14 @@ mod tests {
         for value in &values {
             assert!(
                 *value >= 5,
-                "Found value {} which should have been deleted by retention SQL",
-                value
+                "Found value {value} which should have been deleted by retention SQL"
             );
         }
 
         // We should have 3 rows remaining (values 6, 7, 8)
         assert_eq!(
             total_rows, 3,
-            "Expected 3 rows after retention (values >= 5), found {}. Values: {:?}",
-            total_rows, values
+            "Expected 3 rows after retention (values >= 5), found {total_rows}. Values: {values:?}"
         );
 
         // cleanup
@@ -1314,89 +1261,42 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_retention_sql_simple() {
-        use datafusion::sql::sqlparser::ast::FromTable;
-        
-        let sql = "DELETE FROM taxi_trips WHERE status = 'expired'";
-        let result = super::parse_retention_sql_for_duckdb(sql, "taxi_trips");
-        
-        assert!(result.is_ok(), "Should parse simple DELETE statement");
-        let delete = result.expect("parsed delete");
-        
-        // Verify the table name
-        if let FromTable::WithFromKeyword(tables) = &delete.from {
-            assert_eq!(tables.len(), 1);
-            // The table name should be taxi_trips
-            let table_str = if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } = &tables[0].relation {
-                name.to_string()
-            } else {
-                String::new()
-            };
-            assert_eq!(table_str, "taxi_trips");
-        } else {
-            panic!("Expected WithFromKeyword variant");
-        }
-        
-        // Verify WHERE clause exists
-        assert!(delete.selection.is_some(), "Should have WHERE clause");
-    }
-
-    #[test]
-    fn test_parse_retention_sql_schema_qualified() {
-        let sql = "DELETE FROM schema.taxi_trips WHERE status = 'expired'";
-        let result = super::parse_retention_sql_for_duckdb(sql, "taxi_trips");
-        
-        assert!(result.is_ok(), "Should parse schema-qualified DELETE statement");
-    }
-
-    #[test]
-    fn test_parse_retention_sql_wrong_table_name() {
-        let sql = "DELETE FROM wrong_table WHERE status = 'expired'";
-        let result = super::parse_retention_sql_for_duckdb(sql, "taxi_trips");
-        
-        assert!(result.is_err(), "Should fail when table name doesn't match");
-        assert!(
-            result.expect_err("error").contains("does not match dataset name"),
-            "Error should mention table name mismatch"
-        );
-    }
-
-    #[test]
-    fn test_parse_retention_sql_not_delete() {
-        let sql = "SELECT * FROM taxi_trips";
-        let result = super::parse_retention_sql_for_duckdb(sql, "taxi_trips");
-        
-        assert!(result.is_err(), "Should fail when statement is not DELETE");
-        assert!(
-            result.expect_err("error").contains("must be a DELETE statement"),
-            "Error should mention DELETE requirement"
-        );
-    }
-
-    #[test]
     fn test_reconstruct_retention_sql() {
         let sql = "DELETE FROM taxi_trips WHERE status = 'expired'";
-        let parsed = super::parse_retention_sql_for_duckdb(sql, "taxi_trips")
-            .expect("should parse");
-        
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Utf8,
+            true,
+        )]));
+        let parsed = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("taxi_trips"),
+            sql,
+            schema,
+        )
+        .expect("should parse");
+
         let internal_name = "__data_taxi_trips_1234567890";
-        let result = super::reconstruct_retention_sql_with_table_name(&parsed, internal_name);
-        
+        let result = super::reconstruct_retention_sql_with_table_name(
+            &parsed.delete_statement,
+            internal_name,
+        );
+
         assert!(result.is_ok(), "Should reconstruct SQL successfully");
         let reconstructed = result.expect("reconstructed");
-        
+
         // Verify the internal table name is used
         assert!(
             reconstructed.contains(internal_name),
             "Should contain internal table name"
         );
-        
+
         // Verify the WHERE clause is preserved
         assert!(
-            reconstructed.contains("status = 'expired'") || reconstructed.contains("status = \"expired\""),
+            reconstructed.contains("status = 'expired'")
+                || reconstructed.contains("status = \"expired\""),
             "Should preserve WHERE clause"
         );
-        
+
         // Verify it's still a DELETE statement
         assert!(
             reconstructed.to_lowercase().starts_with("delete from"),
@@ -1407,21 +1307,35 @@ mod tests {
     #[test]
     fn test_reconstruct_retention_sql_complex_where() {
         let sql = "DELETE FROM orders WHERE created_at < NOW() - INTERVAL '30 days' AND status IN ('cancelled', 'expired')";
-        let parsed = super::parse_retention_sql_for_duckdb(sql, "orders")
-            .expect("should parse");
-        
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("created_at", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let parsed = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("orders"),
+            sql,
+            schema,
+        )
+        .expect("should parse");
+
         let internal_name = "__data_orders_9876543210";
-        let result = super::reconstruct_retention_sql_with_table_name(&parsed, internal_name);
-        
-        assert!(result.is_ok(), "Should reconstruct complex SQL successfully");
+        let result = super::reconstruct_retention_sql_with_table_name(
+            &parsed.delete_statement,
+            internal_name,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should reconstruct complex SQL successfully"
+        );
         let reconstructed = result.expect("reconstructed");
-        
+
         // Verify the internal table name is used
         assert!(
             reconstructed.contains(internal_name),
             "Should contain internal table name"
         );
-        
+
         // Basic sanity check - make sure it's still a valid DELETE statement structure
         assert!(
             reconstructed.to_lowercase().starts_with("delete from"),
