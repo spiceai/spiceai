@@ -17,6 +17,7 @@ limitations under the License.
 use rand::Rng;
 use regex::Regex;
 use std::{
+    fs,
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
@@ -144,4 +145,19 @@ pub async fn observe_memory(
     println!("Max memory usage: {max_memory:.2} GB");
     println!("Median memory usage: {median_memory:.2} GB");
     Ok((max_memory, median_memory))
+}
+
+pub fn recursively_get_dir_size(dir: &PathBuf) -> anyhow::Result<usize> {
+    let mut total_size = 0;
+    if dir.exists() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                total_size += usize::try_from(entry.metadata()?.len())?;
+            } else if entry.file_type()?.is_dir() {
+                total_size += recursively_get_dir_size(&entry.path())?;
+            }
+        }
+    }
+    Ok(total_size)
 }
