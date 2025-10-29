@@ -96,6 +96,8 @@ pub enum QueryOverridesArg {
     DatabricksCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
+    #[serde(rename = "saffron-views")]
+    SaffronViews,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -131,6 +133,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
+            QueryOverridesArg::SaffronViews => QueryOverrides::SaffronViews,
         }
     }
 }

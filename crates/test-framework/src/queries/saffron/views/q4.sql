@@ -1,12 +1,11 @@
--- Area Code Random Number Selection Query
+-- Area Code Random Number Selection Query (Views)
 -- Executes area code random number selection queries (most selective)
 -- Filters by AccountSid, NumberPoolSid, NumberRegion, AreaCodeRegion, NumberType, Capability, etc.
 
-SELECT A.DateCreated, A.DateUpdated, A.AccountSid, A.NumberPoolSid, A.NumberSid, A.MaxRate, A.NumberDid, 
-  A.NumberType, A.SupportedDestRegion, A.NumberRegion, A.CurrentRate, A.IsAvailable, A.ProviderSid,
-  A.AreaCodeRegion, A.AvailableForNumberSelection
-FROM number_info AS A
-INNER JOIN number_caps AS B ON A.NumberSid = B.NumberSid
+SELECT DateCreated, DateUpdated, AccountSid, NumberPoolSid, NumberSid, MaxRate, NumberDid, 
+       NumberType, SupportedDestRegion, NumberRegion, CurrentRate, IsAvailable, ProviderSid,
+       AreaCodeRegion, AvailableForNumberSelection, Capability
+FROM number_info_with_cap AS A
 WHERE A.AccountSid = ? 
   AND A.NumberPoolSid = ? 
   AND A.NumberRegion IN (?)
@@ -14,7 +13,7 @@ WHERE A.AccountSid = ?
   AND A.AreaCodeRegion IN (?)
   AND A.MaxRate = ?
   AND A.NumberSid NOT IN (?)
-  AND B.Capability = ?
+  AND A.Capability = ?
   AND (CASE WHEN ? THEN A.AvailableForNumberSelection = 1 ELSE A.AvailableForNumberSelection IN (1, 0) END)
 ORDER BY RAND()
 LIMIT 1 OFFSET ?

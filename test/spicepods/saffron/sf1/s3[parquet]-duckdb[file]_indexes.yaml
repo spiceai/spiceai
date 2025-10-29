@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]_view_with_partitioning
+name: s3[parquet]-duckdb[file]_indexes
 
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
@@ -21,7 +21,9 @@ datasets:
       refresh_mode: append
       params:
         duckdb_preserve_insertion_order: false
-
+      indexes:
+        '(AccountSid, NumberPoolSid)': enabled
+  
   - from: s3://benchmarks/saffron/number_caps_sf1
     name: number_caps
     params: *params_s3
@@ -31,21 +33,5 @@ datasets:
       mode: file
       params:
         duckdb_preserve_insertion_order: false
-
-views:
-  - name: number_info_with_cap
-    sql: |
-      select ni.*, nc.Capability from number_info ni
-      inner join number_caps nc
-      on ni.NumberSid = nc.NumberSid
-      order by ni.AccountSid, ni.NumberPoolSid
-    acceleration:
-      enabled: true
-      engine: duckdb
-      mode: file
-      refresh_on_startup: auto
-      params: 
-        partition_mode: tables
-        duckdb_partitioned_write_flush_threshold: 522880
-      partition_by:
-        - bucket(32, AccountSid)
+      indexes:
+        NumberSid: enabled
