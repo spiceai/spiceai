@@ -40,6 +40,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::SystemTime,
 };
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::streaming_utils::generate_stream_id;
 
@@ -171,7 +172,11 @@ impl SamplingParams {
         if samplers.is_empty() {
             LlamaSampler::greedy()
         } else if samplers.len() == 1 {
-            samplers.into_iter().next().expect("has one sampler")
+            // Safe to unwrap: we just checked that samplers has exactly one element
+            match samplers.into_iter().next() {
+                Some(sampler) => sampler,
+                None => unreachable!("samplers.len() == 1 guarantees one element exists"),
+            }
         } else {
             LlamaSampler::chain_simple(samplers)
         }
@@ -214,8 +219,9 @@ impl LlamaCpp {
             )
         })
         .await
-        .boxed()
-        .context(FailedToRunModelSnafu)??;
+        .map_err(|e| ChatError::FailedToLoadModel {
+            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+        })??;
 
         Ok(Self {
             model: Arc::new(model),
@@ -549,12 +555,8 @@ impl LlamaCpp {
             }
         });
 
-        // Create stream from receiver
-        let stream = async_stream::stream! {
-            while let Some(result) = rx.recv().await {
-                yield result;
-            }
-        };
+        // Create stream from receiver using ReceiverStream (avoids async_stream::stream! macro)
+        let stream = ReceiverStream::new(rx);
 
         Ok(Box::pin(stream))
     }
