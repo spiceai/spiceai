@@ -138,11 +138,6 @@ pub async fn write(
         result_batches.push(processed_chunk);
     }
 
-    if result_batches.is_empty() {
-        return Ok(record);
-    }
-
-    let schema = result_batches[0].schema();
     let concatenated =
         concat_batches(&schema, &result_batches).context(IssueWithArrowProcessingSnafu {
             index: index.name(),
