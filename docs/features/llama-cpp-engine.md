@@ -94,13 +94,14 @@ The llama.cpp engine provides:
 ### Current Limitations
 
 - **Model format**: Only GGUF format is supported (mistral-rs supports Safetensors, GGUF, and GGML).
-- **Max tokens**: Hardcoded to 512 tokens per generation (will be made configurable).
+- **Context size**: Hardcoded to 2048 tokens (will be made configurable in a future release).
 
 ### Future Enhancements
 
 The following improvements are planned:
 
-1. **Batch processing** - Optimize for multiple concurrent requests
+1. **Configurable context size** - Allow users to specify the context window size (currently hardcoded to 2048)
+2. **Batch processing** - Optimize for multiple concurrent requests
 
 ## Architecture
 
