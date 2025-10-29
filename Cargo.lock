@@ -17496,38 +17496,34 @@ dependencies = [
 [[package]]
 name = "vortex-datafusion"
 version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dc3631ce7f0553be748990d1195d34e10dfe6a0ab93d1cfd792d46bb5df4cca"
 dependencies = [
- "anyhow",
- "arrow",
  "arrow-schema",
  "async-trait",
  "chrono",
- "datafusion",
  "datafusion-catalog",
  "datafusion-common",
  "datafusion-common-runtime",
  "datafusion-datasource",
  "datafusion-execution",
  "datafusion-expr",
+ "datafusion-functions",
  "datafusion-physical-expr",
+ "datafusion-physical-expr-adapter",
  "datafusion-physical-expr-common",
  "datafusion-physical-plan",
  "datafusion-pruning",
  "futures",
- "insta",
  "itertools 0.14.0",
  "log",
  "moka",
  "object_store",
- "rstest 0.26.1",
- "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
- "uuid 1.18.1",
  "vortex",
  "vortex-utils",
- "walkdir",
 ]
 
 [[package]]
