@@ -26,8 +26,9 @@ use data_components::delete::DeletionTableProvider;
 use datafusion::prelude::*;
 use datafusion_physical_plan::collect;
 use pepper::metadata::CreateTableOptions;
-use pepper::{MetadataCatalog, PepperTableProvider};
+use pepper::{MetadataCatalog, PepperCatalog, PepperTableProvider};
 use std::sync::Arc;
+use tempfile::TempDir;
 
 // Generate test variants for each backend
 test_with_backends!(test_delete_with_primary_key_impl);
