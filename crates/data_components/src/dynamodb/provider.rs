@@ -78,13 +78,14 @@ impl DynamoDBTableProvider {
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
     ) -> Result<Self, Error> {
-        let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) = Self::fetch_table_metadata(
-            Arc::clone(&client),
-            &table_name,
-            unnest_depth,
-            schema_infer_max_records,
-        )
-        .await?;
+        let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) =
+            Self::fetch_table_metadata(
+                Arc::clone(&client),
+                &table_name,
+                unnest_depth,
+                schema_infer_max_records,
+            )
+            .await?;
 
         let table_schema = DynamoDBTableSchema::new(
             table_name,
@@ -108,7 +109,13 @@ impl DynamoDBTableProvider {
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
-    ) -> Result<(SchemaRef, String, Option<String>, HashSet<String>, Option<i64>)> {
+    ) -> Result<(
+        SchemaRef,
+        String,
+        Option<String>,
+        HashSet<String>,
+        Option<i64>,
+    )> {
         let response = client
             .describe_table()
             .table_name(table_name)
@@ -185,7 +192,7 @@ impl DynamoDBTableProvider {
                 100_000..1_000_000 => 8,
                 1_000_000..10_000_000 => 16,
                 _ => 32,
-            }
+            },
         }
     }
 }
@@ -226,9 +233,15 @@ impl TableProvider for DynamoDBTableProvider {
             self.request_plan_builder
                 .build_request_plan(filters, &projected_schema, limit)?;
 
-        let total_partitions = self.config_partitions.unwrap_or_else(|| self.get_partitions_from_table_size());
+        let total_partitions = self
+            .config_partitions
+            .unwrap_or_else(|| self.get_partitions_from_table_size());
 
-        println!("table {:?}, total_partitions: {:?}", self.table_schema.table_name(), total_partitions);
+        tracing::debug!(
+            "[DynamoDB] table {:?}, total_partitions: {:?}",
+            self.table_schema.table_name(),
+            total_partitions
+        );
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             Arc::clone(&self.client),
@@ -333,14 +346,15 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let unnest_depth = self.unnest_depth;
 
         let total_partitions = match self.properties.partitioning {
-            Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _)=> 1,
-            Partitioning::UnknownPartitioning(partitions) => partitions
+            Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
+            Partitioning::UnknownPartitioning(partitions) => partitions,
         };
 
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
 
-            let item_stream = build_stream_from_plan(&client, request_plan, partition, total_partitions);
+            let item_stream =
+                build_stream_from_plan(&client, request_plan, partition, total_partitions);
             let chunked_stream = item_stream.chunks(CHUNK_SIZE);
             pin_mut!(chunked_stream);
 
@@ -415,8 +429,6 @@ fn build_stream_from_plan(
             projection_expression,
             limit,
         }) => {
-            println!("table {:?}, segment: {:?}, total_segments: {:?}", table_name, partition, total_partitions);
-
             let mut request = client
                 .scan()
                 .table_name(table_name)

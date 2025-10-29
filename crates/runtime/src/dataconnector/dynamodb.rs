@@ -50,7 +50,7 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const DEFAULT_PARTITIONS_STR: &str = "1";
-const PARTITIONS_AUTO_STR = "auto";
+const PARTITIONS_AUTO_STR: &str = "auto";
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
@@ -73,8 +73,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Number of documents to use to infer the schema. Defaults to 10.")
         .default(DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR),
     ParameterSpec::runtime("scan_partitions")
-        .description("Number of partitions. 1 by default.")
-        .default(DEFAULT_PARTITIONS_STR),
+        .description("Number of partitions. 'auto' by default.")
+        .default(PARTITIONS_AUTO_STR),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -156,21 +156,20 @@ impl DataConnector for DynamoDB {
             ExposedParamLookup::Absent(_) => None,
         };
 
-        let config_partitions_str =
-            match self.params.get("scan_partitions").expose() {
-                ExposedParamLookup::Present(partitions_str) => partitions_str,
-                ExposedParamLookup::Absent(_) => DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR,
-            };
+        let config_partitions_str = match self.params.get("scan_partitions").expose() {
+            ExposedParamLookup::Present(partitions_str) => partitions_str,
+            ExposedParamLookup::Absent(_) => PARTITIONS_AUTO_STR,
+        };
 
         let config_partitions = match config_partitions_str.to_lowercase().as_str() {
-            "auto" => None,
+            PARTITIONS_AUTO_STR => None,
             _ => Some(usize::from_str(config_partitions_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                 dataconnector: "dynamodb".to_string(),
                 message: format!(
                     "DynamoDB parameter 'scan_partitions' must be either an integer or 'auto', not {config_partitions_str}"),
                 connector_component: ConnectorComponent::from(dataset)
             })?)
-        } ;
+        };
 
         let provider = DynamoDBTableProvider::try_new(
             Arc::new(client),
