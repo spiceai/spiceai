@@ -13,10 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+use crate::{component::view::View, search::full_text::table::add_full_text_search_to_table};
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
-use datafusion::{datasource::ViewTable, error::Result, prelude::SessionContext};
-use std::collections::HashSet;
+use datafusion::{
+    catalog::TableProvider, datasource::ViewTable, error::Result, prelude::SessionContext,
+};
+use std::{collections::HashSet, sync::Arc};
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
     let mut table_names = Vec::new();
@@ -90,13 +92,20 @@ fn extract_tables_from_set_expr(
     }
 }
 
-pub(crate) async fn create_view_table(
+pub(crate) async fn prepare_view(
     ctx: &SessionContext,
     statement: &parser::Statement,
-    view: impl Into<String>,
-) -> Result<ViewTable> {
+    view: &Arc<View>,
+) -> Result<Arc<dyn TableProvider>> {
     let plan = ctx.state().statement_to_plan(statement.clone()).await?;
-    Ok(ViewTable::new(plan, Some(view.into())))
+    let view_table = ViewTable::new(plan, Some(view.sql.to_string()));
+
+    if view.has_full_text_column() {
+        let idx = add_full_text_search_to_table(Arc::new(view_table), &view.columns, &view.name)?;
+        Ok(Arc::new(idx) as Arc<dyn TableProvider>)
+    } else {
+        Ok(Arc::new(view_table) as Arc<dyn TableProvider>)
+    }
 }
 
 #[cfg(test)]
