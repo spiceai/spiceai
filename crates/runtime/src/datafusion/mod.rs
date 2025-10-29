@@ -100,6 +100,7 @@ pub mod cluster;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
+pub mod flight_session_extension;
 pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;

@@ -378,10 +378,14 @@ pub(crate) async fn do_put_query(
             }
             DecodedPayload::RecordBatch(record_batch) => {
                 total_rows += record_batch.num_rows();
-                batches.push(record_batch);
+                batches.push(record_batch.clone());
+                // Write each batch to the encoder for serialization
+                encoder.write(&record_batch).map_err(error_to_status)?;
             }
         }
     }
+    encoder.finish().map_err(error_to_status)?;
+    
     if total_rows > 1 {
         return Err(Status::invalid_argument(
             "parameters should contain a single row",
@@ -397,23 +401,10 @@ pub(crate) async fn do_put_query(
         bytes
     };
 
-    // Combine multiple batches if parameters span multiple batches
-    let parameter_batch = if batches.is_empty() {
-        None
-    } else if batches.len() == 1 {
-        batches.into_iter().next()
-    } else {
-        // Multiple batches received - combine them using the schema we already have
-        let combined = concat_batches(&schema, &batches)
-            .map_err(|e| Status::internal(format!("Failed to combine parameter batches: {e}")))?;
-        Some(combined)
-    };
-
     let mut stmt: PreparedStatement =
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
     stmt.parameters = parameters;
     stmt.parameter_schema = Some(schema_bytes);
-    // stmt.parameter_batch = parameter_batch;  // Field not in struct
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     let result = DoPutPreparedStatementResult {
@@ -1099,5 +1090,129 @@ mod tests {
         // 2. Each execution produces correct results based on the provided parameters
         // 3. Parameter binding works correctly with the query execution infrastructure
         // 4. The parameterized query pattern (used by prepared statements) functions properly
+    }
+
+    #[tokio::test]
+    async fn test_prepare_execute_with_dataframe_api() {
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::prelude::*;
+        use std::sync::Arc;
+
+        // Create a new SessionContext (DataFusion's main entry point)
+        let ctx = SessionContext::new();
+
+        // Create a simple table to query
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Diana", "Eve"])),
+                Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
+            ],
+        )
+        .expect("should create record batch");
+
+        // Register the table
+        ctx.register_batch("users", batch)
+            .expect("should register table");
+
+        // Test 1: PREPARE a statement with parameters
+        let prepare_sql = "PREPARE my_query AS SELECT id, name, value FROM users WHERE id = $1 AND value > $2";
+        let prepare_df = ctx.sql(prepare_sql).await.expect("PREPARE should succeed");
+
+        // Execute PREPARE (this creates the prepared statement but returns no data)
+        let prepare_result = prepare_df.collect().await.expect("PREPARE execution should succeed");
+        assert_eq!(prepare_result.len(), 0, "PREPARE should return no rows");
+
+        // Test 2: EXECUTE the prepared statement with parameters
+        let execute_sql = "EXECUTE my_query(2, 150)";
+        let execute_df = ctx.sql(execute_sql).await.expect("EXECUTE should succeed");
+        let execute_result = execute_df.collect().await.expect("EXECUTE should return results");
+
+        // Verify results: should return row with id=2 (Bob, value=200) since 200 > 150
+        assert_eq!(execute_result.len(), 1, "should return one batch");
+        let result_batch = &execute_result[0];
+        assert_eq!(result_batch.num_rows(), 1, "should return one row");
+
+        let id_col = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64Array");
+        assert_eq!(id_col.value(0), 2, "id should be 2");
+
+        let name_col = result_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name should be StringArray");
+        assert_eq!(name_col.value(0), "Bob", "name should be Bob");
+
+        let value_col = result_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value should be Int64Array");
+        assert_eq!(value_col.value(0), 200, "value should be 200");
+
+        // Test 3: EXECUTE the same prepared statement with different parameters
+        let execute2_sql = "EXECUTE my_query(4, 350)";
+        let execute2_df = ctx.sql(execute2_sql).await.expect("EXECUTE should succeed");
+        let execute2_result = execute2_df.collect().await.expect("EXECUTE should return results");
+
+        // Verify results: should return row with id=4 (Diana, value=400) since 400 > 350
+        assert_eq!(execute2_result.len(), 1, "should return one batch");
+        let result2_batch = &execute2_result[0];
+        assert_eq!(result2_batch.num_rows(), 1, "should return one row");
+
+        let id2_col = result2_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64Array");
+        assert_eq!(id2_col.value(0), 4, "id should be 4");
+
+        let name2_col = result2_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name should be StringArray");
+        assert_eq!(name2_col.value(0), "Diana", "name should be Diana");
+
+        let value2_col = result2_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value should be Int64Array");
+        assert_eq!(value2_col.value(0), 400, "value should be 400");
+
+        // Test 4: EXECUTE with parameters that return no rows
+        let execute3_sql = "EXECUTE my_query(3, 500)";
+        let execute3_df = ctx.sql(execute3_sql).await.expect("EXECUTE should succeed");
+        let execute3_result = execute3_df.collect().await.expect("EXECUTE should return results");
+
+        // Verify results: should return no rows (id=3 has value=300, which is not > 500)
+        let total_rows: usize = execute3_result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "should return no rows when filter doesn't match");
+
+        // Test 5: DEALLOCATE the prepared statement
+        let deallocate_sql = "DEALLOCATE my_query";
+        let deallocate_df = ctx.sql(deallocate_sql).await.expect("DEALLOCATE should succeed");
+        let deallocate_result = deallocate_df.collect().await.expect("DEALLOCATE should succeed");
+        assert_eq!(deallocate_result.len(), 0, "DEALLOCATE should return no rows");
+
+        // This test verifies:
+        // 1. PREPARE statement creates a prepared statement with parameters
+        // 2. EXECUTE can run the prepared statement multiple times with different parameters
+        // 3. Each execution returns correct results based on the provided parameters
+        // 4. DEALLOCATE properly cleans up the prepared statement
+        // 5. All operations work through the DataFusion DataFrame API (ctx.sql())
     }
 }

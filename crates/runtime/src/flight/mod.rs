@@ -76,11 +76,15 @@ mod get_schema;
 mod handshake;
 mod metrics;
 mod middleware;
+mod session;
 mod util;
+
+pub use session::SessionStore;
 
 pub struct Service {
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    session_store: SessionStore,
 }
 
 impl Service {
@@ -91,6 +95,7 @@ impl Service {
             // Pre-allocate for typical workloads (avoid reallocation)
             channel_map: Arc::new(RwLock::new(HashMap::with_capacity(64))),
             basic_auth,
+            session_store: SessionStore::new(),
         }
     }
 }
@@ -110,7 +115,12 @@ impl FlightService for Service {
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
         let _start = track_flight_request("do_handshake", None).await;
-        let response = handshake::handle(request.metadata(), self.basic_auth.as_ref()).await?;
+        let response = handshake::handle(
+            request.metadata(),
+            self.basic_auth.as_ref(),
+            &self.session_store,
+        )
+        .await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 
@@ -450,6 +460,7 @@ pub async fn start(
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let session_store = service.session_store.clone();
     let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
@@ -471,7 +482,7 @@ pub async fn start(
 
     #[allow(unused_mut)]
     let mut server = server
-        .layer(RequestContextLayer::new(app, rt.datafusion()))
+        .layer(RequestContextLayer::new(app, rt.datafusion(), session_store))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))

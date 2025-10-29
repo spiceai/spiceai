@@ -83,7 +83,13 @@ pub fn validate_sql_query_operations(
             plan_err!("COPY operations are not allowed")
         }
         LogicalPlan::Statement(stmt) => {
-            plan_err!("Statements are not allowed: {}", stmt.name())
+            // Allow PREPARE, EXECUTE, and DEALLOCATE statements
+            let stmt_name = stmt.name();
+            if stmt_name == "Prepare" || stmt_name == "Execute" || stmt_name == "Deallocate" {
+                Ok(TreeNodeRecursion::Continue)
+            } else {
+                plan_err!("Statements are not allowed: {}", stmt_name)
+            }
         }
         _ => Ok(TreeNodeRecursion::Continue),
     })?;

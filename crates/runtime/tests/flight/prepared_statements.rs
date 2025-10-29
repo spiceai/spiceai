@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
-use arrow_flight::sql::client::{FlightSqlServiceClient, PreparedStatement};
+use arrow_flight::{sql::client::{FlightSqlServiceClient, PreparedStatement}, FlightClient};
 use futures::TryStreamExt as _;
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
@@ -490,4 +490,140 @@ fn create_param_batch(
             .collect::<Vec<_>>(),
     );
     RecordBatch::try_new(Arc::new(schema), arrays).map_err(Into::into)
+}
+
+/// Test SQL PREPARE/EXECUTE/DEALLOCATE statements through Arrow Flight SQL.
+/// 
+/// DataFusion supports PREPARE/EXECUTE/DEALLOCATE SQL statements (see https://datafusion.apache.org/user-guide/sql/prepared_statements.html).
+/// These statements modify session state by storing/retrieving prepared statements in the SessionContext.
+/// 
+/// This test validates that Flight SQL session tracking works correctly, allowing prepared statements
+/// created with SQL PREPARE in one request to be available in subsequent EXECUTE requests.
+#[tokio::test]
+async fn test_sql_prepare_execute_statements() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
+            let (channel, _df) = start_spice_test_app(Some(auth), None, None).await?;
+
+            // Create and populate test table
+            let test_record_batch = test_record_batch()?;
+            let batches = vec![test_record_batch.clone(), test_record_batch];
+
+            let mut write_client = create_flight_client(channel.clone(), Some("valid"))?;
+            write_record_batches(&mut write_client, batches).await?;
+
+            // Create a client and perform authentication handshake.
+            // After handshake, the client should maintain authentication for subsequent requests.
+            let mut client = FlightSqlServiceClient::new(channel);
+            client.handshake("", "valid").await?;
+
+            // Test 1: PREPARE a SQL statement with parameters
+            // SQL PREPARE creates a prepared statement but doesn't return data
+            let prepare_sql = "PREPARE my_query AS SELECT a, b FROM my_table WHERE a = $1 AND b = $2";
+            let mut prepare_stmt = client.prepare(prepare_sql.to_string(), None).await?;
+            let prepare_info = prepare_stmt.execute().await?;
+            
+            // PREPARE doesn't return data, but we need to fetch to trigger the server-side execution
+            if let Some(endpoint) = prepare_info.endpoint.first() {
+                if let Some(ticket) = &endpoint.ticket {
+                    let prepare_stream = client.do_get(ticket.clone()).await?;
+                    let _prepare_results: Vec<RecordBatch> = prepare_stream.try_collect().await?;
+                }
+            }
+
+            // Test 2: EXECUTE the prepared statement with parameters
+            let execute_sql = "EXECUTE my_query(1, 'a')";
+            let mut execute_stmt = client.prepare(execute_sql.to_string(), None).await?;
+            let execute_flight_info = execute_stmt.execute().await?;
+
+            let ticket = execute_flight_info
+                .endpoint
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No endpoint in FlightInfo"))?
+                .ticket
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No ticket in endpoint"))?;
+
+            let stream = client.do_get(ticket.clone()).await?;
+            let results: Vec<RecordBatch> = stream.try_collect().await?;
+
+            // Verify we got the expected row (a=1, b='a')
+            assert_eq!(results.len(), 1, "should return one batch");
+            let batch = &results[0];
+            assert_eq!(batch.num_rows(), 1, "should return one row");
+
+            let a_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("column 'a' should be Int32Array");
+            assert_eq!(a_col.value(0), 1, "column 'a' should be 1");
+
+            let b_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column 'b' should be StringArray");
+            assert_eq!(b_col.value(0), "a", "column 'b' should be 'a'");
+
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("sql_prepare_execute_first_execution", results_str);
+
+            // Test 3: EXECUTE the same prepared statement with different parameters
+            let execute2_sql = "EXECUTE my_query(2, 'b')";
+            let mut execute2_stmt = client.prepare(execute2_sql.to_string(), None).await?;
+            let execute2_flight_info = execute2_stmt.execute().await?;
+
+            let ticket2 = execute2_flight_info
+                .endpoint
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No endpoint in FlightInfo"))?
+                .ticket
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No ticket in endpoint"))?;
+
+            let stream2 = client.do_get(ticket2.clone()).await?;
+            let results2: Vec<RecordBatch> = stream2.try_collect().await?;
+
+            // Verify we got the expected row (a=2, b='b')
+            assert_eq!(results2.len(), 1, "should return one batch");
+            let batch2 = &results2[0];
+            assert_eq!(batch2.num_rows(), 1, "should return one row");
+
+            let a2_col = batch2
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("column 'a' should be Int32Array");
+            assert_eq!(a2_col.value(0), 2, "column 'a' should be 2");
+
+            let b2_col = batch2
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column 'b' should be StringArray");
+            assert_eq!(b2_col.value(0), "b", "column 'b' should be 'b'");
+
+            let results2_str =
+                arrow::util::pretty::pretty_format_batches(&results2).expect("pretty batches");
+            insta::assert_snapshot!("sql_prepare_execute_second_execution", results2_str);
+
+            // Test 4: DEALLOCATE the prepared statement
+            let deallocate_sql = "DEALLOCATE my_query";
+            let mut deallocate_stmt = client.prepare(deallocate_sql.to_string(), None).await?;
+            let deallocate_flight_info = deallocate_stmt.execute().await?;
+            
+            // DEALLOCATE should not return data
+            assert!(deallocate_flight_info.endpoint.is_empty() || 
+                    deallocate_flight_info.total_records == 0,
+                    "DEALLOCATE should not return data");
+
+            Ok(())
+        })
+        .await
 }
