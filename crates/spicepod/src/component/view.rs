@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
-use crate::{acceleration::Acceleration, semantic::Column};
-
+use crate::{acceleration::Acceleration, semantic::Column, vector::VectorStore};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]

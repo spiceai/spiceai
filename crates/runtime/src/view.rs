@@ -110,26 +110,28 @@ pub(crate) async fn prepare_view(
     let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
 
     if view.has_embeddings() {
-        tbl_provider = EmbeddingTable::from_spicepod_columns(
-            tbl_provider,
-            view.columns
-                .iter()
-                .flat_map(|col| {
-                    col.embeddings.iter().map(|emb| ColumnEmbeddingConfig {
-                        column: col.name.clone(),
-                        model: emb.model.clone(),
-                        primary_keys: emb.row_ids.clone(),
-                        chunking: emb.chunking.clone(),
-                        vector_size: emb.vector_size,
+        if !view.vectors.as_ref().is_some_and(|v| v.enabled) {
+            tbl_provider = EmbeddingTable::from_spicepod_columns(
+                tbl_provider,
+                view.columns
+                    .iter()
+                    .flat_map(|col| {
+                        col.embeddings.iter().map(|emb| ColumnEmbeddingConfig {
+                            column: col.name.clone(),
+                            model: emb.model.clone(),
+                            primary_keys: emb.row_ids.clone(),
+                            chunking: emb.chunking.clone(),
+                            vector_size: emb.vector_size,
+                        })
                     })
-                })
-                .collect(),
-            &view.runtime.embeds(),
-            None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
-        )
-        .await
-        .boxed()
-        .map_err(DataFusionError::External)?;
+                    .collect(),
+                &view.runtime.embeds(),
+                None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
+            )
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?;
+        }
     }
 
     if view.has_full_text_column() {
@@ -139,6 +141,7 @@ pub(crate) async fn prepare_view(
             &view.name,
         )?) as Arc<dyn TableProvider>;
     }
+
     Ok(tbl_provider)
 }
 

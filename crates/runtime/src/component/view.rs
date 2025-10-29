@@ -18,7 +18,7 @@ use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;
 use snafu::prelude::*;
-use spicepod::component::view as spicepod_view;
+use spicepod::{component::view as spicepod_view, vector::VectorStore};
 use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
