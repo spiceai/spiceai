@@ -127,7 +127,7 @@ pub async fn write(
             .map(|col| col.slice(chunk_start, chunk_length))
             .collect();
 
-        let chunk_batch = RecordBatch::try_new(schema.clone(), chunk_columns).context(
+        let chunk_batch = RecordBatch::try_new(Arc::clone(&schema), chunk_columns).context(
             IssueWithArrowProcessingSnafu {
                 index: index.name(),
             },
