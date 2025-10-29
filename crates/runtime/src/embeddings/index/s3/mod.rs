@@ -82,8 +82,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("The AWS session token to use.")
         .secret(),
     ParameterSpec::component("batch_write_rows")
-        .description("The number of rows to chunk record batches into for individual processing used to control memory usage")
-        .secret(),
+        .description("The number of rows to chunk record batches into for individual processing used to control memory usage"),
 ];
 
 /// Attempt to construct an [`S3Vector`] for the provided dataset on the given column.
