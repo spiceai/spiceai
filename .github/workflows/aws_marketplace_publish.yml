@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       repository:
-        description: 'Target ECR repository (e.g., spice-ai/spiceai-enterprise or spice-ai/spiceai-enterprise-hourly)'
+        description: 'Target ECR repository'
         required: false
-        default: 'spice-ai/spiceai-enterprise'
+        default: 'spice-ai/spiceai-enterprise-byol'
         type: string
       platforms:
         description: 'Platforms to publish (comma separated)'
