@@ -49,7 +49,6 @@ impl DynamoDBFactory {
 }
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
-const DEFAULT_PARTITIONS_STR: &str = "1";
 const PARTITIONS_AUTO_STR: &str = "auto";
 
 const PARAMETERS: &[ParameterSpec] = &[
