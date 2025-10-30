@@ -91,6 +91,16 @@ pub enum CatalogError {
 /// Result type for catalog operations.
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
+/// Transaction guard for catalog operations that automatically rolls back on drop unless explicitly committed.
+///
+/// This follows the RAII pattern used by rusqlite and other database libraries.
+#[async_trait]
+// Transaction support is currently not exposed at the catalog level.
+// Each catalog implementation can use backend-specific transactions internally
+// to ensure atomicity of operations.
+//
+// Future work: Expose catalog-level transactions when needed.
+
 /// Trait for metadata catalog operations.
 ///
 /// This trait provides the core operations needed to manage a Pepper catalog,
@@ -175,15 +185,6 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get data files belonging to a specific partition.
     async fn get_partition_data_files(&self, partition_id: i64) -> CatalogResult<Vec<DataFile>>;
-
-    /// Begin a transaction.
-    async fn begin_transaction(&self) -> CatalogResult<()>;
-
-    /// Commit a transaction.
-    async fn commit_transaction(&self) -> CatalogResult<()>;
-
-    /// Rollback a transaction.
-    async fn rollback_transaction(&self) -> CatalogResult<()>;
 
     /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
     /// Default implementation does nothing.
