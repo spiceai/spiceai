@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: s3[parquet]-duckdb[file]_indexes.yaml
+    spicepod_path: s3[parquet]-duckdb[file]_indexes_with_partitioning.yaml
     query_set: saffron
     ready_wait: 300
     runner_type: spicehq-dev-runners
