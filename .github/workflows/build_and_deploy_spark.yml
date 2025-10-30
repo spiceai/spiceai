@@ -32,9 +32,7 @@ jobs:
   build-spark:
     name: Build CUDA binaries for DGX Spark (ARM64)
     # Build natively on DGX Spark ARM64 device with CUDA support
-    runs-on:
-      - self-hosted
-      - CUDA
+    runs-on: self-hosted
     env:
       RUST_PROFILE: release
       CARGO_TERM_COLOR: always
