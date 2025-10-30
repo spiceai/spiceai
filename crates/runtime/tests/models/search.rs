@@ -107,7 +107,7 @@ impl SearchTestCase {
             SearchTestType::Sql(ref sql) => {
                 SearchTestType::Sql(sql.replace(&from.to_string(), &to.to_string()))
             }
-            body => body,
+            SearchTestType::Http(http) => SearchTestType::Http(http),
         };
 
         Self {

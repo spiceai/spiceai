@@ -51,6 +51,7 @@ mod search {
     use serde_json::json;
     use spicepod::{
         component::{dataset::Dataset, embeddings::EmbeddingChunkConfig},
+        param::ParamValue,
         semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig},
         vector::VectorStore,
     };
@@ -80,7 +81,7 @@ mod search {
             .as_ref()
             .and_then(|v| v.params.as_ref())
             .and_then(|p| p.data.get("s3_vectors_bucket"))
-            .map(|bkt| bkt.as_string())
+            .map(ParamValue::as_string)
             .clone()
             .ok_or(anyhow!("Dataset has no 's3_vectors_bucket'"))?;
 
@@ -89,7 +90,7 @@ mod search {
             .as_ref()
             .and_then(|v| v.params.as_ref())
             .and_then(|p| p.data.get("s3_vectors_index"))
-            .map(|bkt| bkt.as_string())
+            .map(ParamValue::as_string)
             .clone()
             .ok_or(anyhow!("Dataset has no 's3_vectors_index'"))?;
 
@@ -131,7 +132,7 @@ mod search {
 
         run_search_w_explain(
             app.build(),
-            vec![
+            [
                 basic_vector_search_tests("s3vectors_basic"),
                 basic_vector_search_tests_on_table("s3vectors_basic_view", "qs_view"),
             ]
@@ -586,7 +587,7 @@ mod search {
                 // vectors_nonfilterable_col("question"),
                 vectors_filterable_col("subject"),
             ]);
-        };
+        }
 
         run_search_w_explain(
             app,

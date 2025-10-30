@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::too_many_arguments)]
 
 use crate::embeddings::construct_chunker;
 use crate::embeddings::index::VectorScanTableProvider;
@@ -70,7 +71,8 @@ pub async fn wrap_table_as_index(
             .await
         }
         None => Err(Box::from(
-            "No vector engine specified. Use '.datasets[].vectors.engine'".to_string(),
+            "No vector engine specified. Provide a vector engine under `.vectors.engine`."
+                .to_string(),
         )),
         Some(unknown_engine) => Err(Box::from(format!(
             "Unknown vector engine '.vectors.engine: {unknown_engine}'"
@@ -92,7 +94,7 @@ async fn wrap_table_as_index_s3(
     tracing::info!("S3 Vectors for table {tbl} initializing...");
     let start = std::time::Instant::now();
 
-    let partition_by = get_dataset_partition_expressions(ctx, &inner_table_provider, vector_store)?;
+    let partition_by = get_partition_expressions(ctx, &inner_table_provider, vector_store)?;
 
     let embedding_columns: Vec<_> = columns
         .iter()
@@ -104,24 +106,23 @@ async fn wrap_table_as_index_s3(
         .collect();
     let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
     for (column, config) in embedding_columns {
-        let (dataset_columns, index_schema) =
-            if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
-                updated_chunked_search_index_format(&inner_table_provider, columns, &column)
-            } else {
-                (columns.to_vec(), inner_table_provider.schema())
-            };
+        let (columns, index_schema) = if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
+            updated_chunked_search_index_format(&inner_table_provider, columns, &column)
+        } else {
+            (columns.to_vec(), inner_table_provider.schema())
+        };
 
-        let vector_index = super::s3::try_from_dataset(
-            &tbl,
+        let vector_index = super::s3::try_from_table(
+            tbl,
             column,
             config.clone(),
             vector_store,
             // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
             get_primary_keys(&inner_table_provider).boxed()?,
             index_schema,
-            Arc::clone(&embedding_models),
-            dataset_columns,
-            Arc::clone(&secrets),
+            Arc::clone(embedding_models),
+            columns,
+            Arc::clone(secrets),
             partition_by.clone(),
         )
         .await?;
@@ -131,7 +132,7 @@ async fn wrap_table_as_index_s3(
         {
             provider = construct_s3_chunked_vector_index(
                 provider,
-                &embedding_models,
+                embedding_models,
                 chunking,
                 vector_index,
                 config.model.as_str(),
@@ -199,32 +200,33 @@ fn updated_chunked_search_index_format(
     columns: &[Column],
     column: &str,
 ) -> (Vec<spicepod::semantic::Column>, SchemaRef) {
-    let mut dataset_fields = inner_table_provider
+    let mut fields = inner_table_provider
         .schema()
         .fields()
         .iter()
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut dataset_columns = columns.to_vec();
+    let mut columns = columns.to_vec();
     if let Some((_, f)) = inner_table_provider.schema().column_with_name(column) {
         // These are internal columns that won't exist in existing columns. No need to find & replace.
         // get search field as metadata column.
-        let search_metadata = dataset_columns
-            .iter()
-            .find(|&c| c.name == column)
-            .and_then(|c| match c.as_vector_metadata() {
-                Some(MetadataType::NonFilterable) => {
-                    Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
-                }
-                Some(MetadataType::Filterable) => {
-                    Some(MetadataColumn::Filterable(Arc::new(f.clone())))
-                }
-                _ => None,
-            });
+        let search_metadata =
+            columns
+                .iter()
+                .find(|&c| c.name == column)
+                .and_then(|c| match c.as_vector_metadata() {
+                    Some(MetadataType::NonFilterable) => {
+                        Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
+                    }
+                    Some(MetadataType::Filterable) => {
+                        Some(MetadataColumn::Filterable(Arc::new(f.clone())))
+                    }
+                    _ => None,
+                });
 
         for col in ChunkedSearchIndex::additional_metadata(column, search_metadata) {
-            dataset_columns.push(
+            columns.push(
                 spicepod::semantic::Column::new(col.name()).with_metadata(
                     [(
                         "vectors".to_string(),
@@ -233,21 +235,21 @@ fn updated_chunked_search_index_format(
                     .into(),
                 ),
             );
-            dataset_fields.push(col.field());
+            fields.push(col.field());
         }
     }
-    (dataset_columns, Arc::new(Schema::new(dataset_fields)))
+    (columns, Arc::new(Schema::new(fields)))
 }
 
 #[cfg(feature = "s3_vectors")]
-fn get_dataset_partition_expressions(
+fn get_partition_expressions(
     ctx: &Arc<SessionContext>,
     inner_table_provider: &Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
 ) -> Result<Vec<datafusion_expr::Expr>, Box<dyn std::error::Error + Send + Sync>> {
     let df_schema = &inner_table_provider.schema().to_dfschema().boxed()?;
 
-    let partition_by = partition_by_expressions(&vector_store.partition_by, &ctx, df_schema)
+    let partition_by = partition_by_expressions(&vector_store.partition_by, ctx, df_schema)
         .boxed()?
         .into_iter()
         .map(|p| p.expression)
