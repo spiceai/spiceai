@@ -79,22 +79,11 @@ fn infer_dynamodb_type(value: &AttributeValue) -> Result<DataType> {
             }
         }
         AttributeValue::Ss(_) => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-        AttributeValue::N(n) => {
-            // Determine if it's an integer or float based on the string representation
-            if n.contains('.') || n.contains('e') || n.contains('E') {
-                DataType::Float64
-            } else {
-                DataType::Int64
-            }
-        }
+        AttributeValue::N(n) => get_numeric_type_from_string(n),
         AttributeValue::Ns(numbers) => {
             // Determine the type based on the first number in the set
             let inner_type = if let Some(first) = numbers.first() {
-                if first.contains('.') || first.contains('e') || first.contains('E') {
-                    DataType::Float64
-                } else {
-                    DataType::Int64
-                }
+                get_numeric_type_from_string(first)
             } else {
                 DataType::Int64 // Default to Int64 for empty sets
             };
@@ -118,6 +107,28 @@ fn infer_dynamodb_type(value: &AttributeValue) -> Result<DataType> {
     })
 }
 
+fn get_numeric_type_from_string(s: &str) -> DataType {
+    if s.contains('.') {
+        if count_decimal_places(s) == 2 {
+            DataType::Decimal128(18, 6)
+        } else {
+            DataType::Float64
+        }
+    } else {
+        DataType::Int64
+    }
+}
+
+fn count_decimal_places(n: &str) -> usize {
+    let n = n.trim_start_matches(&['+', '-'][..]);
+
+    if let Some(pos) = n.find('.') {
+        n[pos + 1..].len()
+    } else {
+        0
+    }
+}
+
 fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
     match (type1, type2) {
         (a, b) if a == b => a.clone(),
@@ -127,6 +138,10 @@ fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
         (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => {
             DataType::Float64
         }
+        (DataType::Int64, DataType::Decimal128(_, _))
+        | (DataType::Decimal128(_, _), DataType::Int64) => DataType::Decimal128(18, 6),
+        (DataType::Float64, DataType::Decimal128(_, _))
+        | (DataType::Decimal128(_, _), DataType::Float64) => DataType::Decimal128(18, 6),
 
         // Temporal type unification - if same temporal type, keep it
         (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => type1.clone(),
@@ -278,7 +293,8 @@ mod tests {
     fn test_number_type_inference() {
         let mut item = HashMap::new();
         item.insert("integer".to_string(), av_number("42"));
-        item.insert("float".to_string(), av_number("3.14"));
+        item.insert("decimal".to_string(), av_number("3.14"));
+        item.insert("float".to_string(), av_number("3.141"));
         item.insert("scientific".to_string(), av_number("1.5e10"));
         item.insert("negative_int".to_string(), av_number("-100"));
         item.insert("negative_float".to_string(), av_number("-2.5"));
@@ -292,6 +308,10 @@ mod tests {
             .collect();
 
         assert_eq!(field_map.get("integer"), Some(&&DataType::Int64));
+        assert_eq!(
+            field_map.get("decimal"),
+            Some(&&DataType::Decimal128(18, 6))
+        );
         assert_eq!(field_map.get("float"), Some(&&DataType::Float64));
         assert_eq!(field_map.get("scientific"), Some(&&DataType::Float64));
         assert_eq!(field_map.get("negative_int"), Some(&&DataType::Int64));
@@ -396,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_unification_numeric_promotion_int_to_float() {
+    fn test_type_unification_numeric_promotion_int_to_decimal() {
         let mut item1 = HashMap::new();
         item1.insert("value".to_string(), av_number("10"));
 
@@ -406,7 +426,21 @@ mod tests {
         let items = vec![item1, item2];
         let schema = infer_arrow_schema_from_items(&items).expect("schema");
         let field = schema.field_with_name("value").expect("arrow schema");
-        assert_eq!(field.data_type(), &DataType::Float64);
+        assert_eq!(field.data_type(), &DataType::Decimal128(18, 6));
+    }
+
+    #[test]
+    fn test_type_unification_numeric_promotion_float_to_decimal() {
+        let mut item1 = HashMap::new();
+        item1.insert("value".to_string(), av_number("3.141"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("value".to_string(), av_number("3.14"));
+
+        let items = vec![item1, item2];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+        let field = schema.field_with_name("value").expect("arrow schema");
+        assert_eq!(field.data_type(), &DataType::Decimal128(18, 6));
     }
 
     #[test]
