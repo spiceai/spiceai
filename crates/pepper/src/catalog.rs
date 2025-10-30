@@ -21,8 +21,8 @@ limitations under the License.
 //! (`SQLite`, `PostgreSQL`, etc.).
 
 use super::metadata::{
-    CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
-    TableStats,
+    CreateTableOptions, DataFile, DeleteFile, KeyIndexEntry, KeyIndexEntryNew, KeyIndexKey,
+    PartitionMetadata, PartitionStats, TableMetadata, TableStats,
 };
 use async_trait::async_trait;
 use snafu::Snafu;
@@ -185,6 +185,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get data files belonging to a specific partition.
     async fn get_partition_data_files(&self, partition_id: i64) -> CatalogResult<Vec<DataFile>>;
+
+    /// Fetch active key-index entries whose hashes match the supplied list.
+    async fn get_active_key_index_entries(
+        &self,
+        table_id: i64,
+        key_hashes: &[Vec<u8>],
+    ) -> CatalogResult<Vec<KeyIndexEntry>>;
+
+    /// Insert new key-index entries.
+    async fn insert_key_index_entries(&self, entries: &[KeyIndexEntryNew]) -> CatalogResult<()>;
+
+    /// Mark key-index entries as logically deleted by setting their end snapshot.
+    async fn mark_key_index_entries_deleted(
+        &self,
+        table_id: i64,
+        keys: &[KeyIndexKey],
+        end_snapshot: &str,
+    ) -> CatalogResult<()>;
 
     /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
     /// Default implementation does nothing.

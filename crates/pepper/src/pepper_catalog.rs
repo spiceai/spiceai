@@ -18,8 +18,8 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
-    CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
-    TableStats,
+    CreateTableOptions, DataFile, DeleteFile, KeyIndexEntry, KeyIndexEntryNew, KeyIndexKey,
+    PartitionMetadata, PartitionStats, TableMetadata, TableStats,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -788,6 +788,33 @@ impl MetadataCatalog for PepperCatalog {
             },
         )
         .await
+    }
+
+    async fn get_active_key_index_entries(
+        &self,
+        _table_id: i64,
+        _key_hashes: &[Vec<u8>],
+    ) -> CatalogResult<Vec<KeyIndexEntry>> {
+        Err(CatalogError::InvalidOperation {
+            message: "Key index lookups are not yet implemented".to_string(),
+        })
+    }
+
+    async fn insert_key_index_entries(&self, _entries: &[KeyIndexEntryNew]) -> CatalogResult<()> {
+        Err(CatalogError::InvalidOperation {
+            message: "Key index insert is not yet implemented".to_string(),
+        })
+    }
+
+    async fn mark_key_index_entries_deleted(
+        &self,
+        _table_id: i64,
+        _keys: &[KeyIndexKey],
+        _end_snapshot: &str,
+    ) -> CatalogResult<()> {
+        Err(CatalogError::InvalidOperation {
+            message: "Key index delete is not yet implemented".to_string(),
+        })
     }
 }
 

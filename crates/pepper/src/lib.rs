@@ -61,6 +61,9 @@ pub mod pepper_catalog;
 pub mod provider;
 
 pub use catalog::MetadataCatalog;
-pub use metadata::{DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata};
+pub use metadata::{
+    DataFile, DeleteFile, KeyIndexEntry, KeyIndexEntryNew, KeyIndexKey, PartitionMetadata,
+    PartitionStats, TableMetadata,
+};
 pub use pepper_catalog::PepperCatalog;
 pub use provider::PepperTableProvider;

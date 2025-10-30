@@ -169,6 +169,22 @@ impl SqliteMetastore {
             UNIQUE(table_id, partition_value)
         )
     ";
+
+    /// Schema for the `pepper_key_index` table.
+    const KEY_INDEX_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS pepper_key_index (
+            table_id BIGINT NOT NULL,
+            key_hash BLOB NOT NULL,
+            key_bytes BLOB NOT NULL,
+            data_file_id BIGINT NOT NULL,
+            row_id BIGINT NOT NULL,
+            begin_snapshot TEXT NOT NULL,
+            end_snapshot TEXT,
+            PRIMARY KEY (table_id, key_hash, key_bytes, begin_snapshot)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pepper_key_index_active
+            ON pepper_key_index (table_id, key_hash, end_snapshot);
+    ";
 }
 
 /// `SQLite` row wrapper implementing `MetastoreRow`.
@@ -287,12 +303,13 @@ impl MetastoreBackend for SqliteMetastore {
 
             // Create tables in a transaction
             conn.execute_batch(&format!(
-                "{}; {}; {}; {}; {};",
+                "{}; {}; {}; {}; {}; {};",
                 Self::METADATA_TABLE_DDL,
                 Self::TABLE_TABLE_DDL,
                 Self::DATA_FILE_TABLE_DDL,
                 Self::DELETE_FILE_TABLE_DDL,
-                Self::PARTITION_TABLE_DDL
+                Self::PARTITION_TABLE_DDL,
+                Self::KEY_INDEX_TABLE_DDL
             ))?;
 
             // Initialize metadata with next IDs if not exists

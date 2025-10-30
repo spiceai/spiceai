@@ -94,6 +94,51 @@ pub struct DeleteFile {
     pub file_size_bytes: i64,
 }
 
+/// Represents an entry in the Pepper key index for enforcing primary/unique keys.
+#[derive(Debug, Clone)]
+pub struct KeyIndexEntry {
+    /// Table identifier the entry belongs to.
+    pub table_id: i64,
+    /// 128-bit hash of the key columns (stored as 16-byte blob).
+    pub key_hash: Vec<u8>,
+    /// Canonical byte representation of the key columns.
+    pub key_bytes: Vec<u8>,
+    /// Data file identifier containing the row.
+    pub data_file_id: i64,
+    /// Logical row identifier within the Pepper table.
+    pub row_id: i64,
+    /// Snapshot identifier when the entry became visible.
+    pub begin_snapshot: String,
+    /// Snapshot identifier when the entry became invalid (NULL if active).
+    pub end_snapshot: Option<String>,
+}
+
+/// New key-index entry to insert for freshly ingested rows.
+#[derive(Debug, Clone)]
+pub struct KeyIndexEntryNew {
+    /// Table identifier.
+    pub table_id: i64,
+    /// 128-bit hash of the key columns.
+    pub key_hash: Vec<u8>,
+    /// Canonical byte representation of the key columns.
+    pub key_bytes: Vec<u8>,
+    /// Data file identifier containing the row.
+    pub data_file_id: i64,
+    /// Logical row identifier.
+    pub row_id: i64,
+    /// Snapshot identifier when the entry becomes visible.
+    pub begin_snapshot: String,
+}
+
+/// Identifies an existing key-index entry for update/deletion.
+#[derive(Debug, Clone)]
+pub struct KeyIndexKey {
+    /// 128-bit hash of the key columns.
+    pub key_hash: Vec<u8>,
+    /// Canonical byte representation of the key columns.
+    pub key_bytes: Vec<u8>,
+}
+
 /// Metadata about a partition in a table.
 #[derive(Debug, Clone)]
 pub struct PartitionMetadata {
