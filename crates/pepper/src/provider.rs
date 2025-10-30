@@ -34,7 +34,11 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::deletion::{DeletionVectorWriteSpec, DeletionVectorWriter};
-use super::metadata::{CreateTableOptions, TableMetadata};
+use super::metadata::{
+    CreateTableOptions, KeyIndexEntry, KeyIndexEntryNew, KeyIndexKey, TableMetadata,
+};
+use crate::key_index::{KeyMaterial, KeySerializer};
+use arrow::array::UInt32Array;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
@@ -44,7 +48,7 @@ use datafusion::datasource::listing::{
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream as DFStream;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::Constraints;
+use datafusion_common::{Constraints, DataFusionError};
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
@@ -52,16 +56,40 @@ use datafusion_physical_plan::collect;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_table_providers::util::on_conflict::OnConflict;
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
+};
 use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
+
+#[derive(Debug)]
+struct BatchInsertInfo {
+    keys: Vec<KeyMaterial>,
+}
+
+#[derive(Default)]
+struct ConflictState {
+    batches: Vec<BatchInsertInfo>,
+    delete_keys: Vec<KeyIndexKey>,
+    delete_rows: HashMap<i64, Vec<i64>>,
+    delete_key_bytes: HashSet<Vec<u8>>,
+    seen_new_keys: HashSet<Vec<u8>>,
+    total_rows: usize,
+}
+
+#[derive(Clone)]
+enum ConflictMode {
+    Drop,
+    Upsert { options: UpsertOptions },
+}
 
 /// Execution plan that filters out deleted rows based on deletion vectors.
 ///
@@ -161,6 +189,7 @@ struct DeletionFilterStream {
 impl futures::Stream for DeletionFilterStream {
     type Item = datafusion_common::Result<arrow::array::RecordBatch>;
 
+    #[allow(clippy::too_many_lines)]
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -233,6 +262,32 @@ impl futures::Stream for DeletionFilterStream {
                     }
 
                     // Filter the batch using take kernel
+                    if batch.num_columns() == 0 {
+                        // COUNT(*) plans can introduce zero-column batches. Arrow requires an explicit
+                        // row count in that case, so we synthesize an empty batch with the filtered
+                        // row count instead of using the take kernel.
+                        let filtered_row_count = keep_indices.len();
+                        let options = arrow::array::RecordBatchOptions::new()
+                            .with_row_count(Some(filtered_row_count));
+                        match arrow::array::RecordBatch::try_new_with_options(
+                            batch.schema(),
+                            vec![],
+                            &options,
+                        ) {
+                            Ok(filtered_batch) => {
+                                return std::task::Poll::Ready(Some(Ok(filtered_batch)));
+                            }
+                            Err(e) => {
+                                return std::task::Poll::Ready(Some(Err(
+                                    datafusion_common::DataFusionError::ArrowError(
+                                        Box::new(e),
+                                        None,
+                                    ),
+                                )));
+                            }
+                        }
+                    }
+
                     let indices = arrow::array::UInt64Array::from(keep_indices);
                     let filtered_columns: datafusion_common::Result<Vec<_>> = batch
                         .columns()
@@ -491,13 +546,21 @@ impl PepperTableProvider {
     #[allow(clippy::too_many_lines)]
     pub async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
         let schema = stream.schema();
+        let primary_key = self.table_metadata.primary_key.clone();
+        let conflict_mode = self.resolve_conflict_mode(&primary_key)?;
+        let conflict_state = conflict_mode
+            .as_ref()
+            .map(|_| Arc::new(tokio::sync::Mutex::new(ConflictState::default())));
 
-        // Create a streaming execution plan that forwards batches without buffering
-        // Uses tokio::sync::Mutex to properly handle async context
         struct StreamingExec {
-            schema: arrow_schema::SchemaRef,
+            schema: SchemaRef,
             stream: tokio::sync::Mutex<Option<DFStream>>,
             properties: datafusion_physical_plan::PlanProperties,
+            catalog: Arc<dyn MetadataCatalog>,
+            table_id: i64,
+            primary_key: Vec<String>,
+            conflict_mode: Option<ConflictMode>,
+            conflict_state: Option<Arc<tokio::sync::Mutex<ConflictState>>>,
         }
 
         impl std::fmt::Debug for StreamingExec {
@@ -516,6 +579,171 @@ impl PepperTableProvider {
             }
         }
 
+        impl StreamingExec {
+            fn catalog_error_to_df(err: &CatalogError) -> DataFusionError {
+                DataFusionError::Execution(format!("Pepper catalog error: {err}"))
+            }
+
+            async fn process_conflict_batch(
+                catalog: Arc<dyn MetadataCatalog>,
+                table_id: i64,
+                serializer: &mut KeySerializer,
+                mode: ConflictMode,
+                state: Arc<tokio::sync::Mutex<ConflictState>>,
+                batch: arrow::array::RecordBatch,
+            ) -> datafusion_common::Result<Option<arrow::array::RecordBatch>> {
+                let mut key_materials = serializer
+                    .extract(&batch)
+                    .map_err(|err| Self::catalog_error_to_df(&err))?;
+
+                if key_materials.is_empty() {
+                    return Ok(None);
+                }
+
+                let mut unique_keys: Vec<KeyMaterial> = Vec::with_capacity(key_materials.len());
+                let mut key_lookup: HashMap<Vec<u8>, usize> =
+                    HashMap::with_capacity(key_materials.len());
+
+                for material in key_materials.drain(..) {
+                    let key_bytes = material.key_bytes.clone();
+                    if let Some(existing_idx) = key_lookup.get(&key_bytes) {
+                        match &mode {
+                            ConflictMode::Drop => {}
+                            ConflictMode::Upsert { options } => {
+                                if options.last_write_wins {
+                                    unique_keys[*existing_idx] = material;
+                                } else if !options.remove_duplicates {
+                                    return Err(DataFusionError::Execution(
+                                        "Duplicate primary key detected within batch without supported upsert option"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        key_lookup.insert(key_bytes.clone(), unique_keys.len());
+                        unique_keys.push(material);
+                    }
+                }
+
+                if unique_keys.is_empty() {
+                    return Ok(None);
+                }
+
+                let key_hashes: Vec<Vec<u8>> =
+                    unique_keys.iter().map(|k| k.key_hash.to_vec()).collect();
+
+                let existing_entries = catalog
+                    .get_active_key_index_entries(table_id, &key_hashes)
+                    .await
+                    .map_err(|err| Self::catalog_error_to_df(&err))?;
+
+                let mut existing_by_key: HashMap<Vec<u8>, Vec<KeyIndexEntry>> =
+                    HashMap::with_capacity(existing_entries.len());
+                for entry in existing_entries {
+                    existing_by_key
+                        .entry(entry.key_bytes.clone())
+                        .or_default()
+                        .push(entry);
+                }
+
+                let mut state_guard = state.lock().await;
+                let mut kept_keys: Vec<KeyMaterial> = Vec::new();
+
+                for key in unique_keys {
+                    let key_bytes = key.key_bytes.clone();
+                    let seen_in_stream = state_guard.seen_new_keys.contains(&key_bytes);
+                    let existing = existing_by_key.get(&key_bytes);
+
+                    match &mode {
+                        ConflictMode::Drop => {
+                            if seen_in_stream {
+                                continue;
+                            }
+                            if existing.is_some() {
+                                continue;
+                            }
+                            state_guard.seen_new_keys.insert(key_bytes.clone());
+                            kept_keys.push(key);
+                        }
+                        ConflictMode::Upsert { .. } => {
+                            if seen_in_stream {
+                                return Err(DataFusionError::Execution(
+                                    "Duplicate primary key encountered across streaming batches; \
+                                     last-write-wins across batches is not yet supported"
+                                        .to_string(),
+                                ));
+                            }
+
+                            if let Some(entries) = existing {
+                                for entry in entries {
+                                    state_guard
+                                        .delete_rows
+                                        .entry(entry.data_file_id)
+                                        .or_default()
+                                        .push(entry.row_id);
+
+                                    if state_guard.delete_key_bytes.insert(entry.key_bytes.clone())
+                                    {
+                                        state_guard.delete_keys.push(KeyIndexKey {
+                                            key_hash: entry.key_hash.clone(),
+                                            key_bytes: entry.key_bytes.clone(),
+                                        });
+                                    }
+                                }
+                            }
+
+                            state_guard.seen_new_keys.insert(key_bytes.clone());
+                            kept_keys.push(key);
+                        }
+                    }
+                }
+
+                if kept_keys.is_empty() {
+                    return Ok(None);
+                }
+
+                state_guard.total_rows += kept_keys.len();
+                state_guard.batches.push(BatchInsertInfo {
+                    keys: kept_keys.clone(),
+                });
+                drop(state_guard);
+
+                let mut indices: Vec<u32> = Vec::with_capacity(kept_keys.len());
+                for key in kept_keys {
+                    let index = u32::try_from(key.row_index).map_err(|err| {
+                        DataFusionError::Execution(format!(
+                            "Row index {} exceeds u32 range: {err}",
+                            key.row_index
+                        ))
+                    })?;
+                    indices.push(index);
+                }
+
+                let indices_array = UInt32Array::from(indices);
+                let mut columns = Vec::with_capacity(batch.num_columns());
+
+                for column in batch.columns() {
+                    let taken = arrow::compute::take(column.as_ref(), &indices_array, None)
+                        .map_err(|err| {
+                            DataFusionError::Execution(format!(
+                                "Failed to filter batch for conflict handling: {err}"
+                            ))
+                        })?;
+                    columns.push(taken);
+                }
+
+                let filtered = arrow::array::RecordBatch::try_new(batch.schema(), columns)
+                    .map_err(|err| {
+                        DataFusionError::Execution(format!(
+                            "Failed to reconstruct filtered record batch: {err}"
+                        ))
+                    })?;
+
+                Ok(Some(filtered))
+            }
+        }
+
         impl ExecutionPlan for StreamingExec {
             fn name(&self) -> &'static str {
                 "StreamingExec"
@@ -525,8 +753,8 @@ impl PepperTableProvider {
                 self
             }
 
-            fn schema(&self) -> arrow_schema::SchemaRef {
-                Arc::<arrow_schema::Schema>::clone(&self.schema)
+            fn schema(&self) -> SchemaRef {
+                Arc::clone(&self.schema)
             }
 
             fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
@@ -549,31 +777,89 @@ impl PepperTableProvider {
                 _partition: usize,
                 _context: Arc<datafusion_execution::TaskContext>,
             ) -> datafusion_common::Result<DFStream> {
-                // Use async-aware RecordBatchStreamAdapter to properly forward the stream
-                let schema = Arc::<arrow_schema::Schema>::clone(&self.schema);
+                let schema = Arc::clone(&self.schema);
                 let stream_mutex = Arc::new(tokio::sync::Mutex::new(
                     self.stream
                         .try_lock()
                         .map_err(|_| {
-                            datafusion_common::DataFusionError::Execution(
+                            DataFusionError::Execution(
                                 "Stream is locked (concurrent access detected)".to_string(),
                             )
                         })?
                         .take()
                         .ok_or_else(|| {
-                            datafusion_common::DataFusionError::Execution(
-                                "Stream already consumed".to_string(),
-                            )
+                            DataFusionError::Execution("Stream already consumed".to_string())
                         })?,
                 ));
 
+                let catalog = Arc::clone(&self.catalog);
+                let table_id = self.table_id;
+                let conflict_mode = self.conflict_mode.clone();
+                let conflict_state = self.conflict_state.clone();
+                let primary_key = self.primary_key.clone();
+
                 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
                 let adapter = RecordBatchStreamAdapter::new(
-                    schema,
+                    Arc::clone(&schema),
                     async_stream::stream! {
                         let mut stream = stream_mutex.lock().await;
-                        while let Some(batch) = stream.next().await {
-                            yield batch;
+                        let mut serializer = if conflict_mode.is_some() {
+                            match KeySerializer::try_new(&schema, &primary_key) {
+                                Ok(serializer) => Some(serializer),
+                                Err(err) => {
+                                    yield Err(StreamingExec::catalog_error_to_df(&err));
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        while let Some(batch_result) = stream.next().await {
+                            match batch_result {
+                                Ok(batch) => {
+                                    if let Some(mode) = conflict_mode.clone() {
+                                        let Some(state) = conflict_state.clone() else {
+                                            yield Err(DataFusionError::Execution(
+                                                "Missing conflict state for Pepper streaming insert"
+                                                    .to_string(),
+                                            ));
+                                            return;
+                                        };
+
+                                        let Some(serializer_ref) = serializer.as_mut() else {
+                                            yield Err(DataFusionError::Execution(
+                                                "Missing key serializer for conflict handling"
+                                                    .to_string(),
+                                            ));
+                                            return;
+                                        };
+
+                                        match StreamingExec::process_conflict_batch(
+                                            Arc::clone(&catalog),
+                                            table_id,
+                                            serializer_ref,
+                                            mode.clone(),
+                                            state,
+                                            batch,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(filtered)) => {
+                                                yield Ok(filtered);
+                                            }
+                                            Ok(None) => {}
+                                            Err(err) => {
+                                                yield Err(err);
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        yield Ok(batch);
+                                    }
+                                }
+                                Err(err) => yield Err(err),
+                            }
                         }
                     },
                 );
@@ -587,7 +873,7 @@ impl PepperTableProvider {
         use datafusion_physical_plan::PlanProperties;
 
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::<arrow_schema::Schema>::clone(&schema)),
+            EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Unbounded {
@@ -596,12 +882,16 @@ impl PepperTableProvider {
         );
 
         let stream_exec = Arc::new(StreamingExec {
-            schema: Arc::<arrow_schema::Schema>::clone(&schema),
+            schema: Arc::clone(&schema),
             stream: tokio::sync::Mutex::new(Some(stream)),
             properties,
+            catalog: Arc::clone(&self.catalog),
+            table_id: self.table_metadata.table_id,
+            primary_key,
+            conflict_mode: conflict_mode.clone(),
+            conflict_state: conflict_state.clone(),
         });
 
-        // Create a session context for executing the insert
         let ctx = SessionContext::new();
         let state = ctx.state();
 
@@ -658,6 +948,14 @@ impl PepperTableProvider {
             results.iter().map(|b| b.num_rows() as u64).sum()
         };
 
+        if let Some(state_arc) = conflict_state {
+            let mut state_guard = state_arc.lock().await;
+            let mut state_snapshot = std::mem::take(&mut *state_guard);
+            drop(state_guard);
+            self.apply_conflict_side_effects(&mut state_snapshot)
+                .await?;
+        }
+
         tracing::debug!("Insert completed, wrote {} rows to Vortex", row_count);
 
         // Refresh the listing table to pick up new files and update statistics
@@ -666,6 +964,130 @@ impl PepperTableProvider {
         self.refresh_listing_table()?;
 
         Ok(row_count)
+    }
+
+    fn resolve_conflict_mode(&self, primary_key: &[String]) -> CatalogResult<Option<ConflictMode>> {
+        match &self.on_conflict {
+            None => Ok(None),
+            Some(on_conflict) => {
+                if primary_key.is_empty() {
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Pepper table {} defines on_conflict but no primary key columns",
+                            self.table_metadata.table_name
+                        ),
+                    });
+                }
+
+                match on_conflict {
+                    OnConflict::DoNothingAll => Ok(Some(ConflictMode::Drop)),
+                    OnConflict::DoNothing(columns) => {
+                        Self::ensure_conflict_columns_match_pk(columns, primary_key)?;
+                        Ok(Some(ConflictMode::Drop))
+                    }
+                    OnConflict::Upsert(columns, options) => {
+                        Self::ensure_conflict_columns_match_pk(columns, primary_key)?;
+                        Ok(Some(ConflictMode::Upsert {
+                            options: options.clone(),
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_conflict_columns_match_pk(
+        columns: &ColumnReference,
+        primary_key: &[String],
+    ) -> CatalogResult<()> {
+        let conflict_columns: Vec<String> = columns
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        if conflict_columns.len() != primary_key.len() {
+            return Err(CatalogError::InvalidOperation {
+                message: format!(
+                    "on_conflict columns ({conflict_columns:?}) must match Pepper primary key ({primary_key:?})"
+                ),
+            });
+        }
+
+        let mut pk_sorted = primary_key.to_vec();
+        pk_sorted.sort_unstable();
+        let mut conflict_sorted = conflict_columns.clone();
+        conflict_sorted.sort_unstable();
+
+        if pk_sorted != conflict_sorted {
+            return Err(CatalogError::InvalidOperation {
+                message: format!(
+                    "on_conflict columns ({conflict_columns:?}) must match Pepper primary key ({primary_key:?})"
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn apply_conflict_side_effects(&self, state: &mut ConflictState) -> CatalogResult<()> {
+        if state.total_rows > 0 {
+            let start_row_id = self
+                .catalog
+                .allocate_row_ids(self.table_metadata.table_id, state.total_rows)
+                .await?;
+
+            let mut next_row_id = start_row_id;
+            let mut entries = Vec::with_capacity(state.total_rows);
+
+            for batch in &state.batches {
+                for key in &batch.keys {
+                    entries.push(KeyIndexEntryNew {
+                        table_id: self.table_metadata.table_id,
+                        key_hash: key.key_hash.to_vec(),
+                        key_bytes: key.key_bytes.clone(),
+                        data_file_id: DEFAULT_DATA_FILE_ID,
+                        row_id: next_row_id,
+                        begin_snapshot: self.table_metadata.current_snapshot_id.clone(),
+                    });
+                    next_row_id += 1;
+                }
+            }
+
+            if !entries.is_empty() {
+                self.catalog.insert_key_index_entries(&entries).await?;
+            }
+        }
+
+        if !state.delete_keys.is_empty() {
+            self.catalog
+                .mark_key_index_entries_deleted(
+                    self.table_metadata.table_id,
+                    &state.delete_keys,
+                    &self.table_metadata.current_snapshot_id,
+                )
+                .await?;
+        }
+
+        if !state.delete_rows.is_empty() {
+            let mut specs = Vec::with_capacity(state.delete_rows.len());
+            for (data_file_id, row_ids) in &mut state.delete_rows {
+                row_ids.sort_unstable();
+                row_ids.dedup();
+                if !row_ids.is_empty() {
+                    specs.push(DeletionVectorWriteSpec::new(*data_file_id, row_ids.clone()));
+                }
+            }
+
+            if !specs.is_empty() {
+                let writer = DeletionVectorWriter::new(&self.table_metadata);
+                let mut results = writer.write(specs).await?;
+                for result in results.drain(..) {
+                    self.catalog.add_delete_file(result.delete_file).await?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Delete rows matching the given primary key values.

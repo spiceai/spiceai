@@ -26,18 +26,18 @@
 -
 ### 2. Key Index Design & Metastore Schema
 -[x] Design a normalized schema for a key index table shared by all backends (e.g., `pepper_key_index` with `{table_id, key_hash, key_bytes, data_file_id, row_id, begin_snapshot, end_snapshot}`).
--[ ] Extend `MetastoreBackend` helpers for batched insert/query/update operations.
--[ ] Update `PepperCatalog` (and other catalog implementations) to create & migrate the new schema.
--[ ] Implement catalog-layer APIs for bulk lookup of primary-key hashes, insertion of new key rows, and logical deletion (setting `end_snapshot`).
+-[x] Extend `MetastoreBackend` helpers for batched insert/query/update operations.
+-[x] Update `PepperCatalog` (and other catalog implementations) to create & migrate the new schema.
+-[x] Implement catalog-layer APIs for bulk lookup of primary-key hashes, insertion of new key rows, and logical deletion (setting `end_snapshot`).
 -[ ] Provide documentation/comments describing hash strategy, collision handling, and transaction expectations.
 -
 ### 3. Streaming Conflict Detection & Upsert Workflow
--[ ] Build a reusable `KeyExtractor` that projects key columns from streaming `RecordBatch`es, computes stable hashes, and returns `(hash, bytes, row_ref)` tuples without buffering whole datasets.
--[ ] Integrate conflict detection into `PepperTableProvider::insert` (or new writer) to consult the metastore index per chunk.
+-[x] Build a reusable `KeyExtractor` that projects key columns from streaming `RecordBatch`es, computes stable hashes, and returns `(hash, bytes, row_ref)` tuples without buffering whole datasets.
+-[x] Integrate conflict detection into `PepperTableProvider::insert` (or new writer) to consult the metastore index per chunk.
 -[ ] Implement policy handling:
-    -[ ] `DoNothing` => drop conflicting rows before write.
-    -[ ] `Upsert` => capture conflicting `(data_file_id, row_id)` for deletion vectors and retain only the newest row.
--[ ] Ensure row IDs for new writes are deterministically assigned so the index can be updated immediately after Vortex ingestion.
+    -[x] `DoNothing` => drop conflicting rows before write.
+    -[x] `Upsert` => capture conflicting `(data_file_id, row_id)` for deletion vectors and retain only the newest row.
+-[x] Ensure row IDs for new writes are deterministically assigned so the index can be updated immediately after Vortex ingestion.
 -[ ] Wrap ingestion + index/deletion updates in catalog transactions to keep metadata and data consistent.
 -
 ### 4. Query Path & Constraint Surfacing
@@ -62,12 +62,15 @@
 -[ ] Determine optimal batch size for metastore lookups and writes based on benchmark outcomes.
 -[ ] Decide whether to stage Vortex file writes in temporary directories pending transaction commit (affects crash recovery).
 -[ ] Evaluate concurrency controls (e.g., SQLite locking strategies) to handle simultaneous writers gracefully.
+-[ ] Design cross-batch duplicate resolution for `last_write_wins` without buffering the entire stream.
 
 -## Progress Log
 - 2025-02-10: Completed shared deletion-vector writer and refactored Pepper deletion sink to use it; updated planning checklist accordingly.
 - 2025-02-10: Added Pepper key-index metadata structs, schema DDL, and catalog trait scaffolding as groundwork for on_conflict support.
 - 2025-02-10: Implemented PepperCatalog key-index read/write operations backed by the new schema.
 - 2025-02-10: Introduced batch-oriented key serialization utilities (RowConverter + xxh3) to prepare for conflict detection.
+- 2025-02-10: Propagated primary key and `on_conflict` settings through runtime table creation and Pepper providers.
+- 2025-02-11: Wired streaming inserts to consult the key index, perform drop/upsert policy handling, allocate row IDs, and emit deletion vectors; cross-batch last-write-wins remains outstanding.
 -
 -## Execution Checklist (High-Level)
 -[ ] Finish deletion-vector pipeline and land as standalone commit.
