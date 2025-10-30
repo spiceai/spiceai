@@ -45,7 +45,7 @@ fn bench_init_schema(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let (metastore, _temp_dir) = get_sqlite_metastore();
-                let _: () = metastore.init_schema().await.expect("Failed to init");
+                metastore.init_schema().await.expect("Failed to init");
                 black_box(());
             });
         });
@@ -73,7 +73,7 @@ fn bench_insert_single(c: &mut Criterion) {
     let sql = "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)";
 
     group.bench_function("sqlite", |b| {
-        let (metastore, _temp_dir) = rt.block_on(async {
+        let setup = rt.block_on(async {
             let (metastore, temp_dir) = get_sqlite_metastore();
             metastore
                 .execute_batch(SCHEMA_SQL)
@@ -83,25 +83,22 @@ fn bench_insert_single(c: &mut Criterion) {
         });
 
         b.iter(|| {
-            let params = vec![
-                MetastoreValue::Integer(1),
-                MetastoreValue::Text("test_name".to_string()),
-                MetastoreValue::Integer(100),
-                MetastoreValue::Bool(true),
-            ];
-
-            // Measure only the insert operation
             rt.block_on(async {
-                let _: () = metastore
+                let params = vec![
+                    MetastoreValue::Integer(1),
+                    MetastoreValue::Text("test_name".to_string()),
+                    MetastoreValue::Integer(100),
+                    MetastoreValue::Bool(true),
+                ];
+                setup
+                    .0
                     .execute(ExecuteParams { sql, params })
                     .await
                     .expect("Failed to insert");
                 black_box(());
-            });
-
-            // Cleanup (not measured as part of the benchmark)
-            rt.block_on(async {
-                metastore
+                // Cleanup for next iteration
+                setup
+                    .0
                     .execute(ExecuteParams {
                         sql: "DELETE FROM test_table WHERE id = 1",
                         params: vec![],
@@ -114,7 +111,7 @@ fn bench_insert_single(c: &mut Criterion) {
 
     #[cfg(feature = "turso")]
     group.bench_function("turso", |b| {
-        let (metastore, _temp_dir) = rt.block_on(async {
+        let setup = rt.block_on(async {
             let (metastore, temp_dir) = get_turso_metastore();
             metastore
                 .execute_batch(SCHEMA_SQL)
@@ -124,25 +121,22 @@ fn bench_insert_single(c: &mut Criterion) {
         });
 
         b.iter(|| {
-            let params = vec![
-                MetastoreValue::Integer(1),
-                MetastoreValue::Text("test_name".to_string()),
-                MetastoreValue::Integer(100),
-                MetastoreValue::Bool(true),
-            ];
-
-            // Measure only the insert operation
             rt.block_on(async {
-                metastore
+                let params = vec![
+                    MetastoreValue::Integer(1),
+                    MetastoreValue::Text("test_name".to_string()),
+                    MetastoreValue::Integer(100),
+                    MetastoreValue::Bool(true),
+                ];
+                setup
+                    .0
                     .execute(ExecuteParams { sql, params })
                     .await
                     .expect("Failed to insert");
                 black_box(());
-            });
-
-            // Cleanup (not measured as part of the benchmark)
-            rt.block_on(async {
-                metastore
+                // Cleanup for next iteration
+                setup
+                    .0
                     .execute(ExecuteParams {
                         sql: "DELETE FROM test_table WHERE id = 1",
                         params: vec![],
@@ -165,14 +159,13 @@ fn bench_insert_batch(c: &mut Criterion) {
 
     for size in sizes {
         group.bench_with_input(BenchmarkId::new("sqlite", size), &size, |b, &size| {
-            let (metastore, _temp_dir) = rt.block_on(async {
+            let setup = rt.block_on(async {
                 let (metastore, temp_dir) = get_sqlite_metastore();
                 metastore.execute_batch(SCHEMA_SQL).await.expect("Failed to init");
                 (metastore, temp_dir)
             });
 
             b.iter(|| {
-                // Measure only the insert operations
                 rt.block_on(async {
                     for i in 0..size {
                         let params = vec![
@@ -181,17 +174,18 @@ fn bench_insert_batch(c: &mut Criterion) {
                             MetastoreValue::Integer(i * 10),
                             MetastoreValue::Bool(i % 2 == 0),
                         ];
-                        metastore.execute(ExecuteParams {
-                            sql: "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)",
-                            params
-                        }).await.expect("Failed to insert");
+                        setup
+                            .0
+                            .execute(ExecuteParams {
+                                sql: "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)",
+                                params
+                            })
+                            .await
+                            .expect("Failed to insert");
                         black_box(());
                     }
-                });
-
-                // Cleanup (not measured as part of the benchmark)
-                rt.block_on(async {
-                    metastore.execute(ExecuteParams {
+                    // Cleanup
+                    setup.0.execute(ExecuteParams {
                         sql: "DELETE FROM test_table",
                         params: vec![]
                     }).await.expect("Failed to cleanup");
@@ -201,14 +195,13 @@ fn bench_insert_batch(c: &mut Criterion) {
 
         #[cfg(feature = "turso")]
         group.bench_with_input(BenchmarkId::new("turso", size), &size, |b, &size| {
-            let (metastore, _temp_dir) = rt.block_on(async {
+            let setup = rt.block_on(async {
                 let (metastore, temp_dir) = get_turso_metastore();
                 metastore.execute_batch(SCHEMA_SQL).await.expect("Failed to init");
                 (metastore, temp_dir)
             });
 
             b.iter(|| {
-                // Measure only the insert operations
                 rt.block_on(async {
                     for i in 0..size {
                         let params = vec![
@@ -217,17 +210,18 @@ fn bench_insert_batch(c: &mut Criterion) {
                             MetastoreValue::Integer(i * 10),
                             MetastoreValue::Bool(i % 2 == 0),
                         ];
-                        metastore.execute(ExecuteParams {
-                            sql: "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)",
-                            params
-                        }).await.expect("Failed to insert");
+                        setup
+                            .0
+                            .execute(ExecuteParams {
+                                sql: "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)",
+                                params
+                            })
+                            .await
+                            .expect("Failed to insert");
                         black_box(());
                     }
-                });
-
-                // Cleanup (not measured as part of the benchmark)
-                rt.block_on(async {
-                    metastore.execute(ExecuteParams {
+                    // Cleanup
+                    setup.0.execute(ExecuteParams {
                         sql: "DELETE FROM test_table",
                         params: vec![]
                     }).await.expect("Failed to cleanup");

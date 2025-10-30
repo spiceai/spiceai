@@ -18,6 +18,8 @@ limitations under the License.
 
 //! Simple integration test for Pepper with Vortex
 
+#![allow(clippy::expect_used)]
+
 mod common;
 
 use arrow::array::{Array, Int64Array, StringArray};

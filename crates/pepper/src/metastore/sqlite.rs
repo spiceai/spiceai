@@ -247,7 +247,7 @@ fn convert_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> MetastoreValue 
     }
 }
 
-/// Convert `MetastoreValue` to rusqlite parameter.
+/// Convert `MetastoreValue` to a `rusqlite` parameter.
 fn to_sqlite_param(value: &MetastoreValue) -> Box<dyn rusqlite::ToSql> {
     match value {
         MetastoreValue::Integer(i) => Box::new(*i),

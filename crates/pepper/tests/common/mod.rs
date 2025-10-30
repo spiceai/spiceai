@@ -40,6 +40,7 @@ impl BackendType {
 
 /// Test fixture that sets up a temporary directory and catalog
 pub struct TestFixture {
+    #[allow(dead_code)]
     pub temp_dir: TempDir,
     pub catalog: Arc<PepperCatalog>,
     pub data_path: std::path::PathBuf,
@@ -76,7 +77,7 @@ impl TestFixture {
         })
     }
 
-    /// Get the database file path (`SQLite` only)
+    /// Get the database path for SQLite-specific verification
     #[allow(dead_code)]
     pub fn db_path(&self) -> std::path::PathBuf {
         self.temp_dir.path().join("test.db")

@@ -371,7 +371,7 @@ impl PepperAccelerator {
             let metastore_type = acceleration
                 .params
                 .get("pepper_metastore")
-                .map_or("sqlite", std::string::String::as_str);
+                .map_or("sqlite", String::as_str);
 
             (metadata_dir, metastore_type.to_string())
         } else {
