@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Common test utilities for Pepper with multiple metastore backends
 
-use pepper::PepperCatalog;
+use pepper::{MetadataCatalog, PepperCatalog};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -49,8 +49,6 @@ pub struct TestFixture {
 impl TestFixture {
     /// Create a new test fixture with the specified backend
     pub async fn new(backend: BackendType) -> Result<Self, Box<dyn std::error::Error>> {
-        use pepper::MetadataCatalog;
-
         let temp_dir = TempDir::new()?;
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path)?;
@@ -67,7 +65,7 @@ impl TestFixture {
             }
         };
 
-        let catalog = Arc::new(PepperCatalog::new(connection_string));
+        let catalog = Arc::new(PepperCatalog::new(connection_string)?);
         catalog.init().await?;
 
         Ok(Self {
@@ -76,6 +74,12 @@ impl TestFixture {
             data_path,
             backend_type: backend,
         })
+    }
+
+    /// Get the database file path (SQLite only)
+    #[allow(dead_code)]
+    pub fn db_path(&self) -> std::path::PathBuf {
+        self.temp_dir.path().join("test.db")
     }
 }
 
