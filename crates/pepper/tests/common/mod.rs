@@ -76,7 +76,7 @@ impl TestFixture {
         })
     }
 
-    /// Get the database file path (SQLite only)
+    /// Get the database file path (`SQLite` only)
     #[allow(dead_code)]
     pub fn db_path(&self) -> std::path::PathBuf {
         self.temp_dir.path().join("test.db")

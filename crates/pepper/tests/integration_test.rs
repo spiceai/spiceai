@@ -372,7 +372,8 @@ async fn test_pepper_basic_workflow_impl(
 
     // Create a fresh table provider by reading from catalog
     // This simulates what happens when spiced restarts or a new client connects
-    let catalog_arc: Arc<dyn pepper::MetadataCatalog> = catalog.clone();
+    let catalog_arc: Arc<dyn pepper::MetadataCatalog> =
+        Arc::<pepper::PepperCatalog>::clone(catalog);
     let fresh_table = PepperTableProvider::new("test_table", catalog_arc).await?;
 
     // Create a fresh context and register the fresh table

@@ -28,7 +28,7 @@ fn get_sqlite_metastore() -> (SqliteMetastore, TempDir) {
 }
 
 #[cfg(feature = "turso")]
-async fn get_turso_metastore() -> (TursoMetastore, TempDir) {
+fn get_turso_metastore() -> (TursoMetastore, TempDir) {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let db_path = temp_dir.path().join("test.db");
     let connection_string = format!("libsql://{}", db_path.display());
@@ -55,8 +55,9 @@ fn bench_init_schema(c: &mut Criterion) {
     group.bench_function("turso", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let (metastore, _temp_dir) = get_turso_metastore().await;
-                black_box(metastore.init_schema().await.expect("Failed to init"));
+                let (metastore, _temp_dir) = get_turso_metastore();
+                metastore.init_schema().await.expect("Failed to init");
+                black_box(());
             });
         });
     });
@@ -114,7 +115,7 @@ fn bench_insert_single(c: &mut Criterion) {
     #[cfg(feature = "turso")]
     group.bench_function("turso", |b| {
         let (metastore, _temp_dir) = rt.block_on(async {
-            let (metastore, temp_dir) = get_turso_metastore().await;
+            let (metastore, temp_dir) = get_turso_metastore();
             metastore
                 .execute_batch(SCHEMA_SQL)
                 .await
@@ -132,12 +133,11 @@ fn bench_insert_single(c: &mut Criterion) {
 
             // Measure only the insert operation
             rt.block_on(async {
-                black_box(
-                    metastore
-                        .execute(ExecuteParams { sql, params })
-                        .await
-                        .expect("Failed to insert"),
-                );
+                metastore
+                    .execute(ExecuteParams { sql, params })
+                    .await
+                    .expect("Failed to insert");
+                black_box(());
             });
 
             // Cleanup (not measured as part of the benchmark)
@@ -181,7 +181,7 @@ fn bench_insert_batch(c: &mut Criterion) {
                             MetastoreValue::Integer(i * 10),
                             MetastoreValue::Bool(i % 2 == 0),
                         ];
-                        let _: () = metastore.execute(ExecuteParams {
+                        metastore.execute(ExecuteParams {
                             sql: "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)",
                             params
                         }).await.expect("Failed to insert");
@@ -202,7 +202,7 @@ fn bench_insert_batch(c: &mut Criterion) {
         #[cfg(feature = "turso")]
         group.bench_with_input(BenchmarkId::new("turso", size), &size, |b, &size| {
             let (metastore, _temp_dir) = rt.block_on(async {
-                let (metastore, temp_dir) = get_turso_metastore().await;
+                let (metastore, temp_dir) = get_turso_metastore();
                 metastore.execute_batch(SCHEMA_SQL).await.expect("Failed to init");
                 (metastore, temp_dir)
             });
@@ -217,10 +217,11 @@ fn bench_insert_batch(c: &mut Criterion) {
                             MetastoreValue::Integer(i * 10),
                             MetastoreValue::Bool(i % 2 == 0),
                         ];
-                        black_box(metastore.execute(ExecuteParams {
+                        metastore.execute(ExecuteParams {
                             sql: "INSERT INTO test_table (id, name, value, is_active) VALUES (?, ?, ?, ?)",
                             params
-                        }).await.expect("Failed to insert"));
+                        }).await.expect("Failed to insert");
+                        black_box(());
                     }
                 });
 
@@ -293,7 +294,7 @@ fn bench_query_single(c: &mut Criterion) {
     #[cfg(feature = "turso")]
     group.bench_function("turso", |b| {
         let setup = rt.block_on(async {
-            let (metastore, temp_dir) = get_turso_metastore().await;
+            let (metastore, temp_dir) = get_turso_metastore();
             metastore
                 .execute_batch(SCHEMA_SQL)
                 .await
@@ -392,7 +393,7 @@ fn bench_query_batch(c: &mut Criterion) {
         #[cfg(feature = "turso")]
         group.bench_with_input(BenchmarkId::new("turso", size), &size, |b, &size| {
             let setup = rt.block_on(async {
-                let (metastore, temp_dir) = get_turso_metastore().await;
+                let (metastore, temp_dir) = get_turso_metastore();
                 metastore.execute_batch(SCHEMA_SQL).await.expect("Failed to init");
                 // Insert test data
                 for i in 0..size {

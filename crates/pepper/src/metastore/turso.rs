@@ -217,7 +217,7 @@ impl MetastoreRow for TursoRow {
     }
 }
 
-/// Convert Turso Value to MetastoreValue.
+/// Convert Turso Value to `MetastoreValue`.
 fn convert_turso_value(value: &TursoValue) -> MetastoreValue {
     match value {
         TursoValue::Null => MetastoreValue::Null,
@@ -234,7 +234,7 @@ fn convert_turso_value(value: &TursoValue) -> MetastoreValue {
     }
 }
 
-/// Convert MetastoreValue to Turso Value.
+/// Convert `MetastoreValue` to Turso Value.
 fn to_turso_value(value: &MetastoreValue) -> TursoValue {
     match value {
         MetastoreValue::Integer(i) => TursoValue::Integer(*i),
@@ -402,30 +402,6 @@ impl MetastoreBackend for TursoMetastore {
         }
 
         Ok(results)
-    }
-
-    async fn begin_transaction(&self) -> CatalogResult<()> {
-        self.execute(ExecuteParams {
-            sql: "BEGIN TRANSACTION",
-            params: vec![],
-        })
-        .await
-    }
-
-    async fn commit_transaction(&self) -> CatalogResult<()> {
-        self.execute(ExecuteParams {
-            sql: "COMMIT",
-            params: vec![],
-        })
-        .await
-    }
-
-    async fn rollback_transaction(&self) -> CatalogResult<()> {
-        self.execute(ExecuteParams {
-            sql: "ROLLBACK",
-            params: vec![],
-        })
-        .await
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
