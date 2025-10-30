@@ -528,7 +528,7 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
-        CardinalityEffect::Unknown
+        CardinalityEffect::Equal
     }
 
     fn try_swapping_with_projection(
