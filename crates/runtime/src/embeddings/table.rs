@@ -51,6 +51,11 @@ pub enum Error {
         "Column '{column}' has an unsupported data type for embedding. Only string types are allowed. For details, visit: https://spiceai.org/docs/components/embeddings",
     ))]
     InvalidColumnType { column: String, data_type: DataType },
+
+    #[snafu(display(
+        "The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    EmbeddingModelNotFound { column: String, model: String },
 }
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
@@ -99,6 +104,61 @@ impl std::fmt::Debug for EmbeddingColumnConfig {
 }
 
 impl EmbeddingTable {
+    pub async fn from_spicepod_columns(
+        base_table: Arc<dyn TableProvider>,
+        embeddings: Vec<ColumnEmbeddingConfig>,
+        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+        file_format: Option<&str>,
+    ) -> Result<Arc<dyn TableProvider>, Error> {
+        if embeddings.is_empty() {
+            return Ok(base_table);
+        }
+
+        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
+            .iter()
+            .map(|e| (e.column.clone(), e.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // Early check if embedding models are available.
+        for (column, config) in &embed_columns {
+            let model = &config.model;
+            if !embedding_models.read().await.contains_key(model) {
+                return Err(Error::EmbeddingModelNotFound {
+                    column: column.clone(),
+                    model: model.clone(),
+                });
+            }
+        }
+
+        let embed_chunker_config: HashMap<String, ChunkingConfig> = embeddings
+            .iter()
+            .filter(|e| e.chunking.as_ref().is_some_and(|s| s.enabled))
+            .filter_map(|e| {
+                e.chunking.as_ref().map(|chunk_cfg| {
+                    (
+                        e.column.clone(),
+                        ChunkingConfig {
+                            target_chunk_size: chunk_cfg.target_chunk_size,
+                            overlap_size: chunk_cfg.overlap_size,
+                            trim_whitespace: chunk_cfg.trim_whitespace,
+                            file_format,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        let embedding_table = EmbeddingTable::try_new(
+            base_table,
+            embed_columns,
+            Arc::clone(embedding_models),
+            embed_chunker_config,
+        )
+        .await?;
+
+        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
+    }
+
     /// When creating a new [`EmbeddingTable`], the provided columns (in `embed_columns`) must be checked to see if they are already in the base table.
     /// Constructing the [`EmbeddingColumnConfig`] for each column is different depending on whether the column is in the base table or not.
     pub async fn try_new(

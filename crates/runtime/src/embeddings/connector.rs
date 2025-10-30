@@ -52,7 +52,6 @@ use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::semantic::MetadataType;
 use spicepod::vector::VectorStore;
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -127,55 +126,15 @@ impl EmbeddingConnector {
                 })
             })
             .collect_vec();
-        let mut embeddings = dataset.embeddings.clone();
+
+        let mut embeddings: Vec<ColumnEmbeddingConfig> = dataset.embeddings.clone();
         embeddings.extend(from_columns);
 
-        if embeddings.is_empty() {
-            return Ok(inner_table_provider);
-        }
-
-        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
-            .iter()
-            .map(|e| (e.column.clone(), e.clone()))
-            .collect::<HashMap<_, _>>();
-
-        // Early check if embedding models are available.
-        for (column, config) in &embed_columns {
-            let model = &config.model;
-            if !self.embedding_models.read().await.contains_key(model) {
-                return Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "EmbeddingConnector".to_string(),
-                    message: format!(
-                        "The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
-                    ),
-                    connector_component: dataset.into(),
-                });
-            }
-        }
-
-        let embed_chunker_config: HashMap<String, ChunkingConfig> = embeddings
-            .iter()
-            .filter(|e| e.chunking.as_ref().is_some_and(|s| s.enabled))
-            .filter_map(|e| {
-                e.chunking.as_ref().map(|chunk_cfg| {
-                    (
-                        e.column.clone(),
-                        ChunkingConfig {
-                            target_chunk_size: chunk_cfg.target_chunk_size,
-                            overlap_size: chunk_cfg.overlap_size,
-                            trim_whitespace: chunk_cfg.trim_whitespace,
-                            file_format: dataset.params.get("file_format").map(String::as_str),
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>();
-
-        let embedding_table = EmbeddingTable::try_new(
+        EmbeddingTable::from_spicepod_columns(
             inner_table_provider,
-            embed_columns,
-            Arc::clone(&self.embedding_models),
-            embed_chunker_config,
+            embeddings,
+            &self.embedding_models,
+            dataset.params.get("file_format").map(String::as_str),
         )
         .await
         .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -183,9 +142,7 @@ impl EmbeddingConnector {
             message: e.to_string(),
             connector_component: dataset.into(),
             source: Box::new(e),
-        })?;
-
-        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
+        })
     }
 
     async fn wrap_table_as_index(

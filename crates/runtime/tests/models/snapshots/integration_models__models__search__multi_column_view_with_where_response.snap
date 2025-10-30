@@ -9,12 +9,13 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        "answer": "A relation is partial if there is an element in the domain that is not related to any element in the co-domain.",
+        "question": "What is the definition of a partial relation?"
       },
       "primary_key": {
-        "id": 890
+        "id": 921
       },
-      "score": 7.52
+      "score": 0.03
     }
   ]
 }
