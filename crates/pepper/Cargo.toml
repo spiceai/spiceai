@@ -12,6 +12,7 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-row = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64 = "0.22"
@@ -35,6 +36,7 @@ tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 uuid = { version = "1.11", features = ["v7"] }
 vortex-datafusion = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [features]
 default = []

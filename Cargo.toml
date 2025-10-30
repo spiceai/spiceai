@@ -79,6 +79,7 @@ arrow-ipc = "56.0.0"
 arrow-json = "56.0.0"
 arrow-odbc = "18"
 arrow-schema = "56.0.0"
+arrow-row = "56.0.0"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "ec48de2d31ecc021a1962c629199ca11cf645fab", features = [
     "byot",
 ] }
@@ -354,4 +355,3 @@ aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887
 
 # Required until Turso releases 0.23 without the GPL dependency
 turso = { git = "https://github.com/tursodatabase/turso", rev = "ae60b78d828dc08c6bcdc070d7ec71c4d61bd007" }
-
