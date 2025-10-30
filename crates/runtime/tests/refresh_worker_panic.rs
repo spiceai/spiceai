@@ -35,7 +35,6 @@ use runtime::accelerated_table::{Error as AcceleratedError, RefreshTaskRunner};
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::federated_table::FederatedTable;
 use runtime::status;
-use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, timeout};
 

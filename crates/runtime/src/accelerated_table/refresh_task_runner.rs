@@ -37,7 +37,6 @@ use tokio::sync::RwLock;
 
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use opentelemetry::KeyValue;
-use spicepod::metric::Metrics;
 
 pub struct RefreshTaskRunnerBuilder {
     runtime_status: Arc<status::RuntimeStatus>,
