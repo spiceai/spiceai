@@ -67,6 +67,7 @@
 - 2025-02-10: Completed shared deletion-vector writer and refactored Pepper deletion sink to use it; updated planning checklist accordingly.
 - 2025-02-10: Added Pepper key-index metadata structs, schema DDL, and catalog trait scaffolding as groundwork for on_conflict support.
 - 2025-02-10: Implemented PepperCatalog key-index read/write operations backed by the new schema.
+- 2025-02-10: Introduced batch-oriented key serialization utilities (RowConverter + xxh3) to prepare for conflict detection.
 -
 -## Execution Checklist (High-Level)
 -[ ] Finish deletion-vector pipeline and land as standalone commit.
