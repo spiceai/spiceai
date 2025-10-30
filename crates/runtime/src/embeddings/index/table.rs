@@ -23,8 +23,7 @@ use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use chunking::ChunkingConfig;
 use datafusion::datasource::TableProvider;
-#[cfg(feature = "s3_vectors")]
-use datafusion::prelude::SessionContext;
+use datafusion::{prelude::SessionContext, sql::TableReference};
 use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::util::get_primary_keys;
@@ -34,11 +33,12 @@ use tokio::sync::RwLock;
 
 use datafusion::common::ToDFSchema as _;
 use runtime_table_partition::expression::partition_by_expressions;
+use spicepod::semantic::Column;
 
 #[cfg(feature = "s3_vectors")]
 use {
-    datafusion::sql::TableReference, search::index::s3_vectors::S3Vector, snafu::ResultExt,
-    spicepod::component::embeddings::EmbeddingChunkConfig, spicepod::semantic::Column,
+    search::index::s3_vectors::S3Vector, snafu::ResultExt,
+    spicepod::component::embeddings::EmbeddingChunkConfig,
 };
 
 use spicepod::semantic::MetadataType;
