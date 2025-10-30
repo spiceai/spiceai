@@ -221,7 +221,7 @@ impl TableProvider for DynamoDBTableProvider {
         let mut projected_schema = project_schema(self.table_schema.schema(), projection)?;
 
         tracing::debug!(
-            "[DynamoDB] table {:?}, projection: {:?}, filters: {:?}, limit: {:?}",
+            "Table {:?}, projection: {:?}, filters: {:?}, limit: {:?}",
             self.table_schema.table_name(),
             projection,
             filters,
@@ -242,17 +242,18 @@ impl TableProvider for DynamoDBTableProvider {
                 .build_request_plan(filters, &projected_schema, limit)?;
 
         tracing::debug!(
-            "[DynamoDB] table {:?}, request_plan: {:?}",
+            "Table {:?}, request_plan: {:?}",
             self.table_schema.table_name(),
             request_plan
         );
 
+        // If `config_partitions` is empty (i.e. it was set to 'auto' in the config), use table size as a heuristic.
         let total_partitions = self
             .config_partitions
             .unwrap_or_else(|| self.get_partitions_from_table_size());
 
         tracing::debug!(
-            "[DynamoDB] table {:?}, total_partitions: {:?}",
+            "Table {:?}, total_partitions: {:?}",
             self.table_schema.table_name(),
             total_partitions
         );

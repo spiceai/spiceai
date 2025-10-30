@@ -1169,6 +1169,31 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_scan_with_filters_and_empty_values() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filters = vec![col("name").eq(col("sort_key"))];
+        let projection = create_projection_schema(&["id", "name"]);
+
+        let result = builder
+            .build_request_plan(&filters, &projection, None)
+            .expect("request plan");
+
+        match result {
+            DynamoDBRequestPlan::Scan(params) => {
+                assert_eq!(params.limit, None);
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#name = #sort_key)".to_string())
+                );
+                assert_eq!(params.expression_attribute_values, None);
+            }
+            DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
+        }
+    }
+
+    #[test]
     fn test_plan_query_with_multiple_filter_expressions() {
         let schema = create_test_schema();
         let builder = DynamoDBRequestPlanBuilder::new(schema);
