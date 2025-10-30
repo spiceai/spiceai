@@ -792,29 +792,117 @@ impl MetadataCatalog for PepperCatalog {
 
     async fn get_active_key_index_entries(
         &self,
-        _table_id: i64,
-        _key_hashes: &[Vec<u8>],
+        table_id: i64,
+        key_hashes: &[Vec<u8>],
     ) -> CatalogResult<Vec<KeyIndexEntry>> {
-        Err(CatalogError::InvalidOperation {
-            message: "Key index lookups are not yet implemented".to_string(),
-        })
+        if key_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_hashes: Vec<Vec<u8>> = key_hashes.to_owned();
+        unique_hashes.sort();
+        unique_hashes.dedup();
+
+        let unique_len = unique_hashes.len();
+        let placeholder_list = (0..unique_len)
+            .map(|idx| format!("?{}", idx + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let query_sql = format!(
+            "SELECT table_id, key_hash, key_bytes, data_file_id, row_id, begin_snapshot, end_snapshot \
+             FROM pepper_key_index \
+             WHERE table_id = ?1 AND end_snapshot IS NULL AND key_hash IN ({placeholder_list})"
+        );
+
+        let mut params = Vec::with_capacity(1 + unique_len);
+        params.push(MetastoreValue::Integer(table_id));
+        for hash in &unique_hashes {
+            params.push(MetastoreValue::from(hash.clone()));
+        }
+
+        self.query_helper(
+            QueryParams {
+                sql: &query_sql,
+                params,
+            },
+            |row| {
+                Ok(KeyIndexEntry {
+                    table_id: row.get_i64(0)?,
+                    key_hash: row.get_blob(1)?,
+                    key_bytes: row.get_blob(2)?,
+                    data_file_id: row.get_i64(3)?,
+                    row_id: row.get_i64(4)?,
+                    begin_snapshot: row.get_string(5)?,
+                    end_snapshot: row.get_optional_string(6)?,
+                })
+            },
+        )
+        .await
     }
 
-    async fn insert_key_index_entries(&self, _entries: &[KeyIndexEntryNew]) -> CatalogResult<()> {
-        Err(CatalogError::InvalidOperation {
-            message: "Key index insert is not yet implemented".to_string(),
-        })
+    async fn insert_key_index_entries(&self, entries: &[KeyIndexEntryNew]) -> CatalogResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        for entry in entries {
+            let params = vec![
+                MetastoreValue::Integer(entry.table_id),
+                MetastoreValue::from(entry.key_hash.clone()),
+                MetastoreValue::from(entry.key_bytes.clone()),
+                MetastoreValue::Integer(entry.data_file_id),
+                MetastoreValue::Integer(entry.row_id),
+                MetastoreValue::Text(entry.begin_snapshot.clone()),
+            ];
+
+            self.execute_helper(ExecuteParams {
+                sql: r"
+                    INSERT INTO pepper_key_index (
+                        table_id, key_hash, key_bytes, data_file_id, row_id, begin_snapshot, end_snapshot
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+                ",
+                params,
+            })
+            .await?;
+        }
+
+        Ok(())
     }
 
     async fn mark_key_index_entries_deleted(
         &self,
-        _table_id: i64,
-        _keys: &[KeyIndexKey],
-        _end_snapshot: &str,
+        table_id: i64,
+        keys: &[KeyIndexKey],
+        end_snapshot: &str,
     ) -> CatalogResult<()> {
-        Err(CatalogError::InvalidOperation {
-            message: "Key index delete is not yet implemented".to_string(),
-        })
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        for key in keys {
+            let params = vec![
+                MetastoreValue::Text(end_snapshot.to_string()),
+                MetastoreValue::Integer(table_id),
+                MetastoreValue::from(key.key_hash.clone()),
+                MetastoreValue::from(key.key_bytes.clone()),
+            ];
+
+            self.execute_helper(ExecuteParams {
+                sql: r"
+                    UPDATE pepper_key_index
+                    SET end_snapshot = ?1
+                    WHERE table_id = ?2
+                      AND key_hash = ?3
+                      AND key_bytes = ?4
+                      AND end_snapshot IS NULL
+                ",
+                params,
+            })
+            .await?;
+        }
+
+        Ok(())
     }
 }
 
