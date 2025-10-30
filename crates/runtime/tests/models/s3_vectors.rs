@@ -75,7 +75,6 @@ mod search {
         );
         app = app.with_dataset(view_ds);
 
-        views.reverse();
         let bkt = ds
             .vectors
             .as_ref()
@@ -99,6 +98,7 @@ mod search {
             let store =
                 init_vector_store_w_index_name(&bkt, format!("{idx}-view").as_str(), true).await?;
             v.vectors = Some(store);
+
             app = app.with_view(v);
         }
 
@@ -233,14 +233,18 @@ mod search {
         run_search_w_explain(
             app.build(),
             [
-                // Duplicate views
+                // Run all tests cases on dataset `qs`, and view `qs_view`.
                 cases
                     .iter()
                     .map(|c| {
-                        c.replace_table(
+                        let mut case = c.replace_table(
                             &TableReference::parse_str("qs"),
                             &TableReference::parse_str("qs_view"),
-                        )
+                        );
+                        case.name = case
+                            .name
+                            .replace("s3vectors_hybrid_", "s3vectors_hybrid_view_");
+                        case
                     })
                     .collect(),
                 cases,
@@ -291,7 +295,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "s3vectors_multiple_embeddings_additional_columns2",
+                    "s3vectors_multiple_embeddings_view_additional_columns2",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -306,7 +310,7 @@ mod search {
                     ),
                 ),
                 SearchTestCase::new(
-                    "s3vectors_multiple_embeddings_vector_search_questions",
+                    "s3vectors_multiple_embeddings_view_vector_search_questions",
                     SearchTestType::from_sql(
                         "SELECT id, answer, trunc(score, 3) FROM vector_search(qs_view, 'second', question) order by score desc, id LIMIT 4",
                     ),
@@ -319,7 +323,7 @@ mod search {
                 ),
 
                 SearchTestCase::new(
-                    "s3vectors_multiple_embeddings_vector_search_w_embeddings",
+                    "s3vectors_multiple_embeddings_view_vector_search_w_embeddings",
                     SearchTestType::from_sql(
                         "SELECT id, answer, array_length(question_embedding), array_length(answer_embedding), trunc(score, 3) FROM vector_search(qs_view, 'second', question) order by score desc, id LIMIT 4",
                     ),
@@ -332,6 +336,10 @@ mod search {
 
     #[tokio::test]
     async fn multi_column_primary_key() -> Result<(), anyhow::Error> {
+        let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
@@ -343,20 +351,16 @@ mod search {
                 ),
             ),
         );
-        let bucket_name = "spice-ci-tests-s3-vectors-compose-pk";
-        let vector_store = init_vector_store(bucket_name, true).await?;
+        let vector_store = init_vector_store("spice-ci-tests-s3-vectors-compose-pk", true).await?;
         ds.vectors = Some(vector_store);
+        app = add_mega_science_view_from_ds(app, &ds).await?;
+        app = app.with_dataset(ds);
 
         run_search_w_explain(
-            AppBuilder::new("search_app")
-                .with_embedding(get_model_to_vec_embeddings(
-                    "minishlab/potion-base-2M",
-                    "hf_minilm",
-                ))
-                .with_dataset(ds)
-                .build(),
+            app.build(),
 
             [basic_vector_search_tests("s3vectors_composite"),
+                basic_vector_search_tests_on_table("s3vectors_composite_view", "qs_view"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_composite_key",
@@ -365,9 +369,21 @@ mod search {
                     ),
                 ),
                 SearchTestCase::new(
+                    "s3vector_composite_view_vector_search_sql_composite_key",
+                    SearchTestType::from_sql(
+                        "SELECT id, question, answer, trunc(score, 3) FROM vector_search(qs_view, 'second') order by score desc, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_filters",
                     SearchTestType::from_sql(
                         "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id > 10 order by score desc, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_composite_view_vector_search_sql_filters",
+                    SearchTestType::from_sql(
+                        "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs_view, 'secondary') where id > 10 order by score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true
@@ -377,6 +393,10 @@ mod search {
 
     #[tokio::test]
     async fn with_chunking_metadata() -> Result<(), anyhow::Error> {
+        let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
@@ -392,24 +412,28 @@ mod search {
                 ),
             )),
         );
-        let bucket_name = "spice-ci-tests-s3-vectors-chunking-metadata";
-        let vector_store = init_vector_store(bucket_name, true).await?;
+        let vector_store =
+            init_vector_store("spice-ci-tests-s3-vectors-chunking-metadata", true).await?;
         ds.vectors = Some(vector_store);
 
+        app = add_mega_science_view_from_ds(app, &ds).await?;
+        app = app.with_dataset(ds);
+
         run_search_w_explain(
-            AppBuilder::new("search_app")
-                .with_embedding(get_model_to_vec_embeddings(
-                    "minishlab/potion-base-2M",
-                    "hf_minilm",
-                ))
-                .with_dataset(ds)
-                .build(),
+            app.build(),
             [basic_vector_search_tests("s3vectors_chunking_metadata"),
+                basic_vector_search_tests_on_table("s3vectors_chunking_metadata_view", "qs_view"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match",
                     SearchTestType::from_sql(
                         "SELECT id, match, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_chunking_metadata_view_vector_search_sql_match",
+                    SearchTestType::from_sql(
+                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs_view, 'second') order by score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
@@ -419,9 +443,21 @@ mod search {
                     ),
                 ),
                 SearchTestCase::new(
+                    "s3vector_chunking_metadata_view_vector_search_sql_offset",
+                    SearchTestType::from_sql(
+                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs_view, 'second') order by score DESC, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_chunking_metadata_view_vector_search_sql_match_and_underlying",
+                    SearchTestType::from_sql(
+                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs_view, 'second') order by score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true
@@ -431,6 +467,10 @@ mod search {
 
     #[tokio::test]
     async fn with_chunking() -> Result<(), anyhow::Error> {
+        let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
@@ -446,19 +486,17 @@ mod search {
                 ),
             ),
         );
-        let bucket_name = "spice-ci-tests-s3-vectors-chunking";
-        let vector_store = init_vector_store(bucket_name, true).await?;
+        let vector_store = init_vector_store("spice-ci-tests-s3-vectors-chunking", true).await?;
         ds.vectors = Some(vector_store);
 
+        app = add_mega_science_view_from_ds(app, &ds).await?;
+        app = app.with_dataset(ds);
+
         run_search_w_explain(
-            AppBuilder::new("search_app")
-                .with_embedding(get_model_to_vec_embeddings(
-                    "minishlab/potion-base-2M",
-                    "hf_minilm",
-                ))
-                .with_dataset(ds)
-                .build(),
-            [basic_vector_search_tests("s3vectors_chunking"),
+            app.build(),
+            [
+                basic_vector_search_tests("s3vectors_chunking"),
+                basic_vector_search_tests_on_table("s3vectors_chunking_view", "qs_view"),
                 vec![
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match",
@@ -467,9 +505,21 @@ mod search {
                     ),
                 ),
                 SearchTestCase::new(
+                    "s3vector_chunking_view_vector_search_sql_match",
+                    SearchTestType::from_sql(
+                        "SELECT id, match, trunc(score, 3) FROM vector_search(qs_view, 'second') order by score desc, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_offset",
                     SearchTestType::from_sql(
                         "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs, 'second') order by score DESC, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_chunking_view_vector_search_sql_offset",
+                    SearchTestType::from_sql(
+                        "SELECT id, answer_offset, trunc(score, 3) FROM vector_search(qs_view, 'second') order by score DESC, id LIMIT 4",
                     ),
                 ),
                 // TODO: This is performing a needless join (since search_field is in vector index, `match` can be computed without base table).
@@ -478,6 +528,12 @@ mod search {
                     "s3vector_chunking_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
                         "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc, id LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_chunking_view_vector_search_sql_match_and_underlying",
+                    SearchTestType::from_sql(
+                        "SELECT id, match, answer, trunc(score, 3) FROM vector_search(qs_view, 'second') order by score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true
@@ -488,6 +544,10 @@ mod search {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn metadata_columns() -> Result<(), anyhow::Error> {
+        let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ));
         // Metadata columns: question, subject (filterable), answer
         // Base columns:     reference_answer,source
         let mut ds = get_mega_science_dataset(
@@ -512,20 +572,27 @@ mod search {
             vectors_filterable_col("subject"),
         ]);
 
-        let bucket_name = "spice-ci-tests-s3-vectors-metadata-columns";
-        let vector_store = init_vector_store(bucket_name, true).await?;
+        let vector_store =
+            init_vector_store("spice-ci-tests-s3-vectors-metadata-columns", true).await?;
         ds.vectors = Some(vector_store);
 
+        app = add_mega_science_view_from_ds(app, &ds).await?;
+        app = app.with_dataset(ds);
+
+        let mut app = app.build();
+        if let Some(v) = app.views.iter_mut().find(|v| v.name == "qs_view") {
+            v.columns.extend([
+                // `question` column already added in `add_mega_science_view_from_ds`.
+                // vectors_nonfilterable_col("question"),
+                vectors_filterable_col("subject"),
+            ]);
+        };
+
         run_search_w_explain(
-            AppBuilder::new("search_app")
-                .with_embedding(get_model_to_vec_embeddings(
-                    "minishlab/potion-base-2M",
-                    "hf_minilm",
-                ))
-                .with_dataset(ds)
-                .build(),
+            app,
             [
                 basic_vector_search_tests("s3vectors_metadata"),
+                basic_vector_search_tests_on_table("s3vectors_metadata_view", "qs_view"),
                 vec![
                     SearchTestCase::new(
                         "s3vector_metadata_additional_columns_metadata",
@@ -536,7 +603,15 @@ mod search {
                             "additional_columns": ["reference_answer", "source"],
                         })),
                     ),
-
+                    SearchTestCase::new(
+                        "s3vector_metadata_view_additional_columns_metadata",
+                        SearchTestType::Http(json!({
+                            "text": "second",
+                            "limit": 4,
+                            "datasets": ["qs_view"],
+                            "additional_columns": ["reference_answer", "source"],
+                        })),
+                    ),
                     SearchTestCase::new(
                         "s3vector_metadata_with_where_metadata",
                         SearchTestType::Http(json!({
@@ -546,7 +621,15 @@ mod search {
                             "limit": 4,
                         })),
                     ),
-
+                    SearchTestCase::new(
+                        "s3vector_metadata_view_with_where_metadata",
+                        SearchTestType::Http(json!({
+                            "text": "secondary",
+                            "datasets": ["qs_view"],
+                            "where": "subject!='math'",
+                            "limit": 4,
+                        })),
+                    ),
                     SearchTestCase::new(
                         "s3vector_metadata_vector_search_sql_projection_metadata",
                         SearchTestType::from_sql(
@@ -554,9 +637,21 @@ mod search {
                         ),
                     ),
                     SearchTestCase::new(
+                        "s3vector_metadata_view_vector_search_sql_projection_metadata",
+                        SearchTestType::from_sql(
+                            "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs_view, 'second') order by score desc, id LIMIT 4",
+                        ),
+                    ),
+                    SearchTestCase::new(
                         "s3vector_metadata_vector_search_sql_filters_metadata",
                         SearchTestType::from_sql(
                             "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc, id LIMIT 4",
+                        ),
+                    ),
+                    SearchTestCase::new(
+                        "s3vector_metadata_view_vector_search_sql_filters_metadata",
+                        SearchTestType::from_sql(
+                            "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs_view, 'secondary') where subject!='math' order by score desc, id LIMIT 4",
                         ),
                     ),
                 ],
