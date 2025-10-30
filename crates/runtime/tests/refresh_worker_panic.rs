@@ -157,7 +157,6 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
         None,
         refresh_state,
         accelerator_provider,
-        Handle::current(),
     )
     .build();
 
