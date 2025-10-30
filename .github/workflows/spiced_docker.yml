@@ -111,7 +111,7 @@ jobs:
 
   build-amd64:
     needs: setup
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners`
     steps:
       - name: Skip AMD64 build
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
@@ -244,7 +244,7 @@ jobs:
 
   build-cuda:
     needs: setup
-    runs-on: 'spiceai-dev-runners'
+    runs-on: 'spicehq-dev-runners`'
     env:
       CUDA_COMPUTE_CAP: 80
     steps:
