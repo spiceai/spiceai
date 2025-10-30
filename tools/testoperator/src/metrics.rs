@@ -43,6 +43,22 @@ pub static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static ACCELERATION_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("acceleration_size_bytes")
+        .with_description("Size of acceleration data on disk.")
+        .with_unit("bytes")
+        .build()
+});
+
+pub static READY_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("ready_duration_ms")
+        .with_description("Duration until the spicepod is ready.")
+        .with_unit("ms")
+        .build()
+});
+
 pub static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("median_duration_ms")
