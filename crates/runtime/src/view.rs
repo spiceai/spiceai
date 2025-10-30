@@ -13,11 +13,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{component::view::View, search::full_text::table::add_full_text_search_to_table};
+use crate::{
+    component::view::View, embeddings::table::EmbeddingTable,
+    search::full_text::table::add_full_text_search_to_table,
+};
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
 use datafusion::{
-    catalog::TableProvider, datasource::ViewTable, error::Result, prelude::SessionContext,
+    catalog::TableProvider,
+    datasource::ViewTable,
+    error::{DataFusionError, Result},
+    prelude::SessionContext,
 };
+use snafu::ResultExt;
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{collections::HashSet, sync::Arc};
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
@@ -99,13 +107,39 @@ pub(crate) async fn prepare_view(
 ) -> Result<Arc<dyn TableProvider>> {
     let plan = ctx.state().statement_to_plan(statement.clone()).await?;
     let view_table = ViewTable::new(plan, Some(view.sql.to_string()));
+    let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
+
+    if view.has_embeddings() {
+        tbl_provider = EmbeddingTable::from_spicepod_columns(
+            tbl_provider,
+            view.columns
+                .iter()
+                .flat_map(|col| {
+                    col.embeddings.iter().map(|emb| ColumnEmbeddingConfig {
+                        column: col.name.clone(),
+                        model: emb.model.clone(),
+                        primary_keys: emb.row_ids.clone(),
+                        chunking: emb.chunking.clone(),
+                        vector_size: emb.vector_size,
+                    })
+                })
+                .collect(),
+            &view.runtime.embeds(),
+            None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
+        )
+        .await
+        .boxed()
+        .map_err(DataFusionError::External)?;
+    }
 
     if view.has_full_text_column() {
-        let idx = add_full_text_search_to_table(Arc::new(view_table), &view.columns, &view.name)?;
-        Ok(Arc::new(idx) as Arc<dyn TableProvider>)
-    } else {
-        Ok(Arc::new(view_table) as Arc<dyn TableProvider>)
+        tbl_provider = Arc::new(add_full_text_search_to_table(
+            tbl_provider,
+            &view.columns,
+            &view.name,
+        )?) as Arc<dyn TableProvider>;
     }
+    Ok(tbl_provider)
 }
 
 #[cfg(test)]

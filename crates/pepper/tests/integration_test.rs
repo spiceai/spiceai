@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 //! Simple integration test for Pepper with Vortex
+
+mod common;
 
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -22,26 +26,21 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use pepper::metadata::CreateTableOptions;
-use pepper::{MetadataCatalog, PepperCatalog, PepperTableProvider};
+use pepper::{MetadataCatalog, PepperTableProvider};
 use std::sync::Arc;
-use tempfile::TempDir;
 
-#[tokio::test]
+// Generate test variants for each backend
+test_with_backends!(test_pepper_basic_workflow_impl);
+
 #[allow(clippy::too_many_lines)]
-async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a temporary directory for the test
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
+async fn test_pepper_basic_workflow_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let catalog = &fixture.catalog;
+    let data_path = &fixture.data_path;
+    let backend_name = fixture.backend_type.name();
 
-    // 1. Create and initialize catalog
-    let catalog = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
-    println!("✓ Catalog initialized");
+    println!("✓ Catalog initialized with {backend_name} backend");
 
     // 2. Create table schema
     let schema = Arc::new(Schema::new(vec![
@@ -59,7 +58,7 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
 
     // 3. Create Pepper table provider
     let table = PepperTableProvider::create_table(
-        Arc::<pepper::PepperCatalog>::clone(&catalog),
+        Arc::<pepper::PepperCatalog>::clone(catalog),
         table_options,
     )
     .await?;
@@ -164,9 +163,11 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     }
     println!("✓ Projection query successful (1 column, 3 rows)");
 
-    // 13. Verify SQLite metastore after first insert
-    verify_sqlite_metadata(&db_path, &data_path)?;
-    println!("✓ SQLite metastore verification successful (round 1)");
+    // 13. Verify metastore after first insert (SQLite only)
+    if fixture.backend_type == common::BackendType::Sqlite {
+        verify_sqlite_metadata(&fixture.db_path(), data_path)?;
+        println!("✓ SQLite metastore verification successful (round 1)");
+    }
 
     // === ROUND 2: Second insert ===
     println!("\n--- Round 2: Additional insert ---");
@@ -258,9 +259,11 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
     }
     println!("✓ Projection query successful (round 2: 1 column, 5 rows)");
 
-    // 20. Verify SQLite metastore after second insert
-    verify_sqlite_metadata(&db_path, &data_path)?;
-    println!("✓ SQLite metastore verification successful (round 2)");
+    // 20. Verify metastore after second insert (SQLite only)
+    if fixture.backend_type == common::BackendType::Sqlite {
+        verify_sqlite_metadata(&fixture.db_path(), data_path)?;
+        println!("✓ SQLite metastore verification successful (round 2)");
+    }
 
     // === ROUND 3: INSERT OVERWRITE ===
     println!("\n--- Round 3: INSERT OVERWRITE ---");
@@ -369,7 +372,8 @@ async fn test_pepper_basic_workflow() -> Result<(), Box<dyn std::error::Error>> 
 
     // Create a fresh table provider by reading from catalog
     // This simulates what happens when spiced restarts or a new client connects
-    let catalog_arc: Arc<dyn pepper::MetadataCatalog> = catalog;
+    let catalog_arc: Arc<dyn pepper::MetadataCatalog> =
+        Arc::<pepper::PepperCatalog>::clone(catalog);
     let fresh_table = PepperTableProvider::new("test_table", catalog_arc).await?;
 
     // Create a fresh context and register the fresh table
@@ -533,55 +537,62 @@ fn verify_sqlite_metadata(
     Ok(())
 }
 
-#[tokio::test]
-async fn test_pepper_catalog_persistence() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = TempDir::new()?;
+// Generate test variants for each backend
+test_with_backends!(test_pepper_catalog_persistence_impl);
+
+async fn test_pepper_catalog_persistence_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = fixture.temp_dir;
     let db_path = temp_dir.path().join("persist.db");
+    let backend_name = fixture.backend_type.name();
+
+    let connection_string = match fixture.backend_type {
+        common::BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
+        #[cfg(feature = "turso")]
+        common::BackendType::Turso => format!("libsql://{}", db_path.to_string_lossy()),
+    };
 
     // Create catalog and initialize
     {
-        let catalog = PepperCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()));
+        let catalog = pepper::PepperCatalog::new(connection_string.clone())?;
         catalog.init().await?;
-        println!("✓ First initialization complete");
+        println!("✓ First initialization complete with {backend_name}");
     }
 
     // Re-open and verify it doesn't fail
     {
-        let catalog = PepperCatalog::new(format!("sqlite://{}", db_path.to_string_lossy()));
+        let catalog = pepper::PepperCatalog::new(connection_string)?;
         catalog.init().await?;
-        println!("✓ Second initialization complete (idempotent)");
+        println!("✓ Second initialization complete (idempotent) with {backend_name}");
     }
 
-    println!("\n✅ Catalog persistence test passed!");
+    println!("\n✅ Catalog persistence test passed with {backend_name}!");
     Ok(())
 }
 
-#[tokio::test]
-async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
+// Generate test variants for each backend
+test_with_backends!(test_pepper_statistics_impl);
+
+async fn test_pepper_statistics_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::TableReference;
     use datafusion::execution::context::SessionContext;
     use datafusion_catalog::TableProvider;
     use pepper::metadata::CreateTableOptions;
-    use pepper::{PepperCatalog, PepperTableProvider};
+    use pepper::PepperTableProvider;
     use std::sync::Arc;
-    use tempfile::TempDir;
 
-    println!("\n🧪 Testing Pepper statistics tracking...");
+    let backend_name = fixture.backend_type.name();
+    println!("\n🧪 Testing Pepper statistics tracking with {backend_name}...");
 
     // 1. Setup test environment
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("stats_test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
+    let catalog = fixture.catalog;
+    let data_path = fixture.data_path;
 
-    // 2. Create catalog and table
-    let catalog = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
-
+    // 2. Create table
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Utf8, false),
@@ -639,13 +650,17 @@ async fn test_pepper_statistics() -> Result<(), Box<dyn std::error::Error>> {
         println!("  • Statistics provide query optimizer information for better performance");
     }
 
-    println!("\n✅ Statistics tracking test passed!");
+    println!("\n✅ Statistics tracking test passed with {backend_name}!");
     Ok(())
 }
 
-#[tokio::test]
+// Generate test variants for each backend
+test_with_backends!(test_pepper_core_data_types_impl);
+
 #[allow(clippy::too_many_lines)]
-async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_pepper_core_data_types_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
         Float32Array, Float64Array, Int16Array, Int32Array, Int8Array, LargeBinaryArray,
@@ -656,18 +671,11 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
     use std::f32::consts::{E as F32_E, PI as F32_PI};
     use std::f64::consts::{E as F64_E, PI as F64_PI};
 
-    println!("\n🧪 Testing Pepper core data type support...");
+    let backend_name = fixture.backend_type.name();
+    println!("\n🧪 Testing Pepper core data type support with {backend_name}...");
 
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("types_test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
-
-    let catalog = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
+    let catalog = fixture.catalog;
+    let data_path = fixture.data_path;
 
     // Create table with all core supported data types
     let schema = Arc::new(Schema::new(vec![
@@ -909,6 +917,6 @@ async fn test_pepper_core_data_types() -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(dec_col.value(0), 314_159_265_358_i128);
     println!("  ✓ Decimal128: {}", dec_col.value(0));
 
-    println!("\n✅ Core data types test passed!");
+    println!("\n✅ Core data types test passed with {backend_name}!");
     Ok(())
 }

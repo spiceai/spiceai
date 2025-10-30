@@ -36,7 +36,7 @@ pub enum Error {
     #[snafu(display("Unsupported scalar value type: {data_type}"))]
     UnsupportedType { data_type: DataType },
 
-    #[snafu(display("Unsupported partition key: {value}"))]
+    #[snafu(display("Unsupported partition key: {value:?}"))]
     UnsupportedPartitionKey { value: ScalarValue },
 
     #[snafu(display("Failed to parse partition key: {source}"))]
@@ -77,6 +77,10 @@ fn encode_key(key: &ScalarValue) -> Result<String, Error> {
         ScalarValue::UInt16(v) => v.map(|v| format!("{v}")),
         ScalarValue::UInt32(v) => v.map(|v| format!("{v}")),
         ScalarValue::UInt64(v) => v.map(|v| format!("{v}")),
+        ScalarValue::TimestampSecond(v, _) => v.map(|v| format!("{v}")),
+        ScalarValue::TimestampMillisecond(v, _) => v.map(|v| format!("{v}")),
+        ScalarValue::TimestampMicrosecond(v, _) => v.map(|v| format!("{v}")),
+        ScalarValue::TimestampNanosecond(v, _) => v.map(|v| format!("{v}")),
         ScalarValue::Utf8(v) => v.clone(),
         value => {
             return Err(Error::UnsupportedPartitionKey {

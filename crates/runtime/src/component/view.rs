@@ -143,6 +143,11 @@ impl View {
     }
 
     #[must_use]
+    pub fn has_embeddings(&self) -> bool {
+        self.columns.iter().any(|c| !c.embeddings.is_empty())
+    }
+
+    #[must_use]
     pub fn has_full_text_column(&self) -> bool {
         self.columns
             .iter()

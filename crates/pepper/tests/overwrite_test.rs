@@ -38,7 +38,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
         "sqlite://{}",
         db_path.to_string_lossy()
-    )));
+    ))?);
     catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![

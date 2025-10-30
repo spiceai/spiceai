@@ -107,7 +107,8 @@ pub async fn parse_explicit_primary_keys(
     app: Arc<RwLock<Option<Arc<App>>>>,
 ) -> HashMap<TableReference, Vec<String>> {
     app.read().await.as_ref().map_or(HashMap::new(), |app| {
-        app.datasets
+        let mut pks = app
+            .datasets
             .iter()
             .filter_map(|d| {
                 d.primary_key_override().map(|pks| {
@@ -119,7 +120,24 @@ pub async fn parse_explicit_primary_keys(
                     )
                 })
             })
-            .collect::<HashMap<TableReference, Vec<_>>>()
+            .collect::<HashMap<TableReference, Vec<_>>>();
+
+        pks.extend(
+            app.views
+                .iter()
+                .filter_map(|d| {
+                    d.primary_key_override().map(|pks| {
+                        (
+                            TableReference::parse_str(&d.name)
+                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                                .into(),
+                            pks,
+                        )
+                    })
+                })
+                .collect::<HashMap<TableReference, Vec<_>>>(),
+        );
+        pks
     })
 }
 
