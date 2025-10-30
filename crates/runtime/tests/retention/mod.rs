@@ -396,15 +396,6 @@ SET
                 )
                 .await?;
 
-            let pg_updated_ts: i64 = db_conn
-                .conn
-                .query_one(
-                    "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000000)::BIGINT FROM widgets WHERE name = 'Sample widget';",
-                    &[],
-                )
-                .await?
-                .get(0);
-
             refresh_table(Arc::clone(&rt), "widgets").await?;
 
             let deleted_batches = execute_rt_sql(
