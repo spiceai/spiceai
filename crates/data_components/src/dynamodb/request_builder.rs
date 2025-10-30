@@ -63,7 +63,6 @@ enum KeyFilter {
 /// All column references are automatically aliased using `expression_attribute_names` to ensure compatibility
 /// with `DynamoDB` reserved words and special characters.
 /// See: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ExpressionAttributeNames.html#Expressions.ExpressionAttributeNames.ReservedWords>
-///
 impl DynamoDBRequestPlanBuilder {
     pub fn new(schema: DynamoDBTableSchema) -> Self {
         Self { schema }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 use super::{Error, Result};
 use crate::arrow::struct_builder::StructBuilder;
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder,
-    ListBuilder, NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
-    new_empty_array,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, ListBuilder,
+    NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_array::builder::ArrayBuilder;
@@ -32,17 +32,7 @@ pub fn dynamodb_items_to_arrow(
     projected_schema: SchemaRef,
 ) -> Result<RecordBatch> {
     if items.is_empty() {
-        let empty_arrays: Vec<ArrayRef> = projected_schema
-            .fields()
-            .iter()
-            .map(|field| new_empty_array(field.data_type()))
-            .collect();
-
-        return RecordBatch::try_new(projected_schema, empty_arrays).map_err(|e| {
-            Error::ConversionError {
-                source: Box::new(e),
-            }
-        });
+        return Ok(RecordBatch::new_empty(projected_schema));
     }
 
     // Create a single StructBuilder instead of HashMap of builders
@@ -53,13 +43,7 @@ pub fn dynamodb_items_to_arrow(
         append_item_to_struct_builder(item, &mut struct_builder)?;
     }
 
-    // Finish the struct builder to get the arrays
-    let struct_array = struct_builder.finish();
-    let (_fields, arrays, _nulls) = struct_array.into_parts();
-
-    RecordBatch::try_new(projected_schema, arrays).map_err(|e| Error::ConversionError {
-        source: Box::new(e),
-    })
+    Ok(struct_builder.finish().into())
 }
 
 fn append_item_to_struct_builder(
