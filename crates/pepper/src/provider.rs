@@ -32,7 +32,8 @@ limitations under the License.
 //! subdirectory (e.g., `file_000001/`, `file_000002/`). When querying the table,
 //! the provider reads from all active virtual files.
 
-use super::catalog::{CatalogResult, MetadataCatalog};
+use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
+use super::deletion::{DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::metadata::{CreateTableOptions, TableMetadata};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -58,6 +59,8 @@ use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
+
+const DEFAULT_DATA_FILE_ID: i64 = 0;
 
 /// Execution plan that filters out deleted rows based on deletion vectors.
 ///
@@ -1089,15 +1092,6 @@ impl PepperDeletionSink {
         }
     }
 
-    /// Create a deletion vector schema (row IDs to delete).
-    fn deletion_vector_schema() -> SchemaRef {
-        use arrow::datatypes::{DataType, Field, Schema};
-        Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::Int64, false),
-            Field::new("deleted_at", DataType::Int64, false), // Unix timestamp in microseconds
-        ]))
-    }
-
     async fn delete_all_rows(
         &self,
         ctx: &SessionContext,
@@ -1113,39 +1107,7 @@ impl PepperDeletionSink {
 
         let row_ids: Vec<i64> = (0..total_rows_i64).collect();
 
-        let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
-            .join(&self.table_metadata.current_snapshot_id)
-            .join("deletions")
-            .join(format!("delete_{}.vortex", uuid::Uuid::now_v7()));
-
-        let deleted_count = self
-            .write_deletion_vector(row_ids, &deletion_vector_path)
-            .await?;
-
-        let file_size = tokio::fs::metadata(&deletion_vector_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let deleted_count_i64 = convert_to_i64_box(deleted_count, "deleted row count")?;
-        let file_size_i64 = convert_to_i64_box(file_size, "deletion vector file size")?;
-
-        let delete_file = super::metadata::DeleteFile {
-            delete_file_id: 0,
-            table_id: self.table_metadata.table_id,
-            data_file_id: 0,
-            path: deletion_vector_path.to_string_lossy().to_string(),
-            path_is_relative: false,
-            format: "arrow_ipc".to_string(),
-            delete_count: deleted_count_i64,
-            file_size_bytes: file_size_i64,
-        };
-
-        self.catalog
-            .add_delete_file(delete_file)
-            .await
-            .map_err(|e| format!("Failed to register deletion file: {e}"))?;
-
-        Ok(deleted_count)
+        self.persist_deletions(row_ids, DEFAULT_DATA_FILE_ID).await
     }
 
     async fn delete_filtered_rows(
@@ -1219,122 +1181,47 @@ impl PepperDeletionSink {
             }
         }
 
-        let deleted_count = convert_to_u64_box(row_ids.len(), "deleted row count")?;
-
-        if deleted_count == 0 {
-            return Ok(0);
-        }
-
-        let deletion_vector_path = std::path::PathBuf::from(&self.table_metadata.path)
-            .join(&self.table_metadata.current_snapshot_id)
-            .join("deletions")
-            .join(format!("delete_{}.vortex", uuid::Uuid::now_v7()));
-
-        self.write_deletion_vector(row_ids, &deletion_vector_path)
-            .await?;
-
-        let file_size = tokio::fs::metadata(&deletion_vector_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let deleted_count_i64 = convert_to_i64_box(deleted_count, "deleted row count")?;
-        let file_size_i64 = convert_to_i64_box(file_size, "deletion vector file size")?;
-
-        let delete_file = super::metadata::DeleteFile {
-            delete_file_id: 0,
-            table_id: self.table_metadata.table_id,
-            data_file_id: 0,
-            path: deletion_vector_path.to_string_lossy().to_string(),
-            path_is_relative: false,
-            format: "arrow_ipc".to_string(),
-            delete_count: deleted_count_i64,
-            file_size_bytes: file_size_i64,
-        };
-
-        self.catalog
-            .add_delete_file(delete_file)
-            .await
-            .map_err(|e| format!("Failed to register deletion file: {e}"))?;
-
-        Ok(deleted_count)
+        self.persist_deletions(row_ids, DEFAULT_DATA_FILE_ID).await
     }
 
-    /// Write deletion vector to a file.
-    ///
-    /// Currently writes as Arrow IPC format for simplicity and compatibility.
-    /// Row IDs represent the logical position of rows in the table (0-indexed).
-    async fn write_deletion_vector(
+    async fn persist_deletions(
         &self,
         row_ids: Vec<i64>,
-        output_path: &std::path::Path,
+        data_file_id: i64,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        use arrow::array::{Int64Array, RecordBatch};
-        use arrow::ipc::writer::FileWriter;
-
         if row_ids.is_empty() {
             return Ok(0);
         }
 
-        let deleted_count = row_ids.len();
-        let deleted_at = chrono::Utc::now().timestamp_micros();
+        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        let mut results = writer
+            .write(vec![DeletionVectorWriteSpec::new(data_file_id, row_ids)])
+            .await
+            .map_err(catalog_error_to_box)?;
 
-        // Create arrays for the deletion vector
-        let row_id_array = Int64Array::from(row_ids);
-        let deleted_at_array = Int64Array::from(vec![deleted_at; deleted_count]);
+        let Some(result) = results.pop() else {
+            return Ok(0);
+        };
 
-        // Create RecordBatch
-        let schema = Self::deletion_vector_schema();
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(row_id_array) as Arc<dyn arrow::array::Array>,
-                Arc::new(deleted_at_array),
-            ],
-        )?;
+        self.catalog
+            .add_delete_file(result.delete_file)
+            .await
+            .map_err(catalog_error_to_box)?;
 
-        // Create directory if it doesn't exist
-        if let Some(parent) = output_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Write as Arrow IPC file format
-        let output_path_owned = output_path.to_path_buf();
-        let schema_for_write = Arc::clone(&schema);
-        let batch_for_write = batch;
-        let blocking_result = tokio::task::spawn_blocking(
-            move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-                let file = std::fs::File::create(&output_path_owned)
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
-                let mut writer = FileWriter::try_new(file, &schema_for_write)
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
-                writer
-                    .write(&batch_for_write)
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
-                writer
-                    .finish()
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
-
-                let file_size = std::fs::metadata(&output_path_owned)
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?
-                    .len();
-
-                Ok(file_size)
-            },
-        )
-        .await
-        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
-
-        let file_size = blocking_result?;
+        let deleted_count = convert_to_u64_box(result.row_ids.len(), "deleted row count")?;
 
         tracing::debug!(
-            "Deletion vector written: {} row(s), {} bytes at {:?}",
+            "Deletion vector written: {} row(s) at {:?}",
             deleted_count,
-            file_size,
-            output_path
+            result.path
         );
 
-        Ok(deleted_count as u64)
+        Ok(deleted_count)
     }
+}
+
+fn catalog_error_to_box(err: CatalogError) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(err)
 }
 
 #[async_trait]
