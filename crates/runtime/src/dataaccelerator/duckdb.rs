@@ -19,7 +19,7 @@ use crate::{
     component::{
         dataset::{
             Dataset,
-            acceleration::{Acceleration, Engine, Mode, RefreshMode},
+            acceleration::{Acceleration, Engine, Mode},
         },
         view::View,
     },
@@ -451,7 +451,35 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        let write_completion_handler = build_write_completion_handler(source, &cmd);
+        let write_completion_handler = source.and_then(|src| {
+            let retention_sql = src
+                .acceleration()
+                .and_then(|acc| acc.retention_sql.as_deref())
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())?
+                .to_string();
+
+            let dataset_name = src.name().to_string();
+            let schema = Arc::new(cmd.schema.as_arrow().clone());
+
+            match crate::datafusion::retention_sql::parse_retention_sql(
+                src.name(),
+                &retention_sql,
+                schema,
+            ) {
+                Ok(parsed_sql) => Some(make_retention_write_handler(
+                    dataset_name,
+                    parsed_sql.delete_statement,
+                )),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse retention_sql for dataset {}: {}. Retention SQL will not be applied.",
+                        dataset_name, e
+                    );
+                    None
+                }
+            }
+        });
 
         Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
     }
@@ -462,47 +490,6 @@ impl DataAccelerator for DuckDBAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
-    }
-}
-
-fn build_write_completion_handler(
-    source: Option<&dyn AccelerationSource>,
-    cmd: &CreateExternalTable,
-) -> Option<WriteCompletionHandler> {
-    let src = source?;
-    let acceleration = src.acceleration()?;
-    if acceleration.refresh_mode == Some(RefreshMode::Append) {
-        tracing::debug!(
-            dataset = %src.name(),
-            "Skipping pre-commit retention SQL for append refresh mode"
-        );
-        return None;
-    }
-
-    let retention_sql = acceleration
-        .retention_sql
-        .as_deref()
-        .map(str::trim)
-        .filter(|sql| !sql.is_empty())?
-        .to_string();
-
-    let dataset_name = src.name().to_string();
-    let schema = Arc::new(cmd.schema.as_arrow().clone());
-
-    match crate::datafusion::retention_sql::parse_retention_sql(src.name(), &retention_sql, schema)
-    {
-        Ok(parsed_sql) => Some(make_retention_write_handler(
-            dataset_name,
-            parsed_sql.delete_statement,
-        )),
-        Err(e) => {
-            tracing::warn!(
-                "Failed to parse retention_sql for dataset {}: {}. Retention SQL will not be applied.",
-                dataset_name,
-                e
-            );
-            None
-        }
     }
 }
 
