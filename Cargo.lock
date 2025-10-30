@@ -16755,9 +16755,10 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.3.0-pre.4"
-source = "git+https://github.com/tursodatabase/turso?rev=ae60b78d828dc08c6bcdc070d7ec71c4d61bd007#ae60b78d828dc08c6bcdc070d7ec71c4d61bd007"
+version = "0.3.0"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
+ "mimalloc",
  "thiserror 2.0.17",
  "tracing",
  "tracing-subscriber",
@@ -16766,12 +16767,13 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.3.0-pre.4"
-source = "git+https://github.com/tursodatabase/turso?rev=ae60b78d828dc08c6bcdc070d7ec71c4d61bd007#ae60b78d828dc08c6bcdc070d7ec71c4d61bd007"
+version = "0.3.0"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "aegis",
  "aes",
  "aes-gcm",
+ "arc-swap",
  "bitflags 2.10.0",
  "built",
  "bytemuck",
@@ -16794,6 +16796,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "roaring 0.11.2",
+ "rustc-hash 2.1.1",
  "rustix 1.1.2",
  "ryu",
  "simsimd",
@@ -16812,8 +16815,8 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.3.0-pre.4"
-source = "git+https://github.com/tursodatabase/turso?rev=ae60b78d828dc08c6bcdc070d7ec71c4d61bd007#ae60b78d828dc08c6bcdc070d7ec71c4d61bd007"
+version = "0.3.0"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -16822,8 +16825,8 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.3.0-pre.4"
-source = "git+https://github.com/tursodatabase/turso?rev=ae60b78d828dc08c6bcdc070d7ec71c4d61bd007#ae60b78d828dc08c6bcdc070d7ec71c4d61bd007"
+version = "0.3.0"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -16832,8 +16835,8 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.3.0-pre.4"
-source = "git+https://github.com/tursodatabase/turso?rev=ae60b78d828dc08c6bcdc070d7ec71c4d61bd007#ae60b78d828dc08c6bcdc070d7ec71c4d61bd007"
+version = "0.3.0"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "bitflags 2.10.0",
  "miette",

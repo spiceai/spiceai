@@ -352,6 +352,7 @@ aws-smithy-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "8
 aws-smithy-runtime-api = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-runtime-api" }                   # pinned from release-2025-10-08
 aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-types" }                               # pinned from release-2025-10-08
 
-# Required until Turso releases 0.23 without the GPL dependency
-turso = { git = "https://github.com/tursodatabase/turso", rev = "ae60b78d828dc08c6bcdc070d7ec71c4d61bd007" }
+# Note: Turso's bindings/rust/src/lib.rs defines #[global_allocator] which conflicts with spiced's allocator
+# We need to fork and remove the global allocator or patch it out
+turso = { git = "https://github.com/spiceai/turso", rev = "5c4d14d298869fe5ea296163b3241d6963a2e87d" }
 
