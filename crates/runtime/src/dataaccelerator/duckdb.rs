@@ -1261,8 +1261,8 @@ mod tests {
         drop(temp_dir);
     }
 
-    #[test]
-    fn test_reconstruct_retention_sql() {
+    #[tokio::test]
+    async fn test_reconstruct_retention_sql() {
         let sql = "DELETE FROM taxi_trips WHERE status = 'expired'";
         let schema = Arc::new(Schema::new(vec![Field::new(
             "status",
@@ -1305,8 +1305,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_reconstruct_retention_sql_complex_where() {
+    #[tokio::test]
+    async fn test_reconstruct_retention_sql_complex_where() {
         let sql = "DELETE FROM orders WHERE created_at < NOW() - INTERVAL '30 days' AND status IN ('cancelled', 'expired')";
         let schema = Arc::new(Schema::new(vec![
             Field::new("created_at", DataType::Utf8, true),
