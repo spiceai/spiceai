@@ -204,6 +204,9 @@ pub trait MetadataCatalog: Send + Sync {
         end_snapshot: &str,
     ) -> CatalogResult<()>;
 
+    /// Allocate a contiguous range of logical row IDs for a table append, returning the starting row ID.
+    async fn allocate_row_ids(&self, table_id: i64, count: usize) -> CatalogResult<i64>;
+
     /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
     /// Default implementation does nothing.
     async fn shutdown(&self) -> CatalogResult<()> {

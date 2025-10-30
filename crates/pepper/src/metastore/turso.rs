@@ -109,7 +109,8 @@ impl TursoMetastore {
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
-            partition_column TEXT
+            partition_column TEXT,
+            next_row_id BIGINT NOT NULL DEFAULT 0
         )
     ";
 
@@ -319,6 +320,95 @@ impl MetastoreBackend for TursoMetastore {
         })?;
 
         Ok(())
+    }
+
+    /// Allocate a contiguous range of row IDs for a table and return the starting row ID.
+    ///
+    /// # Errors
+    /// Returns an error if the metastore update fails or if the row ID counter overflows.
+    pub async fn allocate_row_ids(&self, table_id: i64, count: usize) -> CatalogResult<i64> {
+        let count_i64 = i64::try_from(count).map_err(|_| CatalogError::InvalidOperation {
+            message: "Row count exceeds i64 range".to_string(),
+        })?;
+
+        let conn = self.get_conn().await?;
+
+        conn.execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to begin transaction: {e}"),
+            })?;
+
+        let mut rows = match conn
+            .query(
+                "SELECT next_row_id FROM pepper_table WHERE table_id = ?1",
+                vec![TursoValue::Integer(table_id)],
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                conn.execute("ROLLBACK", ()).await.ok();
+                return Err(CatalogError::Database {
+                    message: format!("Failed to query next_row_id: {e}"),
+                });
+            }
+        };
+
+        let row = match rows.next().await {
+            Ok(Some(row)) => row,
+            _ => {
+                conn.execute("ROLLBACK", ()).await.ok();
+                return Err(CatalogError::Database {
+                    message: format!("Table id {table_id} not found"),
+                });
+            }
+        };
+
+        let current = row
+            .get_value(0)
+            .map(|value| convert_turso_value(&value))
+            .and_then(|value| match value {
+                MetastoreValue::Integer(i) => Ok(i),
+                _ => Err(CatalogError::Database {
+                    message: "Expected integer next_row_id".to_string(),
+                }),
+            })
+            .map_err(|e| {
+                conn.execute("ROLLBACK", ()).await.ok();
+                e
+            })?;
+
+        let new_value =
+            current
+                .checked_add(count_i64)
+                .ok_or_else(|| CatalogError::InvalidOperation {
+                    message: "Row ID overflow".to_string(),
+                })?;
+
+        if let Err(e) = conn
+            .execute(
+                "UPDATE pepper_table SET next_row_id = ?1 WHERE table_id = ?2",
+                vec![
+                    TursoValue::Integer(new_value),
+                    TursoValue::Integer(table_id),
+                ],
+            )
+            .await
+        {
+            conn.execute("ROLLBACK", ()).await.ok();
+            return Err(CatalogError::Database {
+                message: format!("Failed to update next_row_id: {e}"),
+            });
+        }
+
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to commit transaction: {e}"),
+            })?;
+
+        Ok(current)
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {

@@ -39,6 +39,8 @@ pub struct TableMetadata {
     /// Current snapshot ID (`UUIDv7`, changes on overwrite/delete operations)
     /// All tables are created with an initial snapshot.
     pub current_snapshot_id: String,
+    /// Next row identifier to assign when appending data
+    pub next_row_id: i64,
     /// Partition column name (if this is a partitioned table)
     pub partition_column: Option<String>,
 }

@@ -101,6 +101,47 @@ impl SqliteMetastore {
         })?
     }
 
+    /// Allocate a contiguous range of row IDs for a table and return the starting row ID.
+    ///
+    /// # Errors
+    /// Returns an error if the metastore update fails or if the row ID counter overflows.
+    pub async fn allocate_row_ids(&self, table_id: i64, count: usize) -> CatalogResult<i64> {
+        let db_path_owned = self.db_path().to_string();
+        let count_i64 = i64::try_from(count).map_err(|_| CatalogError::InvalidOperation {
+            message: "Row count exceeds i64 range".to_string(),
+        })?;
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = Self::open_connection(&db_path_owned, false)?;
+            let transaction = conn.transaction()?;
+
+            let current: i64 = transaction.query_row(
+                "SELECT next_row_id FROM pepper_table WHERE table_id = ?1",
+                [table_id],
+                |row| row.get(0),
+            )?;
+
+            let new_value =
+                current
+                    .checked_add(count_i64)
+                    .ok_or_else(|| CatalogError::InvalidOperation {
+                        message: "Row ID overflow".to_string(),
+                    })?;
+
+            transaction.execute(
+                "UPDATE pepper_table SET next_row_id = ?1 WHERE table_id = ?2",
+                (new_value, table_id),
+            )?;
+
+            transaction.commit()?;
+
+            Ok::<i64, CatalogError>(current)
+        })
+        .await;
+
+        Self::handle_blocking_result(result, "Allocate row IDs")
+    }
+
     /// Schema for the `pepper_metadata` table that tracks next IDs.
     const METADATA_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS pepper_metadata (
@@ -120,7 +161,8 @@ impl SqliteMetastore {
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
-            partition_column TEXT
+            partition_column TEXT,
+            next_row_id BIGINT NOT NULL DEFAULT 0
         )
     ";
 

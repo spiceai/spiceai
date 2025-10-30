@@ -332,8 +332,8 @@ impl MetadataCatalog for PepperCatalog {
                     INSERT INTO pepper_table (
                         table_id, table_uuid,
                         table_name, path, path_is_relative, schema_json, primary_key_json,
-                        current_snapshot_id, partition_column
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                        current_snapshot_id, partition_column, next_row_id
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ",
                 params: vec![
                     MetastoreValue::Integer(table_id),
@@ -345,6 +345,7 @@ impl MetadataCatalog for PepperCatalog {
                     primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(initial_snapshot_id.clone()),
                     partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                    MetastoreValue::Integer(0),
                 ],
             })
             .await?;
@@ -397,7 +398,7 @@ impl MetadataCatalog for PepperCatalog {
                 sql: r"
                     SELECT table_id, table_uuid,
                            table_name, path, path_is_relative, schema_json, primary_key_json,
-                           current_snapshot_id, partition_column
+                           current_snapshot_id, partition_column, next_row_id
                     FROM pepper_table
                     WHERE table_name = ?1
                     LIMIT 1
@@ -443,6 +444,8 @@ impl MetadataCatalog for PepperCatalog {
                     vec![]
                 };
 
+                let next_row_id = row.get_i64(9)?;
+
                 Ok(TableMetadata {
                     table_id,
                     table_uuid,
@@ -452,6 +455,7 @@ impl MetadataCatalog for PepperCatalog {
                     schema,
                     primary_key,
                     current_snapshot_id,
+                    next_row_id,
                     partition_column,
                 })
             },
@@ -903,6 +907,14 @@ impl MetadataCatalog for PepperCatalog {
         }
 
         Ok(())
+    }
+
+    async fn allocate_row_ids(&self, table_id: i64, count: usize) -> CatalogResult<i64> {
+        match &self.metastore {
+            MetastoreImpl::Sqlite(metastore) => metastore.allocate_row_ids(table_id, count).await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(metastore) => metastore.allocate_row_ids(table_id, count).await,
+        }
     }
 }
 

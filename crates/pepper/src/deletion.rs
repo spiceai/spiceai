@@ -286,6 +286,7 @@ mod tests {
             schema: Arc::new(arrow::datatypes::Schema::empty()),
             primary_key: vec!["id".to_string()],
             current_snapshot_id: Uuid::now_v7().to_string(),
+            next_row_id: 0,
             partition_column: None,
         }
     }
