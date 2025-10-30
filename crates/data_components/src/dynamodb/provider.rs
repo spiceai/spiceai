@@ -220,6 +220,14 @@ impl TableProvider for DynamoDBTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut projected_schema = project_schema(self.table_schema.schema(), projection)?;
 
+        tracing::debug!(
+            "[DynamoDB] table {:?}, projection: {:?}, filters: {:?}, limit: {:?}",
+            self.table_schema.table_name(),
+            projection,
+            filters,
+            limit
+        );
+
         // If no columns are specified, use partition_key - otherwise DynamoDB returns an error
         if projected_schema.fields.is_empty() {
             let idx = self
@@ -232,6 +240,12 @@ impl TableProvider for DynamoDBTableProvider {
         let request_plan =
             self.request_plan_builder
                 .build_request_plan(filters, &projected_schema, limit)?;
+
+        tracing::debug!(
+            "[DynamoDB] table {:?}, request_plan: {:?}",
+            self.table_schema.table_name(),
+            request_plan
+        );
 
         let total_partitions = self
             .config_partitions
@@ -294,13 +308,17 @@ impl DynamoDBTableProviderExec {
 
 impl std::fmt::Debug for DynamoDBTableProviderExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DynamoDBTableProviderExec")
+        f.debug_struct("DynamoDBTableProviderExec")
+            .field("request_plan", &self.request_plan)
+            .finish_non_exhaustive()
     }
 }
 
 impl DisplayAs for DynamoDBTableProviderExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DynamoDBTableProviderExec")
+        f.debug_struct("DynamoDBTableProviderExec")
+            .field("request_plan", &self.request_plan)
+            .finish_non_exhaustive()
     }
 }
 

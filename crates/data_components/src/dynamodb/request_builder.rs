@@ -174,6 +174,8 @@ impl DynamoDBRequestPlanBuilder {
             let (filter_str, attribute_values) = self.build_filter_expression(filters);
             if !filter_str.is_empty() {
                 scan_params = scan_params.filter_expression(filter_str);
+            }
+            if !attribute_values.is_empty() {
                 scan_params = scan_params.expression_attribute_values(attribute_values);
             }
         }
