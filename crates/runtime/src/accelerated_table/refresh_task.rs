@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::{
     array::{RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
-    datatypes::DataType,
+    datatypes::{DataType, TimeUnit},
 };
 use arrow_schema::SchemaRef;
 use async_stream::stream;
@@ -1240,11 +1240,20 @@ pub fn max_timestamp_df(
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
-    let expr = cast(
-        col(format!(r#""{column}""#)),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-    )
-    .alias("a");
+    let column_expr = col(format!(r#""{column}""#));
+    let schema = accelerator.schema();
+
+    let target_type = schema.field_with_name(column).map_or(
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        |field| match field.data_type() {
+            DataType::Timestamp(_, tz_opt) => {
+                DataType::Timestamp(TimeUnit::Nanosecond, tz_opt.clone())
+            }
+            _ => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        },
+    );
+
+    let expr = cast(column_expr, target_type).alias("a");
 
     accelerator_df(accelerator, &ctx)?
         .select(vec![expr])?
