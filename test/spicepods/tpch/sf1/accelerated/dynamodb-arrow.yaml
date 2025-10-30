@@ -5,7 +5,7 @@ name: dynamodb-arrow
 definitions:
   - &acceleration
     enabled: true
-    mode: file
+    engine: arrow
 
 datasets:
   - from: dynamodb:tpch_customer
