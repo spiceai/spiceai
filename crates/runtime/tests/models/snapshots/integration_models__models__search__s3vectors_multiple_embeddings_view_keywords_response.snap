@@ -1,0 +1,52 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs_view",
+      "matches": {
+        "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers.",
+        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+      },
+      "primary_key": {
+        "id": 470
+      },
+      "score": 0.03
+    },
+    {
+      "dataset": "qs_view",
+      "matches": {
+        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
+      },
+      "primary_key": {
+        "id": 1277
+      },
+      "score": 0.03
+    },
+    {
+      "dataset": "qs_view",
+      "matches": {
+        "question": "Identify the given number as prime, composite, or neither: 36."
+      },
+      "primary_key": {
+        "id": 484
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs_view",
+      "matches": {
+        "answer": "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
+      },
+      "primary_key": {
+        "id": 42
+      },
+      "score": 0.01
+    }
+  ]
+}

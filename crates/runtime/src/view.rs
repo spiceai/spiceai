@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    component::view::View, embeddings::table::EmbeddingTable,
+    component::view::View,
+    embeddings::{index::table::wrap_table_as_index, table::EmbeddingTable},
     search::full_text::table::add_full_text_search_to_table,
 };
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
@@ -109,29 +110,47 @@ pub(crate) async fn prepare_view(
     let view_table = ViewTable::new(plan, Some(view.sql.to_string()));
     let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
 
+    // Add any embedding columns (and vector engine, if applicable)
     if view.has_embeddings() {
-        tbl_provider = EmbeddingTable::from_spicepod_columns(
-            tbl_provider,
-            view.columns
-                .iter()
-                .flat_map(|col| {
-                    col.embeddings.iter().map(|emb| ColumnEmbeddingConfig {
-                        column: col.name.clone(),
-                        model: emb.model.clone(),
-                        primary_keys: emb.row_ids.clone(),
-                        chunking: emb.chunking.clone(),
-                        vector_size: emb.vector_size,
+        if let Some(ref vectors) = view.vectors
+            && vectors.enabled
+        {
+            tbl_provider = wrap_table_as_index(
+                &Arc::new(ctx.clone()),
+                &view.runtime.embeds(),
+                &view.runtime.secrets(),
+                &view.name,
+                &view.columns,
+                None,
+                tbl_provider,
+                vectors,
+            )
+            .await?;
+        } else {
+            tbl_provider = EmbeddingTable::from_spicepod_columns(
+                tbl_provider,
+                view.columns
+                    .iter()
+                    .flat_map(|col| {
+                        col.embeddings.iter().map(|emb| ColumnEmbeddingConfig {
+                            column: col.name.clone(),
+                            model: emb.model.clone(),
+                            primary_keys: emb.row_ids.clone(),
+                            chunking: emb.chunking.clone(),
+                            vector_size: emb.vector_size,
+                        })
                     })
-                })
-                .collect(),
-            &view.runtime.embeds(),
-            None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
-        )
-        .await
-        .boxed()
-        .map_err(DataFusionError::External)?;
+                    .collect(),
+                &view.runtime.embeds(),
+                None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
+            )
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?;
+        }
     }
 
+    // Configure full-text search
     if view.has_full_text_column() {
         tbl_provider = Arc::new(add_full_text_search_to_table(
             tbl_provider,
@@ -139,6 +158,7 @@ pub(crate) async fn prepare_view(
             &view.name,
         )?) as Arc<dyn TableProvider>;
     }
+
     Ok(tbl_provider)
 }
 

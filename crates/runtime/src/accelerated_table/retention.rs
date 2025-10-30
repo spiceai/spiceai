@@ -304,6 +304,7 @@ mod tests {
                 accelerator.schema(),
             )
             .expect("Failed to parse retention SQL")
+            .delete_expr
         });
 
         let retention = Retention::builder()
