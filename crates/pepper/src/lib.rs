@@ -55,6 +55,7 @@ limitations under the License.
 
 pub mod catalog;
 pub mod metadata;
+pub mod metastore;
 pub mod pepper_catalog;
 pub mod provider;
 

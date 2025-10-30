@@ -11,6 +11,9 @@ snapshot_kind: text
       "matches": {
         "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
       },
+      "primary_key": {
+        "id": 890
+      },
       "score": 7.52
     }
   ]

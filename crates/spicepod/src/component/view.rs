@@ -91,6 +91,20 @@ impl View {
         }
         metadata
     }
+
+    /// Find any primary keys explicitly defined in the [`View`]. Order of precedence:
+    ///  1. Primary key defined in `.columns[].embeddings[].row_id`
+    ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
+    #[must_use]
+    pub fn primary_key_override(&self) -> Option<Vec<String>> {
+        self.columns
+            .iter()
+            .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()))
+            .or(self
+                .columns
+                .iter()
+                .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone())))
+    }
 }
 
 impl WithDependsOn<View> for View {

@@ -70,3 +70,8 @@ data/
 !crates/runtime/tests/acceleration/spicepods
 merge_conflict_report.md
 pr_body.md
+
+# Database files
+*.db
+*.db-wal
+*.db-shm
