@@ -1,0 +1,26 @@
+---
+source: crates/runtime/tests/models/search.rs
+description: "SELECT id, answer FROM vector_search(qs_view, 'second', answer) order by score desc, id LIMIT 4"
+snapshot_kind: text
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                           |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: vector_search(qs_view, Utf8("second"), answer).id, vector_search(qs_view, Utf8("second"), answer).answer                                                           |
+|               |   Sort: vector_search(qs_view, Utf8("second"), answer).score DESC NULLS FIRST, vector_search(qs_view, Utf8("second"), answer).id ASC NULLS LAST, fetch=4                       |
+|               |     Projection: vector_search(qs_view, Utf8("second"), answer).id, vector_search(qs_view, Utf8("second"), answer).answer, vector_search(qs_view, Utf8("second"), answer).score |
+|               |       BytesProcessedNode                                                                                                                                                       |
+|               |         TableScan: vector_search(qs_view, Utf8("second"), answer) projection=[answer, id, score]                                                                               |
+| physical_plan | ProjectionExec: expr=[id@0 as id, answer@1 as answer]                                                                                                                          |
+|               |   SortPreservingMergeExec: [score@2 DESC, id@0 ASC NULLS LAST], fetch=4                                                                                                        |
+|               |     SortExec: TopK(fetch=4), expr=[score@2 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                            |
+|               |       ProjectionExec: expr=[id@1 as id, answer@0 as answer, score@2 as score]                                                                                                  |
+|               |         BytesProcessedExec                                                                                                                                                     |
+|               |           ProjectionExec: expr=[answer@0 as answer, CAST(key@1 AS Int64) as id, 1 - distance@2 as score]                                                                       |
+|               |             BytesProcessedExec                                                                                                                                                 |
+|               |               CooperativeExec                                                                                                                                                  |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                           |
+|               |                   CooperativeExec                                                                                                                                              |
+|               |                     S3VectorsQueryExec: limit=30                                                                                                                               |
+|               |                                                                                                                                                                                |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -210,6 +210,7 @@ impl DuckDBRegexpFunction {
                                     ))),
                                     substring_for: None,
                                     special: true,
+                                    shorthand: false,
                                 }));
                         }
                         _ => {
@@ -342,7 +343,7 @@ impl DuckDBRegexpFunction {
 mod tests {
     use datafusion::{
         common::{Column, Spans},
-        functions_array::make_array::make_array_udf,
+        functions_nested::make_array::make_array_udf,
         logical_expr::expr::ScalarFunction,
         prelude::lit,
         scalar::ScalarValue,

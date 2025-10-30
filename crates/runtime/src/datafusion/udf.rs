@@ -24,7 +24,8 @@ use crate::search::util::parse_explicit_primary_keys;
 use datafusion::functions::math::random::RandomFunc;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::ai;
-use runtime_datafusion_udfs::{alias, bucket, cosine_distance, digest_many, embed, truncate};
+use runtime_datafusion_udfs::embed;
+use runtime_datafusion_udfs::{alias, bucket, cosine_distance, digest_many, truncate};
 
 pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;

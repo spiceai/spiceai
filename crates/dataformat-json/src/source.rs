@@ -258,18 +258,20 @@ impl FileOpener for SpiceJsonOpener {
                         let separator = separator.clone();
                         Ok(stream
                             .map(move |batch| {
-                                batch.map(|batch| {
-                                    extract_flattened_from_nested(
-                                        &batch,
-                                        &projected_flattened_schema,
-                                        &separator,
-                                    )
-                                    .unwrap_or(batch)
-                                })
+                                batch
+                                    .map(|batch| {
+                                        extract_flattened_from_nested(
+                                            &batch,
+                                            &projected_flattened_schema,
+                                            &separator,
+                                        )
+                                        .unwrap_or(batch)
+                                    })
+                                    .map_err(DataFusionError::from)
                             })
                             .boxed())
                     } else {
-                        Ok(stream)
+                        Ok(stream.map(|b| b.map_err(DataFusionError::from)).boxed())
                     }
                 }
                 GetResultPayload::Stream(s) => {
@@ -288,7 +290,9 @@ impl FileOpener for SpiceJsonOpener {
                             unnest_struct_separator,
                             projected_flattened_schema,
                         )),
-                    ))
+                    )
+                    .map(|b| b.map_err(DataFusionError::from))
+                    .boxed())
                 }
             }
         }))

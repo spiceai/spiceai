@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::array::Array;
 use arrow_schema::{DataType, Field, FieldRef};
+use datafusion::config::ConfigOptions;
 use datafusion::functions::crypto;
 use datafusion::logical_expr::{
     DocSection, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, lit,
@@ -56,7 +57,7 @@ pub static SIGNATURE: LazyLock<Signature> =
 
 pub static INSTANCE: LazyLock<ScalarUDF> = LazyLock::new(|| DigestMany::default().into());
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Hash, PartialEq, Eq)]
 pub struct DigestMany {}
 
 impl DigestMany {
@@ -80,6 +81,7 @@ impl DigestMany {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         }
     }
 }

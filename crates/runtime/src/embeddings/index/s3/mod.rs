@@ -81,9 +81,9 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
 ];
 
-/// Attempt to construct an [`S3Vector`] for the provided dataset on the given column.
+/// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
 #[allow(clippy::too_many_arguments)]
-pub async fn try_from_dataset(
+pub async fn try_from_table(
     ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,

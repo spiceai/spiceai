@@ -68,3 +68,8 @@ data/
 !test/nsql_bench/data
 !crates/runtime/tests/acceleration/data
 !crates/runtime/tests/acceleration/spicepods
+
+# Database files
+*.db
+*.db-wal
+*.db-shm

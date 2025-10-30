@@ -516,7 +516,7 @@ mod tests {
 
         // Optimizer is a bag of rules
         let optimizer = PhysicalOptimizer::new();
-        let config = ctx.state().config_options().clone();
+        let config = Arc::clone(ctx.state().config_options());
 
         // Fold over the default rules to apply the same optimizations DF would at runtime
         let optimized = optimizer

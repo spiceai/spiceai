@@ -318,15 +318,23 @@ impl PepperAccelerator {
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
+        metastore_type: &str,
     ) -> Result<Arc<dyn pepper::MetadataCatalog>> {
-        let connection_string = format!("sqlite://{metadata_dir}/pepper.db");
+        let connection_string = match metastore_type {
+            "turso" => format!("libsql://{metadata_dir}/pepper.db"),
+            _ => format!("sqlite://{metadata_dir}/pepper.db"), // Default to SQLite
+        };
 
         self.catalog
             .get_or_try_init(move || {
                 let connection_string = connection_string.clone();
                 async move {
-                    let catalog = Arc::new(pepper::PepperCatalog::new(connection_string))
-                        as Arc<dyn pepper::MetadataCatalog>;
+                    let catalog =
+                        Arc::new(pepper::PepperCatalog::new(connection_string).map_err(|e| {
+                            Error::AccelerationInitializationFailed {
+                                source: Box::new(e),
+                            }
+                        })?) as Arc<dyn pepper::MetadataCatalog>;
 
                     catalog
                         .init()
@@ -351,15 +359,26 @@ impl PepperAccelerator {
     ) -> Result<Arc<dyn TableProvider>> {
         use pepper::{PepperTableProvider, metadata::CreateTableOptions};
 
-        // Use custom metadata directory if provided (for testing), otherwise use shared directory
-        let metadata_dir = if let Some(acceleration) = source.acceleration() {
-            if let Some(custom_dir) = acceleration.params.get("pepper_metadata_dir") {
-                custom_dir.clone()
-            } else {
-                format!("{}/metadata", crate::spice_data_base_path())
-            }
+        // Get metastore type and custom metadata directory if provided
+        let (metadata_dir, metastore_type) = if let Some(acceleration) = source.acceleration() {
+            let metadata_dir =
+                if let Some(custom_dir) = acceleration.params.get("pepper_metadata_dir") {
+                    custom_dir.clone()
+                } else {
+                    format!("{}/metadata", crate::spice_data_base_path())
+                };
+
+            let metastore_type = acceleration
+                .params
+                .get("pepper_metastore")
+                .map_or("sqlite", String::as_str);
+
+            (metadata_dir, metastore_type.to_string())
         } else {
-            format!("{}/metadata", crate::spice_data_base_path())
+            (
+                format!("{}/metadata", crate::spice_data_base_path()),
+                "sqlite".to_string(),
+            )
         };
 
         // Ensure metadata directory exists
@@ -368,7 +387,9 @@ impl PepperAccelerator {
         })?;
 
         // Get or create the shared catalog (lazy initialization)
-        let catalog = self.get_or_create_catalog(&metadata_dir).await?;
+        let catalog = self
+            .get_or_create_catalog(&metadata_dir, &metastore_type)
+            .await?;
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -391,6 +412,9 @@ impl PepperAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path"),
+    ParameterSpec::component("metastore")
+        .description("Metastore backend for Pepper catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
+        .default("sqlite"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("unsupported_type_action")
         .description("How to handle data types not natively supported by Pepper (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
@@ -619,9 +643,13 @@ impl DataAccelerator for PepperAccelerator {
             })?;
 
             // Create a new catalog - it will use WAL mode and busy timeout internally
-            let catalog = Arc::new(pepper::PepperCatalog::new(format!(
-                "sqlite://{metadata_dir}/pepper.db"
-            ))) as Arc<dyn pepper::MetadataCatalog>;
+            let catalog = Arc::new(
+                pepper::PepperCatalog::new(format!("sqlite://{metadata_dir}/pepper.db")).map_err(
+                    |e| Error::AccelerationInitializationFailed {
+                        source: Box::new(e),
+                    },
+                )?,
+            ) as Arc<dyn pepper::MetadataCatalog>;
 
             // Initialize the catalog (creates tables if needed)
             catalog

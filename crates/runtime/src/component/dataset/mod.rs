@@ -30,16 +30,10 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::{Column, FullTextSearchConfig, IndexStore},
+    semantic::{Column, IndexStore},
     vector::VectorStore,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
 pub mod acceleration;
 pub mod builder;
@@ -614,99 +608,6 @@ impl Dataset {
         self.columns
             .iter()
             .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
-    }
-
-    #[allow(clippy::type_complexity)] // From a two-part `.unzip()`.
-    #[must_use]
-    pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
-        let (search_fields_and_primary_key_overrides, indexes): (
-            Vec<(String, Option<Vec<String>>)>,
-            Vec<(IndexStore, Option<String>)>,
-        ) = self
-            .columns
-            .iter()
-            .filter_map(|c| {
-                let Some(FullTextSearchConfig {
-                    enabled: true,
-                    row_ids,
-                    index_store,
-                    index_directory,
-                }) = &c.full_text_search
-                else {
-                    return None;
-                };
-
-                if index_store.is_some_and(|is| is == IndexStore::Memory) && index_directory.is_some() {
-                    tracing::warn!("Dataset '{}' column '{}' has `index_store: memory` but also sets `index_directory`. These options are mutually exclusive. Defaulting to `index_store: memory`.", self.name, c.name);
-                }
-                Some(((c.name.clone(), row_ids.clone()), (index_store.unwrap_or_default(), index_directory.clone())))
-            })
-            .unzip();
-        let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
-            search_fields_and_primary_key_overrides.into_iter().unzip();
-
-        // No columns have full text search fields defined.
-        if search_fields.is_empty() {
-            return None;
-        }
-
-        // For all full text search columns, find the first with a non-null primary key override and
-        // if there are multiple, warn if they are different.
-        let mut first_pks: Option<Vec<String>> = None;
-        let mut first_search_field: Option<String> = None;
-        for (search_field, pk_overrides) in search_fields.iter().zip(primary_key_overrides.iter()) {
-            let Some(mut pks) = pk_overrides.clone() else {
-                continue;
-            };
-            pks.sort();
-
-            // If this is not the first FTS column that defined row ids, check if they match the previous.
-            // Otherwise set to be used for next comparison.
-            if let (Some(f), Some(s)) = (&first_pks, &first_search_field) {
-                if *pks != *f {
-                    tracing::warn!(
-                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
-                        self.name(),
-                        s,
-                        f.join(", "),
-                        search_field,
-                        pks.join(", "),
-                    );
-                }
-            } else {
-                first_pks = Some(pks.clone());
-                first_search_field = Some(search_field.clone());
-            }
-        }
-
-        let index_paths: HashSet<String> = indexes
-            .iter()
-            .filter_map(|(_, directory)| directory.clone())
-            .collect();
-        let index_path_len = index_paths.len();
-        let index_path: Option<String> = index_paths.into_iter().next();
-
-        if let Some(ref path) = index_path
-            && index_path_len > 1
-        {
-            tracing::warn!(
-                "Dataset '{}' has several full text search index directories provided. Using '{path}'.",
-                self.name
-            );
-        }
-
-        let index_store = if indexes.iter().any(|(store, _)| *store == IndexStore::File) {
-            IndexStore::File
-        } else {
-            IndexStore::Memory
-        };
-
-        Some(FullTextSearchDatasetConfig {
-            index_store,
-            index_path,
-            search_fields,
-            primary_key: first_pks.unwrap_or_default(),
-        })
     }
 
     /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:

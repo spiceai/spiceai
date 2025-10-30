@@ -110,12 +110,30 @@ impl TextSearchTableFuncArgs {
 pub struct TextSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
+    df_ptr: u64,
+}
+
+impl PartialEq for TextSearchTableFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.df_ptr == other.df_ptr
+    }
+}
+
+impl Eq for TextSearchTableFunc {}
+
+impl std::hash::Hash for TextSearchTableFunc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.df_ptr.hash(state);
+    }
 }
 
 impl TextSearchTableFunc {
     #[must_use]
     pub fn new(df: Weak<DataFusion>) -> Self {
-        Self { df }
+        let ptr = df.as_ptr().addr() as u64;
+
+        Self { df, df_ptr: ptr }
     }
 
     fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {

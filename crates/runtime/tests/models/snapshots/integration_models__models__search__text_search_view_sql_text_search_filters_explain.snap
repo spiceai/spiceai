@@ -1,0 +1,32 @@
+---
+source: crates/runtime/tests/models/search.rs
+description: "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4"
+snapshot_kind: text
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                               |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: score DESC NULLS FIRST, fetch=4                                                                                                                              |
+|               |   Projection: text_search(qs, Utf8("secondary")).id, text_search(qs, Utf8("secondary")).answer, trunc(text_search(qs, Utf8("secondary")).score, Int64(3)) AS score |
+|               |     BytesProcessedNode                                                                                                                                             |
+|               |       TableScan: text_search(qs, Utf8("secondary")) projection=[answer, id, score], full_filters=[text_search(qs, Utf8("secondary")).subject != Utf8("math")]      |
+| physical_plan | SortPreservingMergeExec: [score@2 DESC], fetch=4                                                                                                                   |
+|               |   SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]                                                                                       |
+|               |     ProjectionExec: expr=[id@1 as id, answer@0 as answer, trunc(score@2, 3) as score]                                                                              |
+|               |       BytesProcessedExec                                                                                                                                           |
+|               |         ProjectionExec: expr=[answer@2 as answer, id@0 as id, score@1 as score]                                                                                    |
+|               |           FilterExec: subject@3 != math, projection=[id@0, score@1, answer@2]                                                                                      |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3, subject@4]                                     |
+|               |               CoalescePartitionsExec                                                                                                                               |
+|               |                 BytesProcessedExec                                                                                                                                 |
+|               |                   CooperativeExec                                                                                                                                  |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                           |
+|               |                       CooperativeExec                                                                                                                              |
+|               |                         FullTextSearchTableExec q=secondary                                                                                                        |
+|               |               BytesProcessedExec                                                                                                                                   |
+|               |                 FilterExec: subject@2 != math                                                                                                                      |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                             |
+|               |                     SchemaCastScanExec                                                                                                                             |
+|               |                       DataSourceExec: partitions=1, partition_sizes=[2]                                                                                            |
+|               |                                                                                                                                                                    |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
