@@ -17,12 +17,12 @@
 -
 -## Workstreams
 -
-### 1. Deletion Vector Pipeline Enhancements
--[ ] Audit current deletion-vector code paths (`delete_vectors.rs`, provider insert/upsert stubs) and identify missing functionality needed for upsert.
--[ ] Implement writing of deletion vectors for a supplied `(data_file_id, row_id)` list using Parquet output.
--[ ] Extend catalog APIs to register new delete files atomically with data file updates.
--[ ] Update query execution (`DeletionFilterExec`) to handle new deletion files seamlessly.
--[ ] Add targeted unit/integration tests verifying deletes propagate correctly.
+-### 1. Deletion Vector Pipeline Enhancements
+-[x] Audit current deletion-vector code paths (`provider.rs`) and identify missing functionality needed for upsert.
+-[x] Implement writing of deletion vectors for a supplied `(data_file_id, row_id)` list using Arrow IPC output.
+-[x] Extend catalog APIs to register new delete files atomically with data file updates.
+-[x] Update query execution (`DeletionFilterExec`) to handle new deletion files seamlessly.
+-[x] Add targeted unit/integration tests verifying deletes propagate correctly.
 -
 ### 2. Key Index Design & Metastore Schema
 -[ ] Design a normalized schema for a key index table shared by all backends (e.g., `pepper_key_index` with `{table_id, key_hash, key_bytes, data_file_id, row_id, begin_snapshot, end_snapshot}`).
@@ -62,6 +62,9 @@
 -[ ] Determine optimal batch size for metastore lookups and writes based on benchmark outcomes.
 -[ ] Decide whether to stage Vortex file writes in temporary directories pending transaction commit (affects crash recovery).
 -[ ] Evaluate concurrency controls (e.g., SQLite locking strategies) to handle simultaneous writers gracefully.
+
+-## Progress Log
+- 2025-02-10: Completed shared deletion-vector writer and refactored Pepper deletion sink to use it; updated planning checklist accordingly.
 -
 -## Execution Checklist (High-Level)
 -[ ] Finish deletion-vector pipeline and land as standalone commit.
