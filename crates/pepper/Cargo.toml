@@ -32,9 +32,20 @@ serde_json = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
+turso = { workspace = true, optional = true }
 uuid = { version = "1.11", features = ["v7"] }
 vortex-datafusion = { workspace = true }
 
+[features]
+default = []
+turso = ["dep:turso"]
+
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+paste = "1.0"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
+
+[[bench]]
+name = "metastore_operations"
+harness = false

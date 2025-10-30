@@ -14,37 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+#![allow(clippy::clone_on_ref_ptr)]
+
 //! Test DELETE operations for Pepper
 //!
 //! These tests work at the API level by calling `delete_from()` directly,
 //! rather than using SQL DELETE statements (which require runtime-level integration).
+
+mod common;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use data_components::delete::DeletionTableProvider;
 use datafusion::prelude::*;
 use datafusion_physical_plan::collect;
 use pepper::metadata::CreateTableOptions;
-use pepper::{MetadataCatalog, PepperCatalog, PepperTableProvider};
+use pepper::{MetadataCatalog, PepperTableProvider};
 use std::sync::Arc;
-use tempfile::TempDir;
 
-#[tokio::test]
+// Generate test variants for each backend
+test_with_backends!(test_delete_with_primary_key_impl);
+test_with_backends!(test_delete_without_primary_key_impl);
+test_with_backends!(test_delete_all_rows_impl);
+test_with_backends!(test_delete_then_insert_impl);
+test_with_backends!(test_delete_with_complex_filter_impl);
+
 #[allow(clippy::too_many_lines)]
-async fn test_delete_with_primary_key() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🧪 Testing DELETE with primary key...");
+async fn test_delete_with_primary_key_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_name = fixture.backend_type.name();
+    println!("\n🧪 Testing DELETE with primary key using {backend_name}...");
 
     // 1. Setup test environment
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("delete_pk_test.db");
-    let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path)?;
-
-    // 2. Create catalog and table with primary key
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
+    let data_path = fixture.data_path;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -60,7 +63,8 @@ async fn test_delete_with_primary_key() -> Result<(), Box<dyn std::error::Error>
         partition_column: None,
     };
 
-    let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let table = PepperTableProvider::create_table(catalog_arc, table_options).await?;
     let table = Arc::new(table);
     println!("✓ Table created with primary key on 'id'");
 
@@ -170,22 +174,19 @@ async fn test_delete_with_primary_key() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-#[tokio::test]
-async fn test_delete_without_primary_key() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🧪 Testing DELETE without primary key...");
+#[allow(clippy::too_many_lines)]
+async fn test_delete_without_primary_key_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_name = fixture.backend_type.name();
+    println!("\n🧪 Testing DELETE without primary key using {backend_name}...");
 
     // 1. Setup test environment
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("delete_no_pk_test.db");
+    let temp_dir = &fixture.temp_dir;
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path)?;
 
     // 2. Create catalog and table WITHOUT primary key
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -201,7 +202,8 @@ async fn test_delete_without_primary_key() -> Result<(), Box<dyn std::error::Err
         partition_column: None,
     };
 
-    let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let table = PepperTableProvider::create_table(catalog_arc, table_options).await?;
     let table = Arc::new(table);
     println!("✓ Table created WITHOUT primary key");
 
@@ -273,22 +275,19 @@ async fn test_delete_without_primary_key() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[tokio::test]
-async fn test_delete_all_rows() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🧪 Testing DELETE all rows...");
+#[allow(clippy::too_many_lines)]
+async fn test_delete_all_rows_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_name = fixture.backend_type.name();
+    println!("\n🧪 Testing DELETE all rows using {backend_name}...");
 
     // 1. Setup test environment
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("delete_all_test.db");
+    let temp_dir = &fixture.temp_dir;
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path)?;
 
     // 2. Create catalog and table
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -296,14 +295,15 @@ async fn test_delete_all_rows() -> Result<(), Box<dyn std::error::Error>> {
     ]));
 
     let table_options = CreateTableOptions {
-        table_name: "test_delete_all".to_string(),
+        table_name: "test_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
     };
 
-    let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let table = PepperTableProvider::create_table(catalog_arc, table_options).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
@@ -347,27 +347,23 @@ async fn test_delete_all_rows() -> Result<(), Box<dyn std::error::Error>> {
     );
     // TODO: Once read-time filtering is implemented, uncomment:
     // assert_eq!(count, 0, "Expected 0 rows after DELETE all");
-
     println!("\n✅ DELETE all rows test completed successfully");
     Ok(())
 }
 
-#[tokio::test]
-async fn test_delete_then_insert() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🧪 Testing DELETE followed by INSERT...");
+#[allow(clippy::too_many_lines)]
+async fn test_delete_then_insert_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_name = fixture.backend_type.name();
+    println!("\n🧪 Testing DELETE followed by INSERT using {backend_name}...");
 
     // 1. Setup test environment
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("delete_insert_test.db");
+    let temp_dir = &fixture.temp_dir;
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path)?;
 
     // 2. Create catalog and table
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -382,7 +378,8 @@ async fn test_delete_then_insert() -> Result<(), Box<dyn std::error::Error>> {
         partition_column: None,
     };
 
-    let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let table = PepperTableProvider::create_table(catalog_arc, table_options).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
@@ -457,22 +454,19 @@ async fn test_delete_then_insert() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_delete_with_complex_filter() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🧪 Testing DELETE with complex filter...");
+#[allow(clippy::too_many_lines)]
+async fn test_delete_with_complex_filter_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_name = fixture.backend_type.name();
+    println!("\n🧪 Testing DELETE with complex filter using {backend_name}...");
 
     // 1. Setup test environment
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("delete_complex_test.db");
+    let temp_dir = &fixture.temp_dir;
     let data_path = temp_dir.path().join("data");
     std::fs::create_dir_all(&data_path)?;
 
     // 2. Create catalog and table
-    let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
-        "sqlite://{}",
-        db_path.to_string_lossy()
-    )));
-    catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -489,7 +483,8 @@ async fn test_delete_with_complex_filter() -> Result<(), Box<dyn std::error::Err
         partition_column: None,
     };
 
-    let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let table = PepperTableProvider::create_table(catalog_arc, table_options).await?;
     let table = Arc::new(table);
 
     // 3. Register with DataFusion
