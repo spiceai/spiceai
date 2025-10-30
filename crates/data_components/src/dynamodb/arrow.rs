@@ -21,11 +21,14 @@ use arrow::array::{
     NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use arrow_array::builder::ArrayBuilder;
+use arrow_array::builder::{ArrayBuilder, Decimal128Builder};
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::{DateTime, NaiveDate, Utc};
+use num_traits::ToPrimitive;
+use rust_decimal::Decimal;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 pub fn dynamodb_items_to_arrow(
     items: &[HashMap<String, AttributeValue>],
@@ -105,6 +108,24 @@ fn append_value_to_builder(
                     } else {
                         b.append_null();
                     }
+                }
+                _ => b.append_null(),
+            }
+        }
+        DataType::Decimal128(_, scale) => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<Decimal128Builder>()
+                .ok_or_else(|| Error::ConversionError {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Failed to downcast to Decimal128Builder",
+                    )),
+                })?;
+
+            match value {
+                Some(AttributeValue::N(n)) => {
+                    b.append_value(string_to_decimal(scale, n)?);
                 }
                 _ => b.append_null(),
             }
@@ -335,6 +356,38 @@ fn append_value_to_builder(
                     _ => b.append_null(),
                 }
             }
+            DataType::Decimal128(_, scale) => {
+                let b = builder
+                    .as_any_mut()
+                    .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
+                    .ok_or_else(|| Error::ConversionError {
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Failed to downcast to ListBuilder",
+                        )),
+                    })?;
+
+                let values_builder = b
+                    .values()
+                    .as_any_mut()
+                    .downcast_mut::<Decimal128Builder>()
+                    .ok_or_else(|| Error::ConversionError {
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Failed to downcast values builder to Decimal128Builder",
+                        )),
+                    })?;
+
+                match value {
+                    Some(AttributeValue::Ns(number_set)) => {
+                        for n in number_set {
+                            values_builder.append_value(string_to_decimal(scale, n)?);
+                        }
+                        b.append(true);
+                    }
+                    _ => b.append_null(),
+                }
+            }
             _ => {
                 return Err(Error::UnsupportedType {
                     unsupported_type_name: data_type.to_string(),
@@ -441,6 +494,68 @@ fn append_value_to_builder(
         }
     }
     Ok(())
+}
+
+fn string_to_decimal(scale: &i8, n: &String) -> Result<i128> {
+    let parsed_decimal = Decimal::from_str(n.as_str()).map_err(|e| Error::ConversionError {
+        source: Box::new(e),
+    })?;
+
+    let scaling_factor: Decimal = if *scale >= 0 {
+        ten_pow_decimal(*scale as u32).map_err(|_| Error::ConversionError {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "overflow in scaling factor",
+            )),
+        })?
+    } else {
+        let abs_scale = (-i32::from(*scale)) as u32;
+        if abs_scale > 28 {
+            return Err(Error::ConversionError {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Negative scale too large for rust_decimal",
+                )),
+            });
+        }
+        Decimal::new(1, abs_scale)
+    };
+
+    let scaled_decimal =
+        parsed_decimal
+            .checked_mul(scaling_factor)
+            .ok_or_else(|| Error::ConversionError {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "overflow during decimal conversion",
+                )),
+            })?;
+
+    let rounded_decimal = scaled_decimal.round();
+
+    rounded_decimal
+        .to_i128()
+        .ok_or_else(|| Error::ConversionError {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "overflow during decimal conversion",
+            )),
+        })
+}
+
+fn ten_pow_decimal(exp: u32) -> Result<Decimal, Error> {
+    let mut result = Decimal::ONE;
+    for _ in 0..exp {
+        result = result
+            .checked_mul(Decimal::TEN)
+            .ok_or_else(|| Error::ConversionError {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Multiplication overflow during decimal conversion",
+                )),
+            })?;
+    }
+    Ok(result)
 }
 
 fn parse_iso8601_timestamp(s: &str) -> Option<i64> {

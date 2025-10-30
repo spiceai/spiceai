@@ -11,7 +11,7 @@ expression: formatted
 | col_date                                | Date32                                                                                                             | YES         |
 | col_list                                | List(Field { name: "item", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })    | YES         |
 | col_map_fully_unnested.age              | Int64                                                                                                              | YES         |
-| col_map_fully_unnested.balance          | Float64                                                                                                            | YES         |
+| col_map_fully_unnested.balance          | Decimal128(18, 6)                                                                                                  | YES         |
 | col_map_fully_unnested.is_active        | Boolean                                                                                                            | YES         |
 | col_map_fully_unnested.name             | Utf8                                                                                                               | YES         |
 | col_map_partially_unnested.foo          | Utf8                                                                                                               | YES         |
