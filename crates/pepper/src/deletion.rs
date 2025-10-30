@@ -127,17 +127,17 @@ impl<'a> DeletionVectorWriter<'a> {
             spec.row_ids.sort_unstable();
             spec.row_ids.dedup();
 
-            let deletion_dir = self.table_snapshot_deletion_dir()?;
+            let deletion_dir = self.table_snapshot_deletion_dir();
             tokio::fs::create_dir_all(&deletion_dir)
                 .await
                 .map_err(|source| CatalogError::IoError { source })?;
 
-            let file_path = self.deletion_file_path(&deletion_dir)?;
+            let file_path = Self::deletion_file_path(&deletion_dir);
             let schema = deletion_vector_schema();
             let batch = build_deletion_batch(&schema, &spec.row_ids)?;
 
             let file_size_bytes =
-                write_deletion_file(&file_path, schema.clone(), batch.clone()).await?;
+                write_deletion_file(&file_path, Arc::clone(&schema), batch).await?;
 
             let delete_file = build_delete_file(
                 self.table,
@@ -157,16 +157,16 @@ impl<'a> DeletionVectorWriter<'a> {
         Ok(results)
     }
 
-    fn table_snapshot_deletion_dir(&self) -> CatalogResult<PathBuf> {
+    fn table_snapshot_deletion_dir(&self) -> PathBuf {
         let base = Path::new(&self.table.path);
         let snapshot_path = base.join(&self.table.current_snapshot_id);
 
-        Ok(snapshot_path.join(DELETION_DIR_NAME))
+        snapshot_path.join(DELETION_DIR_NAME)
     }
 
-    fn deletion_file_path(&self, deletion_dir: &Path) -> CatalogResult<PathBuf> {
+    fn deletion_file_path(deletion_dir: &Path) -> PathBuf {
         let file_name = format!("delete_{}.{}", Uuid::now_v7(), DELETION_FILE_EXTENSION);
-        Ok(deletion_dir.join(file_name))
+        deletion_dir.join(file_name)
     }
 }
 
@@ -236,14 +236,11 @@ fn build_delete_file(
 ) -> CatalogResult<DeleteFile> {
     let delete_count_i64 =
         i64::try_from(delete_count).map_err(|err| CatalogError::InvalidOperation {
-            message: format!("Deletion count overflow ({}): {err}", delete_count),
+            message: format!("Deletion count overflow ({delete_count}): {err}"),
         })?;
     let file_size_i64 =
         i64::try_from(file_size_bytes).map_err(|err| CatalogError::InvalidOperation {
-            message: format!(
-                "Deletion vector file too large ({} bytes): {err}",
-                file_size_bytes
-            ),
+            message: format!("Deletion vector file too large ({file_size_bytes} bytes): {err}"),
         })?;
 
     Ok(DeleteFile {

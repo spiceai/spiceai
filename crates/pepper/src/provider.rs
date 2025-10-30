@@ -304,6 +304,8 @@ pub struct PepperTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    /// Optional retention filters that should be applied immediately after writes.
+    retention_filters: Vec<Expr>,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -402,6 +404,23 @@ impl PepperTableProvider {
     /// Returns an error if the table cannot be found in the catalog or if the listing
     /// table cannot be created.
     pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
+        Self::new_with_retention(table_name, catalog, Vec::new()).await
+    }
+
+    /// Create a new table provider with explicit retention filters.
+    ///
+    /// This is primarily used by the runtime when datasets specify `retention_sql`
+    /// so that deletion vectors are written before a refresh completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be found in the catalog or if the listing
+    /// table cannot be created.
+    pub async fn new_with_retention(
+        table_name: &str,
+        catalog: Arc<dyn MetadataCatalog>,
+        retention_filters: Vec<Expr>,
+    ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
 
         // Construct path to current snapshot
@@ -422,6 +441,7 @@ impl PepperTableProvider {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
+            retention_filters,
         })
     }
 
@@ -434,8 +454,21 @@ impl PepperTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
     ) -> CatalogResult<Self> {
+        Self::create_table_with_retention(catalog, options, Vec::new()).await
+    }
+
+    /// Create a new table in Pepper with retention filters applied to subsequent writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be created in the catalog.
+    pub async fn create_table_with_retention(
+        catalog: Arc<dyn MetadataCatalog>,
+        options: CreateTableOptions,
+        retention_filters: Vec<Expr>,
+    ) -> CatalogResult<Self> {
         let _table_id = catalog.create_table(options.clone()).await?;
-        Self::new(&options.table_name, catalog).await
+        Self::new_with_retention(&options.table_name, catalog, retention_filters).await
     }
     /// Get a reference to the catalog.
     ///
@@ -651,12 +684,59 @@ impl PepperTableProvider {
 
         tracing::debug!("Insert completed, wrote {} rows to Vortex", row_count);
 
+        // Apply retention filters before refreshing the listing table so any rows matching the
+        // configured predicate are captured in deletion vector files within this refresh.
+        if !self.retention_filters.is_empty() {
+            match self.apply_retention_filters().await {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            "Retention filters deleted {} row(s) for table {}",
+                            deleted,
+                            self.table_metadata.table_name
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Retention filters found no rows to delete for table {}",
+                            self.table_metadata.table_name
+                        );
+                    }
+                }
+                Err(err) => {
+                    return Err(super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to apply retention filters after insert: {err}"),
+                    });
+                }
+            }
+        }
+
         // Refresh the listing table to pick up new files and update statistics
         // This ensures that query plans have access to up-to-date table statistics
         // after the insert operation completes
         self.refresh_listing_table()?;
 
         Ok(row_count)
+    }
+
+    async fn apply_retention_filters(&self) -> CatalogResult<u64> {
+        if self.retention_filters.is_empty() {
+            return Ok(0);
+        }
+
+        let filters = self.retention_filters.clone();
+        let sink = PepperDeletionSink::new(
+            self.table_metadata.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.listing_table),
+            Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
+            &filters,
+        );
+
+        sink.delete_from()
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: format!("Failed to execute retention filters: {err}"),
+            })
     }
 
     /// Delete rows matching the given primary key values.
@@ -1189,13 +1269,18 @@ impl PepperDeletionSink {
         row_ids: Vec<i64>,
         data_file_id: i64,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        if row_ids.is_empty() {
+        let filtered_row_ids = self.filter_existing_deletions(row_ids).await?;
+
+        if filtered_row_ids.is_empty() {
             return Ok(0);
         }
 
         let writer = DeletionVectorWriter::new(&self.table_metadata);
         let mut results = writer
-            .write(vec![DeletionVectorWriteSpec::new(data_file_id, row_ids)])
+            .write(vec![DeletionVectorWriteSpec::new(
+                data_file_id,
+                filtered_row_ids,
+            )])
             .await
             .map_err(catalog_error_to_box)?;
 
@@ -1217,6 +1302,42 @@ impl PepperDeletionSink {
         );
 
         Ok(deleted_count)
+    }
+
+    async fn filter_existing_deletions(
+        &self,
+        row_ids: Vec<i64>,
+    ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let delete_files = self
+            .catalog
+            .get_table_delete_files(self.table_metadata.table_id)
+            .await
+            .map_err(catalog_error_to_box)?;
+
+        if delete_files.is_empty() {
+            return Ok(row_ids);
+        }
+
+        let delete_files_for_read = delete_files.clone();
+        let existing_row_ids = tokio::task::spawn_blocking(move || {
+            PepperTableProvider::read_deletion_vectors(delete_files_for_read)
+        })
+        .await
+        .map_err(|source| catalog_error_to_box(CatalogError::TaskJoin { source }))?
+        .map_err(|err| {
+            catalog_error_to_box(CatalogError::InvalidOperation {
+                message: format!("Failed to read existing deletion vectors: {err}"),
+            })
+        })?;
+
+        Ok(row_ids
+            .into_iter()
+            .filter(|row_id| !existing_row_ids.contains(row_id))
+            .collect())
     }
 }
 
