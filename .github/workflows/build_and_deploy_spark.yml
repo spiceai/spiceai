@@ -32,7 +32,7 @@ jobs:
   build-spark:
     name: Build CUDA binaries for DGX Spark (ARM64)
     # Build natively on DGX Spark ARM64 device with CUDA support
-    runs-on: spiceai-dgx-spark-runners
+    runs-on: 'spiceai-dgx-spark-runners'
     env:
       RUST_PROFILE: release
       CARGO_TERM_COLOR: always
@@ -56,7 +56,7 @@ jobs:
       - name: Run Spiced CUDA Build for ARM64
         uses: ./.github/actions/spiced-cuda-build
         with:
-          cuda-version: '12.4.1'
+          cuda-version: '13.0'
           cuda-compute-capability: ${{ env.COMPUTE_CAP }}
           artifact-tag: ${{ env.TARGET_OS }}_${{ env.TARGET_ARCH }}
           target_os: ${{ env.TARGET_OS }}
