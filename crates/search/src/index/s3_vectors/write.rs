@@ -119,17 +119,7 @@ pub async fn write(
         let chunk_end = (chunk_start + batch_write_rows).min(record.num_rows());
         let chunk_length = chunk_end - chunk_start;
 
-        let chunk_columns: Vec<Arc<dyn Array>> = record
-            .columns()
-            .iter()
-            .map(|col| col.slice(chunk_start, chunk_length))
-            .collect();
-
-        let chunk_batch = RecordBatch::try_new(Arc::clone(&schema), chunk_columns).context(
-            IssueWithArrowProcessingSnafu {
-                index: index.name(),
-            },
-        )?;
+        let chunk_batch = record.slice(chunk_start, chunk_length);
 
         let processed_chunk = process_single_batch(index, table, chunk_batch).await?;
         result_batches.push(processed_chunk);
