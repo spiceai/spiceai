@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::{Error, Result};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,13 +109,30 @@ fn infer_dynamodb_type(value: &AttributeValue) -> Result<DataType> {
             // Arrow arrays must be homogeneous - use strings to preserve all data
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
         }
-        AttributeValue::M(_) => {
+        AttributeValue::M(map) => {
             // Represent nested maps as JSON strings
-            DataType::Utf8
+            infer_struct_type(map)?
         }
         AttributeValue::Null(_) => DataType::Null,
         _ => return Err(Error::UnknownType),
     })
+}
+
+fn infer_struct_type(map: &HashMap<String, AttributeValue>) -> Result<DataType> {
+    if map.is_empty() {
+        return Ok(DataType::Struct(Fields::empty()));
+    }
+
+    let mut fields = Vec::new();
+
+    for (key, value) in map {
+        let field_type = infer_dynamodb_type(value)?;
+        fields.push(Field::new(key.clone(), field_type, true));
+    }
+
+    fields.sort_by(|a, b| a.name().cmp(b.name()));
+
+    Ok(DataType::Struct(Fields::from(fields)))
 }
 
 fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
@@ -139,9 +156,48 @@ fn unify_types(type1: &DataType, type2: &DataType) -> DataType {
             DataType::List(Arc::new(Field::new("item", unified_inner, true)))
         }
 
+        // Struct unification - merge fields from both structs
+        (DataType::Struct(fields1), DataType::Struct(fields2)) => {
+            unify_struct_fields(fields1, fields2)
+        }
+
         // Otherwise use string as the most general type
         _ => DataType::Utf8,
     }
+}
+
+fn unify_struct_fields(fields1: &Fields, fields2: &Fields) -> DataType {
+    let mut unified_fields: HashMap<String, DataType> = HashMap::new();
+
+    // Add all fields from fields1
+    for field in fields1 {
+        unified_fields.insert(field.name().clone(), field.data_type().clone());
+    }
+
+    // Merge/unify with fields from fields2
+    for field in fields2 {
+        match unified_fields.get(field.name()) {
+            Some(existing_type) => {
+                // Field exists in both - unify the types
+                let unified_type = unify_types(existing_type, field.data_type());
+                unified_fields.insert(field.name().clone(), unified_type);
+            }
+            None => {
+                // Field only in fields2 - add it
+                unified_fields.insert(field.name().clone(), field.data_type().clone());
+            }
+        }
+    }
+
+    let mut result_fields: Vec<Field> = unified_fields
+        .into_iter()
+        .map(|(name, data_type)| Field::new(name, data_type, true))
+        .collect();
+
+    // Sort for deterministic schema
+    result_fields.sort_by(|a, b| a.name().cmp(b.name()));
+
+    DataType::Struct(Fields::from(result_fields))
 }
 
 fn is_iso8601_timestamp(s: &str) -> bool {
@@ -372,28 +428,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_map_types() {
-        let mut inner_map = HashMap::new();
-        inner_map.insert("name".to_string(), av_string("Alice"));
-        inner_map.insert("age".to_string(), av_number("30"));
-
-        let mut item = HashMap::new();
-        item.insert("user".to_string(), AttributeValue::M(inner_map));
-        item.insert("metadata".to_string(), AttributeValue::M(HashMap::new()));
-
-        let items = vec![item];
-        let schema = infer_arrow_schema_from_items(&items).expect("schema");
-        let field_map: HashMap<String, &DataType> = schema
-            .fields()
-            .iter()
-            .map(|f| (f.name().clone(), f.data_type()))
-            .collect();
-
-        // Maps should be treated as strings (JSON) by default
-        assert_eq!(field_map.get("user"), Some(&&DataType::Utf8));
-        assert_eq!(field_map.get("metadata"), Some(&&DataType::Utf8));
-    }
+    // #[test]
+    // fn test_map_types() {
+    //     let mut inner_map = HashMap::new();
+    //     inner_map.insert("name".to_string(), av_string("Alice"));
+    //     inner_map.insert("age".to_string(), av_number("30"));
+    //
+    //     let mut item = HashMap::new();
+    //     item.insert("user".to_string(), AttributeValue::M(inner_map));
+    //     item.insert("metadata".to_string(), AttributeValue::M(HashMap::new()));
+    //
+    //     let items = vec![item];
+    //     let schema = infer_arrow_schema_from_items(&items).expect("schema");
+    //     let field_map: HashMap<String, &DataType> = schema
+    //         .fields()
+    //         .iter()
+    //         .map(|f| (f.name().clone(), f.data_type()))
+    //         .collect();
+    //
+    //     // Maps should be treated as strings (JSON) by default
+    //     assert_eq!(field_map.get("user"), Some(&&DataType::Utf8));
+    //     assert_eq!(field_map.get("metadata"), Some(&&DataType::Utf8));
+    // }
 
     #[test]
     fn test_type_unification_numeric_promotion_int_to_float() {
@@ -802,5 +858,326 @@ mod tests {
             timestamp_field.data_type(),
             DataType::Timestamp(TimeUnit::Millisecond, Some(_))
         ));
+    }
+
+    #[test]
+    fn test_simple_nested_struct_inference() {
+        let mut address_map = HashMap::new();
+        address_map.insert("city".to_string(), av_string("Seattle"));
+        address_map.insert("zip".to_string(), av_string("98101"));
+
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), av_string("John"));
+        item.insert("address".to_string(), AttributeValue::M(address_map));
+
+        let items = vec![item];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let address_field = schema.field_with_name("address").expect("field");
+        match address_field.data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+
+                let city_field = fields.find("city").expect("city field").1;
+                assert_eq!(city_field.data_type(), &DataType::Utf8);
+
+                let zip_field = fields.find("zip").expect("zip field").1;
+                assert_eq!(zip_field.data_type(), &DataType::Utf8);
+            }
+            _ => panic!("Expected Struct type, got {:?}", address_field.data_type()),
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_struct_inference() {
+        let mut location_map = HashMap::new();
+        location_map.insert("lat".to_string(), av_number("47.6062"));
+        location_map.insert("lon".to_string(), av_number("-122.3321"));
+
+        let mut address_map = HashMap::new();
+        address_map.insert("city".to_string(), av_string("Seattle"));
+        address_map.insert("location".to_string(), AttributeValue::M(location_map));
+
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), av_string("John"));
+        item.insert("address".to_string(), AttributeValue::M(address_map));
+
+        let items = vec![item];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let address_field = schema.field_with_name("address").expect("field");
+        match address_field.data_type() {
+            DataType::Struct(fields) => {
+                let location_field = fields.find("location").expect("location field").1;
+                match location_field.data_type() {
+                    DataType::Struct(location_fields) => {
+                        assert_eq!(location_fields.len(), 2);
+                        let lat_field = location_fields.find("lat").expect("lat field").1;
+                        assert_eq!(lat_field.data_type(), &DataType::Float64);
+                        let lon_field = location_fields.find("lon").expect("lon field").1;
+                        assert_eq!(lon_field.data_type(), &DataType::Float64);
+                    }
+                    _ => panic!("Expected nested Struct type"),
+                }
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_struct_field_unification_different_fields() {
+        // First item has city and zip
+        let mut address_map1 = HashMap::new();
+        address_map1.insert("city".to_string(), av_string("Seattle"));
+        address_map1.insert("zip".to_string(), av_string("98101"));
+
+        let mut item1 = HashMap::new();
+        item1.insert("name".to_string(), av_string("John"));
+        item1.insert("address".to_string(), AttributeValue::M(address_map1));
+
+        // Second item has city and state (no zip)
+        let mut address_map2 = HashMap::new();
+        address_map2.insert("city".to_string(), av_string("Portland"));
+        address_map2.insert("state".to_string(), av_string("OR"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("name".to_string(), av_string("Jane"));
+        item2.insert("address".to_string(), AttributeValue::M(address_map2));
+
+        let items = vec![item1, item2];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let address_field = schema.field_with_name("address").expect("field");
+        match address_field.data_type() {
+            DataType::Struct(fields) => {
+                // Should have all 3 fields: city, state, zip (merged from both items)
+                assert_eq!(fields.len(), 3);
+                assert!(fields.find("city").is_some(), "city field should exist");
+                assert!(fields.find("zip").is_some(), "zip field should exist");
+                assert!(fields.find("state").is_some(), "state field should exist");
+
+                // All fields should be nullable
+                assert!(fields.find("city").expect("field").1.is_nullable());
+                assert!(fields.find("zip").expect("field").1.is_nullable());
+                assert!(fields.find("state").expect("field").1.is_nullable());
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_struct_field_type_unification() {
+        // First item has numeric score
+        let mut meta1 = HashMap::new();
+        meta1.insert("score".to_string(), av_number("100"));
+
+        let mut item1 = HashMap::new();
+        item1.insert("id".to_string(), av_string("1"));
+        item1.insert("meta".to_string(), AttributeValue::M(meta1));
+
+        // Second item has float score
+        let mut meta2 = HashMap::new();
+        meta2.insert("score".to_string(), av_number("98.5"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("id".to_string(), av_string("2"));
+        item2.insert("meta".to_string(), AttributeValue::M(meta2));
+
+        let items = vec![item1, item2];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let meta_field = schema.field_with_name("meta").expect("field");
+        match meta_field.data_type() {
+            DataType::Struct(fields) => {
+                let score_field = fields.find("score").expect("score field").1;
+                // Should be promoted to Float64 since one item has decimal
+                assert_eq!(score_field.data_type(), &DataType::Float64);
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_empty_struct() {
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), av_string("John"));
+        item.insert("meta".to_string(), AttributeValue::M(HashMap::new()));
+
+        let items = vec![item];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let meta_field = schema.field_with_name("meta").expect("field");
+        match meta_field.data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 0, "Empty struct should have no fields");
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_struct_with_null() {
+        let mut address_map = HashMap::new();
+        address_map.insert("city".to_string(), av_string("Seattle"));
+        address_map.insert("zip".to_string(), AttributeValue::Null(true));
+
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), av_string("John"));
+        item.insert("address".to_string(), AttributeValue::M(address_map));
+
+        let items = vec![item];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let address_field = schema.field_with_name("address").expect("field");
+        match address_field.data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+
+                let city_field = fields.find("city").expect("city field").1;
+                assert_eq!(city_field.data_type(), &DataType::Utf8);
+
+                let zip_field = fields.find("zip").expect("zip field").1;
+                assert_eq!(zip_field.data_type(), &DataType::Null);
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_struct_null_unification() {
+        // First item has null zip
+        let mut address_map1 = HashMap::new();
+        address_map1.insert("city".to_string(), av_string("Seattle"));
+        address_map1.insert("zip".to_string(), AttributeValue::Null(true));
+
+        let mut item1 = HashMap::new();
+        item1.insert("address".to_string(), AttributeValue::M(address_map1));
+
+        // Second item has actual zip value
+        let mut address_map2 = HashMap::new();
+        address_map2.insert("city".to_string(), av_string("Portland"));
+        address_map2.insert("zip".to_string(), av_string("97201"));
+
+        let mut item2 = HashMap::new();
+        item2.insert("address".to_string(), AttributeValue::M(address_map2));
+
+        let items = vec![item1, item2];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let address_field = schema.field_with_name("address").expect("field");
+        match address_field.data_type() {
+            DataType::Struct(fields) => {
+                let zip_field = fields.find("zip").expect("zip field").1;
+                // Should unify to Utf8 (null unified with string)
+                assert_eq!(zip_field.data_type(), &DataType::Utf8);
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_nested_structs() {
+        let mut address_map = HashMap::new();
+        address_map.insert("city".to_string(), av_string("Seattle"));
+
+        let mut contact_map = HashMap::new();
+        contact_map.insert("email".to_string(), av_string("john@example.com"));
+        contact_map.insert("phone".to_string(), av_string("555-1234"));
+
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), av_string("John"));
+        item.insert("address".to_string(), AttributeValue::M(address_map));
+        item.insert("contact".to_string(), AttributeValue::M(contact_map));
+
+        let items = vec![item];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        assert_eq!(schema.fields().len(), 3);
+
+        let address_field = schema.field_with_name("address").expect("address field");
+        match address_field.data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 1);
+                assert!(fields.find("city").is_some());
+            }
+            _ => panic!("Expected Struct type for address"),
+        }
+
+        let contact_field = schema.field_with_name("contact").expect("contact field");
+        match contact_field.data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert!(fields.find("email").is_some());
+                assert!(fields.find("phone").is_some());
+            }
+            _ => panic!("Expected Struct type for contact"),
+        }
+    }
+
+    #[test]
+    fn test_struct_field_ordering() {
+        let mut address_map = HashMap::new();
+        address_map.insert("zip".to_string(), av_string("98101"));
+        address_map.insert("city".to_string(), av_string("Seattle"));
+        address_map.insert("state".to_string(), av_string("WA"));
+
+        let mut item = HashMap::new();
+        item.insert("address".to_string(), AttributeValue::M(address_map));
+
+        let items = vec![item];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let address_field = schema.field_with_name("address").expect("field");
+        match address_field.data_type() {
+            DataType::Struct(fields) => {
+                // Fields should be sorted alphabetically
+                let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+                assert_eq!(field_names, vec!["city", "state", "zip"]);
+            }
+            _ => panic!("Expected Struct type"),
+        }
+    }
+
+    #[test]
+    fn test_three_level_nested_struct() {
+        let mut coordinates_map = HashMap::new();
+        coordinates_map.insert("lat".to_string(), av_number("47.6062"));
+        coordinates_map.insert("lon".to_string(), av_number("-122.3321"));
+
+        let mut location_map = HashMap::new();
+        location_map.insert("name".to_string(), av_string("Space Needle"));
+        location_map.insert("coords".to_string(), AttributeValue::M(coordinates_map));
+
+        let mut address_map = HashMap::new();
+        address_map.insert("street".to_string(), av_string("400 Broad St"));
+        address_map.insert("landmark".to_string(), AttributeValue::M(location_map));
+
+        let mut item = HashMap::new();
+        item.insert("address".to_string(), AttributeValue::M(address_map));
+
+        let items = vec![item];
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+
+        let address_field = schema.field_with_name("address").expect("field");
+        match address_field.data_type() {
+            DataType::Struct(level1_fields) => {
+                let landmark_field = level1_fields.find("landmark").expect("landmark field").1;
+                match landmark_field.data_type() {
+                    DataType::Struct(level2_fields) => {
+                        let coords_field = level2_fields.find("coords").expect("coords field").1;
+                        match coords_field.data_type() {
+                            DataType::Struct(level3_fields) => {
+                                assert_eq!(level3_fields.len(), 2);
+                                assert!(level3_fields.find("lat").is_some());
+                                assert!(level3_fields.find("lon").is_some());
+                            }
+                            _ => panic!("Expected third level Struct type"),
+                        }
+                    }
+                    _ => panic!("Expected second level Struct type"),
+                }
+            }
+            _ => panic!("Expected first level Struct type"),
+        }
     }
 }

@@ -1,45 +1,27 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParamsBuilder, ScanParamsBuilder};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
+use crate::dynamodb::utils::FilterStringVisitor;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use derive_builder::Builder;
 use std::collections::{HashMap, HashSet};
-
-#[derive(Clone, Debug)]
-pub enum DynamoDBRequestPlan {
-    Query(QueryParams),
-    Scan(ScanParams),
-}
-
-#[derive(Builder, Debug, Default, Clone)]
-#[builder(pattern = "owned")]
-#[builder(setter(into, strip_option), default)]
-#[builder(derive(Debug))]
-pub struct QueryParams {
-    pub table_name: String,
-    pub key_condition_expression: Option<String>,
-    pub filter_expression: Option<String>,
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    pub expression_attribute_names: Option<HashMap<String, String>>,
-    pub projection_expression: Option<String>,
-    pub limit: Option<i32>,
-}
-
-#[derive(Builder, Debug, Default, Clone)]
-#[builder(pattern = "owned")]
-#[builder(setter(into, strip_option), default)]
-#[builder(derive(Debug))]
-pub struct ScanParams {
-    pub table_name: String,
-    pub filter_expression: Option<String>,
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    pub expression_attribute_names: Option<HashMap<String, String>>,
-    pub projection_expression: Option<String>,
-    pub limit: Option<i32>,
-}
 
 #[derive(Debug)]
 pub struct DynamoDBRequestPlanBuilder {
@@ -100,7 +82,7 @@ impl DynamoDBRequestPlanBuilder {
                 limit_i32,
             )
         } else {
-            self.build_scan_request(filters, projection_expr, attribute_names, limit_i32)
+            Ok(self.build_scan_request(filters, projection_expr, attribute_names, limit_i32))
         }
     }
 
@@ -146,9 +128,7 @@ impl DynamoDBRequestPlanBuilder {
             query_params = query_params.expression_attribute_names(attribute_names);
         }
 
-        let query = query_params
-            .build()
-            .map_err(|e| DataFusionError::Execution(format!("{e}").to_string()))?;
+        let query = query_params.build();
         Ok(DynamoDBRequestPlan::Query(query))
     }
 
@@ -158,7 +138,7 @@ impl DynamoDBRequestPlanBuilder {
         projection: Option<String>,
         attribute_names: HashMap<String, String>,
         limit: Option<i32>,
-    ) -> DataFusionResult<DynamoDBRequestPlan> {
+    ) -> DynamoDBRequestPlan {
         let mut scan_params =
             ScanParamsBuilder::default().table_name(self.schema.table_name().to_string());
 
@@ -185,24 +165,8 @@ impl DynamoDBRequestPlanBuilder {
             scan_params = scan_params.expression_attribute_names(attribute_names);
         }
 
-        let scan = scan_params
-            .build()
-            .map_err(|e| DataFusionError::Execution(format!("{e}").to_string()))?;
-        Ok(DynamoDBRequestPlan::Scan(scan))
-    }
-
-    fn get_column_alias(&self, column_name: &str) -> String {
-        if self.schema.is_flattened_field(column_name) {
-            // Flattened field: split into dotted segments
-            column_name
-                .split('.')
-                .map(|segment| format!("#{segment}"))
-                .collect::<Vec<_>>()
-                .join(".")
-        } else {
-            // Non-flattened field: single alias
-            format!("#{column_name}")
-        }
+        let scan = scan_params.build();
+        DynamoDBRequestPlan::Scan(scan)
     }
 
     fn extract_attribute_names(&self, filters: &[Expr]) -> HashMap<String, String> {
@@ -218,24 +182,27 @@ impl DynamoDBRequestPlanBuilder {
         expr: &Expr,
         attribute_names: &mut HashMap<String, String>,
     ) {
-        match expr {
-            Expr::Column(col) => {
-                if self.schema.is_flattened_field(col.name()) {
-                    // Add each segment separately for flattened fields
-                    for segment in col.name().split('.') {
-                        attribute_names.insert(format!("#{segment}"), segment.to_string());
+        let _ = expr.apply(|expr| {
+            match expr {
+                Expr::Column(col) => {
+                    if self.schema.is_flattened_field(col.name()) {
+                        // Add each segment separately for flattened fields
+                        for segment in col.name().split('.') {
+                            attribute_names.insert(format!("#{segment}"), segment.to_string());
+                        }
+                    } else {
+                        // Add single alias for non-flattened fields
+                        attribute_names.insert(format!("#{}", col.name()), col.name().to_string());
                     }
-                } else {
-                    // Add single alias for non-flattened fields
-                    attribute_names.insert(format!("#{}", col.name()), col.name().to_string());
                 }
+                Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+                    self.extract_columns_from_expr(left, attribute_names);
+                    self.extract_columns_from_expr(right, attribute_names);
+                }
+                _ => {}
             }
-            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
-                self.extract_columns_from_expr(left, attribute_names);
-                self.extract_columns_from_expr(right, attribute_names);
-            }
-            _ => {}
-        }
+            Ok(TreeNodeRecursion::Continue)
+        });
     }
 
     fn build_key_condition_expression(
@@ -294,44 +261,18 @@ impl DynamoDBRequestPlanBuilder {
         attribute_values: &mut HashMap<String, AttributeValue>,
         value_counter: &mut usize,
     ) -> DataFusionResult<String> {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                let left_str = self.expr_to_filter_string(left, attribute_values, value_counter)?;
-                let right_str =
-                    self.expr_to_filter_string(right, attribute_values, value_counter)?;
+        let mut visitor = FilterStringVisitor::new(&self.schema, attribute_values, value_counter);
 
-                let op_str = match op {
-                    Operator::Eq => "=",
-                    Operator::NotEq => "<>",
-                    Operator::Lt => "<",
-                    Operator::LtEq => "<=",
-                    Operator::Gt => ">",
-                    Operator::GtEq => ">=",
-                    Operator::And => "AND",
-                    Operator::Or => "OR",
-                    _ => {
-                        return Err(DataFusionError::NotImplemented(format!(
-                            "Operator {op:?} not supported"
-                        )));
-                    }
-                };
+        expr.visit(&mut visitor)?;
 
-                Ok(format!("({left_str} {op_str} {right_str})"))
-            }
-            Expr::Column(col) => Ok(self.get_column_alias(col.name())),
-            Expr::Literal(scalar, _) => {
-                let value_key = format!(":v{value_counter}");
-                *value_counter += 1;
-
-                let attr_value = scalar_to_attribute_value(scalar)?;
-                attribute_values.insert(value_key.clone(), attr_value);
-
-                Ok(value_key)
-            }
-            _ => Err(DataFusionError::NotImplemented(
-                "Expression type not supported in filters".to_string(),
-            )),
+        if let Some(error) = visitor.error {
+            return Err(error);
         }
+
+        visitor
+            .result_stack
+            .pop()
+            .ok_or_else(|| DataFusionError::Internal("No result produced".to_string()))
     }
 
     fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
@@ -400,21 +341,6 @@ impl DynamoDBRequestPlanBuilder {
                 attribute_names.insert(format!("#{field_name}"), field_name.to_string());
             }
         }
-    }
-}
-
-fn scalar_to_attribute_value(scalar: &ScalarValue) -> datafusion::error::Result<AttributeValue> {
-    match scalar {
-        ScalarValue::Utf8(Some(s)) => Ok(AttributeValue::S(s.clone())),
-        ScalarValue::Int64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Float64(Some(f)) => Ok(AttributeValue::N(f.to_string())),
-        ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
-        ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
-        ScalarValue::Null => Ok(AttributeValue::Null(true)),
-        _ => Err(DataFusionError::NotImplemented(
-            "ScalarValue type not supported".to_string(),
-        )),
     }
 }
 
@@ -1415,52 +1341,6 @@ mod tests {
         assert_eq!(expr, "(#id = :v1000) AND (#sort_key > :v1001)");
         assert!(values.contains_key(":v1000"));
         assert!(values.contains_key(":v1001"));
-    }
-
-    #[test]
-    fn test_scalar_to_attribute_value_string() {
-        let scalar = ScalarValue::Utf8(Some("test".to_string()));
-        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
-
-        match attr {
-            AttributeValue::S(s) => assert_eq!(s, "test"),
-            _ => panic!("Expected String attribute"),
-        }
-    }
-
-    #[test]
-    #[allow(clippy::similar_names)]
-    fn test_scalar_to_attribute_value_numbers() {
-        let scalar_i64 = ScalarValue::Int64(Some(42));
-        let attr = scalar_to_attribute_value(&scalar_i64).expect("scalar_to_attribute_value");
-        assert!(matches!(attr, AttributeValue::N(_)));
-
-        let scalar_i32 = ScalarValue::Int32(Some(42));
-        let attr = scalar_to_attribute_value(&scalar_i32).expect("scalar_to_attribute_value");
-        assert!(matches!(attr, AttributeValue::N(_)));
-
-        let scalar_f64 = ScalarValue::Float64(Some(42.5));
-        let attr = scalar_to_attribute_value(&scalar_f64).expect("scalar_to_attribute_value");
-        assert!(matches!(attr, AttributeValue::N(_)));
-    }
-
-    #[test]
-    fn test_scalar_to_attribute_value_boolean() {
-        let scalar = ScalarValue::Boolean(Some(true));
-        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
-
-        match attr {
-            AttributeValue::Bool(b) => assert!(b),
-            _ => panic!("Expected Boolean attribute"),
-        }
-    }
-
-    #[test]
-    fn test_scalar_to_attribute_value_null() {
-        let scalar = ScalarValue::Null;
-        let attr = scalar_to_attribute_value(&scalar).expect("scalar_to_attribute_value");
-
-        assert!(matches!(attr, AttributeValue::Null(true)));
     }
 
     #[test]

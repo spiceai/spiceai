@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,9 +19,11 @@ use std::sync::Arc;
 mod arrow;
 pub mod provider;
 mod request_builder;
+mod request_plan;
 mod schema;
 mod table_schema;
 mod unnest;
+mod utils;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

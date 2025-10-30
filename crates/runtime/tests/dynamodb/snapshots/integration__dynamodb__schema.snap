@@ -15,7 +15,7 @@ expression: formatted
 | col_map_fully_unnested.is_active        | Boolean                                                                                                            | YES         |
 | col_map_fully_unnested.name             | Utf8                                                                                                               | YES         |
 | col_map_partially_unnested.foo          | Utf8                                                                                                               | YES         |
-| col_map_partially_unnested.nested_lvl_1 | Utf8                                                                                                               | YES         |
+| col_map_partially_unnested.nested_lvl_1 | Struct([Field { name: "foo", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]) | YES         |
 | col_number_float                        | Float64                                                                                                            | YES         |
 | col_number_int                          | Int64                                                                                                              | YES         |
 | col_number_scientific                   | Int64                                                                                                              | YES         |

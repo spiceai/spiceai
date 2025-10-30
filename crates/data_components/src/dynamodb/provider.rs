@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,9 +19,8 @@ use super::{
     TableStatusIsNotActiveSnafu,
 };
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
-use crate::dynamodb::request_builder::{
-    DynamoDBRequestPlan, DynamoDBRequestPlanBuilder, QueryParams, ScanParams,
-};
+use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
+use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;

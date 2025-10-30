@@ -361,9 +361,10 @@ fn append_value_to_builder(
                     }
                 }
                 Some(AttributeValue::Null(_)) | None => {
-                    b.append_null();
-                    // Still need to append nulls to all child builders
-                    for idx in 0..b.num_fields() {
+                    b.append(false);
+
+                    // Still need to append nulls to all child builders to keep arrays aligned
+                    for idx in 0..fields.len() {
                         let nested_builder = b.field_builder_array(idx);
                         let nested_field = &fields[idx];
                         append_value_to_builder(nested_builder, None, nested_field.data_type())?;
@@ -373,7 +374,7 @@ fn append_value_to_builder(
                     return Err(Error::ConversionError {
                         source: Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            "Expected Map for Struct field",
+                            format!("Expected Map or Null for Struct field, got: {value:?}"),
                         )),
                     });
                 }
@@ -819,16 +820,17 @@ mod tests {
 
     #[test]
     fn test_nested_struct() {
-        let inner_fields = vec![
-            Field::new("city", DataType::Utf8, true),
-            Field::new("zip", DataType::Utf8, true),
-        ];
-
         let schema = create_test_schema(vec![
             Field::new("name", DataType::Utf8, true),
             Field::new(
                 "address",
-                DataType::Struct(inner_fields.clone().into()),
+                DataType::Struct(
+                    vec![
+                        Field::new("city", DataType::Utf8, true),
+                        Field::new("zip", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
                 true,
             ),
         ]);
@@ -842,7 +844,68 @@ mod tests {
         item.insert("address".to_string(), AttributeValue::M(address_map));
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result =
+            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+
+        assert_eq!(result.num_rows(), 1);
+
+        // Check name column
+        let name_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Failed to downcast to StringArray");
+        assert_eq!(name_array.value(0), "John");
+
+        // Check address struct
+        let struct_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("Failed to downcast to StructArray");
+
+        // Verify struct is not null
+        assert!(!struct_array.is_null(0));
+
+        let city_array = struct_array
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Failed to downcast city to StringArray");
+        let zip_array = struct_array
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Failed to downcast zip to StringArray");
+
+        assert_eq!(city_array.value(0), "Seattle");
+        assert_eq!(zip_array.value(0), "98101");
+    }
+
+    #[test]
+    fn test_nested_struct_with_null() {
+        let schema = create_test_schema(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "address",
+                DataType::Struct(
+                    vec![
+                        Field::new("city", DataType::Utf8, true),
+                        Field::new("zip", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]);
+
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), AttributeValue::S("Jane".to_string()));
+        // No address field - should be null
+
+        let items = vec![item];
+        let result =
+            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -850,54 +913,72 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("array");
-        assert_eq!(name_array.value(0), "John");
+            .expect("Failed to downcast to StringArray");
+        assert_eq!(name_array.value(0), "Jane");
 
         let struct_array = result
             .column(1)
             .as_any()
             .downcast_ref::<StructArray>()
-            .expect("array");
+            .expect("Failed to downcast to StructArray");
+
+        // Verify struct is null
+        assert!(struct_array.is_null(0));
+    }
+
+    #[test]
+    fn test_nested_struct_with_partial_fields() {
+        let schema = create_test_schema(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "address",
+                DataType::Struct(
+                    vec![
+                        Field::new("city", DataType::Utf8, true),
+                        Field::new("zip", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]);
+
+        let mut address_map = HashMap::new();
+        address_map.insert(
+            "city".to_string(),
+            AttributeValue::S("Portland".to_string()),
+        );
+        // zip is missing
+
+        let mut item = HashMap::new();
+        item.insert("name".to_string(), AttributeValue::S("Bob".to_string()));
+        item.insert("address".to_string(), AttributeValue::M(address_map));
+
+        let items = vec![item];
+        let result =
+            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+
+        assert_eq!(result.num_rows(), 1);
+
+        let struct_array = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("Failed to downcast to StructArray");
+
         let city_array = struct_array
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("array");
+            .expect("Failed to downcast city to StringArray");
         let zip_array = struct_array
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("array");
+            .expect("Failed to downcast zip to StringArray");
 
-        assert_eq!(city_array.value(0), "Seattle");
-        assert_eq!(zip_array.value(0), "98101");
-    }
-
-    #[test]
-    fn test_null_struct() {
-        let inner_fields = vec![
-            Field::new("field1", DataType::Utf8, true),
-            Field::new("field2", DataType::Int64, true),
-        ];
-
-        let schema = create_test_schema(vec![Field::new(
-            "data",
-            DataType::Struct(inner_fields.clone().into()),
-            true,
-        )]);
-
-        let mut item = HashMap::new();
-        item.insert("data".to_string(), AttributeValue::Null(true));
-
-        let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
-
-        let struct_array = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("array");
-        assert!(struct_array.is_null(0));
+        assert_eq!(city_array.value(0), "Portland");
+        assert!(zip_array.is_null(0)); // zip should be null
     }
 
     #[test]
