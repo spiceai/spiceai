@@ -25,7 +25,7 @@
 -[x] Add targeted unit/integration tests verifying deletes propagate correctly.
 -
 ### 2. Key Index Design & Metastore Schema
--[ ] Design a normalized schema for a key index table shared by all backends (e.g., `pepper_key_index` with `{table_id, key_hash, key_bytes, data_file_id, row_id, begin_snapshot, end_snapshot}`).
+-[x] Design a normalized schema for a key index table shared by all backends (e.g., `pepper_key_index` with `{table_id, key_hash, key_bytes, data_file_id, row_id, begin_snapshot, end_snapshot}`).
 -[ ] Extend `MetastoreBackend` helpers for batched insert/query/update operations.
 -[ ] Update `PepperCatalog` (and other catalog implementations) to create & migrate the new schema.
 -[ ] Implement catalog-layer APIs for bulk lookup of primary-key hashes, insertion of new key rows, and logical deletion (setting `end_snapshot`).
@@ -65,6 +65,7 @@
 
 -## Progress Log
 - 2025-02-10: Completed shared deletion-vector writer and refactored Pepper deletion sink to use it; updated planning checklist accordingly.
+- 2025-02-10: Added Pepper key-index metadata structs, schema DDL, and catalog trait scaffolding as groundwork for on_conflict support.
 -
 -## Execution Checklist (High-Level)
 -[ ] Finish deletion-vector pipeline and land as standalone commit.
