@@ -22,6 +22,7 @@ on:
           - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
+          - 'saffron[parameterized]'
       query_overrides:
         description: 'Query overrides'
         required: false
@@ -45,6 +46,7 @@ on:
           - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
+          - 'saffron-views'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
