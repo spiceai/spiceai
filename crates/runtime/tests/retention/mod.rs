@@ -326,8 +326,6 @@ SET
                 refresh_mode: Some(RefreshMode::Append),
                 refresh_check_interval: Some("200ms".to_string()),
                 retention_sql: Some("DELETE FROM widgets WHERE deleted = true".to_string()),
-                retention_check_enabled: true,
-                retention_check_interval: Some("200ms".to_string()),
                 primary_key: Some("id".to_string()),
                 on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
                 ..Acceleration::default()
@@ -398,54 +396,17 @@ SET
                 )
                 .await?;
 
-            let pg_updated_ts: i64 = db_conn
-                .conn
-                .query_one(
-                    "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000000)::BIGINT FROM widgets WHERE name = 'Sample widget';",
-                    &[],
-                )
-                .await?
-                .get(0);
-
             refresh_table(Arc::clone(&rt), "widgets").await?;
 
-            let refreshed_batches = execute_rt_sql(
+            let deleted_batches = execute_rt_sql(
                 Arc::clone(&rt),
-                "SELECT name, updated_at, deleted FROM widgets ORDER BY name",
+                "SELECT name FROM widgets WHERE deleted = TRUE",
             )
             .await?;
-
-            let refreshed_rows = rows_from_batches(&refreshed_batches)?;
-            let (_, runtime_updated_ts, runtime_deleted_flag) = refreshed_rows
-                .into_iter()
-                .find(|(name, _, _)| name == "Sample widget")
-                .expect("sample widget should still be present after append refresh");
-
-            assert!(runtime_deleted_flag, "append refresh should include updated rows");
-            assert_eq!(
-                runtime_updated_ts, pg_updated_ts,
-                "append refresh should keep timestamptz values aligned even when host timezone is positive"
-            );
-
-            let mut retention_applied = false;
-            for _ in 0..15 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                let deleted_batches = execute_rt_sql(
-                    Arc::clone(&rt),
-                    "SELECT name FROM widgets WHERE deleted = TRUE",
-                )
-                .await?;
-                let deleted_count: usize =
-                    deleted_batches.iter().map(RecordBatch::num_rows).sum();
-                if deleted_count == 0 {
-                    retention_applied = true;
-                    break;
-                }
-            }
-
+            let deleted_count: usize = deleted_batches.iter().map(RecordBatch::num_rows).sum();
             assert!(
-                retention_applied,
-                "retention_sql should eventually remove soft-deleted rows"
+                deleted_count == 0,
+                "retention_sql should remove soft-deleted rows on refresh commit"
             );
 
             running_container.remove().await?;

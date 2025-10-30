@@ -69,6 +69,8 @@ pub struct S3Vector {
     pub compute_query: Arc<dyn Embed>,
 
     pub partition_by: Vec<Expr>,
+
+    batch_write_rows: usize,
 }
 
 impl S3Vector {
@@ -85,6 +87,7 @@ impl S3Vector {
         metadata_columns: MetadataColumns,
         compute_query: Arc<dyn Embed>,
         partition_by: Vec<Expr>,
+        batch_write_rows: usize,
     ) -> Self {
         Self {
             table,
@@ -93,6 +96,7 @@ impl S3Vector {
             metadata_columns,
             compute_query,
             partition_by,
+            batch_write_rows,
         }
     }
 
@@ -131,7 +135,9 @@ impl SearchIndex for S3Vector {
                             tracing::warn!(
                                 "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
                             );
-                            return write::write(self, &self.table, record).await.boxed();
+                            return write::write(self, &self.table, record, self.batch_write_rows)
+                                .await
+                                .boxed();
                         }
                         S3VectorIdentifier::Index {
                             bucket_name,
@@ -169,11 +175,15 @@ impl SearchIndex for S3Vector {
                         )
                     })?;
 
-                    write::write(self, &table, partition_record).await.boxed()?;
+                    write::write(self, &table, partition_record, self.batch_write_rows)
+                        .await
+                        .boxed()?;
                 }
             }
             None => {
-                return write::write(self, &self.table, record).await.boxed();
+                return write::write(self, &self.table, record, self.batch_write_rows)
+                    .await
+                    .boxed();
             }
         }
 

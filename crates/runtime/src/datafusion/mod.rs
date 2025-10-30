@@ -1074,14 +1074,16 @@ impl DataFusion {
         accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
 
         let retention_delete_expr = match dataset.retention_sql() {
-            Some(retention_sql) => Some(
-                retention_sql::parse_retention_sql(
+            Some(retention_sql) => {
+                let parsed = retention_sql::parse_retention_sql(
                     &dataset.name,
                     retention_sql.as_str(),
                     source_table_provider.schema(),
                 )
-                .context(RetentionSqlSnafu)?,
-            ),
+                .context(RetentionSqlSnafu)?;
+
+                Some(parsed.delete_expr)
+            }
             None => None,
         };
 
