@@ -52,6 +52,7 @@ use datafusion_physical_plan::collect;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
@@ -296,6 +297,9 @@ pub struct PepperTableProvider {
     table_metadata: TableMetadata,
     /// Reference to the metadata catalog for file operations
     catalog: Arc<dyn MetadataCatalog>,
+    /// Conflict resolution behavior for writes
+    #[allow(dead_code)]
+    on_conflict: Option<OnConflict>,
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory.
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
@@ -401,7 +405,11 @@ impl PepperTableProvider {
     ///
     /// Returns an error if the table cannot be found in the catalog or if the listing
     /// table cannot be created.
-    pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
+    pub async fn new(
+        table_name: &str,
+        catalog: Arc<dyn MetadataCatalog>,
+        on_conflict: Option<OnConflict>,
+    ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
 
         // Construct path to current snapshot
@@ -422,6 +430,7 @@ impl PepperTableProvider {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
+            on_conflict,
         })
     }
 
@@ -435,7 +444,7 @@ impl PepperTableProvider {
         options: CreateTableOptions,
     ) -> CatalogResult<Self> {
         let _table_id = catalog.create_table(options.clone()).await?;
-        Self::new(&options.table_name, catalog).await
+        Self::new(&options.table_name, catalog, options.on_conflict.clone()).await
     }
     /// Get a reference to the catalog.
     ///

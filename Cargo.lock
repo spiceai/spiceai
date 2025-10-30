@@ -11036,6 +11036,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
+ "datafusion-table-providers",
  "futures",
  "paste",
  "rusqlite",

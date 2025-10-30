@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Pepper metadata.
 
 use arrow_schema::SchemaRef;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -182,6 +183,8 @@ pub struct CreateTableOptions {
     pub base_path: String,
     /// Optional partition column name (for partitioned tables)
     pub partition_column: Option<String>,
+    /// Optional conflict handling behavior (upsert/drop)
+    pub on_conflict: Option<OnConflict>,
 }
 
 /// Statistics about a table.

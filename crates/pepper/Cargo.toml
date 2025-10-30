@@ -27,6 +27,7 @@ datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }

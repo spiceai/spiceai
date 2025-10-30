@@ -24,7 +24,7 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{CreateExternalTable, ExprSchemable, TableProviderFilterPushDown};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use datafusion_table_providers::UnsupportedTypeAction;
+use datafusion_table_providers::{UnsupportedTypeAction, util::on_conflict::OnConflict};
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
@@ -355,6 +355,8 @@ impl PepperAccelerator {
         table_name: &str,
         dir_path: &str,
         schema: Arc<Schema>,
+        primary_keys: Vec<String>,
+        on_conflict: Option<OnConflict>,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<dyn TableProvider>> {
         use pepper::{PepperTableProvider, metadata::CreateTableOptions};
@@ -394,9 +396,10 @@ impl PepperAccelerator {
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
-            primary_key: vec![], // No PK by default, can be set by caller
+            primary_key: primary_keys,
             base_path: dir_path.to_string(),
             partition_column: None, // Non-partitioned table
+            on_conflict,
         };
 
         // Create PepperTableProvider
@@ -551,6 +554,17 @@ impl DataAccelerator for PepperAccelerator {
 
         let dir_path = self.resolve_storage_config(source).boxed()?;
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
+        let primary_keys =
+            super::get_primary_keys_from_constraints(&cmd.constraints, &arrow_schema);
+        let on_conflict = cmd
+            .options
+            .get("on_conflict")
+            .map(|value| {
+                OnConflict::try_from(value.as_str()).map_err(|err| Error::InvalidConfiguration {
+                    detail: Arc::from(format!("Invalid on_conflict setting for Pepper: {err}")),
+                })
+            })
+            .transpose()?;
         let _ = Self::ensure_directory(&dir_path).boxed()?;
 
         // Validate append mode configuration: requires either none, primary_key or time_column, but not both
@@ -559,12 +573,6 @@ impl DataAccelerator for PepperAccelerator {
             && refresh_mode == RefreshMode::Append
         {
             // Get primary keys from constraints
-            let arrow_schema_for_pk = Arc::new(cmd.schema.as_arrow().clone());
-            let primary_keys = if cmd.constraints.is_empty() {
-                Vec::new()
-            } else {
-                super::get_primary_keys_from_constraints(&cmd.constraints, &arrow_schema_for_pk)
-            };
             let has_primary_key = !primary_keys.is_empty();
 
             // Get time_column from the source via the trait method
@@ -611,7 +619,14 @@ impl DataAccelerator for PepperAccelerator {
 
         // Always create the base Pepper table provider
         let pepper_table = self
-            .create_pepper_table_provider(&table_name, &dir_path, Arc::clone(&arrow_schema), source)
+            .create_pepper_table_provider(
+                &table_name,
+                &dir_path,
+                Arc::clone(&arrow_schema),
+                primary_keys.clone(),
+                on_conflict.clone(),
+                source,
+            )
             .await
             .boxed()?;
 
@@ -676,6 +691,8 @@ impl DataAccelerator for PepperAccelerator {
                 catalog,
                 table_metadata.table_id,
                 unsupported_type_action,
+                primary_keys,
+                on_conflict,
             ));
 
             // Wrap the base table provider with partitioning logic
@@ -729,6 +746,8 @@ struct PepperPartitionCreator {
     catalog: Arc<dyn pepper::MetadataCatalog>,
     table_id: i64,
     unsupported_type_action: UnsupportedTypeAction,
+    primary_keys: Vec<String>,
+    on_conflict: Option<OnConflict>,
 }
 
 impl std::fmt::Debug for PepperPartitionCreator {
@@ -741,11 +760,14 @@ impl std::fmt::Debug for PepperPartitionCreator {
             .field("catalog", &"<dyn MetadataCatalog>")
             .field("table_id", &self.table_id)
             .field("unsupported_type_action", &self.unsupported_type_action)
+            .field("primary_keys", &self.primary_keys)
+            .field("on_conflict", &self.on_conflict)
             .finish()
     }
 }
 
 impl PepperPartitionCreator {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         table_name: String,
         base_path: PathBuf,
@@ -754,6 +776,8 @@ impl PepperPartitionCreator {
         catalog: Arc<dyn pepper::MetadataCatalog>,
         table_id: i64,
         unsupported_type_action: UnsupportedTypeAction,
+        primary_keys: Vec<String>,
+        on_conflict: Option<OnConflict>,
     ) -> Self {
         Self {
             table_name,
@@ -763,6 +787,8 @@ impl PepperPartitionCreator {
             catalog,
             table_id,
             unsupported_type_action,
+            primary_keys,
+            on_conflict,
         }
     }
 
@@ -850,9 +876,10 @@ impl PartitionCreator for PepperPartitionCreator {
         let table_options = pepper::metadata::CreateTableOptions {
             table_name: self.partition_table_name(&partition_value_str),
             schema: Arc::clone(&self.schema),
-            primary_key: vec![],
+            primary_key: self.primary_keys.clone(),
             base_path: partition_path.clone(),
             partition_column: None, // Partitions themselves are not partitioned
+            on_conflict: self.on_conflict.clone(),
         };
 
         // Create Pepper table provider for this partition
@@ -895,12 +922,15 @@ impl PartitionCreator for PepperPartitionCreator {
 
             // Create Pepper table provider for this partition
             let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
-            let pepper_table =
-                pepper::PepperTableProvider::new(&partition_table_name, Arc::clone(&self.catalog))
-                    .await
-                    .map_err(|e| creator::Error::InferringPartitions {
-                        source: Box::new(e),
-                    })?;
+            let pepper_table = pepper::PepperTableProvider::new(
+                &partition_table_name,
+                Arc::clone(&self.catalog),
+                self.on_conflict.clone(),
+            )
+            .await
+            .map_err(|e| creator::Error::InferringPartitions {
+                source: Box::new(e),
+            })?;
 
             result.push(Partition {
                 partition_value,

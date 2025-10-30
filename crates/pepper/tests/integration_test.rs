@@ -54,6 +54,7 @@ async fn test_pepper_basic_workflow_impl(
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        on_conflict: None,
     };
 
     // 3. Create Pepper table provider
@@ -374,7 +375,7 @@ async fn test_pepper_basic_workflow_impl(
     // This simulates what happens when spiced restarts or a new client connects
     let catalog_arc: Arc<dyn pepper::MetadataCatalog> =
         Arc::<pepper::PepperCatalog>::clone(catalog);
-    let fresh_table = PepperTableProvider::new("test_table", catalog_arc).await?;
+    let fresh_table = PepperTableProvider::new("test_table", catalog_arc, None).await?;
 
     // Create a fresh context and register the fresh table
     let fresh_ctx = SessionContext::new();
@@ -604,6 +605,7 @@ async fn test_pepper_statistics_impl(
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        on_conflict: None,
     };
 
     let table = PepperTableProvider::create_table(
@@ -717,6 +719,7 @@ async fn test_pepper_core_data_types_impl(
         primary_key: vec!["col_int64".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        on_conflict: None,
     };
 
     let table = PepperTableProvider::create_table(

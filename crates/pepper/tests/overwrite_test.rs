@@ -52,6 +52,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        on_conflict: None,
     };
 
     let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;

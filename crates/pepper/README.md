@@ -137,6 +137,8 @@ let options = CreateTableOptions {
     ])),
     primary_key: vec!["id".to_string()],
     base_path: "/data/users".to_string(),
+    partition_column: None,
+    on_conflict: None,
 };
 
 let table = PepperTableProvider::create_table(catalog, options).await?;
@@ -271,6 +273,8 @@ let options = CreateTableOptions {
     ])),
     primary_key: vec!["event_id".to_string()],
     base_path: "/data/events".to_string(),
+    partition_column: None,
+    on_conflict: None,
 };
 
 let table = PepperTableProvider::create_table(catalog.clone(), options).await?;
