@@ -142,7 +142,8 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }}
+            --concurrency ${{ github.event.inputs.concurrency_count }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -175,6 +176,7 @@ jobs:
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
 
       - name: Run the load test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -189,7 +191,8 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }}
+            --concurrency ${{ github.event.inputs.concurrency_count }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -222,3 +225,4 @@ jobs:
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
