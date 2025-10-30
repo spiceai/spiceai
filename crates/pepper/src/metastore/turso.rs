@@ -215,6 +215,16 @@ impl MetastoreRow for TursoRow {
             })?;
         Option::<String>::from_value(value)
     }
+
+    fn get_blob(&self, index: usize) -> CatalogResult<Vec<u8>> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or_else(|| CatalogError::Database {
+                message: format!("Column index {index} out of bounds"),
+            })?;
+        Vec::<u8>::from_value(value)
+    }
 }
 
 /// Convert Turso Value to `MetastoreValue`.
@@ -227,10 +237,7 @@ fn convert_turso_value(value: &TursoValue) -> MetastoreValue {
             MetastoreValue::Null
         }
         TursoValue::Text(t) => MetastoreValue::Text(t.clone()),
-        TursoValue::Blob(_) => {
-            // We don't use blobs in metadata
-            MetastoreValue::Null
-        }
+        TursoValue::Blob(b) => MetastoreValue::Blob(b.clone()),
     }
 }
 
@@ -240,6 +247,7 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
         MetastoreValue::Integer(i) => TursoValue::Integer(*i),
         MetastoreValue::Text(s) => TursoValue::Text(s.clone()),
         MetastoreValue::Bool(b) => TursoValue::Integer(i64::from(*b)),
+        MetastoreValue::Blob(b) => TursoValue::Blob(b.clone()),
         MetastoreValue::Null => TursoValue::Null,
     }
 }

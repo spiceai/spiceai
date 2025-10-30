@@ -64,6 +64,8 @@ pub enum MetastoreValue {
     Text(String),
     /// Boolean value
     Bool(bool),
+    /// Binary blob value
+    Blob(Vec<u8>),
     /// Null value
     Null,
 }
@@ -89,6 +91,18 @@ impl From<&str> for MetastoreValue {
 impl From<bool> for MetastoreValue {
     fn from(v: bool) -> Self {
         Self::Bool(v)
+    }
+}
+
+impl From<Vec<u8>> for MetastoreValue {
+    fn from(v: Vec<u8>) -> Self {
+        Self::Blob(v)
+    }
+}
+
+impl From<&[u8]> for MetastoreValue {
+    fn from(v: &[u8]) -> Self {
+        Self::Blob(v.to_vec())
     }
 }
 
@@ -140,6 +154,14 @@ pub trait MetastoreRow: Send {
     ///
     /// Returns an error if the column index is out of bounds.
     fn get_optional_string(&self, index: usize) -> CatalogResult<Option<String>>;
+
+    /// Get a blob value from the row by column index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column index is out of bounds or if the value
+    /// cannot be converted to a byte vector.
+    fn get_blob(&self, index: usize) -> CatalogResult<Vec<u8>>;
 }
 
 /// Trait for types that can be extracted from a metastore row.
@@ -191,6 +213,17 @@ impl<T: MetastoreGetValue> MetastoreGetValue for Option<T> {
         match value {
             MetastoreValue::Null => Ok(None),
             _ => Ok(Some(T::from_value(value)?)),
+        }
+    }
+}
+
+impl MetastoreGetValue for Vec<u8> {
+    fn from_value(value: &MetastoreValue) -> CatalogResult<Self> {
+        match value {
+            MetastoreValue::Blob(v) => Ok(v.clone()),
+            _ => Err(super::catalog::CatalogError::Database {
+                message: "Expected blob value".to_string(),
+            }),
         }
     }
 }

@@ -226,6 +226,16 @@ impl MetastoreRow for SqliteRow {
             })?;
         Option::<String>::from_value(value)
     }
+
+    fn get_blob(&self, index: usize) -> CatalogResult<Vec<u8>> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or_else(|| CatalogError::Database {
+                message: format!("Column index {index} out of bounds"),
+            })?;
+        Vec::<u8>::from_value(value)
+    }
 }
 
 /// Convert `rusqlite::Value` to `MetastoreValue`.
@@ -240,10 +250,7 @@ fn convert_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> MetastoreValue 
         rusqlite::types::ValueRef::Text(t) => {
             MetastoreValue::Text(String::from_utf8_lossy(t).to_string())
         }
-        rusqlite::types::ValueRef::Blob(_) => {
-            // We don't use blobs in metadata
-            MetastoreValue::Null
-        }
+        rusqlite::types::ValueRef::Blob(bytes) => MetastoreValue::Blob(bytes.to_vec()),
     }
 }
 
@@ -253,6 +260,7 @@ fn to_sqlite_param(value: &MetastoreValue) -> Box<dyn rusqlite::ToSql> {
         MetastoreValue::Integer(i) => Box::new(*i),
         MetastoreValue::Text(s) => Box::new(s.clone()),
         MetastoreValue::Bool(b) => Box::new(*b),
+        MetastoreValue::Blob(b) => Box::new(b.clone()),
         MetastoreValue::Null => Box::new(rusqlite::types::Null),
     }
 }
