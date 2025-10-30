@@ -95,6 +95,8 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .execution
         .skip_physical_aggregate_schema_check = true;
 
+    df_config.options_mut().execution.parquet.pushdown_filters = true;
+
     RwLock::new(df_config)
 });
 
