@@ -16756,8 +16756,7 @@ dependencies = [
 [[package]]
 name = "turso"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13e46b08d3c1f5d6d604a8a367bde08d6884762cef99bd73ee4e5f514c8f0559"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "mimalloc",
  "thiserror 2.0.17",
@@ -16769,8 +16768,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b48939c21f420d33a5f222c4723cb37ebafe3dfa6488acdce0ceb99b136b002"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "aegis",
  "aes",
@@ -16818,8 +16816,7 @@ dependencies = [
 [[package]]
 name = "turso_ext"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb31d1e0dcdcf596406b83dd6cacbda726195d03063f237de49db0a5eddba157"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -16829,8 +16826,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1f64cfc56b1c550a347b6679bf50686d9ff34c04e0c1a007fc6f8538dc74664"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -16840,8 +16836,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "821b2223adfd988771afc9c7fb743a6acf5cd20f1d4386614b2e2ac413844c16"
+source = "git+https://github.com/spiceai/turso?rev=5c4d14d298869fe5ea296163b3241d6963a2e87d#5c4d14d298869fe5ea296163b3241d6963a2e87d"
 dependencies = [
  "bitflags 2.10.0",
  "miette",
