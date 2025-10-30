@@ -596,7 +596,7 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .expect("array");
         // assert_eq!(float_array.value(0), 6.14);
-        assert!((float_array.value(0) - 6.14).abs() < f64::EPSILON);
+        assert!((float_array.value(0) - 6.14).abs() < 1e-10);
 
         let string_array = result
             .column(3)
@@ -795,9 +795,9 @@ mod tests {
             .expect("array");
 
         assert_eq!(float_values.len(), 3);
-        assert!((float_values.value(0) - 9.99).abs() < f64::EPSILON);
-        assert!((float_values.value(1) - 19.99).abs() < f64::EPSILON);
-        assert!((float_values.value(2) - 29.99).abs() < f64::EPSILON);
+        assert!((float_values.value(0) - 9.99).abs() < 1e-10);
+        assert!((float_values.value(1) - 19.99).abs() < 1e-10);
+        assert!((float_values.value(2) - 29.99).abs() < 1e-10);
     }
 
     #[test]

@@ -1518,7 +1518,7 @@ mod tests {
         let schema = create_test_schema();
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
-        let filter = col(r#""user.email""#).eq(lit("john@example.acom"));
+        let filter = col(r#""user.email""#).eq(lit("john@example.com"));
 
         let (expr, values) = builder.build_filter_expression(&[filter]);
 
@@ -1526,7 +1526,7 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert_eq!(
             values.get(":v0"),
-            Some(&AttributeValue::S("john@example.acom".to_string()))
+            Some(&AttributeValue::S("john@example.com".to_string()))
         );
     }
 }
