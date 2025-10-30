@@ -46,6 +46,14 @@ pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(
         .build()
 });
 
+pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_worker_panics";
+pub(crate) static REFRESH_WORKER_PANICS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter(METRIC_REFRESH_WORKER_PANICS)
+        .with_description("Number of times a refresh worker panicked while refreshing a dataset.")
+        .build()
+});
+
 pub(crate) static READY_STATE_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("accelerated_ready_state_federated_fallback")
