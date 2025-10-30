@@ -81,5 +81,5 @@ license-files = []
 name = "cfg_block"
 version = "0.1.1"
 expression = "Apache-2.0"
-license-files = ['https://github.com/pluots/cfg_block/blob/main/LICENSE']
+license-files = []
 
