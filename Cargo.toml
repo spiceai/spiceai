@@ -138,7 +138,7 @@ datafusion-physical-expr-common = "50.3.0"
 datafusion-physical-plan = "50.3.0"
 datafusion-proto = { version = "50.3.0", features = ["json"] }
 datafusion-pruning = "50.3.0"
-datafusion-table-providers = "0.1"
+datafusion-table-providers = { path = '../datafusion-table-providers/core' }
 delta_kernel = { version = "0.14", features = [
     "default-engine-rustls",
     "arrow-56",
@@ -284,11 +284,11 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "7d4fa6d36b464a72afea88e7d3644e143c2535ad" } # spiceai
+datafusion-table-providers = { path = '../datafusion-table-providers/core' } # spiceai
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "d6e7ebd853463acafaf8132dced23c98c45f7947" } # spiceai-50
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "71150a1e274fcccff34976bc59becb137752bf99" } # spiceai-1.4.1
+duckdb = { path = '../duckdb-rs/crates/duckdb' }
 ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }           # spiceai/spiceai-50
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }      # spiceai/spiceai-50
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }  # spiceai/spiceai-50

@@ -30,7 +30,7 @@ use datafusion_table_providers::{
     },
     util,
 };
-use duckdb::Transaction;
+use duckdb::{Connection, Transaction};
 use snafu::prelude::*;
 use std::sync::Arc;
 
@@ -68,7 +68,7 @@ impl DeletionTableProvider for DuckDBTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(
             Arc::new(DuckDBDeletionSink::new(
-                self.pool(),
+                self.connection()?,
                 self.table_definition(),
                 filters,
             )),
@@ -78,19 +78,19 @@ impl DeletionTableProvider for DuckDBTableWriter {
 }
 
 struct DuckDBDeletionSink {
-    pool: Arc<DuckDbConnectionPool>,
+    connection: Connection,
     table_definition: Arc<TableDefinition>,
     filters: Vec<Expr>,
 }
 
 impl DuckDBDeletionSink {
     fn new(
-        pool: Arc<DuckDbConnectionPool>,
+        connection: Connection,
         table_definition: Arc<TableDefinition>,
         filters: &[Expr],
     ) -> Self {
         Self {
-            pool,
+            connection,
             table_definition,
             filters: filters.to_vec(),
         }
@@ -100,17 +100,13 @@ impl DuckDBDeletionSink {
 #[async_trait]
 impl DeletionSink for DuckDBDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let pool = Arc::clone(&self.pool);
         let table_definition = Arc::clone(&self.table_definition);
         let filters = self.filters.clone();
+        let mut task_connection = self.connection.try_clone()?;
 
         tokio::task::spawn_blocking(
             move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-                let mut db_conn = pool.connect_sync()?;
-                let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let tx = duckdb_conn
-                    .conn
+                let tx = task_connection
                     .transaction()
                     .context(UnableToBeginTransactionSnafu)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;

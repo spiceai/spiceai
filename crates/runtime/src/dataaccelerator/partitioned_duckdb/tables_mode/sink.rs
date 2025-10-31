@@ -557,8 +557,15 @@ fn write_to_tables(
                     .map_err(table_providers_duckdb_to_datafusion_error)?,
             );
 
+            let mut write_cxn = Arc::clone(&pool).connect_sync()
+                .map_err(|e| DataFusionError::External(e.into()))?;
+
+            let mut write_cxn = DuckDB::duckdb_conn(
+                &mut write_cxn
+            ).map_err(|e| DataFusionError::External(e.into()))?.conn.try_clone().map_err(|e| DataFusionError::External(e.into()))?;
+
             partition_table
-                .create_table(Arc::clone(pool), tx)
+                .create_table(&mut write_cxn, tx)
                 .map_err(table_providers_duckdb_to_datafusion_error)?;
 
             created_partitions.insert(partition.clone(), Arc::clone(&partition_table));

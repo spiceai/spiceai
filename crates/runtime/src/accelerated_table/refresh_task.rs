@@ -840,8 +840,11 @@ impl RefreshTask {
         disable_federation: bool,
         io_runtime: Handle,
     ) -> SessionContext {
+        let mut cfg = get_df_default_config();
+        cfg.options_mut().execution.batch_size = 32768;
+
         let state_builder = SessionStateBuilder::new()
-            .with_config(get_df_default_config())
+            .with_config(cfg)
             .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
 

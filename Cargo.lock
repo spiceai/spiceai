@@ -4798,9 +4798,9 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=7d4fa6d36b464a72afea88e7d3644e143c2535ad#7d4fa6d36b464a72afea88e7d3644e143c2535ad"
 dependencies = [
  "arrow",
+ "arrow-array",
  "arrow-json",
  "arrow-schema",
  "async-stream",
@@ -5308,7 +5308,6 @@ checksum = "d3a5ccdfd6c5e7e2fea9c5cf256f2a08216047fab19c621c3da64e9ae4a1462d"
 [[package]]
 name = "duckdb"
 version = "1.4.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=71150a1e274fcccff34976bc59becb137752bf99#71150a1e274fcccff34976bc59becb137752bf99"
 dependencies = [
  "arrow",
  "calamine",
@@ -8319,7 +8318,6 @@ checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 [[package]]
 name = "libduckdb-sys"
 version = "1.4.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=71150a1e274fcccff34976bc59becb137752bf99#71150a1e274fcccff34976bc59becb137752bf99"
 dependencies = [
  "cc",
  "flate2",
