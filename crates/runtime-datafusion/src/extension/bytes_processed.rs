@@ -145,7 +145,8 @@ impl Stream for BytesProcessedStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                self.bytes_processed += batch.get_array_memory_size() as u64;
+                let array_size: usize = batch.get_array_memory_size();
+                self.bytes_processed += array_size as u64;
                 Poll::Ready(Some(Ok(batch)))
             }
             Poll::Ready(None) => {
