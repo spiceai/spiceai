@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
+};
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use runtime_parameters::ExposedParamLookup;
+use snafu::ResultExt;
+use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
-
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
-};
 
 #[derive(Debug)]
 pub struct DynamoDB {
@@ -46,6 +48,8 @@ impl DynamoDBFactory {
     }
 }
 
+const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
+
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
     ParameterSpec::component("aws_region")
@@ -61,6 +65,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use for DynamoDB.")
         .secret(),
+    ParameterSpec::runtime("unnest_depth")
+        .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
+    ParameterSpec::runtime("schema_infer_max_records")
+        .description("Number of documents to use to infer the schema. Defaults to 10.")
+        .default(DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -118,13 +127,42 @@ impl DataConnector for DynamoDB {
         .await;
 
         let client = Client::new(&config);
-        let provider = DynamoDBTableProvider::try_new(Arc::new(client), Arc::from(table_name))
-            .await
-            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+
+        let schema_infer_max_records_str =
+            match self.params.get("schema_infer_max_records").expose() {
+                ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str,
+                ExposedParamLookup::Absent(_) => DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR,
+            };
+
+        let schema_infer_max_records = i32::from_str(schema_infer_max_records_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            dataconnector: "dynamodb".to_string(),
+            message: format!(
+                "DynamoDB parameter 'schema_infer_max_records' must be an integer, not {schema_infer_max_records_str}"),
+            connector_component: ConnectorComponent::from(dataset)
+        })?;
+
+        let unnest_depth = match self.params.get("unnest_depth").expose() {
+            ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                 dataconnector: "dynamodb".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?;
+                message: format!(
+                    "DynamoDB parameter 'unnest_depth' must be an integer, not {unnest_depth_str}"),
+                connector_component: ConnectorComponent::from(dataset)
+            })?),
+            ExposedParamLookup::Absent(_) => None,
+        };
+
+        let provider = DynamoDBTableProvider::try_new(
+            Arc::new(client),
+            Arc::from(table_name),
+            unnest_depth,
+            schema_infer_max_records,
+        )
+        .await
+        .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "dynamodb".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
         Ok(Arc::new(provider))
     }
 }

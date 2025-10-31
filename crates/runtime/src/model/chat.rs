@@ -273,7 +273,34 @@ async fn huggingface(
             path.display()
         );
     }
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token).await
+
+    // Check which engine to use
+    let engine = component.engine.as_deref().unwrap_or("mistral-rs");
+
+    match engine {
+        #[cfg(feature = "llama_cpp")]
+        "llama.cpp" => {
+            tracing::debug!("Using llama.cpp engine for model {}", component.name);
+            llms::chat::create_hf_model_llama_cpp(&id, gguf_path, hf_token).await
+        }
+        "mistral-rs" => {
+            tracing::debug!("Using mistral-rs engine for model {}", component.name);
+            llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token).await
+        }
+        _ => Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Unknown or unsupported engine '{}' for HuggingFace model. \
+                Supported engines: mistral-rs{}",
+                engine,
+                if cfg!(feature = "llama_cpp") {
+                    ", llama.cpp"
+                } else {
+                    ""
+                }
+            )
+            .into(),
+        }),
+    }
 }
 
 async fn databricks(
@@ -495,15 +522,41 @@ async fn file(
 
     let chat_template_literal = params.get("chat_template").expose().ok();
 
-    llms::chat::create_local_model(
-        model_weights.as_slice(),
-        config_path.as_deref(),
-        tokenizer_path.as_deref(),
-        tokenizer_config_path.as_deref(),
-        generation_config.as_deref(),
-        chat_template_literal,
-    )
-    .await
+    // Check which engine to use
+    let engine = component.engine.as_deref().unwrap_or("mistral-rs");
+
+    match engine {
+        #[cfg(feature = "llama_cpp")]
+        "llama.cpp" => {
+            tracing::debug!("Using llama.cpp engine for local model {}", component.name);
+            llms::chat::create_local_model_llama_cpp(model_weights.as_slice()).await
+        }
+        "mistral-rs" => {
+            tracing::debug!("Using mistral-rs engine for local model {}", component.name);
+            llms::chat::create_local_model(
+                model_weights.as_slice(),
+                config_path.as_deref(),
+                tokenizer_path.as_deref(),
+                tokenizer_config_path.as_deref(),
+                generation_config.as_deref(),
+                chat_template_literal,
+            )
+            .await
+        }
+        _ => Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Unknown or unsupported engine '{}' for local file model. \
+                Supported engines: mistral-rs{}",
+                engine,
+                if cfg!(feature = "llama_cpp") {
+                    ", llama.cpp"
+                } else {
+                    ""
+                }
+            )
+            .into(),
+        }),
+    }
 }
 
 // Get OpenAI compatible request parameter overrides.
