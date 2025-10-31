@@ -312,26 +312,15 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        None
+        self.input_exec.metrics()
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+        self.input_exec.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        if let Some(idx) = partition {
-            // Validate partition index
-            let partition_count = self.properties().partitioning.partition_count();
-            if idx >= partition_count {
-                return internal_err!(
-                    "Invalid partition index: {}, the partition count is {}",
-                    idx,
-                    partition_count
-                );
-            }
-        }
-        Ok(Statistics::new_unknown(&self.schema()))
+        self.input_exec.partition_statistics(partition)
     }
 
     // Allow optimizer to push limits through to inputs
