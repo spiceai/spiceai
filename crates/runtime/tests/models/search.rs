@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
+#[cfg(feature = "s3_vectors")]
 use crate::models::s3_vectors::basic_vector_search_tests;
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
@@ -434,7 +435,10 @@ async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
     run_search_w_explain(
         app.build(),
         [
+        #[cfg(feature = "s3_vectors")]
         basic_vector_search_tests("multi_column_view_answer"),
+        #[cfg(not(feature = "s3_vectors"))]
+        vec![],
         vec![
             SearchTestCase::new(
                 "multi_column_view_basic".to_string(),
