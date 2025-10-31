@@ -23,7 +23,7 @@ use std::{
 
 use crate::{
     metrics::QueryStatus,
-    queries::{self, QueryOverrides, QuerySet},
+    queries::{self, QuerySet},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -64,12 +64,8 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_query_set(
-        mut self,
-        query_set: QuerySet,
-        overrides: Option<QueryOverrides>,
-    ) -> Self {
-        self.queries = query_set.get_queries(overrides);
+    pub fn with_query_set(mut self, query_set: QuerySet, queries: Vec<queries::Query>) -> Self {
+        self.queries = queries;
         self.query_count = self.queries.len();
         self.query_set = query_set;
         self
@@ -229,14 +225,14 @@ impl SpiceTest<Running> {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             Ok(Err(e)) => {
                 self.state.query_workers.iter().for_each(|worker| {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             _ => {}
         }

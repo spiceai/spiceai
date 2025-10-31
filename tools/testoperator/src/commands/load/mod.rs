@@ -48,7 +48,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .query_overrides
         .clone()
         .map(QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
 
     let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -56,6 +55,15 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
+
+    let queries = query_set
+        .get_queries(
+            query_overrides,
+            Some(&spiced_instance),
+            args.test_args.random_param_set_count,
+        )
+        .await?;
+
     let health_monitor = HealthMonitor::spawn()?;
 
     let test_duration = Duration::from_secs(args.test_args.common.duration);
@@ -138,6 +146,14 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         KeyValue::new("spiced_commit_sha", spiced_commit_sha),
         KeyValue::new("branch_name", metrics.branch_name.clone()),
         KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
+        // If not specified, default to 1 meaning single fixed params set was used
+        KeyValue::new(
+            "param_set_variants",
+            args.test_args
+                .random_param_set_count
+                .unwrap_or(1)
+                .to_string(),
+        ),
     ]);
 
     let telemetry = Telemetry::new(&load_resource, "SPICEAI_BENCHMARK_METRICS_KEY");

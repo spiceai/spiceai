@@ -48,6 +48,7 @@ impl FileAppendableSource {
 
 #[async_trait]
 impl AppendableSource for FileAppendableSource {
+    #[allow(clippy::format_push_string)]
     async fn setup(&self, config: &AppendConfig) -> Result<()> {
         if fs::try_exists(&self.dest_db_file).await? {
             fs::remove_file(&self.dest_db_file).await?;
@@ -69,8 +70,7 @@ impl AppendableSource for FileAppendableSource {
         tokio::task::spawn_blocking(move || {
             let dest_conn = Connection::open(&dest_db_file)?;
             println!(
-                "Loading initial data for {} benchmark suite",
-                query_set
+                "Loading initial data for {query_set} benchmark suite"
             );
             match query_set {
                 QuerySet::Tpch => {
@@ -78,8 +78,7 @@ impl AppendableSource for FileAppendableSource {
                         "INSTALL tpch;
                          LOAD tpch;
                          BEGIN;
-                         CALL dbgen(sf=1, children={load_steps}, step=0);\n",
-                        load_steps = load_steps
+                         CALL dbgen(sf=1, children={load_steps}, step=0);\n"
                     );
 
                     for TableWithTimeColumn { name, column } in &tables {
@@ -108,8 +107,7 @@ impl AppendableSource for FileAppendableSource {
                              ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                              INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
                              LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
-                             COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
-                            load_steps = load_steps
+                             COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n"
                         );
                     }
 
@@ -142,6 +140,7 @@ impl AppendableSource for FileAppendableSource {
         Ok(())
     }
 
+    #[allow(clippy::format_push_string)]
     async fn generate(&self, config: &AppendConfig, load_index: u16) -> Result<()> {
         println!(
             "Loading append data for {query_set} benchmark suite - {load_index}/{load_steps}",
@@ -165,8 +164,7 @@ impl AppendableSource for FileAppendableSource {
                         "INSTALL tpch;
                          LOAD tpch;
                          BEGIN;
-                         CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n",
-                        load_steps = load_steps
+                         CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n"
                     );
 
                     for TableWithTimeColumn { name, column } in &tables {
@@ -189,8 +187,7 @@ impl AppendableSource for FileAppendableSource {
                                          FROM {name}_gen
                                          LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
                                          OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
-                                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
-                                load_steps = load_steps);
+                                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n");
                     }
 
                     sql += "COMMIT;";
@@ -204,8 +201,7 @@ impl AppendableSource for FileAppendableSource {
                                        LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
                                        OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
                                        COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
-                                       COMMIT;",
-                                                    load_steps = load_steps);
+                                       COMMIT;");
 
                     dest_conn.execute_batch(&sql)?;
                 }

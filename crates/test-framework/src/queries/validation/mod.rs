@@ -587,12 +587,14 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_correct_answer_wrong_type() {
+    #[tokio::test]
+    async fn test_correct_answer_wrong_type() {
         // Use the correct answer, but a different datatype
         // Q22 from CSV, cntrycode is Utf8. Query returns it as Int64
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();
@@ -672,11 +674,13 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_wrong_answers() {
+    #[tokio::test]
+    async fn test_wrong_answers() {
         // Use the wrong answer and validate it fails
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();

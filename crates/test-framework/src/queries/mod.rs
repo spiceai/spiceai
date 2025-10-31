@@ -20,9 +20,13 @@ use arrow::array::RecordBatch;
 use parameterized::{ParameterValue, add_tpch_parameters};
 use serde::{Deserialize, Serialize};
 
-use crate::flight::{PreparedStatementParamColumn, create_param_batch};
+use crate::{
+    flight::{PreparedStatementParamColumn, create_param_batch},
+    spiced::SpicedInstance,
+};
 
 pub mod parameterized;
+pub mod saffron;
 pub mod validation;
 
 #[macro_export]
@@ -257,13 +261,19 @@ impl From<&(&'static str, u32)> for TableWithRowCount {
 }
 
 impl QuerySet {
-    #[must_use]
-    pub fn get_queries(&self, overrides: Option<QueryOverrides>) -> Vec<Query> {
+    pub async fn get_queries(
+        &self,
+        overrides: Option<QueryOverrides>,
+        instance: Option<&SpicedInstance>,
+        random_param_set_count: Option<usize>,
+    ) -> anyhow::Result<Vec<Query>> {
         match self {
-            QuerySet::Tpch => get_tpch_test_queries(overrides),
-            QuerySet::Tpcds => get_tpcds_test_queries(overrides),
-            QuerySet::Clickbench => get_clickbench_test_queries(overrides),
-            QuerySet::ParameterizedSaffron => get_saffron_test_queries(overrides),
+            QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
+            QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
+            QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
+            QuerySet::ParameterizedSaffron => {
+                get_saffron_test_queries(overrides, instance, random_param_set_count).await
+            }
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
                     "parameterized",
@@ -288,7 +298,7 @@ impl QuerySet {
                     q21 // q22 -- Invalid argument error: column types must match schema types, expected Float64 but found Decimal128(38, 10) at column index 7
                 );
 
-                add_tpch_parameters(queries)
+                Ok(add_tpch_parameters(queries))
             }
         }
     }
@@ -750,99 +760,26 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     queries
 }
 
-#[must_use]
-pub fn get_saffron_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+pub async fn get_saffron_test_queries(
+    overrides: Option<QueryOverrides>,
+    instance: Option<&SpicedInstance>,
+    random_param_set_count: Option<usize>,
+) -> anyhow::Result<Vec<Query>> {
     let queries = match overrides {
         Some(QueryOverrides::SaffronViews) => {
             generate_saffron_views_queries!(1, 2, 3, 4, 5, 6)
         }
         _ => generate_saffron_queries!(1, 2, 3, 4, 5, 6),
     };
-    add_saffron_parameters(queries)
-}
 
-/// Defines parameters for Saffron queries based on typical telephony use cases
-#[must_use]
-pub fn add_saffron_parameters(queries: Vec<Query>) -> Vec<Query> {
-    queries
-        .into_iter()
-        .map(|q| {
-            let mut q = q;
-            match q.name.replace("saffron_", "").as_str() {
-                "q1" => {
-                    q.parameters = Some(vec![
-                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
-                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
-                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid
-                        ParameterValue::String("sms".into()), // Capability
-                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
-                    ]);
-                }
-                "q2" => {
-                    q.parameters = Some(vec![
-                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
-                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
-                        ParameterValue::String("tf".into()), // NumberType (IN clause)
-                        ParameterValue::Number(49),          // MaxRate filter
-                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
-                        ParameterValue::Number(0), // selectA2pNumber flag (0 = false)
-                        ParameterValue::String("sms".into()), // Capability
-                        ParameterValue::Number(0), // LIMIT offset
-                    ]);
-                }
-                "q3" => {
-                    q.parameters = Some(vec![
-                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
-                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
-                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
-                        ParameterValue::String("tf".into()), // NumberType (IN clause)
-                        ParameterValue::String("212".into()), // AreaCodeRegion (IN clause)
-                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
-                        ParameterValue::String("sms".into()), // Capability
-                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
-                    ]);
-                }
-                "q4" => {
-                    q.parameters = Some(vec![
-                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
-                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
-                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
-                        ParameterValue::String("tf".into()), // NumberType (IN clause)
-                        ParameterValue::String("212".into()), // AreaCodeRegion (IN clause)
-                        ParameterValue::Number(49),          // MaxRate filter
-                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
-                        ParameterValue::String("sms".into()), // Capability
-                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
-                        ParameterValue::Number(0),            // LIMIT offset
-                    ]);
-                }
-                "q5" => {
-                    q.parameters = Some(vec![
-                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
-                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
-                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
-                        ParameterValue::String("tf".into()), // NumberType (IN clause)
-                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
-                        ParameterValue::String("sms".into()), // Capability
-                        ParameterValue::Number(0),            // selectA2pNumber flag (0 = false)
-                    ]);
-                }
-                "q6" => {
-                    q.parameters = Some(vec![
-                        ParameterValue::String("AC02da2b759e8342d4b73ff6e64a77ce58".into()), // AccountSid
-                        ParameterValue::String("NPcb39bd63c0a54ab8b106d8f9e0aa6507".into()), // NumberPoolSid
-                        ParameterValue::String("CA".into()), // NumberRegion (IN clause)
-                        ParameterValue::String("tf".into()), // NumberType (IN clause)
-                        ParameterValue::Number(49),          // MaxRate filter
-                        ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
-                        ParameterValue::Number(0), // selectA2pNumber flag (0 = false)
-                        ParameterValue::String("sms".into()), // Capability
-                        ParameterValue::Number(0), // LIMIT offset
-                    ]);
-                }
-                _ => {}
-            }
-            q
-        })
-        .collect()
+    match (random_param_set_count, instance) {
+        (Some(count), Some(instance)) if count > 0 => {
+            // Generate randomized parameter sets for load testing
+            saffron::generate_randomized_saffron_queries(queries, instance, count, overrides).await
+        }
+        _ => {
+            // Use fixed parameters for deterministic testing
+            Ok(saffron::add_saffron_fixed_parameters(queries))
+        }
+    }
 }

@@ -47,6 +47,11 @@ pub struct DatasetTestArgs {
     /// Whether to add HTTP clients for the test
     #[arg(long)]
     pub(crate) http_clients: bool,
+
+    /// Number of parameters to randomize for each query execution.
+    /// If not specified or 0, fixed parameters are used (no randomization).
+    #[arg(long)]
+    pub(crate) random_param_set_count: Option<usize>,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
