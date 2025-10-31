@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/dynamodb/mod.rs
+expression: formatted
+---
++-------------+----------------------+
+| total_count | max_timestamp        |
++-------------+----------------------+
+| 2           | 2019-01-01T00:00:00Z |
++-------------+----------------------+

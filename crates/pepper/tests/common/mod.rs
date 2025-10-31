@@ -29,6 +29,7 @@ pub enum BackendType {
 }
 
 impl BackendType {
+    #[allow(dead_code)]
     pub fn name(self) -> &'static str {
         match self {
             BackendType::Sqlite => "SQLite",
@@ -44,6 +45,7 @@ pub struct TestFixture {
     pub temp_dir: TempDir,
     pub catalog: Arc<PepperCatalog>,
     pub data_path: std::path::PathBuf,
+    #[allow(dead_code)]
     pub backend_type: BackendType,
 }
 
