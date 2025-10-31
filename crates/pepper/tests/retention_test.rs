@@ -53,7 +53,7 @@ async fn test_retention_filters_apply_on_insert_impl(
     };
 
     let retention_expr = col("value").lt(lit(3i64));
-    let catalog_arc: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
+    let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table_provider = Arc::new(
         PepperTableProvider::create_table_with_retention(
             catalog_arc,
@@ -165,7 +165,7 @@ async fn test_retention_filters_skip_when_no_matches_impl(
     };
 
     let retention_expr = col("value").lt(lit(0i64));
-    let catalog_arc: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
+    let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table_provider = PepperTableProvider::create_table_with_retention(
         catalog_arc,
         table_options,
