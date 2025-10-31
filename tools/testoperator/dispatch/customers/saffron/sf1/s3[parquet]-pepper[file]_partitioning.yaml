@@ -8,6 +8,6 @@ tests:
     spicepod_path: s3[parquet]-pepper[file]_partitioning.yaml
     query_set: saffron[parameterized]
     ready_wait: 300
-    runner_type: spicehq-dev-large-runners
+    runner_type: spicehq-dev-runners
     concurrency: 128
     duration: 1800

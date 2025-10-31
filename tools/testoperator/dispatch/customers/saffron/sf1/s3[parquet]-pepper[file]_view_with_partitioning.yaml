@@ -10,6 +10,6 @@ tests:
     query_set: saffron[parameterized]
     query_overrides: saffron-views
     ready_wait: 300
-    runner_type: spicehq-dev-large-runners
+    runner_type: spicehq-dev-runners
     concurrency: 128
     duration: 1800
