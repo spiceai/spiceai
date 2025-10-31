@@ -19,7 +19,7 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Statistics, internal_err};
+use datafusion::common::Statistics;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -208,6 +208,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
+        #[allow(deprecated)]
         self.input.statistics()
     }
 

@@ -20,8 +20,8 @@ limitations under the License.
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::Statistics;
 use datafusion::common::tree_node::TransformedResult;
-use datafusion::common::{Statistics, internal_err};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr::OrderingRequirements;
@@ -58,6 +58,7 @@ pub struct BytesProcessedPhysicalOptimizer {
 }
 
 impl BytesProcessedPhysicalOptimizer {
+    #[must_use]
     pub fn new(emit_bytes_callback: Arc<BytesEmittedCallback>) -> Self {
         Self {
             emit_bytes_callback,
@@ -173,7 +174,8 @@ impl BytesProcessedExec {
         }
     }
 
-    pub fn fallback_to_new_context(mut self) -> Self {
+    #[must_use]
+    fn fallback_to_new_context(mut self) -> Self {
         self.fallback_to_new_context = true;
         self
     }
@@ -316,6 +318,7 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
+        #[allow(deprecated)]
         self.input_exec.statistics()
     }
 
