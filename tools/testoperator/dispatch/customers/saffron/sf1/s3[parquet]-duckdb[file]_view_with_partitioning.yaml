@@ -13,3 +13,4 @@ tests:
     runner_type: spicehq-dev-runners
     concurrency: 128
     duration: 1800
+    random_param_set_count: 1000
