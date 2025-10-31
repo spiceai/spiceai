@@ -43,7 +43,6 @@ use datafusion::{
             resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
     },
-    physical_plan::ExecutionPlan,
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
