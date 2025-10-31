@@ -300,7 +300,7 @@ vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]
-pepper = { path = "../pepper", optional = true }
+pepper = { path = "../pepper", optional = true, features = ["turso"] }
 vortex = { workspace = true, optional = true }
 vortex-datafusion = { workspace = true, optional = true }
 
