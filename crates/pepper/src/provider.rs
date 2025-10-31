@@ -37,7 +37,6 @@ use super::deletion::{DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::metadata::{
     CreateTableOptions, KeyIndexEntry, KeyIndexEntryNew, KeyIndexKey, TableMetadata,
 };
-use super::metadata::{CreateTableOptions, TableMetadata};
 use crate::key_index::{KeyMaterial, KeySerializer};
 use arrow::array::UInt32Array;
 use arrow_schema::SchemaRef;
@@ -64,6 +63,8 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use futures::StreamExt;
+use std::any::Any;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};

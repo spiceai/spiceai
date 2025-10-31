@@ -108,6 +108,10 @@ impl KeySerializer {
     /// The returned collection preserves row ordering so callers can map key
     /// material back to the original rows. This method allocates only the
     /// per-row key bytes and reuses internal buffers across calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key columns cannot be encoded.
     pub fn extract(&mut self, batch: &RecordBatch) -> CatalogResult<Vec<KeyMaterial>> {
         let row_count = batch.num_rows();
         if row_count == 0 {
