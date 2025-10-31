@@ -368,11 +368,21 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
             Partitioning::UnknownPartitioning(partitions) => partitions,
         };
 
+        let segment: i32 = i32::try_from(partition).map_err(|_| {
+            DataFusionError::Execution(
+                format!("Partition number too large for DynamoDB segment: {partition}").to_string(),
+            )
+        })?;
+
+        let total_segments: i32 = i32::try_from(total_partitions).map_err(|_| DataFusionError::Execution(
+            format!("Total partitions number too large for DynamoDB total_segments: {total_partitions}").to_string()
+        ))?;
+
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
 
             let item_stream =
-                build_stream_from_plan(&client, request_plan, partition, total_partitions);
+                build_stream_from_plan(&client, request_plan, segment, total_segments);
             let chunked_stream = item_stream.chunks(CHUNK_SIZE);
             pin_mut!(chunked_stream);
 
@@ -404,8 +414,8 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 fn build_stream_from_plan(
     client: &Arc<Client>,
     request: DynamoDBRequestPlan,
-    partition: usize,
-    total_partitions: usize,
+    segment: i32,
+    total_segments: i32,
 ) -> Pin<Box<DynamoDBItemStream>> {
     match request {
         DynamoDBRequestPlan::Query(QueryParams {
@@ -456,10 +466,8 @@ fn build_stream_from_plan(
                 .set_projection_expression(projection_expression)
                 .set_limit(limit);
 
-            if total_partitions > 1 {
-                request = request
-                    .segment(partition as i32)
-                    .total_segments(total_partitions as i32);
+            if total_segments > 1 {
+                request = request.segment(segment).total_segments(total_segments);
             }
 
             let pagination_stream = TryFlatMap::new(request.into_paginator().send())
