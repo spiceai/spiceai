@@ -259,7 +259,9 @@ models = [
     "mcp",
     "dep:strsim",
     "runtime-datafusion-udfs/models",
+    "llama_cpp",
 ]
+llama_cpp = ["llms/llama_cpp"]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
@@ -300,7 +302,7 @@ vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]
-pepper = { path = "../pepper", optional = true }
+pepper = { path = "../pepper", optional = true, features = ["turso"] }
 vortex = { workspace = true, optional = true }
 vortex-datafusion = { workspace = true, optional = true }
 

@@ -19,13 +19,25 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::{Statistics, internal_err};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::OrderingRequirements;
+use datafusion::physical_plan::execution_plan::{
+    CardinalityEffect, InvariantLevel, check_default_invariants,
+};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+};
+use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    PhysicalExpr, PlanProperties,
 };
 use futures::StreamExt;
 use std::any::Any;
@@ -75,8 +87,19 @@ impl fmt::Debug for SchemaCastScanExec {
     }
 }
 
+// if new features are added to ExecutionPlan, we want to know
+// it's possible we'll just re-implement the default methods - but that requires attention
+// for example, the recently added `gather_filters_for_pushdown` defaults to `all_unsupported` but we likely want `from_children`
+#[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for SchemaCastScanExec {
     fn name(&self) -> &'static str {
+        "SchemaCastScanExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
         "SchemaCastScanExec"
     }
 
@@ -107,6 +130,26 @@ impl ExecutionPlan for SchemaCastScanExec {
         )
     }
 
+    fn check_invariants(&self, check: InvariantLevel) -> Result<()> {
+        check_default_invariants(self, check)
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![None; self.children().len()]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true; self.children().len()]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -127,6 +170,19 @@ impl ExecutionPlan for SchemaCastScanExec {
         }
     }
 
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
+
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -145,6 +201,75 @@ impl ExecutionPlan for SchemaCastScanExec {
                 }
             },
         )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if let Some(idx) = partition {
+            // Validate partition index
+            let partition_count = self.properties().partitioning.partition_count();
+            if idx >= partition_count {
+                return internal_err!(
+                    "Invalid partition index: {}, the partition count is {}",
+                    idx,
+                    partition_count
+                );
+            }
+        }
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    // Allow optimizer to push limits through to inputs
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
     }
 }
 

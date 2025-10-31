@@ -24,8 +24,10 @@ use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
-use spicepod::component::view::View;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::{
+    component::{dataset::Dataset, view::View},
+    param::Params,
+};
 use std::sync::Arc;
 use std::{
     collections::HashMap,

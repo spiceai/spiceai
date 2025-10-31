@@ -20,6 +20,7 @@ use arrow::array::{
     Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
     StringViewArray,
 };
+use arrow::compute::concat_batches;
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field, Schema};
 use data_components::s3_vectors::S3VectorsTable;
@@ -105,6 +106,37 @@ pub async fn write(
     index: &S3Vector,
     table: &S3VectorsTable,
     record: RecordBatch,
+    batch_write_rows: usize,
+) -> Result<RecordBatch, Error> {
+    if record.num_rows() <= batch_write_rows {
+        return process_single_batch(index, table, record).await;
+    }
+
+    let mut result_batches = Vec::with_capacity(record.num_rows().div_ceil(batch_write_rows));
+    let schema = record.schema();
+
+    for chunk_start in (0..record.num_rows()).step_by(batch_write_rows) {
+        let chunk_end = (chunk_start + batch_write_rows).min(record.num_rows());
+        let chunk_length = chunk_end - chunk_start;
+
+        let chunk_batch = record.slice(chunk_start, chunk_length);
+
+        let processed_chunk = process_single_batch(index, table, chunk_batch).await?;
+        result_batches.push(processed_chunk);
+    }
+
+    let concatenated =
+        concat_batches(&schema, &result_batches).context(IssueWithArrowProcessingSnafu {
+            index: index.name(),
+        })?;
+
+    Ok(concatenated)
+}
+
+async fn process_single_batch(
+    index: &S3Vector,
+    table: &S3VectorsTable,
+    record: RecordBatch,
 ) -> Result<RecordBatch, Error> {
     let Some((embedded_column_idx, _)) = record
         .schema()
@@ -162,9 +194,13 @@ pub async fn write(
     }
 
     // Update the embedding column in the batch with computed embeddings
-    let updated_record =
-        update_embedding_column_in_batch(&record, &index.embedded_column, &embedding_vectors)
-            .map_err(|e| *e)?;
+    let updated_record = update_embedding_column_in_batch(
+        &record,
+        &index.embedded_column,
+        &embedding_vectors,
+        i32::try_from(table.dimension).unwrap_or_default(),
+    )
+    .map_err(|e| *e)?;
 
     // Filter out zero vectors to prevent cosine similarity calculation errors
     let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
@@ -381,6 +417,7 @@ fn update_embedding_column_in_batch(
     record: &RecordBatch,
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
+    dimension: i32,
 ) -> Result<RecordBatch, Box<Error>> {
     let embedding_column_name = embedding_col(embedded_column_name);
 
@@ -388,7 +425,7 @@ fn update_embedding_column_in_batch(
     let mut columns = record.columns().to_vec();
 
     // Create new embedding array that will replace the existing column or be added as a new column
-    let embedding_array = create_embedding_array(embedding_vectors)?;
+    let embedding_array = create_embedding_array(embedding_vectors, dimension)?;
 
     // Check if the embedding column already exists
     let target_schema = if let Some((idx, _)) = schema.column_with_name(&embedding_column_name) {
@@ -417,21 +454,24 @@ fn update_embedding_column_in_batch(
 #[allow(clippy::cast_sign_loss)]
 fn create_embedding_array(
     embedding_vectors: &[Option<Vec<f32>>],
+    dimension: i32,
 ) -> Result<Arc<dyn Array>, Box<Error>> {
-    // Determine embedding dimension from first non-null embedding
-    let dimension = i32::try_from(
-        embedding_vectors
-            .iter()
-            .find_map(|opt| opt.as_ref().map(Vec::len))
-            .unwrap_or(0),
-    )
-    .context(EmbeddingDimensionTooLargeSnafu)
-    .map_err(Box::from)?;
-
+    let mut dimension = dimension;
     if dimension <= 0 {
-        CannotDetermineEmbeddingDimensionSnafu {}
-            .fail()
-            .map_err(Box::from)?;
+        // Fallback: determine embedding dimension from first non-null embedding
+        dimension = i32::try_from(
+            embedding_vectors
+                .iter()
+                .find_map(|opt| opt.as_ref().map(Vec::len))
+                .unwrap_or(0),
+        )
+        .context(EmbeddingDimensionTooLargeSnafu)
+        .map_err(Box::from)?;
+        if dimension <= 0 {
+            CannotDetermineEmbeddingDimensionSnafu {}
+                .fail()
+                .map_err(Box::from)?;
+        }
     }
 
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
@@ -555,7 +595,8 @@ mod tests {
     fn test_create_embedding_array_valid_embeddings() {
         let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
 
-        let result = create_embedding_array(&embeddings).expect("Failed to create embedding array");
+        let result =
+            create_embedding_array(&embeddings, 3).expect("Failed to create embedding array");
 
         let list_array = result
             .as_any()
@@ -582,7 +623,7 @@ mod tests {
     fn test_create_embedding_array_empty_embeddings() {
         let embeddings: Vec<Option<Vec<f32>>> = vec![None, None];
 
-        let result = create_embedding_array(&embeddings);
+        let result = create_embedding_array(&embeddings, 0);
 
         // Should fail because no valid embeddings to determine dimension
         assert!(result.is_err());
@@ -603,7 +644,7 @@ mod tests {
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
 
-        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings)
+        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings, 3)
             .expect("Failed to update embedding column");
 
         // Verify the updated batch has the new embeddings
@@ -633,7 +674,7 @@ mod tests {
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
 
-        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings)
+        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings, 3)
             .expect("Failed to handle missing embedding column");
 
         // Should append the embedding column with the correct name

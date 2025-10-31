@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use app::AppBuilder;
@@ -24,24 +25,33 @@ use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
+use aws_config::Region;
+use aws_credential_types::Credentials;
+use aws_sdk_dynamodb::config::BehaviorVersion;
+use aws_sdk_dynamodb::types::{
+    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
+    ScalarAttributeType,
+};
+use std::env;
+
 #[tokio::test]
-async fn dynamodb_federated() -> Result<(), anyhow::Error> {
+async fn dynamodb_schema() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+    // init_test_table(table_name).await?;
 
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    "dynamodb:sales_transactions",
-                    "test.sales_transactions",
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
                 ))
                 .build();
 
             configure_test_datafusion();
-            let rt = Runtime::builder()
-                .with_app(app)
-                .build()
-                .await;
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -52,22 +62,459 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                 () = cloned_rt.load_components() => {}
             }
 
-            // order of columns for dynamodb connector may vary, so we retrieve and sort them manually instead of using 'describe test.sales_transactions;'
             run_and_snapshot_query(
                 &rt,
                 "SELECT column_name, data_type, is_nullable \
                  FROM information_schema.columns \
-                 WHERE table_schema = 'test' \
-                   AND table_name = 'sales_transactions' \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'test_dynamodb' \
                  ORDER BY column_name;",
                 "schema",
-            ).await?;
-            run_and_snapshot_query(
-                &rt,
-                "select customer_id, product_id, quantity, timestamp, total_amount, transaction_id from test.sales_transactions order by total_amount limit 5;",
-                "query_result",
             )
             .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_scan_no_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(&rt, "SELECT * FROM test_dynamodb ORDER BY id;", "full_scan")
+                .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_query_no_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, col_string, col_number_int, col_bool \
+                 FROM test_dynamodb \
+                 WHERE id = 1;",
+                "query_no_filter",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_query_with_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, col_string, col_number_int, col_bool \
+                 FROM test_dynamodb \
+                 WHERE id = 1 and version > '0';",
+                "query_with_filter",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT COUNT(*) as total_count, MAX(col_timestamp) as max_timestamp FROM test_dynamodb;",
+                "aggregation",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_nulls() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, col_string, col_number_int \
+                 FROM test_dynamodb \
+                 WHERE col_string IS NULL;",
+                "nulls",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_not_nulls() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, col_string, col_number_int \
+                 FROM test_dynamodb \
+                 WHERE col_string IS NOT NULL;",
+                "not_nulls",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_temporal() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, col_timestamp, col_date, col_time \
+                 FROM test_dynamodb \
+                 WHERE id = 1;",
+                "temporal",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_collections() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, array_sort(col_string_set), array_sort(col_number_set_int), array_sort(col_list) \
+                 FROM test_dynamodb \
+                 WHERE id = 1;",
+                "collections",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_timestamp_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "SELECT id, col_timestamp, col_date \
+                 FROM test_dynamodb \
+                 WHERE col_timestamp > '2010-01-01';",
+                "timestamp_filter",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+#[tokio::test]
+async fn dynamodb_nested_projection_no_nested_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                r#"SELECT id, "col_map_fully_unnested.age", "col_map_fully_unnested.balance", "col_map_fully_unnested.is_active", "col_map_fully_unnested.name", "col_map_partially_unnested.foo", "col_map_partially_unnested.nested_lvl_1"
+                 FROM test_dynamodb
+                 "#,
+                "nested_projection_no_nested_filter",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_nested_projection_with_nested_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let table_name = "spice_integration_test";
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{table_name}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                r#"SELECT id, "col_map_fully_unnested.age", "col_map_fully_unnested.balance", "col_map_fully_unnested.is_active", "col_map_fully_unnested.name", "col_map_partially_unnested.foo", "col_map_partially_unnested.nested_lvl_1"
+                 FROM test_dynamodb
+                 WHERE "col_map_fully_unnested.age" = 30
+                 "#,
+                "nested_projection_with_nested_filter",
+            )
+                .await?;
 
             Ok(())
         })
@@ -114,9 +561,238 @@ fn get_test_dataset(from: &str, name: &str) -> Dataset {
                 "dynamodb_aws_secret_access_key".to_string(),
                 "${ env:AWS_DYNAMODB_SECRET }".to_string(),
             ),
+            ("unnest_depth".to_string(), "1".to_string()),
         ]
         .into_iter()
         .collect(),
     ));
     dataset
+}
+
+#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::missing_errors_doc)]
+pub fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::Error> {
+    let Ok(dynamodb_access_key_id) = env::var("AWS_DYNAMODB_KEY") else {
+        panic!("AWS_DYNAMODB_KEY not set")
+    };
+
+    let Ok(dynamodb_secret_access_key) = env::var("AWS_DYNAMODB_SECRET") else {
+        panic!("AWS_DYNAMODB_SECRET not set")
+    };
+
+    let credentials = Credentials::new(
+        dynamodb_access_key_id,
+        dynamodb_secret_access_key,
+        None,
+        None,
+        "dynamodb",
+    );
+
+    let config = aws_sdk_dynamodb::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("ap-northeast-2"))
+        .credentials_provider(credentials)
+        .build();
+
+    let client = aws_sdk_dynamodb::Client::from_conf(config);
+
+    Ok(client)
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
+async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
+    let client = get_dynamodb_client()?;
+
+    tracing::info!("Initializing test table: {}", table_name);
+
+    let _ = client.delete_table().table_name(table_name).send().await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    client
+        .create_table()
+        .table_name(table_name)
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("id")
+                .key_type(KeyType::Hash)
+                .build()?,
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("version")
+                .key_type(KeyType::Range)
+                .build()?,
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("id")
+                .attribute_type(ScalarAttributeType::N)
+                .build()?,
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("version")
+                .attribute_type(ScalarAttributeType::N)
+                .build()?,
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await?;
+
+    // Wait for table to be active
+    tracing::info!("Waiting for table to become active...");
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    // Insert test items with comprehensive type coverage
+
+    // Item 1: All types with values
+    let mut item1 = HashMap::new();
+    item1.insert("id".to_string(), AttributeValue::N("1".to_string()));
+    item1.insert("version".to_string(), AttributeValue::N("2".to_string()));
+    item1.insert("col_bool".to_string(), AttributeValue::Bool(true));
+    item1.insert(
+        "col_string".to_string(),
+        AttributeValue::S("string 🚀😊".to_string()),
+    );
+    item1.insert(
+        "col_number_int".to_string(),
+        AttributeValue::N("42".to_string()),
+    );
+    item1.insert(
+        "col_number_float".to_string(),
+        AttributeValue::N("3.14159".to_string()),
+    );
+    item1.insert(
+        "col_number_scientific".to_string(),
+        AttributeValue::N("1.23e10".to_string()),
+    );
+    item1.insert(
+        "col_binary".to_string(),
+        AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(b"blob")),
+    );
+    item1.insert(
+        "col_string_set".to_string(),
+        AttributeValue::Ss(vec!["apple".to_string(), "banana".to_string()]),
+    );
+    item1.insert(
+        "col_number_set_int".to_string(),
+        AttributeValue::Ns(vec!["1".to_string(), "2".to_string(), "3".to_string()]),
+    );
+    item1.insert(
+        "col_number_set_float".to_string(),
+        AttributeValue::Ns(vec![
+            "1.1".to_string(),
+            "2.2".to_string(),
+            "3.3".to_string(),
+        ]),
+    );
+    item1.insert(
+        "col_binary_set".to_string(),
+        AttributeValue::Bs(vec![
+            aws_sdk_dynamodb::primitives::Blob::new(b"data1"),
+            aws_sdk_dynamodb::primitives::Blob::new(b"data2"),
+        ]),
+    );
+
+    // Heterogeneous list
+    item1.insert(
+        "col_list".to_string(),
+        AttributeValue::L(vec![
+            AttributeValue::N("1".to_string()),
+            AttributeValue::S("foo".to_string()),
+            AttributeValue::Bool(true),
+        ]),
+    );
+
+    // Map (nested object)
+    let mut fully_unnested_map = HashMap::new();
+    fully_unnested_map.insert("name".to_string(), AttributeValue::S("John".to_string()));
+    fully_unnested_map.insert("age".to_string(), AttributeValue::N("30".to_string()));
+    fully_unnested_map.insert("is_active".to_string(), AttributeValue::Bool(true));
+    fully_unnested_map.insert(
+        "balance".to_string(),
+        AttributeValue::N("1234.56".to_string()),
+    );
+
+    // Map (nested object)
+    let mut partially_unnested_map = HashMap::new();
+    let mut nested_lvl_1 = HashMap::new();
+    nested_lvl_1.insert("foo".to_string(), AttributeValue::S("baz".to_string()));
+    partially_unnested_map.insert("nested_lvl_1".to_string(), AttributeValue::M(nested_lvl_1));
+    partially_unnested_map.insert("foo".to_string(), AttributeValue::S("bar".to_string()));
+    item1.insert(
+        "col_map_fully_unnested".to_string(),
+        AttributeValue::M(fully_unnested_map),
+    );
+    item1.insert(
+        "col_map_partially_unnested".to_string(),
+        AttributeValue::M(partially_unnested_map),
+    );
+
+    // Temporal types (stored as strings)
+    item1.insert(
+        "col_timestamp".to_string(),
+        AttributeValue::S("2019-01-01T00:00:00Z".to_string()),
+    );
+    item1.insert(
+        "col_date".to_string(),
+        AttributeValue::S("2019-01-01".to_string()),
+    );
+    item1.insert(
+        "col_time".to_string(),
+        AttributeValue::S("12:34:56".to_string()),
+    );
+
+    client
+        .put_item()
+        .table_name(table_name)
+        .set_item(Some(item1))
+        .send()
+        .await?;
+
+    // Item 2: All nulls
+    let mut item2 = HashMap::new();
+    item2.insert("id".to_string(), AttributeValue::N("2".to_string()));
+    item2.insert("version".to_string(), AttributeValue::N("2".to_string()));
+    item2.insert("col_bool".to_string(), AttributeValue::Null(true));
+    item2.insert("col_string".to_string(), AttributeValue::Null(true));
+    item2.insert("col_number_int".to_string(), AttributeValue::Null(true));
+    item2.insert("col_number_float".to_string(), AttributeValue::Null(true));
+    item2.insert(
+        "col_number_scientific".to_string(),
+        AttributeValue::Null(true),
+    );
+    item2.insert("col_binary".to_string(), AttributeValue::Null(true));
+    item2.insert("col_string_set".to_string(), AttributeValue::Null(true));
+    item2.insert("col_number_set_int".to_string(), AttributeValue::Null(true));
+    item2.insert(
+        "col_number_set_float".to_string(),
+        AttributeValue::Null(true),
+    );
+    item2.insert("col_binary_set".to_string(), AttributeValue::Null(true));
+    item2.insert("col_list".to_string(), AttributeValue::Null(true));
+    item2.insert(
+        "col_map_fully_unnested".to_string(),
+        AttributeValue::M(HashMap::new()),
+    );
+    item2.insert(
+        "col_map_partially_unnested".to_string(),
+        AttributeValue::M(HashMap::new()),
+    );
+
+    item2.insert("col_timestamp".to_string(), AttributeValue::Null(true));
+    item2.insert("col_date".to_string(), AttributeValue::Null(true));
+    item2.insert("col_time".to_string(), AttributeValue::Null(true));
+
+    client
+        .put_item()
+        .table_name(table_name)
+        .set_item(Some(item2))
+        .send()
+        .await?;
+
+    tracing::info!("Test data inserted successfully");
+    Ok(())
 }

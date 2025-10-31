@@ -25,6 +25,7 @@ use super::{Error, Result};
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
@@ -124,11 +125,18 @@ impl CandidateAggregation for ReciprocalRankFusion {
             .await;
         }
 
-        let additional_columns = additional_columns.into_iter().collect::<Vec<_>>();
+        let additional_columns = additional_columns
+            .into_iter()
+            .map(|c| quote_identifier(&c).to_string())
+            .collect::<Vec<_>>();
+        let pks = primary_key
+            .iter()
+            .map(|c| quote_identifier(c).to_string())
+            .collect::<Vec<_>>();
 
         let sql = reciprocal_rank_fusion_sql(
             table_names.as_slice(),
-            primary_key.as_slice(),
+            pks.as_slice(),
             additional_columns.as_slice(),
             60,
             limit,
