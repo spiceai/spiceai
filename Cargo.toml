@@ -286,7 +286,7 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "41d
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "7d4fa6d36b464a72afea88e7d3644e143c2535ad" } # spiceai
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "d6e7ebd853463acafaf8132dced23c98c45f7947" } # spiceai-50
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "338e177cfe385f6fc759ec4bdc2c65d4d9807083" } # spiceai-50
 
 ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }           # spiceai/spiceai-50
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }      # spiceai/spiceai-50
@@ -355,4 +355,3 @@ aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887
 # Note: Turso's bindings/rust/src/lib.rs defines #[global_allocator] which conflicts with spiced's allocator
 # We need to fork and remove the global allocator or patch it out
 turso = { git = "https://github.com/spiceai/turso", rev = "5c4d14d298869fe5ea296163b3241d6963a2e87d" }
-
