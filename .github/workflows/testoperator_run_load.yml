@@ -63,7 +63,7 @@ on:
         options:
           - 'spicehq-dev-runners'
           - 'spicehq-dev-large-runners'
-      concurrency_count:
+      concurrency:
         description: 'How many concurrent client connections to use?'
         required: true
         default: '8'
@@ -73,6 +73,10 @@ on:
         required: false
         type: string
         default: '1'
+      random_param_set_count:
+        description: 'Number of random parameter sets to generate for parameterized queries (optional)'
+        required: false
+        type: string
 
 jobs:
   run-load:
@@ -142,7 +146,8 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }} \
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
             --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
@@ -191,7 +196,8 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }} \
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
             --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}

@@ -165,6 +165,10 @@ pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
     pub duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub random_param_set_count: Option<usize>,
 }
 
 /// Represents the type of runner to use in the action
