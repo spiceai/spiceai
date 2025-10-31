@@ -67,6 +67,8 @@ mod sink;
 mod synchronized_table;
 mod timestamp_metrics_utils;
 
+pub use refresh_task_runner::RefreshTaskRunner;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -88,6 +90,14 @@ pub enum Error {
         "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
+
+    #[snafu(display(
+        "Failed to refresh dataset {dataset_name}: refresh worker panicked. {message}"
+    ))]
+    RefreshWorkerPanicked {
+        dataset_name: String,
+        message: String,
+    },
 
     #[snafu(display("Failed to refresh the dataset. {source}"))]
     FailedToTriggerRefresh {

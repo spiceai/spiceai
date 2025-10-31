@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,5 +13,57 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use snafu::Snafu;
+use std::sync::Arc;
 
+mod arrow;
 pub mod provider;
+mod request_builder;
+mod request_plan;
+mod schema;
+mod table_schema;
+mod unnest;
+mod utils;
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Failed to fetch table information. Error: {source} Verify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/dynamodb"
+    ))]
+    DescribeTableError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    ScanError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Table does not exist: {table_name}"))]
+    TableDoesNotExist { table_name: Arc<str> },
+
+    #[snafu(display("Table status is not active"))]
+    TableStatusIsNotActive,
+
+    #[snafu(display("Failed to infer schema: {source}"))]
+    SchemaInferenceError { source: ::arrow::error::ArrowError },
+
+    #[snafu(display("Failed to convert DynamoDB items to Arrow: {source}"))]
+    ConversionError {
+        source: Box<dyn std::error::Error + std::marker::Send + Sync>,
+    },
+
+    #[snafu(display("Invalid item access: {message}"))]
+    InvalidItemAccess { message: String },
+
+    #[snafu(display("Type {unsupported_type_name} is not supported"))]
+    UnsupportedType { unsupported_type_name: String },
+
+    #[snafu(display("DynamoDB returned value of 'Unknown' type"))]
+    UnknownType,
+
+    #[snafu(display("Table has no partition key"))]
+    MissingPartitionKey,
+}
