@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       run_conflict_resolution:
-        description: "Attempt automated conflict resolution when needed"
+        description: 'Attempt automated conflict resolution when needed'
         required: false
-        default: "true"
+        default: 'true'
       custom_merge_branch_suffix:
-        description: "Optional suffix to append to the automation branch"
+        description: 'Optional suffix to append to the automation branch'
         required: false
   schedule:
     - cron: '0 21 * * *' # Daily: 9PM UTC, 2PM PST, 6AM KST
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   merge-upstream:
-    runs-on: ubuntu-latest
+    runs-on: spiceai-macos
     env:
       DEFAULT_BRANCH: trunk
       UPSTREAM_REPO: https://github.com/spiceai/spiceai.git
@@ -149,7 +149,7 @@ jobs:
           CONFLICT_FILES=$(git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' || true)
           git diff --name-only --diff-filter=U | grep '^\.github/workflows/' | xargs -r git restore  --theirs
           git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' | xargs -r git add          
-          
+
           if [ -n "$CONFLICT_FILES" ]; then
             FILES_LIST=$(echo "$CONFLICT_FILES" | tr '\n' ',' | sed 's/,$//')
             echo "conflict_files=$FILES_LIST" >> $GITHUB_OUTPUT
@@ -182,7 +182,7 @@ jobs:
             done
             echo "" >> "$pr_body"
           fi
-          
+
           if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
             echo "* Conflict handling: $([[ -n "${{ steps.llm.outputs.status }}" ]] && echo "${{ steps.llm.outputs.status }}" || echo "manual")" >> "$pr_body"
           else
