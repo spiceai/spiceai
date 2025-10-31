@@ -48,10 +48,13 @@ use datafusion_common::Constraints;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::collect;
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::PlanProperties;
 use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
@@ -606,10 +609,6 @@ impl PepperTableProvider {
             }
         }
 
-        use datafusion_physical_expr::EquivalenceProperties;
-        use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
-        use datafusion_physical_plan::PlanProperties;
-
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::<arrow_schema::Schema>::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -728,7 +727,7 @@ impl PepperTableProvider {
             self.table_metadata.clone(),
             Arc::clone(&self.catalog),
             Arc::clone(&self.listing_table),
-            Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
+            Arc::clone(&self.table_metadata.schema),
             &filters,
         );
 

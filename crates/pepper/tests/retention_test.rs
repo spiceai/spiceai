@@ -53,8 +53,7 @@ async fn test_retention_filters_apply_on_insert_impl(
     };
 
     let retention_expr = col("value").lt(lit(3i64));
-    #[allow(clippy::clone_on_ref_ptr)]
-    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let catalog_arc: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let table_provider = Arc::new(
         PepperTableProvider::create_table_with_retention(
             catalog_arc,
