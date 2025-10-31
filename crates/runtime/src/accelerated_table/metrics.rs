@@ -27,6 +27,7 @@ pub const METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS: &str =
     "dataset_acceleration_max_timestamp_after_refresh_ms";
 pub const METRIC_REFRESH_LAG_MS: &str = "dataset_acceleration_refresh_lag_ms";
 pub const METRIC_INGESTION_LAG_MS: &str = "dataset_acceleration_ingestion_lag_ms";
+pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_worker_panics";
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
 
@@ -50,6 +51,13 @@ pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(
         .f64_histogram("dataset_acceleration_refresh_duration_ms")
         .with_description("Duration in milliseconds to load a full or appended refresh data.")
         .with_unit("ms")
+        .build()
+});
+
+pub(crate) static REFRESH_WORKER_PANICS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter(METRIC_REFRESH_WORKER_PANICS)
+        .with_description("Number of times a refresh worker panicked while refreshing a dataset.")
         .build()
 });
 

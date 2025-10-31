@@ -18,11 +18,24 @@ limitations under the License.
 #![allow(clippy::missing_panics_doc)]
 
 //! Adds telemetry to leaf nodes (i.e. `TableScans`) to track the number of bytes scanned during query execution.
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::common::{Statistics, internal_err};
+use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::UserDefinedLogicalNode;
+use datafusion::physical_expr::OrderingRequirements;
+use datafusion::physical_plan::execution_plan::{
+    CardinalityEffect, InvariantLevel, check_default_invariants,
+};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+};
+use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::{Distribution, PhysicalExpr, PlanProperties};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::{
     common::{
@@ -364,8 +377,19 @@ impl DisplayAs for BytesProcessedExec {
     }
 }
 
+// if new features are added to ExecutionPlan, we want to know
+// it's possible we'll just re-implement the default methods - but that requires attention
+// for example, the recently added `gather_filters_for_pushdown` defaults to `all_unsupported` but we likely want `from_children`
+#[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for BytesProcessedExec {
     fn name(&self) -> &'static str {
+        "BytesProcessedExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
         "BytesProcessedExec"
     }
 
@@ -373,12 +397,28 @@ impl ExecutionPlan for BytesProcessedExec {
         self
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(self.properties().eq_properties.schema())
+    }
+
+    fn properties(&self) -> &PlanProperties {
         self.input_exec.properties()
     }
 
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input_exec]
+    fn check_invariants(&self, check: InvariantLevel) -> Result<()> {
+        check_default_invariants(self, check)
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![None; self.children().len()]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true; self.children().len()]
     }
 
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
@@ -387,8 +427,8 @@ impl ExecutionPlan for BytesProcessedExec {
         vec![false]
     }
 
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true; self.children().len()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input_exec]
     }
 
     fn with_new_children(
@@ -404,6 +444,19 @@ impl ExecutionPlan for BytesProcessedExec {
             emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
             fallback_to_new_context: self.fallback_to_new_context,
         }))
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
+
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
     }
 
     fn execute(
@@ -438,9 +491,73 @@ impl ExecutionPlan for BytesProcessedExec {
         Ok(Box::pin(stream_adapter))
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        if let Some(idx) = partition {
+            // Validate partition index
+            let partition_count = self.properties().partitioning.partition_count();
+            if idx >= partition_count {
+                return internal_err!(
+                    "Invalid partition index: {}, the partition count is {}",
+                    idx,
+                    partition_count
+                );
+            }
+        }
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
         true
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
     }
 }
 

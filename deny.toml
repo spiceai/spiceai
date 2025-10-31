@@ -77,3 +77,9 @@ version = "0.1.3"
 expression = "MIT"
 license-files = []
 
+[[licenses.clarify]]
+name = "cfg_block"
+version = "0.1.1"
+expression = "Apache-2.0"
+license-files = []
+
