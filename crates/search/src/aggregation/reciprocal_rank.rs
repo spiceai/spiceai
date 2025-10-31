@@ -131,7 +131,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
             .collect::<Vec<_>>();
         let pks = primary_key
             .iter()
-            .map(|c| quote_identifier(&c).to_string())
+            .map(|c| quote_identifier(c).to_string())
             .collect::<Vec<_>>();
 
         let sql = reciprocal_rank_fusion_sql(
