@@ -165,8 +165,7 @@ async fn test_retention_filters_skip_when_no_matches_impl(
     };
 
     let retention_expr = col("value").lt(lit(0i64));
-    #[allow(clippy::clone_on_ref_ptr)]
-    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let catalog_arc: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog);
     let table_provider = PepperTableProvider::create_table_with_retention(
         catalog_arc,
         table_options,
