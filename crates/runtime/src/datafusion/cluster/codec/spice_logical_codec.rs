@@ -60,7 +60,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         let name = serde_json::from_slice::<String>(buf)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        return exec_err!(
+        exec_err!(
             "SpiceLogicalCodec does not support {}. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
             name.as_str()
         );
