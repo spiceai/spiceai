@@ -105,7 +105,6 @@ jobs:
   test-openai:
     name: Test OpenAI Models
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -153,11 +152,10 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
+  
   test-ai-udf:
     name: Test AI UDF
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -248,7 +246,6 @@ jobs:
     name: Test Huggingface Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -296,7 +293,6 @@ jobs:
   test-local:
     name: Test Local Models
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -340,7 +336,6 @@ jobs:
     name: Test Bedrock Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -374,7 +369,6 @@ jobs:
   test-workers:
     name: Test Workers
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -415,7 +409,6 @@ jobs:
   test-search:
     name: Test Search
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
