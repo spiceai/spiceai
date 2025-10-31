@@ -1557,14 +1557,17 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
 
     let queries = vec![
         (
+            "topk_with_fetch_4",
             "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic') order by score desc LIMIT 4".to_string(),
-            vec!["SortPreservingMergeExec: [score@1 DESC], fetch=4"]
+            vec!["SortExec: TopK(fetch=4)"]
         ),
         (
+            "topk_with_fetch_2_from_parameter_ignores_other_limit",
             "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) order by score desc LIMIT 4".to_string(),
-            vec!["SortPreservingMergeExec: [score@1 DESC], fetch=4", "SortExec: TopK(fetch=2)"]
+            vec!["SortExec: TopK(fetch=2)"]
         ),
         (
+            "topk_with_fetch_3_from_parameter",
             "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 3) order by score desc".to_string(),
             vec!["SortExec: TopK(fetch=3)"]
         )
@@ -1573,8 +1576,14 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
     let api_config = start_app(app).await?;
     let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-    for (query, must_contain) in queries {
+    for (name, query, must_contain) in queries {
         let result = http_sql(http_base_url.as_str(), &query).await?;
+
+        insta::assert_snapshot!(
+            format!("{name}_response"),
+            normalize_search_response(result.clone())
+        );
+
         let result_str = result
             .as_array()
             .and_then(|o| o.last())
