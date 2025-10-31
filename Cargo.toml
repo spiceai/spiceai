@@ -96,10 +96,10 @@ aws-sdk-s3 = "1.108.0"
 aws-sdk-s3vectors = "1.11"
 aws-sdk-secretsmanager = "1.90.0"
 aws-sdk-sts = "1.88.0"
+aws-smithy-async = "1.2.5"
 aws-smithy-runtime = "1.9.3"
 aws-smithy-runtime-api = "1.9.1"
 aws-smithy-types = "1.3.3"
-aws-smithy-async = "1.2.5"
 axum = { version = "0.8", features = ["macros"] }
 ballista = "50.0.0"
 ballista-core = "50.0.0"
@@ -288,7 +288,7 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "41d
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "7d4fa6d36b464a72afea88e7d3644e143c2535ad" } # spiceai
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "338e177cfe385f6fc759ec4bdc2c65d4d9807083" } # spiceai-50
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "d6e7ebd853463acafaf8132dced23c98c45f7947" } # spiceai-50
 
 ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }           # spiceai/spiceai-50
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }      # spiceai/spiceai-50
@@ -350,10 +350,10 @@ aws-sdk-s3vectors = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "88
 aws-sdk-secretsmanager = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-secretsmanager" }                   # pinned from release-2025-10-08
 aws-sdk-sts = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-sts" }                                         # pinned from release-2025-10-08
 aws-sigv4 = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sigv4" }                                             # pinned from release-2025-10-08
+aws-smithy-async = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-async" }                               # pinned from release-2025-10-08
 aws-smithy-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-runtime" }                           # pinned from release-2025-10-08
 aws-smithy-runtime-api = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-runtime-api" }                   # pinned from release-2025-10-08
 aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-types" }                               # pinned from release-2025-10-08
-aws-smithy-async = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-smithy-async" }                               # pinned from release-2025-10-08
 
 
 # Note: Turso's bindings/rust/src/lib.rs defines #[global_allocator] which conflicts with spiced's allocator
