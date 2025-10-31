@@ -136,12 +136,8 @@ impl<'a> DeletionVectorWriter<'a> {
             let schema = deletion_vector_schema();
             let batch = build_deletion_batch(&schema, &spec.row_ids)?;
 
-            let file_size_bytes = write_deletion_file(
-                &file_path,
-                Arc::<arrow_schema::Schema>::clone(&schema),
-                batch,
-            )
-            .await?;
+            let file_size_bytes =
+                write_deletion_file(&file_path, Arc::clone(&schema), batch).await?;
 
             let delete_file = build_delete_file(
                 self.table,

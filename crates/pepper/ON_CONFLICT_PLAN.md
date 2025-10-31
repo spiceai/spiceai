@@ -71,6 +71,7 @@
 - 2025-02-10: Introduced batch-oriented key serialization utilities (RowConverter + xxh3) to prepare for conflict detection.
 - 2025-02-10: Propagated primary key and `on_conflict` settings through runtime table creation and Pepper providers.
 - 2025-02-11: Wired streaming inserts to consult the key index, perform drop/upsert policy handling, allocate row IDs, and emit deletion vectors; cross-batch last-write-wins remains outstanding.
+- 2025-02-11: Merged retention SQL support with on_conflict flow so Pepper providers apply configured deletion predicates immediately after ingestion (including partitioned datasets).
 -
 -## Execution Checklist (High-Level)
 -[ ] Finish deletion-vector pipeline and land as standalone commit.

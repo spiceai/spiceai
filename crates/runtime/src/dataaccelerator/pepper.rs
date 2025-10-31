@@ -350,6 +350,7 @@ impl PepperAccelerator {
             .map(Arc::clone)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_pepper_table_provider(
         &self,
         table_name: &str,
@@ -358,6 +359,7 @@ impl PepperAccelerator {
         primary_keys: Vec<String>,
         on_conflict: Option<OnConflict>,
         source: &dyn AccelerationSource,
+        retention_filters: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>> {
         use pepper::{PepperTableProvider, metadata::CreateTableOptions};
 
@@ -403,11 +405,15 @@ impl PepperAccelerator {
         };
 
         // Create PepperTableProvider
-        let pepper_table = PepperTableProvider::create_table(catalog, table_options)
-            .await
-            .map_err(|e| Error::AccelerationCreationFailed {
-                source: Box::new(e),
-            })?;
+        let pepper_table = PepperTableProvider::create_table_with_retention(
+            catalog,
+            table_options,
+            retention_filters,
+        )
+        .await
+        .map_err(|e| Error::AccelerationCreationFailed {
+            source: Box::new(e),
+        })?;
 
         Ok(Arc::new(pepper_table))
     }
@@ -480,15 +486,6 @@ impl DataAccelerator for PepperAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            // Validate that retention_sql is not specified
-            if acceleration.retention_sql.is_some() {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Pepper data accelerator does not yet support retention_sql. Please remove this configuration",
-                    ),
-                }));
-            }
-
             // Validate refresh_mode - append and full are supported
             if let Some(refresh_mode) = acceleration.refresh_mode
                 && refresh_mode != RefreshMode::Append
@@ -617,6 +614,34 @@ impl DataAccelerator for PepperAccelerator {
         // Get the table name from the source
         let table_name = source.name().to_string();
 
+        // Parse retention SQL once so it can be reused for partitioned tables.
+        let retention_filters = if let Some(acceleration) = source.acceleration() {
+            acceleration
+                .retention_sql
+                .as_deref()
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())
+                .map(|retention_sql| {
+                    match crate::datafusion::retention_sql::parse_retention_sql(
+                        source.name(),
+                        retention_sql,
+                        Arc::clone(&arrow_schema),
+                    ) {
+                        Ok(parsed) => vec![parsed.delete_expr],
+                        Err(err) => {
+                            tracing::warn!(
+                                dataset = %source.name(),
+                                "Failed to parse retention_sql: {err}. Retention SQL will be skipped."
+                            );
+                            Vec::new()
+                        }
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // Always create the base Pepper table provider
         let pepper_table = self
             .create_pepper_table_provider(
@@ -626,6 +651,7 @@ impl DataAccelerator for PepperAccelerator {
                 primary_keys.clone(),
                 on_conflict.clone(),
                 source,
+                retention_filters.clone(),
             )
             .await
             .boxed()?;
@@ -693,6 +719,7 @@ impl DataAccelerator for PepperAccelerator {
                 unsupported_type_action,
                 primary_keys,
                 on_conflict,
+                retention_filters,
             ));
 
             // Wrap the base table provider with partitioning logic
@@ -748,6 +775,7 @@ struct PepperPartitionCreator {
     unsupported_type_action: UnsupportedTypeAction,
     primary_keys: Vec<String>,
     on_conflict: Option<OnConflict>,
+    retention_filters: Vec<Expr>,
 }
 
 impl std::fmt::Debug for PepperPartitionCreator {
@@ -762,6 +790,7 @@ impl std::fmt::Debug for PepperPartitionCreator {
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("primary_keys", &self.primary_keys)
             .field("on_conflict", &self.on_conflict)
+            .field("retention_filters", &self.retention_filters.len())
             .finish()
     }
 }
@@ -778,6 +807,7 @@ impl PepperPartitionCreator {
         unsupported_type_action: UnsupportedTypeAction,
         primary_keys: Vec<String>,
         on_conflict: Option<OnConflict>,
+        retention_filters: Vec<Expr>,
     ) -> Self {
         Self {
             table_name,
@@ -789,6 +819,7 @@ impl PepperPartitionCreator {
             unsupported_type_action,
             primary_keys,
             on_conflict,
+            retention_filters,
         }
     }
 
@@ -883,12 +914,15 @@ impl PartitionCreator for PepperPartitionCreator {
         };
 
         // Create Pepper table provider for this partition
-        let pepper_table =
-            pepper::PepperTableProvider::create_table(Arc::clone(&self.catalog), table_options)
-                .await
-                .map_err(|e| creator::Error::CreatePartition {
-                    source: Box::new(e),
-                })?;
+        let pepper_table = pepper::PepperTableProvider::create_table_with_retention(
+            Arc::clone(&self.catalog),
+            table_options,
+            self.retention_filters.clone(),
+        )
+        .await
+        .map_err(|e| creator::Error::CreatePartition {
+            source: Box::new(e),
+        })?;
 
         Ok(Partition {
             partition_value,
@@ -922,10 +956,11 @@ impl PartitionCreator for PepperPartitionCreator {
 
             // Create Pepper table provider for this partition
             let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
-            let pepper_table = pepper::PepperTableProvider::new(
+            let pepper_table = pepper::PepperTableProvider::new_with_retention_and_conflict(
                 &partition_table_name,
                 Arc::clone(&self.catalog),
                 self.on_conflict.clone(),
+                self.retention_filters.clone(),
             )
             .await
             .map_err(|e| creator::Error::InferringPartitions {
