@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 468,
+    "question": "How many multiples of 4 are there between 1 and 30? List them and count the total.",
+    "trunc(vector_search(qs_view, Utf8(\"second\")).score,Int64(3))": 0.54
+  },
+  {
+    "id": 1277,
+    "question": "Which base number, when raised to the fifth power, equals thirty-two?",
+    "trunc(vector_search(qs_view, Utf8(\"second\")).score,Int64(3))": 0.539
+  },
+  {
+    "id": 189,
+    "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
+    "trunc(vector_search(qs_view, Utf8(\"second\")).score,Int64(3))": 0.539
+  },
+  {
+    "id": 948,
+    "question": "What is the fifth root of 32?",
+    "trunc(vector_search(qs_view, Utf8(\"second\")).score,Int64(3))": 0.528
+  }
+]

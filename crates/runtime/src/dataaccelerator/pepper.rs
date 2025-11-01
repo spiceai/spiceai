@@ -65,9 +65,6 @@ pub enum Error {
     #[snafu(display("Invalid Pepper acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
 
-    #[snafu(display("Pepper feature not enabled in build"))]
-    FeatureNotEnabled,
-
     #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
@@ -318,15 +315,23 @@ impl PepperAccelerator {
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
+        metastore_type: &str,
     ) -> Result<Arc<dyn pepper::MetadataCatalog>> {
-        let connection_string = format!("sqlite://{metadata_dir}/pepper.db");
+        let connection_string = match metastore_type {
+            "turso" => format!("libsql://{metadata_dir}/pepper.db"),
+            _ => format!("sqlite://{metadata_dir}/pepper.db"), // Default to SQLite
+        };
 
         self.catalog
             .get_or_try_init(move || {
                 let connection_string = connection_string.clone();
                 async move {
-                    let catalog = Arc::new(pepper::PepperCatalog::new(connection_string))
-                        as Arc<dyn pepper::MetadataCatalog>;
+                    let catalog =
+                        Arc::new(pepper::PepperCatalog::new(connection_string).map_err(|e| {
+                            Error::AccelerationInitializationFailed {
+                                source: Box::new(e),
+                            }
+                        })?) as Arc<dyn pepper::MetadataCatalog>;
 
                     catalog
                         .init()
@@ -348,18 +353,30 @@ impl PepperAccelerator {
         dir_path: &str,
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
+        retention_filters: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>> {
         use pepper::{PepperTableProvider, metadata::CreateTableOptions};
 
-        // Use custom metadata directory if provided (for testing), otherwise use shared directory
-        let metadata_dir = if let Some(acceleration) = source.acceleration() {
-            if let Some(custom_dir) = acceleration.params.get("pepper_metadata_dir") {
-                custom_dir.clone()
-            } else {
-                format!("{}/metadata", crate::spice_data_base_path())
-            }
+        // Get metastore type and custom metadata directory if provided
+        let (metadata_dir, metastore_type) = if let Some(acceleration) = source.acceleration() {
+            let metadata_dir =
+                if let Some(custom_dir) = acceleration.params.get("pepper_metadata_dir") {
+                    custom_dir.clone()
+                } else {
+                    format!("{}/metadata", crate::spice_data_base_path())
+                };
+
+            let metastore_type = acceleration
+                .params
+                .get("pepper_metastore")
+                .map_or("sqlite", String::as_str);
+
+            (metadata_dir, metastore_type.to_string())
         } else {
-            format!("{}/metadata", crate::spice_data_base_path())
+            (
+                format!("{}/metadata", crate::spice_data_base_path()),
+                "sqlite".to_string(),
+            )
         };
 
         // Ensure metadata directory exists
@@ -368,7 +385,9 @@ impl PepperAccelerator {
         })?;
 
         // Get or create the shared catalog (lazy initialization)
-        let catalog = self.get_or_create_catalog(&metadata_dir).await?;
+        let catalog = self
+            .get_or_create_catalog(&metadata_dir, &metastore_type)
+            .await?;
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -379,11 +398,15 @@ impl PepperAccelerator {
         };
 
         // Create PepperTableProvider
-        let pepper_table = PepperTableProvider::create_table(catalog, table_options)
-            .await
-            .map_err(|e| Error::AccelerationCreationFailed {
-                source: Box::new(e),
-            })?;
+        let pepper_table = PepperTableProvider::create_table_with_retention(
+            catalog,
+            table_options,
+            retention_filters,
+        )
+        .await
+        .map_err(|e| Error::AccelerationCreationFailed {
+            source: Box::new(e),
+        })?;
 
         Ok(Arc::new(pepper_table))
     }
@@ -391,6 +414,9 @@ impl PepperAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path"),
+    ParameterSpec::component("metastore")
+        .description("Metastore backend for Pepper catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
+        .default("sqlite"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("unsupported_type_action")
         .description("How to handle data types not natively supported by Pepper (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
@@ -453,15 +479,6 @@ impl DataAccelerator for PepperAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            // Validate that retention_sql is not specified
-            if acceleration.retention_sql.is_some() {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Pepper data accelerator does not yet support retention_sql. Please remove this configuration",
-                    ),
-                }));
-            }
-
             // Validate refresh_mode - append and full are supported
             if let Some(refresh_mode) = acceleration.refresh_mode
                 && refresh_mode != RefreshMode::Append
@@ -585,9 +602,43 @@ impl DataAccelerator for PepperAccelerator {
         // Get the table name from the source
         let table_name = source.name().to_string();
 
+        // Parse retention SQL once so it can be reused for partitioned tables.
+        let retention_filters = if let Some(acceleration) = source.acceleration() {
+            acceleration
+                .retention_sql
+                .as_deref()
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())
+                .map(|retention_sql| {
+                    match crate::datafusion::retention_sql::parse_retention_sql(
+                        source.name(),
+                        retention_sql,
+                        Arc::clone(&arrow_schema),
+                    ) {
+                        Ok(parsed) => vec![parsed.delete_expr],
+                        Err(err) => {
+                            tracing::warn!(
+                                dataset = %source.name(),
+                                "Failed to parse retention_sql: {err}. Retention SQL will be skipped."
+                            );
+                            Vec::new()
+                        }
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // Always create the base Pepper table provider
         let pepper_table = self
-            .create_pepper_table_provider(&table_name, &dir_path, Arc::clone(&arrow_schema), source)
+            .create_pepper_table_provider(
+                &table_name,
+                &dir_path,
+                Arc::clone(&arrow_schema),
+                source,
+                retention_filters.clone(),
+            )
             .await
             .boxed()?;
 
@@ -619,9 +670,13 @@ impl DataAccelerator for PepperAccelerator {
             })?;
 
             // Create a new catalog - it will use WAL mode and busy timeout internally
-            let catalog = Arc::new(pepper::PepperCatalog::new(format!(
-                "sqlite://{metadata_dir}/pepper.db"
-            ))) as Arc<dyn pepper::MetadataCatalog>;
+            let catalog = Arc::new(
+                pepper::PepperCatalog::new(format!("sqlite://{metadata_dir}/pepper.db")).map_err(
+                    |e| Error::AccelerationInitializationFailed {
+                        source: Box::new(e),
+                    },
+                )?,
+            ) as Arc<dyn pepper::MetadataCatalog>;
 
             // Initialize the catalog (creates tables if needed)
             catalog
@@ -648,6 +703,7 @@ impl DataAccelerator for PepperAccelerator {
                 catalog,
                 table_metadata.table_id,
                 unsupported_type_action,
+                retention_filters,
             ));
 
             // Wrap the base table provider with partitioning logic
@@ -701,6 +757,7 @@ struct PepperPartitionCreator {
     catalog: Arc<dyn pepper::MetadataCatalog>,
     table_id: i64,
     unsupported_type_action: UnsupportedTypeAction,
+    retention_filters: Vec<Expr>,
 }
 
 impl std::fmt::Debug for PepperPartitionCreator {
@@ -713,11 +770,13 @@ impl std::fmt::Debug for PepperPartitionCreator {
             .field("catalog", &"<dyn MetadataCatalog>")
             .field("table_id", &self.table_id)
             .field("unsupported_type_action", &self.unsupported_type_action)
+            .field("retention_filters", &self.retention_filters.len())
             .finish()
     }
 }
 
 impl PepperPartitionCreator {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         table_name: String,
         base_path: PathBuf,
@@ -726,6 +785,7 @@ impl PepperPartitionCreator {
         catalog: Arc<dyn pepper::MetadataCatalog>,
         table_id: i64,
         unsupported_type_action: UnsupportedTypeAction,
+        retention_filters: Vec<Expr>,
     ) -> Self {
         Self {
             table_name,
@@ -735,6 +795,7 @@ impl PepperPartitionCreator {
             catalog,
             table_id,
             unsupported_type_action,
+            retention_filters,
         }
     }
 
@@ -828,12 +889,15 @@ impl PartitionCreator for PepperPartitionCreator {
         };
 
         // Create Pepper table provider for this partition
-        let pepper_table =
-            pepper::PepperTableProvider::create_table(Arc::clone(&self.catalog), table_options)
-                .await
-                .map_err(|e| creator::Error::CreatePartition {
-                    source: Box::new(e),
-                })?;
+        let pepper_table = pepper::PepperTableProvider::create_table_with_retention(
+            Arc::clone(&self.catalog),
+            table_options,
+            self.retention_filters.clone(),
+        )
+        .await
+        .map_err(|e| creator::Error::CreatePartition {
+            source: Box::new(e),
+        })?;
 
         Ok(Partition {
             partition_value,
@@ -867,12 +931,15 @@ impl PartitionCreator for PepperPartitionCreator {
 
             // Create Pepper table provider for this partition
             let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
-            let pepper_table =
-                pepper::PepperTableProvider::new(&partition_table_name, Arc::clone(&self.catalog))
-                    .await
-                    .map_err(|e| creator::Error::InferringPartitions {
-                        source: Box::new(e),
-                    })?;
+            let pepper_table = pepper::PepperTableProvider::new_with_retention(
+                &partition_table_name,
+                Arc::clone(&self.catalog),
+                self.retention_filters.clone(),
+            )
+            .await
+            .map_err(|e| creator::Error::InferringPartitions {
+                source: Box::new(e),
+            })?;
 
             result.push(Partition {
                 partition_value,

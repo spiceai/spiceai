@@ -82,8 +82,7 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso",
-    "pepper"
+    "turso"
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -99,6 +98,7 @@ keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
 models = ["runtime/models"]
+llama_cpp = ["runtime/llama_cpp"]
 mongodb = ["runtime/mongodb"]
 mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]
@@ -114,5 +114,4 @@ spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 turso = ["runtime/turso"]
 tpc-extension = ["dep:tpc-extension"]
-pepper = ["runtime/pepper"]
 xxhash = ["runtime/xxhash"]

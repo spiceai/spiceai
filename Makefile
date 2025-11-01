@@ -74,7 +74,7 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster,llama_cpp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -86,7 +86,7 @@ lint-rust:
 lint-rust-fix:
 	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster,llama_cpp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \

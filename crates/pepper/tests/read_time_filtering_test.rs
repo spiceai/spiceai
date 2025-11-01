@@ -40,7 +40,7 @@ async fn setup_test_table(
     let catalog = Arc::new(PepperCatalog::new(format!(
         "sqlite://{}/test.db",
         metadata_dir.path().display()
-    )));
+    ))?);
     catalog.init().await?;
 
     // Create schema

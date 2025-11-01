@@ -54,7 +54,9 @@ limitations under the License.
 //! - **Data Files**: Metadata for virtual files (Vortex `ListingTables` at unique directories)
 
 pub mod catalog;
+pub mod deletion;
 pub mod metadata;
+pub mod metastore;
 pub mod pepper_catalog;
 pub mod provider;
 

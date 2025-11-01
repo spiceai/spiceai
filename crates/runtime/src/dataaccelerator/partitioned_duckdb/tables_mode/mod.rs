@@ -258,7 +258,7 @@ impl DuckDBPartitionCreator {
 
         // We use the DuckDB factory to create a table provider in order to extract
         // target table definition and on_conflict settings that will be used directly for each partition.
-        let table_provider = create_table_provider(&duckdb_factory, &cmd)
+        let table_provider = create_table_provider(&duckdb_factory, &cmd, None)
             .await
             .map_err(|e| format!("Failed to create table provider: {e}"))?;
 

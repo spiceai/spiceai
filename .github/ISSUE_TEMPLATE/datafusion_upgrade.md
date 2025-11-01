@@ -59,6 +59,7 @@ The following forked dependencies use DataFusion and need to be upgraded in lock
   - Run `cargo test` to confirm compatibility.
   - Do not merge into the `spice` branch until the main Spice OSS PR is ready to be merged. Merging sooner can block other PRs.
 - [ ] **[datafusion-federation](https://github.com/spiceai/datafusion-federation)**: Update the fork to be compatible with the new DataFusion version.
+  - We keep a fork because our changes are incompatible with upstream, and we maintain this fork separately. Create a new branch named `spiceai-X` from the previous `spiceai-Y` branch, and perform the upgrades there.
 - [ ] **[datafusion-table-providers](https://github.com/datafusion-contrib/datafusion-table-providers)**: Update the fork to be compatible with the new DataFusion version.
   - Do not merge the into the `spiceai` branch until the main Spice OSS PR is ready to be merged. Merging sooner can block other PRs.
 - [ ] **[iceberg-rust](https://github.com/spiceai/iceberg-rust.git)**: The `iceberg-datafusion` crate within this forked repository needs to be updated.
@@ -71,6 +72,8 @@ Spice should use the same version of Arrow that DataFusion uses. If DataFusion u
 - [ ] **snowflake-rs**:
 - [ ] **delta-kernel-rs**:
 - [ ] **duckdb-rs**:
+- [ ] **spark-connect-rs**:
+- [ ] **spice-rs**:
 
 ## Core Dependency Upgrade
 
