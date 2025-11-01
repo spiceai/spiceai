@@ -507,16 +507,77 @@ impl MetadataCatalog for PepperCatalog {
         })
     }
 
-    async fn add_data_file(&self, _data_file: DataFile) -> CatalogResult<i64> {
-        // Implementation would insert into pepper_data_file
-        Err(CatalogError::InvalidOperation {
-            message: "Not yet implemented".to_string(),
+    async fn add_data_file(&self, data_file: DataFile) -> CatalogResult<i64> {
+        // Get next data_file_id
+        let next_data_file_id: i64 = self
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT COALESCE(MAX(data_file_id), 0) + 1 FROM pepper_data_file",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await?;
+
+        // Insert the data file record
+        self.execute_helper(ExecuteParams {
+            sql: r"
+                INSERT INTO pepper_data_file (
+                    data_file_id, table_id, partition_id, file_order,
+                    path, path_is_relative, file_format, record_count,
+                    file_size_bytes, row_id_start
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+            params: vec![
+                MetastoreValue::Integer(next_data_file_id),
+                MetastoreValue::Integer(data_file.table_id),
+                data_file
+                    .partition_id
+                    .map_or(MetastoreValue::Null, MetastoreValue::Integer),
+                MetastoreValue::Integer(data_file.file_order),
+                MetastoreValue::Text(data_file.path),
+                MetastoreValue::Integer(if data_file.path_is_relative { 1 } else { 0 }),
+                MetastoreValue::Text(data_file.file_format),
+                MetastoreValue::Integer(data_file.record_count),
+                MetastoreValue::Integer(data_file.file_size_bytes),
+                MetastoreValue::Integer(data_file.row_id_start),
+            ],
         })
+        .await?;
+
+        Ok(next_data_file_id)
     }
 
-    async fn get_data_files(&self, _table_id: i64) -> CatalogResult<Vec<DataFile>> {
-        // Implementation would query active data files for table
-        Ok(vec![])
+    async fn get_data_files(&self, table_id: i64) -> CatalogResult<Vec<DataFile>> {
+        self.query_helper(
+            QueryParams {
+                sql: r"
+                    SELECT 
+                        data_file_id, table_id, partition_id, file_order,
+                        path, path_is_relative, file_format, record_count,
+                        file_size_bytes, row_id_start
+                    FROM pepper_data_file
+                    WHERE table_id = ?
+                    ORDER BY file_order ASC
+                ",
+                params: vec![MetastoreValue::Integer(table_id)],
+            },
+            |row| {
+                Ok(DataFile {
+                    data_file_id: row.get_i64(0)?,
+                    table_id: row.get_i64(1)?,
+                    partition_id: row.get_optional_i64(2)?,
+                    file_order: row.get_i64(3)?,
+                    path: row.get_string(4)?,
+                    path_is_relative: row.get_bool(5)?,
+                    file_format: row.get_string(6)?,
+                    record_count: row.get_i64(7)?,
+                    file_size_bytes: row.get_i64(8)?,
+                    row_id_start: row.get_i64(9)?,
+                })
+            },
+        )
+        .await
     }
 
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<i64> {
@@ -899,6 +960,38 @@ impl MetadataCatalog for PepperCatalog {
                     WHERE table_id = ?2
                       AND key_hash = ?3
                       AND key_bytes = ?4
+                      AND end_snapshot IS NULL
+                ",
+                params,
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn delete_key_index_entries(
+        &self,
+        table_id: i64,
+        keys: &[KeyIndexKey],
+    ) -> CatalogResult<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        for key in keys {
+            let params = vec![
+                MetastoreValue::Integer(table_id),
+                MetastoreValue::from(key.key_hash.clone()),
+                MetastoreValue::from(key.key_bytes.clone()),
+            ];
+
+            self.execute_helper(ExecuteParams {
+                sql: r"
+                    DELETE FROM pepper_key_index
+                    WHERE table_id = ?1
+                      AND key_hash = ?2
+                      AND key_bytes = ?3
                       AND end_snapshot IS NULL
                 ",
                 params,

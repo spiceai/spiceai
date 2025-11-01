@@ -66,7 +66,8 @@ use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
@@ -98,9 +99,15 @@ enum ConflictMode {
 ///
 /// This wraps another execution plan and removes rows whose positions
 /// match the deleted row IDs loaded from deletion vector files.
+///
+/// Uses a shared atomic counter to guarantee sequential global row numbering across
+/// all concurrent execution streams. Combined with deterministic file ordering and
+/// per-file metadata, this approach provides stable behaviour even when DataFusion
+/// introduces intra-partition parallelism.
 struct DeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
     deleted_row_ids: std::collections::HashSet<i64>,
+    global_row_counter: Arc<AtomicI64>,
     properties: datafusion_physical_plan::PlanProperties,
 }
 
@@ -110,6 +117,7 @@ impl DeletionFilterExec {
         Self {
             input,
             deleted_row_ids,
+            global_row_counter: Arc::new(AtomicI64::new(0)),
             properties,
         }
     }
@@ -157,10 +165,9 @@ impl ExecutionPlan for DeletionFilterExec {
                 "DeletionFilterExec requires exactly 1 child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            self.deleted_row_ids.clone(),
-        )))
+        let mut new_exec = Self::new(Arc::clone(&children[0]), self.deleted_row_ids.clone());
+        new_exec.global_row_counter = Arc::clone(&self.global_row_counter);
+        Ok(Arc::new(new_exec))
     }
 
     fn execute(
@@ -171,22 +178,30 @@ impl ExecutionPlan for DeletionFilterExec {
         let input_stream = self.input.execute(partition, context)?;
         let deleted_row_ids = self.deleted_row_ids.clone();
         let schema = input_stream.schema();
+        let global_row_counter = Arc::clone(&self.global_row_counter);
+
+        tracing::debug!(
+            "DeletionFilterExec partition {partition} starting ({} deleted rows)",
+            deleted_row_ids.len()
+        );
 
         Ok(Box::pin(DeletionFilterStream {
             input: input_stream,
             deleted_row_ids,
             schema,
-            global_row_offset: 0,
+            global_row_counter,
         }))
     }
 }
 
 /// Stream that filters out deleted rows from an input stream.
+///
 struct DeletionFilterStream {
     input: SendableRecordBatchStream,
     deleted_row_ids: std::collections::HashSet<i64>,
     schema: arrow_schema::SchemaRef,
-    global_row_offset: i64,
+    /// Shared counter for tracking global row offset across all streams
+    global_row_counter: Arc<AtomicI64>,
 }
 
 impl futures::Stream for DeletionFilterStream {
@@ -200,7 +215,6 @@ impl futures::Stream for DeletionFilterStream {
         loop {
             match std::pin::Pin::new(&mut self.input).poll_next(cx) {
                 std::task::Poll::Ready(Some(Ok(batch))) => {
-                    let current_offset = self.global_row_offset;
                     let batch_size = batch.num_rows();
 
                     // Validate batch size upfront to avoid redundant error handling in hot path
@@ -209,21 +223,14 @@ impl futures::Stream for DeletionFilterStream {
                         Err(err) => return std::task::Poll::Ready(Some(Err(err))),
                     };
 
-                    self.global_row_offset =
-                        match self.global_row_offset.checked_add(batch_size_i64) {
-                            Some(value) => value,
-                            None => {
-                                return std::task::Poll::Ready(Some(Err(
-                                    datafusion_common::DataFusionError::Execution(
-                                        "Row ID overflow while updating global offset".to_string(),
-                                    ),
-                                )))
-                            }
-                        };
+                    let batch_start_row_id = self
+                        .global_row_counter
+                        .fetch_add(batch_size_i64, std::sync::atomic::Ordering::SeqCst);
 
                     tracing::debug!(
-                        "DeletionFilterStream: processing batch with {} rows, offset {}, deleted_ids: {:?}",
-                        batch_size, current_offset, self.deleted_row_ids
+                        "DeletionFilterStream batch: {} rows starting at global row {}",
+                        batch_size,
+                        batch_start_row_id
                     );
 
                     // Find which rows in this batch should be kept
@@ -236,22 +243,24 @@ impl futures::Stream for DeletionFilterStream {
                                 return std::task::Poll::Ready(Some(Err(err)));
                             }
                         };
-                        let Some(global_row_id) = current_offset.checked_add(row_offset) else {
+                        let Some(global_row_id) = batch_start_row_id.checked_add(row_offset) else {
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::Execution(
                                     "Row ID overflow while calculating global row id".to_string(),
                                 ),
                             )));
                         };
-                        if !self.deleted_row_ids.contains(&global_row_id) {
+                        let is_deleted = self.deleted_row_ids.contains(&global_row_id);
+                        if !is_deleted {
                             keep_indices.push(row_idx as u64);
                         }
                     }
 
-                    tracing::debug!(
-                        "DeletionFilterStream: keeping {} of {} rows",
+                    tracing::trace!(
+                        "DeletionFilterStream kept {} of {} rows from offset {}",
                         keep_indices.len(),
-                        batch_size
+                        batch_size,
+                        batch_start_row_id
                     );
 
                     // If all rows are deleted, skip this batch and continue to next
@@ -428,7 +437,9 @@ impl PepperTableProvider {
         })?;
 
         let format = Arc::new(VortexFormat::default());
-        let listing_options = ListingOptions::new(format);
+        let listing_options = ListingOptions::new(format)
+            .with_file_extension(".vortex".to_string())
+            .with_target_partitions(1);
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
@@ -709,7 +720,7 @@ impl PepperTableProvider {
                     HashMap::with_capacity(existing_entries.len());
                 for entry in existing_entries {
                     existing_by_key
-                        .entry(entry.key_bytes.clone())
+                        .entry(entry.key_hash.clone())
                         .or_default()
                         .push(entry);
                 }
@@ -719,8 +730,9 @@ impl PepperTableProvider {
 
                 for key in unique_keys {
                     let key_bytes = key.key_bytes.clone();
+                    let key_hash_vec = key.key_hash.to_vec();
                     let seen_in_stream = state_guard.seen_new_keys.contains(&key_bytes);
-                    let existing = existing_by_key.get(&key_bytes);
+                    let existing = existing_by_key.get(&key_hash_vec);
 
                     match &mode {
                         ConflictMode::Drop => {
@@ -1049,8 +1061,29 @@ impl PepperTableProvider {
 
         // Refresh the listing table to pick up new files and update statistics
         // This ensures that query plans have access to up-to-date table statistics
-        // after the insert operation completes
+        // after the insert operation completes.
+        //
+        // NOTE: The ListingTable will re-list files from the ObjectStore on each scan,
+        // so this refresh primarily updates the in-memory ListingTable instance.
+        // For local filesystems, file discovery should be immediate.
         self.refresh_listing_table()?;
+
+        // Register any new data files with the catalog for proper offset tracking
+        let row_count_i64 =
+            i64::try_from(row_count).map_err(|_| CatalogError::InvalidOperation {
+                message: format!(
+                    "Inserted row count {} exceeds 64-bit signed range",
+                    row_count
+                ),
+            })?;
+
+        self.register_new_data_files(Some(row_count_i64)).await?;
+
+        tracing::debug!(
+            "Insert and refresh complete for table {}, total rows inserted: {}",
+            self.table_metadata.table_name,
+            row_count
+        );
 
         Ok(row_count)
     }
@@ -1119,6 +1152,34 @@ impl PepperTableProvider {
     }
 
     async fn apply_conflict_side_effects(&self, state: &mut ConflictState) -> CatalogResult<()> {
+        // For UPSERT, we need to use different snapshot IDs for old and new entries.
+        // The PRIMARY KEY is (table_id, key_hash, key_bytes, begin_snapshot).
+        //
+        // Strategy:
+        // 1. Mark old entries deleted: set end_snapshot = current_snapshot_id
+        // 2. Insert new entries with: begin_snapshot = new_snapshot_id
+        //
+        // The get_active_key_index_entries query filters WHERE end_snapshot IS NULL,
+        // so only the new entries will be visible.
+        let new_snapshot_id = if !state.delete_keys.is_empty() {
+            // Generate a new snapshot ID for the upserted entries
+            uuid::Uuid::now_v7().to_string()
+        } else {
+            // For simple inserts (no conflicts), use current snapshot
+            self.table_metadata.current_snapshot_id.clone()
+        };
+
+        // Mark old key_index entries as deleted with current snapshot
+        if !state.delete_keys.is_empty() {
+            self.catalog
+                .mark_key_index_entries_deleted(
+                    self.table_metadata.table_id,
+                    &state.delete_keys,
+                    &self.table_metadata.current_snapshot_id,
+                )
+                .await?;
+        }
+
         if state.total_rows > 0 {
             let start_row_id = self
                 .catalog
@@ -1136,7 +1197,7 @@ impl PepperTableProvider {
                         key_bytes: key.key_bytes.clone(),
                         data_file_id: DEFAULT_DATA_FILE_ID,
                         row_id: next_row_id,
-                        begin_snapshot: self.table_metadata.current_snapshot_id.clone(),
+                        begin_snapshot: new_snapshot_id.clone(),
                     });
                     next_row_id += 1;
                 }
@@ -1147,15 +1208,14 @@ impl PepperTableProvider {
             }
         }
 
-        if !state.delete_keys.is_empty() {
-            self.catalog
-                .mark_key_index_entries_deleted(
-                    self.table_metadata.table_id,
-                    &state.delete_keys,
-                    &self.table_metadata.current_snapshot_id,
-                )
-                .await?;
-        }
+        // NOTE: We do NOT update the catalog's current_snapshot_id here.
+        // The snapshot directory remains the same - all data files stay in the current snapshot.
+        // The different begin_snapshot values in key_index entries are purely for MVCC versioning
+        // of the index itself, not for organizing data files into separate directories.
+        //
+        // The get_active_key_index_entries query filters WHERE end_snapshot IS NULL,
+        // which ensures only the latest version of each key is visible, regardless of
+        // what begin_snapshot value it has.
 
         if !state.delete_rows.is_empty() {
             let mut specs = Vec::with_capacity(state.delete_rows.len());
@@ -1254,6 +1314,11 @@ impl PepperTableProvider {
             &self.table_metadata.current_snapshot_id,
         );
 
+        tracing::debug!(
+            "Refreshing listing table for {}",
+            self.table_metadata.table_name
+        );
+
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
@@ -1268,8 +1333,139 @@ impl PepperTableProvider {
         *guard = new_listing_table;
 
         tracing::debug!(
-            "Refreshed listing table for {} to pick up new files and update statistics",
+            "Refreshed listing table for {} - DataFusion will re-list files on next scan",
             self.table_metadata.table_name
+        );
+
+        Ok(())
+    }
+
+    /// Register any new data files in the snapshot directory with the catalog.
+    ///
+    /// This method scans the snapshot directory for Vortex files and registers any
+    /// files that aren't already tracked in the `pepper_data_file` table. This enables
+    /// proper row offset calculation during scans, which is critical for deletion filtering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file listing or catalog operations fail.
+    async fn register_new_data_files(&self, row_count_hint: Option<i64>) -> CatalogResult<()> {
+        let snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &self.table_metadata.current_snapshot_id,
+        );
+
+        // Read directory to find all .vortex files with their metadata
+        let entries = tokio::fs::read_dir(&snapshot_dir).await.map_err(|e| {
+            super::catalog::CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to read snapshot directory {}: {e}",
+                    snapshot_dir.display()
+                ),
+            }
+        })?;
+
+        let mut vortex_files = Vec::new();
+        let mut entries = entries;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to read directory entry: {e}"),
+            }
+        })? {
+            let path = entry.path();
+            let ext = path.extension().and_then(|s| s.to_str());
+
+            if ext == Some("vortex") || ext == Some("vt") {
+                let metadata = entry.metadata().await.map_err(|e| {
+                    super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to read metadata for {}: {e}", path.display()),
+                    }
+                })?;
+                let modified = metadata.modified().map_err(|e| {
+                    super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to get modified time for {}: {e}", path.display()),
+                    }
+                })?;
+                vortex_files.push((path, metadata.len(), modified));
+            }
+        }
+
+        if vortex_files.is_empty() {
+            return Ok(());
+        }
+
+        // Sort files by modification time (oldest first) to maintain insertion order
+        vortex_files.sort_by_key(|(_, _, modified)| *modified);
+
+        // Get already-registered files from catalog
+        let registered_files = self
+            .catalog
+            .get_data_files(self.table_metadata.table_id)
+            .await?;
+
+        let registered_paths: std::collections::HashSet<String> =
+            registered_files.iter().map(|f| f.path.clone()).collect();
+
+        // Identify files that still need to be registered
+        let new_files: Vec<_> = vortex_files
+            .iter()
+            .filter(|(path, _, _)| !registered_paths.contains(&path.to_string_lossy().to_string()))
+            .collect();
+
+        if new_files.is_empty() {
+            return Ok(());
+        }
+
+        // Start from the highest row_id recorded so far
+        let mut cumulative_row_id = registered_files
+            .iter()
+            .map(|f| f.row_id_start + f.record_count)
+            .max()
+            .unwrap_or(0);
+
+        // Distribute the hinted row count (if any) across newly discovered files.
+        let mut rows_remaining = row_count_hint.unwrap_or(0).max(0);
+        let mut files_remaining = new_files.len() as i64;
+
+        for (idx, (vortex_path, file_size_bytes, _modified)) in new_files.into_iter().enumerate() {
+            let path_str = vortex_path.to_string_lossy().to_string();
+
+            let base_row_count = if files_remaining > 0 && rows_remaining > 0 {
+                let div = rows_remaining / files_remaining;
+                let rem = rows_remaining % files_remaining;
+                // Spread remainder across earliest files for determinism
+                let extra = if rem > 0 && (idx as i64) < rem { 1 } else { 0 };
+                rows_remaining -= div + extra;
+                files_remaining -= 1;
+                div + extra
+            } else {
+                0
+            };
+
+            let data_file = super::metadata::DataFile {
+                data_file_id: 0, // Assigned by catalog
+                table_id: self.table_metadata.table_id,
+                partition_id: None,
+                file_order: (registered_files.len() + idx) as i64,
+                path: path_str.clone(),
+                path_is_relative: false,
+                file_format: "vortex".to_string(),
+                record_count: base_row_count,
+                file_size_bytes: *file_size_bytes as i64,
+                row_id_start: cumulative_row_id,
+            };
+
+            self.catalog.add_data_file(data_file).await?;
+            cumulative_row_id = cumulative_row_id
+                .checked_add(base_row_count)
+                .unwrap_or(cumulative_row_id);
+        }
+
+        tracing::debug!(
+            "Registered new data files for table {} (row hint: {:?})",
+            self.table_metadata.table_name,
+            row_count_hint
         );
 
         Ok(())
@@ -1436,7 +1632,12 @@ impl TableProvider for PepperTableProvider {
                     })?;
 
             if !deleted_row_ids.is_empty() {
-                // Wrap the plan with our deletion filter
+                tracing::debug!(
+                    "Applying deletion filter with {} deleted rows to scan of table {}",
+                    deleted_row_ids.len(),
+                    self.table_metadata.table_name
+                );
+
                 return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
             }
         }
