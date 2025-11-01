@@ -69,6 +69,8 @@ pub struct DynamoDBTableProvider {
 type DynamoDBItemStream =
     dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
 
+const DEFAULT_SEGMENTS: usize = 8;
+
 impl DynamoDBTableProvider {
     pub async fn try_new(
         client: Arc<Client>,
@@ -183,7 +185,7 @@ impl DynamoDBTableProvider {
 
     fn get_partitions_from_table_size(&self) -> usize {
         match self.table_total_item_count {
-            None => 8,
+            None => DEFAULT_SEGMENTS,
             Some(row_count) => match row_count {
                 0..1_000 => 1,
                 1_000..10_000 => 2,
