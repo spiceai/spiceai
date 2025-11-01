@@ -27,7 +27,7 @@ RUN \
     --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
     case "${TARGETARCH}" in \
-      arm64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=armv8-a" ;; \
+      arm64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
       amd64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=x86-64" ;; \
       *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
     esac && \
