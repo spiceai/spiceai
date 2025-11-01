@@ -1,25 +1,10 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
-    {
-      "data": {
-        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-        "question": "What is the fifth root of 32?"
-      },
-      "primary_key": {
-        "id": 948
-      },
-      "score": 0.03
-    },
     {
       "data": {
         "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
@@ -36,9 +21,23 @@ snapshot_kind: text
     },
     {
       "data": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "dataset": "qs",
+      "matches": {
+        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+        "question": "What is the fifth root of 32?"
+      },
+      "primary_key": {
+        "id": 948
+      },
+      "score": 0.03
+    },
+    {
+      "data": {
+        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+      },
+      "dataset": "qs_view",
       "matches": {
         "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
         "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
@@ -52,7 +51,7 @@ snapshot_kind: text
       "data": {
         "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
       },
-      "dataset": "qs_view",
+      "dataset": "qs",
       "matches": {
         "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
         "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
