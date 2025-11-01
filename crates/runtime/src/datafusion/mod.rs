@@ -23,7 +23,7 @@ use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -35,7 +35,6 @@ use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::Query;
-use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -43,8 +42,16 @@ use crate::federated_table::FederatedTable;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
-use crate::view::create_view_table;
+use crate::view::prepare_view;
 use crate::{status, view};
+
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterConfig,
+    ballista_executor::executor::Executor,
+    ballista_scheduler::scheduler_server::SchedulerServer,
+    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
+};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -56,7 +63,7 @@ use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
-use datafusion::datasource::{TableProvider, ViewTable};
+use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
@@ -71,9 +78,11 @@ use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
 use runtime_async::ManagedTokioRuntime;
+use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
+use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
@@ -84,11 +93,14 @@ use util::{RetryError, retry};
 
 pub mod query;
 
+pub mod app_context_extension;
 pub mod builder;
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod dialect;
 pub mod error;
-pub mod extension;
 pub mod filter_converter;
+pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;
@@ -232,6 +244,14 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    UnableToLockWritableSchedulerHandle {},
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    UnableToLockWritableExecutorHandle {},
+
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
     ))]
@@ -320,9 +340,17 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
-
-    tokio_runtime: OnceLock<ManagedTokioRuntime>,
+    cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    io_runtime: Handle,
     metrics: Option<Metrics>,
+
+    pub temp_directory: Option<String>,
+    #[cfg(feature = "cluster")]
+    pub cluster_config: Arc<ClusterConfig>,
+    #[cfg(feature = "cluster")]
+    pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
+    #[cfg(feature = "cluster")]
+    pub executor: RwLock<Option<Arc<Executor>>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -342,8 +370,9 @@ impl DataFusion {
     pub fn builder(
         status: Arc<status::RuntimeStatus>,
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+        io_runtime: Handle,
     ) -> DataFusionBuilder {
-        DataFusionBuilder::new(status, accelerator_engine_registry)
+        DataFusionBuilder::new(status, accelerator_engine_registry, io_runtime)
     }
 
     #[must_use]
@@ -578,8 +607,8 @@ impl DataFusion {
             .contains(table_reference)
     }
 
-    pub fn set_tokio_runtime(&self, handle: ManagedTokioRuntime) {
-        if self.tokio_runtime.set(handle).is_err() {
+    pub fn set_cpu_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.cpu_runtime.set(handle).is_err() {
             // Failure to set means this was already set - that shouldn't happen.
             tracing::error!(
                 "Failed to set tokio runtime on the Datafusion struct, this is an unexpected internal error"
@@ -588,8 +617,8 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn tokio_runtime(&self) -> Option<&tokio::runtime::Handle> {
-        self.tokio_runtime.get().map(ManagedTokioRuntime::handle)
+    pub fn cpu_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
     }
 
     async fn get_table_provider(
@@ -1040,17 +1069,21 @@ impl DataFusion {
             dataset.source().to_string(),
             accelerated_table_provider,
             refresh,
+            self.io_runtime.clone(),
         );
+        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
 
         let retention_delete_expr = match dataset.retention_sql() {
-            Some(retention_sql) => Some(
-                retention_sql::parse_retention_sql(
+            Some(retention_sql) => {
+                let parsed = retention_sql::parse_retention_sql(
                     &dataset.name,
                     retention_sql.as_str(),
                     source_table_provider.schema(),
                 )
-                .context(RetentionSqlSnafu)?,
-            ),
+                .context(RetentionSqlSnafu)?;
+
+                Some(parsed.delete_expr)
+            }
             None => None,
         };
 
@@ -1115,7 +1148,12 @@ impl DataFusion {
             }
         }
 
-        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+        // For append mode without time_column, check if source provides append_stream
+        // Skip this check for Pepper which has its own validation (supports primary_key or time_column)
+        if refresh_mode == RefreshMode::Append
+            && dataset.time_column.is_none()
+            && acceleration_settings.engine != Engine::Pepper
+        {
             let append_stream = source.append_stream(source_table_provider);
             if let Some(append_stream) = append_stream {
                 accelerated_table_builder.append_stream(append_stream);
@@ -1419,9 +1457,7 @@ impl DataFusion {
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<JoinHandle<Option<Arc<Notify>>>> {
         tracing::info!("Initializing view {}", &view.name);
-
-        let table_exists = self.ctx.table_exist(view.name.clone()).unwrap_or(false);
-        if table_exists {
+        if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
             return TableAlreadyExistsSnafu.fail();
         }
         ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &view.name)?;
@@ -1444,10 +1480,8 @@ impl DataFusion {
         let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
 
-        tracing::debug!(
-            "Creating view {} with dependent tables {dependent_table_names:?}",
-            view.name
-        );
+        let table = view.name.clone();
+        tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
         let register_task: JoinHandle<Option<Arc<Notify>>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
@@ -1457,15 +1491,11 @@ impl DataFusion {
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<TableReference> = None;
 
-            let table = &view.name;
-
             for dependent_table_name in &dependent_table_names {
                 let mut attempts = 0;
-
                 if unresolved_dependent_table.is_some() {
                     break;
                 }
-
                 loop {
                     if !ctx
                         .table_exist(dependent_table_name.clone())
@@ -1487,34 +1517,35 @@ impl DataFusion {
                     }
                     break;
                 }
+                if attempts > 0 {
+                    tracing::info!("Dependent table {dependent_table_name} for view {table} found");
+                }
             }
 
             if let Some(missing_table) = unresolved_dependent_table {
                 tracing::error!(
                     "Failed to create view {table}. Dependent table {missing_table} does not exist."
                 );
-                status.update_view(table, status::ComponentStatus::Error);
+                status.update_view(&table, status::ComponentStatus::Error);
                 return None;
             }
 
             // If view depends on other tables, wait until they are ready
-            wait_until_dependent_tables_are_ready(table, &dependent_table_names, &status).await;
+            wait_until_dependent_tables_are_ready(&table, &dependent_table_names, &status).await;
 
-            let view_table = match create_view_table(&ctx, &statements[0], view.sql.as_ref()).await
-            {
-                Ok(view_table) => view_table,
+            let tbl_provider = match prepare_view(&ctx, &statements[0], &view).await {
+                Ok(tbl) => tbl,
                 Err(e) => {
                     tracing::error!("Failed to create view {table}: {e}");
-                    status.update_view(table, status::ComponentStatus::Error);
+                    status.update_view(&table, status::ComponentStatus::Error);
                     return None;
                 }
             };
-
             if let Some(acceleration) = &view.acceleration
                 && acceleration.enabled
             {
                 match df_ref
-                    .create_accelerated_view(&view, view_table, secrets)
+                    .create_accelerated_view(&view, tbl_provider, secrets)
                     .await
                 {
                     Ok(is_ready) => {
@@ -1522,20 +1553,20 @@ impl DataFusion {
                     }
                     Err(e) => {
                         tracing::error!("Failed to create view {table}: {e}");
-                        status.update_view(table, status::ComponentStatus::Error);
+                        status.update_view(&table, status::ComponentStatus::Error);
                         return None;
                     }
                 }
             }
 
             // non-accelerated view
-            if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
+            if let Err(e) = ctx.register_table(table.clone(), tbl_provider) {
                 tracing::error!("Failed to create view {table}: {e}");
-                status.update_view(table, status::ComponentStatus::Error);
+                status.update_view(&table, status::ComponentStatus::Error);
                 return None;
             }
-            tracing::info!("{}", view_registered_trace(table, None));
-            status.update_view(table, status::ComponentStatus::Ready);
+            tracing::info!("{}", view_registered_trace(&table, None));
+            status.update_view(&table, status::ComponentStatus::Ready);
 
             None
         });
@@ -1546,7 +1577,7 @@ impl DataFusion {
     pub async fn create_accelerated_view(
         self: &Arc<Self>,
         view: &View,
-        view_table: ViewTable,
+        view_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<Option<Arc<Notify>>> {
         let table = &view.name;
@@ -1559,8 +1590,6 @@ impl DataFusion {
                 })?;
 
         let schema = view_table.schema();
-        let federated_table =
-            FederatedTable::new_unchecked(Arc::new(view_table) as Arc<dyn TableProvider>);
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()
@@ -1601,11 +1630,13 @@ impl DataFusion {
         let mut builder = AcceleratedTable::builder(
             self.runtime_status(),
             table.clone(),
-            federated_table.into(),
+            Arc::new(FederatedTable::new_unchecked(view_table)),
             "view".to_string(),
             accelerated_table_provider,
             refresh,
+            self.io_runtime.clone(),
         );
+        builder.cpu_runtime(self.cpu_runtime().cloned());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
@@ -1807,6 +1838,29 @@ impl DataFusion {
             }
         }
     }
+
+    #[cfg(feature = "cluster")]
+    pub fn bind_scheduler_server(
+        &self,
+        server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
+    ) -> Result<()> {
+        let mut scheduler_server = self
+            .scheduler_server
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
+        *scheduler_server = Some(server);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
+        let mut executor_handle = self
+            .executor
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableExecutorHandle {})?;
+        *executor_handle = Some(executor);
+        Ok(())
+    }
 }
 
 #[must_use]
@@ -1865,8 +1919,9 @@ async fn wait_until_dependent_tables_are_ready(
         .collect::<Vec<_>>();
 
     let _ = retry(retry_strategy, || async {
-        let statuses = runtime_status
-            .get_dataset_statuses()
+        let mut table_statuses = runtime_status.get_dataset_statuses();
+        table_statuses.extend(runtime_status.get_view_statuses());
+        let statuses = table_statuses
             .into_iter()
             .map(|(key, value)| (resolve_table_reference(key), value))
             .collect::<std::collections::HashMap<_, _>>();
@@ -1910,6 +1965,7 @@ mod tests {
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
+                Handle::current(),
             )
             .with_caching(Arc::new(
                 Caching::new().with_plans_cache(plan_cache_provider),

@@ -192,7 +192,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
   - [ ] (Docs DRI) Tag the merged `trunk` commit `vX.Y.Z`.
 - [ ] When binaries are built for the release, edit the GitHub release and select **“Set as latest release”** to trigger the [spiced_docker workflow](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker.yml) so Docker images are built from the published artifacts.
   - [ ] Monitor the spiced_docker workflow (and re-run with **workflow_dispatch** using `release_tag` and optional `target` overrides if a rebuild or partial rebuild is required).
-- [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version & image.tag) in the release branch (not in trunk).
+- [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version e.g. `1.8.3` & image.tag e.g. `1.8.3-models`) in the release branch (not in trunk).
   - [ ] If this is a **minor** release, replace the `ghcr.io/spiceai/spiceai-nightly` repository in `values.yaml` with `spiceai/spiceai` and change the tag to the release version (e.g. `1.0.0`).
   - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
 - [ ] Perform a final test pass on the released binaries and Docker images.

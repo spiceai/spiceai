@@ -257,13 +257,13 @@ async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow
         .build()
         .run()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to run query: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run query: {e:?}"))?;
 
     let collected_data = query_result
         .data
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to collect query results: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to collect query results: {e:?}"))?;
 
     Ok(collected_data)
 }

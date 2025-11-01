@@ -42,7 +42,6 @@ tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util" }
-vortex = "0.52.1"
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
@@ -53,6 +52,7 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
+cluster = ["runtime/cluster"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -82,8 +82,7 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "pepper"
-
+    "turso"
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -99,6 +98,7 @@ keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
 models = ["runtime/models"]
+llama_cpp = ["runtime/llama_cpp"]
 mongodb = ["runtime/mongodb"]
 mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]
@@ -112,6 +112,6 @@ snowflake = ["runtime/snowflake"]
 snapshots = ["runtime/snapshots"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
+turso = ["runtime/turso"]
 tpc-extension = ["dep:tpc-extension"]
-pepper = ["runtime/pepper"]
 xxhash = ["runtime/xxhash"]

@@ -38,7 +38,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(PepperCatalog::new(format!(
         "sqlite://{}",
         db_path.to_string_lossy()
-    )));
+    ))?);
     catalog.init().await?;
 
     let schema = Arc::new(Schema::new(vec![
@@ -51,6 +51,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
+        partition_column: None,
     };
 
     let table = PepperTableProvider::create_table(Arc::clone(&catalog), table_options).await?;

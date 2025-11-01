@@ -42,6 +42,7 @@ use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
+use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
@@ -234,7 +235,9 @@ pub async fn run(args: Args) -> Result<()> {
             Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
         )]))
         .with_datasets_health_monitor()
-        .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
+        .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
+        .with_runtime_config(args.runtime.clone())
+        .with_io_runtime(Handle::current());
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
@@ -257,12 +260,27 @@ pub async fn run(args: Args) -> Result<()> {
     .await
     .context(UnableToInitializeTracingSnafu)?;
 
-    // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-    let tokio_runtime = ManagedTokioRuntime::try_new()
-        .boxed()
-        .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+    // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
+    match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
+        Some("sql_engine") | None => {
+            // This needs to be created after tracing is set up, or else task_history events aren't emitted.
+            let tokio_runtime = ManagedTokioRuntime::try_new()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-    rt.datafusion().set_tokio_runtime(tokio_runtime);
+            rt.datafusion().set_cpu_runtime(tokio_runtime);
+        }
+        Some("disabled") => {
+            tracing::info!(
+                "Dedicated SQL engine thread pool is disabled via runtime parameter `runtime.params.dedicated_thread_pool`."
+            );
+        }
+        Some(other) => {
+            tracing::warn!(
+                "Invalid runtime parameter value for `runtime.params.dedicated_thread_pool`: `{other}`. Set to `disabled` or `sql_engine`. Continuing with dedicated SQL engine thread pool."
+            );
+        }
+    }
 
     if let Some(metrics_registry) = prometheus_registry {
         init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;

@@ -48,6 +48,8 @@ mod metrics;
 use client::S3VectorClient;
 mod retry_client;
 
+const DEFAULT_BATCH_WRITE_ROWS: usize = 100_000;
+
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
         .description("The S3 bucket name to use for the S3 Vectors index.")
@@ -79,11 +81,13 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use.")
         .secret(),
+    ParameterSpec::component("batch_write_rows")
+        .description("The number of rows to chunk record batches into for individual processing. Used to control memory usage during writes."),
 ];
 
-/// Attempt to construct an [`S3Vector`] for the provided dataset on the given column.
+/// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
 #[allow(clippy::too_many_arguments)]
-pub async fn try_from_dataset(
+pub async fn try_from_table(
     ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,
@@ -112,6 +116,16 @@ pub async fn try_from_dataset(
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
+    let batch_write_rows = string_from_params(&params, "batch_write_rows")
+        .and_then(|s| match s.parse::<usize>() {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::warn!("Invalid value for 's3_vectors_batch_write_rows': {s}. Error: {e}. Falling back to default: {DEFAULT_BATCH_WRITE_ROWS}");
+                None
+            },
+        })
+        .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
+
     let table = try_vector_table(
         metadata_columns.clone(),
         params,
@@ -138,6 +152,7 @@ pub async fn try_from_dataset(
         metadata_columns,
         Arc::clone(model),
         partition_by,
+        batch_write_rows,
     ))
 }
 

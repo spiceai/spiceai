@@ -17,10 +17,12 @@ limitations under the License.
 use crate::{federated_table::FederatedTable, status};
 
 use super::{
-    refresh::RefreshOverrides, refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
+    metrics, refresh::RefreshOverrides, refresh_task::RefreshTask,
+    synchronized_table::SynchronizedTable,
 };
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use tokio::{
+    runtime::Handle,
     select,
     sync::{
         Semaphore,
@@ -29,11 +31,12 @@ use tokio::{
     task::JoinHandle,
 };
 
-use std::sync::Arc;
+use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::RwLock;
 
 use super::refresh::Refresh;
 use datafusion::{datasource::TableProvider, sql::TableReference};
+use opentelemetry::KeyValue;
 use spicepod::metric::Metrics;
 
 pub struct RefreshTaskRunnerBuilder {
@@ -46,6 +49,8 @@ pub struct RefreshTaskRunnerBuilder {
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -57,6 +62,7 @@ impl RefreshTaskRunnerBuilder {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -68,6 +74,8 @@ impl RefreshTaskRunnerBuilder {
             disable_federation: false,
             semaphore: None,
             metrics: None,
+            cpu_runtime: None,
+            io_runtime,
         }
     }
 
@@ -91,6 +99,12 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> Self {
+        self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -98,13 +112,16 @@ impl RefreshTaskRunnerBuilder {
             self.federated,
             self.federated_source,
             self.accelerator,
-            self.metrics,
+            self.io_runtime,
         )
-        .with_disable_federation(self.disable_federation);
+        .with_disable_federation(self.disable_federation)
+        .with_metrics(self.metrics);
 
         if let Some(semaphore) = self.semaphore {
             refresh_task_builder = refresh_task_builder.with_semaphore(semaphore);
         }
+
+        refresh_task_builder = refresh_task_builder.with_cpu_runtime(self.cpu_runtime);
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 
@@ -128,6 +145,9 @@ pub struct RefreshTaskRunner {
     task: Option<JoinHandle<()>>,
 }
 
+type RefreshRunFuture =
+    BoxFuture<'static, std::result::Result<super::Result<()>, Box<dyn Any + Send>>>;
+
 impl RefreshTaskRunner {
     #[must_use]
     pub fn builder(
@@ -137,6 +157,7 @@ impl RefreshTaskRunner {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        io_runtime: Handle,
     ) -> RefreshTaskRunnerBuilder {
         RefreshTaskRunnerBuilder::new(
             runtime_status,
@@ -145,9 +166,13 @@ impl RefreshTaskRunner {
             federated_source,
             refresh,
             accelerator,
+            io_runtime,
         )
     }
 
+    /// # Panics
+    ///
+    /// Panics if `start` is called more than once for the same runner instance.
     pub fn start(
         &mut self,
     ) -> (
@@ -168,22 +193,41 @@ impl RefreshTaskRunner {
         let refresh_task = Arc::clone(&self.refresh_task);
 
         self.task = Some(tokio::spawn(async move {
-            let mut task_completion: Option<BoxFuture<super::Result<()>>> = None;
+            let mut task_completion: Option<RefreshRunFuture> = None;
 
             loop {
                 if let Some(task) = task_completion.take() {
                     select! {
                         res = task => {
                             match res {
-                                Ok(()) => {
+                                Ok(Ok(())) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully");
                                     if let Err(err) = notify_refresh_complete.send(Ok(())).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
-                                Err(err) => {
+                                Ok(Err(err)) => {
                                     tracing::debug!("Dataset {dataset_name} failed to refresh with error: {err}");
                                     if let Err(err) = notify_refresh_complete.send(Err(err)).await {
+                                        tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
+                                    }
+                                },
+                                Err(panic_payload) => {
+                                    let dataset_label = dataset_name.to_string();
+                                    let panic_message = Self::panic_to_message(panic_payload);
+                                    tracing::error!(
+                                        dataset = %dataset_label,
+                                        %panic_message,
+                                        "Refresh worker panicked; continuing refresh loop"
+                                    );
+                                    metrics::REFRESH_WORKER_PANICS.add(1, &[KeyValue::new("dataset", dataset_label.clone())]);
+
+                                    let panic_error = super::Error::RefreshWorkerPanicked {
+                                        dataset_name: dataset_label,
+                                        message: panic_message.clone(),
+                                    };
+
+                                    if let Err(err) = notify_refresh_complete.send(Err(panic_error)).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 }
@@ -191,14 +235,14 @@ impl RefreshTaskRunner {
                         },
                         Some(overrides_opt) = on_start_refresh.recv() => {
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
-                            task_completion = Some(Box::pin(refresh_task.run(request)));
+                            task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
                 } else {
                     select! {
                         Some(overrides_opt) = on_start_refresh.recv() => {
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
-                            task_completion = Some(Box::pin(refresh_task.run(request)));
+                            task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                         else => {
                             // The parent refresher is shutting down, we should too
@@ -229,6 +273,20 @@ impl RefreshTaskRunner {
             r = r.with_overrides(&overrides);
         }
         r
+    }
+
+    fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {
+        Box::pin(AssertUnwindSafe(async move { refresh_task.run(request).await }).catch_unwind())
+    }
+
+    fn panic_to_message(panic: Box<dyn Any + Send>) -> String {
+        match panic.downcast::<String>() {
+            Ok(message) => *message,
+            Err(panic) => match panic.downcast::<&'static str>() {
+                Ok(message) => (*message).to_string(),
+                Err(_) => "refresh worker panicked with a non-string payload".to_string(),
+            },
+        }
     }
 
     pub fn abort(&mut self) {

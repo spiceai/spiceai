@@ -53,7 +53,7 @@ RUN set -eux; \
 
 FROM ${BASE_IMAGE} AS sandbox-setup
 
-ARG CARGO_FEATURES
+ARG CARGO_FEATURES=default
 ARG INSTALL_ORACLE_ODPIC=false
 
 # Install required packages

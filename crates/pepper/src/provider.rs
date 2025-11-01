@@ -32,10 +32,12 @@ limitations under the License.
 //! subdirectory (e.g., `file_000001/`, `file_000002/`). When querying the table,
 //! the provider reads from all active virtual files.
 
-use super::catalog::{CatalogResult, MetadataCatalog};
+use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
+use super::deletion::{DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::metadata::{CreateTableOptions, TableMetadata};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -46,15 +48,242 @@ use datafusion_common::Constraints;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::collect;
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::PlanProperties;
 use futures::StreamExt;
 use std::any::Any;
 use std::borrow::Cow;
+use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
+use tokio::task;
 use vortex_datafusion::VortexFormat;
+
+const DEFAULT_DATA_FILE_ID: i64 = 0;
+
+/// Execution plan that filters out deleted rows based on deletion vectors.
+///
+/// This wraps another execution plan and removes rows whose positions
+/// match the deleted row IDs loaded from deletion vector files.
+struct DeletionFilterExec {
+    input: Arc<dyn ExecutionPlan>,
+    deleted_row_ids: std::collections::HashSet<i64>,
+    properties: datafusion_physical_plan::PlanProperties,
+}
+
+impl DeletionFilterExec {
+    fn new(input: Arc<dyn ExecutionPlan>, deleted_row_ids: std::collections::HashSet<i64>) -> Self {
+        let properties = input.properties().clone();
+        Self {
+            input,
+            deleted_row_ids,
+            properties,
+        }
+    }
+}
+
+impl std::fmt::Debug for DeletionFilterExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DeletionFilterExec")
+    }
+}
+
+impl DisplayAs for DeletionFilterExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "DeletionFilterExec: filtered_rows={}",
+            self.deleted_row_ids.len()
+        )
+    }
+}
+
+impl ExecutionPlan for DeletionFilterExec {
+    fn name(&self) -> &'static str {
+        "DeletionFilterExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(datafusion_common::DataFusionError::Plan(
+                "DeletionFilterExec requires exactly 1 child".to_string(),
+            ));
+        }
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            self.deleted_row_ids.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion_execution::TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let deleted_row_ids = self.deleted_row_ids.clone();
+        let schema = input_stream.schema();
+
+        Ok(Box::pin(DeletionFilterStream {
+            input: input_stream,
+            deleted_row_ids,
+            schema,
+            global_row_offset: 0,
+        }))
+    }
+}
+
+/// Stream that filters out deleted rows from an input stream.
+struct DeletionFilterStream {
+    input: SendableRecordBatchStream,
+    deleted_row_ids: std::collections::HashSet<i64>,
+    schema: arrow_schema::SchemaRef,
+    global_row_offset: i64,
+}
+
+impl futures::Stream for DeletionFilterStream {
+    type Item = datafusion_common::Result<arrow::array::RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            match std::pin::Pin::new(&mut self.input).poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(batch))) => {
+                    let current_offset = self.global_row_offset;
+                    let batch_size = batch.num_rows();
+
+                    // Validate batch size upfront to avoid redundant error handling in hot path
+                    let batch_size_i64 = match convert_to_i64(batch_size, "batch size") {
+                        Ok(value) => value,
+                        Err(err) => return std::task::Poll::Ready(Some(Err(err))),
+                    };
+
+                    self.global_row_offset =
+                        match self.global_row_offset.checked_add(batch_size_i64) {
+                            Some(value) => value,
+                            None => {
+                                return std::task::Poll::Ready(Some(Err(
+                                    datafusion_common::DataFusionError::Execution(
+                                        "Row ID overflow while updating global offset".to_string(),
+                                    ),
+                                )))
+                            }
+                        };
+
+                    tracing::debug!(
+                        "DeletionFilterStream: processing batch with {} rows, offset {}, deleted_ids: {:?}",
+                        batch_size, current_offset, self.deleted_row_ids
+                    );
+
+                    // Find which rows in this batch should be kept
+                    let mut keep_indices = Vec::new();
+                    for row_idx in 0..batch_size {
+                        // Convert once - we've already validated batch_size fits in i64
+                        let row_offset = match convert_to_i64(row_idx, "row index") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                return std::task::Poll::Ready(Some(Err(err)));
+                            }
+                        };
+                        let Some(global_row_id) = current_offset.checked_add(row_offset) else {
+                            return std::task::Poll::Ready(Some(Err(
+                                datafusion_common::DataFusionError::Execution(
+                                    "Row ID overflow while calculating global row id".to_string(),
+                                ),
+                            )));
+                        };
+                        if !self.deleted_row_ids.contains(&global_row_id) {
+                            keep_indices.push(row_idx as u64);
+                        }
+                    }
+
+                    tracing::debug!(
+                        "DeletionFilterStream: keeping {} of {} rows",
+                        keep_indices.len(),
+                        batch_size
+                    );
+
+                    // If all rows are deleted, skip this batch and continue to next
+                    if keep_indices.is_empty() {
+                        continue;
+                    }
+
+                    // If no rows are deleted, return the batch as-is
+                    if keep_indices.len() == batch_size {
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+
+                    // Filter the batch using take kernel
+                    let indices = arrow::array::UInt64Array::from(keep_indices);
+                    let filtered_columns: datafusion_common::Result<Vec<_>> = batch
+                        .columns()
+                        .iter()
+                        .map(|col| {
+                            arrow::compute::take(col.as_ref(), &indices, None).map_err(|e| {
+                                datafusion_common::DataFusionError::ArrowError(Box::new(e), None)
+                            })
+                        })
+                        .collect();
+
+                    match filtered_columns {
+                        Ok(columns) => {
+                            match arrow::array::RecordBatch::try_new(batch.schema(), columns) {
+                                Ok(filtered_batch) => {
+                                    return std::task::Poll::Ready(Some(Ok(filtered_batch)));
+                                }
+                                Err(e) => {
+                                    return std::task::Poll::Ready(Some(Err(
+                                        datafusion_common::DataFusionError::ArrowError(
+                                            Box::new(e),
+                                            None,
+                                        ),
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => return std::task::Poll::Ready(Some(Err(e))),
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                std::task::Poll::Ready(None) => {
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Pending => {
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl datafusion_execution::RecordBatchStream for DeletionFilterStream {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
 
 /// Pepper table provider that reads from Vortex virtual files.
 ///
@@ -69,8 +298,8 @@ pub struct PepperTableProvider {
     /// Table metadata from the catalog
     table_metadata: TableMetadata,
     /// Reference to the metadata catalog for file operations
-    _catalog: Arc<dyn MetadataCatalog>,
-    /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory
+    catalog: Arc<dyn MetadataCatalog>,
+    /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory.
     /// Note: Each `DataFile` in the catalog represents a subdirectory (virtual file),
     /// but this `ListingTable` currently scans all of them together.
     /// Wrapped in `RwLock` to allow updating the listing table on overwrite operations.
@@ -78,6 +307,8 @@ pub struct PepperTableProvider {
     /// synchronous access in `TableProvider` trait methods (`supports_filters_pushdown`
     /// and `statistics`), and the lock is held for very short durations (just Arc clones).
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    /// Optional retention filters that should be applied immediately after writes.
+    retention_filters: Vec<Expr>,
 }
 
 impl std::fmt::Debug for PepperTableProvider {
@@ -89,31 +320,51 @@ impl std::fmt::Debug for PepperTableProvider {
 }
 
 impl PepperTableProvider {
-    /// Create a new Pepper table provider.
+    /// Construct the path to a snapshot directory.
+    ///
+    /// Directory structure: `[table_path]/[table_id]/[snapshot_id]/`
+    ///
+    /// # Arguments
+    ///
+    /// * `table_path` - The base path for the table
+    /// * `table_id` - The unique identifier for the table
+    /// * `snapshot_id` - The snapshot identifier
+    fn snapshot_dir_path(table_path: &str, table_id: i64, snapshot_id: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(table_path)
+            .join(table_id.to_string())
+            .join(snapshot_id)
+    }
+
+    /// Convert a directory path to a `DataFusion`-compatible URL string with trailing slash.
+    ///
+    /// `DataFusion` requires directory URLs to end with a trailing slash.
+    fn dir_to_url_string(dir: &std::path::Path) -> String {
+        let mut url_str = dir.to_string_lossy().to_string();
+        if !url_str.ends_with('/') {
+            url_str.push('/');
+        }
+        url_str
+    }
+
+    /// Create a new `ListingTable` for a snapshot directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `snapshot_dir` - Path to the snapshot directory
+    /// * `schema` - Arrow schema for the table
     ///
     /// # Errors
     ///
-    /// Returns an error if the table cannot be found in the catalog or if the listing
-    /// table cannot be created.
-    pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
-        let table_metadata = catalog.get_table(table_name).await?;
-
-        // Construct path to current snapshot
-        // Directory structure: [table_path]/[table_id]/[snapshot_id]/
-        // All tables have a snapshot ID (created on table initialization)
-        let snapshot_dir = std::path::PathBuf::from(&table_metadata.path)
-            .join(table_metadata.table_id.to_string())
-            .join(&table_metadata.current_snapshot_id);
-
-        // DataFusion requires trailing slash for directory URLs
-        let mut dir_url_str = snapshot_dir.to_string_lossy().to_string();
-        if !dir_url_str.ends_with('/') {
-            dir_url_str.push('/');
-        }
+    /// Returns an error if the listing table cannot be created.
+    fn create_listing_table(
+        snapshot_dir: &std::path::Path,
+        schema: SchemaRef,
+    ) -> CatalogResult<Arc<ListingTable>> {
+        let dir_url_str = Self::dir_to_url_string(snapshot_dir);
 
         let table_url = ListingTableUrl::parse(&dir_url_str).map_err(|e| {
             super::catalog::CatalogError::InvalidOperation {
-                message: e.to_string(),
+                message: format!("Failed to parse table URL: {e}"),
             }
         })?;
 
@@ -122,18 +373,78 @@ impl PepperTableProvider {
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
-            .with_schema(Arc::<arrow_schema::Schema>::clone(&table_metadata.schema));
+            .with_schema(schema);
 
         let listing_table = ListingTable::try_new(config).map_err(|e| {
             super::catalog::CatalogError::InvalidOperation {
-                message: e.to_string(),
+                message: format!("Failed to create listing table: {e}"),
             }
         })?;
 
+        Ok(Arc::new(listing_table))
+    }
+
+    /// Ensure a snapshot directory exists, creating it if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created.
+    async fn ensure_snapshot_dir_exists(
+        snapshot_dir: &std::path::Path,
+    ) -> datafusion_common::Result<()> {
+        if !snapshot_dir.exists() {
+            tokio::fs::create_dir_all(snapshot_dir)
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
+    /// Create a new Pepper table provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be found in the catalog or if the listing
+    /// table cannot be created.
+    pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
+        Self::new_with_retention(table_name, catalog, Vec::new()).await
+    }
+
+    /// Create a new table provider with explicit retention filters.
+    ///
+    /// This is primarily used by the runtime when datasets specify `retention_sql`
+    /// so that deletion vectors are written before a refresh completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be found in the catalog or if the listing
+    /// table cannot be created.
+    pub async fn new_with_retention(
+        table_name: &str,
+        catalog: Arc<dyn MetadataCatalog>,
+        retention_filters: Vec<Expr>,
+    ) -> CatalogResult<Self> {
+        let table_metadata = catalog.get_table(table_name).await?;
+
+        // Construct path to current snapshot
+        // Directory structure: [table_path]/[table_id]/[snapshot_id]/
+        // All tables have a snapshot ID (created on table initialization)
+        let snapshot_dir = Self::snapshot_dir_path(
+            &table_metadata.path,
+            table_metadata.table_id,
+            &table_metadata.current_snapshot_id,
+        );
+
+        let listing_table = Self::create_listing_table(
+            &snapshot_dir,
+            Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
+        )?;
+
         Ok(Self {
             table_metadata,
-            _catalog: catalog,
-            listing_table: Arc::new(RwLock::new(Arc::new(listing_table))),
+            catalog,
+            listing_table: Arc::new(RwLock::new(listing_table)),
+            retention_filters,
         })
     }
 
@@ -146,8 +457,28 @@ impl PepperTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
     ) -> CatalogResult<Self> {
+        Self::create_table_with_retention(catalog, options, Vec::new()).await
+    }
+
+    /// Create a new table in Pepper with retention filters applied to subsequent writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be created in the catalog.
+    pub async fn create_table_with_retention(
+        catalog: Arc<dyn MetadataCatalog>,
+        options: CreateTableOptions,
+        retention_filters: Vec<Expr>,
+    ) -> CatalogResult<Self> {
         let _table_id = catalog.create_table(options.clone()).await?;
-        Self::new(&options.table_name, catalog).await
+        Self::new_with_retention(&options.table_name, catalog, retention_filters).await
+    }
+    /// Get a reference to the catalog.
+    ///
+    /// This is useful for testing and advanced use cases that need direct catalog access.
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<dyn MetadataCatalog> {
+        &self.catalog
     }
 
     /// Get the table metadata.
@@ -278,10 +609,6 @@ impl PepperTableProvider {
             }
         }
 
-        use datafusion_physical_expr::EquivalenceProperties;
-        use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
-        use datafusion_physical_plan::PlanProperties;
-
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::<arrow_schema::Schema>::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -356,7 +683,59 @@ impl PepperTableProvider {
 
         tracing::debug!("Insert completed, wrote {} rows to Vortex", row_count);
 
+        // Apply retention filters before refreshing the listing table so any rows matching the
+        // configured predicate are captured in deletion vector files within this refresh.
+        if !self.retention_filters.is_empty() {
+            match self.apply_retention_filters().await {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            "Retention filters deleted {} row(s) for table {}",
+                            deleted,
+                            self.table_metadata.table_name
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Retention filters found no rows to delete for table {}",
+                            self.table_metadata.table_name
+                        );
+                    }
+                }
+                Err(err) => {
+                    return Err(super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to apply retention filters after insert: {err}"),
+                    });
+                }
+            }
+        }
+
+        // Refresh the listing table to pick up new files and update statistics
+        // This ensures that query plans have access to up-to-date table statistics
+        // after the insert operation completes
+        self.refresh_listing_table()?;
+
         Ok(row_count)
+    }
+
+    async fn apply_retention_filters(&self) -> CatalogResult<u64> {
+        if self.retention_filters.is_empty() {
+            return Ok(0);
+        }
+
+        let filters = self.retention_filters.clone();
+        let sink = PepperDeletionSink::new(
+            self.table_metadata.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.listing_table),
+            Arc::clone(&self.table_metadata.schema),
+            &filters,
+        );
+
+        sink.delete_from()
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: format!("Failed to execute retention filters: {err}"),
+            })
     }
 
     /// Delete rows matching the given primary key values.
@@ -394,6 +773,126 @@ impl PepperTableProvider {
             message: "Update not yet implemented".to_string(),
         })
     }
+
+    /// Refresh the underlying `ListingTable` to pick up new files and update statistics.
+    ///
+    /// This method should be called after insert operations to ensure that:
+    /// - The `ListingTable` discovers newly written Vortex files
+    /// - Table statistics (row counts, column stats) are updated
+    /// - Query plans can use fresh statistics for optimization
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table cannot be refreshed.
+    fn refresh_listing_table(&self) -> CatalogResult<()> {
+        // Construct path to current snapshot
+        let snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &self.table_metadata.current_snapshot_id,
+        );
+
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir,
+            Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
+        )?;
+
+        // Update the listing table with write lock
+        let mut guard = self.listing_table.write().map_err(|e| {
+            super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to acquire write lock for listing table refresh: {e}"),
+            }
+        })?;
+        *guard = new_listing_table;
+
+        tracing::debug!(
+            "Refreshed listing table for {} to pick up new files and update statistics",
+            self.table_metadata.table_name
+        );
+
+        Ok(())
+    }
+
+    /// Read deletion vectors from files and return a set of deleted row IDs.
+    ///
+    /// # Blocking I/O Warning
+    ///
+    /// This function performs **blocking file system I/O** operations using `std::fs::File::open`
+    /// and must be called from within `tokio::task::spawn_blocking` to avoid blocking the async
+    /// runtime. The caller is responsible for offloading this to a blocking task context.
+    ///
+    /// See: Project coding guidelines on Async/Blocking Patterns
+    fn read_deletion_vectors(
+        delete_files: Vec<super::metadata::DeleteFile>,
+    ) -> datafusion_common::Result<std::collections::HashSet<i64>> {
+        use arrow::array::Array;
+        use arrow::ipc::reader::FileReader;
+        use std::collections::HashSet;
+
+        let mut deleted_row_ids = HashSet::new();
+        let file_count = delete_files.len();
+
+        tracing::debug!(
+            "read_deletion_vectors: processing {} delete files",
+            file_count
+        );
+
+        for delete_file in delete_files {
+            let path = std::path::Path::new(&delete_file.path);
+            tracing::debug!("read_deletion_vectors: reading file {:?}", path);
+
+            // Read deletion vector file
+            let file = std::fs::File::open(path).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to open deletion vector file {}: {e}",
+                    path.display()
+                ))
+            })?;
+
+            let reader = FileReader::try_new(file, None).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read deletion vector file {}: {e}",
+                    path.display()
+                ))
+            })?;
+
+            // Read all batches and extract row IDs
+            for batch_result in reader {
+                let batch = batch_result.map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to read batch from deletion vector: {e}"
+                    ))
+                })?;
+
+                // Get row_id column (first column)
+                let row_id_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "Expected Int64Array for row_id column".to_string(),
+                        )
+                    })?;
+
+                // Add all row IDs to the set
+                for i in 0..row_id_array.len() {
+                    if !row_id_array.is_null(i) {
+                        let row_id = row_id_array.value(i);
+                        deleted_row_ids.insert(row_id);
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Loaded {} deleted row IDs from {} deletion vector files",
+            deleted_row_ids.len(),
+            file_count
+        );
+
+        Ok(deleted_row_ids)
+    }
 }
 
 #[async_trait]
@@ -421,7 +920,7 @@ impl TableProvider for PepperTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Delegate to the underlying listing table
+        // Delegate to the underlying listing table first
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
             let guard = self.listing_table.read().map_err(|e| {
@@ -431,19 +930,71 @@ impl TableProvider for PepperTableProvider {
             })?;
             Arc::clone(&guard)
         };
-        listing_table.scan(state, projection, filters, limit).await
+        let plan = listing_table
+            .scan(state, projection, filters, limit)
+            .await?;
+
+        // Load deletion vectors from catalog
+        let delete_files = self
+            .catalog
+            .get_table_delete_files(self.table_metadata.table_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to load deletion vectors: {e}"
+                ))
+            })?;
+
+        // If there are any deletion vectors, load and apply filtering
+        if !delete_files.is_empty() {
+            let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
+            tracing::debug!(
+                "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
+                delete_files.len(),
+                total_deleted,
+                self.table_metadata.table_name
+            );
+
+            // Read all deletion vectors and build a set of deleted row IDs
+            let delete_files_for_read = delete_files.clone();
+            let deleted_row_ids =
+                task::spawn_blocking(move || Self::read_deletion_vectors(delete_files_for_read))
+                    .await
+                    .map_err(|err| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Deletion vector reader task panicked or was cancelled: {err}"
+                        ))
+                    })
+                    .and_then(|result| {
+                        result.map_err(|err| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to read deletion vectors: {err}"
+                            ))
+                        })
+                    })?;
+
+            if !deleted_row_ids.is_empty() {
+                // Wrap the plan with our deletion filter
+                return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+            }
+        }
+
+        Ok(plan)
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
-        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
-        let listing_table = self.listing_table.read().map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to acquire read lock on listing table: {e}"
-            ))
-        })?;
+        // Synchronous method - clone Arc quickly and release lock immediately
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to acquire read lock on listing table: {e}"
+                ))
+            })?;
+            Arc::clone(&guard)
+        };
         listing_table.supports_filters_pushdown(filters)
     }
 
@@ -463,8 +1014,11 @@ impl TableProvider for PepperTableProvider {
         // Note: Statistics are cached by the ListingTable and may not reflect
         // very recent writes until the table metadata is refreshed.
         //
-        // Synchronous method - can use blocking read() since we're using std::sync::RwLock
-        let listing_table = self.listing_table.read().ok()?;
+        // Clone Arc quickly and release lock immediately to minimize contention
+        let listing_table = {
+            let guard = self.listing_table.read().ok()?;
+            Arc::clone(&guard)
+        };
         listing_table.statistics()
     }
 
@@ -489,33 +1043,23 @@ impl TableProvider for PepperTableProvider {
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
 
             // Create snapshot directory: [table_path]/[table_id]/[snapshot_id]/
-            let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
-                .join(self.table_metadata.table_id.to_string())
-                .join(&new_snapshot_id);
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
 
             // Create the snapshot directory
-            tokio::fs::create_dir_all(&snapshot_dir)
-                .await
-                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-
-            // DataFusion requires trailing slash for directory URLs
-            let mut snapshot_dir_str = snapshot_dir.to_string_lossy().to_string();
-            if !snapshot_dir_str.ends_with('/') {
-                snapshot_dir_str.push('/');
-            }
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
 
             // Create a new ListingTable pointing to the snapshot directory
-            let table_url = ListingTableUrl::parse(&snapshot_dir_str)
-                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-
-            let format = Arc::new(VortexFormat::default());
-            let listing_options = ListingOptions::new(format);
-
-            let config = ListingTableConfig::new(table_url)
-                .with_listing_options(listing_options)
-                .with_schema(Arc::clone(&self.table_metadata.schema));
-
-            let new_listing_table = Arc::new(ListingTable::try_new(config)?);
+            let new_listing_table =
+                Self::create_listing_table(&snapshot_dir, Arc::clone(&self.table_metadata.schema))
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to create listing table for new snapshot: {e}"
+                        ))
+                    })?;
 
             // Perform the insert using the new listing table with append mode
             // (Vortex only supports append at the file level)
@@ -524,7 +1068,7 @@ impl TableProvider for PepperTableProvider {
                 .await?;
 
             // Update the catalog to point to the new snapshot
-            self._catalog
+            self.catalog
                 .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
                 .await
                 .map_err(|e| {
@@ -547,15 +1091,13 @@ impl TableProvider for PepperTableProvider {
 
         // For regular appends, use the existing snapshot and listing table
         // Ensure the snapshot directory exists (it might not if this is the first write to a newly created table)
-        let snapshot_dir = std::path::PathBuf::from(&self.table_metadata.path)
-            .join(self.table_metadata.table_id.to_string())
-            .join(&self.table_metadata.current_snapshot_id);
+        let snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &self.table_metadata.current_snapshot_id,
+        );
 
-        if !snapshot_dir.exists() {
-            tokio::fs::create_dir_all(&snapshot_dir)
-                .await
-                .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
-        }
+        Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
 
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
@@ -566,10 +1108,408 @@ impl TableProvider for PepperTableProvider {
             })?;
             Arc::clone(&guard)
         };
-        listing_table
+        let result = listing_table
             .insert_into(state, input, InsertOp::Append)
-            .await
+            .await?;
+
+        // Refresh the listing table to pick up new files and update statistics
+        // This ensures query plans have access to up-to-date statistics after the insert
+        self.refresh_listing_table().map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to refresh listing table after insert: {e}"
+            ))
+        })?;
+
+        Ok(result)
     }
+}
+
+// Implement DeletionTableProvider for Pepper
+#[async_trait]
+impl DeletionTableProvider for PepperTableProvider {
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(PepperDeletionSink::new(
+                self.table_metadata.clone(),
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.listing_table),
+                Arc::clone(&self.table_metadata.schema),
+                filters,
+            )),
+            &self.table_metadata.schema,
+        )))
+    }
+}
+
+/// Deletion sink for Pepper tables
+struct PepperDeletionSink {
+    table_metadata: TableMetadata,
+    catalog: Arc<dyn MetadataCatalog>,
+    listing_table: Arc<RwLock<Arc<ListingTable>>>,
+    schema: SchemaRef,
+    filters: Vec<Expr>,
+}
+
+impl PepperDeletionSink {
+    fn new(
+        table_metadata: TableMetadata,
+        catalog: Arc<dyn MetadataCatalog>,
+        listing_table: Arc<RwLock<Arc<ListingTable>>>,
+        schema: SchemaRef,
+        filters: &[Expr],
+    ) -> Self {
+        Self {
+            table_metadata,
+            catalog,
+            listing_table,
+            schema,
+            filters: filters.to_vec(),
+        }
+    }
+
+    async fn delete_all_rows(
+        &self,
+        ctx: &SessionContext,
+        listing_table: Arc<ListingTable>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
+        let batches = collect(scan_plan, ctx.task_ctx()).await?;
+        let total_rows: usize = batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        let total_rows_i64 = convert_to_i64_box(total_rows, "total row count")?;
+
+        let row_ids: Vec<i64> = (0..total_rows_i64).collect();
+
+        self.persist_deletions(row_ids, DEFAULT_DATA_FILE_ID).await
+    }
+
+    async fn delete_filtered_rows(
+        &self,
+        ctx: &SessionContext,
+        listing_table: Arc<ListingTable>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{DataType, Field};
+
+        let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
+        let batches = collect(scan_plan, ctx.task_ctx()).await?;
+
+        // If no data, nothing to delete
+        if batches.is_empty() {
+            return Ok(0);
+        }
+
+        // Flatten all batches into one for simpler processing
+        let concatenated_batch = arrow::compute::concat_batches(&self.schema, &batches)?;
+        let total_rows = concatenated_batch.num_rows();
+
+        // Create a batch with row_id column added
+        let row_id_array = arrow::array::Int64Array::from_iter_values(
+            0..convert_to_i64_box(total_rows, "total rows")?,
+        );
+
+        let mut fields = vec![Field::new("__row_id", DataType::Int64, false)];
+        for field in self.schema.fields() {
+            fields.push((**field).clone());
+        }
+        let schema_with_rowid = Arc::new(arrow::datatypes::Schema::new(fields));
+
+        let mut columns_with_rowid = vec![Arc::new(row_id_array) as Arc<dyn Array>];
+        columns_with_rowid.extend_from_slice(concatenated_batch.columns());
+
+        let batch_with_rowid =
+            arrow::array::RecordBatch::try_new(Arc::clone(&schema_with_rowid), columns_with_rowid)?;
+
+        // Create a new session context with the row_id data
+        let ctx_new = SessionContext::new();
+        let mem_table_with_rowid = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema_with_rowid),
+            vec![vec![batch_with_rowid]],
+        )?;
+        ctx_new.register_table("data_with_rowid", Arc::new(mem_table_with_rowid))?;
+
+        // Start with selecting all columns so filters can reference them
+        let mut filtered_df = ctx_new.sql("SELECT * FROM data_with_rowid").await?;
+
+        // Apply all filters
+        for filter in &self.filters {
+            filtered_df = filtered_df.filter(filter.clone())?;
+        }
+
+        // Now select just the row IDs
+        let row_ids_df = filtered_df.select_columns(&["__row_id"])?;
+
+        // Collect the filtered row IDs
+        let filtered_rowid_batches = row_ids_df.collect().await?;
+        let mut row_ids = Vec::new();
+
+        for batch in filtered_rowid_batches {
+            let row_id_column = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>();
+            for i in 0..row_id_column.len() {
+                if !row_id_column.is_null(i) {
+                    row_ids.push(row_id_column.value(i));
+                }
+            }
+        }
+
+        self.persist_deletions(row_ids, DEFAULT_DATA_FILE_ID).await
+    }
+
+    async fn persist_deletions(
+        &self,
+        row_ids: Vec<i64>,
+        data_file_id: i64,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let filtered_row_ids = self.filter_existing_deletions(row_ids).await?;
+
+        if filtered_row_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        let mut results = writer
+            .write(vec![DeletionVectorWriteSpec::new(
+                data_file_id,
+                filtered_row_ids,
+            )])
+            .await
+            .map_err(catalog_error_to_box)?;
+
+        let Some(result) = results.pop() else {
+            return Ok(0);
+        };
+
+        self.catalog
+            .add_delete_file(result.delete_file)
+            .await
+            .map_err(catalog_error_to_box)?;
+
+        let deleted_count = convert_to_u64_box(result.row_ids.len(), "deleted row count")?;
+
+        tracing::debug!(
+            "Deletion vector written: {} row(s) at {:?}",
+            deleted_count,
+            result.path
+        );
+
+        Ok(deleted_count)
+    }
+
+    async fn filter_existing_deletions(
+        &self,
+        row_ids: Vec<i64>,
+    ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let delete_files = self
+            .catalog
+            .get_table_delete_files(self.table_metadata.table_id)
+            .await
+            .map_err(catalog_error_to_box)?;
+
+        if delete_files.is_empty() {
+            return Ok(row_ids);
+        }
+
+        let delete_files_for_read = delete_files.clone();
+        let existing_row_ids = tokio::task::spawn_blocking(move || {
+            PepperTableProvider::read_deletion_vectors(delete_files_for_read)
+        })
+        .await
+        .map_err(|source| catalog_error_to_box(CatalogError::TaskJoin { source }))?
+        .map_err(|err| {
+            catalog_error_to_box(CatalogError::InvalidOperation {
+                message: format!("Failed to read existing deletion vectors: {err}"),
+            })
+        })?;
+
+        Ok(row_ids
+            .into_iter()
+            .filter(|row_id| !existing_row_ids.contains(row_id))
+            .collect())
+    }
+}
+
+fn catalog_error_to_box(err: CatalogError) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(err)
+}
+
+#[async_trait]
+impl DeletionSink for PepperDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = SessionContext::new();
+
+        let listing_table = {
+            let guard = self
+                .listing_table
+                .read()
+                .map_err(|e| format!("Failed to acquire read lock on listing table: {e}"))?;
+            Arc::clone(&guard)
+        };
+
+        if self.filters.is_empty() {
+            return self.delete_all_rows(&ctx, Arc::clone(&listing_table)).await;
+        }
+
+        self.delete_filtered_rows(&ctx, listing_table).await
+    }
+}
+
+/// Generic conversion function that handles type conversion with proper error handling.
+///
+/// This is the core conversion utility that all type conversion functions delegate to.
+/// It provides consistent error messages with context about what value failed to convert
+/// and includes both the source and target types in the error message.
+///
+/// # Design Rationale
+///
+/// This function consolidates conversion logic to ensure consistent error handling across
+/// all numeric conversions in Pepper. Without it, we would have duplicate error handling
+/// code for each conversion pair (usize→i64, u64→i64, etc.), making it harder to maintain
+/// consistent error messages.
+///
+/// # Generic Parameters
+///
+/// * `T` - Source type (must implement `TryInto<U>`, `Copy`, and `Display`)
+/// * `U` - Target type (must implement `Display`)
+///
+/// # Why `Copy` is Required
+///
+/// The `Copy` bound is required because:
+/// 1. The value is used twice: once for the conversion attempt and once in the error message
+/// 2. `TryInto::try_into` consumes `self`, so without `Copy` we would move the value
+/// 3. All numeric types (`usize`, `u64`, `i64`, etc.) implement `Copy`, so this isn't restrictive
+///
+/// # When to Use
+///
+/// **Do NOT call this function directly.** Instead, use the type-specific wrapper functions:
+/// - `convert_to_i64()` - For conversions within `DataFusion` error context
+/// - `convert_to_i64_box()` - For conversions in async/trait methods with boxed errors
+/// - `convert_to_u64_box()` - For conversions to `u64` with boxed errors
+///
+/// The wrapper functions provide better type inference and appropriate error type handling
+/// for their specific use cases.
+///
+/// # Examples
+///
+/// ```ignore
+/// // GOOD - Use wrapper functions
+/// let value = convert_to_i64(batch.num_rows(), "batch size")?;
+///
+/// // BAD - Don't call try_convert directly
+/// let value = try_convert::<usize, i64>(batch.num_rows(), "batch size")?;
+/// ```
+fn try_convert<T, U>(value: T, context: &str) -> datafusion_common::Result<U>
+where
+    T: TryInto<U> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    U: std::fmt::Display,
+{
+    value.try_into().map_err(|err| {
+        datafusion_common::DataFusionError::Execution(format!(
+            "Failed to convert {context} value {value} to {}: {err}",
+            std::any::type_name::<U>()
+        ))
+    })
+}
+
+/// Convert a numeric value to `i64` with `DataFusion` error type.
+///
+/// Use this function when converting numeric values (typically `usize` or `u64`) to `i64`
+/// within `DataFusion` `TableProvider` implementations or execution plans, where the error
+/// type is `datafusion_common::Result<T>`.
+///
+/// # Arguments
+///
+/// * `value` - The numeric value to convert
+/// * `context` - Description of what the value represents (e.g., "batch size", "row count")
+///
+/// # Examples
+///
+/// ```ignore
+/// // Converting batch size in hot path
+/// let batch_size_i64 = convert_to_i64(batch.num_rows(), "batch size")?;
+///
+/// // Converting row index
+/// let row_offset = convert_to_i64(row_idx, "row index")?;
+/// ```
+fn convert_to_i64<T>(value: T, context: &str) -> datafusion_common::Result<i64>
+where
+    T: TryInto<i64> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    try_convert(value, context)
+}
+
+/// Convert a numeric value to `i64` with boxed error type.
+///
+/// Use this function when converting numeric values to `i64` in contexts that require
+/// boxed errors, such as:
+/// - Async trait methods (`DeletionSink::delete_from`)
+/// - Functions returning `Result<T, Box<dyn Error>>`
+/// - Code that needs to bridge between different error types
+///
+/// # Arguments
+///
+/// * `value` - The numeric value to convert
+/// * `context` - Description of what the value represents (e.g., "deleted row count")
+///
+/// # Examples
+///
+/// ```ignore
+/// // In deletion sink with boxed error return type
+/// let total_rows_i64 = convert_to_i64_box(total_rows, "total row count")?;
+/// let deleted_count_i64 = convert_to_i64_box(deleted_count, "deleted row count")?;
+/// ```
+fn convert_to_i64_box<T>(
+    value: T,
+    context: &str,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: TryInto<i64> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    convert_to_i64(value, context)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+/// Convert a numeric value to `u64` with boxed error type.
+///
+/// Use this function when converting numeric values to `u64` in contexts that require
+/// boxed errors. This is primarily used for return values that must be `u64`, such as
+/// row counts returned from deletion operations.
+///
+/// # Arguments
+///
+/// * `value` - The numeric value to convert
+/// * `context` - Description of what the value represents (e.g., "deleted row count")
+///
+/// # Examples
+///
+/// ```ignore
+/// // Converting deletion count from usize to u64
+/// let deleted_count = convert_to_u64_box(row_ids.len(), "deleted row count")?;
+/// ```
+fn convert_to_u64_box<T>(
+    value: T,
+    context: &str,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: TryInto<u64> + Copy + std::fmt::Display,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    try_convert::<T, u64>(value, context)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 #[cfg(test)]
@@ -579,3 +1519,34 @@ mod tests {
         // Tests will be added once SQLite catalog implementation is complete
     }
 }
+
+// # Deletion Vector Implementation Notes
+//
+// Pepper implements DELETE operations using deletion vectors, following the Delta Lake approach:
+//
+// ## Architecture
+// 1. **Deletion Vectors**: Separate Vortex files containing deleted row IDs
+// 2. **Catalog Tracking**: `DeleteFile` metadata registered in SQLite catalog
+// 3. **Lazy Deletion**: Rows are marked as deleted but not immediately removed from data files
+// 4. **Read-Time Filtering**: Scans apply deletion vectors to filter out deleted rows
+//
+// ## Implementation Status
+// - ✅ `DeletionTableProvider` trait implemented for `PepperTableProvider`
+// - ✅ `PepperDeletionSink` writes deletion vectors to Vortex files
+// - ✅ Deletion vectors registered in catalog via `add_delete_file()`
+// - ⏳ Read-time filtering NOT YET IMPLEMENTED (see TODOs in `scan()` method)
+// - ⏳ SQL DELETE support requires DataFusion logical plan rewriting (runtime-level integration)
+//
+// ## Testing
+// Direct SQL `DELETE` statements will fail with "NotImplemented" until:
+// 1. Runtime adds logical plan optimizer rule to rewrite DELETE DML to `delete_from()` calls
+// 2. OR tests call `DeletionTableProvider::delete_from()` directly (bypassing SQL)
+//
+// ## Compaction
+// Over time, tables accumulate deletion vectors. A compaction process should:
+// 1. Read all data files and their associated deletion vectors
+// 2. Rewrite data files excluding deleted rows
+// 3. Remove obsolete deletion vector files
+// 4. Update catalog metadata
+//
+// This is similar to Delta Lake's OPTIMIZE command and will be added in a future iteration.

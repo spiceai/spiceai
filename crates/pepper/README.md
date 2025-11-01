@@ -1,24 +1,25 @@
 # Pepper
 
-A minimal DuckLake-inspired implementation for the Vortex accelerator that combines SQLite for metadata management with Vortex files as the data lake.
+A minimal DuckLake-inspired implementation for the Vortex accelerator that combines pluggable metastore backends (SQLite, Turso) for metadata management with Vortex files as the data lake.
 
 ## Overview
 
 Pepper provides a lakehouse format that enables efficient CRUD operations on columnar data with the following features:
 
-- **SQLite Metadata Catalog**: Transactional metadata management following the DuckLake specification
+- **Pluggable Metastore Backends**: Transactional metadata management with support for SQLite and Turso (optional)
 - **Vortex Data Files**: High-performance columnar storage with compression
 
 **Note**: While the codebase includes a snapshot module (`snapshot.rs`) and a `SnapshotManager` API stub, snapshot functionality is not yet implemented or available in this version of Pepper. Similarly, MVCC and deletion vectors are not supported. These features are planned for future releases.
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────┐
 │      Pepper Table                   │
 │                                     │
 │  ┌──────────────────────────────┐  │
-│  │   SQLite Metadata Catalog    │  │
+│  │   Metastore Backend          │  │
+│  │   (SQLite or Turso)          │  │
 │  │                              │  │
 │  │  - Table Schemas            │  │
 │  │  - Data File References     │  │
@@ -37,7 +38,27 @@ Pepper provides a lakehouse format that enables efficient CRUD operations on col
 
 ## Key Components
 
-### 1. Metadata Catalog (`catalog.rs`)
+### 1. Metastore Backend (`metastore.rs`)
+
+The `MetastoreBackend` trait defines a pluggable storage abstraction for metadata:
+
+```rust
+#[async_trait]
+pub trait MetastoreBackend: Send + Sync {
+    async fn init_schema(&self) -> CatalogResult<()>;
+    async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()>;
+    async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>;
+    async fn query<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>;
+    // ... transaction and shutdown methods
+}
+```
+
+**Implementations:**
+
+- **SQLite** (`metastore/sqlite.rs`): Default backend using rusqlite with WAL mode for concurrent access
+- **Turso** (`metastore/turso.rs`): Optional backend using libsql/Turso (requires `turso` feature flag)
+
+### 2. Metadata Catalog (`catalog.rs`)
 
 The `MetadataCatalog` trait defines the interface for metadata operations:
 

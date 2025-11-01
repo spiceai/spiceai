@@ -96,7 +96,7 @@ jobs:
 
       # Upload the test archive as an artifact
       - name: Upload test archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
@@ -105,7 +105,6 @@ jobs:
   test-openai:
     name: Test OpenAI Models
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -117,7 +116,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -153,11 +152,10 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
+  
   test-ai-udf:
     name: Test AI UDF
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -169,7 +167,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -248,7 +246,6 @@ jobs:
     name: Test Huggingface Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -260,7 +257,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -296,7 +293,6 @@ jobs:
   test-local:
     name: Test Local Models
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -308,7 +304,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -340,7 +336,6 @@ jobs:
     name: Test Bedrock Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -352,7 +347,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -374,7 +369,6 @@ jobs:
   test-workers:
     name: Test Workers
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -386,7 +380,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -415,7 +409,6 @@ jobs:
   test-search:
     name: Test Search
     needs: build
-    permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
@@ -427,7 +420,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test

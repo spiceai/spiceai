@@ -14,13 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    fmt::Display,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
     get_logical_plan_input_tables,
@@ -28,7 +22,7 @@ use ::cache::{
     result::{CacheStatus, query::QueryResult},
 };
 use arrow::{array::RecordBatch, datatypes::Schema};
-use arrow_schema::{Field, SchemaBuilder, SchemaRef};
+use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
@@ -53,19 +47,35 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterMode,
+    crate::datafusion::builder::default_extension_planners,
+    crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
+    crate::datafusion::cluster::config::SpiceClusterConfig,
+    ballista_core::extension::{SessionConfigExt, SessionStateExt},
+    ballista_core::planner::BallistaQueryPlanner,
+    datafusion::execution::SessionStateBuilder,
+    datafusion::physical_planner::DefaultPhysicalPlanner,
+    datafusion_proto::protobuf::LogicalPlanNode,
+};
+
+use datafusion::execution::SessionState;
+
+use async_stream::stream;
+use futures::StreamExt;
+
+use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
+
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
-use async_stream::stream;
-use futures::{Stream, StreamExt};
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
 
-use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
+use super::managed_runtime;
+use managed_runtime::ManagedRuntimeError;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -135,6 +145,42 @@ macro_rules! handle_error {
 }
 
 impl Query {
+    #[cfg(not(feature = "cluster"))]
+    #[allow(clippy::unnecessary_wraps)]
+    fn get_session_state(&self) -> Result<SessionState> {
+        Ok(self.df.ctx.state())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn get_session_state(&self) -> Result<SessionState> {
+        if !matches!(self.df.cluster_config.mode, Some(ClusterMode::Scheduler)) {
+            return Ok(self.df.ctx.state());
+        }
+
+        let cfg = self
+            .df
+            .ctx
+            .copied_config()
+            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec());
+
+        let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
+            BallistaQueryPlanner::with_local_planner(
+                self.df.cluster_config.scheduler_url.to_string(),
+                cfg.ballista_config(),
+                SpiceLogicalCodec::new_codec(),
+                DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
+            );
+
+        SessionStateBuilder::new_from_existing(self.df.ctx.state())
+            .with_config(
+                cfg.with_ballista_query_planner(Arc::new(query_planner))
+                    .with_option_extension(SpiceClusterConfig::default()),
+            )
+            .build()
+            .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
+            .map_err(|e| Error::UnableToExecuteQuery { source: e })
+    }
+
     /// Run a query and return the result.
     ///
     /// # Panics
@@ -142,7 +188,7 @@ impl Query {
     /// Panics when running under test if no cache key is computed for the query.
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        if let Some(runtime_handle) = self.df.tokio_runtime().cloned() {
+        if let Some(runtime_handle) = self.df.cpu_runtime().cloned() {
             return self
                 .run_with_managed_runtime(request_context, runtime_handle)
                 .await;
@@ -158,62 +204,30 @@ impl Query {
     ) -> Result<QueryResult> {
         let span = Span::current();
 
-        let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
-        let (result_tx, result_rx) = oneshot::channel::<Result<(CacheStatus, SchemaRef), Error>>();
+        let runtime_request_context = Arc::clone(&request_context);
+        let future_request_context = request_context;
 
-        let request_context_clone = Arc::clone(&request_context);
-        let inner_span = span.clone();
-        let driver_task = async move {
-            let stream_span = inner_span.clone();
-            match self
-                .run_internal(request_context_clone)
-                .instrument(inner_span)
-                .await
-            {
-                Ok(query_result) => {
-                    let schema = query_result.data.schema();
-                    let cache_status = query_result.cache_status;
+        let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+            runtime_handle,
+            runtime_request_context,
+            span,
+            async move {
+                self.run_internal(future_request_context)
+                    .await
+                    .map(|query_result| (query_result.cache_status, query_result.data))
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            ManagedRuntimeError::Future(err) => err,
+            ManagedRuntimeError::DriverTaskEnded => Error::UnableToExecuteQuery {
+                source: DataFusionError::Execution(
+                    "Query driver task ended unexpectedly".to_string(),
+                ),
+            },
+        })?;
 
-                    if result_tx.send(Ok((cache_status, schema))).is_err() {
-                        return;
-                    }
-
-                    let mut stream = query_result.data;
-                    while let Some(batch) = Arc::clone(&request_context)
-                        .scope(stream.next().instrument(stream_span.clone()))
-                        .await
-                    {
-                        if batch_tx.send(batch).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(err) => {
-                    if result_tx.send(Err(err)).is_err() {
-                        tracing::debug!("Failed to send query result; receiver dropped");
-                    }
-                }
-            }
-        };
-
-        let driver_handle = runtime_handle.spawn(driver_task.instrument(span));
-
-        let (cache_status, schema) = match result_rx.await {
-            Ok(Ok((cache_status, schema))) => (cache_status, schema),
-            Ok(Err(err)) => return Err(err),
-            Err(_) => {
-                return Err(Error::UnableToExecuteQuery {
-                    source: DataFusionError::Execution(
-                        "Query driver task ended unexpectedly".to_string(),
-                    ),
-                });
-            }
-        };
-
-        let driver_stream = DriverStream::new(batch_rx, driver_handle);
-        let adapter = RecordBatchStreamAdapter::new(schema, Box::pin(driver_stream));
-
-        let stream: SendableRecordBatchStream = Box::pin(adapter);
+        let (cache_status, stream) = managed_stream.into_parts();
 
         Ok(QueryResult::new(stream, cache_status))
     }
@@ -231,7 +245,7 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.df.ctx.state();
+            let mut session = self.get_session_state()?;
 
             let ctx = self;
             let tracker = ctx.tracker;
@@ -312,7 +326,23 @@ impl Query {
                 t
             });
 
-            let physical_plan = match session.create_physical_plan(&plan).await {
+            // Special handling for DescribeTable in cluster mode - execute locally
+            #[cfg(feature = "cluster")]
+            let use_local_session = {
+                matches!(ctx.df.cluster_config.mode, Some(ClusterMode::Scheduler))
+                    && matches!(&*plan, LogicalPlan::DescribeTable { .. })
+            };
+
+            #[cfg(not(feature = "cluster"))]
+            let use_local_session = false;
+
+            let session_for_execution = if use_local_session {
+                ctx.df.ctx.state()
+            } else {
+                session
+            };
+
+            let physical_plan = match session_for_execution.create_physical_plan(&plan).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     let e = find_datafusion_root(e);
@@ -327,7 +357,7 @@ impl Query {
                 }
             };
 
-            let task_ctx = Arc::new(TaskContext::from(&session));
+            let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
 
             let res_stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
                 Ok(stream) => stream,
@@ -508,74 +538,6 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
     };
 
     Ok(maybe_schema)
-}
-
-struct DriverStream {
-    receiver: ReceiverStream<Result<RecordBatch, DataFusionError>>,
-    driver_handle: Option<JoinHandle<()>>,
-    driver_error: Option<DataFusionError>,
-}
-
-impl DriverStream {
-    fn new(
-        receiver: tokio::sync::mpsc::Receiver<Result<RecordBatch, DataFusionError>>,
-        driver_handle: JoinHandle<()>,
-    ) -> Self {
-        Self {
-            receiver: ReceiverStream::new(receiver),
-            driver_handle: Some(driver_handle),
-            driver_error: None,
-        }
-    }
-}
-
-impl Stream for DriverStream {
-    type Item = Result<RecordBatch, DataFusionError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        if let Some(handle) = this.driver_handle.as_mut() {
-            match Future::poll(Pin::new(handle), cx) {
-                Poll::Ready(Ok(())) => {
-                    this.driver_handle = None;
-                }
-                Poll::Ready(Err(err)) => {
-                    this.driver_handle = None;
-                    if err.is_panic() {
-                        this.driver_error = Some(DataFusionError::Execution(format!(
-                            "Query driver task panicked: {err}"
-                        )));
-                    } else if !err.is_cancelled() {
-                        this.driver_error = Some(DataFusionError::Execution(format!(
-                            "Query driver task failed: {err}"
-                        )));
-                    }
-                }
-                Poll::Pending => {}
-            }
-        }
-
-        if let Some(err) = this.driver_error.take() {
-            return Poll::Ready(Some(Err(err)));
-        }
-
-        Pin::new(&mut this.receiver).poll_next(cx)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.receiver.size_hint()
-    }
-}
-
-impl Drop for DriverStream {
-    fn drop(&mut self) {
-        if let Some(handle) = self.driver_handle.take()
-            && !handle.is_finished()
-        {
-            handle.abort();
-        }
-    }
 }
 
 #[must_use]
@@ -803,6 +765,7 @@ mod tests {
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
             )
             .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
             .build(),

@@ -18,7 +18,7 @@ use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;
 use snafu::prelude::*;
-use spicepod::component::view as spicepod_view;
+use spicepod::{component::view as spicepod_view, vector::VectorStore};
 use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
@@ -42,6 +42,7 @@ pub struct View {
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
     pub runtime: Arc<Runtime>,
+    pub vectors: Option<VectorStore>,
     pub app: Arc<App>,
 }
 
@@ -52,6 +53,7 @@ impl PartialEq for View {
             && self.metadata == other.metadata
             && self.columns == other.columns
             && self.acceleration == other.acceleration
+            && self.vectors == other.vectors
             && self.ready_state == other.ready_state
     }
 }
@@ -65,6 +67,7 @@ impl std::fmt::Debug for View {
             .field("columns", &self.columns)
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
+            .field("vectors", &self.vectors)
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +146,11 @@ impl View {
     }
 
     #[must_use]
+    pub fn has_embeddings(&self) -> bool {
+        self.columns.iter().any(|c| !c.embeddings.is_empty())
+    }
+
+    #[must_use]
     pub fn has_full_text_column(&self) -> bool {
         self.columns
             .iter()
@@ -157,6 +165,7 @@ pub struct ViewBuilder {
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
+    pub vectors: Option<VectorStore>,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {
@@ -215,6 +224,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             columns: view.columns,
             acceleration,
             ready_state: ReadyState::from(view.ready_state),
+            vectors: view.vectors,
         })
     }
 }
@@ -249,6 +259,14 @@ impl AccelerationSource for View {
     fn name(&self) -> &TableReference {
         &self.name
     }
+
+    fn time_column(&self) -> Option<&str> {
+        None
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ViewBuilder {
@@ -261,6 +279,7 @@ impl ViewBuilder {
             columns: vec![],
             acceleration: None,
             ready_state: ReadyState::default(),
+            vectors: None,
         }
     }
 
@@ -273,6 +292,7 @@ impl ViewBuilder {
             columns: self.columns,
             acceleration: self.acceleration,
             ready_state: self.ready_state,
+            vectors: self.vectors,
             runtime,
             app,
         }

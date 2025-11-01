@@ -38,6 +38,7 @@ serde_json.workspace = true
 spicepod = { path = "../spicepod" }
 tokenizers = "0.21.2"
 tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util" }
@@ -45,6 +46,8 @@ util = { path = "../util" }
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", optional = true }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", package = "mistralrs-core", optional = true }
 rand.workspace = true
+
+llama-cpp-2 = { version = "0.1", optional = true }
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", features = [
     "candle",
@@ -83,6 +86,7 @@ cuda = [
     "mistralrs/cuda",
     "mistralrs/flash-attn",
     "cudarc/cuda-version-from-build-system",
+    "llama-cpp-2?/cuda",
 ]
 local_embed = [
     "dep:tei_backend",
@@ -92,11 +96,13 @@ local_embed = [
     "dep:model2vec-rs",
 ]
 local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
+llama_cpp = ["dep:llama-cpp-2"]
 metal = [
     "tei_backend/metal",
     "tei_candle/metal",
     "mistralrs-core/metal",
     "mistralrs/metal",
+    "llama-cpp-2?/metal",
 ]
 
 default = ["local_llm", "local_embed"]

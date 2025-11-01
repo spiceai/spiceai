@@ -16,24 +16,20 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
-use snafu::ResultExt;
-use spicepod::semantic::{IndexStore, MetadataType};
+use runtime_datafusion_index::Index;
 use std::any::Any;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::changes::{Indexes, index_change_envelope};
 use crate::component::{
     ComponentInitialization,
-    dataset::{Dataset, FullTextSearchDatasetConfig, acceleration::RefreshMode},
+    dataset::{Dataset, acceleration::RefreshMode},
     metrics::MetricsProvider,
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
-use crate::make_spice_data_sub_directory;
+use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::util::find_index_in_table_provider;
 use futures::StreamExt;
 
@@ -48,98 +44,6 @@ pub struct FullTextConnector {
 impl FullTextConnector {
     pub fn new(inner_connector: Arc<dyn DataConnector>) -> Self {
         Self { inner_connector }
-    }
-
-    pub(crate) fn wrap_table(
-        inner_table_provider: Arc<dyn TableProvider>,
-        dataset: &Dataset,
-    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let Some(FullTextSearchDatasetConfig {
-            index_store,
-            index_path,
-            search_fields,
-            primary_key,
-        }) = dataset.full_text_search_config()
-        else {
-            return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: dataset.source().to_string(),
-                connector_component: dataset.into(),
-                message: format!(
-                    "Attempted to add full text search functionality to '{}', but configuration not available",
-                    dataset.name
-                ),
-            });
-        };
-
-        let directory = if index_store == IndexStore::File {
-            if let Some(path) = index_path {
-                Some(PathBuf::from_str(path.as_str()).boxed().map_err(|e| {
-                    DataConnectorError::InvalidConfiguration {
-                        dataconnector: dataset.source().to_string(),
-                        message: e.to_string(),
-                        connector_component: dataset.into(),
-                        source: e,
-                    }
-                })?)
-            } else {
-                // Default case. Example `.spice/data/fts/catalog/schema/table/`.
-                Some(
-                    make_spice_data_sub_directory(
-                        [vec!["fts".to_string()], dataset.name.to_vec()]
-                            .concat()
-                            .as_slice(),
-                    )
-                    .boxed()
-                    .map_err(|e| DataConnectorError::InvalidConfiguration {
-                        dataconnector: dataset.source().to_string(),
-                        message: e.to_string(),
-                        connector_component: dataset.into(),
-                        source: e,
-                    })?,
-                )
-            }
-        } else {
-            None
-        };
-
-        let store_fields = dataset
-            .columns
-            .iter()
-            .filter_map(|c| {
-                if let Some(MetadataType::NonFilterable) = c.as_vector_metadata() {
-                    return Some(c.name.clone());
-                }
-                None
-            })
-            .collect::<Vec<_>>();
-
-        let index = FullTextDatabaseIndex::try_new(
-            Arc::clone(&inner_table_provider),
-            search_fields.clone(),
-            Some(primary_key),
-            directory,
-            &store_fields,
-        )
-        .map_err(|e| DataConnectorError::InvalidConfiguration {
-            dataconnector: dataset.source().to_string(),
-            message: e.to_string(),
-            connector_component: dataset.into(),
-            source: Box::new(e),
-        })?;
-
-        let tbl: IndexedTableProvider = if let Some(idx_tbl) = inner_table_provider
-            .as_any()
-            .downcast_ref::<IndexedTableProvider>(
-        ) {
-            idx_tbl.clone()
-        } else {
-            IndexedTableProvider::new(inner_table_provider)
-        };
-
-        Ok(
-            Arc::new(tbl.add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>))
-                as Arc<dyn TableProvider>,
-        )
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -190,7 +94,18 @@ impl DataConnector for FullTextConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        Self::wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
+        add_full_text_search_to_table(
+            self.inner_connector.read_provider(dataset).await?,
+            &dataset.columns,
+            &dataset.name,
+        )
+        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: e,
+        })
     }
 
     async fn read_write_provider(
@@ -198,7 +113,16 @@ impl DataConnector for FullTextConnector {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(Self::wrap_table(inner, dataset)),
+            Some(Ok(inner)) => Some(
+                add_full_text_search_to_table(inner, &dataset.columns, &dataset.name)
+                    .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+                    .map_err(|e| DataConnectorError::InvalidConfiguration {
+                        dataconnector: dataset.source().to_string(),
+                        message: e.to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    }),
+            ),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }

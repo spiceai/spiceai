@@ -161,6 +161,13 @@ impl RuntimeStatus {
         metrics::models::STATUS.record(status as u64, &[KeyValue::new("worker", worker_name)]);
     }
 
+    /// Update the status of a cluster node
+    #[cfg(feature = "cluster")]
+    pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
+        let cluster_node_name = node_name.to_string();
+        self.update_component_status(format!("cluster:{cluster_node_name}"), status);
+    }
+
     /// Get the status of a worker
     #[must_use]
     pub fn worker_status(&self, name: &str) -> Option<ComponentStatus> {
@@ -234,6 +241,12 @@ impl RuntimeStatus {
     #[must_use]
     pub fn get_dataset_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
         self.get_statuses_of_prefix("dataset:")
+    }
+
+    /// Returns the status of all registered views.
+    #[must_use]
+    pub fn get_view_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        self.get_statuses_of_prefix("view:")
     }
 
     /// Returns the status of all registered workers.

@@ -38,6 +38,8 @@ mod duckdb;
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+#[cfg(feature = "turso")]
+mod turso;
 
 pub struct DebeziumKafkaSys {
     dataset_name: String,
@@ -60,7 +62,14 @@ impl DebeziumKafkaSys {
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => None,
         }
     }
@@ -73,7 +82,14 @@ impl DebeziumKafkaSys {
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => Err(Error::NoAccelerationConnection),
         }
     }

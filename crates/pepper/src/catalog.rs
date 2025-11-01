@@ -20,7 +20,10 @@ limitations under the License.
 //! and file references. It can be implemented by different RDBMS backends
 //! (`SQLite`, `PostgreSQL`, etc.).
 
-use super::metadata::{CreateTableOptions, DataFile, DeleteFile, TableMetadata, TableStats};
+use super::metadata::{
+    CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
+    TableStats,
+};
 use async_trait::async_trait;
 use snafu::Snafu;
 use std::sync::Arc;
@@ -88,6 +91,16 @@ pub enum CatalogError {
 /// Result type for catalog operations.
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
+/// Transaction guard for catalog operations that automatically rolls back on drop unless explicitly committed.
+///
+/// This follows the RAII pattern used by rusqlite and other database libraries.
+#[async_trait]
+// Transaction support is currently not exposed at the catalog level.
+// Each catalog implementation can use backend-specific transactions internally
+// to ensure atomicity of operations.
+//
+// Future work: Expose catalog-level transactions when needed.
+
 /// Trait for metadata catalog operations.
 ///
 /// This trait provides the core operations needed to manage a Pepper catalog,
@@ -146,14 +159,38 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get statistics for a table.
     async fn get_table_stats(&self, table_id: i64) -> CatalogResult<TableStats>;
 
-    /// Begin a transaction.
-    async fn begin_transaction(&self) -> CatalogResult<()>;
+    /// Add a partition to a table.
+    async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64>;
 
-    /// Commit a transaction.
-    async fn commit_transaction(&self) -> CatalogResult<()>;
+    /// Get all partitions for a table.
+    async fn get_partitions(&self, table_id: i64) -> CatalogResult<Vec<PartitionMetadata>>;
 
-    /// Rollback a transaction.
-    async fn rollback_transaction(&self) -> CatalogResult<()>;
+    /// Get a specific partition by table ID and partition value.
+    async fn get_partition(
+        &self,
+        table_id: i64,
+        partition_value: &str,
+    ) -> CatalogResult<Option<PartitionMetadata>>;
+
+    /// Update partition statistics (record count and file size).
+    async fn update_partition_stats(
+        &self,
+        partition_id: i64,
+        record_count: i64,
+        file_size_bytes: i64,
+    ) -> CatalogResult<()>;
+
+    /// Get partition statistics.
+    async fn get_partition_stats(&self, partition_id: i64) -> CatalogResult<PartitionStats>;
+
+    /// Get data files belonging to a specific partition.
+    async fn get_partition_data_files(&self, partition_id: i64) -> CatalogResult<Vec<DataFile>>;
+
+    /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
+    /// Default implementation does nothing.
+    async fn shutdown(&self) -> CatalogResult<()> {
+        Ok(())
+    }
 }
 
 /// Factory trait for creating catalog instances.

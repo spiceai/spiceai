@@ -54,9 +54,11 @@ pub(crate) async fn handle(
         }
         Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command).await,
         Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command).await,
-        _ => {
+        unsupported => {
             let _start = metrics::track_flight_request("do_get", None).await;
-            Err(Status::unimplemented("Not yet implemented"))
+            Err(Status::unimplemented(format!(
+                "Not yet implemented: {unsupported:?})"
+            )))
         }
     }
 }

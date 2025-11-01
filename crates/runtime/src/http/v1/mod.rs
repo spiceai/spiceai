@@ -198,6 +198,7 @@ pub async fn sql_to_http_response(
         ResponseMetadata::empty(),
     )
     .await
+    .into_response()
 }
 
 // Runs query and returns the results as a vector of `RecordBatch`.
@@ -224,7 +225,9 @@ pub async fn to_http_response(
     cache_status: CacheStatus,
     format: ResponseMimeType,
     meta: ResponseMetadata,
-) -> Response {
+) -> (StatusCode, HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+
     let res = match format {
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
@@ -237,12 +240,11 @@ pub async fn to_http_response(
     let body = match res {
         Ok(body) => body,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
         }
     };
 
     let request_context = RequestContext::current(AsyncMarker::new().await);
-    let mut headers = HeaderMap::new();
 
     if let Some(header_value) = format.to_accept_header() {
         headers.insert(CONTENT_TYPE, header_value);
@@ -254,7 +256,7 @@ pub async fn to_http_response(
         request_context.client_supplied_cache_key().is_some(),
     );
 
-    (StatusCode::OK, headers, body).into_response()
+    (StatusCode::OK, headers, body)
 }
 
 fn attach_cache_headers(

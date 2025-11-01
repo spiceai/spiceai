@@ -78,7 +78,7 @@ jobs:
           chmod +x spiced
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: spiced
           path: spiced
@@ -161,12 +161,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download testoperator
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced
 

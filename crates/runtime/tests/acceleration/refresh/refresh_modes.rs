@@ -20,13 +20,31 @@ limitations under the License.
 //! refresh modes using a helper function with variants for each engine.
 
 use crate::acceleration::refresh::common::{
-    execute_ps_sql, get_acceleration_config_append, get_acceleration_config_full,
+    execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
     initialize_postgres, refresh_table, start_test_runtime,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
 use crate::{init_tracing, utils::test_request_context};
+use spicepod::param::Params;
 use std::sync::Arc;
+
+/// Get acceleration parameters for postgres engine
+fn get_postgres_acceleration_params(port: usize) -> Params {
+    let mut params = common::get_pg_params(port);
+    // Override pg_db to use the acceleration database instead of the default
+    params.insert(
+        "pg_db".to_string(),
+        secrecy::SecretString::from("acceleration".to_string()),
+    );
+
+    Params::from_string_map(
+        params
+            .into_iter()
+            .map(|(k, v)| (k, secrecy::ExposeSecret::expose_secret(&v).to_string()))
+            .collect(),
+    )
+}
 
 /// Helper function to test append mode for a given engine
 async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Error> {
@@ -36,12 +54,19 @@ async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Erro
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let db_conn = initialize_postgres(port).await?;
-            let acceleration_config = get_acceleration_config_append(engine, None);
+
+            // Postgres acceleration requires connection parameters
+            let acceleration_params = if engine == "postgres" {
+                Some(get_postgres_acceleration_params(port))
+            } else {
+                None
+            };
+
+            let acceleration_config = get_acceleration_config_append(engine, acceleration_params);
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             // Initial state: 1 row
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let initial_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -62,8 +87,7 @@ async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Erro
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             // After refresh: 2 rows (append mode keeps old + adds new)
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let final_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -87,12 +111,19 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let db_conn = initialize_postgres(port).await?;
-            let acceleration_config = get_acceleration_config_full(engine, None);
+
+            // Postgres acceleration requires connection parameters
+            let acceleration_params = if engine == "postgres" {
+                Some(get_postgres_acceleration_params(port))
+            } else {
+                None
+            };
+
+            let acceleration_config = get_acceleration_config_full(engine, acceleration_params);
             let rt = start_test_runtime(port, acceleration_config).await?;
 
             // Initial state: 1 row
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let initial_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -113,8 +144,7 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
             refresh_table(Arc::clone(&rt), "test_table").await?;
 
             // After refresh: 2 rows (full mode replaces with current source)
-            let df = rt.datafusion().ctx.table("test_table").await?;
-            let results = df.collect().await?;
+            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * FROM test_table").await?;
             let final_count: usize = results
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
@@ -192,10 +222,10 @@ async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow:
     test_refresh_full_for_engine("postgres").await
 }
 
-// Pepper (feature-gated)
+// Pepper (not available on Windows)
 // Note: Pepper requires mode: file in addition to refresh_mode: append/full.
 // These tests need custom helpers that set both mode and refresh_mode.
-#[cfg(feature = "pepper")]
+#[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Pepper requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_pepper_append_variant() {
@@ -205,7 +235,7 @@ async fn test_acceleration_refresh_pepper_append_variant() {
         .expect("Test should pass when mode: file is properly configured");
 }
 
-#[cfg(feature = "pepper")]
+#[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Pepper requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_pepper_full_variant() {
