@@ -5,7 +5,7 @@ mod refresh_duckdb;
 #[cfg(feature = "postgres")]
 mod refresh_modes;
 #[cfg(all(not(windows), feature = "postgres"))]
-mod refresh_pepper;
+mod refresh_cayenne;
 #[cfg(feature = "postgres")]
 mod refresh_postgres;
 #[cfg(all(feature = "sqlite", feature = "postgres"))]
