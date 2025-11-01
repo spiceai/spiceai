@@ -190,7 +190,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
         if !cmd.options.contains_key("open") {
-            let duckdb_file = duckdb_file_path(&self.duckdb_factory, source)?;
+            let duckdb_file = self.file_path(source)?;
             cmd.options.insert("open".to_string(), duckdb_file);
         }
 
@@ -201,6 +201,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
                 cmd.clone(),
                 partition_by_first,
                 Arc::clone(&schema),
+                &self.duckdb_factory,
             )
             .await?,
         );
@@ -253,12 +254,11 @@ impl DuckDBPartitionCreator {
         cmd: CreateExternalTable,
         partition_by: PartitionedBy,
         schema: SchemaRef,
+        duckdb_factory: &DuckDBTableProviderFactory,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let duckdb_factory = create_factory();
-
         // We use the DuckDB factory to create a table provider in order to extract
         // target table definition and on_conflict settings that will be used directly for each partition.
-        let table_provider = create_table_provider(&duckdb_factory, &cmd, None)
+        let table_provider = create_table_provider(duckdb_factory, &cmd, None)
             .await
             .map_err(|e| format!("Failed to create table provider: {e}"))?;
 
