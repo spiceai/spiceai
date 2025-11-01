@@ -954,9 +954,9 @@ mod accelerator_compat_tests {
 
                         // Also clean up Cayenne metadata to ensure fresh schema
                         // Use test environment's metadata directory
-                        let pepper_db_path = format!("{}/cayenne.db", test_env.metadata_dir());
-                        if std::path::Path::new(&pepper_db_path).exists() {
-                            let _ = std::fs::remove_file(&pepper_db_path);
+                        let cayenne_db_path = format!("{}/cayenne.db", test_env.metadata_dir());
+                        if std::path::Path::new(&cayenne_db_path).exists() {
+                            let _ = std::fs::remove_file(&cayenne_db_path);
                         }
                     }
 
@@ -2172,9 +2172,9 @@ mod accelerator_compat_tests {
 
                             // Clean up Cayenne metadata
                             // Use test environment's metadata directory
-                            let pepper_db_path = format!("{}/cayenne.db", metadata_dir);
-                            if std::path::Path::new(&pepper_db_path).exists() {
-                                let _ = std::fs::remove_file(&pepper_db_path);
+                            let cayenne_db_path = format!("{}/cayenne.db", metadata_dir);
+                            if std::path::Path::new(&cayenne_db_path).exists() {
+                                let _ = std::fs::remove_file(&cayenne_db_path);
                             }
                         }
 

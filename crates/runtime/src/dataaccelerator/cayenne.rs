@@ -227,7 +227,7 @@ impl CayenneAccelerator {
 
     /// Returns the `Cayenne` data directory path that would be used for a file-based `Cayenne` accelerator from this dataset.
     /// Cayenne uses a directory-based approach to support append operations.
-    pub fn pepper_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
+    pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
@@ -239,7 +239,7 @@ impl CayenneAccelerator {
             let dataset_name = source.name().to_string().replace(['.', '/'], "_");
 
             // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
-            let dir_path = if let Some(custom_path) = acceleration_params.get("pepper_file_path") {
+            let dir_path = if let Some(custom_path) = acceleration_params.get("cayenne_file_path") {
                 custom_path.clone()
             } else {
                 format!("{}/{}", spice_data_base_path(), dataset_name)
@@ -326,12 +326,13 @@ impl CayenneAccelerator {
             .get_or_try_init(move || {
                 let connection_string = connection_string.clone();
                 async move {
-                    let catalog =
-                        Arc::new(cayenne::CayenneCatalog::new(connection_string).map_err(|e| {
+                    let catalog = Arc::new(
+                        cayenne::CayenneCatalog::new(connection_string).map_err(|e| {
                             Error::AccelerationInitializationFailed {
                                 source: Box::new(e),
                             }
-                        })?) as Arc<dyn cayenne::MetadataCatalog>;
+                        })?,
+                    ) as Arc<dyn cayenne::MetadataCatalog>;
 
                     catalog
                         .init()
@@ -355,7 +356,7 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         retention_filters: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>> {
-        use cayenne::{PepperTableProvider, metadata::CreateTableOptions};
+        use cayenne::{CayenneTableProvider, metadata::CreateTableOptions};
 
         // Get metastore type and custom metadata directory if provided
         let (metadata_dir, metastore_type) = if let Some(acceleration) = source.acceleration() {
@@ -397,8 +398,8 @@ impl CayenneAccelerator {
             partition_column: None, // Non-partitioned table
         };
 
-        // Create PepperTableProvider
-        let cayenne_table = PepperTableProvider::create_table_with_retention(
+        // Create CayenneTableProvider
+        let cayenne_table = CayenneTableProvider::create_table_with_retention(
             catalog,
             table_options,
             retention_filters,
@@ -438,7 +439,7 @@ impl DataAccelerator for CayenneAccelerator {
     }
 
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
-        self.pepper_data_dir(source)
+        self.cayenne_data_dir(source)
             .map_err(|err| FilePathError::External {
                 engine: Engine::Cayenne,
                 source: err.into(),
@@ -671,11 +672,10 @@ impl DataAccelerator for CayenneAccelerator {
 
             // Create a new catalog - it will use WAL mode and busy timeout internally
             let catalog = Arc::new(
-                cayenne::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).map_err(
-                    |e| Error::AccelerationInitializationFailed {
+                cayenne::CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                    .map_err(|e| Error::AccelerationInitializationFailed {
                         source: Box::new(e),
-                    },
-                )?,
+                    })?,
             ) as Arc<dyn cayenne::MetadataCatalog>;
 
             // Initialize the catalog (creates tables if needed)
@@ -695,7 +695,7 @@ impl DataAccelerator for CayenneAccelerator {
 
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
-            let creator = Arc::new(PepperPartitionCreator::new(
+            let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
                 PathBuf::from(&dir_path),
                 partition_by_first,
@@ -749,7 +749,7 @@ impl DataAccelerator for CayenneAccelerator {
 }
 
 /// Partition creator for Cayenne accelerator
-struct PepperPartitionCreator {
+struct CayennePartitionCreator {
     table_name: String,
     base_path: PathBuf,
     partition_by: PartitionedBy,
@@ -760,9 +760,9 @@ struct PepperPartitionCreator {
     retention_filters: Vec<Expr>,
 }
 
-impl std::fmt::Debug for PepperPartitionCreator {
+impl std::fmt::Debug for CayennePartitionCreator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PepperPartitionCreator")
+        f.debug_struct("CayennePartitionCreator")
             .field("table_name", &self.table_name)
             .field("base_path", &self.base_path)
             .field("partition_by", &self.partition_by)
@@ -775,7 +775,7 @@ impl std::fmt::Debug for PepperPartitionCreator {
     }
 }
 
-impl PepperPartitionCreator {
+impl CayennePartitionCreator {
     #[allow(clippy::too_many_arguments)]
     fn new(
         table_name: String,
@@ -842,7 +842,7 @@ impl PepperPartitionCreator {
 }
 
 #[async_trait]
-impl PartitionCreator for PepperPartitionCreator {
+impl PartitionCreator for CayennePartitionCreator {
     async fn create_partition(
         &self,
         partition_value: ScalarValue,
@@ -889,7 +889,7 @@ impl PartitionCreator for PepperPartitionCreator {
         };
 
         // Create Cayenne table provider for this partition
-        let cayenne_table = cayenne::PepperTableProvider::create_table_with_retention(
+        let cayenne_table = cayenne::CayenneTableProvider::create_table_with_retention(
             Arc::clone(&self.catalog),
             table_options,
             self.retention_filters.clone(),
@@ -931,7 +931,7 @@ impl PartitionCreator for PepperPartitionCreator {
 
             // Create Cayenne table provider for this partition
             let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
-            let cayenne_table = cayenne::PepperTableProvider::new_with_retention(
+            let cayenne_table = cayenne::CayenneTableProvider::new_with_retention(
                 &partition_table_name,
                 Arc::clone(&self.catalog),
                 self.retention_filters.clone(),
@@ -971,13 +971,13 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_pepper_file_path_generation() {
+    async fn test_cayenne_file_path_generation() {
         let app = AppBuilder::new("test").build();
         let rt = crate::Runtime::builder().build().await;
 
         let mut dataset = DatasetBuilder::try_new(
-            "pepper_data_accelerator_test".to_string(),
-            "pepper_data_accelerator_test",
+            "cayenne_data_accelerator_test".to_string(),
+            "cayenne_data_accelerator_test",
         )
         .expect("Failed to create builder")
         .with_app(Arc::new(app))
@@ -992,13 +992,13 @@ mod tests {
         });
 
         let accelerator = CayenneAccelerator::new();
-        let data_dir = accelerator.pepper_data_dir(&dataset);
+        let data_dir = accelerator.cayenne_data_dir(&dataset);
 
         let dir_path = match data_dir {
             Ok(path) => path,
             Err(err) => panic!("Expected Cayenne data directory to resolve, but got {err}"),
         };
-        assert!(dir_path.contains("pepper_data_accelerator_test"));
+        assert!(dir_path.contains("cayenne_data_accelerator_test"));
         assert!(dir_path.ends_with('/'));
     }
 }

@@ -228,7 +228,7 @@ async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow:
 #[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
-async fn test_acceleration_refresh_pepper_append_variant() {
+async fn test_acceleration_refresh_cayenne_append_variant() {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_append_for_engine("cayenne")
         .await
@@ -238,7 +238,7 @@ async fn test_acceleration_refresh_pepper_append_variant() {
 #[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
-async fn test_acceleration_refresh_pepper_full_variant() {
+async fn test_acceleration_refresh_cayenne_full_variant() {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_full_for_engine("cayenne")
         .await

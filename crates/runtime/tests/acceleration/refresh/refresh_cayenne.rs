@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn test_acceleration_refresh_pepper_append() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_cayenne_append() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -88,7 +88,7 @@ async fn test_acceleration_refresh_pepper_append() -> Result<(), anyhow::Error> 
 }
 
 #[tokio::test]
-async fn test_acceleration_refresh_pepper_full() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_cayenne_full() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -147,7 +147,7 @@ async fn test_acceleration_refresh_pepper_full() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn test_pepper_append_mode_requires_constraint() -> Result<(), anyhow::Error> {
+async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()

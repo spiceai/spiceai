@@ -311,7 +311,7 @@ impl MetadataCatalog for CayenneCatalog {
             let next_catalog_id: i64 = self
                 .query_row_helper(
                     QueryRowParams {
-                        sql: "SELECT value FROM pepper_metadata WHERE key = 'next_catalog_id'",
+                        sql: "SELECT value FROM cayenne_metadata WHERE key = 'next_catalog_id'",
                         params: vec![],
                     },
                     |row| row.get_i64(0),
@@ -351,7 +351,7 @@ impl MetadataCatalog for CayenneCatalog {
 
             // Update next_catalog_id in metadata
             self.execute_helper(ExecuteParams {
-                sql: "UPDATE pepper_metadata SET value = ?1 WHERE key = 'next_catalog_id'",
+                sql: "UPDATE cayenne_metadata SET value = ?1 WHERE key = 'next_catalog_id'",
                 params: vec![MetastoreValue::Integer(next_catalog_id + 1)],
             })
             .await?;
@@ -613,7 +613,7 @@ impl MetadataCatalog for CayenneCatalog {
         let next_partition_id: i64 = self
             .query_row_helper(
                 QueryRowParams {
-                    sql: "SELECT value FROM pepper_metadata WHERE key = 'next_partition_id'",
+                    sql: "SELECT value FROM cayenne_metadata WHERE key = 'next_partition_id'",
                     params: vec![],
                 },
                 |row| row.get_i64(0),
@@ -644,7 +644,7 @@ impl MetadataCatalog for CayenneCatalog {
 
         // Update next_partition_id in metadata
         self.execute_helper(ExecuteParams {
-            sql: "UPDATE pepper_metadata SET value = ?1 WHERE key = 'next_partition_id'",
+            sql: "UPDATE cayenne_metadata SET value = ?1 WHERE key = 'next_partition_id'",
             params: vec![MetastoreValue::Integer(next_partition_id + 1)],
         })
         .await?;

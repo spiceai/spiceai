@@ -23,17 +23,17 @@ mod common;
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use cayenne::metadata::CreateTableOptions;
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
-use cayenne::metadata::CreateTableOptions;
-use cayenne::{MetadataCatalog, CayenneTableProvider};
 use std::sync::Arc;
 
 // Generate test variants for each backend
-test_with_backends!(test_pepper_basic_workflow_impl);
+test_with_backends!(test_cayenne_basic_workflow_impl);
 
 #[allow(clippy::too_many_lines)]
-async fn test_pepper_basic_workflow_impl(
+async fn test_cayenne_basic_workflow_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = &fixture.catalog;
@@ -439,14 +439,14 @@ fn verify_sqlite_metadata(
 
     let conn = Connection::open(db_path)?;
 
-    // 1. Verify pepper_metadata table has initial metadata
+    // 1. Verify cayenne_metadata table has initial metadata
     let next_catalog_id: i64 = conn.query_row(
-        "SELECT value FROM pepper_metadata WHERE key = 'next_catalog_id'",
+        "SELECT value FROM cayenne_metadata WHERE key = 'next_catalog_id'",
         [],
         |row| row.get(0),
     )?;
     let next_file_id: i64 = conn.query_row(
-        "SELECT value FROM pepper_metadata WHERE key = 'next_file_id'",
+        "SELECT value FROM cayenne_metadata WHERE key = 'next_file_id'",
         [],
         |row| row.get(0),
     )?;
@@ -538,9 +538,9 @@ fn verify_sqlite_metadata(
 }
 
 // Generate test variants for each backend
-test_with_backends!(test_pepper_catalog_persistence_impl);
+test_with_backends!(test_cayenne_catalog_persistence_impl);
 
-async fn test_pepper_catalog_persistence_impl(
+async fn test_cayenne_catalog_persistence_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = fixture.temp_dir;
@@ -572,17 +572,17 @@ async fn test_pepper_catalog_persistence_impl(
 }
 
 // Generate test variants for each backend
-test_with_backends!(test_pepper_statistics_impl);
+test_with_backends!(test_cayenne_statistics_impl);
 
-async fn test_pepper_statistics_impl(
+async fn test_cayenne_statistics_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::datatypes::{DataType, Field, Schema};
+    use cayenne::metadata::CreateTableOptions;
+    use cayenne::CayenneTableProvider;
     use datafusion::common::TableReference;
     use datafusion::execution::context::SessionContext;
     use datafusion_catalog::TableProvider;
-    use cayenne::metadata::CreateTableOptions;
-    use cayenne::CayenneTableProvider;
     use std::sync::Arc;
 
     let backend_name = fixture.backend_type.name();
@@ -655,10 +655,10 @@ async fn test_pepper_statistics_impl(
 }
 
 // Generate test variants for each backend
-test_with_backends!(test_pepper_core_data_types_impl);
+test_with_backends!(test_cayenne_core_data_types_impl);
 
 #[allow(clippy::too_many_lines)]
-async fn test_pepper_core_data_types_impl(
+async fn test_cayenne_core_data_types_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::{
