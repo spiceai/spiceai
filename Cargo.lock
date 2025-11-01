@@ -11081,6 +11081,7 @@ dependencies = [
 name = "pepper"
 version = "0.1.0"
 dependencies = [
+ "aegis",
  "arrow",
  "arrow-flight",
  "arrow-ipc",
