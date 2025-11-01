@@ -12,10 +12,11 @@ RUN apt update \
 COPY . /build
 WORKDIR /build
 
-ARG CARGO_FEATURES
-ARG RUST_PROFILE
+ARG CARGO_FEATURES=default
+ARG RUST_PROFILE=release
 ARG CARGO_INCREMENTAL=yes
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
+ARG TARGETARCH
 ENV CARGO_FEATURES=$CARGO_FEATURES \
     CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
     CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
@@ -25,6 +26,11 @@ RUN \
     --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
+    case "${TARGETARCH}" in \
+      arm64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=armv8-a" ;; \
+      amd64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=x86-64" ;; \
+      *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
+    esac && \
     cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default} && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
