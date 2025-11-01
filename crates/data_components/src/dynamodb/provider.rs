@@ -62,10 +62,14 @@ pub struct DynamoDBTableProvider {
     table_schema: DynamoDBTableSchema,
     request_plan_builder: DynamoDBRequestPlanBuilder,
     unnest_depth: Option<usize>,
+    config_partitions: Option<usize>,
+    table_total_item_count: Option<i64>,
 }
 
 type DynamoDBItemStream =
     dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
+
+const DEFAULT_PARTITIONS: usize = 8;
 
 impl DynamoDBTableProvider {
     pub async fn try_new(
@@ -73,14 +77,16 @@ impl DynamoDBTableProvider {
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
+        config_partitions: Option<usize>,
     ) -> Result<Self, Error> {
-        let (table_schema, partition_key, sort_key, flattened_fields) = Self::fetch_table_metadata(
-            Arc::clone(&client),
-            &table_name,
-            unnest_depth,
-            schema_infer_max_records,
-        )
-        .await?;
+        let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) =
+            Self::fetch_table_metadata(
+                Arc::clone(&client),
+                &table_name,
+                unnest_depth,
+                schema_infer_max_records,
+            )
+            .await?;
 
         let table_schema = DynamoDBTableSchema::new(
             table_name,
@@ -94,6 +100,8 @@ impl DynamoDBTableProvider {
             table_schema: table_schema.clone(),
             request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
             unnest_depth,
+            config_partitions,
+            table_total_item_count,
         })
     }
 
@@ -102,7 +110,13 @@ impl DynamoDBTableProvider {
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
-    ) -> Result<(SchemaRef, String, Option<String>, HashSet<String>)> {
+    ) -> Result<(
+        SchemaRef,
+        String,
+        Option<String>,
+        HashSet<String>,
+        Option<i64>,
+    )> {
         let response = client
             .describe_table()
             .table_name(table_name)
@@ -165,7 +179,22 @@ impl DynamoDBTableProvider {
             partition_key,
             sort_key,
             flattened_fields,
+            table.item_count,
         ))
+    }
+
+    fn get_partitions_from_table_size(&self) -> usize {
+        match self.table_total_item_count {
+            None => DEFAULT_PARTITIONS,
+            Some(row_count) => match row_count {
+                0..1_000 => 1,
+                1_000..10_000 => 2,
+                10_000..100_000 => 4,
+                100_000..1_000_000 => 8,
+                1_000_000..10_000_000 => 16,
+                _ => 32,
+            },
+        }
     }
 }
 
@@ -192,6 +221,14 @@ impl TableProvider for DynamoDBTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut projected_schema = project_schema(self.table_schema.schema(), projection)?;
 
+        tracing::debug!(
+            "Table {:?}, projection: {:?}, filters: {:?}, limit: {:?}",
+            self.table_schema.table_name(),
+            projection,
+            filters,
+            limit
+        );
+
         // If no columns are specified, use partition_key - otherwise DynamoDB returns an error
         if projected_schema.fields.is_empty() {
             let idx = self
@@ -205,11 +242,29 @@ impl TableProvider for DynamoDBTableProvider {
             self.request_plan_builder
                 .build_request_plan(filters, &projected_schema, limit)?;
 
+        tracing::debug!(
+            "Table {:?}, request_plan: {:?}",
+            self.table_schema.table_name(),
+            request_plan
+        );
+
+        // If `config_partitions` is empty (i.e. it was set to 'auto' in the config), use table size as a heuristic.
+        let total_partitions = self
+            .config_partitions
+            .unwrap_or_else(|| self.get_partitions_from_table_size());
+
+        tracing::debug!(
+            "Table {:?}, total_partitions: {:?}",
+            self.table_schema.table_name(),
+            total_partitions
+        );
+
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             Arc::clone(&self.client),
             request_plan,
             self.unnest_depth,
             projected_schema,
+            total_partitions,
         )))
     }
 
@@ -236,6 +291,7 @@ impl DynamoDBTableProviderExec {
         request_plan: DynamoDBRequestPlan,
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
+        partitions: usize,
     ) -> Self {
         Self {
             client,
@@ -244,7 +300,7 @@ impl DynamoDBTableProviderExec {
             unnest_depth,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
-                Partitioning::UnknownPartitioning(1),
+                Partitioning::UnknownPartitioning(partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
@@ -254,13 +310,17 @@ impl DynamoDBTableProviderExec {
 
 impl std::fmt::Debug for DynamoDBTableProviderExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DynamoDBTableProviderExec")
+        f.debug_struct("DynamoDBTableProviderExec")
+            .field("request_plan", &self.request_plan)
+            .finish_non_exhaustive()
     }
 }
 
 impl DisplayAs for DynamoDBTableProviderExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DynamoDBTableProviderExec")
+        f.debug_struct("DynamoDBTableProviderExec")
+            .field("request_plan", &self.request_plan)
+            .finish_non_exhaustive()
     }
 }
 
@@ -294,7 +354,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.projected_schema), 2);
@@ -305,10 +365,26 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
 
+        let total_partitions = match self.properties.partitioning {
+            Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
+            Partitioning::UnknownPartitioning(partitions) => partitions,
+        };
+
+        let segment: i32 = i32::try_from(partition).map_err(|_| {
+            DataFusionError::Execution(
+                format!("Partition number too large for DynamoDB segment: {partition}").to_string(),
+            )
+        })?;
+
+        let total_segments: i32 = i32::try_from(total_partitions).map_err(|_| DataFusionError::Execution(
+            format!("Total partitions number too large for DynamoDB total_segments: {total_partitions}").to_string()
+        ))?;
+
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
 
-            let item_stream = build_stream_from_plan(&client, request_plan);
+            let item_stream =
+                build_stream_from_plan(&client, request_plan, segment, total_segments);
             let chunked_stream = item_stream.chunks(CHUNK_SIZE);
             pin_mut!(chunked_stream);
 
@@ -340,6 +416,8 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 fn build_stream_from_plan(
     client: &Arc<Client>,
     request: DynamoDBRequestPlan,
+    segment: i32,
+    total_segments: i32,
 ) -> Pin<Box<DynamoDBItemStream>> {
     match request {
         DynamoDBRequestPlan::Query(QueryParams {
@@ -381,7 +459,7 @@ fn build_stream_from_plan(
             projection_expression,
             limit,
         }) => {
-            let request = client
+            let mut request = client
                 .scan()
                 .table_name(table_name)
                 .set_filter_expression(filter_expression)
@@ -389,6 +467,10 @@ fn build_stream_from_plan(
                 .set_expression_attribute_names(expression_attribute_names)
                 .set_projection_expression(projection_expression)
                 .set_limit(limit);
+
+            if total_segments > 1 {
+                request = request.segment(segment).total_segments(total_segments);
+            }
 
             let pagination_stream = TryFlatMap::new(request.into_paginator().send())
                 .flat_map(|output| output.items().to_vec());

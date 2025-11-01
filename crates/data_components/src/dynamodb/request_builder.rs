@@ -153,6 +153,8 @@ impl DynamoDBRequestPlanBuilder {
             let (filter_str, attribute_values) = self.build_filter_expression(filters);
             if !filter_str.is_empty() {
                 scan_params = scan_params.filter_expression(filter_str);
+            }
+            if !attribute_values.is_empty() {
                 scan_params = scan_params.expression_attribute_values(attribute_values);
             }
         }
@@ -1086,6 +1088,31 @@ mod tests {
             DynamoDBRequestPlan::Scan(params) => {
                 assert_eq!(params.limit, None);
                 assert_eq!(params.filter_expression, Some("(#name = :v0)".to_string()));
+            }
+            DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
+        }
+    }
+
+    #[test]
+    fn test_plan_scan_with_filters_and_empty_values() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filters = vec![col("name").eq(col("sort_key"))];
+        let projection = create_projection_schema(&["id", "name"]);
+
+        let result = builder
+            .build_request_plan(&filters, &projection, None)
+            .expect("request plan");
+
+        match result {
+            DynamoDBRequestPlan::Scan(params) => {
+                assert_eq!(params.limit, None);
+                assert_eq!(
+                    params.filter_expression,
+                    Some("(#name = #sort_key)".to_string())
+                );
+                assert_eq!(params.expression_attribute_values, None);
             }
             DynamoDBRequestPlan::Query(_) => panic!("Expected Scan request"),
         }
