@@ -166,6 +166,11 @@ jobs:
           IC_DIR=$PWD/$(ls -d linux/instantclient*)
           echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
 
+      - name: Install OpenMP runtime library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgomp1
+
       - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
