@@ -61,6 +61,10 @@ jobs:
         id: setup-matrix
         with:
           script: |
+            // Use GitHub-hosted macOS runner only for tag releases
+            const isTagRelease = context.ref && context.ref.startsWith('refs/tags/v');
+            const macosRunner = isTagRelease ? "macos-14" : "spiceai-macos";
+
             const matrix = [
               {
                 name: "Linux x64",
@@ -78,7 +82,7 @@ jobs:
                 tags: ["default", "models"],
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                runner: "macos-14",
+                runner: macosRunner,
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
