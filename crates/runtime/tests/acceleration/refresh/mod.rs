@@ -4,7 +4,7 @@ mod common;
 mod refresh_duckdb;
 #[cfg(feature = "postgres")]
 mod refresh_modes;
-#[cfg(all(feature = "pepper", feature = "postgres"))]
+#[cfg(all(not(windows), feature = "postgres"))]
 mod refresh_pepper;
 #[cfg(feature = "postgres")]
 mod refresh_postgres;

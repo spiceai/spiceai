@@ -65,9 +65,6 @@ pub enum Error {
     #[snafu(display("Invalid Pepper acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
 
-    #[snafu(display("Pepper feature not enabled in build"))]
-    FeatureNotEnabled,
-
     #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]

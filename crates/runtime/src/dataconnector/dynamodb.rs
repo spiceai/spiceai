@@ -49,6 +49,7 @@ impl DynamoDBFactory {
 }
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
+const SEGMENTS_AUTO_STR: &str = "auto";
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
@@ -70,6 +71,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_infer_max_records")
         .description("Number of documents to use to infer the schema. Defaults to 10.")
         .default(DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR),
+    ParameterSpec::runtime("scan_segments")
+        .description("Number of segments. 'auto' by default.")
+        .default(SEGMENTS_AUTO_STR),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -151,11 +155,43 @@ impl DataConnector for DynamoDB {
             ExposedParamLookup::Absent(_) => None,
         };
 
+        let config_segments = match self
+            .params
+            .get("scan_segments")
+            .expose()
+            .unwrap_or_else(|_| SEGMENTS_AUTO_STR)
+            .to_lowercase()
+            .as_str()
+        {
+            SEGMENTS_AUTO_STR => None,
+            config_segments_str => {
+                let config_segments = usize::from_str(config_segments_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                    dataconnector: "dynamodb".to_string(),
+                    message: format!(
+                        "DynamoDB parameter 'scan_segments' must be either an integer > 0 or 'auto', not {config_segments_str}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
+
+                if config_segments == 0 {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "dynamodb".to_string(),
+                        message: format!(
+                            "DynamoDB parameter 'scan_segments' must be either an integer > 0 or 'auto', not {config_segments_str}"
+                        ),
+                        connector_component: ConnectorComponent::from(dataset),
+                    });
+                }
+
+                Some(config_segments)
+            }
+        };
+
         let provider = DynamoDBTableProvider::try_new(
             Arc::new(client),
             Arc::from(table_name),
             unnest_depth,
             schema_infer_max_records,
+            config_segments,
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
