@@ -63,7 +63,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         exec_err!(
             "SpiceLogicalCodec does not support {}. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
             name.as_str()
-        );
+        )
     }
 
     fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> Result<()> {
