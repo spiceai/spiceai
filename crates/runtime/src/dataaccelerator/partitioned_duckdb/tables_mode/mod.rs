@@ -131,9 +131,11 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     }
 
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
-        duckdb_file_path(&self.duckdb_factory, source).map_err(|e| FilePathError::External {
-            engine: Engine::DuckDB,
-            source: e.into(),
+        duckdb_file_path(&self.duckdb_factory, source, &source.name().to_string()).map_err(|e| {
+            FilePathError::External {
+                engine: Engine::DuckDB,
+                source: e.into(),
+            }
         })
     }
 
