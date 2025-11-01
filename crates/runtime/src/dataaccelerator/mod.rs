@@ -41,14 +41,14 @@ use tokio::sync::RwLock;
 
 use self::arrow::ArrowAccelerator;
 
+#[cfg(not(windows))]
+use self::cayenne::CayenneAccelerator;
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(not(windows))]
-use self::cayenne::CayenneAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
@@ -57,12 +57,12 @@ use self::sqlite::SqliteAccelerator;
 use self::turso::TursoAccelerator;
 
 pub mod arrow;
+#[cfg(not(windows))]
+pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(not(windows))]
-pub mod cayenne;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
@@ -941,7 +941,8 @@ mod accelerator_compat_tests {
                                 for entry in entries.flatten() {
                                     let path = entry.path();
                                     // Safety: only delete .cayenne files
-                                    if path.extension().and_then(|s| s.to_str()) == Some("cayenne") {
+                                    if path.extension().and_then(|s| s.to_str()) == Some("cayenne")
+                                    {
                                         let _ = std::fs::remove_file(&path);
                                     }
                                 }
