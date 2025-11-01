@@ -85,7 +85,7 @@ impl DynamoDBTableSchema {
         filters
             .iter()
             .map(|&expr| {
-                if self.is_filter_supported(expr) {
+                if self.is_filter_supported(expr, false) {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -94,7 +94,7 @@ impl DynamoDBTableSchema {
             .collect()
     }
 
-    fn is_filter_supported(&self, expr: &Expr) -> bool {
+    fn is_filter_supported(&self, expr: &Expr, is_binary_expr_part: bool) -> bool {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let op_supported = matches!(
@@ -109,24 +109,29 @@ impl DynamoDBTableSchema {
                         | Operator::Or
                 );
 
-                op_supported && self.is_filter_supported(left) && self.is_filter_supported(right)
+                op_supported
+                    && self.is_filter_supported(left, true)
+                    && self.is_filter_supported(right, true)
             }
             Expr::Column(col) => self.table_schema.field_with_name(&col.name).is_ok(),
-            Expr::Literal(scalar, _) => matches!(
-                scalar,
-                ScalarValue::Utf8(_)
-                    | ScalarValue::Int8(_)
-                    | ScalarValue::Int16(_)
-                    | ScalarValue::Int32(_)
-                    | ScalarValue::Int64(_)
-                    | ScalarValue::UInt8(_)
-                    | ScalarValue::UInt16(_)
-                    | ScalarValue::UInt32(_)
-                    | ScalarValue::UInt64(_)
-                    | ScalarValue::Float32(_)
-                    | ScalarValue::Float64(_)
-                    | ScalarValue::Boolean(_)
-            ),
+            Expr::Literal(scalar, _) => {
+                is_binary_expr_part
+                    && matches!(
+                        scalar,
+                        ScalarValue::Utf8(_)
+                            | ScalarValue::Int8(_)
+                            | ScalarValue::Int16(_)
+                            | ScalarValue::Int32(_)
+                            | ScalarValue::Int64(_)
+                            | ScalarValue::UInt8(_)
+                            | ScalarValue::UInt16(_)
+                            | ScalarValue::UInt32(_)
+                            | ScalarValue::UInt64(_)
+                            | ScalarValue::Float32(_)
+                            | ScalarValue::Float64(_)
+                            | ScalarValue::Boolean(_)
+                    )
+            }
             _ => false,
         }
     }
@@ -241,19 +246,27 @@ mod tests {
 
         // age = 25
         let expr = col("age").eq(lit(25i64));
-        assert!(schema.is_filter_supported(&expr));
+        assert!(schema.is_filter_supported(&expr, false));
+    }
+
+    #[test]
+    fn test_is_filter_literal() {
+        let schema = create_test_schema();
+
+        assert!(schema.is_filter_supported(&lit(25i64), true));
+        assert!(!schema.is_filter_supported(&lit(25i64), false));
     }
 
     #[test]
     fn test_is_filter_supported_all_operators() {
         let schema = create_test_schema();
 
-        assert!(schema.is_filter_supported(&col("age").eq(lit(25i64))));
-        assert!(schema.is_filter_supported(&col("age").not_eq(lit(25i64))));
-        assert!(schema.is_filter_supported(&col("age").lt(lit(25i64))));
-        assert!(schema.is_filter_supported(&col("age").lt_eq(lit(25i64))));
-        assert!(schema.is_filter_supported(&col("age").gt(lit(25i64))));
-        assert!(schema.is_filter_supported(&col("age").gt_eq(lit(25i64))));
+        assert!(schema.is_filter_supported(&col("age").eq(lit(25i64)), false));
+        assert!(schema.is_filter_supported(&col("age").not_eq(lit(25i64)), false));
+        assert!(schema.is_filter_supported(&col("age").lt(lit(25i64)), false));
+        assert!(schema.is_filter_supported(&col("age").lt_eq(lit(25i64)), false));
+        assert!(schema.is_filter_supported(&col("age").gt(lit(25i64)), false));
+        assert!(schema.is_filter_supported(&col("age").gt_eq(lit(25i64)), false));
     }
 
     #[test]
@@ -262,21 +275,21 @@ mod tests {
 
         // age > 18 AND active = true
         let expr = col("age").gt(lit(18i64)).and(col("active").eq(lit(true)));
-        assert!(schema.is_filter_supported(&expr));
+        assert!(schema.is_filter_supported(&expr, false));
 
         // age > 18 OR age < 10
         let expr = col("age").gt(lit(18i64)).or(col("age").lt(lit(10i64)));
-        assert!(schema.is_filter_supported(&expr));
+        assert!(schema.is_filter_supported(&expr, false));
     }
 
     #[test]
     fn test_is_filter_supported_different_scalar_types() {
         let schema = create_test_schema();
 
-        assert!(schema.is_filter_supported(&col("name").eq(lit("John"))));
-        assert!(schema.is_filter_supported(&col("age").eq(lit(25i32))));
-        assert!(schema.is_filter_supported(&col("age").eq(lit(25i64))));
-        assert!(schema.is_filter_supported(&col("active").eq(lit(true))));
+        assert!(schema.is_filter_supported(&col("name").eq(lit("John")), false));
+        assert!(schema.is_filter_supported(&col("age").eq(lit(25i32)), false));
+        assert!(schema.is_filter_supported(&col("age").eq(lit(25i64)), false));
+        assert!(schema.is_filter_supported(&col("active").eq(lit(true)), false));
     }
 
     #[test]
@@ -298,7 +311,7 @@ mod tests {
                 op,
                 right: Box::new(lit(5i64)),
             });
-            assert!(!schema.is_filter_supported(&expr));
+            assert!(!schema.is_filter_supported(&expr, false));
         }
     }
 
@@ -312,7 +325,7 @@ mod tests {
             .and(col("active").eq(lit(true)))
             .or(col("age").lt(lit(10i64)).and(col("name").eq(lit("child"))));
 
-        assert!(schema.is_filter_supported(&expr));
+        assert!(schema.is_filter_supported(&expr, false));
     }
 
     #[test]

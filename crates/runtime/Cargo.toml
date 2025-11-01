@@ -268,7 +268,6 @@ mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 oracle = ["data_components/oracle"]
-pepper = ["dep:pepper", "dep:vortex-datafusion", "dep:vortex"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",
@@ -302,7 +301,7 @@ vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]
-pepper = { path = "../pepper", optional = true, features = ["turso"] }
+pepper = { path = "../pepper", features = ["turso"] }
 vortex = { workspace = true, optional = true }
 vortex-datafusion = { workspace = true, optional = true }
 
