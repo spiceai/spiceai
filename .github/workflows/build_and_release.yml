@@ -108,7 +108,7 @@ jobs:
                 return matrix;
               }
 
-              return matrix;
+              return matrix.filter(m => m.name === platform_option);
             }
 
             return matrix;
