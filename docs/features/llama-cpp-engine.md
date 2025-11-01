@@ -80,6 +80,16 @@ SPICED_CUSTOM_FEATURES="models,cuda" make install
 SPICED_CUSTOM_FEATURES="models,metal" make install
 ```
 
+### Static vs Dynamic Linking
+
+By default, llama.cpp dependencies are **statically linked** to avoid runtime dependency issues. This is automatically configured in the build process.
+
+To override this and use dynamic linking (not recommended for production), set:
+
+```bash
+LLAMA_BUILD_SHARED_LIBS=1 make install-with-models
+```
+
 ## Implementation Details
 
 The llama.cpp engine provides:
