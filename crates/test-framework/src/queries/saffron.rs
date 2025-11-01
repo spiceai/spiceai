@@ -72,7 +72,7 @@ async fn fetch_test_records(
                  MaxRate, NumberDid, NumberType, SupportedDestRegion, NumberRegion, \
                  CurrentRate, IsAvailable, ProviderSid, AreaCodeRegion, \
                  AvailableForNumberSelection, Capability \
-                 FROM number_info_with_cap_view \
+                 FROM number_info_with_cap \
                  ORDER BY RAND() \
                  LIMIT {limit}"
             )
