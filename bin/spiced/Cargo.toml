@@ -83,8 +83,7 @@ default = [
     "mongodb",
     "xxhash",
     "iceberg-write",
-    "turso",
-    "pepper"
+    "turso"
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -116,5 +115,4 @@ spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 turso = ["runtime/turso"]
 tpc-extension = ["dep:tpc-extension"]
-pepper = ["runtime/pepper"]
 xxhash = ["runtime/xxhash"]
