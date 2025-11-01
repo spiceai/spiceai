@@ -127,7 +127,7 @@ impl DuckDBAccelerator {
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
     pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
-        duckdb_file_path(&self.duckdb_factory, source)
+        duckdb_file_path(&self.duckdb_factory, source, "accelerated_duckdb")
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
@@ -135,7 +135,7 @@ impl DuckDBAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<DuckDbConnectionPool> {
-        let duckdb_file = duckdb_file_path(&self.duckdb_factory, source);
+        let duckdb_file = self.duckdb_file_path(source);
 
         let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
             dataset: source.name().to_string(),
@@ -229,10 +229,17 @@ impl DuckDBAccelerator {
     }
 }
 
-/// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
+/// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` acceleration for this acceleration source
+///
+/// # Parameters
+///
+/// * `duckdb_factory` - The `DuckDB` table provider factory used to generate the file path
+/// * `source` - The acceleration source (dataset or view) containing acceleration configuration
+/// * `default_db_name` - Default database file name to use if the `duckdb_file` parameter is not specified
 pub fn duckdb_file_path(
     duckdb_factory: &DuckDBTableProviderFactory,
     source: &dyn AccelerationSource,
+    default_db_name: &str,
 ) -> Result<String> {
     if !source.is_file_accelerated() {
         Err(Error::InvalidConfiguration {
@@ -260,7 +267,7 @@ pub fn duckdb_file_path(
         }
 
         duckdb_factory
-            .duckdb_file_path("accelerated_duckdb", &mut params)
+            .duckdb_file_path(default_db_name, &mut params)
             .map_err(|err| Error::InvalidConfiguration {
                 detail: Arc::from(err.to_string()),
             })
