@@ -22,6 +22,7 @@ use snafu::prelude::*;
 use spicepod::component::model::HUGGINGFACE_PATH_REGEX;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ pub struct Huggingface {}
 
 #[async_trait]
 impl ModelSource for Huggingface {
+    #[allow(clippy::too_many_lines)]
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")
@@ -48,12 +50,21 @@ impl ModelSource for Huggingface {
             .map(ToString::to_string);
 
         let files = match files_param {
-            Some(files) => files.split(',').map(ToString::to_string).collect(),
+            Some(files) => files
+                .split(',')
+                .map(str::trim)
+                .filter(|file| !file.is_empty())
+                .map(ToString::to_string)
+                .collect(),
             None => vec![],
         };
 
         // it is not copying local model into .spice folder
         let local_path = super::ensure_model_path(name.as_str())?;
+        let local_path = PathBuf::from(local_path);
+        let root_dir = local_path
+            .parent()
+            .map_or_else(|| local_path.clone(), Path::to_path_buf);
 
         let remote_path = params
             .get("path")
@@ -82,24 +93,13 @@ impl ModelSource for Huggingface {
             _ => caps["revision"].to_string(),
         };
 
-        let versioned_path = format!("{local_path}/{revision}");
+        let versioned_path = local_path.join(&revision);
 
         let mut onnx_file_name = String::new();
 
-        std::fs::create_dir_all(versioned_path.clone())
-            .context(super::UnableToCreateModelPathSnafu {})?;
-
-        let p = versioned_path.clone();
+        std::fs::create_dir_all(&versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
 
         for file in files {
-            let file_name = format!("{p}/{file}");
-
-            if std::fs::metadata(file_name.clone()).is_ok() {
-                tracing::info!("File already exists: {}, skipping download", file_name);
-
-                continue;
-            }
-
             let download_url = format!(
                 "https://huggingface.co/{}/{}/resolve/{}/{}",
                 caps["org"].to_owned(),
@@ -108,10 +108,21 @@ impl ModelSource for Huggingface {
                 file,
             );
 
+            let file_path = resolve_model_file_path(&root_dir, &versioned_path, &file)?;
+
+            if std::fs::metadata(&file_path).is_ok() {
+                tracing::info!(
+                    "File already exists: {}, skipping download",
+                    file_path.display()
+                );
+
+                continue;
+            }
+
             tracing::info!("Downloading model: {}", download_url);
 
             if file.to_lowercase().ends_with(".onnx") {
-                onnx_file_name.clone_from(&file_name);
+                onnx_file_name = file_path.to_string_lossy().into_owned();
             }
 
             let client = reqwest::Client::builder()
@@ -136,15 +147,113 @@ impl ModelSource for Huggingface {
                 return Err(Error::UnableToDownloadModelFile {});
             }
 
-            let mut file = std::fs::File::create(file_name.clone())
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).context(super::UnableToCreateModelPathSnafu {})?;
+            }
+
+            let mut file_handle = std::fs::File::create(&file_path)
                 .context(super::UnableToCreateModelPathSnafu {})?;
-            let mut content = Cursor::new(response.bytes().await.unwrap_or_default());
-            std::io::copy(&mut content, &mut file)
+            let bytes = response
+                .bytes()
+                .await
+                .context(super::UnableToFetchModelSnafu {})?;
+            let mut content = Cursor::new(bytes);
+            std::io::copy(&mut content, &mut file_handle)
                 .context(super::UnableToCreateModelPathSnafu {})?;
 
-            tracing::info!("Downloaded: {}", file_name);
+            tracing::info!("Downloaded: {}", file_path.display());
         }
 
         Ok(onnx_file_name)
+    }
+}
+
+fn resolve_model_file_path(root_dir: &Path, base_dir: &Path, file: &str) -> super::Result<PathBuf> {
+    let trimmed = file.trim();
+    ensure!(
+        !trimmed.is_empty(),
+        super::InvalidModelFilePathSnafu {
+            path: file.to_string(),
+        }
+    );
+
+    let relative_path = Path::new(trimmed);
+    ensure!(
+        !relative_path.has_root(),
+        super::InvalidModelFilePathSnafu {
+            path: file.to_string(),
+        }
+    );
+
+    let mut candidate = base_dir.to_path_buf();
+
+    for component in relative_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => candidate.push(segment),
+            Component::ParentDir => {
+                if candidate == root_dir {
+                    return Err(super::InvalidModelFilePathSnafu {
+                        path: file.to_string(),
+                    }
+                    .build());
+                }
+                if !candidate.pop() {
+                    return Err(super::InvalidModelFilePathSnafu {
+                        path: file.to_string(),
+                    }
+                    .build());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(super::InvalidModelFilePathSnafu {
+                    path: file.to_string(),
+                }
+                .build());
+            }
+        }
+    }
+
+    ensure!(
+        candidate.starts_with(root_dir),
+        super::InvalidModelFilePathSnafu {
+            path: file.to_string(),
+        }
+    );
+
+    Ok(candidate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_parent_directory_components() {
+        let root = Path::new("/tmp/spice/models");
+        let base = root.join("test/latest");
+        let result = resolve_model_file_path(root, &base, "../../../weights.bin");
+        assert!(matches!(
+            result,
+            Err(super::Error::InvalidModelFilePath { .. })
+        ));
+    }
+
+    #[test]
+    fn allows_relative_file() {
+        let root = Path::new("/tmp/spice/models");
+        let base = root.join("test/latest");
+        let result = resolve_model_file_path(root, &base, "weights.bin").expect("valid path");
+        assert!(result.ends_with("weights.bin"));
+    }
+
+    #[test]
+    fn allows_relative_parent_within_root() {
+        let root = Path::new("/tmp/spice/models");
+        let base = root.join("test/latest");
+        let result = resolve_model_file_path(root, &base, "../shared/model.gguf")
+            .expect("valid parent path");
+        assert!(result.ends_with("shared/model.gguf"));
+        assert!(result.starts_with(root));
     }
 }

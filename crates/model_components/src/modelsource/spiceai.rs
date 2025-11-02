@@ -25,6 +25,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::Cursor;
+use std::path::Path;
 use std::string::ToString;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ use regex::Regex;
 
 #[async_trait]
 impl ModelSource for SpiceAI {
+    #[allow(clippy::too_many_lines)]
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")
@@ -134,12 +136,15 @@ impl ModelSource for SpiceAI {
             .clone()
             .context(super::UnableToParseMetadataSnafu {})?;
 
-        let versioned_path = format!("{local_path}/{version}");
-        let file_name = format!("{versioned_path}/model.onnx");
+        let versioned_path = Path::new(&local_path).join(&version);
+        let file_path = versioned_path.join("model.onnx");
 
-        if std::fs::metadata(file_name.clone()).is_ok() {
-            tracing::debug!("File already exists: {file_name}, skipping download");
-            return Ok(file_name);
+        if std::fs::metadata(&file_path).is_ok() {
+            tracing::debug!(
+                "File already exists: {}, skipping download",
+                file_path.display()
+            );
+            return Ok(file_path.to_string_lossy().into_owned());
         }
 
         let response = client
@@ -148,13 +153,17 @@ impl ModelSource for SpiceAI {
             .await
             .context(super::UnableToFetchModelSnafu {})?;
 
-        std::fs::create_dir_all(versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
-        let mut file = std::fs::File::create(file_name.clone())
-            .context(super::UnableToCreateModelPathSnafu {})?;
-        let mut content = Cursor::new(response.bytes().await.unwrap_or_default());
+        std::fs::create_dir_all(&versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
+        let mut file =
+            std::fs::File::create(&file_path).context(super::UnableToCreateModelPathSnafu {})?;
+        let bytes = response
+            .bytes()
+            .await
+            .context(super::UnableToFetchModelSnafu {})?;
+        let mut content = Cursor::new(bytes);
         std::io::copy(&mut content, &mut file).context(super::UnableToCreateModelPathSnafu {})?;
 
-        Ok(file_name)
+        Ok(file_path.to_string_lossy().into_owned())
     }
 }
 
