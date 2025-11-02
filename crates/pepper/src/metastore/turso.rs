@@ -268,7 +268,7 @@ impl MetastoreBackend for TursoMetastore {
 
         // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
         // Larger cache reduces disk I/O for frequently accessed metadata
-        conn.execute("PRAGMA cache_size = -32000", ())
+        conn.execute("PRAGMA cache_size = -32768", ())
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to set cache size: {e}"),
