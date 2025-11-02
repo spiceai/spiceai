@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Common test utilities for Cayenne with multiple metastore backends
 
-use cayenne::{MetadataCatalog, CayenneCatalog};
+use cayenne::{CayenneCatalog, MetadataCatalog};
 use std::sync::Arc;
 use tempfile::TempDir;
 

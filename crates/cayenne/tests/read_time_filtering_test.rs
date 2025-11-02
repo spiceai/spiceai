@@ -20,11 +20,13 @@ limitations under the License.
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use cayenne::{
+    metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
+};
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::*;
-use cayenne::{metadata::CreateTableOptions, MetadataCatalog, CayenneCatalog, CayenneTableProvider};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -60,7 +62,8 @@ async fn setup_test_table(
     };
 
     // Create table provider
-    let table_provider = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
+    let table_provider =
+        Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
 
     // Create session context for queries
     let ctx = SessionContext::new();
