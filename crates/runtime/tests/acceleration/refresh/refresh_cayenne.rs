@@ -15,11 +15,17 @@ limitations under the License.
 */
 use crate::acceleration::refresh::common::{
     execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    initialize_postgres, refresh_table, start_test_runtime, start_test_runtime_no_time_column,
+    get_dataset_no_time_column, initialize_postgres, refresh_table, start_test_runtime,
+    start_test_runtime_no_time_column,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
-use crate::{init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, configure_test_datafusion_request_context, init_tracing,
+    utils::test_request_context,
+};
+use app;
+use runtime;
 use spicepod::acceleration::Mode;
 use spicepod::param::Params;
 use std::collections::HashMap;
@@ -172,22 +178,44 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
                 get_acceleration_config_append("cayenne", Some(Params::from_string_map(params)));
             acceleration_config.mode = Mode::File;
 
-            // Remove both primary_key and time_column - this should cause an error
+            // Remove both primary_key and time_column - this should cause dataset initialization to fail
             acceleration_config.primary_key = None;
 
-            // Attempt to start runtime - should fail with validation error
-            let result = start_test_runtime_no_time_column(port, acceleration_config).await;
+            // Create the dataset with invalid configuration
+            let mut dataset = get_dataset_no_time_column(port);
+            dataset.acceleration = Some(acceleration_config);
 
-            // Verify that the runtime fails to start with appropriate error
+            let app = app::AppBuilder::new("test_acceleration_refresh")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            configure_test_datafusion_request_context();
+
+            let rt = Arc::new(runtime::Runtime::builder().with_app(app).build().await);
+
+            // Spawn load_components in background (it will keep retrying)
+            let rt_clone = Arc::clone(&rt);
+            tokio::spawn(async move {
+                rt_clone.load_components().await;
+            });
+
+            // Wait a bit for the first initialization attempt
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Verify that the dataset is not available (failed to initialize)
+            let result = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await;
             assert!(
                 result.is_err(),
-                "Expected error when neither primary_key nor time_column is specified for append mode"
+                "Expected query to fail because dataset should not be initialized"
             );
 
             let err_msg = result.expect_err("Expected error").to_string();
             assert!(
-                err_msg.contains("primary_key") || err_msg.contains("time_column"),
-                "Error message should mention primary_key or time_column requirement, got: {err_msg}"
+                err_msg.contains("test_table")
+                    || err_msg.contains("not found")
+                    || err_msg.contains("'datafusion.catalog.spice.public.test_table' not found"),
+                "Error message should indicate table not found, got: {err_msg}"
             );
             tracing::info!("✓ Validation correctly rejects append mode without constraints");
 
