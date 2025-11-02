@@ -1149,10 +1149,10 @@ impl DataFusion {
         }
 
         // For append mode without time_column, check if source provides append_stream
-        // Skip this check for Pepper which has its own validation (supports primary_key or time_column)
+        // Skip this check for Cayenne which has its own validation (supports primary_key or time_column)
         if refresh_mode == RefreshMode::Append
             && dataset.time_column.is_none()
-            && acceleration_settings.engine != Engine::Pepper
+            && acceleration_settings.engine != Engine::Cayenne
         {
             let append_stream = source.append_stream(source_table_provider);
             if let Some(append_stream) = append_stream {
