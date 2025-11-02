@@ -58,8 +58,10 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::Stream;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    Stream, TryFutureExt,
+    future::{join_all, try_join_all},
+};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
@@ -632,14 +634,11 @@ impl Runtime {
                 cluster::initialize_cluster_scheduler(&self).await?;
                 None
             }
-            Some(ClusterMode::Executor) => Some(
-                self.start_runtime_task(
-                    CLUSTER_EXECUTOR,
-                    None,
-                    cluster::initialize_cluster_executor(Arc::clone(&self)).await?,
-                )
-                .await,
-            ),
+            Some(ClusterMode::Executor) => Some(self.start_runtime_task(
+                CLUSTER_EXECUTOR,
+                None,
+                cluster::initialize_cluster_executor(Arc::clone(&self)).await?,
+            )),
             _ => None,
         };
 
@@ -650,8 +649,8 @@ impl Runtime {
         let cloned_endpoint_auth = endpoint_auth.clone();
         let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
-        let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+        let flight_future =
+            self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
                 flight::start(
                     config.flight_bind_address,
                     cloned_app_ref,
@@ -663,8 +662,7 @@ impl Runtime {
                 )
                 .await
                 .context(UnableToStartFlightServerSnafu)
-            })
-            .await;
+            });
 
         #[cfg(feature = "cluster")]
         // If this is an executor, we only need the shutdown signal and flight server
@@ -684,37 +682,35 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let http_auth = endpoint_auth.http_auth.clone();
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
-        let http_future = self
-            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
-                http::start(
-                    cloned_config.http_bind_address,
-                    self_ref,
-                    cloned_config.into(),
-                    cloned_tls_config,
-                    http_auth,
-                    Some(http_shutdown),
-                )
-                .await
-                .context(UnableToStartHttpServerSnafu)
-            })
-            .await;
+        let http_future = self.start_runtime_task(
+            HTTP_SERVER,
+            Some(http_shutdown.clone()),
+            http::start(
+                cloned_config.http_bind_address,
+                self_ref,
+                cloned_config.into(),
+                cloned_tls_config,
+                auth.clone()
+                    .unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth {})),
+                Some(http_shutdown),
+            )
+            .map_err(Error::from),
+        );
 
         // Start Metrics server
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
 
-        let metrics_future = self
-            .start_runtime_task(METRICS_SERVER, None, async move {
-                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
-                    .await
-                    .context(UnableToStartMetricsServerSnafu)
-            })
-            .await;
+        let metrics_future = self.start_runtime_task(METRICS_SERVER, None, async move {
+            metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
+                .await
+                .context(UnableToStartMetricsServerSnafu)
+        });
 
         // Start OpenTelemetry server
         let opentelemetry_graceful_shutdown = CancellationToken::new();
@@ -722,23 +718,21 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let grpc_auth = endpoint_auth.grpc_auth.clone();
 
-        let opentelemetry_future = self
-            .start_runtime_task(
-                OPENTELEMETRY_SERVER,
-                Some(opentelemetry_graceful_shutdown.clone()),
-                async move {
-                    opentelemetry::start(
-                        config.open_telemetry_bind_address,
-                        df_ref,
-                        cloned_tls_config,
-                        grpc_auth,
-                        Some(opentelemetry_graceful_shutdown),
-                    )
-                    .await
-                    .context(UnableToStartOpenTelemetryServerSnafu)
-                },
-            )
-            .await;
+        let opentelemetry_future = self.start_runtime_task(
+            OPENTELEMETRY_SERVER,
+            Some(opentelemetry_graceful_shutdown.clone()),
+            async move {
+                opentelemetry::start(
+                    config.open_telemetry_bind_address,
+                    df_ref,
+                    cloned_tls_config,
+                    grpc_auth,
+                    Some(opentelemetry_graceful_shutdown),
+                )
+                .await
+                .context(UnableToStartOpenTelemetryServerSnafu)
+            },
+        );
 
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
@@ -753,14 +747,12 @@ impl Runtime {
 
         // Start Spicepod watcher
         let self_ref = Arc::clone(&self);
-        let pods_watcher_future = self
-            .start_runtime_task(PODS_WATCHER, None, async move {
-                self_ref
-                    .start_pods_watcher()
-                    .await
-                    .context(UnableToInitializePodsWatcherSnafu)
-            })
-            .await;
+        let pods_watcher_future = self.start_runtime_task(PODS_WATCHER, None, async move {
+            self_ref
+                .start_pods_watcher()
+                .await
+                .context(UnableToInitializePodsWatcherSnafu)
+        });
 
         // wait for all servers to shut down or if any of the servers fail to start
         match tokio::try_join!(
@@ -929,30 +921,28 @@ impl Runtime {
 
         // Wait for all components to load returning the first error
         // or canceling spawned tokio tasks if the runtime is shutting down
-        let load_result = self
-            .start_runtime_task(
-                COMPONENTS_INITIAL_LOAD,
-                Some(cancel_loading.clone()),
-                async move {
-                    let abort_handlers = components
-                        .iter()
-                        .map(JoinHandle::abort_handle)
-                        .collect::<Vec<_>>();
+        let load_result = self.start_runtime_task(
+            COMPONENTS_INITIAL_LOAD,
+            Some(cancel_loading.clone()),
+            async move {
+                let abort_handlers = components
+                    .iter()
+                    .map(JoinHandle::abort_handle)
+                    .collect::<Vec<_>>();
 
-                    tokio::select! {
-                        load_result = try_join_all(components) => {
-                            load_result.map(|_| ()).context(ComponentsInitializationFailedSnafu)
-                        }
-                        () = cancel_loading.cancelled() => {
-                            for handle in abort_handlers {
-                                handle.abort();
-                            }
-                            ComponentsInitializationCancelledSnafu.fail()
-                        }
+                tokio::select! {
+                    load_result = try_join_all(components) => {
+                        load_result.map(|_| ()).context(ComponentsInitializationFailedSnafu)
                     }
-                },
-            )
-            .await;
+                    () = cancel_loading.cancelled() => {
+                        for handle in abort_handlers {
+                            handle.abort();
+                        }
+                        ComponentsInitializationCancelledSnafu.fail()
+                    }
+                }
+            },
+        );
 
         if let Err(err) = load_result.await {
             if !matches!(err, Error::ComponentsInitializationCancelled) {
@@ -1067,7 +1057,7 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
-    async fn start_runtime_task<F>(
+    fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
@@ -1078,12 +1068,13 @@ impl Runtime {
     {
         let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
 
-        self.tasks
-            .write()
-            .await
-            .insert(component_name.to_string(), handle);
+        let tasks = Arc::clone(&self.tasks);
+        let component_name = component_name.to_string();
 
-        future
+        async move {
+            tasks.write().await.insert(component_name, handle);
+            future.await
+        }
     }
 
     /// List all tools available in the runtime, either within a catalog or standalone.
@@ -1160,4 +1151,17 @@ pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<Path
     base_folder.extend(directory);
     std::fs::create_dir_all(base_folder.clone()).context(UnableToCreateDirectorySnafu)?;
     Ok(base_folder)
+}
+
+impl From<http::Error> for Error {
+    fn from(err: http::Error) -> Self {
+        match err {
+            http::Error::UnableToBindServerToPort { source } => Error::UnableToStartHttpServer {
+                source: http::Error::UnableToBindServerToPort { source },
+            },
+            http::Error::UnableToStartHttpServer { source } => Error::UnableToStartHttpServer {
+                source: http::Error::UnableToStartHttpServer { source },
+            },
+        }
+    }
 }
