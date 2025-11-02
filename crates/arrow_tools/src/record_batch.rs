@@ -276,10 +276,14 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
         ))
     } else {
         // Convert list_params back to named if we have mixed types
+        // IMPORTANT: Preserve the '$' prefix for positional parameters to maintain consistency
+        // with DataFusion's parameter naming convention. DataFusion's SQL parser and parameter
+        // resolution expect positional parameters to be named "$1", "$2", etc.
+        // Mixed mode occurs when we have both "$1" style and "param_name" style parameters.
         if !list_params.is_empty() {
             for (index, value) in list_params {
-                // Use just the number without '$' prefix for mixed parameters
-                named_params.push((index.to_string(), value));
+                // Preserve the '$' prefix format: "$1", "$2", etc.
+                named_params.push((format!("${index}"), value));
             }
         }
         Ok(ParamValues::Map(named_params.into_iter().collect()))
@@ -594,7 +598,8 @@ mod test {
 
         let result = record_to_param_values(&batch).expect("record to param values");
         let mut expected_map = HashMap::new();
-        expected_map.insert("1".to_string(), ScalarValue::Int32(Some(10)));
+        // Preserve the '$' prefix for positional parameters in mixed mode
+        expected_map.insert("$1".to_string(), ScalarValue::Int32(Some(10)));
         expected_map.insert(
             "param2".to_string(),
             ScalarValue::Utf8(Some("test".to_string())),

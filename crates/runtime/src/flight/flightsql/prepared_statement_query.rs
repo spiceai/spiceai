@@ -289,11 +289,10 @@ pub(crate) async fn do_put_query(
             },
         }
     }
-    let parameters = bound_parameters;
 
     let mut stmt: PreparedStatement =
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
-    stmt.parameters = parameters;
+    stmt.parameters = bound_parameters;
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     let result = DoPutPreparedStatementResult {
