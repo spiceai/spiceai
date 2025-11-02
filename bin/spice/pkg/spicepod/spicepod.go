@@ -29,7 +29,8 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 	fs, err := os.Stat(name)
 	if err != nil {
 		if os.IsNotExist(err) && spicepodDir != "." {
-			err = os.Mkdir(name, 0766)
+			// Use 0755 (rwxr-xr-x) instead of 0766 to prevent world-writable directories
+			err = os.Mkdir(name, 0755)
 			if err != nil {
 				return "", fmt.Errorf("error creating directory: %w", err)
 			}
