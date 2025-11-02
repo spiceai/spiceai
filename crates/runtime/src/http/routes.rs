@@ -59,7 +59,7 @@ use super::{metrics, v1};
 use axum::{
     Extension,
     body::Body,
-    extract::MatchedPath,
+    extract::{DefaultBodyLimit, MatchedPath},
     http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
@@ -194,6 +194,11 @@ pub(crate) fn routes(
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
 ) -> Router {
+    // Set a reasonable request body size limit to prevent DoS attacks through memory exhaustion
+    // 16MB is sufficient for most legitimate requests including large SQL queries, JSON payloads,
+    // and embeddings, while preventing abuse
+    const MAX_BODY_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
         .route("/v1/status", get(v1::status::get))
@@ -311,6 +316,7 @@ pub(crate) fn routes(
         ))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
 }
 
 async fn track_metrics(

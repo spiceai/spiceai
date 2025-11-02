@@ -71,34 +71,45 @@ func ExtractZip(body []byte, downloadDir string) error {
 	}
 
 	for _, file := range zipReader.File {
+		cleanName := filepath.Clean(file.Name)
+		if err := SanitizeExtractPath(cleanName, downloadDir); err != nil {
+			return err
+		}
+
+		targetPath := filepath.Join(downloadDir, cleanName)
+
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return err
+		}
+
 		reader, err := file.Open()
 		if err != nil {
 			return err
 		}
-
 		defer func() {
 			if err := reader.Close(); err != nil {
 				slog.Error("failed to close reader", "error", err)
 			}
 		}()
 
-		fileName := file.FileInfo().Name()
-
-		fileToWrite := filepath.Join(downloadDir, fileName)
-
-		newFile, err := os.Create(fileToWrite)
+		newFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, file.Mode().Perm())
 		if err != nil {
 			return err
 		}
-
 		defer func() {
 			if err := newFile.Close(); err != nil {
 				slog.Error("failed to close file", "error", err)
 			}
 		}()
 
-		_, err = io.Copy(newFile, reader)
-		if err != nil {
+		if _, err := io.Copy(newFile, reader); err != nil {
 			return err
 		}
 	}
