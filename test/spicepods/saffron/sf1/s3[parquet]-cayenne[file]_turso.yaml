@@ -1,0 +1,27 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]_turso
+
+datasets:
+  - from: s3://benchmarks/saffron/number_info_sf1
+    name: number_info
+    time_column: DateCreated
+    time_format: timestamp
+    params: &params_s3
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration: &acceleration_params
+      enabled: true
+      engine: cayenne
+      mode: file
+      params:
+        cayenne_metastore: turso
+
+  - from: s3://benchmarks/saffron/number_caps_sf1
+    name: number_caps
+    params: *params_s3
+    acceleration: *acceleration_params

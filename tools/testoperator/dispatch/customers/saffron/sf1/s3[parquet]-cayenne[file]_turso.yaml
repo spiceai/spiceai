@@ -1,0 +1,14 @@
+tests:
+  bench:
+    spicepod_path: s3[parquet]-cayenne[file]_turso.yaml
+    query_set: saffron[parameterized]
+    ready_wait: 300
+    runner_type: spicehq-dev-runners
+  load:
+    spicepod_path: s3[parquet]-cayenne[file]_turso.yaml
+    query_set: saffron[parameterized]
+    ready_wait: 300
+    runner_type: spicehq-dev-runners
+    concurrency: 128
+    duration: 1800
+    random_param_set_count: 1000
