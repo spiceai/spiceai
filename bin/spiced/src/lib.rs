@@ -200,9 +200,6 @@ pub async fn run(args: Args) -> Result<()> {
             // In pods watcher mode, allow runtime to start without a valid spicepod
             // It will load the spicepod when it becomes available
             if args.pods_watcher_enabled && args.spicepod.is_none() {
-                eprintln!(
-                    "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided."
-                );
                 spicepod_load_error = Some(e);
                 None
             } else {
