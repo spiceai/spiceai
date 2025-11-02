@@ -128,7 +128,8 @@ FROM scratch
 
 COPY --from=sandbox-setup /spice_sandbox/ /
 
-USER 65534:65534
+RUN groupadd -r spiced && useradd -r -g spiced spiced
+USER spiced
 
 EXPOSE 8090 50051
 

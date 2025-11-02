@@ -59,7 +59,7 @@ pub(crate) async fn start<A>(
     rt: Arc<Runtime>,
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
-    auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
+    auth_provider: Arc<dyn HttpAuth + Send + Sync>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()>
 where
@@ -78,7 +78,7 @@ where
         &rt,
         config,
         vsearch,
-        auth_provider.map(AuthLayer::new),
+        Some(AuthLayer::new(auth_provider)),
         &cors_config,
     );
     drop(app);

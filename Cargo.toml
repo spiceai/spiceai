@@ -79,9 +79,7 @@ arrow-ipc = "56.0.0"
 arrow-json = "56.0.0"
 arrow-odbc = "18"
 arrow-schema = "56.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "ec48de2d31ecc021a1962c629199ca11cf645fab", features = [
-    "byot",
-] }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "ec48de2d31ecc021a1962c629199ca11cf645fab" }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
 aws-config = "1.8.8"
@@ -176,7 +174,7 @@ mongodb = { version = "3.3.0", features = ["openssl-tls"] }
 mysql_async = { version = "0.35.1", features = ["native-tls-tls", "chrono"] }
 num_cpus = "1.16"
 object_store = { version = "0.12", features = ["aws", "gcp", "azure", "http"] }
-odbc-api = { version = "13" }
+odbc-api = { version = "14" }
 opentelemetry = { version = "0.27", default-features = false, features = [
     "metrics",
     "trace",
