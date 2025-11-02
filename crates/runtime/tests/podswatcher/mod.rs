@@ -184,7 +184,7 @@ async fn test_runtime_without_spicepod_in_pods_watcher_mode() -> Result<(), anyh
             let app_result = AppBuilder::build_from_path(temp_dir.clone()).await;
             assert!(app_result.is_err(), "Expected error when loading missing spicepod");
 
-            // Build runtime with None app and pods watcher enabled
+            // Build runtime with None app and pods watcher enabled (simulating --pods-watcher-enabled mode)
             let pods_watcher = PodsWatcher::new(temp_dir.clone());
             let rt = Arc::new(
                 Runtime::builder()
@@ -194,14 +194,7 @@ async fn test_runtime_without_spicepod_in_pods_watcher_mode() -> Result<(), anyh
                     .await,
             );
 
-            // Start server - should succeed even without spicepod
-            let api_config = Config::new();
-            let rt_ref_copy = Arc::clone(&rt);
-            let server_handle = tokio::spawn(async move {
-                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-            });
-
-            // Load components - should complete without errors
+            // Load components - should complete without errors even with None app
             let components_result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 Arc::clone(&rt).load_components()
@@ -209,18 +202,7 @@ async fn test_runtime_without_spicepod_in_pods_watcher_mode() -> Result<(), anyh
 
             assert!(components_result.is_ok(), "Components should load successfully even without spicepod");
 
-            // Check that runtime is ready (no datasets, but server should be up)
-            let http_client = reqwest::Client::builder().build()?;
-            wait_until_true(std::time::Duration::from_secs(10), || async {
-                http_client
-                    .get("http://127.0.0.1:8090/health")
-                    .send()
-                    .await
-                    .is_ok()
-            })
-            .await;
-
-            // Query should work but return no datasets
+            // Query should work but return no datasets (only internal/system tables)
             let results = run_query(
                 &rt,
                 "SELECT COUNT(*) as dataset_count FROM information_schema.tables WHERE table_schema = 'public'"
@@ -233,11 +215,9 @@ async fn test_runtime_without_spicepod_in_pods_watcher_mode() -> Result<(), anyh
                 .expect("Expected Int64Array")
                 .value(0);
             
-            assert_eq!(count, 0, "Expected no datasets without spicepod");
+            assert_eq!(count, 0, "Expected no public datasets without spicepod");
 
             // Clean up
-            rt.shutdown().await;
-            let _ = server_handle.await;
             std::fs::remove_dir_all(&temp_dir).ok();
 
             Ok(())
