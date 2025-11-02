@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
@@ -94,7 +95,9 @@ func (s *SpiceApiClient) GetAuthContext(accessToken string, orgName *string, app
 
 	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return spiceAuthContext, err
@@ -137,7 +140,9 @@ func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, err
 	}
 	request.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return authStatusResponse, err
