@@ -32,6 +32,7 @@ use regex::Regex;
 
 #[async_trait]
 impl ModelSource for SpiceAI {
+    #[allow(clippy::too_many_lines)]
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")
@@ -94,7 +95,14 @@ impl ModelSource for SpiceAI {
             _ => caps["version"].to_string(),
         };
 
-        match version.as_str() {
+        // Sanitize version to prevent path traversal (e.g., "../../etc")
+        let sanitized_version = util::security::sanitize_filename(&version).map_err(|reason| {
+            super::Error::UnableToLoadConfig {
+                reason: format!("Invalid version in path: {reason}"),
+            }
+        })?;
+
+        match sanitized_version.as_str() {
             "latest" => {}
             _ => {
                 let _ = write!(url, "?training_run_id={version}");
@@ -129,7 +137,7 @@ impl ModelSource for SpiceAI {
             .clone()
             .context(super::UnableToParseMetadataSnafu {})?;
 
-        let versioned_path = format!("{local_path}/{version}");
+        let versioned_path = format!("{local_path}/{sanitized_version}");
         let file_name = format!("{versioned_path}/model.onnx");
 
         if std::fs::metadata(file_name.clone()).is_ok() {
@@ -143,10 +151,18 @@ impl ModelSource for SpiceAI {
             .await
             .context(super::UnableToFetchModelSnafu {})?;
 
+        let bytes = response
+            .bytes()
+            .await
+            .context(super::UnableToFetchModelSnafu)?;
+
+        util::security::validate_non_empty_bytes(&bytes, "model.onnx")
+            .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
+
         std::fs::create_dir_all(versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
         let mut file = std::fs::File::create(file_name.clone())
             .context(super::UnableToCreateModelPathSnafu {})?;
-        let mut content = Cursor::new(response.bytes().await.unwrap_or_default());
+        let mut content = Cursor::new(bytes);
         std::io::copy(&mut content, &mut file).context(super::UnableToCreateModelPathSnafu {})?;
 
         Ok(file_name)

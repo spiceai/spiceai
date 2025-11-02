@@ -28,6 +28,7 @@ pub struct Huggingface {}
 
 #[async_trait]
 impl ModelSource for Huggingface {
+    #[allow(clippy::too_many_lines)]
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")
@@ -81,7 +82,15 @@ impl ModelSource for Huggingface {
             _ => caps["revision"].to_string(),
         };
 
-        let versioned_path = format!("{local_path}/{revision}");
+        // Sanitize revision to prevent path traversal (e.g., "../../../etc")
+        let sanitized_revision =
+            util::security::sanitize_filename(&revision).map_err(|reason| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!("Invalid revision in path: {reason}"),
+                }
+            })?;
+
+        let versioned_path = format!("{local_path}/{sanitized_revision}");
 
         let mut onnx_file_name = String::new();
 
@@ -91,7 +100,14 @@ impl ModelSource for Huggingface {
         let p = versioned_path.clone();
 
         for file in files {
-            let file_name = format!("{p}/{file}");
+            // Sanitize file name to prevent path traversal attacks
+            let sanitized_file = util::security::sanitize_filename(&file).map_err(|reason| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!("Invalid file name in files parameter: {reason}"),
+                }
+            })?;
+
+            let file_name = format!("{p}/{sanitized_file}");
 
             if std::fs::metadata(file_name.clone()).is_ok() {
                 tracing::info!("File already exists: {}, skipping download", file_name);
@@ -109,7 +125,7 @@ impl ModelSource for Huggingface {
 
             tracing::info!("Downloading model: {}", download_url);
 
-            if file.to_lowercase().ends_with(".onnx") {
+            if sanitized_file.to_lowercase().ends_with(".onnx") {
                 onnx_file_name.clone_from(&file_name);
             }
 
@@ -131,9 +147,17 @@ impl ModelSource for Huggingface {
                 return Err(Error::UnableToDownloadModelFile {});
             }
 
+            let bytes = response
+                .bytes()
+                .await
+                .context(super::UnableToFetchModelSnafu)?;
+
+            util::security::validate_non_empty_bytes(&bytes, &sanitized_file)
+                .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
+
             let mut file = std::fs::File::create(file_name.clone())
                 .context(super::UnableToCreateModelPathSnafu {})?;
-            let mut content = Cursor::new(response.bytes().await.unwrap_or_default());
+            let mut content = Cursor::new(bytes);
             std::io::copy(&mut content, &mut file)
                 .context(super::UnableToCreateModelPathSnafu {})?;
 

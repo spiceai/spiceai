@@ -27,6 +27,7 @@ spicepod = { path = "../spicepod" }
 tracing.workspace = true
 tract-core = "0.22.0"
 tract-onnx = "0.22.0"
+util = { path = "../util" }
 
 [features]
 dev = []
