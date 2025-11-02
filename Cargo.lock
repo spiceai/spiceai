@@ -2943,6 +2943,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "cayenne"
+version = "0.1.0"
+dependencies = [
+ "aegis",
+ "arrow",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "criterion 0.5.1",
+ "data_components",
+ "datafusion",
+ "datafusion-catalog",
+ "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-physical-expr",
+ "datafusion-physical-plan",
+ "futures",
+ "paste",
+ "rusqlite",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "turso",
+ "uuid 1.18.1",
+ "vortex-datafusion",
+]
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11078,43 +11115,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pepper"
-version = "0.1.0"
-dependencies = [
- "aegis",
- "arrow",
- "arrow-flight",
- "arrow-ipc",
- "arrow-schema",
- "async-stream",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "criterion 0.5.1",
- "data_components",
- "datafusion",
- "datafusion-catalog",
- "datafusion-common",
- "datafusion-datasource",
- "datafusion-execution",
- "datafusion-expr",
- "datafusion-physical-expr",
- "datafusion-physical-plan",
- "futures",
- "paste",
- "rusqlite",
- "serde_json",
- "snafu",
- "tempfile",
- "tokio",
- "tracing",
- "turso",
- "uuid 1.18.1",
- "vortex-datafusion",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12967,6 +12967,7 @@ dependencies = [
  "byte-unit",
  "bytes",
  "cache",
+ "cayenne",
  "chrono",
  "chunking",
  "clap",
@@ -13030,7 +13031,6 @@ dependencies = [
  "otel-arrow",
  "package",
  "paste",
- "pepper",
  "percent-encoding",
  "pin-project",
  "postcard",
