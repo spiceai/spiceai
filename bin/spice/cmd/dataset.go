@@ -173,14 +173,16 @@ spice dataset configure
 		}
 
 		dirPath := fmt.Sprintf("datasets/%s", dataset.Name)
-		err = os.MkdirAll(dirPath, 0766)
+		// Use 0755 (rwxr-xr-x) instead of 0766 to prevent world-writable directories
+		err = os.MkdirAll(dirPath, 0755)
 		if err != nil {
 			slog.Error("creating dataset directory", "error", err)
 			os.Exit(1)
 		}
 
 		filePath := fmt.Sprintf("%s/dataset.yaml", dirPath)
-		err = os.WriteFile(filePath, datasetBytes, 0766)
+		// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
+		err = os.WriteFile(filePath, datasetBytes, 0644)
 		if err != nil {
 			slog.Error(fmt.Sprintf("writing dataset file to %s", filePath), "error", err)
 			os.Exit(1)
@@ -217,7 +219,8 @@ spice dataset configure
 				os.Exit(1)
 			}
 
-			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
+			// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
+			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0644)
 			if err != nil {
 				slog.Error("writing spicepod.yaml", "error", err)
 				os.Exit(1)

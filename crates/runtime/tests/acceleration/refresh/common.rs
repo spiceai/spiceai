@@ -153,6 +153,7 @@ pub(crate) async fn start_test_runtime(
     start_test_runtime_with_dataset(port, acceleration, get_dataset(port)).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn start_test_runtime_no_time_column(
     port: usize,
     acceleration: Acceleration,

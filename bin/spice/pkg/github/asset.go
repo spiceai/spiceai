@@ -74,6 +74,7 @@ func DownloadReleaseAsset(gh *GitHubClient, release *RepoRelease, assetName stri
 		return util.ExtractTarGz(body, downloadDir)
 	default:
 		filePath := filepath.Join(downloadDir, assetName)
-		return os.WriteFile(filePath, body, 0766)
+		// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
+		return os.WriteFile(filePath, body, 0644)
 	}
 }
