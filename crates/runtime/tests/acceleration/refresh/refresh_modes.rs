@@ -222,25 +222,25 @@ async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow:
     test_refresh_full_for_engine("postgres").await
 }
 
-// Pepper (not available on Windows)
-// Note: Pepper requires mode: file in addition to refresh_mode: append/full.
+// Cayenne (not available on Windows)
+// Note: Cayenne requires mode: file in addition to refresh_mode: append/full.
 // These tests need custom helpers that set both mode and refresh_mode.
 #[cfg(not(windows))]
 #[tokio::test]
-#[ignore = "Pepper requires mode: file which is not set by the generic test helpers"]
-async fn test_acceleration_refresh_pepper_append_variant() {
+#[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
+async fn test_acceleration_refresh_cayenne_append_variant() {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("pepper")
+    test_refresh_append_for_engine("cayenne")
         .await
         .expect("Test should pass when mode: file is properly configured");
 }
 
 #[cfg(not(windows))]
 #[tokio::test]
-#[ignore = "Pepper requires mode: file which is not set by the generic test helpers"]
-async fn test_acceleration_refresh_pepper_full_variant() {
+#[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
+async fn test_acceleration_refresh_cayenne_full_variant() {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("pepper")
+    test_refresh_full_for_engine("cayenne")
         .await
         .expect("Test should pass when mode: file is properly configured");
 }
