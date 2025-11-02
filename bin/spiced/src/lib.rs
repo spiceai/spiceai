@@ -45,7 +45,6 @@ use spiced_tracing::LogVerbosity;
 use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use util::in_tracing_context;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -53,7 +52,7 @@ mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to construct spice app: {source}"))]
+    #[snafu(display("Failed to start Spice runtime: {source}"))]
     UnableToConstructSpiceApp { source: Box<app::Error> },
 
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
@@ -191,42 +190,37 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
-    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
+    let app: Arc<App> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-            Some(Arc::new(app))
+            Arc::new(app)
         }
         Err(e) => {
-            in_tracing_context(|| {
-                tracing::warn!("{e}");
+            return Err(Error::UnableToConstructSpiceApp {
+                source: Box::new(e),
             });
-            None
         }
     };
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
-    if let Some(app) = &app
-        && let Some(manifest) = app.extensions.get("spice_cloud")
-    {
+    if let Some(manifest) = app.extensions.get("spice_cloud") {
         let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
         extension_factories.push(Box::new(spice_extension_factory));
     }
     #[cfg(feature = "tpc-extension")]
-    if let Some(app) = &app
-        && let Some(manifest) = app.extensions.get("tpc")
-    {
+    if let Some(manifest) = app.extensions.get("tpc") {
         let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
         extension_factories.push(Box::new(tpc_extension_factory));
     }
 
-    let runtime_config = app.as_ref().map(|app| &app.runtime);
-    let app_name = app.as_ref().map(|app| app.name.clone());
-    let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
-    let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
-    let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
+    let runtime_config = &app.runtime;
+    let app_name = app.name.clone();
+    let spicepod_tls_config = runtime_config.tls.clone();
+    let tracing_config = runtime_config.tracing.clone();
+    let telemetry_config = runtime_config.telemetry.clone();
 
     let mut builder = Runtime::builder()
-        .with_app_opt(app.clone())
+        .with_app_opt(Some(app.clone()))
         // User configured extensions
         .with_extensions(extension_factories)
         // Extensions that will be auto-loaded if not explicitly loaded and requested by a component
@@ -247,21 +241,23 @@ pub async fn run(args: Args) -> Result<()> {
     let rt = builder.build().await;
 
     spiced_tracing::init_tracing(
-        app.as_ref(),
+        Some(&app),
         tracing_config.as_ref(),
         rt.datafusion(),
         LogVerbosity::from_flags_and_env_and_config(
             args.verbose == 1,                      // -v or --verbose
             args.verbose >= 2 || args.very_verbose, // -vv or --very-verbose
             "SPICED_LOG",
-            app.as_ref().and_then(|a| a.runtime.output_level),
+            app.runtime.output_level,
         ),
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;
 
     // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
-    match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
+    match App::get_runtime_param_opt::<String>(&Some(app.clone()), "dedicated_thread_pool")
+        .as_deref()
+    {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
             let tokio_runtime = ManagedTokioRuntime::try_new()
@@ -290,15 +286,12 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .context(UnableToInitializeTlsSnafu)?;
 
-    start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
+    start_anonymous_telemetry(&args, Some(&telemetry_config), Some(&app_name)).await;
 
     let rt = Arc::new(rt);
 
     let cloned_rt = Arc::clone(&rt);
-    let endpoint_auth = match app.as_ref() {
-        Some(app) => EndpointAuth::new(rt.secrets(), app).await,
-        None => EndpointAuth::no_auth(),
-    };
+    let endpoint_auth = EndpointAuth::new(rt.secrets(), &app).await;
 
     let server_thread = tokio::spawn(async move {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
