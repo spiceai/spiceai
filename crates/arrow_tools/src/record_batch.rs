@@ -224,39 +224,65 @@ pub fn truncate_numeric_column_length(
 /// # Errors
 /// Returns an error when a value in an array cannot be converted into a scalar.
 pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusionError> {
-    let mut param_values: Vec<(String, Option<usize>, ScalarValue)> = Vec::new();
+    let num_columns = batch.num_columns();
 
+    // Fast path: empty batch
+    if num_columns == 0 {
+        return Ok(ParamValues::List(Vec::new()));
+    }
+
+    let schema = batch.schema_ref();
+
+    // Pre-allocate with exact capacity to avoid reallocation
+    let mut list_params: Vec<(usize, ScalarValue)> = Vec::with_capacity(num_columns);
+    let mut named_params: Vec<(String, ScalarValue)> = Vec::with_capacity(num_columns);
     let mut is_list = true;
-    for col_index in 0..batch.num_columns() {
+    let mut needs_sort = false;
+    let mut prev_index = 0usize;
+    let mut has_prev_index = false;
+
+    // Single pass: determine type and collect values simultaneously
+    for col_index in 0..num_columns {
         let array = batch.column(col_index);
         let scalar = ScalarValue::try_from_array(array, 0)?;
-        let name = batch
-            .schema_ref()
-            .field(col_index)
-            .name()
-            .trim_start_matches('$')
-            .to_string();
-        let index = name.parse().ok();
-        is_list &= index.is_some();
-        param_values.push((name, index, scalar));
+        let name = schema.field(col_index).name();
+
+        // Check if name starts with '$' and parse index - avoid allocations
+        if let Some(stripped) = name.strip_prefix('$')
+            && let Ok(index) = stripped.parse::<usize>()
+        {
+            if has_prev_index && index < prev_index {
+                needs_sort = true;
+            }
+            prev_index = index;
+            has_prev_index = true;
+            list_params.push((index, scalar));
+            continue;
+        }
+
+        // Not a numbered parameter - switch to named mode
+        is_list = false;
+        named_params.push((name.to_string(), scalar));
     }
-    if is_list {
-        let mut values: Vec<(Option<usize>, ScalarValue)> = param_values
-            .into_iter()
-            .map(|(_name, index, value)| (index, value))
-            .collect();
-        values.sort_by_key(|(index, _value)| *index);
-        Ok(values
-            .into_iter()
-            .map(|(_index, value)| value)
-            .collect::<Vec<ScalarValue>>()
-            .into())
+
+    if is_list && !list_params.is_empty() {
+        if needs_sort {
+            list_params.sort_unstable_by_key(|(index, _)| *index);
+        }
+
+        // Extract just the values (compiler can optimize this to a move)
+        Ok(ParamValues::List(
+            list_params.into_iter().map(|(_, value)| value).collect(),
+        ))
     } else {
-        Ok(param_values
-            .into_iter()
-            .map(|(name, _index, value)| (name, value))
-            .collect::<Vec<(String, ScalarValue)>>()
-            .into())
+        // Convert list_params back to named if we have mixed types
+        if !list_params.is_empty() {
+            for (index, value) in list_params {
+                // Use just the number without '$' prefix for mixed parameters
+                named_params.push((index.to_string(), value));
+            }
+        }
+        Ok(ParamValues::Map(named_params.into_iter().collect()))
     }
 }
 
