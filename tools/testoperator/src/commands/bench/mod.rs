@@ -47,7 +47,7 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
                 && accel.enabled
                 && matches!(
                     accel.engine.as_deref(),
-                    Some("sqlite" | "duckdb" | "pepper")
+                    Some("sqlite" | "duckdb" | "cayenne")
                 )
         })
     }) {
