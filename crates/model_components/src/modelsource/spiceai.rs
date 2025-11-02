@@ -25,8 +25,10 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::Cursor;
+use std::path::Path;
 use std::string::ToString;
 use std::sync::Arc;
+use std::time::Duration;
 
 use regex::Regex;
 
@@ -109,7 +111,11 @@ impl ModelSource for SpiceAI {
             }
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
+            .build()
+            .context(super::UnableToFetchModelSnafu)?;
         let data: ModelRoot = client
             .get(url)
             .bearer_auth(
@@ -140,9 +146,12 @@ impl ModelSource for SpiceAI {
         let versioned_path = format!("{local_path}/{sanitized_version}");
         let file_name = format!("{versioned_path}/model.onnx");
 
-        if std::fs::metadata(file_name.clone()).is_ok() {
-            tracing::debug!("File already exists: {file_name}, skipping download");
-            return Ok(file_name);
+        if std::fs::metadata(&file_path).is_ok() {
+            tracing::debug!(
+                "File already exists: {}, skipping download",
+                file_path.display()
+            );
+            return Ok(file_path.to_string_lossy().into_owned());
         }
 
         let response = client
@@ -165,7 +174,7 @@ impl ModelSource for SpiceAI {
         let mut content = Cursor::new(bytes);
         std::io::copy(&mut content, &mut file).context(super::UnableToCreateModelPathSnafu {})?;
 
-        Ok(file_name)
+        Ok(file_path.to_string_lossy().into_owned())
     }
 }
 

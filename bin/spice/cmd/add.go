@@ -137,7 +137,8 @@ func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []str
 				os.Exit(1)
 			}
 
-			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
+			// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
+			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0644)
 			if err != nil {
 				slog.Error("writing spicepod.yaml with dependencies", "error", err)
 				os.Exit(1)

@@ -32,7 +32,7 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
 };
-use std::{any::Any, path::Path, sync::Arc};
+use std::{any::Any, path::Path, sync::Arc, time::Duration};
 use token_provider::TokenProvider;
 use util::ExponentialBackoff;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
@@ -308,14 +308,20 @@ where
 }
 
 impl GithubRestClient {
-    #[must_use]
-    pub fn new(token: Arc<dyn TokenProvider>, rate_limiter: Arc<dyn RateLimiter>) -> Self {
-        let client = reqwest::Client::new();
-        GithubRestClient {
+    pub fn new(
+        token: Arc<dyn TokenProvider>,
+        rate_limiter: Arc<dyn RateLimiter>,
+    ) -> reqwest::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()?;
+
+        Ok(GithubRestClient {
             client,
             token,
             rate_limiter,
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
