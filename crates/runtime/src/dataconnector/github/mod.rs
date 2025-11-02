@@ -54,7 +54,7 @@ use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
+use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
@@ -239,7 +239,15 @@ impl Github {
                 return Ok(()); // If no endpoint, skip this validation
             };
 
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|err| {
+                    format!(
+                        "Failed to create GitHub HTTP client while validating installation access: {err}"
+                    )
+                })?;
 
             // Check if the installation has access to this specific resource type
             let validation_url = if let Some(repo) = repo {
@@ -402,10 +410,11 @@ impl Github {
             .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
         match token {
-            Some(token) => Ok(GithubRestClient::new(
+            Some(token) => GithubRestClient::new(
                 token,
                 Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>,
-            )),
+            )
+            .map_err(Into::into),
             None => Err("Github token not provided".into()),
         }
     }

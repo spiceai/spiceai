@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::TimeZone;
@@ -162,7 +162,18 @@ impl ObjectStore for GitHubRawObjectStore {
         let config = Arc::clone(&self.config);
 
         Box::pin(async_stream::stream! {
-            let gh_rest_api = GithubRestClient::new(config.token.as_deref());
+            let gh_rest_api = match GithubRestClient::new(config.token.as_deref()) {
+                Ok(client) => client,
+                Err(err) => {
+                    yield Err(object_store::Error::Generic {
+                        store: "GitHubRawObjectStore",
+                        source: Box::new(std::io::Error::other(format!(
+                            "Failed to create GitHub client: {err}"
+                        ))),
+                    });
+                    return;
+                }
+            };
             let git_tree = match gh_rest_api.fetch_git_tree(&config.org, &config.repo, &config.rev).await {
                 Ok(tree) => tree,
                 Err(e) => {
@@ -236,12 +247,16 @@ pub struct GithubRestClient {
 }
 
 impl GithubRestClient {
-    #[must_use]
-    pub fn new(token: Option<&str>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    pub fn new(token: Option<&str>) -> reqwest::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()?;
+
+        Ok(Self {
+            client,
             token: token.map(ToString::to_string),
-        }
+        })
     }
 
     async fn fetch_git_tree(

@@ -209,7 +209,11 @@ async fn generate_token(
     let jwt_token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
         .context(UnableToGenerateJWTSnafu {})?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
     let response = client
         .post(format!(
