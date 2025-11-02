@@ -18,3 +18,4 @@ tracing = { workspace = true }
 tracing-subscriber.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
+datafusion.workspace = true

@@ -93,13 +93,36 @@ impl ModelSource for Huggingface {
             _ => caps["revision"].to_string(),
         };
 
-        let versioned_path = local_path.join(&revision);
+        // Sanitize revision to prevent path traversal (e.g., "../../../etc")
+        let sanitized_revision =
+            util::security::sanitize_filename(&revision).map_err(|reason| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!("Invalid revision in path: {reason}"),
+                }
+            })?;
+
+        let versioned_path = format!("{local_path}/{sanitized_revision}");
 
         let mut onnx_file_name = String::new();
 
         std::fs::create_dir_all(&versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
 
         for file in files {
+            // Sanitize file name to prevent path traversal attacks
+            let sanitized_file = util::security::sanitize_filename(&file).map_err(|reason| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!("Invalid file name in files parameter: {reason}"),
+                }
+            })?;
+
+            let file_name = format!("{p}/{sanitized_file}");
+
+            if std::fs::metadata(file_name.clone()).is_ok() {
+                tracing::info!("File already exists: {}, skipping download", file_name);
+
+                continue;
+            }
+
             let download_url = format!(
                 "https://huggingface.co/{}/{}/resolve/{}/{}",
                 caps["org"].to_owned(),
@@ -121,8 +144,8 @@ impl ModelSource for Huggingface {
 
             tracing::info!("Downloading model: {}", download_url);
 
-            if file.to_lowercase().ends_with(".onnx") {
-                onnx_file_name = file_path.to_string_lossy().into_owned();
+            if sanitized_file.to_lowercase().ends_with(".onnx") {
+                onnx_file_name.clone_from(&file_name);
             }
 
             let client = reqwest::Client::builder()
@@ -147,18 +170,18 @@ impl ModelSource for Huggingface {
                 return Err(Error::UnableToDownloadModelFile {});
             }
 
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent).context(super::UnableToCreateModelPathSnafu {})?;
-            }
-
-            let mut file_handle = std::fs::File::create(&file_path)
-                .context(super::UnableToCreateModelPathSnafu {})?;
             let bytes = response
                 .bytes()
                 .await
-                .context(super::UnableToFetchModelSnafu {})?;
+                .context(super::UnableToFetchModelSnafu)?;
+
+            util::security::validate_non_empty_bytes(&bytes, &sanitized_file)
+                .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
+
+            let mut file = std::fs::File::create(file_name.clone())
+                .context(super::UnableToCreateModelPathSnafu {})?;
             let mut content = Cursor::new(bytes);
-            std::io::copy(&mut content, &mut file_handle)
+            std::io::copy(&mut content, &mut file)
                 .context(super::UnableToCreateModelPathSnafu {})?;
 
             tracing::info!("Downloaded: {}", file_path.display());
