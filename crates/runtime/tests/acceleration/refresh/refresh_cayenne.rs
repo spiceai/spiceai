@@ -16,7 +16,6 @@ limitations under the License.
 use crate::acceleration::refresh::common::{
     execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
     get_dataset_no_time_column, initialize_postgres, refresh_table, start_test_runtime,
-    start_test_runtime_no_time_column,
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
@@ -24,8 +23,6 @@ use crate::{
     configure_test_datafusion, configure_test_datafusion_request_context, init_tracing,
     utils::test_request_context,
 };
-use app;
-use runtime;
 use spicepod::acceleration::Mode;
 use spicepod::param::Params;
 use std::collections::HashMap;
