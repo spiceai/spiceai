@@ -359,6 +359,7 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 
             kubernetes_secret_store
                 .init()
+                .await
                 .context(UnableToLoadSecretsSnafu)?;
 
             Ok(Arc::new(kubernetes_secret_store) as Arc<dyn SecretStore>)
