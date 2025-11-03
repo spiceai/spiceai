@@ -1520,6 +1520,8 @@ mod tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::context::SessionContext;
     use datafusion_catalog::TableProvider;
     use futures::future::join_all;
@@ -1566,7 +1568,8 @@ mod tests {
 
         // Create provider and insert test data
         let ctx = SessionContext::new();
-        let catalog_trait: Arc<dyn MetadataCatalog> = catalog.clone();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
         let provider = CayenneTableProvider::new(table_name, catalog_trait)
             .await
             .expect("Failed to create CayenneTableProvider instance");
@@ -1589,8 +1592,6 @@ mod tests {
         .expect("Failed to create RecordBatch with test data");
 
         // Create a memory exec plan from the batch
-        use datafusion::datasource::memory::MemorySourceConfig;
-        use datafusion::datasource::source::DataSourceExec;
         let mem_config = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
             .expect("Failed to create MemorySourceConfig from test data");
         let mem_exec = DataSourceExec::new(Arc::new(mem_config));
@@ -1662,7 +1663,7 @@ mod tests {
                         .await
                         .expect("Failed to collect scan results in concurrent reader");
 
-                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
                     total_rows += row_count;
 
                     if query_num == 0 {
@@ -1690,11 +1691,10 @@ mod tests {
                     assert_eq!(
                         *total_rows,
                         1000 * num_queries_per_reader,
-                        "Reader {} read incorrect number of rows",
-                        idx
+                        "Reader {idx} read incorrect number of rows"
                     );
                 }
-                Err(e) => panic!("Reader {} failed: {}", idx, e),
+                Err(e) => panic!("Reader {idx} failed: {e}"),
             }
         }
 
@@ -1767,10 +1767,11 @@ mod tests {
                         .expect("Failed to downcast count column to Int64Array")
                         .value(0);
 
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let count_usize = count as usize;
                     assert_eq!(
-                        count as usize, *expected_count,
-                        "Reader {} query '{}' returned incorrect count",
-                        reader_id, query
+                        count_usize, *expected_count,
+                        "Reader {reader_id} query '{query}' returned incorrect count"
                     );
                 }
 
@@ -1853,11 +1854,10 @@ mod tests {
                         .await
                         .expect("Failed to collect projection query results");
 
-                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
                     assert_eq!(
                         row_count, 1000,
-                        "Reader {} query '{}' returned incorrect row count",
-                        reader_id, query
+                        "Reader {reader_id} query '{query}' returned incorrect row count"
                     );
                 }
 
@@ -1930,8 +1930,8 @@ mod tests {
                         .await
                         .expect("Failed to collect scan results in stress test");
 
-                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    assert_eq!(row_count, 1000, "Reader {} got wrong row count", reader_id);
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(row_count, 1000, "Reader {reader_id} got wrong row count");
                 }
 
                 reader_id

@@ -779,8 +779,6 @@ mod accelerator_compat_tests {
         }
     }
 
-    /// Mock acceleration source for testing
-
     /// Helper function to construct mode label with optional timestamp format
     fn make_mode_label(mode: &str, timestamp_format: Option<&str>) -> String {
         if let Some(ts_fmt) = timestamp_format {
