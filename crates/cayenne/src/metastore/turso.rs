@@ -152,8 +152,7 @@ impl TursoMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
-    /// Note: PRIMARY KEY and FOREIGN KEY constraints removed to enable MVCC mode in libSQL.
-    /// MVCC is incompatible with any indexes, including those created by constraints.
+    /// Note: UNIQUE constraint removed for Turso as indexes are not yet supported with MVCC
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id BIGINT NOT NULL,
