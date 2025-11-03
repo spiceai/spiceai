@@ -230,7 +230,7 @@ impl Service {
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
-        let mut encoder = IpcDataGenerator::default();
+        let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
                 .schema_to_bytes_with_dictionary_tracker(
