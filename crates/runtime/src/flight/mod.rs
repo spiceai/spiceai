@@ -224,11 +224,12 @@ impl Service {
             .await
             .map_err(handle_query_error)?;
 
+        // Reuse the same options for all messages
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema = query_result.data.schema();
 
         // Pre-compute schema flight data once
-        let mut dict_tracker = DictionaryTracker::new(false);
+        let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder

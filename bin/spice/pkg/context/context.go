@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -46,22 +47,24 @@ const (
 )
 
 type RuntimeContext struct {
-	spiceRuntimeDir string
-	flags           *pflag.FlagSet
-	spiceBinDir     string
-	appDir          string
-	podsDir         string
-	isCloud         bool
-	httpClient      *http.Client
-	userAgent       string
-	extraHeaders    map[string]string
+	spiceRuntimeDir       string
+	flags                 *pflag.FlagSet
+	spiceBinDir           string
+	appDir                string
+	podsDir               string
+	isCloud               bool
+	httpClient            *http.Client
+	longRunningHttpClient *http.Client
+	userAgent             string
+	extraHeaders          map[string]string
 }
 
 func NewContext() *RuntimeContext {
 	rtcontext := &RuntimeContext{
-		httpClient:   &http.Client{},
-		userAgent:    util.GetSpiceUserAgent("spice"),
-		extraHeaders: make(map[string]string),
+		httpClient:            newHTTPClient(30 * time.Second),
+		longRunningHttpClient: newHTTPClient(0),
+		userAgent:             util.GetSpiceUserAgent("spice"),
+		extraHeaders:          make(map[string]string),
 	}
 	return rtcontext
 }
@@ -74,7 +77,13 @@ func FromFlags(flags *pflag.FlagSet) (*RuntimeContext, error) {
 	return ctx, nil
 }
 
-func TlsHttpClient(rootCertPath string) http.Client {
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+	}
+}
+
+func tlsHTTPClient(rootCertPath string, timeout time.Duration) *http.Client {
 	rootCert, err := os.ReadFile(rootCertPath)
 	if err != nil {
 		panic(err)
@@ -93,13 +102,18 @@ func TlsHttpClient(rootCertPath string) http.Client {
 		TLSClientConfig: tlsConfig,
 	}
 
-	return http.Client{
+	return &http.Client{
 		Transport: transport,
+		Timeout:   timeout,
 	}
 }
 
 func (c *RuntimeContext) Client() *http.Client {
 	return c.httpClient
+}
+
+func (c *RuntimeContext) LongRunningClient() *http.Client {
+	return c.longRunningHttpClient
 }
 
 func (c *RuntimeContext) SpiceRuntimeDir() string {
@@ -127,6 +141,26 @@ func (c *RuntimeContext) HttpEndpoint() string {
 }
 
 func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
+	return c.doWithClient(c.httpClient, method, path, body, additionalHeaders...)
+}
+
+func (c *RuntimeContext) DoLongRunning(method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
+	headers := make([]string, len(additionalHeaders))
+	copy(headers, additionalHeaders)
+	hasConnectionHeader := false
+	for i := 0; i < len(headers); i += 2 {
+		if strings.EqualFold(headers[i], "Connection") {
+			hasConnectionHeader = true
+			break
+		}
+	}
+	if !hasConnectionHeader {
+		headers = append(headers, "Connection", "keep-alive")
+	}
+	return c.doWithClient(c.longRunningHttpClient, method, path, body, headers...)
+}
+
+func (c *RuntimeContext) doWithClient(client *http.Client, method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
 	request, err := http.NewRequest(method, fmt.Sprintf("%s%s", c.HttpEndpoint(), path), body)
 	if err != nil {
 		return nil, fmt.Errorf("error sending HTTP request: %w", err)
@@ -141,7 +175,7 @@ func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeade
 		request.Header.Set(additionalHeaders[i], additionalHeaders[i+1])
 	}
 
-	return c.httpClient.Do(request)
+	return client.Do(request)
 }
 
 func (c *RuntimeContext) HttpSocketAddress() string {
@@ -187,7 +221,6 @@ func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 		}
 	}
 
-	client := http.Client{}
 	rootCertPath, err := flags.GetString(constants.TlsRootCertificateFile)
 	if err != nil {
 		return err
@@ -195,9 +228,12 @@ func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 	cloud, _ := flags.GetBool(constants.CloudKeyFlag)
 	c.isCloud = cloud
 	if rootCertPath != "" {
-		client = TlsHttpClient(rootCertPath)
+		c.httpClient = tlsHTTPClient(rootCertPath, 30*time.Second)
+		c.longRunningHttpClient = tlsHTTPClient(rootCertPath, 0)
+	} else {
+		c.httpClient = newHTTPClient(30 * time.Second)
+		c.longRunningHttpClient = newHTTPClient(0)
 	}
-	c.httpClient = &client
 	return nil
 }
 
