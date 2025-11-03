@@ -20,7 +20,7 @@ jobs:
             target_os: linux
             target_arch: aarch64
           - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
+            runner: macos-15
             target_os: darwin
             target_arch: aarch64
           - name: Windows x64
