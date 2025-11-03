@@ -158,15 +158,25 @@ impl TableProvider for PartitionTableProvider {
         // Partition filters are those that can be evaluated using only the partition expression columns
         let partition_columns = self.partition_by.expression.column_refs();
 
-        let (partition_filters, data_filters): (Vec<_>, Vec<_>) =
-            filters.iter().cloned().partition(|filter| {
+        // Pre-compute column references for all filters to avoid repeated expression tree traversals
+        let filter_columns_cache: Vec<_> =
+            filters.iter().map(|filter| filter.column_refs()).collect();
+
+        let (partition_filters, data_filters): (Vec<_>, Vec<_>) = filters
+            .iter()
+            .cloned()
+            .zip(filter_columns_cache.iter())
+            .partition(|(_, filter_columns)| {
                 // A filter is a partition filter if it only references columns in the partition expression
-                let filter_columns = filter.column_refs();
                 !filter_columns.is_empty()
                     && filter_columns
                         .iter()
                         .all(|col| partition_columns.contains(col))
             });
+
+        // Extract just the filters (without the cached column refs)
+        let partition_filters: Vec<_> = partition_filters.into_iter().map(|(f, _)| f).collect();
+        let data_filters: Vec<_> = data_filters.into_iter().map(|(f, _)| f).collect();
 
         tracing::debug!(
             "Partition pruning: {} partition filters, {} data filters",
