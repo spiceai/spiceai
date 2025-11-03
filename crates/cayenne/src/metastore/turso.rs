@@ -146,6 +146,7 @@ impl TursoMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
+    /// Note: UNIQUE constraint removed for Turso as indexes are not yet supported with MVCC
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id BIGINT PRIMARY KEY,
@@ -155,8 +156,7 @@ impl TursoMetastore {
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
-            file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            UNIQUE(table_id, partition_value)
+            file_size_bytes BIGINT NOT NULL DEFAULT 0
         )
     ";
 }
@@ -274,13 +274,8 @@ impl MetastoreBackend for TursoMetastore {
                 message: format!("Failed to set cache size: {e}"),
             })?;
 
-        // Store temporary tables in memory for better performance
-        // Reduces disk I/O for temporary operations during queries
-        conn.execute("PRAGMA temp_store = memory", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set temp store: {e}"),
-            })?;
+        // Note: PRAGMA temp_store is not supported by Turso/libSQL
+        // Turso automatically manages temporary storage
 
         // Create tables
         let schema_sql = format!(
