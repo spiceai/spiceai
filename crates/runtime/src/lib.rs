@@ -263,7 +263,7 @@ pub enum Error {
     ExpectedAccelerationSettings { name: String },
 
     #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."
+        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
