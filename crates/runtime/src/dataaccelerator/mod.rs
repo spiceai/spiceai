@@ -835,7 +835,12 @@ mod accelerator_compat_tests {
             // Create appropriate location based on mode with a unique identifier per test run
             // This ensures tests don't interfere with each other by reusing the same file/directory
             let location = if mode == "file" {
-                let variant = timestamp_format.or(metastore_type).unwrap_or("default");
+                let variant = match (timestamp_format, metastore_type) {
+                    (Some(ts_fmt), Some(metastore)) => format!("{ts_fmt}_{metastore}"),
+                    (Some(ts_fmt), None) => ts_fmt.to_string(),
+                    (None, Some(metastore)) => metastore.to_string(),
+                    (None, None) => "default".to_string(),
+                };
                 format!(
                     "/tmp/spice_benchmark_{:?}_{}_{}_{}.db",
                     engine,
