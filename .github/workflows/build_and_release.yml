@@ -61,6 +61,23 @@ jobs:
         id: setup-matrix
         with:
           script: |
+            // Check if this is a tagged release
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            
+            // Check if this is trunk or a release branch
+            const isTrunkOrRelease = context.ref === 'refs/heads/trunk' || 
+                                      context.ref.startsWith('refs/heads/release-') ||
+                                      context.ref.startsWith('refs/heads/release/');
+            
+            // Check if this is a manual workflow dispatch
+            const isManualDispatch = context.eventName === 'workflow_dispatch';
+            
+            // Include Windows only for trunk, release branches, tagged releases, or manual dispatch
+            const includeWindows = isTaggedRelease || isTrunkOrRelease || isManualDispatch;
+            
+            // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
+            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
+            
             const matrix = [
               {
                 name: "Linux x64",
@@ -78,23 +95,28 @@ jobs:
                 tags: ["default", "models"],
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                runner: "macos-14",
+                runner: macosRunner,
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
                 tags: ["default", "models", "metal"],
-              }, {
+              }
+            ];
+            
+            // Add Windows only for trunk, release branches, tagged releases, or manual dispatch
+            if (includeWindows) {
+              matrix.push({
                 name: "Windows x64",
                 runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models"],
-              }
-            ];
+              });
+            }
 
             // If running via workflow_dispatch, filter based on input
-            if (context.eventName === 'workflow_dispatch') {
+            if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
 
               if (platform_option === 'all') {
