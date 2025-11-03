@@ -1514,9 +1514,426 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::cayenne_catalog::CayenneCatalog;
+    use crate::metadata::CreateTableOptions;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::execution::context::SessionContext;
+    use datafusion_catalog::TableProvider;
+    use futures::future::join_all;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Helper to create a test catalog with a table containing sample data
+    async fn setup_test_table(
+        connection_string: &str,
+    ) -> (Arc<CayenneCatalog>, TableMetadata, TempDir) {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("create catalog"));
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let table_name = "test_table";
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+            })
+            .await
+            .expect("create table");
+
+        let table_metadata = catalog.get_table(table_name).await.expect("get table");
+
+        tracing::info!("Created table '{}' with ID {}", table_name, table_id);
+
+        // Create provider and insert test data
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> = catalog.clone();
+        let provider = CayenneTableProvider::new(table_name, catalog_trait)
+            .await
+            .expect("create provider");
+
+        // Insert 1000 rows of test data
+        let mut id_values = Vec::new();
+        let mut name_values = Vec::new();
+        for i in 0..1000 {
+            id_values.push(i);
+            name_values.push(format!("name_{i}"));
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(id_values)),
+                Arc::new(StringArray::from(name_values)),
+            ],
+        )
+        .expect("create batch");
+
+        // Create a memory exec plan from the batch
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::datasource::source::DataSourceExec;
+        let mem_config = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("create memory config");
+        let mem_exec = DataSourceExec::new(Arc::new(mem_config));
+
+        let insert_result = provider
+            .insert_into(&ctx.state(), Arc::new(mem_exec), InsertOp::Append)
+            .await
+            .expect("insert data");
+
+        // Execute the insert plan to actually write the data
+        let batches = collect(insert_result, ctx.task_ctx())
+            .await
+            .expect("execute insert");
+
+        tracing::info!("Insert completed, wrote {} batches", batches.len());
+
+        (catalog, table_metadata, temp_dir)
+    }
+
     #[tokio::test]
-    async fn test_table_provider_creation() {
-        // Tests will be added once SQLite catalog implementation is complete
+    async fn test_concurrent_reads_sqlite() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_turso() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_impl(&connection_string).await;
+    }
+
+    /// Core concurrent read test implementation
+    async fn test_concurrent_reads_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        // Create multiple concurrent readers
+        let num_readers = 20;
+        let num_queries_per_reader = 10;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("create provider");
+
+                let mut total_rows = 0;
+                for query_num in 0..num_queries_per_reader {
+                    // Execute a full table scan
+                    let plan = provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .expect("scan table");
+
+                    let batches = collect(plan, ctx.task_ctx())
+                        .await
+                        .expect("collect results");
+
+                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    total_rows += row_count;
+
+                    if query_num == 0 {
+                        tracing::info!(
+                            "Reader {} first query returned {} rows",
+                            reader_id,
+                            row_count
+                        );
+                    }
+                }
+
+                total_rows
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all readers to complete
+        let results = join_all(handles).await;
+
+        // Verify all readers completed successfully
+        for (idx, result) in results.iter().enumerate() {
+            match result {
+                Ok(total_rows) => {
+                    assert_eq!(
+                        *total_rows,
+                        1000 * num_queries_per_reader,
+                        "Reader {} read incorrect number of rows",
+                        idx
+                    );
+                }
+                Err(e) => panic!("Reader {} failed: {}", idx, e),
+            }
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers successfully completed {} queries each",
+            num_readers,
+            num_queries_per_reader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_with_filters_sqlite() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_filter_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_filters_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_with_filters_turso() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_filter_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_filters_impl(&connection_string).await;
+    }
+
+    /// Test concurrent reads with various filter conditions
+    async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        let num_readers = 10;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("create provider");
+
+                // Register the table with DataFusion so we can run SQL queries
+                ctx.register_table("test_table", Arc::new(provider))
+                    .expect("register table");
+
+                // Execute various queries with filters
+                let queries = vec![
+                    ("SELECT COUNT(*) FROM test_table WHERE id < 500", 500),
+                    ("SELECT COUNT(*) FROM test_table WHERE id >= 500", 500),
+                    ("SELECT COUNT(*) FROM test_table WHERE id % 2 = 0", 500),
+                    ("SELECT COUNT(*) FROM test_table", 1000),
+                ];
+
+                for (query, expected_count) in &queries {
+                    let df = ctx.sql(query).await.expect("execute query");
+                    let batches = df.collect().await.expect("collect results");
+
+                    // Extract count from result
+                    let count = batches[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("downcast count")
+                        .value(0);
+
+                    assert_eq!(
+                        count as usize, *expected_count,
+                        "Reader {} query '{}' returned incorrect count",
+                        reader_id, query
+                    );
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all readers to complete
+        let results = join_all(handles).await;
+
+        // Verify all readers completed successfully
+        for result in results {
+            result.expect("reader should complete successfully");
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers with filters completed successfully",
+            num_readers
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_with_projections_sqlite() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_projection_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_projections_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_with_projections_turso() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_projection_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_projections_impl(&connection_string).await;
+    }
+
+    /// Test concurrent reads with different column projections
+    async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        let num_readers = 15;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("create provider");
+
+                ctx.register_table("test_table", Arc::new(provider))
+                    .expect("register table");
+
+                // Test different projection patterns
+                let queries = vec![
+                    "SELECT id FROM test_table",
+                    "SELECT name FROM test_table",
+                    "SELECT id, name FROM test_table",
+                    "SELECT name, id FROM test_table",
+                ];
+
+                for query in &queries {
+                    let df = ctx.sql(query).await.expect("execute query");
+                    let batches = df.collect().await.expect("collect results");
+
+                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    assert_eq!(
+                        row_count, 1000,
+                        "Reader {} query '{}' returned incorrect row count",
+                        reader_id, query
+                    );
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+
+        for result in results {
+            result.expect("reader should complete successfully");
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers with projections completed successfully",
+            num_readers
+        );
+    }
+
+    #[tokio::test]
+    async fn test_high_concurrency_stress_sqlite() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_stress_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_high_concurrency_stress_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_high_concurrency_stress_turso() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("cayenne_stress_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_high_concurrency_stress_impl(&connection_string).await;
+    }
+
+    /// Stress test with high concurrency (50 readers, 50 queries each)
+    async fn test_high_concurrency_stress_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        let num_readers = 50;
+        let queries_per_reader = 50;
+
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("create provider");
+
+                for _ in 0..queries_per_reader {
+                    let plan = provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .expect("scan table");
+
+                    let batches = collect(plan, ctx.task_ctx())
+                        .await
+                        .expect("collect results");
+
+                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    assert_eq!(row_count, 1000, "Reader {} got wrong row count", reader_id);
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+        let duration = start.elapsed();
+
+        for result in results {
+            result.expect("reader should complete successfully");
+        }
+
+        let total_queries = num_readers * queries_per_reader;
+        let qps = f64::from(total_queries) / duration.as_secs_f64();
+
+        tracing::info!(
+            "✓ Stress test: {} concurrent readers × {} queries = {} total queries in {:.2}s ({:.0} qps)",
+            num_readers,
+            queries_per_reader,
+            total_queries,
+            duration.as_secs_f64(),
+            qps
+        );
     }
 }
 
