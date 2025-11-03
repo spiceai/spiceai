@@ -129,8 +129,10 @@ mod param_values_serde {
                     .map(|(i, v)| Field::new(format!("${}", i + 1), v.data_type(), v.is_null()))
                     .collect();
 
-                let arrays: Result<Vec<ArrayRef>, _> =
-                    values.iter().map(|v| v.to_array()).collect();
+                let arrays: Result<Vec<ArrayRef>, _> = values
+                    .iter()
+                    .map(datafusion::scalar::ScalarValue::to_array)
+                    .collect();
 
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
             }
