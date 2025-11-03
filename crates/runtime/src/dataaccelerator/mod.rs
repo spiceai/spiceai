@@ -3300,13 +3300,14 @@ mod accelerator_compat_tests {
         print_comparison_table(&results);
     }
 
-    /// Helper function to test schema mismatch between LargeUtf8 and Utf8
+    /// Helper function to test schema mismatch between `LargeUtf8` and Utf8
     /// This happens when:
     /// 1. An accelerator stores data with Utf8 type
-    /// 2. The schema passed to SchemaCastScanExec has LargeUtf8 for the same field
-    /// 3. SchemaCastScanExec.schema() creates a mixed schema
-    /// 4. When data flows through and gets sorted/joined, RowConverter fails with schema mismatch
-    /// Related to PR: https://github.com/spiceai/spiceai/pull/7811
+    /// 2. The schema passed to `SchemaCastScanExec` has `LargeUtf8` for the same field
+    /// 3. `SchemaCastScanExec.schema()` creates a mixed schema
+    /// 4. When data flows through and gets sorted/joined, `RowConverter` fails with schema mismatch
+    ///
+    ///    Related to PR: <https://github.com/spiceai/spiceai/pull/7811>
     async fn test_schema_mismatch_impl(engine: Engine, table: Arc<dyn TableProvider>) {
         use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 
@@ -3479,7 +3480,7 @@ mod accelerator_compat_tests {
         .await;
     }
 
-    /// Test schema mismatch specifically for SQLite accelerator
+    /// Test schema mismatch specifically for `SQLite` accelerator
     #[tokio::test]
     #[cfg(feature = "sqlite")]
     async fn test_large_utf8_schema_mismatch_sqlite() {
@@ -3503,7 +3504,7 @@ mod accelerator_compat_tests {
         .await;
     }
 
-    /// Test schema mismatch specifically for DuckDB accelerator
+    /// Test schema mismatch specifically for `DuckDB` accelerator
     #[tokio::test]
     #[cfg(feature = "duckdb")]
     async fn test_large_utf8_schema_mismatch_duckdb() {
@@ -3515,7 +3516,7 @@ mod accelerator_compat_tests {
         .await;
     }
 
-    /// Test schema mismatch specifically for PostgreSQL accelerator
+    /// Test schema mismatch specifically for `PostgreSQL` accelerator
     #[tokio::test]
     #[cfg(feature = "postgres")]
     async fn test_large_utf8_schema_mismatch_postgres() {
