@@ -138,12 +138,13 @@ pub async fn send_messages_to_kafka<T>(
 where
     T: serde::Serialize,
 {
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
     for message in messages {
         let message_str = serde_json::to_string(message)?;
         producer
             .send(
                 FutureRecord::<String, String>::to(topic).payload(&message_str),
-                Duration::from_secs(2),
+                QUEUE_TIMEOUT,
             )
             .await
             .map_err(|(e, _)| anyhow::Error::msg(format!("Kafka message delivery failed: {e}")))?;
