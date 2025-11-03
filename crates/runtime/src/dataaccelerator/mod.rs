@@ -790,11 +790,6 @@ mod accelerator_compat_tests {
         }
     }
 
-    /// Helper function to get variant identifier for file names
-    fn get_variant_id(timestamp_format: Option<&str>) -> &str {
-        timestamp_format.unwrap_or("default")
-    }
-
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
@@ -852,7 +847,7 @@ mod accelerator_compat_tests {
                 format!(
                     "/tmp/spice_benchmark_{:?}_{}_{}_{}.db",
                     engine,
-                    get_variant_id(timestamp_format),
+                    variant,
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

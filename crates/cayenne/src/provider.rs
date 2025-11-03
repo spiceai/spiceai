@@ -1530,9 +1530,15 @@ mod tests {
     async fn setup_test_table(
         connection_string: &str,
     ) -> (Arc<CayenneCatalog>, TableMetadata, TempDir) {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("create catalog"));
-        catalog.init().await.expect("init catalog");
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory for test");
+        let catalog = Arc::new(
+            CayenneCatalog::new(connection_string)
+                .expect("Failed to create CayenneCatalog instance"),
+        );
+        catalog
+            .init()
+            .await
+            .expect("Failed to initialize catalog schema and tables");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -1549,9 +1555,12 @@ mod tests {
                 partition_column: None,
             })
             .await
-            .expect("create table");
+            .expect("Failed to create test table in catalog");
 
-        let table_metadata = catalog.get_table(table_name).await.expect("get table");
+        let table_metadata = catalog
+            .get_table(table_name)
+            .await
+            .expect("Failed to get table metadata from catalog");
 
         tracing::info!("Created table '{}' with ID {}", table_name, table_id);
 
@@ -1560,7 +1569,7 @@ mod tests {
         let catalog_trait: Arc<dyn MetadataCatalog> = catalog.clone();
         let provider = CayenneTableProvider::new(table_name, catalog_trait)
             .await
-            .expect("create provider");
+            .expect("Failed to create CayenneTableProvider instance");
 
         // Insert 1000 rows of test data
         let mut id_values = Vec::new();
@@ -1577,24 +1586,24 @@ mod tests {
                 Arc::new(StringArray::from(name_values)),
             ],
         )
-        .expect("create batch");
+        .expect("Failed to create RecordBatch with test data");
 
         // Create a memory exec plan from the batch
         use datafusion::datasource::memory::MemorySourceConfig;
         use datafusion::datasource::source::DataSourceExec;
         let mem_config = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
-            .expect("create memory config");
+            .expect("Failed to create MemorySourceConfig from test data");
         let mem_exec = DataSourceExec::new(Arc::new(mem_config));
 
         let insert_result = provider
             .insert_into(&ctx.state(), Arc::new(mem_exec), InsertOp::Append)
             .await
-            .expect("insert data");
+            .expect("Failed to create insert execution plan");
 
         // Execute the insert plan to actually write the data
         let batches = collect(insert_result, ctx.task_ctx())
             .await
-            .expect("execute insert");
+            .expect("Failed to execute insert plan and write test data");
 
         tracing::info!("Insert completed, wrote {} batches", batches.len());
 
@@ -1603,7 +1612,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_reads_sqlite() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for concurrent reads test");
         let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
         test_concurrent_reads_impl(&connection_string).await;
@@ -1612,7 +1622,8 @@ mod tests {
     #[cfg(feature = "turso")]
     #[tokio::test]
     async fn test_concurrent_reads_turso() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for concurrent reads test (Turso)");
         let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
         let connection_string = format!("libsql://{}", db_path.to_string_lossy());
         test_concurrent_reads_impl(&connection_string).await;
@@ -1637,7 +1648,7 @@ mod tests {
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
                 let provider = CayenneTableProvider::new(&table_name, catalog_trait)
                     .await
-                    .expect("create provider");
+                    .expect("Failed to create provider in concurrent reader task");
 
                 let mut total_rows = 0;
                 for query_num in 0..num_queries_per_reader {
@@ -1645,11 +1656,11 @@ mod tests {
                     let plan = provider
                         .scan(&ctx.state(), None, &[], None)
                         .await
-                        .expect("scan table");
+                        .expect("Failed to create scan plan in concurrent reader");
 
                     let batches = collect(plan, ctx.task_ctx())
                         .await
-                        .expect("collect results");
+                        .expect("Failed to collect scan results in concurrent reader");
 
                     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
                     total_rows += row_count;
@@ -1696,7 +1707,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_reads_with_filters_sqlite() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for filter test");
         let db_path = temp_dir.path().join("cayenne_filter_test.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
         test_concurrent_reads_with_filters_impl(&connection_string).await;
@@ -1705,7 +1717,8 @@ mod tests {
     #[cfg(feature = "turso")]
     #[tokio::test]
     async fn test_concurrent_reads_with_filters_turso() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for filter test (Turso)");
         let db_path = temp_dir.path().join("cayenne_filter_test.db");
         let connection_string = format!("libsql://{}", db_path.to_string_lossy());
         test_concurrent_reads_with_filters_impl(&connection_string).await;
@@ -1728,11 +1741,11 @@ mod tests {
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
                 let provider = CayenneTableProvider::new(&table_name, catalog_trait)
                     .await
-                    .expect("create provider");
+                    .expect("Failed to create provider for filter test reader");
 
                 // Register the table with DataFusion so we can run SQL queries
                 ctx.register_table("test_table", Arc::new(provider))
-                    .expect("register table");
+                    .expect("Failed to register table with DataFusion context");
 
                 // Execute various queries with filters
                 let queries = vec![
@@ -1743,15 +1756,15 @@ mod tests {
                 ];
 
                 for (query, expected_count) in &queries {
-                    let df = ctx.sql(query).await.expect("execute query");
-                    let batches = df.collect().await.expect("collect results");
+                    let df = ctx.sql(query).await.expect("Failed to execute SQL query");
+                    let batches = df.collect().await.expect("Failed to collect query results");
 
                     // Extract count from result
                     let count = batches[0]
                         .column(0)
                         .as_any()
                         .downcast_ref::<arrow::array::Int64Array>()
-                        .expect("downcast count")
+                        .expect("Failed to downcast count column to Int64Array")
                         .value(0);
 
                     assert_eq!(
@@ -1772,7 +1785,7 @@ mod tests {
 
         // Verify all readers completed successfully
         for result in results {
-            result.expect("reader should complete successfully");
+            result.expect("Filter test concurrent reader task should complete successfully");
         }
 
         tracing::info!(
@@ -1783,7 +1796,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_reads_with_projections_sqlite() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for projection test");
         let db_path = temp_dir.path().join("cayenne_projection_test.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
         test_concurrent_reads_with_projections_impl(&connection_string).await;
@@ -1792,7 +1806,8 @@ mod tests {
     #[cfg(feature = "turso")]
     #[tokio::test]
     async fn test_concurrent_reads_with_projections_turso() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for projection test (Turso)");
         let db_path = temp_dir.path().join("cayenne_projection_test.db");
         let connection_string = format!("libsql://{}", db_path.to_string_lossy());
         test_concurrent_reads_with_projections_impl(&connection_string).await;
@@ -1815,10 +1830,10 @@ mod tests {
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
                 let provider = CayenneTableProvider::new(&table_name, catalog_trait)
                     .await
-                    .expect("create provider");
+                    .expect("Failed to create provider for projection test reader");
 
                 ctx.register_table("test_table", Arc::new(provider))
-                    .expect("register table");
+                    .expect("Failed to register table for projection test");
 
                 // Test different projection patterns
                 let queries = vec![
@@ -1829,8 +1844,14 @@ mod tests {
                 ];
 
                 for query in &queries {
-                    let df = ctx.sql(query).await.expect("execute query");
-                    let batches = df.collect().await.expect("collect results");
+                    let df = ctx
+                        .sql(query)
+                        .await
+                        .expect("Failed to execute projection query");
+                    let batches = df
+                        .collect()
+                        .await
+                        .expect("Failed to collect projection query results");
 
                     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
                     assert_eq!(
@@ -1849,7 +1870,7 @@ mod tests {
         let results = join_all(handles).await;
 
         for result in results {
-            result.expect("reader should complete successfully");
+            result.expect("Projection test concurrent reader task should complete successfully");
         }
 
         tracing::info!(
@@ -1860,7 +1881,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_high_concurrency_stress_sqlite() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for high concurrency stress test");
         let db_path = temp_dir.path().join("cayenne_stress_test.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
         test_high_concurrency_stress_impl(&connection_string).await;
@@ -1869,7 +1891,9 @@ mod tests {
     #[cfg(feature = "turso")]
     #[tokio::test]
     async fn test_high_concurrency_stress_turso() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = TempDir::new().expect(
+            "Failed to create temporary directory for high concurrency stress test (Turso)",
+        );
         let db_path = temp_dir.path().join("cayenne_stress_test.db");
         let connection_string = format!("libsql://{}", db_path.to_string_lossy());
         test_high_concurrency_stress_impl(&connection_string).await;
@@ -1894,17 +1918,17 @@ mod tests {
                 let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
                 let provider = CayenneTableProvider::new(&table_name, catalog_trait)
                     .await
-                    .expect("create provider");
+                    .expect("Failed to create provider for stress test reader");
 
                 for _ in 0..queries_per_reader {
                     let plan = provider
                         .scan(&ctx.state(), None, &[], None)
                         .await
-                        .expect("scan table");
+                        .expect("Failed to create scan plan in stress test");
 
                     let batches = collect(plan, ctx.task_ctx())
                         .await
-                        .expect("collect results");
+                        .expect("Failed to collect scan results in stress test");
 
                     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
                     assert_eq!(row_count, 1000, "Reader {} got wrong row count", reader_id);
@@ -1920,7 +1944,7 @@ mod tests {
         let duration = start.elapsed();
 
         for result in results {
-            result.expect("reader should complete successfully");
+            result.expect("Stress test concurrent reader task should complete successfully");
         }
 
         let total_queries = num_readers * queries_per_reader;
