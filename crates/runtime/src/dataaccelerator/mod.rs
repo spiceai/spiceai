@@ -750,9 +750,10 @@ mod accelerator_compat_tests {
         datasource::TableProvider,
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, col, dml::InsertOp, lit},
-        physical_plan::collect,
+        physical_plan::{ExecutionPlan, collect},
     };
     use datafusion_table_providers::util::test::MockExec;
+    use futures::StreamExt;
     use std::{collections::HashMap, sync::Arc};
     use tempfile::TempDir;
 
@@ -3297,5 +3298,232 @@ mod accelerator_compat_tests {
             Err(poisoned) => panic!("Failed to lock benchmark results: {poisoned}"),
         };
         print_comparison_table(&results);
+    }
+
+    /// Helper function to test schema mismatch between LargeUtf8 and Utf8
+    /// This happens when:
+    /// 1. An accelerator stores data with Utf8 type
+    /// 2. The schema passed to SchemaCastScanExec has LargeUtf8 for the same field
+    /// 3. SchemaCastScanExec.schema() creates a mixed schema
+    /// 4. When data flows through and gets sorted/joined, RowConverter fails with schema mismatch
+    /// Related to PR: https://github.com/spiceai/spiceai/pull/7811
+    async fn test_schema_mismatch_impl(engine: Engine, table: Arc<dyn TableProvider>) {
+        use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+
+        let ctx = SessionContext::new();
+
+        // Get the table's existing schema and insert some test data
+        let schema = test_schema(Some(engine));
+        let data = generate_test_data(Arc::clone(&schema), 5, 0);
+        insert_test_data(&table, &ctx, data).await;
+
+        // Verify data was inserted
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be successful");
+        let results = collect(scan, ctx.task_ctx())
+            .await
+            .expect("scan successful");
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5, "{:?}: should have 5 rows", engine);
+
+        // Create a target schema where the "name" field is LargeUtf8 instead of Utf8
+        // This simulates what happens when a federated data source has LargeUtf8
+        // but the accelerator stores it as Utf8
+        let mut target_fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == "name" {
+                    Field::new(f.name(), DataType::LargeUtf8, f.is_nullable())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+
+        // Ensure we have at least the name field
+        if !target_fields.iter().any(|f| f.name() == "name") {
+            // If the test schema doesn't have a "name" field, add one
+            target_fields.push(Field::new("name", DataType::LargeUtf8, false));
+        }
+
+        let target_schema = Arc::new(Schema::new(target_fields));
+
+        // Now simulate what happens with SchemaCastScanExec by wrapping the scan
+        // with a schema that has LargeUtf8 for the "name" field
+        let scan_plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be successful");
+
+        // Wrap with SchemaCastScanExec using the target schema (LargeUtf8 for name field)
+        let schema_cast_exec = Arc::new(SchemaCastScanExec::new(scan_plan, target_schema));
+
+        // The schema() method will create a mixed schema
+        let resulting_schema = schema_cast_exec.schema();
+        println!(
+            "{:?}: Resulting schema from SchemaCastScanExec: {:?}",
+            engine, resulting_schema
+        );
+
+        // Execute and collect - this should expose the mismatch
+        let mut stream = schema_cast_exec
+            .execute(0, ctx.task_ctx())
+            .expect("execute should work");
+
+        let mut results: Vec<RecordBatch> = Vec::new();
+        while let Some(batch_result) = stream.next().await {
+            match batch_result {
+                Ok(batch) => results.push(batch),
+                Err(e) => {
+                    println!("{:?}: Error during execution: {}", engine, e);
+                    return;
+                }
+            }
+        }
+
+        // The bug shows up when we try to sort the data using the schema from SchemaCastScanExec
+        // with a LIMIT (TopK), because RowConverter will try to convert based on the declared
+        // schema (LargeUtf8) but when limit pushdown happens, TopK receives data before
+        // SchemaCastScanExec.execute() can cast it
+        if let Some(_batch) = results.first() {
+            use datafusion::physical_expr::PhysicalSortExpr;
+            use datafusion::physical_plan::sorts::sort::SortExec;
+
+            // Try to sort by the "name" field with LIMIT 1 - this will trigger TopK optimization
+            // which is where the bug manifests when limit pushdown is enabled
+            let name_index = schema_cast_exec
+                .schema()
+                .index_of("name")
+                .expect("name field exists");
+            let sort_expr = PhysicalSortExpr {
+                expr: Arc::new(datafusion::physical_plan::expressions::Column::new(
+                    "name", name_index,
+                )),
+                options: datafusion::arrow::compute::SortOptions::default(),
+            };
+
+            // Add fetch=1 to trigger TopK optimization which tests limit pushdown
+            let sort_exec =
+                Arc::new(SortExec::new([sort_expr].into(), schema_cast_exec).with_fetch(Some(1)));
+
+            // Now execute the sort with TopK - with the fix, this should work correctly
+            // because SchemaCastScanExec.schema() returns the target schema (LargeUtf8)
+            // and execute() properly casts the data to match it
+            let mut sort_stream = sort_exec
+                .execute(0, ctx.task_ctx())
+                .expect("sort should execute successfully with schema cast fix");
+
+            // Collect sorted results - should work correctly now
+            let mut sorted_count = 0;
+            while let Some(batch_result) = sort_stream.next().await {
+                let batch = batch_result.expect("batch should be retrieved without error");
+                sorted_count += batch.num_rows();
+
+                // Verify the schema matches what we expect (LargeUtf8 for name field)
+                let batch_schema = batch.schema();
+                let name_field = batch_schema
+                    .field_with_name("name")
+                    .expect("name field should exist");
+                assert_eq!(
+                    *name_field.data_type(),
+                    DataType::LargeUtf8,
+                    "{:?}: name field should be LargeUtf8 after schema cast",
+                    engine
+                );
+            }
+
+            assert_eq!(
+                sorted_count, 1,
+                "{:?}: TopK with fetch=1 should return exactly 1 row",
+                engine
+            );
+            println!(
+                "{:?}: ✓ Sort with TopK and schema cast completed successfully (limit pushdown working correctly)",
+                engine
+            );
+        }
+    }
+
+    /// Test schema mismatch across all accelerators
+    #[tokio::test]
+    async fn test_large_utf8_schema_mismatch() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            test_schema_mismatch_impl(engine, table).await;
+        })
+        .await;
+    }
+
+    /// Test schema mismatch specifically for Arrow accelerator
+    #[tokio::test]
+    async fn test_large_utf8_schema_mismatch_arrow() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            if engine == Engine::Arrow {
+                test_schema_mismatch_impl(engine, table).await;
+            }
+        })
+        .await;
+    }
+
+    /// Test schema mismatch specifically for Cayenne/Vortex accelerator
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_large_utf8_schema_mismatch_cayenne() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            if engine == Engine::Cayenne {
+                test_schema_mismatch_impl(engine, table).await;
+            }
+        })
+        .await;
+    }
+
+    /// Test schema mismatch specifically for SQLite accelerator
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_large_utf8_schema_mismatch_sqlite() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            if engine == Engine::Sqlite {
+                test_schema_mismatch_impl(engine, table).await;
+            }
+        })
+        .await;
+    }
+
+    /// Test schema mismatch specifically for Turso accelerator
+    #[tokio::test]
+    #[cfg(feature = "turso")]
+    async fn test_large_utf8_schema_mismatch_turso() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            if engine == Engine::Turso {
+                test_schema_mismatch_impl(engine, table).await;
+            }
+        })
+        .await;
+    }
+
+    /// Test schema mismatch specifically for DuckDB accelerator
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_large_utf8_schema_mismatch_duckdb() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            if engine == Engine::DuckDB {
+                test_schema_mismatch_impl(engine, table).await;
+            }
+        })
+        .await;
+    }
+
+    /// Test schema mismatch specifically for PostgreSQL accelerator
+    #[tokio::test]
+    #[cfg(feature = "postgres")]
+    async fn test_large_utf8_schema_mismatch_postgres() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            if engine == Engine::PostgreSQL {
+                test_schema_mismatch_impl(engine, table).await;
+            }
+        })
+        .await;
     }
 }

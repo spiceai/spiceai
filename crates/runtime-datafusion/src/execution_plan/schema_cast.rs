@@ -43,7 +43,6 @@ use futures::StreamExt;
 use std::any::Any;
 use std::clone::Clone;
 use std::fmt;
-use std::ops::Deref;
 use std::sync::Arc;
 
 pub struct SchemaCastScanExec {
@@ -112,22 +111,24 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(
-            Schema::new(
-                self.input
-                    .schema()
-                    .fields()
-                    .into_iter()
-                    .map(|field| {
-                        self.schema
-                            .field_with_name(field.name())
-                            .ok()
-                            .map_or(field.deref().clone(), Clone::clone)
-                    })
-                    .collect::<Vec<Field>>(),
-            )
-            .with_metadata(self.input.schema().metadata().clone()),
-        )
+        // Iterate through input fields (preserving order) and look up each in target schema
+        // This ensures we return a consistent schema with target types (e.g., LargeUtf8)
+        // for all fields, avoiding the mixed schema bug that causes RowConverter mismatches
+        let fields: Vec<Field> = self
+            .input
+            .schema()
+            .fields()
+            .iter()
+            .filter_map(|input_field| {
+                // Look up this field in the target schema
+                self.schema
+                    .field_with_name(input_field.name())
+                    .ok()
+                    .cloned()
+            })
+            .collect();
+
+        Arc::new(Schema::new(fields).with_metadata(self.input.schema().metadata().clone()))
     }
 
     fn check_invariants(&self, check: InvariantLevel) -> Result<()> {
