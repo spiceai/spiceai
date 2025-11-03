@@ -212,16 +212,19 @@ pub async fn run(args: Args) -> Result<()> {
     };
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
-    if let Some(app) = &app {
-        if let Some(manifest) = app.extensions.get("spice_cloud") {
-            let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
-            extension_factories.push(Box::new(spice_extension_factory));
-        }
-        #[cfg(feature = "tpc-extension")]
-        if let Some(manifest) = app.extensions.get("tpc") {
-            let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
-            extension_factories.push(Box::new(tpc_extension_factory));
-        }
+    if let Some(some_app) = &app
+        && let Some(manifest) = some_app.extensions.get("spice_cloud")
+    {
+        let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
+        extension_factories.push(Box::new(spice_extension_factory));
+    }
+
+    #[cfg(feature = "tpc-extension")]
+    if let Some(some_app) = &app
+        && let Some(manifest) = some_app.extensions.get("tpc")
+    {
+        let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
+        extension_factories.push(Box::new(tpc_extension_factory));
     }
 
     let runtime_config = app.as_ref().map(|app| &app.runtime);
