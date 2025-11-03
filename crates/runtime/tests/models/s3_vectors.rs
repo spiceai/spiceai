@@ -776,7 +776,7 @@ mod search {
 
     #[cfg(feature = "kafka")]
     #[tokio::test]
-    #[ignore] // github.com/spiceai/spiceai/issues/7862
+    #[ignore = "https://github.com/spiceai/spiceai/issues/7862"] // github.com/spiceai/spiceai/issues/7862
     async fn s3_vectors_kafka_stream() -> Result<(), anyhow::Error> {
         use crate::utils::test_request_context;
 
