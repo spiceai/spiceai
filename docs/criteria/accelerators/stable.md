@@ -9,10 +9,10 @@ All criteria must be met for the accelerator to be considered Stable, with excep
 | Accelerator | Stable Quality | DRI Sign-off |
 | ----------- | -------------- | ------------ |
 | Arrow       | ✅            | @peasee      |
-| Cayenne     | ❌            |              |
+| Cayenne     | ➖            |              |
 | DuckDB      | ✅            | @peasee      |
-| SQLite      | ❌            |              |
-| PostgreSQL  | ❌            |              |
+| SQLite      | ➖            |              |
+| PostgreSQL  | ➖            |              |
 
 ## Stable Release Criteria
 
