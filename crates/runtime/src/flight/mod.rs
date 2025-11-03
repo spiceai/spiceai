@@ -231,7 +231,20 @@ impl Service {
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
         let encoder = IpcDataGenerator::default();
-        let schema_flight_data = FlightData::from(SchemaAsIpc::new(schema.as_ref(), &options));
+        let data = IpcMessage(
+            encoder
+                .schema_to_bytes_with_dictionary_tracker(
+                    schema.as_ref(),
+                    &mut dict_tracker,
+                    &options,
+                )
+                .ipc_message
+                .into(),
+        );
+        let schema_flight_data = FlightData {
+            data_header: data.0,
+            ..Default::default()
+        };
 
         let data_stream = query_result.data;
         let cache_status = query_result.cache_status;
