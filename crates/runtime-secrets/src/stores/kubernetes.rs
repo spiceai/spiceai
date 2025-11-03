@@ -76,19 +76,25 @@ impl KubernetesClient {
         }
     }
 
-    fn init(&mut self) -> Result<(), Error> {
-        self.token = Some(
-            std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/token"))
-                .context(UnableToReadK8STokenSnafu)?,
-        );
+    async fn init(&mut self) -> Result<(), Error> {
+        // Perform blocking file I/O in a separate thread to avoid blocking the async runtime
+        let (token, namespace, ca_cert) = tokio::task::spawn_blocking(|| {
+            let token = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/token"))
+                .context(UnableToReadK8STokenSnafu)?;
 
-        self.namespace = Some(
-            std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/namespace"))
-                .context(UnableToReadK8SNamespaceSnafu)?,
-        );
+            let namespace = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/namespace"))
+                .context(UnableToReadK8SNamespaceSnafu)?;
 
-        let ca_cert = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/ca.crt"))
-            .context(UnableToReadCACertificateSnafu)?;
+            let ca_cert = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/ca.crt"))
+                .context(UnableToReadCACertificateSnafu)?;
+
+            Ok::<_, Error>((token, namespace, ca_cert))
+        })
+        .await
+        .map_err(|_| Error::UnableToReadKubernetesCredentials {})??;
+
+        self.token = Some(token);
+        self.namespace = Some(namespace);
 
         let Ok(certificate) = reqwest::Certificate::from_pem(ca_cert.as_bytes()) else {
             return Err(Error::UnableToReadKubernetesCredentials {});
@@ -179,8 +185,8 @@ impl KubernetesSecretStore {
     /// # Errors
     ///
     /// Returns an error if unable to read Kubernetes credentials.
-    pub fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Err(err) = self.kubernetes_client.init() {
+    pub async fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Err(err) = self.kubernetes_client.init().await {
             return Err(Box::new(StoreError::UnableToInitKubernetesClient {
                 source: err,
             }));

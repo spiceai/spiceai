@@ -20,62 +20,61 @@ use crate::{
 };
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
+use std::fmt::Write;
 use std::sync::Arc;
 
 impl Runtime {
     pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
         let app = self.app.read().await;
 
-        if let Some(app) = app.as_ref()
-            && !app.runtime.task_history.enabled
-        {
+        // Skip task history initialization if there's no valid spicepod
+        // Task history requires App infrastructure (datasets, table providers) to function
+        let Some(app) = app.as_ref() else {
+            tracing::debug!(
+                "Task history initialization skipped: no valid spicepod configuration."
+            );
+            return Ok(());
+        };
+
+        if !app.runtime.task_history.enabled {
             tracing::debug!("Task history is disabled via configuration.");
             return Ok(());
         }
 
-        let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
-            Some(app) => (
-                app.runtime
-                    .task_history
-                    .retention_period_as_secs()
-                    .map_err(|e| Error::UnableToTrackTaskHistory {
-                        source: task_history::Error::InvalidConfiguration { source: e }, // keeping the spicepod detached but still want to return snafu errors
-                    })?,
-                app.runtime
-                    .task_history
-                    .retention_check_interval_as_secs()
-                    .map_err(|e| Error::UnableToTrackTaskHistory {
-                        source: task_history::Error::InvalidConfiguration { source: e },
-                    })?,
-            ),
-            None => (
-                task_history::DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS,
-                task_history::DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS,
-            ),
-        };
+        let retention_period_secs = app
+            .runtime
+            .task_history
+            .retention_period_as_secs()
+            .map_err(|e| Error::UnableToTrackTaskHistory {
+                source: task_history::Error::InvalidConfiguration { source: e },
+            })?;
+
+        let retention_check_interval_secs = app
+            .runtime
+            .task_history
+            .retention_check_interval_as_secs()
+            .map_err(|e| Error::UnableToTrackTaskHistory {
+                source: task_history::Error::InvalidConfiguration { source: e },
+            })?;
 
         // Log task history configuration details
         let mut config_details = format!(
             "Task history enabled: retention_period={retention_period_secs}s, retention_check_interval={retention_check_interval_secs}s"
         );
 
-        if let Some(app) = app.as_ref() {
-            use std::fmt::Write;
+        // Add min_sql_duration if configured
+        if let Some(min_sql_duration) = &app.runtime.task_history.min_sql_duration {
+            let _ = write!(config_details, ", min_sql_duration={min_sql_duration}");
+        }
 
-            // Add min_sql_duration if configured
-            if let Some(min_sql_duration) = &app.runtime.task_history.min_sql_duration {
-                let _ = write!(config_details, ", min_sql_duration={min_sql_duration}");
-            }
+        // Add captured_plan and min_plan_duration if configured
+        if let Some(captured_plan) = &app.runtime.task_history.captured_plan
+            && captured_plan.as_ref() != "none"
+        {
+            let _ = write!(config_details, ", captured_plan={captured_plan}");
 
-            // Add captured_plan and min_plan_duration if configured
-            if let Some(captured_plan) = &app.runtime.task_history.captured_plan
-                && captured_plan.as_ref() != "none"
-            {
-                let _ = write!(config_details, ", captured_plan={captured_plan}");
-
-                if let Some(min_plan_duration) = &app.runtime.task_history.min_plan_duration {
-                    let _ = write!(config_details, ", min_plan_duration={min_plan_duration}");
-                }
+            if let Some(min_plan_duration) = &app.runtime.task_history.min_plan_duration {
+                let _ = write!(config_details, ", min_plan_duration={min_plan_duration}");
             }
         }
 
