@@ -250,6 +250,38 @@ impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
 
+        // Enable foreign keys (disabled by default in SQLite for historical reasons)
+        // Ensures referential integrity in the metastore
+        conn.execute("PRAGMA foreign_keys = ON", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to enable foreign keys: {e}"),
+            })?;
+
+        // NORMAL synchronous mode: safe with WAL, more performant than FULL
+        // With WAL mode, NORMAL only syncs at checkpoints, not on every commit
+        conn.execute("PRAGMA synchronous = NORMAL", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set synchronous mode: {e}"),
+            })?;
+
+        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
+        // Larger cache reduces disk I/O for frequently accessed metadata
+        conn.execute("PRAGMA cache_size = -32768", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set cache size: {e}"),
+            })?;
+
+        // Store temporary tables in memory for better performance
+        // Reduces disk I/O for temporary operations during queries
+        conn.execute("PRAGMA temp_store = memory", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set temp store: {e}"),
+            })?;
+
         // Create tables
         let schema_sql = format!(
             "{}; {}; {}; {}; {};",
