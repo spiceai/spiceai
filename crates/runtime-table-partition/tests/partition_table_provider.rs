@@ -826,7 +826,7 @@ async fn test_partition_filter_splitting_snapshot() -> Result<(), Box<dyn std::e
         .to_string();
     // Sort lines to make test deterministic (HashMap iteration order is non-deterministic)
     let mut lines: Vec<&str> = explain_plan.lines().collect();
-    lines[1..].sort(); // Sort all lines except the first (UnionExec)
+    lines[1..].sort_unstable(); // Sort all lines except the first (UnionExec)
     explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("data_filter_only", explain_plan);
 
@@ -844,7 +844,7 @@ async fn test_partition_filter_splitting_snapshot() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Test partition filter splitting with bucket() partition function
+/// Test partition filter splitting with `bucket()` partition function
 #[tokio::test]
 async fn test_partition_filter_splitting_bucket_snapshot() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -923,7 +923,7 @@ async fn test_partition_filter_splitting_bucket_snapshot() -> Result<(), Box<dyn
         .to_string();
     // Sort lines to make test deterministic (HashMap iteration order is non-deterministic)
     let mut lines: Vec<&str> = explain_plan.lines().collect();
-    lines[1..].sort(); // Sort all lines except the first (UnionExec)
+    lines[1..].sort_unstable(); // Sort all lines except the first (UnionExec)
     explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("bucket_data_filter_all_partitions", explain_plan);
 
