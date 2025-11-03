@@ -124,11 +124,15 @@ RUN mkdir -p /spice_sandbox/.cache/huggingface/hub
 RUN chown -R 65534:65534 /spice_sandbox/.cache
 RUN chmod -R 755 /spice_sandbox/.cache
 
+# Create spiced user and group in sandbox
+RUN groupadd -r spiced && useradd -r -g spiced spiced -d /app
+RUN echo 'spiced:x:999:999::/app:/usr/sbin/nologin' >> /spice_sandbox/etc/passwd && \
+    echo 'spiced:x:999:' >> /spice_sandbox/etc/group
+
 FROM scratch
 
 COPY --from=sandbox-setup /spice_sandbox/ /
 
-RUN groupadd -r spiced && useradd -r -g spiced spiced
 USER spiced
 
 EXPOSE 8090 50051
