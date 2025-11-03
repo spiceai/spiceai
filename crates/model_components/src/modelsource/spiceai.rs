@@ -145,6 +145,7 @@ impl ModelSource for SpiceAI {
 
         let versioned_path = format!("{local_path}/{sanitized_version}");
         let file_name = format!("{versioned_path}/model.onnx");
+        let file_path = Path::new(&file_name);
 
         if std::fs::metadata(&file_path).is_ok() {
             tracing::debug!(

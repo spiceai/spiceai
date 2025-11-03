@@ -115,7 +115,7 @@ impl ModelSource for Huggingface {
                 }
             })?;
 
-            let file_name = format!("{p}/{sanitized_file}");
+            let file_name = format!("{versioned_path}/{sanitized_file}");
 
             if std::fs::metadata(file_name.clone()).is_ok() {
                 tracing::info!("File already exists: {}, skipping download", file_name);
