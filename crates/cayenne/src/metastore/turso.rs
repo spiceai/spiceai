@@ -72,6 +72,7 @@ impl TursoMetastore {
         }
 
         let db = Builder::new_local(db_path)
+            .with_mvcc(true)
             .build()
             .await
             .map_err(|e| CatalogError::Database {
