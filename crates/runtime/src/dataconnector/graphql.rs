@@ -22,7 +22,7 @@ use data_components::graphql::{
 use datafusion::datasource::TableProvider;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use snafu::ResultExt;
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, future::Future, pin::Pin, sync::Arc, time::Duration};
 use token_provider::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
@@ -105,6 +105,8 @@ pub(crate) fn default_spice_client(content_type: &'static str) -> reqwest::Resul
 
     reqwest::Client::builder()
         .user_agent("spice")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .default_headers(headers)
         .build()
 }

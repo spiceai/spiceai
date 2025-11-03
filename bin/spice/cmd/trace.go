@@ -28,6 +28,14 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
+// quoteSQLString escapes single quotes in a string and wraps it in single quotes
+// This follows PostgreSQL string literal syntax
+func quoteSQLString(s string) string {
+	// Escape single quotes by doubling them (SQL standard)
+	escaped := strings.ReplaceAll(s, "'", "''")
+	return fmt.Sprintf("'%s'", escaped)
+}
+
 var (
 	// The id of the trace to provide
 	id string
@@ -222,12 +230,14 @@ func init() {
 }
 
 func getTraceFilter(task string, id string, trace_id string) (string, error) {
+	// Use proper SQL string escaping to prevent SQL injection
+	// This follows PostgreSQL string literal syntax by escaping single quotes
 	if id != "" {
-		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id='%s')", id), nil
+		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id=%s)", quoteSQLString(id)), nil
 	}
 	if trace_id != "" {
-		return fmt.Sprintf("trace_id='%s'", trace_id), nil
+		return fmt.Sprintf("trace_id=%s", quoteSQLString(trace_id)), nil
 	}
 	// use last by default
-	return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where task='%s' order by start_time desc limit 1)", task), nil
+	return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where task=%s order by start_time desc limit 1)", quoteSQLString(task)), nil
 }

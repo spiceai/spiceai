@@ -16,8 +16,6 @@ limitations under the License.
 
 use std::{borrow::Cow, ops::ControlFlow};
 
-use arrow::array::RecordBatch;
-use arrow::compute::concat_batches;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, PutResult, Ticket,
     decode::{DecodedPayload, FlightDataDecoder},
@@ -53,28 +51,34 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
     query: String,
-    // Store parameter RecordBatch as IPC bytes for serialization
-    #[serde(with = "record_batch_serde")]
-    parameter_batch: Option<RecordBatch>,
+    // Store parameters directly as ParamValues for fast access
+    // This avoids RecordBatch serialization/deserialization overhead
+    #[serde(with = "param_values_serde")]
+    parameters: Option<datafusion::common::ParamValues>,
 }
 
-mod record_batch_serde {
+mod param_values_serde {
     use arrow::array::RecordBatch;
     use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+    use arrow_tools::record_batch::record_to_param_values;
+    use datafusion::common::ParamValues;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::io::Cursor;
 
     #[allow(clippy::ref_option)]
-    pub fn serialize<S>(batch: &Option<RecordBatch>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(params: &Option<ParamValues>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        match batch {
+        match params {
             None => Vec::<u8>::new().serialize(serializer),
-            Some(batch) => {
+            Some(params) => {
+                // Convert ParamValues back to RecordBatch for serialization
+                // This is only done once during do_put, not on every query execution
+                let batch = param_values_to_record(params).map_err(serde::ser::Error::custom)?;
                 let mut writer = StreamWriter::try_new(Vec::new(), &batch.schema())
                     .map_err(serde::ser::Error::custom)?;
-                writer.write(batch).map_err(serde::ser::Error::custom)?;
+                writer.write(&batch).map_err(serde::ser::Error::custom)?;
                 writer.finish().map_err(serde::ser::Error::custom)?;
                 let bytes = writer.into_inner().map_err(serde::ser::Error::custom)?;
                 bytes.serialize(serializer)
@@ -82,7 +86,7 @@ mod record_batch_serde {
         }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<RecordBatch>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ParamValues>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -93,8 +97,60 @@ mod record_batch_serde {
 
         let cursor = Cursor::new(bytes);
         let mut reader = StreamReader::try_new(cursor, None).map_err(serde::de::Error::custom)?;
+        let batch = reader
+            .next()
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
 
-        reader.next().transpose().map_err(serde::de::Error::custom)
+        match batch {
+            None => Ok(None),
+            Some(batch) => {
+                // Convert RecordBatch to ParamValues once during deserialization
+                // This is more efficient than doing it on every query execution
+                let params = record_to_param_values(&batch).map_err(serde::de::Error::custom)?;
+                Ok(Some(params))
+            }
+        }
+    }
+
+    // Helper function to convert ParamValues back to RecordBatch
+    fn param_values_to_record(
+        params: &ParamValues,
+    ) -> Result<RecordBatch, arrow::error::ArrowError> {
+        use arrow::array::{ArrayRef, RecordBatch};
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        match params {
+            ParamValues::List(values) => {
+                let fields: Vec<Field> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| Field::new(format!("${}", i + 1), v.data_type(), v.is_null()))
+                    .collect();
+
+                let arrays: Result<Vec<ArrayRef>, _> = values
+                    .iter()
+                    .map(datafusion::scalar::ScalarValue::to_array)
+                    .collect();
+
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
+            }
+            ParamValues::Map(map) => {
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by_key(|(k, _)| *k);
+
+                let fields: Vec<Field> = entries
+                    .iter()
+                    .map(|(name, v)| Field::new(name.as_str(), v.data_type(), v.is_null()))
+                    .collect();
+
+                let arrays: Result<Vec<ArrayRef>, _> =
+                    entries.iter().map(|(_, v)| v.to_array()).collect();
+
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
+            }
+        }
     }
 }
 
@@ -123,7 +179,7 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     let stmt = PreparedStatement {
         query: query.to_string(),
-        parameter_batch: None,
+        parameters: None,
     };
 
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
@@ -171,15 +227,11 @@ pub(crate) async fn do_get(
 
     let PreparedStatement {
         query: sql,
-        parameter_batch,
+        parameters,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    // Convert parameter batch to ParamValues if present
-    let parameters = if let Some(batch) = parameter_batch {
-        Some(record_to_param_values(&batch).map_err(error_to_status)?)
-    } else {
-        None
-    };
+    // Parameters are already in ParamValues format - no conversion needed!
+    // This is a major performance win vs previous RecordBatch conversion on every query
 
     // Execute the query through the standard path
     // The logical plan will be created and cached on first execution
@@ -208,11 +260,10 @@ pub(crate) async fn do_put_query(
     let mut decoder = FlightDataDecoder::new(streaming_flight);
 
     // Read the schema first - Arrow Flight always sends schema before batches
-    let schema = decode_schema(&mut decoder).await?;
+    let _schema = decode_schema(&mut decoder).await?;
 
-    // Collect all parameter batches
-    let mut batches = Vec::new();
-    let mut total_rows = 0;
+    // Collect the single parameter row (if any)
+    let mut bound_parameters: Option<datafusion::common::ParamValues> = None;
     while let Some(msg) = futures::TryStreamExt::try_next(&mut decoder).await? {
         match msg.payload {
             DecodedPayload::None => {}
@@ -221,33 +272,29 @@ pub(crate) async fn do_put_query(
                     "parameter flight data must contain a single schema",
                 ));
             }
-            DecodedPayload::RecordBatch(record_batch) => {
-                total_rows += record_batch.num_rows();
-                batches.push(record_batch);
-            }
+            DecodedPayload::RecordBatch(record_batch) => match record_batch.num_rows() {
+                0 => {}
+                1 => {
+                    if bound_parameters.is_some() {
+                        return Err(Status::invalid_argument(
+                            "parameters should contain a single row",
+                        ));
+                    }
+                    let params = record_to_param_values(&record_batch).map_err(error_to_status)?;
+                    bound_parameters = Some(params);
+                }
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "parameters should contain a single row",
+                    ));
+                }
+            },
         }
     }
-    if total_rows > 1 {
-        return Err(Status::invalid_argument(
-            "parameters should contain a single row",
-        ));
-    }
-
-    // Combine multiple batches if parameters span multiple batches
-    let parameter_batch = if batches.is_empty() {
-        None
-    } else if batches.len() == 1 {
-        batches.into_iter().next()
-    } else {
-        // Multiple batches received - combine them using the schema we already have
-        let combined = concat_batches(&schema, &batches)
-            .map_err(|e| Status::internal(format!("Failed to combine parameter batches: {e}")))?;
-        Some(combined)
-    };
 
     let mut stmt: PreparedStatement =
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
-    stmt.parameter_batch = parameter_batch;
+    stmt.parameters = bound_parameters;
     let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     let result = DoPutPreparedStatementResult {

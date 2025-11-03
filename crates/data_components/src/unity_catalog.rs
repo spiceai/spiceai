@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{fmt::Write, sync::Arc, time::Duration};
 
 use datafusion::sql::TableReference;
 use serde::Deserialize;
 use snafu::prelude::*;
-use std::fmt::Write;
 use url::Url;
 
 use token_provider::TokenProvider;
@@ -68,6 +67,9 @@ pub enum Error {
 
     #[snafu(display("Failed to get token. {source}"))]
     UnableToGetToken { source: token_provider::Error },
+
+    #[snafu(display("Failed to create HTTP client for Unity Catalog: {source}"))]
+    UnableToCreateHttpClient { source: reqwest::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -90,9 +92,8 @@ pub struct Endpoint(pub String);
 pub struct CatalogId(pub String);
 
 impl UnityCatalog {
-    #[must_use]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Self {
+    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Result<Self> {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
@@ -113,12 +114,18 @@ impl UnityCatalog {
             };
         }
 
-        Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context(UnableToCreateHttpClientSnafu)?;
+
+        Ok(Self {
             endpoint: endpoint_str,
             token_provider,
-            client: reqwest::Client::new(),
+            client,
             user_agent,
-        }
+        })
     }
 
     /// Parses a catalog url into the endpoint and catalog id.

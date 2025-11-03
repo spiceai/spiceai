@@ -224,26 +224,14 @@ impl Service {
             .await
             .map_err(handle_query_error)?;
 
+        // Reuse the same options for all messages
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema = query_result.data.schema();
 
         // Pre-compute schema flight data once
-        let mut dict_tracker = DictionaryTracker::new(false);
+        let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
         let encoder = IpcDataGenerator::default();
-        let data = IpcMessage(
-            encoder
-                .schema_to_bytes_with_dictionary_tracker(
-                    schema.as_ref(),
-                    &mut dict_tracker,
-                    &options,
-                )
-                .ipc_message
-                .into(),
-        );
-        let schema_flight_data = FlightData {
-            data_header: data.0,
-            ..Default::default()
-        };
+        let schema_flight_data = FlightData::from(SchemaAsIpc::new(schema.as_ref(), &options));
 
         let data_stream = query_result.data;
         let cache_status = query_result.cache_status;
