@@ -44,7 +44,7 @@ jobs:
               },
               {
                 name: "macOS aarch64",
-                runner: "macos-14",
+                runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64",
                 tags: []
