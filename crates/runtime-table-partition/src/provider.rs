@@ -167,9 +167,11 @@ impl TableProvider for PartitionTableProvider {
             .cloned()
             .zip(filter_columns_cache.iter())
             .partition(|(_, filter_columns)| {
-                // A filter is a partition filter if it only references columns in the partition expression
-                !filter_columns.is_empty()
-                    && filter_columns
+                // A filter is a partition filter if:
+                // 1. It has no column references (constant expression like WHERE true), OR
+                // 2. All its column references are in the partition expression columns
+                filter_columns.is_empty()
+                    || filter_columns
                         .iter()
                         .all(|col| partition_columns.contains(col))
             });
