@@ -14,6 +14,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Delta Lake                       | ✅            | @Sevenannn      |
 | Dremio                           | ✅            | @Sevenannn      |
 | DuckDB                           | ✅            | @peasee         |
+| DynamoDB                         | ✅            | @krinart        |
 | File                             | ✅            | @peasee         |
 | FlightSQL                        | ➖            |                 |
 | FTP/SFTP                         | ➖            |                 |
