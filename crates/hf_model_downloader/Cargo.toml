@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "hf_model_downloader"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+hf-hub.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror = "2.0.11"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true

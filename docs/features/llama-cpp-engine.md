@@ -27,15 +27,14 @@ You can specify which engine to use via the `engine` field in your spicepod mode
 
 ```yaml
 models:
-  - from: huggingface
+  - from: huggingface:TheBloke/Llama-2-7B-GGUF
     name: my-model
-    params:
-      huggingface_model_id: 'TheBloke/Llama-2-7B-GGUF'
-      huggingface_file: 'llama-2-7b.Q4_K_M.gguf'
+    files:
+      - path: llama-2-7b.Q4_K_M.gguf
     engine: llama.cpp # Use llama.cpp engine
 ```
 
-If the `engine` field is omitted, **mistral-rs** is used by default.
+If the `engine` field is omitted, **mistral-rs** is used by default`.
 
 ### Supported Values
 
@@ -46,12 +45,53 @@ If the `engine` field is omitted, **mistral-rs** is used by default.
 
 ### Model Format
 
-The llama.cpp engine requires models in **GGUF format**. When using HuggingFace models, ensure you specify a GGUF file:
+The llama.cpp engine requires models in **GGUF format**. The engine provides flexible options for loading models from HuggingFace:
+
+#### Option 1: Automatic GGUF Discovery (Recommended)
+
+Simply specify the HuggingFace repository, and the engine will automatically find and download the best GGUF file:
 
 ```yaml
-params:
-  huggingface_model_id: 'TheBloke/Llama-2-7B-GGUF'
-  huggingface_file: 'llama-2-7b.Q4_K_M.gguf' # Must be .gguf format
+models:
+  - from: huggingface:TheBloke/Llama-2-7B-GGUF
+    name: my-model
+    engine: llama.cpp
+    # No files needed! Automatically discovers and downloads the best GGUF
+```
+
+**Supported `from:` formats:**
+
+- `huggingface:TheBloke/Llama-2-7B-GGUF`
+- `huggingface:huggingface.co/TheBloke/Llama-2-7B-GGUF`
+- `hf:TheBloke/Llama-2-7B-GGUF`
+- `TheBloke/Llama-2-7B-GGUF`
+
+The auto-discovery prefers `Q4_K_M` quantization for an optimal balance of quality and size.
+
+#### Option 2: Specify a GGUF File
+
+If you want a specific GGUF file, specify it in the `files` section:
+
+```yaml
+models:
+  - from: huggingface:TheBloke/Llama-2-7B-GGUF
+    name: my-model
+    engine: llama.cpp
+    files:
+      - path: llama-2-7b.Q5_K_M.gguf # Downloads this specific file
+```
+
+#### Option 3: Use a Local File
+
+If you've already downloaded a GGUF file, provide the full path:
+
+```yaml
+models:
+  - from: huggingface:TheBloke/Llama-2-7B-GGUF
+    name: my-model
+    engine: llama.cpp
+    files:
+      - path: /path/to/local/llama-2-7b.Q4_K_M.gguf # Use existing file
 ```
 
 ### Hardware Acceleration
@@ -167,15 +207,14 @@ kind: Spicepod
 name: my-app
 
 models:
-  - from: huggingface
+  - from: huggingface:TheBloke/Llama-2-7B-GGUF
     name: llama2-7b
-    params:
-      huggingface_model_id: 'TheBloke/Llama-2-7B-GGUF'
-      huggingface_file: 'llama-2-7b.Q4_K_M.gguf'
+    files:
+      - path: llama-2-7b.Q4_K_M.gguf
     # engine: mistral-rs  # Default, can be omitted
 ```
 
-### Using llama.cpp
+### Using llama.cpp with Auto-Discovery
 
 ```yaml
 version: v1beta1
@@ -183,12 +222,29 @@ kind: Spicepod
 name: my-app
 
 models:
-  - from: huggingface
+  # Any of these formats work:
+  # - from: huggingface:TheBloke/Llama-2-7B-GGUF
+  # - from: huggingface:huggingface.co/TheBloke/Llama-2-7B-GGUF
+  # - from: hf:TheBloke/Llama-2-7B-GGUF
+  - from: TheBloke/Llama-2-7B-GGUF
     name: llama2-7b
-    params:
-      huggingface_model_id: 'TheBloke/Llama-2-7B-GGUF'
-      huggingface_file: 'llama-2-7b.Q4_K_M.gguf'
-    engine: llama.cpp # Explicitly use llama.cpp engine
+    engine: llama.cpp
+    # files section is optional - automatically discovers and downloads the best GGUF
+```
+
+### Using llama.cpp with Specific File
+
+```yaml
+version: v1beta1
+kind: Spicepod
+name: my-app
+
+models:
+  - from: huggingface:TheBloke/Llama-2-7B-GGUF
+    name: llama2-7b
+    engine: llama.cpp
+    files:
+      - path: llama-2-7b.Q4_K_M.gguf # Specify exact GGUF file to download
 ```
 
 ## API Usage

@@ -6950,6 +6950,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hf_model_downloader"
+version = "1.9.0-unstable"
+dependencies = [
+ "hf-hub",
+ "secrecy",
+ "serde",
+ "snafu",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hickory-proto"
 version = "0.24.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8593,6 +8607,7 @@ dependencies = [
  "futures",
  "governor",
  "hf-hub",
+ "hf_model_downloader",
  "indexmap 2.12.0",
  "insta",
  "itertools 0.14.0",

@@ -85,6 +85,7 @@ struct SamplingParams {
     presence_penalty: f32,
     repeat_penalty: f32,
     n_ctx: u32,
+    stop_sequences: Vec<String>,
 }
 
 impl Default for SamplingParams {
@@ -101,6 +102,7 @@ impl Default for SamplingParams {
             // 2048 is a common default for many LLMs, balancing memory usage and context length.
             // This value is currently not user-configurable; making it user-settable is a planned future enhancement.
             n_ctx: 2048,
+            stop_sequences: Vec::new(),
         }
     }
 }
@@ -136,7 +138,26 @@ impl SamplingParams {
             params.presence_penalty = pres_penalty;
         }
 
+        // Extract stop sequences from the request
+        if let Some(stop) = &req.stop {
+            params.stop_sequences = match stop {
+                async_openai::types::Stop::String(s) => vec![s.clone()],
+                async_openai::types::Stop::StringArray(arr) => arr.clone(),
+            };
+        }
+
         params
+    }
+
+    /// Check if the output contains any stop sequence
+    /// Returns `Some(position)` if a stop sequence is found, `None` otherwise
+    fn find_stop_sequence(&self, text: &str) -> Option<usize> {
+        for stop_seq in &self.stop_sequences {
+            if let Some(pos) = text.find(stop_seq) {
+                return Some(pos);
+            }
+        }
+        None
     }
 
     /// Create a sampler chain from these parameters
@@ -174,15 +195,14 @@ impl SamplingParams {
         // Add temperature sampling
         if self.temperature > 0.0 {
             samplers.push(LlamaSampler::temp(self.temperature));
-        } else {
-            // Temperature 0 means greedy sampling
-            return LlamaSampler::greedy();
         }
 
-        // Chain samplers together if we have multiple
-        if samplers.is_empty() {
-            LlamaSampler::greedy()
-        } else if samplers.len() == 1 {
+        // Always end with a token selection sampler
+        // Note: greedy() is the final sampler that actually selects a token from the distribution
+        samplers.push(LlamaSampler::greedy());
+
+        // Chain samplers together
+        if samplers.len() == 1 {
             // We've verified samplers.len() == 1, so pop() is guaranteed to return Some
             match samplers.pop() {
                 Some(sampler) => sampler,
@@ -248,22 +268,99 @@ impl LlamaCpp {
 
     /// Create from `HuggingFace` model ID
     ///
-    /// Note: llama.cpp engine does not support automatic model downloading from `HuggingFace`.
-    /// The `model_id` parameter is accepted for API consistency but is not used.
-    /// Users must pre-download GGUF files and specify the local path via `gguf_filename`.
-    /// The `hf_token_literal` is also unused as no downloading occurs.
+    /// This method supports three modes:
+    /// 1. If `gguf_filename` is a local file path, it will be loaded directly
+    /// 2. If `gguf_filename` is just a filename, it will be downloaded from `HuggingFace`
+    /// 3. If `gguf_filename` is `None`, the best GGUF file will be automatically discovered and downloaded
+    ///
+    /// # Arguments
+    /// * `model_id` - `HuggingFace` model ID (e.g., "TheBloke/Llama-2-7B-GGUF")
+    /// * `hf_token_literal` - Optional `HuggingFace` API token for private models
+    /// * `gguf_filename` - Optional GGUF file path or filename. If omitted, auto-discovers the best GGUF file
     pub async fn from_hf(
-        _model_id: &str,
-        _hf_token_literal: Option<&SecretString>,
+        model_id: &str,
+        hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
-        // llama.cpp requires local GGUF files
-        // Users should download the model first or specify the local path
-        let model_path = gguf_filename.ok_or_else(|| ChatError::FailedToLoadModel {
-            source: "llama.cpp engine requires a local GGUF file path. \
-                    Please download the model and specify the file path in model files configuration."
-                .into(),
-        })?;
+        let model_path = match gguf_filename {
+            // Case 1: Local file path provided
+            Some(ref gguf_path) if gguf_path.exists() => {
+                tracing::debug!("Using local GGUF file: {}", gguf_path.display());
+                gguf_path.clone()
+            }
+            // Case 2: Filename provided (download specific file)
+            Some(ref gguf_path) if gguf_path.components().count() == 1 => {
+                let filename = gguf_path
+                    .to_str()
+                    .ok_or_else(|| ChatError::FailedToLoadModel {
+                        source: "Invalid GGUF filename".into(),
+                    })?;
+
+                tracing::info!(
+                    "Downloading GGUF file '{}' from HuggingFace repository '{}'",
+                    filename,
+                    model_id
+                );
+
+                let mut config = hf_model_downloader::DownloadConfig::new(model_id);
+                if let Some(token) = hf_token_literal {
+                    config = config.with_token(token.clone());
+                }
+
+                let downloader = hf_model_downloader::HfDownloader::new(config).map_err(|e| {
+                    ChatError::FailedToLoadModel {
+                        source: format!("Failed to create HuggingFace downloader: {e}").into(),
+                    }
+                })?;
+
+                downloader.download_file(filename).await.map_err(|e| {
+                    ChatError::FailedToLoadModel {
+                        source: format!("Failed to download GGUF file from HuggingFace: {e}")
+                            .into(),
+                    }
+                })?
+            }
+            // Case 3: No filename provided - auto-discover and download best GGUF
+            None => {
+                tracing::info!(
+                    "Auto-discovering GGUF files in HuggingFace repository '{}'",
+                    model_id
+                );
+
+                let mut config = hf_model_downloader::DownloadConfig::new(model_id);
+                if let Some(token) = hf_token_literal {
+                    config = config.with_token(token.clone());
+                }
+
+                let downloader = hf_model_downloader::HfDownloader::new(config).map_err(|e| {
+                    ChatError::FailedToLoadModel {
+                        source: format!("Failed to create HuggingFace downloader: {e}").into(),
+                    }
+                })?;
+
+                downloader
+                    .download_best_gguf()
+                    .await
+                    .map_err(|e| ChatError::FailedToLoadModel {
+                        source: format!(
+                            "Failed to auto-discover and download GGUF file from HuggingFace: {e}"
+                        )
+                        .into(),
+                    })?
+            }
+            // Case 4: Path doesn't exist and has multiple components
+            Some(ref gguf_path) => {
+                return Err(ChatError::FailedToLoadModel {
+                    source: format!(
+                        "GGUF file not found: {}. Either provide a valid local path, \
+                        just a filename to download from HuggingFace, or omit the filename \
+                        to auto-discover the best GGUF file.",
+                        gguf_path.display()
+                    )
+                    .into(),
+                });
+            }
+        };
 
         Self::from_file(&model_path).await
     }
@@ -424,13 +521,26 @@ impl LlamaCpp {
                     break;
                 }
 
-                // Convert token to string
-                match model.token_to_str(new_token, Special::Tokenize) {
-                    Ok(token_str) => output.push_str(&token_str),
+                // Convert token to string and check for stop sequences BEFORE accepting/decoding
+                let token_str = match model.token_to_str(new_token, Special::Tokenize) {
+                    Ok(s) => s,
                     Err(_) => continue, // Skip tokens that can't be converted
+                };
+
+                // Tentatively add to output to check for stop sequences
+                let output_with_new_token = format!("{output}{token_str}");
+
+                // Check if this new token would trigger a stop sequence
+                if let Some(stop_pos) = params_clone.find_stop_sequence(&output_with_new_token) {
+                    // Only add the part before the stop sequence
+                    if stop_pos > output.len() {
+                        output.push_str(&token_str[..(stop_pos - output.len())]);
+                    }
+                    break; // Don't accept or decode this token
                 }
 
-                // Accept the token in the sampler
+                // No stop sequence found, accept the token
+                output.push_str(&token_str);
                 sampler.accept(new_token);
 
                 // Prepare next batch with the new token at the next position
@@ -460,6 +570,7 @@ impl LlamaCpp {
     }
 
     /// Internal method for streaming inference with configurable sampling parameters
+    #[allow(clippy::too_many_lines)]
     fn stream_with_params(&self, prompt: String, params: &SamplingParams) -> StreamResult {
         let model = Arc::clone(&self.model);
         let backend = Arc::clone(&self.backend);
@@ -534,6 +645,7 @@ impl LlamaCpp {
             // Create sampler from parameters
             let mut sampler = params_clone.create_sampler();
 
+            let mut accumulated_output = String::new(); // Track output for stop sequence detection
             let mut n_generated = 0;
             let mut n_cur = match i32::try_from(n_prompt_tokens) {
                 Ok(v) => v,
@@ -555,18 +667,35 @@ impl LlamaCpp {
                     break;
                 }
 
-                // Convert token to string and send it
-                match model.token_to_str(new_token, Special::Tokenize) {
-                    Ok(token_str) => {
-                        if tx.blocking_send(Ok(Some(token_str))).is_err() {
-                            // Receiver dropped, stop generation
-                            break;
+                // Convert token to string BEFORE accepting/decoding
+                let token_str = match model.token_to_str(new_token, Special::Tokenize) {
+                    Ok(s) => s,
+                    Err(_) => continue, // Skip tokens that can't be converted
+                };
+
+                // Tentatively add to accumulated output to check for stop sequences
+                let output_with_new_token = format!("{accumulated_output}{token_str}");
+
+                // Check if this new token would trigger a stop sequence
+                if let Some(stop_pos) = params_clone.find_stop_sequence(&output_with_new_token) {
+                    // Send only the partial token text that comes before the stop sequence
+                    let current_len = accumulated_output.len();
+                    if stop_pos > current_len {
+                        let partial_token = &token_str[..(stop_pos - current_len)];
+                        if !partial_token.is_empty() {
+                            let _ = tx.blocking_send(Ok(Some(partial_token.to_string())));
                         }
                     }
-                    Err(_) => continue, // Skip tokens that can't be converted
+                    break; // Don't accept or decode this token
                 }
 
-                // Accept the token in the sampler
+                // No stop sequence found, send the token and accept it
+                if tx.blocking_send(Ok(Some(token_str.clone()))).is_err() {
+                    // Receiver dropped, stop generation
+                    break;
+                }
+
+                accumulated_output.push_str(&token_str);
                 sampler.accept(new_token);
 
                 // Prepare next batch with the new token at the next position

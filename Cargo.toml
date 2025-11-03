@@ -12,6 +12,7 @@ members = [
     "crates/dataformat-json",
     "crates/document_parse",
     "crates/event_stream",
+    "crates/hf_model_downloader",
     "crates/flight_client",
     "crates/flightrepl",
     "crates/llms",
