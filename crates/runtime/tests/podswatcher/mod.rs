@@ -214,7 +214,7 @@ async fn test_runtime_without_spicepod_in_pods_watcher_mode() -> Result<(), anyh
                 .downcast_ref::<arrow::array::Int64Array>()
                 .expect("Expected Int64Array")
                 .value(0);
-            
+
             assert_eq!(count, 0, "Expected no public datasets without spicepod");
 
             // Clean up
@@ -235,7 +235,8 @@ async fn test_runtime_without_spicepod_normal_mode_fails() -> Result<(), anyhow:
     test_request_context()
         .scope(async {
             // Create a temporary directory without a spicepod.yaml file
-            let temp_dir = std::env::temp_dir().join(format!("spice_test_no_pod_fail_{}", std::process::id()));
+            let temp_dir =
+                std::env::temp_dir().join(format!("spice_test_no_pod_fail_{}", std::process::id()));
             std::fs::create_dir_all(&temp_dir).expect("Failed to create test directory");
 
             // Ensure no spicepod.yaml exists
@@ -246,19 +247,18 @@ async fn test_runtime_without_spicepod_normal_mode_fails() -> Result<(), anyhow:
 
             // Try to build app - should fail with clear error message
             let app_result = AppBuilder::build_from_path(temp_dir.clone()).await;
-            
-            assert!(app_result.is_err(), "Expected error when loading missing spicepod");
-            
-            let error = app_result.unwrap_err();
+            let error = app_result.expect_err("Expected error when loading missing spicepod");
             let error_msg = error.to_string();
-            
+
             // Verify error message contains helpful information
             assert!(
-                error_msg.contains("spicepod.yaml not found") || error_msg.contains("spicepod.yml not found"),
+                error_msg.contains("spicepod.yaml not found")
+                    || error_msg.contains("spicepod.yml not found"),
                 "Error should mention missing spicepod file, got: {error_msg}"
             );
             assert!(
-                error_msg.contains("Cannot start the Spice runtime without a valid spicepod.yaml file"),
+                error_msg
+                    .contains("Cannot start the Spice runtime without a valid spicepod.yaml file"),
                 "Error should explain the issue clearly, got: {error_msg}"
             );
             assert!(
@@ -269,7 +269,7 @@ async fn test_runtime_without_spicepod_normal_mode_fails() -> Result<(), anyhow:
                 error_msg.contains("Expected file"),
                 "Error should show expected file path, got: {error_msg}"
             );
-            
+
             // In normal mode (without pods watcher), runtime should NOT be built with None app
             // This simulates what spiced does in normal mode - it should fail early and not start
 
