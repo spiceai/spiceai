@@ -76,7 +76,7 @@ jobs:
             const includeWindows = isTaggedRelease || isTrunkOrRelease || isManualDispatch;
             
             // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
-            const macosRunner = isTaggedRelease ? "macos-14" : "spiceai-macos";
+            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
             
             const matrix = [
               {
