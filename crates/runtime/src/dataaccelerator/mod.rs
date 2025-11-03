@@ -780,6 +780,21 @@ mod accelerator_compat_tests {
     }
 
     /// Mock acceleration source for testing
+
+    /// Helper function to construct mode label with optional timestamp format
+    fn make_mode_label(mode: &str, timestamp_format: Option<&str>) -> String {
+        if let Some(ts_fmt) = timestamp_format {
+            format!("{}, timestamp_format={}", mode, ts_fmt)
+        } else {
+            mode.to_string()
+        }
+    }
+
+    /// Helper function to get variant identifier for file names
+    fn get_variant_id(timestamp_format: Option<&str>) -> &str {
+        timestamp_format.unwrap_or("default")
+    }
+
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
@@ -818,14 +833,7 @@ mod accelerator_compat_tests {
             // Create a unique test environment for this test run
             let test_env = TestEnvironment::new();
 
-            let mut mode_parts = vec![mode.to_string()];
-            if let Some(ts_fmt) = timestamp_format {
-                mode_parts.push(format!("timestamp_format={}", ts_fmt));
-            }
-            if let Some(metastore) = metastore_type {
-                mode_parts.push(format!("metastore={}", metastore));
-            }
-            let mode_label = mode_parts.join(", ");
+            let mode_label = make_mode_label(mode, timestamp_format);
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
@@ -844,7 +852,7 @@ mod accelerator_compat_tests {
                 format!(
                     "/tmp/spice_benchmark_{:?}_{}_{}_{}.db",
                     engine,
-                    variant,
+                    get_variant_id(timestamp_format),
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
