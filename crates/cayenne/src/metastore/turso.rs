@@ -274,14 +274,6 @@ impl MetastoreBackend for TursoMetastore {
                 message: format!("Failed to set cache size: {e}"),
             })?;
 
-        // Store temporary tables in memory for better performance
-        // Reduces disk I/O for temporary operations during queries
-        conn.execute("PRAGMA temp_store = memory", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set temp store: {e}"),
-            })?;
-
         // Create tables
         let schema_sql = format!(
             "{}; {}; {}; {}; {};",
