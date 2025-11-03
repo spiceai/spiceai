@@ -127,12 +127,13 @@ impl TursoMetastore {
             data_file_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
             partition_id BIGINT,
-            content BLOB NOT NULL,
-            file_path TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            null_count BIGINT NOT NULL,
-            row_count BIGINT NOT NULL
+            file_order BIGINT NOT NULL,
+            path TEXT NOT NULL,
+            path_is_relative BOOLEAN NOT NULL,
+            file_format TEXT NOT NULL,
+            record_count BIGINT NOT NULL,
+            file_size_bytes BIGINT NOT NULL,
+            row_id_start BIGINT NOT NULL
         )
     ";
 
