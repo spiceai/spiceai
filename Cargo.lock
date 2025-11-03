@@ -13324,6 +13324,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "futures",
+ "insta",
  "parking_lot 0.12.5",
  "runtime-datafusion-udfs",
  "serde",
