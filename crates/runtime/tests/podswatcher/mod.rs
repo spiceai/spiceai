@@ -247,13 +247,7 @@ async fn test_runtime_without_spicepod_normal_mode_fails() -> Result<(), anyhow:
 
             // Try to build app - should fail with clear error message
             let app_result = AppBuilder::build_from_path(temp_dir.clone()).await;
-
-            assert!(
-                app_result.is_err(),
-                "Expected error when loading missing spicepod"
-            );
-
-            let error = app_result.unwrap_err();
+            let err = app_result.expect_err("Expected error when loading missing spicepod");
             let error_msg = error.to_string();
 
             // Verify error message contains helpful information
