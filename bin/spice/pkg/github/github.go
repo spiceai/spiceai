@@ -70,7 +70,8 @@ func (g *GitHubClient) DownloadFile(url string, downloadPath string) error {
 		return err
 	}
 
-	return os.WriteFile(downloadPath, body, 0766)
+	// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
+	return os.WriteFile(downloadPath, body, 0644)
 }
 
 func (g *GitHubClient) DownloadTarGzip(url string, downloadDir string) error {

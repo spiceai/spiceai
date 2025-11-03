@@ -384,12 +384,14 @@ func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 }
 
 func (c *RuntimeContext) prepareInstallDir() error {
-	err := os.MkdirAll(c.spiceBinDir, 0777)
+	// Use 0755 (rwxr-xr-x) instead of 0777 to prevent world-writable directories
+	// Owner can read/write/execute, others can only read/execute
+	err := os.MkdirAll(c.spiceBinDir, 0755)
 	if err != nil {
 		return err
 	}
 
-	err = os.Chmod(c.spiceBinDir, 0777)
+	err = os.Chmod(c.spiceBinDir, 0755)
 	if err != nil {
 		return err
 	}

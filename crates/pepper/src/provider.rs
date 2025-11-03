@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `DataFusion` `TableProvider` implementation for Pepper tables.
+//! `DataFusion` `TableProvider` implementation for Cayenne tables.
 //!
 //! # Virtual File Concept
 //!
-//! Pepper treats "files" as virtual files, where each file is actually a Vortex
+//! Cayenne treats "files" as virtual files, where each file is actually a Vortex
 //! `ListingTable` at a unique directory. The catalog's `DataFile` entries track metadata
 //! for these virtual files, but all actual I/O operations delegate to the corresponding
 //! `ListingTable`:
@@ -28,7 +28,7 @@ limitations under the License.
 //! - **Deleting**: Delete the `ListingTable`'s directory
 //! - **Stats**: Get statistics from the `ListingTable`
 //!
-//! A Pepper table can have multiple virtual files (`ListingTables`), each in its own
+//! A Cayenne table can have multiple virtual files (`ListingTables`), each in its own
 //! subdirectory (e.g., `file_000001/`, `file_000002/`). When querying the table,
 //! the provider reads from all active virtual files.
 
@@ -286,7 +286,7 @@ impl datafusion_execution::RecordBatchStream for DeletionFilterStream {
     }
 }
 
-/// Pepper table provider that reads from Vortex virtual files.
+/// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
 /// is a Vortex `ListingTable` at its own directory.
@@ -295,7 +295,7 @@ impl datafusion_execution::RecordBatchStream for DeletionFilterStream {
 /// directory. In a future optimization, this could be enhanced to manage multiple
 /// `ListingTables` (one per virtual file) and union their results for better control
 /// over file-level operations.
-pub struct PepperTableProvider {
+pub struct CayenneTableProvider {
     /// Table metadata from the catalog
     table_metadata: TableMetadata,
     /// Reference to the metadata catalog for file operations
@@ -312,15 +312,15 @@ pub struct PepperTableProvider {
     retention_filters: Vec<Expr>,
 }
 
-impl std::fmt::Debug for PepperTableProvider {
+impl std::fmt::Debug for CayenneTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PepperTableProvider")
+        f.debug_struct("CayenneTableProvider")
             .field("table_metadata", &self.table_metadata)
             .finish_non_exhaustive()
     }
 }
 
-impl PepperTableProvider {
+impl CayenneTableProvider {
     /// Construct the path to a snapshot directory.
     ///
     /// Directory structure: `[table_path]/[table_id]/[snapshot_id]/`
@@ -402,7 +402,7 @@ impl PepperTableProvider {
         Ok(())
     }
 
-    /// Create a new Pepper table provider.
+    /// Create a new Cayenne table provider.
     ///
     /// # Errors
     ///
@@ -450,7 +450,7 @@ impl PepperTableProvider {
         })
     }
 
-    /// Create a new table in Pepper.
+    /// Create a new table in Cayenne.
     ///
     /// # Errors
     ///
@@ -462,7 +462,7 @@ impl PepperTableProvider {
         Self::create_table_with_retention(catalog, options, Vec::new()).await
     }
 
-    /// Create a new table in Pepper with retention filters applied to subsequent writes.
+    /// Create a new table in Cayenne with retention filters applied to subsequent writes.
     ///
     /// # Errors
     ///
@@ -502,7 +502,7 @@ impl PepperTableProvider {
     /// 2. Writes Vortex files to the table directory
     /// 3. Returns the number of rows written
     ///
-    /// Note: Currently this doesn't create per-file virtual file entries in the Pepper
+    /// Note: Currently this doesn't create per-file virtual file entries in the Cayenne
     /// catalog. In a future enhancement, we could track individual Vortex files as
     /// separate `DataFile` entries by:
     /// - Intercepting the `VortexSink` output to discover written files
@@ -511,7 +511,7 @@ impl PepperTableProvider {
     ///
     /// For now, the data is successfully written to the `ListingTable`'s directory and
     /// will be readable on the next scan, even though we're not tracking individual
-    /// files in the Pepper catalog metadata yet.
+    /// files in the Cayenne catalog metadata yet.
     ///
     /// # Errors
     ///
@@ -725,7 +725,7 @@ impl PepperTableProvider {
         }
 
         let filters = self.retention_filters.clone();
-        let sink = PepperDeletionSink::new(
+        let sink = CayenneDeletionSink::new(
             self.table_metadata.clone(),
             Arc::clone(&self.catalog),
             Arc::clone(&self.listing_table),
@@ -898,7 +898,7 @@ impl PepperTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for PepperTableProvider {
+impl TableProvider for CayenneTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1126,16 +1126,16 @@ impl TableProvider for PepperTableProvider {
     }
 }
 
-// Implement DeletionTableProvider for Pepper
+// Implement DeletionTableProvider for Cayenne
 #[async_trait]
-impl DeletionTableProvider for PepperTableProvider {
+impl DeletionTableProvider for CayenneTableProvider {
     async fn delete_from(
         &self,
         _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(
-            Arc::new(PepperDeletionSink::new(
+            Arc::new(CayenneDeletionSink::new(
                 self.table_metadata.clone(),
                 Arc::clone(&self.catalog),
                 Arc::clone(&self.listing_table),
@@ -1147,8 +1147,8 @@ impl DeletionTableProvider for PepperTableProvider {
     }
 }
 
-/// Deletion sink for Pepper tables
-struct PepperDeletionSink {
+/// Deletion sink for Cayenne tables
+struct CayenneDeletionSink {
     table_metadata: TableMetadata,
     catalog: Arc<dyn MetadataCatalog>,
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
@@ -1156,7 +1156,7 @@ struct PepperDeletionSink {
     filters: Vec<Expr>,
 }
 
-impl PepperDeletionSink {
+impl CayenneDeletionSink {
     fn new(
         table_metadata: TableMetadata,
         catalog: Arc<dyn MetadataCatalog>,
@@ -1325,7 +1325,7 @@ impl PepperDeletionSink {
 
         let delete_files_for_read = delete_files.clone();
         let existing_row_ids = tokio::task::spawn_blocking(move || {
-            PepperTableProvider::read_deletion_vectors(delete_files_for_read)
+            CayenneTableProvider::read_deletion_vectors(delete_files_for_read)
         })
         .await
         .map_err(|source| catalog_error_to_box(CatalogError::TaskJoin { source }))?
@@ -1347,7 +1347,7 @@ fn catalog_error_to_box(err: CatalogError) -> Box<dyn std::error::Error + Send +
 }
 
 #[async_trait]
-impl DeletionSink for PepperDeletionSink {
+impl DeletionSink for CayenneDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
 
@@ -1376,7 +1376,7 @@ impl DeletionSink for PepperDeletionSink {
 /// # Design Rationale
 ///
 /// This function consolidates conversion logic to ensure consistent error handling across
-/// all numeric conversions in Pepper. Without it, we would have duplicate error handling
+/// all numeric conversions in Cayenne. Without it, we would have duplicate error handling
 /// code for each conversion pair (usize→i64, u64→i64, etc.), making it harder to maintain
 /// consistent error messages.
 ///
@@ -1524,7 +1524,7 @@ mod tests {
 
 // # Deletion Vector Implementation Notes
 //
-// Pepper implements DELETE operations using deletion vectors, following the Delta Lake approach:
+// Cayenne implements DELETE operations using deletion vectors, following the Delta Lake approach:
 //
 // ## Architecture
 // 1. **Deletion Vectors**: Separate Vortex files containing deleted row IDs
@@ -1533,8 +1533,8 @@ mod tests {
 // 4. **Read-Time Filtering**: Scans apply deletion vectors to filter out deleted rows
 //
 // ## Implementation Status
-// - ✅ `DeletionTableProvider` trait implemented for `PepperTableProvider`
-// - ✅ `PepperDeletionSink` writes deletion vectors to Vortex files
+// - ✅ `DeletionTableProvider` trait implemented for `CayenneTableProvider`
+// - ✅ `CayenneDeletionSink` writes deletion vectors to Vortex files
 // - ✅ Deletion vectors registered in catalog via `add_delete_file()`
 // - ⏳ Read-time filtering NOT YET IMPLEMENTED (see TODOs in `scan()` method)
 // - ⏳ SQL DELETE support requires DataFusion logical plan rewriting (runtime-level integration)
