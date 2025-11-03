@@ -160,3 +160,123 @@ async fn podswatcher_integration_test() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_runtime_without_spicepod_in_pods_watcher_mode() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            // Create a temporary directory without a spicepod.yaml file
+            let temp_dir = std::env::temp_dir().join(format!("spice_test_no_pod_{}", std::process::id()));
+            std::fs::create_dir_all(&temp_dir).expect("Failed to create test directory");
+
+            // Ensure no spicepod.yaml exists
+            let spicepod_path = temp_dir.join("spicepod.yaml");
+            if spicepod_path.exists() {
+                std::fs::remove_file(&spicepod_path)?;
+            }
+
+            // Try to build app - should fail with clear error
+            let app_result = AppBuilder::build_from_path(temp_dir.clone()).await;
+            assert!(app_result.is_err(), "Expected error when loading missing spicepod");
+
+            // Build runtime with None app and pods watcher enabled (simulating --pods-watcher-enabled mode)
+            let pods_watcher = PodsWatcher::new(temp_dir.clone());
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app_opt(None)
+                    .with_pods_watcher(pods_watcher)
+                    .build()
+                    .await,
+            );
+
+            // Load components - should complete without errors even with None app
+            let components_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Arc::clone(&rt).load_components()
+            ).await;
+
+            assert!(components_result.is_ok(), "Components should load successfully even without spicepod");
+
+            // Query should work but return no datasets (only internal/system tables)
+            let results = run_query(
+                &rt,
+                "SELECT COUNT(*) as dataset_count FROM information_schema.tables WHERE table_schema = 'public'"
+            ).await?;
+
+            let count = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("Expected Int64Array")
+                .value(0);
+            
+            assert_eq!(count, 0, "Expected no public datasets without spicepod");
+
+            // Clean up
+            std::fs::remove_dir_all(&temp_dir).ok();
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_runtime_without_spicepod_normal_mode_fails() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            // Create a temporary directory without a spicepod.yaml file
+            let temp_dir = std::env::temp_dir().join(format!("spice_test_no_pod_fail_{}", std::process::id()));
+            std::fs::create_dir_all(&temp_dir).expect("Failed to create test directory");
+
+            // Ensure no spicepod.yaml exists
+            let spicepod_path = temp_dir.join("spicepod.yaml");
+            if spicepod_path.exists() {
+                std::fs::remove_file(&spicepod_path)?;
+            }
+
+            // Try to build app - should fail with clear error message
+            let app_result = AppBuilder::build_from_path(temp_dir.clone()).await;
+            
+            assert!(app_result.is_err(), "Expected error when loading missing spicepod");
+            
+            let error = app_result.unwrap_err();
+            let error_msg = error.to_string();
+            
+            // Verify error message contains helpful information
+            assert!(
+                error_msg.contains("spicepod.yaml not found") || error_msg.contains("spicepod.yml not found"),
+                "Error should mention missing spicepod file, got: {error_msg}"
+            );
+            assert!(
+                error_msg.contains("Cannot start the Spice runtime without a valid spicepod.yaml file"),
+                "Error should explain the issue clearly, got: {error_msg}"
+            );
+            assert!(
+                error_msg.contains("Current working directory"),
+                "Error should show current directory, got: {error_msg}"
+            );
+            assert!(
+                error_msg.contains("Expected file"),
+                "Error should show expected file path, got: {error_msg}"
+            );
+            
+            // In normal mode (without pods watcher), runtime should NOT be built with None app
+            // This simulates what spiced does in normal mode - it should fail early and not start
+
+            // Clean up
+            std::fs::remove_dir_all(&temp_dir).ok();
+
+            Ok(())
+        })
+        .await
+}

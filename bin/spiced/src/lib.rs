@@ -45,7 +45,6 @@ use spiced_tracing::LogVerbosity;
 use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use util::in_tracing_context;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -53,7 +52,7 @@ mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to construct spice app: {source}"))]
+    #[snafu(display("Failed to start Spice runtime: {source}"))]
     UnableToConstructSpiceApp { source: Box<app::Error> },
 
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
@@ -191,32 +190,38 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
+    let mut spicepod_load_error: Option<app::Error> = None;
     let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             Some(Arc::new(app))
         }
         Err(e) => {
-            in_tracing_context(|| {
-                tracing::warn!("{e}");
-            });
-            None
+            // In pods watcher mode, allow runtime to start without a valid spicepod
+            // It will load the spicepod when it becomes available
+            if args.pods_watcher_enabled && args.spicepod.is_none() {
+                spicepod_load_error = Some(e);
+                None
+            } else {
+                // In normal mode, fail immediately if spicepod cannot be loaded
+                return Err(Error::UnableToConstructSpiceApp {
+                    source: Box::new(e),
+                });
+            }
         }
     };
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
-    if let Some(app) = &app
-        && let Some(manifest) = app.extensions.get("spice_cloud")
-    {
-        let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
-        extension_factories.push(Box::new(spice_extension_factory));
-    }
-    #[cfg(feature = "tpc-extension")]
-    if let Some(app) = &app
-        && let Some(manifest) = app.extensions.get("tpc")
-    {
-        let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
-        extension_factories.push(Box::new(tpc_extension_factory));
+    if let Some(app) = &app {
+        if let Some(manifest) = app.extensions.get("spice_cloud") {
+            let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(spice_extension_factory));
+        }
+        #[cfg(feature = "tpc-extension")]
+        if let Some(manifest) = app.extensions.get("tpc") {
+            let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(tpc_extension_factory));
+        }
     }
 
     let runtime_config = app.as_ref().map(|app| &app.runtime);
@@ -259,6 +264,13 @@ pub async fn run(args: Args) -> Result<()> {
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;
+
+    // Log spicepod load error now that tracing is initialized
+    if let Some(err) = spicepod_load_error {
+        tracing::warn!(
+            "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided.\n{err}"
+        );
+    }
 
     // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
