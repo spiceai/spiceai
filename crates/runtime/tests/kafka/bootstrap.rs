@@ -138,7 +138,7 @@ pub async fn send_messages_to_kafka<T>(
 where
     T: serde::Serialize,
 {
-    const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
     for message in messages {
         let message_str = serde_json::to_string(message)?;
         producer
