@@ -121,17 +121,6 @@ impl ModelSource for Huggingface {
                 }
             })?;
 
-            let file_name = versioned_path.join(&sanitized_file);
-
-            if std::fs::metadata(&file_name).is_ok() {
-                tracing::info!(
-                    "File already exists: {}, skipping download",
-                    file_name.display()
-                );
-
-                continue;
-            }
-
             let download_url = format!(
                 "https://huggingface.co/{}/{}/resolve/{}/{}",
                 caps["org"].to_owned(),
@@ -154,7 +143,7 @@ impl ModelSource for Huggingface {
             tracing::info!("Downloading model: {}", download_url);
 
             if sanitized_file.to_lowercase().ends_with(".onnx") {
-                onnx_file_name = file_name.to_string_lossy().into_owned();
+                onnx_file_name = file_path.to_string_lossy().into_owned();
             }
 
             let response = client
@@ -182,9 +171,13 @@ impl ModelSource for Huggingface {
             util::security::validate_non_empty_bytes(&bytes, &sanitized_file)
                 .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
 
-            let file_name_clone = file_name.clone();
+            let file_path_clone = file_path.clone();
             tokio::task::spawn_blocking(move || {
-                let mut file = std::fs::File::create(file_name_clone)
+                if let Some(parent) = file_path_clone.parent() {
+                    std::fs::create_dir_all(parent)
+                        .context(super::UnableToCreateModelPathSnafu {})?;
+                }
+                let mut file = std::fs::File::create(file_path_clone)
                     .context(super::UnableToCreateModelPathSnafu {})?;
                 let mut content = Cursor::new(bytes);
                 std::io::copy(&mut content, &mut file)
@@ -227,6 +220,12 @@ fn resolve_model_file_path(root_dir: &Path, base_dir: &Path, file: &str) -> supe
             Component::CurDir => {}
             Component::Normal(segment) => candidate.push(segment),
             Component::ParentDir => {
+                if candidate == root_dir {
+                    return Err(super::InvalidModelFilePathSnafu {
+                        path: file.to_string(),
+                    }
+                    .build());
+                }
                 if !candidate.pop() {
                     return Err(super::InvalidModelFilePathSnafu {
                         path: file.to_string(),

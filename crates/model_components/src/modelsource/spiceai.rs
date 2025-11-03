@@ -143,11 +143,10 @@ impl ModelSource for SpiceAI {
             .clone()
             .context(super::UnableToParseMetadataSnafu {})?;
 
-        let versioned_path = format!("{local_path}/{sanitized_version}");
-        let file_name = format!("{versioned_path}/model.onnx");
-        let file_path = Path::new(&file_name);
+        let versioned_path = Path::new(&local_path).join(&sanitized_version);
+        let file_path = versioned_path.join("model.onnx");
 
-        if std::fs::metadata(file_path).is_ok() {
+        if std::fs::metadata(&file_path).is_ok() {
             tracing::debug!(
                 "File already exists: {}, skipping download",
                 file_path.display()
@@ -169,12 +168,12 @@ impl ModelSource for SpiceAI {
         util::security::validate_non_empty_bytes(&bytes, "model.onnx")
             .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
 
-        let versioned_path_str = versioned_path.clone();
-        let file_name_clone = file_name.clone();
+        let versioned_path_clone = versioned_path.clone();
+        let file_path_clone = file_path.clone();
         tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(versioned_path_str)
+            std::fs::create_dir_all(versioned_path_clone)
                 .context(super::UnableToCreateModelPathSnafu {})?;
-            let mut file = std::fs::File::create(file_name_clone)
+            let mut file = std::fs::File::create(file_path_clone)
                 .context(super::UnableToCreateModelPathSnafu {})?;
             let mut content = Cursor::new(bytes);
             std::io::copy(&mut content, &mut file)
