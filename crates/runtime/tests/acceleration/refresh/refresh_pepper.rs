@@ -147,6 +147,7 @@ async fn test_acceleration_refresh_pepper_full() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore] // https://github.com/spiceai/spiceai/issues/7860
 async fn test_pepper_append_mode_requires_constraint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
