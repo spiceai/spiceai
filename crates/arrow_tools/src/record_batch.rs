@@ -247,10 +247,13 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
         let scalar = ScalarValue::try_from_array(array, 0)?;
         let name = schema.field(col_index).name();
 
-        // Check if name starts with '$' and parse index - avoid allocations
-        if let Some(stripped) = name.strip_prefix('$')
-            && let Ok(index) = stripped.parse::<usize>()
-        {
+        // Check if name is a parameter index (with or without $ prefix)
+        let index = if let Some(stripped) = name.strip_prefix('$') {
+            stripped.parse::<usize>().ok()
+        } else {
+            name.parse::<usize>().ok()
+        };
+        if let Some(index) = index {
             if has_prev_index && index < prev_index {
                 needs_sort = true;
             }
@@ -549,6 +552,25 @@ mod test {
     fn record_to_param_values_list_parameters() {
         let batch = create_record_batch(
             vec![("$1", DataType::Int32), ("$2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(42)])),
+                Arc::new(StringArray::from(vec![Some("hello")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::List(vec![
+            ScalarValue::Int32(Some(42)),
+            ScalarValue::Utf8(Some("hello".to_string())),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters_no_dollar() {
+        let batch = create_record_batch(
+            vec![("1", DataType::Int32), ("2", DataType::Utf8)],
             vec![
                 Arc::new(Int32Array::from(vec![Some(42)])),
                 Arc::new(StringArray::from(vec![Some("hello")])),
