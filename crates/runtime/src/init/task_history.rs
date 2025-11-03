@@ -62,8 +62,6 @@ impl Runtime {
             "Task history enabled: retention_period={retention_period_secs}s, retention_check_interval={retention_check_interval_secs}s"
         );
 
-        use std::fmt::Write;
-
         // Add min_sql_duration if configured
         if let Some(min_sql_duration) = &app.runtime.task_history.min_sql_duration {
             let _ = write!(config_details, ", min_sql_duration={min_sql_duration}");
