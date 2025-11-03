@@ -101,11 +101,17 @@ impl ModelSource for Huggingface {
                 }
             })?;
 
-        let versioned_path = format!("{local_path}/{sanitized_revision}");
+        let versioned_path = local_path.join(&sanitized_revision);
 
         let mut onnx_file_name = String::new();
 
         std::fs::create_dir_all(&versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
+            .build()
+            .context(super::UnableToFetchModelSnafu {})?;
 
         for file in files {
             // Sanitize file name to prevent path traversal attacks
@@ -115,10 +121,13 @@ impl ModelSource for Huggingface {
                 }
             })?;
 
-            let file_name = format!("{versioned_path}/{sanitized_file}");
+            let file_name = versioned_path.join(&sanitized_file);
 
-            if std::fs::metadata(file_name.clone()).is_ok() {
-                tracing::info!("File already exists: {}, skipping download", file_name);
+            if std::fs::metadata(&file_name).is_ok() {
+                tracing::info!(
+                    "File already exists: {}, skipping download",
+                    file_name.display()
+                );
 
                 continue;
             }
@@ -145,14 +154,9 @@ impl ModelSource for Huggingface {
             tracing::info!("Downloading model: {}", download_url);
 
             if sanitized_file.to_lowercase().ends_with(".onnx") {
-                onnx_file_name.clone_from(&file_name);
+                onnx_file_name = file_name.to_string_lossy().into_owned();
             }
 
-            let client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(1800))
-                .build()
-                .context(super::UnableToFetchModelSnafu {})?;
             let response = client
                 .get(download_url)
                 .bearer_auth(
@@ -178,11 +182,19 @@ impl ModelSource for Huggingface {
             util::security::validate_non_empty_bytes(&bytes, &sanitized_file)
                 .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
 
-            let mut file = std::fs::File::create(file_name.clone())
-                .context(super::UnableToCreateModelPathSnafu {})?;
-            let mut content = Cursor::new(bytes);
-            std::io::copy(&mut content, &mut file)
-                .context(super::UnableToCreateModelPathSnafu {})?;
+            let file_name_clone = file_name.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut file = std::fs::File::create(file_name_clone)
+                    .context(super::UnableToCreateModelPathSnafu {})?;
+                let mut content = Cursor::new(bytes);
+                std::io::copy(&mut content, &mut file)
+                    .context(super::UnableToCreateModelPathSnafu {})?;
+                Ok::<(), super::Error>(())
+            })
+            .await
+            .map_err(|e| super::Error::UnableToLoadConfig {
+                reason: format!("Failed to write model file: {e}"),
+            })??;
 
             tracing::info!("Downloaded: {}", file_path.display());
         }
@@ -215,12 +227,6 @@ fn resolve_model_file_path(root_dir: &Path, base_dir: &Path, file: &str) -> supe
             Component::CurDir => {}
             Component::Normal(segment) => candidate.push(segment),
             Component::ParentDir => {
-                if candidate == root_dir {
-                    return Err(super::InvalidModelFilePathSnafu {
-                        path: file.to_string(),
-                    }
-                    .build());
-                }
                 if !candidate.pop() {
                     return Err(super::InvalidModelFilePathSnafu {
                         path: file.to_string(),

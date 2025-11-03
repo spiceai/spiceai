@@ -9398,6 +9398,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "spicepod",
+ "tokio",
  "tracing",
  "tract-core",
  "tract-onnx",

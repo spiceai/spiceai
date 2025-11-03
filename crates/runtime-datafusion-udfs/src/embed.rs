@@ -121,7 +121,8 @@ impl Embed {
 
         let first_embedding = embedding.first().ok_or_else(|| {
             DataFusionError::Internal(
-                "Embedding model returned empty result for input text (contract violation)".to_string(),
+                "Embedding model returned empty result for input text (contract violation)"
+                    .to_string(),
             )
         })?;
 
