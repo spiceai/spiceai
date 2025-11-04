@@ -400,6 +400,94 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Cleanup old snapshot directories after a full refresh.
+    ///
+    /// For full refresh mode, after the new snapshot is written and the catalog is updated,
+    /// old snapshot directories are no longer needed and can be physically deleted.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_path` - Base path for the table
+    /// * `table_id` - Table identifier
+    /// * `current_snapshot_id` - The current (active) snapshot ID that should be kept
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot directories cannot be listed or deleted.
+    async fn cleanup_old_snapshots(
+        table_path: &str,
+        table_id: i64,
+        current_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        let table_dir = std::path::PathBuf::from(table_path).join(table_id.to_string());
+
+        // Check if table directory exists
+        if !table_dir.exists() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Cleaning up old snapshots for table {} (keeping {})",
+            table_id,
+            current_snapshot_id
+        );
+
+        // Read all entries in the table directory
+        let mut entries = tokio::fs::read_dir(&table_dir)
+            .await
+            .map_err(|source| CatalogError::IoError { source })?;
+
+        let mut deleted_count = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| CatalogError::IoError { source })?
+        {
+            let path = entry.path();
+
+            // Only process directories (snapshots)
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Get the snapshot ID (directory name)
+            let Some(snapshot_id) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Skip the current snapshot
+            if snapshot_id == current_snapshot_id {
+                tracing::debug!("Keeping current snapshot: {}", snapshot_id);
+                continue;
+            }
+
+            // Delete the old snapshot directory
+            tracing::info!(
+                "Deleting old snapshot directory for table {}: {}",
+                table_id,
+                snapshot_id
+            );
+
+            tokio::fs::remove_dir_all(&path)
+                .await
+                .map_err(|source| CatalogError::IoError { source })?;
+
+            deleted_count += 1;
+        }
+
+        if deleted_count > 0 {
+            tracing::info!(
+                "Cleaned up {} old snapshot(s) for table {}",
+                deleted_count,
+                table_id
+            );
+        } else {
+            tracing::debug!("No old snapshots to cleanup for table {}", table_id);
+        }
+
+        Ok(())
+    }
+
     /// Create a new Cayenne table provider.
     ///
     /// # Errors
@@ -1085,6 +1173,22 @@ impl TableProvider for CayenneTableProvider {
                 ))
             })?;
             *listing_table_guard = new_listing_table;
+
+            // Trigger cleanup of old snapshot directories after successful full refresh
+            // This is fire-and-forget to avoid blocking the refresh operation
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = new_snapshot_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots(&table_path, table_id, &current_snapshot).await
+                {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
 
             return Ok(result);
         }
