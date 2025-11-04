@@ -25,6 +25,7 @@ use datafusion::functions::math::random::RandomFunc;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::ai;
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::ai::AI_UDF_NAME;
 use runtime_datafusion_udfs::bucket::BUCKET_SCALAR_UDF_NAME;
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
