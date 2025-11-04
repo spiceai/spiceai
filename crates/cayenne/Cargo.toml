@@ -46,6 +46,7 @@ turso = ["dep:turso"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+insta = { workspace = true, features = ["json"] }
 paste = "1.0"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
