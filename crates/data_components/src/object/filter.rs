@@ -21,7 +21,7 @@ use arrow::error::ArrowError;
 use arrow_array::{Array, BooleanArray};
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::ColumnarValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use datafusion::{

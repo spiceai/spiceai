@@ -1475,7 +1475,7 @@ mod tests {
             .await
             .expect("collect should succeed");
 
-        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 4, "should have all 4 rows from both partitions");
     }
 
@@ -1659,7 +1659,7 @@ mod tests {
     async fn test_large_dataset_optimization_path() {
         // Test the optimization path for large datasets (> 10,000 rows)
         let large_ids_owned: Vec<String> = (0..15_000).map(|i| format!("id_{i:05}")).collect();
-        let large_ids: Vec<&str> = large_ids_owned.iter().map(|s| s.as_str()).collect();
+        let large_ids: Vec<&str> = large_ids_owned.iter().map(String::as_str).collect();
 
         // Test successful case with unique values
         let result = super::check_and_filter_unique_constraint::<
@@ -1907,7 +1907,7 @@ mod tests {
         // Verify distribution across partitions
         for (i, partition) in table.batches.iter().enumerate() {
             let p = partition.read().await;
-            let row_count: usize = p.iter().map(|b| b.num_rows()).sum();
+            let row_count: usize = p.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(
                 row_count, 3,
                 "partition {i} should have 3 rows due to round-robin distribution"

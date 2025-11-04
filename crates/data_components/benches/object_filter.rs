@@ -30,12 +30,12 @@ fn bench_filter_no_filters(c: &mut Criterion) {
     let now = Utc::now();
 
     for size in [100, 1_000, 10_000, 50_000] {
-        let metas: Vec<ObjectMeta> = (0..size)
+        let metas: Vec<ObjectMeta> = (0_u64..size)
             .map(|i| {
                 create_test_meta(
                     &format!("file_{i:06}.txt"),
                     now,
-                    (i * 1024) as u64,
+                    i * 1024,
                     Some(format!("etag_{i}")),
                     Some(format!("v{i}")),
                 )
@@ -63,12 +63,12 @@ fn bench_filter_by_size(c: &mut Criterion) {
     let now = Utc::now();
 
     for size in [100, 1_000, 10_000, 50_000] {
-        let metas: Vec<ObjectMeta> = (0..size)
+        let metas: Vec<ObjectMeta> = (0_u64..size)
             .map(|i| {
                 create_test_meta(
                     &format!("file_{i:06}.txt"),
                     now,
-                    (i * 1024) as u64,
+                    i * 1024,
                     Some(format!("etag_{i}")),
                     Some(format!("v{i}")),
                 )
@@ -77,7 +77,7 @@ fn bench_filter_by_size(c: &mut Criterion) {
 
         // Filter for files > halfway point
         let threshold = (size / 2) * 1024;
-        let filters = vec![col("size").gt(lit(threshold as u64))];
+        let filters = vec![col("size").gt(lit(threshold))];
 
         group.bench_with_input(
             BenchmarkId::new("gt_threshold", size),
@@ -100,7 +100,7 @@ fn bench_filter_combined(c: &mut Criterion) {
     let now = Utc::now();
 
     for size in [100, 1_000, 10_000, 50_000] {
-        let metas: Vec<ObjectMeta> = (0..size)
+        let metas: Vec<ObjectMeta> = (0_u64..size)
             .map(|i| {
                 let prefix = if i % 3 == 0 {
                     "data"
@@ -112,7 +112,7 @@ fn bench_filter_combined(c: &mut Criterion) {
                 create_test_meta(
                     &format!("{prefix}/file_{i:06}.txt"),
                     now,
-                    (i * 1024) as u64,
+                    i * 1024,
                     Some(format!("etag_{i}")),
                     Some(format!("v{i}")),
                 )
@@ -121,7 +121,7 @@ fn bench_filter_combined(c: &mut Criterion) {
 
         let threshold = (size / 2) * 1024;
         let filters = vec![
-            col("size").gt(lit(threshold as u64)),
+            col("size").gt(lit(threshold)),
             col("location").like(lit("data%")),
         ];
 
@@ -146,7 +146,7 @@ fn bench_filter_complex(c: &mut Criterion) {
     let now = Utc::now();
 
     for size in [100, 1_000, 10_000, 50_000] {
-        let metas: Vec<ObjectMeta> = (0..size)
+        let metas: Vec<ObjectMeta> = (0_u64..size)
             .map(|i| {
                 let etag = if i % 5 == 0 {
                     Some(format!("etag_{i}"))
@@ -158,13 +158,7 @@ fn bench_filter_complex(c: &mut Criterion) {
                 } else {
                     None
                 };
-                create_test_meta(
-                    &format!("file_{i:06}.txt"),
-                    now,
-                    (i * 1024) as u64,
-                    etag,
-                    version,
-                )
+                create_test_meta(&format!("file_{i:06}.txt"), now, i * 1024, etag, version)
             })
             .collect();
 
