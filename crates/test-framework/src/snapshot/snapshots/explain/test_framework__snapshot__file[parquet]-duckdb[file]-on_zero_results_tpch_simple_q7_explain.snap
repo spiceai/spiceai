@@ -12,8 +12,8 @@ description: "Query: tpch_simple_q7"
 |               |         TableScan: orders projection=[o_orderkey], fetch=10                       |
 | physical_plan | ProjectionExec: expr=[o_orderkey@0 as key]                                        |
 |               |   BytesProcessedExec                                                              |
-|               |     SchemaCastScanExec                                                            |
-|               |       GlobalLimitExec: skip=0, fetch=10                                           |
+|               |     GlobalLimitExec: skip=0, fetch=10                                             |
+|               |       SchemaCastScanExec                                                          |
 |               |         FallbackOnZeroResultsScanExec                                             |
 |               |           CoalescePartitionsExec                                                  |
 |               |             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
