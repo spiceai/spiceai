@@ -41,7 +41,7 @@ pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("dataset_acceleration_last_refresh_time_ms")
-        .with_description("Unix timestamp in seconds when the last refresh completed.")
+        .with_description("Unix timestamp in milliseconds when the last refresh completed.")
         .with_unit("ms")
         .build()
 });

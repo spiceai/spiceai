@@ -54,9 +54,6 @@ pub struct Model {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub engine: Option<String>,
 }
 
 impl Nameable for Model {
@@ -77,7 +74,6 @@ impl WithDependsOn<Model> for Model {
             datasets: self.datasets.clone(),
             depends_on: depends_on.to_vec(),
             metrics: self.metrics.clone(),
-            engine: self.engine.clone(),
         }
     }
 }
@@ -244,7 +240,6 @@ impl Model {
             datasets: Vec::default(),
             depends_on: Vec::default(),
             metrics: None,
-            engine: None,
         }
     }
 

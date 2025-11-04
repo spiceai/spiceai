@@ -228,7 +228,8 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        // TODO: https://github.com/spiceai/spiceai/issues/7892
+        false
     }
 
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {

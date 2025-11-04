@@ -779,7 +779,15 @@ mod accelerator_compat_tests {
         }
     }
 
-    /// Mock acceleration source for testing
+    /// Helper function to construct mode label with optional timestamp format
+    fn make_mode_label(mode: &str, timestamp_format: Option<&str>) -> String {
+        if let Some(ts_fmt) = timestamp_format {
+            format!("{}, timestamp_format={}", mode, ts_fmt)
+        } else {
+            mode.to_string()
+        }
+    }
+
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
@@ -787,38 +795,38 @@ mod accelerator_compat_tests {
         Fut: std::future::Future<Output = ()>,
     {
         // Test both memory and file modes for databases
-        // For Turso, also test both timestamp formats
+        // For Turso accelerator, test both timestamp formats
+        // For Cayenne, test both SQLite and Turso metastore backends
+        // Format: (engine, mode, timestamp_format, metastore_type)
         let test_configs = vec![
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "memory", None),
+            (Engine::Sqlite, "memory", None, None),
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "file", None),
+            (Engine::Sqlite, "file", None, None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("rfc3339")),
+            (Engine::Turso, "memory", Some("rfc3339"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("rfc3339")),
+            (Engine::Turso, "file", Some("rfc3339"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("integer_millis")),
+            (Engine::Turso, "memory", Some("integer_millis"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("integer_millis")),
+            (Engine::Turso, "file", Some("integer_millis"), None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "memory", None),
+            (Engine::DuckDB, "memory", None, None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "file", None),
-            (Engine::Arrow, "memory", None),
+            (Engine::DuckDB, "file", None, None),
+            (Engine::Arrow, "memory", None, None),
             #[cfg(not(windows))]
-            (Engine::Cayenne, "file", None), // Cayenne only supports file mode
+            (Engine::Cayenne, "file", None, Some("sqlite")), // Cayenne with SQLite metastore
+            #[cfg(all(not(windows), feature = "turso"))]
+            (Engine::Cayenne, "file", None, Some("turso")), // Cayenne with Turso metastore
         ];
 
-        for (engine, mode, timestamp_format) in test_configs {
+        for (engine, mode, timestamp_format, metastore_type) in test_configs {
             // Create a unique test environment for this test run
             let test_env = TestEnvironment::new();
 
-            let mode_label = if let Some(ts_fmt) = timestamp_format {
-                format!("{}, timestamp_format={}", mode, ts_fmt)
-            } else {
-                mode.to_string()
-            };
+            let mode_label = make_mode_label(mode, timestamp_format);
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
@@ -828,10 +836,16 @@ mod accelerator_compat_tests {
             // Create appropriate location based on mode with a unique identifier per test run
             // This ensures tests don't interfere with each other by reusing the same file/directory
             let location = if mode == "file" {
+                let variant = match (timestamp_format, metastore_type) {
+                    (Some(ts_fmt), Some(metastore)) => format!("{ts_fmt}_{metastore}"),
+                    (Some(ts_fmt), None) => ts_fmt.to_string(),
+                    (None, Some(metastore)) => metastore.to_string(),
+                    (None, None) => "default".to_string(),
+                };
                 format!(
                     "/tmp/spice_benchmark_{:?}_{}_{}_{}.db",
                     engine,
-                    timestamp_format.unwrap_or("default"),
+                    variant,
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -996,6 +1010,10 @@ mod accelerator_compat_tests {
                     // Use 'error' mode for tests to fail on unsupported types
                     // This matches the new default production behavior
                     params.insert("unsupported_type_action".to_string(), "error".to_string());
+                    // Set metastore type if specified (for Cayenne variants)
+                    if let Some(metastore) = metastore_type {
+                        params.insert("cayenne_metastore".to_string(), metastore.to_string());
+                    }
 
                     dataset.acceleration = Some(Acceleration {
                         enabled: true,
@@ -2894,9 +2912,20 @@ mod accelerator_compat_tests {
             );
 
             // Print header with engine names
+            // For Cayenne, include metastore type in the label
             print!("║ {:20}", "Metric");
             for result in &mode_results {
-                print!(" │ {:>15}", format!("{:?}", result.engine));
+                let engine_label = if matches!(result.engine, Engine::Cayenne) {
+                    // Extract metastore type from mode string (e.g., "file, metastore=turso")
+                    if let Some(metastore) = result.mode.split("metastore=").nth(1) {
+                        format!("Cayenne({})", metastore)
+                    } else {
+                        format!("{:?}", result.engine)
+                    }
+                } else {
+                    format!("{:?}", result.engine)
+                };
+                print!(" │ {:>15}", engine_label);
             }
             println!(" ║");
             println!(
