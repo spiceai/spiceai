@@ -3,8 +3,9 @@
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use data_components::arrow::write::{
-    MemTable, check_and_filter_unique_constraint, extract_primary_keys_str, filter_existing,
+use data_components::arrow::write::MemTable;
+use data_components::arrow::write::bench_wrappers::{
+    check_and_filter_unique_constraint, extract_primary_keys_str, filter_existing,
 };
 use datafusion::catalog::TableProvider;
 use datafusion::common::{Constraint, Constraints};

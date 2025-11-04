@@ -591,10 +591,7 @@ pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
 
 // Public wrappers for benchmarking with standard hasher
 #[cfg(feature = "bench")]
-pub use bench_wrappers::*;
-
-#[cfg(feature = "bench")]
-mod bench_wrappers {
+pub mod bench_wrappers {
     use super::*;
     use std::collections::hash_map::RandomState;
 
