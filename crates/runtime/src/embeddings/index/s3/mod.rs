@@ -82,7 +82,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("The AWS session token to use.")
         .secret(),
     ParameterSpec::component("index_poll_interval")
-        .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query.")
+        .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query."),
     ParameterSpec::component("batch_write_rows")
         .description("The number of rows to chunk record batches into for individual processing. Used to control memory usage during writes."),
 ];
