@@ -4052,6 +4052,7 @@ dependencies = [
  "charset",
  "chrono",
  "clickhouse-rs",
+ "criterion 0.7.0",
  "ctor",
  "dataformat-json",
  "datafusion",
