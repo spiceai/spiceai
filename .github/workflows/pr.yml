@@ -131,22 +131,13 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
-      - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
+      - name: Setup MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: "linux"
+          access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -160,32 +151,46 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
-          CARGO_NET_GIT_FETCH_WITH_CLI: true
-          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+      - uses: rui314/setup-mold@v1
 
-      - name: Check archive size
+      - name: pull lint archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           sudo apt update
           sudo apt install zstd -y
+          mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/lint.tar.zst ./ || true
+          if [ ! -f ./lint.tar.zst ]; then
+            mc cp spice-minio/spiceai-cache/trunk/lint.tar.zst ./ || true
+            if [ ! -f ./lint.tar.zst ]; then
+              echo "No lint cache found"
+              exit 0
+            fi
+          fi
+
+          tar --use-compress-program="zstd -d" -xf lint.tar.zst target/lint/x
+
+      - run: make lint
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+
+      - name: push lint archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
           tar --use-compress-program="zstd -T0 -1" -cf lint.tar.zst target/lint/
           ls -lh lint.tar.zst
+          mc cp lint.tar.zst spice-minio/spiceai-cache/${{ github.ref_name }}/lint.tar.zst
+
+      - name: force exit
+        run: exit 1
 
       - name: Build CLI and run nextest
         run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
           AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
