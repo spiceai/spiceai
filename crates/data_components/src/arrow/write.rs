@@ -394,7 +394,7 @@ fn check_and_filter_unique_constraint(
         // For large datasets, sort and check for consecutive duplicates
         let mut sorted_ids: Vec<&str> = ids.to_vec();
         sorted_ids.sort_unstable();
-        
+
         // Check for duplicates in sorted array (O(n) scan)
         for window in sorted_ids.windows(2) {
             if window[0] == window[1] {
@@ -403,7 +403,7 @@ fn check_and_filter_unique_constraint(
                 ));
             }
         }
-        
+
         // Check against existing ids if provided
         if let Some(existing) = existing_ids {
             for &id in &sorted_ids {
@@ -414,7 +414,7 @@ fn check_and_filter_unique_constraint(
                 }
             }
         }
-        
+
         // Build HashSet from sorted unique ids
         Ok(sorted_ids.iter().map(|&s| s.to_string()).collect())
     } else {
@@ -530,7 +530,10 @@ fn filter_existing(
     // and can be faster for moderately sized sets due to fewer cache misses
     let use_sorted_search = overwriting_primary_keys.len() > 1000;
     let sorted_keys = if use_sorted_search {
-        let mut keys: Vec<&str> = overwriting_primary_keys.iter().map(String::as_str).collect();
+        let mut keys: Vec<&str> = overwriting_primary_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         Some(keys)
     } else {
@@ -544,7 +547,7 @@ fn filter_existing(
 
         // Pre-allocate with exact capacity for better performance
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
-        
+
         for k in keys {
             if let Some(k) = k {
                 let should_remove = if let Some(ref sorted) = sorted_keys {

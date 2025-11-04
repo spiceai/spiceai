@@ -201,7 +201,7 @@ impl futures::Stream for DeletionFilterStream {
                     // This is more efficient than building indices and using the take kernel
                     // Pre-allocate with capacity for the entire batch
                     let mut keep_mask = Vec::with_capacity(batch_size);
-                    
+
                     // Vectorized row filtering: batch the contains() checks for better performance
                     // RoaringBitmap::contains is SIMD-optimized, and batching reduces branch mispredictions
                     for row_idx in 0..batch_size {
@@ -256,14 +256,18 @@ impl futures::Stream for DeletionFilterStream {
                     // Use Arrow's filter kernel with boolean array for SIMD-optimized filtering
                     // This is faster than the take kernel with indices for this use case
                     let filter_array = arrow::array::BooleanArray::from(keep_mask);
-                    let filtered_batch = match arrow::compute::filter_record_batch(&batch, &filter_array) {
-                        Ok(filtered) => filtered,
-                        Err(e) => {
-                            return std::task::Poll::Ready(Some(Err(
-                                datafusion_common::DataFusionError::ArrowError(Box::new(e), None)
-                            )));
-                        }
-                    };
+                    let filtered_batch =
+                        match arrow::compute::filter_record_batch(&batch, &filter_array) {
+                            Ok(filtered) => filtered,
+                            Err(e) => {
+                                return std::task::Poll::Ready(Some(Err(
+                                    datafusion_common::DataFusionError::ArrowError(
+                                        Box::new(e),
+                                        None,
+                                    ),
+                                )));
+                            }
+                        };
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
