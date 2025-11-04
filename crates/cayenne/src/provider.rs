@@ -90,16 +90,16 @@ const DELETION_CACHE_LOCK_POISONED: &str =
 /// # Zero-Copy Design
 ///
 /// The deleted row IDs are wrapped in `Arc` to enable zero-copy sharing across
-/// concurrent scans. This avoids cloning potentially large `HashSet`s on every scan,
+/// concurrent scans. This avoids cloning potentially large bitmaps on every scan,
 /// aligning with the project's zero-copy principles for Arrow data.
 struct DeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    deleted_row_ids: RoaringBitmap,
+    deleted_row_ids: Arc<RoaringBitmap>,
     properties: datafusion_physical_plan::PlanProperties,
 }
 
 impl DeletionFilterExec {
-    fn new(input: Arc<dyn ExecutionPlan>, deleted_row_ids: RoaringBitmap) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, deleted_row_ids: Arc<RoaringBitmap>) -> Self {
         let properties = input.properties().clone();
         Self {
             input,
@@ -179,7 +179,7 @@ impl ExecutionPlan for DeletionFilterExec {
 /// Stream that filters out deleted rows from an input stream.
 struct DeletionFilterStream {
     input: SendableRecordBatchStream,
-    deleted_row_ids: RoaringBitmap,
+    deleted_row_ids: Arc<RoaringBitmap>,
     schema: arrow_schema::SchemaRef,
     global_row_offset: i64,
 }
@@ -226,7 +226,6 @@ impl futures::Stream for DeletionFilterStream {
                     let mut keep_mask = Vec::with_capacity(batch_size);
 
                     // Vectorized row filtering: batch the contains() checks for better performance
-                    // RoaringBitmap::contains is SIMD-optimized, and batching reduces branch mispredictions
                     for row_idx in 0..batch_size {
                         // Convert once - we've already validated batch_size fits in i64
                         let row_offset = match convert_to_i64(row_idx, "row index") {
@@ -243,13 +242,17 @@ impl futures::Stream for DeletionFilterStream {
                             )));
                         };
 
-                        // RoaringBitmap::contains is SIMD-optimized for range queries
-                        // Cast to u32 as RoaringBitmap uses u32 internally (i64 row IDs >= 0 fit in u32 for most use cases)
-                        // For large row IDs (> u32::MAX), fall back to checking if in bitmap
+                        // Check if row is deleted using RoaringBitmap's u32 API
+                        // RoaringBitmap uses u32 internally. Row IDs >= 2^32 should trigger compaction
+                        // rather than being supported directly.
                         let is_deleted = if let Ok(row_id_u32) = u32::try_from(global_row_id) {
                             self.deleted_row_ids.contains(row_id_u32)
                         } else {
-                            // Row ID too large for u32, treat as not deleted (conservative approach)
+                            // Row ID exceeds u32::MAX - this indicates table needs compaction
+                            tracing::warn!(
+                                "Row ID {} exceeds u32::MAX - table should be compacted to clear deletion vectors",
+                                global_row_id
+                            );
                             false
                         };
 
@@ -343,9 +346,13 @@ pub struct CayenneTableProvider {
     /// Cached deletion vectors (deleted row IDs) to avoid repeated metastore queries on every scan.
     /// This is loaded once during table provider initialization and invalidated when delete files change.
     /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
-    /// The inner `Arc<HashSet<i64>>` enables zero-copy sharing: scans clone the Arc (cheap ref count
-    /// increment) rather than cloning the entire `HashSet`, aligning with zero-copy principles.
-    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
+    /// The inner `Arc<RoaringBitmap>` enables zero-copy sharing: scans clone the Arc (cheap ref count
+    /// increment) rather than cloning the entire bitmap, aligning with zero-copy principles.
+    ///
+    /// `RoaringBitmap` provides 50-90% memory savings vs `HashSet` for sparse deletions and SIMD-optimized
+    /// contains operations. Limited to u32 row IDs (4 billion rows). Tables with excessive deleted rows
+    /// (approaching billions) should trigger compaction to maintain query performance and clear deletion vectors.
+    cached_deleted_row_ids: Arc<RwLock<Arc<RoaringBitmap>>>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -627,10 +634,12 @@ impl CayenneTableProvider {
             &table_metadata.current_snapshot_id,
         );
 
+        let vortex_config = table_metadata.vortex_config.clone();
+
         let listing_table = Self::create_listing_table(
             &snapshot_dir,
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
-            &super::metadata::VortexConfig::default(),
+            &vortex_config,
         )?;
 
         // Load deletion vectors once at initialization to avoid repeated SQLite queries on every scan
@@ -643,7 +652,7 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
-            vortex_config: super::metadata::VortexConfig::default(),
+            vortex_config,
             // Wrap in Arc for zero-copy sharing across concurrent scans
             cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
         })
@@ -1059,21 +1068,29 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Load deletion vectors from the catalog and return a set of deleted row IDs.
+    /// Load deletion vectors from the catalog and return a `RoaringBitmap` of deleted row IDs.
     ///
     /// This method queries the catalog for delete files and loads all deletion vectors
     /// into memory. It should be called once during table provider initialization and
     /// whenever delete files are added/updated.
+    ///
+    /// # Design Constraints
+    ///
+    /// `RoaringBitmap` uses u32 internally, limiting support to row IDs < 4 billion.
+    /// Tables approaching this limit should trigger compaction. Excessive deletion vectors
+    /// severely degrade query performance and indicate poor table health. Compaction removes
+    /// deleted rows and clears deletion vectors.
     ///
     /// # Performance Notes
     ///
     /// - Queries metastore once via catalog
     /// - Reads deletion vector files in a blocking task
     /// - Result is cached in the table provider to avoid repeated queries on every scan
+    /// - `RoaringBitmap` provides 50-90% memory savings vs `HashSet` for sparse deletions
     async fn load_deletion_vectors(
         table_id: i64,
         catalog: Arc<dyn MetadataCatalog>,
-    ) -> CatalogResult<std::collections::HashSet<i64>> {
+    ) -> CatalogResult<RoaringBitmap> {
         // Query catalog for delete files (this spawns a blocking task internally)
         let delete_files = catalog
             .get_table_delete_files(table_id)
@@ -1083,7 +1100,7 @@ impl CayenneTableProvider {
             })?;
 
         if delete_files.is_empty() {
-            return Ok(std::collections::HashSet::new());
+            return Ok(RoaringBitmap::new());
         }
 
         // Read deletion vector files in a blocking task
@@ -1111,7 +1128,7 @@ impl CayenneTableProvider {
         Ok(deleted_row_ids)
     }
 
-    /// Read deletion vectors from files and return a set of deleted row IDs.
+    /// Read deletion vectors from files and return a `RoaringBitmap` of deleted row IDs.
     ///
     /// # Blocking I/O Warning
     ///
@@ -1120,6 +1137,13 @@ impl CayenneTableProvider {
     /// runtime. The caller is responsible for offloading this to a blocking task context.
     ///
     /// See: Project coding guidelines on Async/Blocking Patterns
+    ///
+    /// # Design Constraints
+    ///
+    /// `RoaringBitmap` uses u32 internally, supporting row IDs 0 to ~4 billion. Row IDs beyond
+    /// `u32::MAX` are logged as warnings and skipped. Tables with excessive deleted rows should
+    /// trigger compaction to remove deleted rows and clear deletion vectors. Large deletion vector
+    /// sets indicate poor table health and severely degrade query performance.
     ///
     /// # Performance Optimizations
     ///
@@ -1187,9 +1211,14 @@ impl CayenneTableProvider {
                     // Fast path: no nulls, bulk insert entire slice
                     for &row_id in values {
                         // Convert i64 to u32 for RoaringBitmap
-                        // Skip row IDs that don't fit in u32 (>= 4 billion rows per file is rare)
+                        // Row IDs >= 4 billion should have triggered compaction
                         if let Ok(row_id_u32) = u32::try_from(row_id) {
                             deleted_row_ids.insert(row_id_u32);
+                        } else {
+                            tracing::warn!(
+                                "Skipping row ID {} that exceeds u32::MAX - table should be compacted",
+                                row_id
+                            );
                         }
                     }
                 } else {
@@ -1199,6 +1228,11 @@ impl CayenneTableProvider {
                             let row_id = values[i];
                             if let Ok(row_id_u32) = u32::try_from(row_id) {
                                 deleted_row_ids.insert(row_id_u32);
+                            } else {
+                                tracing::warn!(
+                                    "Skipping row ID {} that exceeds u32::MAX - table should be compacted",
+                                    row_id
+                                );
                             }
                         }
                     }
@@ -1472,8 +1506,8 @@ struct CayenneDeletionSink {
     schema: SchemaRef,
     filters: Vec<Expr>,
     /// Reference to the cached deletion vectors to invalidate after writing new deletions.
-    /// Uses Arc-wrapped `HashSet` for zero-copy sharing across concurrent operations.
-    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
+    /// Uses Arc-wrapped `RoaringBitmap` for zero-copy sharing across concurrent operations.
+    cached_deleted_row_ids: Arc<RwLock<Arc<RoaringBitmap>>>,
 }
 
 impl CayenneDeletionSink {
@@ -1483,7 +1517,7 @@ impl CayenneDeletionSink {
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
         schema: SchemaRef,
         filters: &[Expr],
-        cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
+        cached_deleted_row_ids: Arc<RwLock<Arc<RoaringBitmap>>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -1638,11 +1672,21 @@ impl CayenneDeletionSink {
                 .write()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 
-            // Clone the entire HashSet and add new deletions.
+            // Clone the entire RoaringBitmap and add new deletions.
             // Cost: O(n) where n = existing deleted rows, but this is write path (infrequent).
             // Benefit: Zero-copy Arc clones for concurrent readers (frequent).
             let mut updated_set = (**guard).clone();
-            updated_set.extend(result.row_ids.iter().copied());
+            // Convert i64 row IDs to u32 for RoaringBitmap
+            for &row_id in &result.row_ids {
+                if let Ok(row_id_u32) = u32::try_from(row_id) {
+                    updated_set.insert(row_id_u32);
+                } else {
+                    tracing::warn!(
+                        "Skipping row ID {} that exceeds u32::MAX - table should be compacted",
+                        row_id
+                    );
+                }
+            }
 
             // Replace with new Arc - concurrent readers still have old Arc
             *guard = Arc::new(updated_set);
@@ -1697,7 +1741,7 @@ impl CayenneDeletionSink {
                 if let Ok(row_id_u32) = u32::try_from(row_id) {
                     !existing_row_ids.contains(row_id_u32)
                 } else {
-                    // Row ID doesn't fit in u32, treat as not existing in bitmap (keep it)
+                    // Row ID exceeds u32::MAX - keep it (not in bitmap)
                     true
                 }
             })

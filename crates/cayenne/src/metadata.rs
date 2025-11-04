@@ -40,6 +40,8 @@ pub struct TableMetadata {
     pub current_snapshot_id: String,
     /// Partition column name (if this is a partitioned table)
     pub partition_column: Option<String>,
+    /// Vortex encoding configuration for this table
+    pub vortex_config: VortexConfig,
 }
 
 /// Represents a data file containing table rows.
@@ -125,7 +127,7 @@ pub struct PartitionStats {
 }
 
 /// Configuration for Vortex encodings to optimize compression and performance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct VortexConfig {
     /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns

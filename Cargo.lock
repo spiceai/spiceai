@@ -2970,6 +2970,7 @@ dependencies = [
  "paste",
  "roaring 0.11.2",
  "rusqlite",
+ "serde",
  "serde_json",
  "snafu",
  "tempfile",
