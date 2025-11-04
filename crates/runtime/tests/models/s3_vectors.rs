@@ -16,7 +16,7 @@ limitations under the License.
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
-use s3_vectors::Client;
+use s3_vectors::{Client, S3Vectors};
 use serde_json::json;
 use snafu::ResultExt;
 use spicepod::{
