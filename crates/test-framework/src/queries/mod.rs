@@ -216,9 +216,37 @@ impl Query {
             create_param_batch(columns)
         })
     }
+
+    /// Converts parameterized SQL to raw SQL with parameters substituted as literals
+    /// for use with endpoints that don't support parameterized queries.
+    #[must_use]
+    pub fn to_sql_with_inlined_params(&self) -> Arc<str> {
+        match &self.parameters {
+            Some(params) if !params.is_empty() => {
+                let mut sql = self.sql.as_ref().to_string();
+
+                // Handle different parameter formats
+                if sql.contains('?') {
+                    // Positional format: replace ? with actual values
+                    for param in params {
+                        sql = sql.replacen('?', &param.to_sql_literal(), 1);
+                    }
+                } else {
+                    // Named format: replace $1, $2, etc. with actual values
+                    for (i, param) in params.iter().enumerate() {
+                        let placeholder = format!("${}", i + 1);
+                        sql = sql.replace(&placeholder, &param.to_sql_literal());
+                    }
+                }
+
+                sql.into()
+            }
+            _ => Arc::clone(&self.sql),
+        }
+    }
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default, PartialEq)]
 pub enum QuerySet {
     #[default]
     #[serde(rename = "tpch")]
@@ -781,5 +809,85 @@ pub async fn get_saffron_test_queries(
             // Use fixed parameters for deterministic testing
             Ok(saffron::add_saffron_fixed_parameters(queries))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_sql_with_inlined_params_named_format() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE id = $1 AND name = $2 AND price > $3".into(),
+            false,
+        );
+        query.parameters = Some(vec![
+            ParameterValue::Number(123),
+            ParameterValue::String("test_name".into()),
+            ParameterValue::Float(99.99),
+        ]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE id = 123 AND name = 'test_name' AND price > 99.99"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_positional_format() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE id = ? AND name = ? AND active = ?".into(),
+            false,
+        );
+        query.parameters = Some(vec![
+            ParameterValue::Number(456),
+            ParameterValue::String("positional_test".into()),
+            ParameterValue::Number(1),
+        ]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE id = 456 AND name = 'positional_test' AND active = 1"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_string_escaping() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE comment = ?".into(),
+            false,
+        );
+        query.parameters = Some(vec![ParameterValue::String(
+            "It's a test with 'quotes'".into(),
+        )]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE comment = 'It''s a test with ''quotes'''"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_no_parameters() {
+        let query = Query::new("test_query".into(), "SELECT * FROM table".into(), false);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(result.as_ref(), "SELECT * FROM table");
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_empty_parameters() {
+        let mut query = Query::new("test_query".into(), "SELECT * FROM table".into(), false);
+        query.parameters = Some(vec![]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(result.as_ref(), "SELECT * FROM table");
     }
 }

@@ -77,6 +77,14 @@ on:
         description: 'Number of random parameter sets to generate for parameterized queries (optional)'
         required: false
         type: string
+      http_clients:
+        description: 'Whether to use HTTP clients for the test (default: false)'
+        required: false
+        type: choice
+        default: 'false'
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   run-load:
@@ -153,6 +161,7 @@ jobs:
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
+            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
             --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
@@ -203,6 +212,7 @@ jobs:
             --query-overrides ${{ github.event.inputs.query_overrides }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
+            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
             --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
@@ -228,6 +238,18 @@ jobs:
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
+          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
+          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+KBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}

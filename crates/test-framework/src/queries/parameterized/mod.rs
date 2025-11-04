@@ -53,6 +53,17 @@ impl ParameterValue {
             }
         }
     }
+
+    /// Converts the parameter value to a SQL literal string for use in queries
+    /// that don't support parameterized queries (e.g., HTTP endpoints).
+    #[must_use]
+    pub fn to_sql_literal(&self) -> String {
+        match self {
+            ParameterValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+            ParameterValue::Number(n) => n.to_string(),
+            ParameterValue::Float(f) => f.to_string(),
+        }
+    }
 }
 
 /// Defines parameters for TPC-H queries. Values are extracted from the original TPC-H queries,

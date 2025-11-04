@@ -154,6 +154,14 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
                 .unwrap_or(1)
                 .to_string(),
         ),
+        KeyValue::new(
+            "protocol",
+            if args.test_args.http_clients {
+                "http"
+            } else {
+                "flight"
+            },
+        ),
     ]);
 
     let telemetry = Telemetry::new(&load_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
