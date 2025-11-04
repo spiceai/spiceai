@@ -406,28 +406,50 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
         let mut sorted_ids: Vec<&str> = ids.to_vec();
         sorted_ids.sort_unstable();
 
-        // Check for duplicates in sorted array (O(n) scan)
-        for window in sorted_ids.windows(2) {
-            if window[0] == window[1] {
-                return Err(DataFusionError::Execution(
-                    "Primary key values must be unique".to_string(),
-                ));
-            }
-        }
+        // Build HashSet incrementally while validating uniqueness
+        // This avoids a separate O(n) allocation pass after validation
+        let mut unique_set = HashSet::with_capacity_and_hasher(ids.len(), S::default());
 
-        // Check against existing ids if provided
         if let Some(existing) = existing_ids {
+            // Path with existing IDs check
+            let mut prev: Option<&str> = None;
             for &id in &sorted_ids {
+                // Check for consecutive duplicates in sorted array
+                if prev.is_some_and(|p| p == id) {
+                    return Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ));
+                }
+
+                // Check against existing ids
                 if existing.contains(id) {
                     return Err(DataFusionError::Execution(format!(
                         "Primary key ({id}) already exists and is not unique"
                     )));
                 }
+
+                // Insert into set while validating (only allocate once per string)
+                unique_set.insert(id.to_string());
+                prev = Some(id);
+            }
+        } else {
+            // Fast path without existing IDs check
+            let mut prev: Option<&str> = None;
+            for &id in &sorted_ids {
+                // Check for consecutive duplicates in sorted array
+                if prev.is_some_and(|p| p == id) {
+                    return Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ));
+                }
+
+                // Insert into set while validating (only allocate once per string)
+                unique_set.insert(id.to_string());
+                prev = Some(id);
             }
         }
 
-        // Build HashSet from sorted unique ids
-        Ok(sorted_ids.iter().map(|&s| s.to_string()).collect())
+        Ok(unique_set)
     } else {
         // For smaller datasets, use HashSet (better for small sizes)
         let mut unique_set = HashSet::with_capacity_and_hasher(ids.len(), S::default());
