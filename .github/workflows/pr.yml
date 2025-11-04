@@ -13,21 +13,21 @@ on:
   workflow_dispatch:
     inputs:
       profile_option:
-        description: 'Which Rust build profile to use? (Default is lint)'
+        description: "Which Rust build profile to use? (Default is lint)"
         required: false
         type: choice
         options:
-          - 'lint'
-          - 'release'
-          - 'release-lto'
-        default: 'lint'
+          - "lint"
+          - "release"
+          - "release-lto"
+        default: "lint"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
 env:
-  IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+  IGNORED_PATHS: "(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)"
   RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
 
 jobs:
@@ -117,7 +117,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -139,7 +139,7 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
+          os: "linux"
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -163,6 +163,14 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
+      - name: Check archive size
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          sudo apt update
+          sudo apt install zstd -y
+          tar --use-compress-program="zstd -T0 -1" -cf lint.tar.zst target/lint/
+          ls -lh lint.tar.zst
+
       - name: Build CLI and run nextest
         run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -181,6 +189,14 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           NEXTEST_FLAG: --features=xxhash
+
+      - name: Check archive size
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          sudo apt update
+          sudo apt install zstd -y
+          tar --use-compress-program="zstd -T0 -1" -cf lint.tar.zst target/lint/
+          ls -lh lint.tar.zst
 
       - if: needs.check_changes.outputs.relevant_changes == 'true'
         run: cargo build -p testoperator --all-features
