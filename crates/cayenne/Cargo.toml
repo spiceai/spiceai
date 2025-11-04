@@ -27,6 +27,7 @@ datafusion-expr = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 futures = { workspace = true }
+roaring = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }

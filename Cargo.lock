@@ -2968,6 +2968,7 @@ dependencies = [
  "datafusion-physical-plan",
  "futures",
  "paste",
+ "roaring 0.11.2",
  "rusqlite",
  "serde_json",
  "snafu",

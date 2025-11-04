@@ -388,25 +388,57 @@ fn check_and_filter_unique_constraint(
     ids: &[&str],
     existing_ids: Option<&HashSet<String>>,
 ) -> Result<HashSet<String>> {
-    let mut unique_set = HashSet::<String>::new();
-    ids.iter()
-        .map(|&id| {
-            if unique_set.insert(id.to_string()) {
-                if existing_ids.is_some_and(|existing| existing.contains(id)) {
+    // Optimization: For large datasets, sort first then check for duplicates
+    // This can be faster than HashSet insertion for very large batches due to better cache locality
+    if ids.len() > 10_000 {
+        // For large datasets, sort and check for consecutive duplicates
+        let mut sorted_ids: Vec<&str> = ids.to_vec();
+        sorted_ids.sort_unstable();
+        
+        // Check for duplicates in sorted array (O(n) scan)
+        for window in sorted_ids.windows(2) {
+            if window[0] == window[1] {
+                return Err(DataFusionError::Execution(
+                    "Primary key values must be unique".to_string(),
+                ));
+            }
+        }
+        
+        // Check against existing ids if provided
+        if let Some(existing) = existing_ids {
+            for &id in &sorted_ids {
+                if existing.contains(id) {
                     return Err(DataFusionError::Execution(format!(
                         "Primary key ({id}) already exists and is not unique"
                     )));
                 }
-                Ok(())
-            } else {
-                Err(DataFusionError::Execution(
-                    "Primary key values must be unique".to_string(),
-                ))
             }
-        })
-        .collect::<Result<Vec<_>>>()?;
+        }
+        
+        // Build HashSet from sorted unique ids
+        Ok(sorted_ids.iter().map(|&s| s.to_string()).collect())
+    } else {
+        // For smaller datasets, use HashSet (better for small sizes)
+        let mut unique_set = HashSet::<String>::with_capacity(ids.len());
+        ids.iter()
+            .map(|&id| {
+                if unique_set.insert(id.to_string()) {
+                    if existing_ids.is_some_and(|existing| existing.contains(id)) {
+                        return Err(DataFusionError::Execution(format!(
+                            "Primary key ({id}) already exists and is not unique"
+                        )));
+                    }
+                    Ok(())
+                } else {
+                    Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-    Ok(unique_set)
+        Ok(unique_set)
+    }
 }
 
 /// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
@@ -493,15 +525,34 @@ fn filter_existing(
         return Ok(());
     }
 
+    // Optimization: For large key sets, convert to sorted vector for binary search
+    // Binary search is O(log n) vs HashSet's O(1), but has better cache locality
+    // and can be faster for moderately sized sets due to fewer cache misses
+    let use_sorted_search = overwriting_primary_keys.len() > 1000;
+    let sorted_keys = if use_sorted_search {
+        let mut keys: Vec<&str> = overwriting_primary_keys.iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        Some(keys)
+    } else {
+        None
+    };
+
     // Instead of concatenating, we can filter each batch individually
     let mut filtered = Vec::with_capacity(existing_batches.len());
     for batch in existing_batches.drain(..) {
         let keys = extract_primary_keys_str(&batch, pk_indices_ordered)?;
 
+        // Pre-allocate with exact capacity for better performance
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
+        
         for k in keys {
             if let Some(k) = k {
-                keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+                let should_remove = if let Some(ref sorted) = sorted_keys {
+                    sorted.binary_search(&k.as_str()).is_ok()
+                } else {
+                    overwriting_primary_keys.contains(&k)
+                };
+                keep_row_builder.append_value(!should_remove);
             } else {
                 unreachable!(
                     "Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion."

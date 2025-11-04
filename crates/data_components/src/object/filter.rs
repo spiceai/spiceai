@@ -21,7 +21,7 @@ use arrow::error::ArrowError;
 use arrow_array::BooleanArray;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::ColumnarValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use datafusion::{
@@ -83,20 +83,25 @@ pub fn filter_object_meta(
         ));
     };
 
+    // Optimization: Use the boolean mask directly instead of materializing to HashSet
+    // This avoids double materialization and leverages SIMD-optimized filtering
     let filtered_rb = filter_record_batch(&rb, bool_arr)?;
-    let valid_locations = filtered_rb
-        .column_by_name("location")
-        .ok_or_else(|| DataFusionError::Internal("location column not found".to_string()))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .map(|s| s.iter().flatten().collect::<HashSet<_>>())
-        .unwrap_or_default();
 
-    Ok(metas
-        .iter()
-        .filter(|m| valid_locations.contains(m.location.as_ref()))
-        .cloned()
-        .collect())
+    // If filtering removed all rows, return empty vector
+    if filtered_rb.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Extract the indices of rows that passed the filter by checking which positions
+    // in the original boolean array were true
+    let mut result = Vec::with_capacity(filtered_rb.num_rows());
+    for (idx, keep) in bool_arr.iter().enumerate() {
+        if keep == Some(true) {
+            result.push(metas[idx].clone());
+        }
+    }
+
+    Ok(result)
 }
 
 fn to_record_batch(metas: &[ObjectMeta]) -> Result<RecordBatch, ArrowError> {
