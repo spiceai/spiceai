@@ -158,16 +158,17 @@ jobs:
         run: |
           sudo apt update
           sudo apt install zstd -y
-          mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/lint.tar.zst ./ || true
+          mc cp spice-minio/benchmarks/caching/${{ github.ref_name }}/lint.tar.zst ./ || true
           if [ ! -f ./lint.tar.zst ]; then
-            mc cp spice-minio/spiceai-cache/trunk/lint.tar.zst ./ || true
+            mc cp spice-minio/benchmarks/caching//trunk/lint.tar.zst ./ || true
             if [ ! -f ./lint.tar.zst ]; then
               echo "No lint cache found"
               exit 0
             fi
           fi
 
-          tar --use-compress-program="zstd -d" -xf lint.tar.zst target/lint/x
+          tar --use-compress-program="zstd -d" -xf lint.tar.zst target/lint/
+          find target/lint/ -type f -exec touch {} +
 
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -180,7 +181,7 @@ jobs:
         run: |
           tar --use-compress-program="zstd -T0 -1" -cf lint.tar.zst target/lint/
           ls -lh lint.tar.zst
-          mc cp lint.tar.zst spice-minio/spiceai-cache/${{ github.ref_name }}/lint.tar.zst
+          mc cp lint.tar.zst spice-minio/benchmarks/caching/${{ github.ref_name }}/lint.tar.zst
 
       - name: force exit
         run: exit 1
