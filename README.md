@@ -210,7 +210,6 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `duckdb`   | Embedded [DuckDB][duckdb]        | Stable               | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres]  | Release Candidate    | N/A              |
 | `sqlite`   | Embedded [SQLite][sqlite]        | Release Candidate    | `memory`, `file` |
-| `turso`    | Embedded [Turso][turso]          | Alpha                | `memory`, `file` |
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
