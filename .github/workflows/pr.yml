@@ -59,10 +59,17 @@ jobs:
               - 'go.mod'
               - 'go.sum'
 
+      # Relevant changes are any code changes OR if this was workflow_dispatch
       - name: Check for relevant changes
         id: check_changes
         run: |
-          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ steps.changed-code-files.outputs.code_changes }}" == "true" ]]; then
+            echo "Detected relevant changes."
+            echo "relevant_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "No relevant changes detected."
+            echo "relevant_changes=false" >> $GITHUB_OUTPUT
+          fi
 
   lint:
     name: Run Go & Rust Linters and Build
