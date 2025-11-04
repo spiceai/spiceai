@@ -32,7 +32,6 @@ use spicepod::{
 use crate::utils::{runtime_ready_check, test_request_context};
 
 // Test data CSV content - use include_str! to embed the test data file
-const TEST_DATA_CSV: &str = include_str!("data/partition_test.csv");
 
 /// Execute a SQL query on the Spice runtime and return the results
 async fn execute_rt_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
