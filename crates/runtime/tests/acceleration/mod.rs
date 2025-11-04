@@ -36,6 +36,8 @@ mod file_watcher;
 mod on_conflict;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
+#[cfg(not(target_os = "windows"))]
+mod partition_by_cayenne;
 mod query_push_down;
 mod refresh;
 #[cfg(feature = "duckdb")]
