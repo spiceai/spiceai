@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use aws_config::timeout::TimeoutConfigBuilder;
@@ -223,7 +223,7 @@ async fn try_vector_table(
 
     let config = config_bldr.load().await;
 
-    let s3_vector_client = S3VectorClient::new(Client::new(&config), index_poll_interval);
+    let s3_vector_client = S3VectorClient::new(Arc::new(Client::new(&config)), index_poll_interval);
 
     let s3_vector_client =
         Arc::new(S3VectorRetryClientBuilder::new(Arc::new(s3_vector_client)).build())

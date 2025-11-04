@@ -70,6 +70,8 @@ pub struct MockData {
     pub vectors: HashMap<String, Vec<ListOutputVector>>,
     pub vector_counts: HashMap<String, usize>, // Track number of vectors per index
     pub quota_limits: HashMap<String, usize>,  // Configurable quota limits per index
+    pub list_indexes_calls: HashMap<String, usize>, // bucket -> call count
+    pub create_index_calls: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,6 +103,36 @@ impl MockClient {
         };
         *data.vector_counts.get(index_name).unwrap_or(&0)
     }
+
+    /// Get the call count for `list_indexes` on a specific bucket
+    #[must_use]
+    pub fn get_list_indexes_call_count(&self, bucket: &str) -> usize {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        *data.list_indexes_calls.get(bucket).unwrap_or(&0)
+    }
+
+    /// Get the total call count for `create_index`
+    #[must_use]
+    pub fn get_create_index_call_count(&self) -> usize {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.create_index_calls
+    }
+
+    /// Reset all call counts
+    pub fn reset_call_counts(&self) {
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.list_indexes_calls.clear();
+        data.create_index_calls = 0;
+    }
 }
 
 #[async_trait]
@@ -130,6 +162,7 @@ impl S3Vectors for MockClient {
         bucket_indexes.push(index_summary);
 
         data.vector_counts.insert(index_name.to_string(), 0);
+        data.create_index_calls += 1;
 
         Ok(CreateIndexOutput::builder().build())
     }
@@ -242,7 +275,7 @@ impl S3Vectors for MockClient {
         input: ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
         let bucket_name = input.vector_bucket_name().unwrap_or_default();
-        let data = match self.data.lock() {
+        let mut data = match self.data.lock() {
             Ok(lock) => lock,
             Err(e) => e.into_inner(),
         };
@@ -252,6 +285,11 @@ impl S3Vectors for MockClient {
         if let Some(prefix) = input.prefix() {
             bucket_indexes.retain(|idx| idx.index_name().starts_with(prefix));
         }
+
+        *data
+            .list_indexes_calls
+            .entry(bucket_name.to_string())
+            .or_insert(0) += 1;
 
         Ok(ListIndexesOutput::builder()
             .set_indexes(Some(bucket_indexes))
