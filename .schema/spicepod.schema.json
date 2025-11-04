@@ -177,7 +177,7 @@
         "partition_by": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/PartitionedBy"
           }
         },
         "primary_key": {
@@ -526,6 +526,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -998,6 +999,7 @@
           "additionalProperties": true
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -1041,6 +1043,7 @@
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "name",
         "dataset",
@@ -1162,6 +1165,7 @@
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "api_key"
       ]
@@ -1254,6 +1258,7 @@
           "additionalProperties": true
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -1345,6 +1350,51 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/ParamValue"
+      }
+    },
+    "PartitionedBy": {
+      "type": "object",
+      "properties": {
+        "expression": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "expression"
+      ]
+    },
+    "Query": {
+      "type": "object",
+      "properties": {
+        "memory_limit": {
+          "description": "Specifies the runtime memory limit. When configured, will spill to disk\n for supported queries larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spill_compression": {
+          "description": "Specifies the compression codec used when spilling data to disk.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpillCompression"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temp_directory": {
+          "description": "Configures where the runtime will store temporary files needed for operations like\n spilling to disk for queries & accelerations that are larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "ReadyState": {
@@ -1515,11 +1565,14 @@
             }
           ]
         },
-        "memory_limit": {
-          "description": "Specifies the runtime memory limit. When configured, will spill to disk\n for supported queries larger than memory.",
-          "type": [
-            "string",
-            "null"
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "output_level": {
@@ -1538,6 +1591,16 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "query": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Query"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "results_cache": {
           "anyOf": [
@@ -1561,13 +1624,6 @@
         },
         "telemetry": {
           "$ref": "#/$defs/TelemetryConfig"
-        },
-        "temp_directory": {
-          "description": "Configures where the runtime will store temporary files needed for operations like\n spilling to disk for queries & accelerations that are larger than memory.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "tls": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
@@ -1656,6 +1712,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -1732,6 +1789,14 @@
         "v1"
       ]
     },
+    "SpillCompression": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "lz4_frame",
+        "uncompressed"
+      ]
+    },
     "TaskHistory": {
       "type": "object",
       "properties": {
@@ -1739,9 +1804,27 @@
           "type": "string",
           "default": "none"
         },
+        "captured_plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "enabled": {
           "type": "boolean",
           "default": true
+        },
+        "min_plan_duration": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_sql_duration": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "retention_check_interval": {
           "type": "string",
@@ -1871,6 +1954,7 @@
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -1936,7 +2020,7 @@
         "partition_by": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/PartitionedBy"
           }
         }
       },
@@ -1996,8 +2080,19 @@
             "string",
             "null"
           ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -2041,6 +2136,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
