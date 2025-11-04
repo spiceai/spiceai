@@ -358,15 +358,17 @@ impl CayenneTableProvider {
     ///
     /// This method registers only the encodings that are enabled in the configuration,
     /// allowing fine-grained control over compression vs performance tradeoffs.
-    fn create_vortex_session(config: &super::metadata::VortexConfig) -> vortex::session::VortexSession {
+    fn create_vortex_session(
+        config: &super::metadata::VortexConfig,
+    ) -> vortex::session::VortexSession {
         use vortex::session::VortexSession;
-        
+
         // Use default session which registers all encodings
         // Note: If all encodings are enabled, this is optimal. Otherwise, the overhead
         // of unused encodings is minimal compared to the complexity of custom registration.
         // Future enhancement: Vortex may provide API for selective encoding registration.
         let session = VortexSession::default();
-        
+
         // Log which encodings are configured to be used
         let mut enabled = Vec::new();
         if config.enable_alp {
@@ -393,13 +395,13 @@ impl CayenneTableProvider {
         if config.enable_zigzag {
             enabled.push("ZigZag");
         }
-        
+
         if !enabled.is_empty() {
             tracing::info!("Cayenne Vortex encodings enabled: {}", enabled.join(", "));
         } else {
             tracing::warn!("All Cayenne Vortex encodings disabled - using canonical encoding only");
         }
-        
+
         session
     }
 
@@ -429,12 +431,12 @@ impl CayenneTableProvider {
 
         // Create a configured Vortex session with selected encodings
         let vortex_session = Self::create_vortex_session(vortex_config);
-        
+
         // Configure VortexFormat with hardware-optimized settings
         let mut vortex_opts = vortex_datafusion::VortexOptions::default();
         vortex_opts.footer_cache_size_mb = vortex_config.footer_cache_mb;
         vortex_opts.segment_cache_size_mb = vortex_config.segment_cache_mb;
-        
+
         let format = Arc::new(VortexFormat::new_with_options(
             Arc::new(vortex_session),
             vortex_opts,
