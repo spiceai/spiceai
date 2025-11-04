@@ -405,6 +405,9 @@ impl CayenneTableProvider {
     /// For full refresh mode, after the new snapshot is written and the catalog is updated,
     /// old snapshot directories are no longer needed and can be physically deleted.
     ///
+    /// This function performs blocking filesystem I/O and should be called from within
+    /// `tokio::task::spawn_blocking` to avoid blocking the async runtime thread pool.
+    ///
     /// # Arguments
     ///
     /// * `table_path` - Base path for the table
@@ -414,7 +417,12 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if snapshot directories cannot be listed or deleted.
-    async fn cleanup_old_snapshots(
+    ///
+    /// # Blocking I/O Warning
+    ///
+    /// This function uses `std::fs` for filesystem operations and will block the calling thread.
+    /// It must be called from within `tokio::task::spawn_blocking`.
+    fn cleanup_old_snapshots_blocking(
         table_path: &str,
         table_id: i64,
         current_snapshot_id: &str,
@@ -432,17 +440,13 @@ impl CayenneTableProvider {
             current_snapshot_id
         );
 
-        // Read all entries in the table directory
-        let mut entries = tokio::fs::read_dir(&table_dir)
-            .await
-            .map_err(|source| CatalogError::IoError { source })?;
+        // Read all entries in the table directory using blocking I/O
+        let entries =
+            std::fs::read_dir(&table_dir).map_err(|source| CatalogError::IoError { source })?;
 
         let mut deleted_count = 0;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|source| CatalogError::IoError { source })?
-        {
+        for entry_result in entries {
+            let entry = entry_result.map_err(|source| CatalogError::IoError { source })?;
             let path = entry.path();
 
             // Only process directories (snapshots)
@@ -461,16 +465,14 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            // Delete the old snapshot directory
+            // Delete the old snapshot directory using blocking I/O
             tracing::info!(
                 "Deleting old snapshot directory for table {}: {}",
                 table_id,
                 snapshot_id
             );
 
-            tokio::fs::remove_dir_all(&path)
-                .await
-                .map_err(|source| CatalogError::IoError { source })?;
+            std::fs::remove_dir_all(&path).map_err(|source| CatalogError::IoError { source })?;
 
             deleted_count += 1;
         }
@@ -1175,13 +1177,13 @@ impl TableProvider for CayenneTableProvider {
             *listing_table_guard = new_listing_table;
 
             // Trigger cleanup of old snapshot directories after successful full refresh
-            // This is fire-and-forget to avoid blocking the refresh operation
+            // This is fire-and-forget using spawn_blocking to avoid blocking the async runtime
             let table_path = self.table_metadata.path.clone();
             let table_id = self.table_metadata.table_id;
             let current_snapshot = new_snapshot_id.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
                 if let Err(e) =
-                    Self::cleanup_old_snapshots(&table_path, table_id, &current_snapshot).await
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
                 {
                     tracing::warn!(
                         "Failed to cleanup old snapshots for table {}: {e}",
