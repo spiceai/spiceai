@@ -147,12 +147,13 @@ mod tests {
             ),
         ];
 
-        for (input, expected) in test_cases {
-            let path_regex = regex::Regex::new(super::CAYENNE_PATH_FILTER_PATTERN)
-                .map_err(|e| format!("{e}"))?;
-            let range_regex = regex::Regex::new(super::VORTEX_RANGE_FILTER_PATTERN)
-                .map_err(|e| format!("{e}"))?;
+        // Compile regexes once outside the loop to avoid repeated compilation overhead
+        let path_regex =
+            regex::Regex::new(super::CAYENNE_PATH_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        let range_regex =
+            regex::Regex::new(super::VORTEX_RANGE_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
 
+        for (input, expected) in test_cases {
             let path_redacted =
                 path_regex.replace_all(input, super::CAYENNE_PATH_FILTER_REPLACEMENT);
             let fully_redacted = range_regex

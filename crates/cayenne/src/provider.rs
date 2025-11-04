@@ -69,14 +69,23 @@ const DEFAULT_DATA_FILE_ID: i64 = 0;
 ///
 /// This wraps another execution plan and removes rows whose positions
 /// match the deleted row IDs loaded from deletion vector files.
+///
+/// # Zero-Copy Design
+///
+/// The deleted row IDs are wrapped in `Arc` to enable zero-copy sharing across
+/// concurrent scans. This avoids cloning potentially large `HashSet`s on every scan,
+/// aligning with the project's zero-copy principles for Arrow data.
 struct DeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    deleted_row_ids: std::collections::HashSet<i64>,
+    deleted_row_ids: Arc<std::collections::HashSet<i64>>,
     properties: datafusion_physical_plan::PlanProperties,
 }
 
 impl DeletionFilterExec {
-    fn new(input: Arc<dyn ExecutionPlan>, deleted_row_ids: std::collections::HashSet<i64>) -> Self {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        deleted_row_ids: Arc<std::collections::HashSet<i64>>,
+    ) -> Self {
         let properties = input.properties().clone();
         Self {
             input,
@@ -130,7 +139,7 @@ impl ExecutionPlan for DeletionFilterExec {
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            self.deleted_row_ids.clone(),
+            Arc::clone(&self.deleted_row_ids),
         )))
     }
 
@@ -140,7 +149,8 @@ impl ExecutionPlan for DeletionFilterExec {
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let deleted_row_ids = self.deleted_row_ids.clone();
+        // Zero-copy Arc clone - just increments reference count
+        let deleted_row_ids = Arc::clone(&self.deleted_row_ids);
         let schema = input_stream.schema();
 
         Ok(Box::pin(DeletionFilterStream {
@@ -155,7 +165,7 @@ impl ExecutionPlan for DeletionFilterExec {
 /// Stream that filters out deleted rows from an input stream.
 struct DeletionFilterStream {
     input: SendableRecordBatchStream,
-    deleted_row_ids: std::collections::HashSet<i64>,
+    deleted_row_ids: Arc<std::collections::HashSet<i64>>,
     schema: arrow_schema::SchemaRef,
     global_row_offset: i64,
 }
@@ -312,7 +322,9 @@ pub struct CayenneTableProvider {
     /// Cached deletion vectors (deleted row IDs) to avoid repeated metastore queries on every scan.
     /// This is loaded once during table provider initialization and invalidated when delete files change.
     /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
-    cached_deleted_row_ids: Arc<RwLock<std::collections::HashSet<i64>>>,
+    /// The inner `Arc<HashSet<i64>>` enables zero-copy sharing: scans clone the Arc (cheap ref count
+    /// increment) rather than cloning the entire `HashSet`, aligning with zero-copy principles.
+    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -454,7 +466,8 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
-            cached_deleted_row_ids: Arc::new(RwLock::new(deleted_row_ids)),
+            // Wrap in Arc for zero-copy sharing across concurrent scans
+            cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
         })
     }
 
@@ -641,9 +654,9 @@ impl CayenneTableProvider {
         // Delegate to ListingTable's insert_into to write Vortex files
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                super::catalog::CatalogError::InvalidOperation {
-                    message: format!("Failed to acquire read lock on listing table: {e}"),
+            let guard = self.listing_table.read().map_err(|_| {
+                super::catalog::CatalogError::LockPoisoned {
+                    operation: "insert (read listing table)".to_string(),
                 }
             })?;
             Arc::clone(&guard)
@@ -775,11 +788,12 @@ impl CayenneTableProvider {
         let mut guard =
             self.cached_deleted_row_ids
                 .write()
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: format!("Failed to acquire write lock on deletion cache: {e}"),
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "refresh deletion cache (write)".to_string(),
                 })?;
 
-        *guard = deleted_row_ids;
+        // Replace with new Arc-wrapped HashSet for zero-copy sharing
+        *guard = Arc::new(deleted_row_ids);
 
         tracing::debug!(
             "Refreshed deletion cache for table {} ({} deleted rows)",
@@ -850,11 +864,12 @@ impl CayenneTableProvider {
         )?;
 
         // Update the listing table with write lock
-        let mut guard = self.listing_table.write().map_err(|e| {
-            super::catalog::CatalogError::InvalidOperation {
-                message: format!("Failed to acquire write lock for listing table refresh: {e}"),
-            }
-        })?;
+        let mut guard =
+            self.listing_table
+                .write()
+                .map_err(|_| super::catalog::CatalogError::LockPoisoned {
+                    operation: "refresh listing table (write)".to_string(),
+                })?;
         *guard = new_listing_table;
 
         tracing::debug!(
@@ -1028,10 +1043,12 @@ impl TableProvider for CayenneTableProvider {
         // Delegate to the underlying listing table first
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
+                    This indicates an internal error that requires restarting the runtime."
+                        .to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1042,13 +1059,16 @@ impl TableProvider for CayenneTableProvider {
         // Use cached deletion vectors instead of querying the catalog on every scan.
         // This dramatically improves concurrent query performance by avoiding repeated
         // SQLite queries and spawn_blocking tasks.
+        // Zero-copy Arc clone: just increments reference count, no HashSet allocation.
         let deleted_row_ids = {
-            let guard = self.cached_deleted_row_ids.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on deletion cache: {e}"
-                ))
+            let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
+                    This indicates an internal error that requires restarting the runtime."
+                        .to_string(),
+                )
             })?;
-            guard.clone()
+            Arc::clone(&guard)
         };
 
         // If there are any deleted rows, apply filtering
@@ -1070,10 +1090,12 @@ impl TableProvider for CayenneTableProvider {
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
         // Synchronous method - clone Arc quickly and release lock immediately
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
+                    This indicates an internal error that requires restarting the runtime."
+                        .to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1161,10 +1183,12 @@ impl TableProvider for CayenneTableProvider {
 
             // Update the provider's listing table to point to the new snapshot
             // This ensures subsequent queries in the same context will read from the new data
-            let mut listing_table_guard = self.listing_table.write().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire write lock on listing table: {e}"
-                ))
+            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
+                    This indicates an internal error that requires restarting the runtime."
+                        .to_string(),
+                )
             })?;
             *listing_table_guard = new_listing_table;
 
@@ -1183,10 +1207,12 @@ impl TableProvider for CayenneTableProvider {
 
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
+                    This indicates an internal error that requires restarting the runtime."
+                        .to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1235,8 +1261,9 @@ struct CayenneDeletionSink {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     schema: SchemaRef,
     filters: Vec<Expr>,
-    /// Reference to the cached deletion vectors to invalidate after writing new deletions
-    cached_deleted_row_ids: Arc<RwLock<std::collections::HashSet<i64>>>,
+    /// Reference to the cached deletion vectors to invalidate after writing new deletions.
+    /// Uses Arc-wrapped `HashSet` for zero-copy sharing across concurrent operations.
+    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
 }
 
 impl CayenneDeletionSink {
@@ -1246,7 +1273,7 @@ impl CayenneDeletionSink {
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
         schema: SchemaRef,
         filters: &[Expr],
-        cached_deleted_row_ids: Arc<RwLock<std::collections::HashSet<i64>>>,
+        cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -1380,15 +1407,24 @@ impl CayenneDeletionSink {
             .map_err(catalog_error_to_box)?;
 
         // Update the cached deletion vectors with the newly deleted row IDs
-        // This avoids needing to reload from SQLite on the next scan
+        // This avoids needing to reload from SQLite on the next scan.
+        // We create a new Arc with the updated HashSet to maintain zero-copy semantics
+        // for concurrent readers who still hold references to the old Arc.
         {
-            let mut guard = self
-                .cached_deleted_row_ids
-                .write()
-                .map_err(|e| format!("Failed to acquire write lock on deletion cache: {e}"))?;
+            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
+                "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
+                This indicates an internal error that requires restarting the runtime."
+                    .to_string()
+            })?;
+
+            // Clone the current HashSet and add new deletions
+            let mut updated_set = (**guard).clone();
             for row_id in &result.row_ids {
-                guard.insert(*row_id);
+                updated_set.insert(*row_id);
             }
+
+            // Replace with new Arc - concurrent readers still have old Arc
+            *guard = Arc::new(updated_set);
         }
 
         let deleted_count = convert_to_u64_box(result.row_ids.len(), "deleted row count")?;
@@ -1449,10 +1485,11 @@ impl DeletionSink for CayenneDeletionSink {
         let ctx = SessionContext::new();
 
         let listing_table = {
-            let guard = self
-                .listing_table
-                .read()
-                .map_err(|e| format!("Failed to acquire read lock on listing table: {e}"))?;
+            let guard = self.listing_table.read().map_err(|_| {
+                "Lock poisoned on listing table: a thread panicked while holding this lock. \
+                This indicates an internal error that requires restarting the runtime."
+                    .to_string()
+            })?;
             Arc::clone(&guard)
         };
 
