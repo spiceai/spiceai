@@ -46,9 +46,9 @@ description: "Query: tpcds_q96"
 |               |                               HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_hdemo_sk@1, hd_demo_sk@0)], projection=[ss_sold_time_sk@0, ss_store_sk@2]     |
 |               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                          |
 |               |                                   RepartitionExec: partitioning=Hash([ss_hdemo_sk@1], 32), input_partitions=32                                                       |
-|               |                                     BytesProcessedExec                                                                                                               |
-|               |                                       SchemaCastScanExec                                                                                                             |
-|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                        |
+|               |                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                            |
+|               |                                       BytesProcessedExec                                                                                                             |
+|               |                                         SchemaCastScanExec                                                                                                           |
 |               |                                           FallbackOnZeroResultsScanExec                                                                                              |
 |               |                                             CoalescePartitionsExec                                                                                                   |
 |               |                                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                  |
@@ -60,8 +60,8 @@ description: "Query: tpcds_q96"
 |               |                                       BytesProcessedExec                                                                                                             |
 |               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                  |
 |               |                                           FilterExec: hd_dep_count@1 = 5                                                                                             |
-|               |                                             SchemaCastScanExec                                                                                                       |
-|               |                                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                  |
+|               |                                             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                    |
+|               |                                               SchemaCastScanExec                                                                                                     |
 |               |                                                 FallbackOnZeroResultsScanExec                                                                                        |
 |               |                                                   CoalescePartitionsExec                                                                                             |
 |               |                                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                            |
@@ -73,8 +73,8 @@ description: "Query: tpcds_q96"
 |               |                               BytesProcessedExec                                                                                                                     |
 |               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                          |
 |               |                                   FilterExec: t_hour@1 = 8 AND t_minute@2 >= 30                                                                                      |
-|               |                                     SchemaCastScanExec                                                                                                               |
-|               |                                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                          |
+|               |                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                            |
+|               |                                       SchemaCastScanExec                                                                                                             |
 |               |                                         FallbackOnZeroResultsScanExec                                                                                                |
 |               |                                           CoalescePartitionsExec                                                                                                     |
 |               |                                             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                    |
@@ -86,8 +86,8 @@ description: "Query: tpcds_q96"
 |               |                       BytesProcessedExec                                                                                                                             |
 |               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                  |
 |               |                           FilterExec: s_store_name@1 = ese                                                                                                           |
-|               |                             SchemaCastScanExec                                                                                                                       |
-|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                  |
+|               |                             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                    |
+|               |                               SchemaCastScanExec                                                                                                                     |
 |               |                                 FallbackOnZeroResultsScanExec                                                                                                        |
 |               |                                   CoalescePartitionsExec                                                                                                             |
 |               |                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                            |
