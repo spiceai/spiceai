@@ -78,7 +78,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Use the test data file from the data directory
-            // When running tests, current dir is /Users/lukim/dev/spice2/crates/runtime
+            // When running tests, the current directory is typically the crate root.
             let test_file = std::env::current_dir()
                 .map_err(|e| anyhow::anyhow!("Failed to get current directory: {e}"))?
                 .join("tests/acceleration/data/partition_test.csv");
