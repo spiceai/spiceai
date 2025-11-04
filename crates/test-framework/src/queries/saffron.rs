@@ -127,6 +127,7 @@ fn generate_queries_with_dynamic_parameters(
 }
 
 /// Build a parameter set dynamically from a record and return the complete query.
+#[allow(clippy::too_many_lines)]
 fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) -> Query {
     let qtype = query.name.strip_prefix("saffron_").unwrap_or(&query.name);
 
@@ -189,6 +190,44 @@ fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) 
             ParameterValue::Number(i64::from(record.available_for_number_selection > 0)), // selectA2pNumber flag
             ParameterValue::String(record.capability.clone().into()),
             ParameterValue::Number(0), // LIMIT offset
+        ]),
+        "q7" => Some(vec![
+            ParameterValue::String(record.number_pool_sid.clone().into()),
+            ParameterValue::String(record.account_sid.clone().into()),
+            ParameterValue::String(record.number_region.clone().into()), // SupportedDestRegion filter
+            ParameterValue::String(record.number_region.clone().into()), // NumberRegion filter
+            ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+            ParameterValue::String(record.capability.clone().into()),
+            ParameterValue::Number(20), // LIMIT value
+        ]),
+        "q8" => Some(vec![
+            ParameterValue::String(record.account_sid.clone().into()),
+            ParameterValue::String(record.number_pool_sid.clone().into()),
+            ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+            ParameterValue::String(record.capability.clone().into()),
+            ParameterValue::Number(20), // LIMIT value
+        ]),
+        "q9" => Some(vec![
+            ParameterValue::String(record.account_sid.clone().into()),
+            ParameterValue::String(record.number_pool_sid.clone().into()),
+            ParameterValue::String(record.number_type.clone().into()), // SenderType
+            ParameterValue::Number(0), // OFFSET value (default to first record)
+        ]),
+        "q10" => Some(vec![
+            ParameterValue::String(record.account_sid.clone().into()),
+            ParameterValue::String(record.number_pool_sid.clone().into()),
+            ParameterValue::String(record.number_type.clone().into()), // SenderType
+            ParameterValue::String(record.number_region.clone().into()), // Region
+            ParameterValue::Number(0), // OFFSET value (default to first record)
+        ]),
+        "q11" => Some(vec![
+            ParameterValue::String(record.account_sid.clone().into()),
+            ParameterValue::String(record.number_pool_sid.clone().into()),
+            ParameterValue::String(record.number_did.clone().into()), // NumberDid for identity lookup
+        ]),
+        "q12" => Some(vec![
+            ParameterValue::String(record.account_sid.clone().into()),
+            ParameterValue::String(record.number_did.clone().into()), // NumberDid used as SenderIdentity
         ]),
         _ => None,
     };
