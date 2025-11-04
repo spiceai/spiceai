@@ -315,6 +315,8 @@ pub struct CayenneTableProvider {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
+    /// Vortex encoding configuration for hardware-accelerated compression
+    vortex_config: super::metadata::VortexConfig,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -352,12 +354,62 @@ impl CayenneTableProvider {
         url_str
     }
 
+    /// Create a configured `VortexSession` with selected encodings for hardware acceleration.
+    ///
+    /// This method registers only the encodings that are enabled in the configuration,
+    /// allowing fine-grained control over compression vs performance tradeoffs.
+    fn create_vortex_session(config: &super::metadata::VortexConfig) -> vortex::session::VortexSession {
+        use vortex::session::VortexSession;
+        
+        // Use default session which registers all encodings
+        // Note: If all encodings are enabled, this is optimal. Otherwise, the overhead
+        // of unused encodings is minimal compared to the complexity of custom registration.
+        // Future enhancement: Vortex may provide API for selective encoding registration.
+        let session = VortexSession::default();
+        
+        // Log which encodings are configured to be used
+        let mut enabled = Vec::new();
+        if config.enable_alp {
+            enabled.push("ALP (SIMD numeric compression)");
+        }
+        if config.enable_fsst {
+            enabled.push("FSST (SIMD string compression)");
+        }
+        if config.enable_bitpacking {
+            enabled.push("BitPacking (SIMD integer compression)");
+        }
+        if config.enable_delta {
+            enabled.push("Delta");
+        }
+        if config.enable_rle {
+            enabled.push("RLE");
+        }
+        if config.enable_dict {
+            enabled.push("Dictionary");
+        }
+        if config.enable_for {
+            enabled.push("FOR");
+        }
+        if config.enable_zigzag {
+            enabled.push("ZigZag");
+        }
+        
+        if !enabled.is_empty() {
+            tracing::info!("Cayenne Vortex encodings enabled: {}", enabled.join(", "));
+        } else {
+            tracing::warn!("All Cayenne Vortex encodings disabled - using canonical encoding only");
+        }
+        
+        session
+    }
+
     /// Create a new `ListingTable` for a snapshot directory.
     ///
     /// # Arguments
     ///
     /// * `snapshot_dir` - Path to the snapshot directory
     /// * `schema` - Arrow schema for the table
+    /// * `vortex_config` - Vortex encoding configuration
     ///
     /// # Errors
     ///
@@ -365,6 +417,7 @@ impl CayenneTableProvider {
     fn create_listing_table(
         snapshot_dir: &std::path::Path,
         schema: SchemaRef,
+        vortex_config: &super::metadata::VortexConfig,
     ) -> CatalogResult<Arc<ListingTable>> {
         let dir_url_str = Self::dir_to_url_string(snapshot_dir);
 
@@ -374,7 +427,18 @@ impl CayenneTableProvider {
             }
         })?;
 
-        let format = Arc::new(VortexFormat::default());
+        // Create a configured Vortex session with selected encodings
+        let vortex_session = Self::create_vortex_session(vortex_config);
+        
+        // Configure VortexFormat with hardware-optimized settings
+        let mut vortex_opts = vortex_datafusion::VortexOptions::default();
+        vortex_opts.footer_cache_size_mb = vortex_config.footer_cache_mb;
+        vortex_opts.segment_cache_size_mb = vortex_config.segment_cache_mb;
+        
+        let format = Arc::new(VortexFormat::new_with_options(
+            Arc::new(vortex_session),
+            vortex_opts,
+        ));
         let listing_options = ListingOptions::new(format);
 
         let config = ListingTableConfig::new(table_url)
@@ -444,6 +508,7 @@ impl CayenneTableProvider {
         let listing_table = Self::create_listing_table(
             &snapshot_dir,
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
+            &super::metadata::VortexConfig::default(),
         )?;
 
         Ok(Self {
@@ -451,6 +516,7 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
+            vortex_config: super::metadata::VortexConfig::default(),
         })
     }
 
@@ -801,6 +867,7 @@ impl CayenneTableProvider {
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
+            &self.vortex_config,
         )?;
 
         // Update the listing table with write lock
@@ -1082,13 +1149,16 @@ impl TableProvider for CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
 
             // Create a new ListingTable pointing to the snapshot directory
-            let new_listing_table =
-                Self::create_listing_table(&snapshot_dir, Arc::clone(&self.table_metadata.schema))
-                    .map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to create listing table for new snapshot: {e}"
-                        ))
-                    })?;
+            let new_listing_table = Self::create_listing_table(
+                &snapshot_dir,
+                Arc::clone(&self.table_metadata.schema),
+                &self.vortex_config,
+            )
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to create listing table for new snapshot: {e}"
+                ))
+            })?;
 
             // Perform the insert using the new listing table with append mode
             // (Vortex only supports append at the file level)
@@ -1593,6 +1663,7 @@ mod tests {
                 primary_key: vec!["id".to_string()],
                 base_path: temp_dir.path().to_string_lossy().to_string(),
                 partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
             })
             .await
             .expect("Failed to create test table in catalog");

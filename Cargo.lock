@@ -2977,7 +2977,20 @@ dependencies = [
  "tracing",
  "turso",
  "uuid 1.18.1",
+ "vortex",
+ "vortex-alp",
+ "vortex-array",
+ "vortex-bytebool",
  "vortex-datafusion",
+ "vortex-datetime-parts",
+ "vortex-decimal-byte-parts",
+ "vortex-dict",
+ "vortex-fastlanes",
+ "vortex-fsst",
+ "vortex-runend",
+ "vortex-sequence",
+ "vortex-sparse",
+ "vortex-zigzag",
 ]
 
 [[package]]

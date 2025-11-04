@@ -36,6 +36,20 @@ tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 uuid = { version = "1.11", features = ["v7"] }
 vortex-datafusion = { workspace = true }
+# Vortex encoding dependencies for hardware-accelerated compression
+vortex = "0.54.0"
+vortex-alp = "0.54.0"
+vortex-array = "0.54.0"
+vortex-bytebool = "0.54.0"
+vortex-datetime-parts = "0.54.0"
+vortex-decimal-byte-parts = "0.54.0"
+vortex-dict = "0.54.0"
+vortex-fastlanes = "0.54.0"
+vortex-fsst = "0.54.0"
+vortex-runend = "0.54.0"
+vortex-sequence = "0.54.0"
+vortex-sparse = "0.54.0"
+vortex-zigzag = "0.54.0"
 
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
