@@ -111,6 +111,23 @@
       "preLaunchTask": "rust: cargo build testoperator"
     },
     {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Dispatch)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "dispatch",
+        "./tools/testoperator/dispatch/customers/saffron/sf1",
+        "--workflow",
+        "bench",
+        "--github-token",
+        "<GITHUB_TOKEN>"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
       "name": "spice version",
       "type": "go",
       "request": "launch",
