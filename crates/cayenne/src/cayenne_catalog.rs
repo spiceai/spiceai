@@ -448,14 +448,20 @@ impl MetadataCatalog for CayenneCatalog {
 
                 // Parse primary key
                 let primary_key = if let Some(pk_json) = primary_key_json {
-                    serde_json::from_str(&pk_json).unwrap_or_default()
+                    serde_json::from_str(&pk_json).map_err(|e| CatalogError::InvalidOperation {
+                        message: format!("Failed to deserialize primary key: {e}"),
+                    })?
                 } else {
                     vec![]
                 };
 
-                // Parse vortex config, use default if not present or invalid
+                // Parse vortex config
                 let vortex_config = if let Some(config_json) = vortex_config_json {
-                    serde_json::from_str(&config_json).unwrap_or_default()
+                    serde_json::from_str(&config_json).map_err(|e| {
+                        CatalogError::InvalidOperation {
+                            message: format!("Failed to deserialize vortex config: {e}"),
+                        }
+                    })?
                 } else {
                     super::metadata::VortexConfig::default()
                 };
