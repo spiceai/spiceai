@@ -24,4 +24,5 @@ tokio-stream.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+insta = { workspace = true, features = ["json"] }
 tempfile.workspace = true
