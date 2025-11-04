@@ -18,7 +18,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion::common::tree_node::TreeNode;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -32,6 +31,36 @@ use spicepod::{
 use crate::utils::{runtime_ready_check, test_request_context};
 
 // Test data CSV content - use include_str! to embed the test data file
+
+/// Sanitize file paths in physical plans for deterministic snapshots.
+/// Replaces absolute file paths with placeholders.
+fn sanitize_file_paths(plan: &str) -> String {
+    // Replace absolute paths in file_groups with placeholder
+    let mut result = String::new();
+    for line in plan.lines() {
+        if line.contains("file_groups={") {
+            // Find the start of file_groups
+            if let Some(fg_start) = line.find("file_groups=") {
+                // Find the closing ]]}
+                if let Some(fg_end) = line[fg_start..].find("]]}") {
+                    let prefix = &line[..fg_start];
+                    let suffix = &line[fg_start + fg_end + 3..];
+                    result.push_str(prefix);
+                    result.push_str("file_groups={1 group: [[<TEMP_PATH>/.vortex]]}");
+                    result.push_str(suffix);
+                } else {
+                    result.push_str(line);
+                }
+            } else {
+                result.push_str(line);
+            }
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+    result
+}
 
 /// Execute a SQL query on the Spice runtime and return the results
 async fn execute_rt_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
@@ -146,7 +175,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("bucket_partition_full_scan", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("bucket_partition_full_scan", sanitized_plan);
 
             // Test 2: Query with id = 1 filter - should only scan partition containing id=1
             let result = execute_rt_sql(&rt, "SELECT * FROM bucket_test WHERE id = 1").await?;
@@ -155,7 +185,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id = 1").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("bucket_partition_id_equals_filter", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("bucket_partition_id_equals_filter", sanitized_plan);
 
             // Test 3: Query with id IN (1, 5) - may scan 1 or 2 partitions depending on hash
             let result = execute_rt_sql(
@@ -169,7 +200,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             let plan =
                 get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id IN (1, 5)").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("bucket_partition_id_in_filter", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("bucket_partition_id_in_filter", sanitized_plan);
 
             // Test 4: Query with range filter - should push down filter to each partition
             // because bucket partitions contain multiple values
@@ -180,7 +212,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id >= 5").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("bucket_partition_id_range_filter", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("bucket_partition_id_range_filter", sanitized_plan);
 
             // Test 5: Query with filter on non-partition column - should scan all partitions
             let result = execute_rt_sql(
@@ -193,7 +226,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE score > 85").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("bucket_partition_non_partition_filter", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("bucket_partition_non_partition_filter", sanitized_plan);
 
             Ok(())
         })
@@ -216,7 +250,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
 
     test_request_context()
         .scope(async {
-            // Use the test data file from the data directory  
+            // Use the test data file from the data directory
             let test_file = std::env::current_dir()
                 .map_err(|e| anyhow::anyhow!("Failed to get current directory: {e}"))?
                 .join("tests/acceleration/data/partition_test.csv");
@@ -284,7 +318,8 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
 
             let plan = get_physical_plan(&rt, "SELECT * FROM multi_partition_test").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("multi_partition_full_scan", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("multi_partition_full_scan", sanitized_plan);
 
             // Test 2: Filter on first partition column (id)
             let result =
@@ -295,7 +330,8 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             let plan =
                 get_physical_plan(&rt, "SELECT * FROM multi_partition_test WHERE id = 1").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("multi_partition_id_filter", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("multi_partition_id_filter", sanitized_plan);
 
             // Test 3: Filter on second partition column (score range)
             let result = execute_rt_sql(
@@ -312,7 +348,8 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("multi_partition_score_range_filter", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("multi_partition_score_range_filter", sanitized_plan);
 
             // Test 4: Filter on both partition columns
             let result = execute_rt_sql(
@@ -329,7 +366,8 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            insta::assert_snapshot!("multi_partition_both_filters", plan_str);
+            let sanitized_plan = sanitize_file_paths(&plan_str);
+            insta::assert_snapshot!("multi_partition_both_filters", sanitized_plan);
 
             Ok(())
         })
