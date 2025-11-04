@@ -63,7 +63,7 @@ runAsRoot() {
         CMD="sudo $CMD"
     fi
 
-    $CMD
+    eval "$CMD"
 }
 
 checkHttpRequestCLI() {

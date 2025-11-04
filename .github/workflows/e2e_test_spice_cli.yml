@@ -33,7 +33,7 @@ jobs:
                 target_arch_go: "amd64",
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                runner: "macos-14",
+                runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
@@ -93,7 +93,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -101,7 +101,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os == 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -128,7 +128,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -231,7 +231,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -312,7 +312,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -374,7 +374,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -454,7 +454,7 @@ jobs:
       matrix:
         target:
           - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'macos-14'
+            runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
             target_arch_go: 'arm64'
@@ -464,7 +464,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -502,7 +502,7 @@ jobs:
       matrix:
         target:
           - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'macos-14'
+            runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
             target_arch_go: 'arm64'
@@ -512,7 +512,7 @@ jobs:
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

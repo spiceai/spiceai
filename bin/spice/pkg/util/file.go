@@ -28,7 +28,8 @@ import (
 )
 
 func SaveReaderToFile(reader io.Reader, fullFilePath string) error {
-	fileHandle, err := os.OpenFile(fullFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0766)
+	// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
+	fileHandle, err := os.OpenFile(fullFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
@@ -173,7 +174,9 @@ func ReplaceEnvVariablesFromPath(filePath string, envVarPrefix string) ([]byte, 
 }
 
 func MakeFileExecutable(filepath string) error {
-	return os.Chmod(filepath, 0777)
+	// Use 0755 (rwxr-xr-x) instead of 0777 to prevent world-writable executables
+	// Owner can read/write/execute, others can only read/execute
+	return os.Chmod(filepath, 0755)
 }
 
 func CopyFile(src string, dst string) error {

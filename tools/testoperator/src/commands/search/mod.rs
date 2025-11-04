@@ -17,7 +17,7 @@ limitations under the License.
 mod mteb_quora;
 
 use super::get_app_and_start_request;
-use crate::{args::SearchTestArgs, wait_test_and_memory};
+use crate::{args::SearchTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::{Duration, SystemTime};
 use test_framework::{
     TestType, anyhow, git,
@@ -70,6 +70,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     let index_finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
@@ -154,7 +155,13 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     telemetry.emit().await?;
 
+    let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+    let health_report = health_report?;
+
+    if let Some(message) = health_report.failure_message() {
+        return Err(anyhow::anyhow!(message));
+    }
 
     println!("Benchmark completed successfully!");
 

@@ -24,6 +24,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -38,9 +39,9 @@ pub struct DeltaLake {
 impl DeltaLake {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters) -> Self {
+    pub fn new(params: Parameters, io_runtime: Handle) -> Self {
         Self {
-            delta_table_factory: DeltaTableFactory::new(params.to_secret_map()),
+            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime),
         }
     }
 }
@@ -72,6 +73,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description("The AWS session token to use for S3 storage.")
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
@@ -116,7 +120,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
         Box::pin(async move {
             // Initialize the AWS SDK and make it available.
             let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
-            let delta = DeltaLake::new(params.parameters);
+            let delta = DeltaLake::new(params.parameters, params.io_runtime);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
     }

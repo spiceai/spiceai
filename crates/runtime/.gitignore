@@ -1,2 +1,4 @@
 abc-sqlite.db-wal
 abc-sqlite.db-shm
+*_turso.db
+*.db-wal

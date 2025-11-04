@@ -163,7 +163,10 @@ async fn get_m2m_access_token(
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     let token_endpoint_url = format!("https://{databricks_endpoint}/oidc/v1/token");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()?;
 
     let response = client
         .post(&token_endpoint_url)

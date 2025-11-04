@@ -80,5 +80,6 @@ sharepoint = []
 snowflake = []
 spark = []
 sqlite = []
+turso = []
 
 file_append = ["dep:duckdb"]

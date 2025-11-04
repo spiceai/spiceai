@@ -1,0 +1,26 @@
+[package]
+name = "runtime-datafusion"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+async-stream.workspace = true
+async-trait.workspace = true
+dashmap = "6.1.0"
+datafusion.workspace = true
+datafusion-federation = { workspace = true }
+futures.workspace = true
+opentelemetry.workspace = true
+runtime-request-context = { path = "../runtime-request-context" }
+tracing.workspace = true
+
+[dev-dependencies]
+datafusion-datasource.workspace = true
+tokio.workspace=true

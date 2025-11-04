@@ -61,6 +61,23 @@ jobs:
         id: setup-matrix
         with:
           script: |
+            // Check if this is a tagged release
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            
+            // Check if this is trunk or a release branch
+            const isTrunkOrRelease = context.ref === 'refs/heads/trunk' || 
+                                      context.ref.startsWith('refs/heads/release-') ||
+                                      context.ref.startsWith('refs/heads/release/');
+            
+            // Check if this is a manual workflow dispatch
+            const isManualDispatch = context.eventName === 'workflow_dispatch';
+            
+            // Include Windows only for trunk, release branches, tagged releases, or manual dispatch
+            const includeWindows = isTaggedRelease || isTrunkOrRelease || isManualDispatch;
+            
+            // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
+            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
+            
             const matrix = [
               {
                 name: "Linux x64",
@@ -78,23 +95,28 @@ jobs:
                 tags: ["default", "models"],
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                runner: "macos-14",
+                runner: macosRunner,
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
                 tags: ["default", "models", "metal"],
-              }, {
+              }
+            ];
+            
+            // Add Windows only for trunk, release branches, tagged releases, or manual dispatch
+            if (includeWindows) {
+              matrix.push({
                 name: "Windows x64",
                 runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models"],
-              }
-            ];
+              });
+            }
 
             // If running via workflow_dispatch, filter based on input
-            if (context.eventName === 'workflow_dispatch') {
+            if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
 
               if (platform_option === 'all') {
@@ -205,13 +227,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spiced.exe --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -245,13 +267,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'models')
         run: ./spiced.exe --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'models')
         with:
           name: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'models')
         with:
           name: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -274,7 +296,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         with:
           name: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -297,7 +319,7 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'darwin'
         with:
           name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -329,13 +351,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice.exe version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -384,22 +406,22 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: download artifacts - spice_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spice_linux_x86_64
 
       - name: download artifacts - spiced_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_linux_x86_64
 
       - name: download artifacts - spiced_models_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_models_linux_x86_64
 
       - name: download artifacts - spiced_odbc_models_linux_x86_64
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_odbc_models_linux_x86_64
 
@@ -438,42 +460,42 @@ jobs:
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
@@ -481,7 +503,7 @@ jobs:
       # macOS metal
       - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'darwin'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}

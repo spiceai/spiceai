@@ -28,6 +28,7 @@ use std::sync::Weak;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
+use tokio::runtime::Handle;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
@@ -92,7 +93,6 @@ pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
 pub mod embeddings;
-pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
@@ -263,7 +263,7 @@ pub enum Error {
     ExpectedAccelerationSettings { name: String },
 
     #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."
+        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
@@ -414,9 +414,6 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
-    #[snafu(display("Full text search is not supported for views."))]
-    FullTextSearchNotSupportedForView,
-
     #[cfg(feature = "cluster")]
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
@@ -448,6 +445,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
@@ -467,6 +465,7 @@ pub struct Runtime {
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
     rate_limits: Arc<RateLimits>,
+    io_runtime: Handle,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -478,6 +477,8 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+
+    #[allow(dead_code)] // used in "cluster" feature
     config: Arc<Config>,
 }
 
@@ -491,6 +492,12 @@ impl Runtime {
     #[must_use]
     pub fn builder() -> RuntimeBuilder {
         RuntimeBuilder::new()
+    }
+
+    /// Returns a handle to the Tokio runtime that should be used to spawn IO tasks.
+    #[must_use]
+    pub fn tokio_io_runtime(&self) -> Handle {
+        self.io_runtime.clone()
     }
 
     #[must_use]

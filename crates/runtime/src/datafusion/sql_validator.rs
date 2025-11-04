@@ -94,9 +94,7 @@ pub fn validate_sql_query_operations(
 mod tests {
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
-        datafusion::{
-            SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder, schema::SpiceSchemaProvider,
-        },
+        datafusion::{SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder},
         status::RuntimeStatus,
     };
 
@@ -104,7 +102,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
     use datafusion::{catalog::MemoryCatalogProvider, sql::TableReference};
+    use runtime_datafusion::schema_provider::SpiceSchemaProvider;
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -119,6 +119,7 @@ mod tests {
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
             )
             .build(),
         );

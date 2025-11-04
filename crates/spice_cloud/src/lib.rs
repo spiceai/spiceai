@@ -145,7 +145,11 @@ impl SpiceExtension {
         path: &str,
         body: Req,
     ) -> Result<Resp, Error> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
+            .build()
+            .context(UnableToConnectToSpiceCloudSnafu)?;
         let response = client
             .post(format!("{}{path}", self.spice_http_url()))
             .json(&body)
@@ -302,6 +306,8 @@ async fn get_spiceai_table_provider(
         });
     };
 
+    let io_runtime = runtime.tokio_io_runtime();
+
     let mut dataset = DatasetBuilder::try_new(cloud_dataset_path.to_string(), name)
         .boxed()
         .context(UnableToCreateDataConnectorSnafu)?
@@ -315,7 +321,7 @@ async fn get_spiceai_table_provider(
     dataset.replication = Some(Replication { enabled: true });
 
     let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
-        .build(secrets)
+        .build(secrets, io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
@@ -380,8 +386,9 @@ pub async fn create_synced_internal_accelerated_table(
         "spice.ai".to_string(),
         accelerated_table_provider,
         refresh,
+        runtime.tokio_io_runtime(),
     );
-    builder.tokio_runtime(runtime.datafusion().tokio_runtime().cloned());
+    builder.cpu_runtime(runtime.datafusion().cpu_runtime().cloned());
 
     builder.retention(retention);
 

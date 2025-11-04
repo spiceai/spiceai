@@ -131,7 +131,14 @@ impl CatalogConnector for UnityCatalog {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
 
-        let client = Arc::new(UnityCatalogClient::new(endpoint, token_provider));
+        let client = UnityCatalogClient::new(endpoint, token_provider).map_err(|source| {
+            super::Error::InternalWithSource {
+                connector: "unity_catalog".to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(source),
+            }
+        })?;
+        let client = Arc::new(client);
 
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =
@@ -157,8 +164,10 @@ impl CatalogConnector for UnityCatalog {
             connector_component: ConnectorComponent::from(catalog),
         })?;
 
-        let delta_table_creator =
-            Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>;
+        let delta_table_creator = Arc::new(DeltaTableFactory::new(
+            params.to_secret_map(),
+            runtime.tokio_io_runtime(),
+        )) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,

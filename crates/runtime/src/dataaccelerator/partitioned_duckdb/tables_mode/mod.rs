@@ -95,7 +95,12 @@ impl TablesModePartitionedDuckDBAccelerator {
             .file_path(source)
             .map_err(|e| super::Error::AccelerationInitializationFailed { source: e.into() })?;
 
-        get_pool(&self.duckdb_factory, &duckdb_path)
+        let pool_size = source
+            .acceleration()
+            .and_then(|accel| accel.params.get("connection_pool_size"))
+            .and_then(|size_str| size_str.parse::<u32>().ok());
+
+        get_pool(&self.duckdb_factory, &duckdb_path, pool_size)
             .await
             .context(FailedToCreateConnectionPoolSnafu)
     }
@@ -126,9 +131,11 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     }
 
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
-        duckdb_file_path(&self.duckdb_factory, source).map_err(|e| FilePathError::External {
-            engine: Engine::DuckDB,
-            source: e.into(),
+        duckdb_file_path(&self.duckdb_factory, source, &source.name().to_string()).map_err(|e| {
+            FilePathError::External {
+                engine: Engine::DuckDB,
+                source: e.into(),
+            }
         })
     }
 
@@ -185,7 +192,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
         if !cmd.options.contains_key("open") {
-            let duckdb_file = duckdb_file_path(&self.duckdb_factory, source)?;
+            let duckdb_file = self.file_path(source)?;
             cmd.options.insert("open".to_string(), duckdb_file);
         }
 
@@ -196,6 +203,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
                 cmd.clone(),
                 partition_by_first,
                 Arc::clone(&schema),
+                &self.duckdb_factory,
             )
             .await?,
         );
@@ -248,12 +256,11 @@ impl DuckDBPartitionCreator {
         cmd: CreateExternalTable,
         partition_by: PartitionedBy,
         schema: SchemaRef,
+        duckdb_factory: &DuckDBTableProviderFactory,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let duckdb_factory = create_factory();
-
         // We use the DuckDB factory to create a table provider in order to extract
         // target table definition and on_conflict settings that will be used directly for each partition.
-        let table_provider = create_table_provider(&duckdb_factory, &cmd)
+        let table_provider = create_table_provider(duckdb_factory, &cmd, None)
             .await
             .map_err(|e| format!("Failed to create table provider: {e}"))?;
 
@@ -405,10 +412,13 @@ fn create_factory() -> DuckDBTableProviderFactory {
 async fn get_pool(
     duckdb_factory: &DuckDBTableProviderFactory,
     duckdb_path: &str,
+    connection_pool_size: Option<u32>,
 ) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
     let pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
-        .with_max_size(Some(20))
-        .with_min_idle(Some(10));
+        .with_max_size(Some(connection_pool_size.unwrap_or(10)))
+        .with_min_idle(Some(
+            crate::dataaccelerator::duckdb::DEFAULT_MIN_IDLE_CONNECTIONS,
+        ));
     Ok(Arc::new(
         duckdb_factory
             .get_or_init_instance_with_builder(pool_builder)

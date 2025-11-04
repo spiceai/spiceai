@@ -234,13 +234,13 @@ pub fn initiate_config_with_credentials(
                 provider_name,
             );
 
-            aws_config::defaults(BehaviorVersion::v2025_01_17())
+            aws_config::defaults(BehaviorVersion::v2025_08_07())
                 .region(Region::new(region))
                 .credentials_provider(credentials)
         }
         _ => {
             // This will automatically load AWS credentials from the environment, via IAM roles if configured.
-            aws_config::defaults(BehaviorVersion::v2025_01_17()).region(Region::new(region))
+            aws_config::defaults(BehaviorVersion::v2025_08_07()).region(Region::new(region))
         }
     })
 }

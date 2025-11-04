@@ -538,7 +538,7 @@ func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest, c
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling search request body: %w", err)
 	}
-	return rtcontext.Do("POST", "/v1/search", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Cache-Control", cache_control)
+	return rtcontext.DoLongRunning("POST", "/v1/search", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Cache-Control", cache_control)
 }
 
 func init() {

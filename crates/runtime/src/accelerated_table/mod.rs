@@ -19,13 +19,9 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
+use crate::dataaccelerator::get_primary_keys_from_constraints;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
-use crate::execution_plan::TableScanParams;
-use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
-use crate::execution_plan::schema_cast::SchemaCastScanExec;
-use crate::execution_plan::slice::SliceExec;
-use crate::execution_plan::tee::TeeExec;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::SchemaRef;
@@ -49,6 +45,11 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
+use runtime_datafusion::execution_plan::{
+    TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
+    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec,
+};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
@@ -65,6 +66,8 @@ mod retention;
 mod sink;
 mod synchronized_table;
 mod timestamp_metrics_utils;
+
+pub use refresh_task_runner::RefreshTaskRunner;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -87,6 +90,14 @@ pub enum Error {
         "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
+
+    #[snafu(display(
+        "Failed to refresh dataset {dataset_name}: refresh worker panicked. {message}"
+    ))]
+    RefreshWorkerPanicked {
+        dataset_name: String,
+        message: String,
+    },
 
     #[snafu(display("Failed to refresh the dataset. {source}"))]
     FailedToTriggerRefresh {
@@ -161,6 +172,11 @@ pub enum AcceleratedTableBuilderError {
         "An append stream is required when `refresh_mode` is set to `append` without a `time_column`. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
     ))]
     AppendStreamRequired,
+
+    #[snafu(display(
+        "Append mode requires either `time_column` or `primary_key` to be specified in the dataset configuration. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+    ))]
+    NeitherTimeColumnNorPrimaryKey,
 
     #[snafu(display(
         "A synchronized accelerated table requires full refresh mode. Set `refresh_mode` to 'full', and try again."
@@ -247,7 +263,8 @@ pub struct Builder {
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
     metrics: Option<Metrics>,
-    tokio_runtime: Option<Handle>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
 }
 
 impl Builder {
@@ -258,6 +275,7 @@ impl Builder {
         federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             runtime_status,
@@ -281,7 +299,8 @@ impl Builder {
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
             metrics: None,
-            tokio_runtime: None,
+            cpu_runtime: None,
+            io_runtime,
         }
     }
 
@@ -325,8 +344,8 @@ impl Builder {
         self
     }
 
-    pub fn tokio_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
-        self.tokio_runtime = runtime;
+    pub fn cpu_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
+        self.cpu_runtime = runtime;
         self
     }
 
@@ -417,28 +436,61 @@ impl Builder {
     }
 
     /// Build the accelerated table
+    #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         let on_complete_notification = Arc::new(Notify::new());
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
             RefreshMode::Append => {
-                if self.refresh.time_column.is_none() {
-                    // Get the append stream
-                    let Some(append_stream) = self.append_stream else {
-                        return AppendStreamRequiredSnafu.fail();
-                    };
-                    (
-                        refresh::AccelerationRefreshMode::Changes(append_stream),
-                        None,
-                    )
-                } else {
-                    let (start_refresh, on_start_refresh) =
-                        mpsc::channel::<Option<RefreshOverrides>>(1);
-                    (
-                        refresh::AccelerationRefreshMode::Append(Some(on_start_refresh)),
-                        Some(start_refresh),
-                    )
+                enum AppendMode {
+                    TimeColumnOrPrimaryKey,
+                    ChangesStream,
+                }
+                impl AppendMode {
+                    fn try_new(
+                        has_time_column: bool,
+                        has_primary_key: bool,
+                        has_append_stream: bool,
+                    ) -> AcceleratedTableBuilderResult<Self> {
+                        if has_append_stream {
+                            Ok(AppendMode::ChangesStream)
+                        } else if has_time_column || has_primary_key {
+                            Ok(AppendMode::TimeColumnOrPrimaryKey)
+                        } else {
+                            NeitherTimeColumnNorPrimaryKeySnafu.fail()
+                        }
+                    }
+                }
+
+                let schema = self.accelerator.schema();
+                let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
+                    !get_primary_keys_from_constraints(constraints, &schema).is_empty()
+                });
+                let has_time_column = self.refresh.time_column.is_some();
+                let has_append_stream = self.append_stream.is_some();
+
+                let append_mode =
+                    AppendMode::try_new(has_time_column, has_primary_key, has_append_stream)?;
+
+                match append_mode {
+                    AppendMode::ChangesStream => {
+                        let Some(append_stream) = self.append_stream else {
+                            return AppendStreamRequiredSnafu.fail();
+                        };
+                        (
+                            refresh::AccelerationRefreshMode::Changes(append_stream),
+                            None,
+                        )
+                    }
+                    AppendMode::TimeColumnOrPrimaryKey => {
+                        let (start_refresh, on_start_refresh) =
+                            mpsc::channel::<Option<RefreshOverrides>>(1);
+                        (
+                            refresh::AccelerationRefreshMode::Append(on_start_refresh),
+                            Some(start_refresh),
+                        )
+                    }
                 }
             }
             RefreshMode::Full => {
@@ -469,7 +521,8 @@ impl Builder {
             Some(self.federated_source),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
-            self.tokio_runtime.clone(),
+            self.cpu_runtime.clone(),
+            self.io_runtime.clone(),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -500,6 +553,7 @@ impl Builder {
                 Arc::clone(&self.accelerator),
                 retention,
                 self.caching.clone(),
+                self.io_runtime.clone(),
             ));
             handlers.push(retention_check_handle);
         }
@@ -534,6 +588,7 @@ impl AcceleratedTable {
         federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
+        io_runtime: Handle,
     ) -> Builder {
         Builder::new(
             runtime_status,
@@ -542,6 +597,7 @@ impl AcceleratedTable {
             federated_source,
             accelerator,
             refresh,
+            io_runtime,
         )
     }
 
@@ -688,12 +744,18 @@ impl TableProvider for AcceleratedTable {
             .scan(state, projection, filters, limit)
             .await?;
 
+        let federated = Arc::clone(&self.federated);
+        let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
+            let federated = Arc::clone(&federated);
+            Box::pin(async move { federated.table_provider().await })
+        });
+
         let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => input,
             ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
-                Arc::clone(&self.federated),
+                fallback_fn,
                 TableScanParams::new(state, projection, filters, limit),
             )),
         };

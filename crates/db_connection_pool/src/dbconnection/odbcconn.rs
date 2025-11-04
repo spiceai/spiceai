@@ -147,7 +147,7 @@ where
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         let schema = Arc::new(
-            arrow_schema_from(&mut prepared, false)
+            arrow_schema_from(&mut prepared, None, false)
                 .boxed()
                 .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
         );
@@ -194,7 +194,7 @@ where
             let cxn = handle.block_on(async { conn.lock().await });
 
             let mut prepared = cxn.prepare(&sql)?;
-            let schema = Arc::new(arrow_schema_from(&mut prepared, false)?);
+            let schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
             let mut statement = prepared.into_statement();
@@ -271,11 +271,32 @@ where
         bind_parameters(&mut statement, params)?;
 
         let row_count = unsafe {
-            statement.execute().unwrap();
-            statement.row_count()
+            if let SqlResult::Error { function } = statement.execute() {
+                return Err(Error::ODBCAPIErrorNoSource {
+                    message: format!("Failed to execute statement: {function}"),
+                }
+                .into());
+            }
+
+            match statement.row_count() {
+                SqlResult::Success(count) | SqlResult::SuccessWithInfo(count) => count,
+                SqlResult::NoData => 0,
+                SqlResult::Error { function } => {
+                    return Err(Error::ODBCAPIErrorNoSource {
+                        message: format!("Failed to get row count: {function}"),
+                    }
+                    .into());
+                }
+                SqlResult::NeedData | SqlResult::StillExecuting => {
+                    return Err(Error::ODBCAPIErrorNoSource {
+                        message: "Unexpected SQL state when getting row count".to_string(),
+                    }
+                    .into());
+                }
+            }
         };
 
-        Ok(row_count.unwrap().try_into().context(TryFromSnafu)?)
+        Ok(row_count.try_into().context(TryFromSnafu)?)
     }
 }
 

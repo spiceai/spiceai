@@ -23,6 +23,7 @@ use spicepod::component::model::HUGGINGFACE_PATH_REGEX;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct Huggingface {}
 
@@ -113,7 +114,11 @@ impl ModelSource for Huggingface {
                 onnx_file_name.clone_from(&file_name);
             }
 
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(1800))
+                .build()
+                .context(super::UnableToFetchModelSnafu {})?;
             let response = client
                 .get(download_url)
                 .bearer_auth(

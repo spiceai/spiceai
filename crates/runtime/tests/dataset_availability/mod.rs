@@ -45,7 +45,7 @@ async fn get_test_dataset_with_check_availability_disabled() -> Result<Dataset, 
         .with_app(Arc::new(AppBuilder::new("test").build()))
         .with_runtime(Arc::new(rt))
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {e}"))?;
 
     Ok(dataset)
 }
@@ -72,7 +72,7 @@ async fn get_test_dataset_with_acceleration() -> Result<Dataset, anyhow::Error> 
         .with_app(Arc::new(AppBuilder::new("test").build()))
         .with_runtime(Arc::new(rt))
         .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {e}"))?;
 
     Ok(dataset)
 }

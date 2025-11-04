@@ -12,10 +12,11 @@ RUN apt update \
 COPY . /build
 WORKDIR /build
 
-ARG CARGO_FEATURES
-ARG RUST_PROFILE
+ARG CARGO_FEATURES=default
+ARG RUST_PROFILE=release
 ARG CARGO_INCREMENTAL=yes
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
+ARG TARGETARCH
 ENV CARGO_FEATURES=$CARGO_FEATURES \
     CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
     CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
@@ -25,6 +26,11 @@ RUN \
     --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
+    case "${TARGETARCH}" in \
+      arm64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
+      amd64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=x86-64" ;; \
+      *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
+    esac && \
     cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default} && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
@@ -33,6 +39,8 @@ FROM debian:bookworm-slim as sandbox-setup
 ARG CARGO_FEATURES
 
 ARG INSTALL_ORACLE_ODPIC=false
+ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=05b4c01c77521eee32c89550d3a2e2f4d9f9601a79af96da441dfdd2d2a32ec4
+ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=1d27641f16df1b1384f5d61cdcbd95a5ca57ba5d25ed881edde56543f8c6d135
 
 # Install required packages
 RUN apt update \
@@ -70,12 +78,19 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
+    set -euo pipefail; \
     apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \
-    curl -sSL https://download.oracle.com/otn_software/linux/instantclient/2380000/instantclient-basiclite-linux.x64-23.8.0.25.04.zip -o basic.zip; \
+    : "${ORACLE_INSTANTCLIENT_SHA256_AMD64:?ORACLE_INSTANTCLIENT_SHA256_AMD64 must be set to the expected SHA256 checksum}"; \
+    curl -fsSLo basic.zip https://download.oracle.com/otn_software/linux/instantclient/2380000/instantclient-basiclite-linux.x64-23.8.0.25.04.zip; \
+    echo "${ORACLE_INSTANTCLIENT_SHA256_AMD64}  basic.zip" | sha256sum -c -; \
     elif [ "$ARCH" = "arm64" ]; then \
-    curl -sSL https://download.oracle.com/otn_software/linux/instantclient/2380000/instantclient-basiclite-linux.arm64-23.8.0.25.04.zip -o basic.zip; \
+    : "${ORACLE_INSTANTCLIENT_SHA256_ARM64:?ORACLE_INSTANTCLIENT_SHA256_ARM64 must be set to the expected SHA256 checksum}"; \
+    curl -fsSLo basic.zip https://download.oracle.com/otn_software/linux/instantclient/2380000/instantclient-basiclite-linux.arm64-23.8.0.25.04.zip; \
+    echo "${ORACLE_INSTANTCLIENT_SHA256_ARM64}  basic.zip" | sha256sum -c -; \
+    else \
+    echo "Unsupported architecture: $ARCH" >&2; exit 1; \
     fi; \
     unzip basic.zip && \
     cp -v \
@@ -89,7 +104,8 @@ RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     ln -s libclntsh.so.23.1 /spice_sandbox/usr/lib/libclntsh.so && \
     ln -s libclntshcore.so.23.1 /spice_sandbox/usr/lib/libclntshcore.so && \
     cp "$(find /usr/lib /lib -name 'libaio.so.1' | head -n 1)" /spice_sandbox/usr/lib && \
-    cp "$(find /usr/lib /lib -name 'libresolv.so.2' | head -n 1)" /spice_sandbox/usr/lib; \
+    cp "$(find /usr/lib /lib -name 'libresolv.so.2' | head -n 1)" /spice_sandbox/usr/lib && \
+    rm -f basic.zip; \
     fi
 
 # Minimal passwd & group for the nobody user

@@ -10,17 +10,29 @@ runs:
     - name: Upload benchmark snapshots to branch
       shell: bash
       run: |
+        BRANCH_ID=${{ github.run_id }}
+        BRANCH_NAME="snapshot-update/${BRANCH_ID}"
+
         git config --global user.name 'Spice Snapshot Update Bot'
         git config --global user.email 'spiceaibot@spice.ai'
+        git checkout -b ${BRANCH_NAME}
         git add '*.snap'
         if git diff --cached --quiet; then
           echo "No changes to commit"
         else
-          git commit -m "fix: Update the integration test snapshots"
-          if git ls-remote --exit-code --heads origin HEAD; then
-            git pull --rebase origin HEAD
+          git commit -m "fix: Update the test snapshots"
+          if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
+            git pull --rebase origin ${BRANCH_NAME}
           fi
-          git push origin HEAD
+          git push origin ${BRANCH_NAME}
+
+          PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
+          if [[ -n "${PR_URL}" ]]; then
+            echo "PR already exists -> ${PR_URL}"
+            exit 0
+          else
+            gh pr create --title "fix: Update test snapshots" --body "Updates some test snapshots" --base trunk --head ${BRANCH_NAME} --label kind/bug
+          fi
         fi
       env:
         GH_TOKEN: ${{ inputs.token }}

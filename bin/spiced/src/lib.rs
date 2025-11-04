@@ -42,9 +42,9 @@ use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
+use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use util::in_tracing_context;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -52,7 +52,7 @@ mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to construct spice app: {source}"))]
+    #[snafu(display("Failed to start Spice runtime: {source}"))]
     UnableToConstructSpiceApp { source: Box<app::Error> },
 
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
@@ -190,29 +190,38 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
+    let mut spicepod_load_error: Option<app::Error> = None;
     let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             Some(Arc::new(app))
         }
         Err(e) => {
-            in_tracing_context(|| {
-                tracing::warn!("{e}");
-            });
-            None
+            // In pods watcher mode, allow runtime to start without a valid spicepod
+            // It will load the spicepod when it becomes available
+            if args.pods_watcher_enabled && args.spicepod.is_none() {
+                spicepod_load_error = Some(e);
+                None
+            } else {
+                // In normal mode, fail immediately if spicepod cannot be loaded
+                return Err(Error::UnableToConstructSpiceApp {
+                    source: Box::new(e),
+                });
+            }
         }
     };
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
-    if let Some(app) = &app
-        && let Some(manifest) = app.extensions.get("spice_cloud")
+    if let Some(some_app) = &app
+        && let Some(manifest) = some_app.extensions.get("spice_cloud")
     {
         let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
         extension_factories.push(Box::new(spice_extension_factory));
     }
+
     #[cfg(feature = "tpc-extension")]
-    if let Some(app) = &app
-        && let Some(manifest) = app.extensions.get("tpc")
+    if let Some(some_app) = &app
+        && let Some(manifest) = some_app.extensions.get("tpc")
     {
         let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
         extension_factories.push(Box::new(tpc_extension_factory));
@@ -235,7 +244,8 @@ pub async fn run(args: Args) -> Result<()> {
         )]))
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
-        .with_runtime_config(args.runtime.clone());
+        .with_runtime_config(args.runtime.clone())
+        .with_io_runtime(Handle::current());
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
@@ -258,12 +268,34 @@ pub async fn run(args: Args) -> Result<()> {
     .await
     .context(UnableToInitializeTracingSnafu)?;
 
-    // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-    let tokio_runtime = ManagedTokioRuntime::try_new()
-        .boxed()
-        .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+    // Log spicepod load error now that tracing is initialized
+    if let Some(err) = spicepod_load_error {
+        tracing::warn!(
+            "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided.\n{err}"
+        );
+    }
 
-    rt.datafusion().set_tokio_runtime(tokio_runtime);
+    // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
+    match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
+        Some("sql_engine") | None => {
+            // This needs to be created after tracing is set up, or else task_history events aren't emitted.
+            let tokio_runtime = ManagedTokioRuntime::try_new()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_cpu_runtime(tokio_runtime);
+        }
+        Some("disabled") => {
+            tracing::info!(
+                "Dedicated SQL engine thread pool is disabled via runtime parameter `runtime.params.dedicated_thread_pool`."
+            );
+        }
+        Some(other) => {
+            tracing::warn!(
+                "Invalid runtime parameter value for `runtime.params.dedicated_thread_pool`: `{other}`. Set to `disabled` or `sql_engine`. Continuing with dedicated SQL engine thread pool."
+            );
+        }
+    }
 
     if let Some(metrics_registry) = prometheus_registry {
         init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
