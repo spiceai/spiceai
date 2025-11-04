@@ -22,9 +22,9 @@ description: "Query: clickbench_q9"
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                   |
 |               |                   RepartitionExec: partitioning=Hash([RegionID@0, alias1@1], 16), input_partitions=16         |
 |               |                     AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID, UserID@1 as alias1], aggr=[]    |
-|               |                       BytesProcessedExec                                                                      |
-|               |                         SchemaCastScanExec                                                                    |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1               |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                   |
+|               |                         BytesProcessedExec                                                                    |
+|               |                           SchemaCastScanExec                                                                  |
 |               |                             FallbackOnZeroResultsScanExec                                                     |
 |               |                               CoalescePartitionsExec                                                          |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1         |

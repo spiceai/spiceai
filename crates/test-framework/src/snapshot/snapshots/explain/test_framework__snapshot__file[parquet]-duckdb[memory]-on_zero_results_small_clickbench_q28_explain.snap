@@ -24,8 +24,8 @@ description: "Query: clickbench_q28"
 |               |                   BytesProcessedExec                                                                                                    |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |                       FilterExec: CAST(URL@1 AS Utf8View) !=                                                                            |
-|               |                         SchemaCastScanExec                                                                                              |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                         |
+|               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                           |
+|               |                           SchemaCastScanExec                                                                                            |
 |               |                             FallbackOnZeroResultsScanExec                                                                               |
 |               |                               CoalescePartitionsExec                                                                                    |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
