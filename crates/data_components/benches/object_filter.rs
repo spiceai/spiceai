@@ -35,7 +35,7 @@ fn bench_filter_no_filters(c: &mut Criterion) {
                 create_test_meta(
                     &format!("file_{i:06}.txt"),
                     now,
-                    (i * 1024) as u64,
+                    u64::try_from(i * 1024).expect("i32 to u64 conversion"),
                     Some(format!("etag_{i}")),
                     Some(format!("v{i}")),
                 )
@@ -68,7 +68,7 @@ fn bench_filter_by_size(c: &mut Criterion) {
                 create_test_meta(
                     &format!("file_{i:06}.txt"),
                     now,
-                    (i * 1024) as u64,
+                    u64::try_from(i * 1024).expect("i32 to u64 conversion"),
                     Some(format!("etag_{i}")),
                     Some(format!("v{i}")),
                 )
@@ -77,7 +77,9 @@ fn bench_filter_by_size(c: &mut Criterion) {
 
         // Filter for files > halfway point
         let threshold = (size / 2) * 1024;
-        let filters = vec![col("size").gt(lit(threshold as u64))];
+        let filters = vec![col("size").gt(lit(
+            u64::try_from(threshold).expect("i32 to u64 conversion"),
+        ))];
 
         group.bench_with_input(
             BenchmarkId::new("gt_threshold", size),
@@ -112,7 +114,7 @@ fn bench_filter_combined(c: &mut Criterion) {
                 create_test_meta(
                     &format!("{prefix}/file_{i:06}.txt"),
                     now,
-                    (i * 1024) as u64,
+                    u64::try_from(i * 1024).expect("i32 to u64 conversion"),
                     Some(format!("etag_{i}")),
                     Some(format!("v{i}")),
                 )
@@ -121,7 +123,7 @@ fn bench_filter_combined(c: &mut Criterion) {
 
         let threshold = (size / 2) * 1024;
         let filters = vec![
-            col("size").gt(lit(threshold as u64)),
+            col("size").gt(lit(u64::try_from(threshold).expect("i32 to u64 conversion"))),
             col("location").like(lit("data%")),
         ];
 
@@ -161,7 +163,7 @@ fn bench_filter_complex(c: &mut Criterion) {
                 create_test_meta(
                     &format!("file_{i:06}.txt"),
                     now,
-                    (i * 1024) as u64,
+                    u64::try_from(i * 1024).expect("i32 to u64 conversion"),
                     etag,
                     version,
                 )
