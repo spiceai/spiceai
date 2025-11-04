@@ -65,6 +65,22 @@ use vortex_datafusion::VortexFormat;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
 
+/// Error message for poisoned `RwLock` on the listing table.
+///
+/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
+/// inconsistent state. This is a critical error that typically requires restarting the runtime.
+const LISTING_TABLE_LOCK_POISONED: &str =
+    "Lock poisoned on listing table: a thread panicked while holding this lock. \
+    This indicates an internal error that requires restarting the runtime.";
+
+/// Error message for poisoned `RwLock` on the deletion cache.
+///
+/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
+/// inconsistent state. This is a critical error that typically requires restarting the runtime.
+const DELETION_CACHE_LOCK_POISONED: &str =
+    "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
+    This indicates an internal error that requires restarting the runtime.";
+
 /// Execution plan that filters out deleted rows based on deletion vectors.
 ///
 /// This wraps another execution plan and removes rows whose positions
@@ -998,9 +1014,8 @@ impl CayenneTableProvider {
         }
 
         // Read deletion vector files in a blocking task
-        let delete_files_for_read = delete_files.clone();
         let deleted_row_ids =
-            task::spawn_blocking(move || Self::read_deletion_vectors(delete_files_for_read))
+            task::spawn_blocking(move || Self::read_deletion_vectors(delete_files))
                 .await
                 .map_err(|err| super::catalog::CatalogError::InvalidOperation {
                     message: format!(
@@ -1015,7 +1030,7 @@ impl CayenneTableProvider {
 
         tracing::debug!(
             "Cached {} deletion vectors ({} deleted rows) for table_id {}",
-            delete_files.len(),
+            deleted_row_ids.len(),
             deleted_row_ids.len(),
             table_id
         );
@@ -1135,9 +1150,7 @@ impl TableProvider for CayenneTableProvider {
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| {
                 datafusion_common::DataFusionError::Execution(
-                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
-                    This indicates an internal error that requires restarting the runtime."
-                        .to_string(),
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
                 )
             })?;
             Arc::clone(&guard)
@@ -1153,9 +1166,7 @@ impl TableProvider for CayenneTableProvider {
         let deleted_row_ids = {
             let guard = self.cached_deleted_row_ids.read().map_err(|_| {
                 datafusion_common::DataFusionError::Execution(
-                    "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
-                    This indicates an internal error that requires restarting the runtime."
-                        .to_string(),
+                    DELETION_CACHE_LOCK_POISONED.to_string(),
                 )
             })?;
             Arc::clone(&guard)
@@ -1182,9 +1193,7 @@ impl TableProvider for CayenneTableProvider {
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| {
                 datafusion_common::DataFusionError::Execution(
-                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
-                    This indicates an internal error that requires restarting the runtime."
-                        .to_string(),
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
                 )
             })?;
             Arc::clone(&guard)
@@ -1275,9 +1284,7 @@ impl TableProvider for CayenneTableProvider {
             // This ensures subsequent queries in the same context will read from the new data
             let mut listing_table_guard = self.listing_table.write().map_err(|_| {
                 datafusion_common::DataFusionError::Execution(
-                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
-                    This indicates an internal error that requires restarting the runtime."
-                        .to_string(),
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
                 )
             })?;
             *listing_table_guard = new_listing_table;
@@ -1315,9 +1322,7 @@ impl TableProvider for CayenneTableProvider {
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| {
                 datafusion_common::DataFusionError::Execution(
-                    "Lock poisoned on listing table: a thread panicked while holding this lock. \
-                    This indicates an internal error that requires restarting the runtime."
-                        .to_string(),
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
                 )
             })?;
             Arc::clone(&guard)
@@ -1514,20 +1519,31 @@ impl CayenneDeletionSink {
 
         // Update the cached deletion vectors with the newly deleted row IDs
         // This avoids needing to reload from SQLite on the next scan.
+        //
         // We create a new Arc with the updated HashSet to maintain zero-copy semantics
-        // for concurrent readers who still hold references to the old Arc.
+        // for concurrent readers who still hold references to the old Arc. This requires
+        // cloning the entire HashSet, which is acceptable because:
+        //
+        // 1. **Write infrequency**: Deletions happen much less frequently than reads
+        // 2. **Concurrent reader safety**: Cloning prevents disrupting ongoing scans that
+        //    hold Arc references to the old deletion set
+        // 3. **Cache coherence**: The alternative (in-place mutation) would require either:
+        //    - Taking write locks during scans (blocks all concurrent queries)
+        //    - Complex lock-free data structures (higher complexity, potential performance issues)
+        //
+        // For tables with very large deletion sets (millions of deleted rows), consider
+        // running compaction to physically remove deleted rows and reset the deletion vectors.
         {
-            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
-                "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
-                This indicates an internal error that requires restarting the runtime."
-                    .to_string()
-            })?;
+            let mut guard = self
+                .cached_deleted_row_ids
+                .write()
+                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 
-            // Clone the current HashSet and add new deletions
+            // Clone the entire HashSet and add new deletions.
+            // Cost: O(n) where n = existing deleted rows, but this is write path (infrequent).
+            // Benefit: Zero-copy Arc clones for concurrent readers (frequent).
             let mut updated_set = (**guard).clone();
-            for row_id in &result.row_ids {
-                updated_set.insert(*row_id);
-            }
+            updated_set.extend(result.row_ids.iter().copied());
 
             // Replace with new Arc - concurrent readers still have old Arc
             *guard = Arc::new(updated_set);
@@ -1591,11 +1607,10 @@ impl DeletionSink for CayenneDeletionSink {
         let ctx = SessionContext::new();
 
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                "Lock poisoned on listing table: a thread panicked while holding this lock. \
-                This indicates an internal error that requires restarting the runtime."
-                    .to_string()
-            })?;
+            let guard = self
+                .listing_table
+                .read()
+                .map_err(|_| LISTING_TABLE_LOCK_POISONED.to_string())?;
             Arc::clone(&guard)
         };
 
