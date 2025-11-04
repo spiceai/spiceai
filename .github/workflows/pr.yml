@@ -73,7 +73,7 @@ jobs:
 
   lint:
     name: Run Go & Rust Linters and Build
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     env:
       GOVER: 1.25.3
     needs: check_changes
@@ -131,6 +131,14 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
+      - name: Setup MinIO
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@v3
@@ -145,26 +153,22 @@ jobs:
 
       - uses: rui314/setup-mold@v1
 
-      # Cache Cargo dependencies
-      - name: Restore target cache
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ./lint.tar.zst
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Decompress target cache
+      - name: pull lint archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          if [ -f ./lint.tar.zst ]; then
-            sudo apt update
-            sudo apt install zstd -y
-            tar --use-compress-program="zstd -d" -xf lint.tar.zst target/lint/
-            find target/lint/ -type f -exec touch {} +
+          sudo apt update
+          sudo apt install zstd -y
+          mc cp spice-minio/benchmarks/caching/${{ github.ref_name }}/lint.tar.zst ./ || true
+          if [ ! -f ./lint.tar.zst ]; then
+            mc cp spice-minio/benchmarks/caching//trunk/lint.tar.zst ./ || true
+            if [ ! -f ./lint.tar.zst ]; then
+              echo "No lint cache found"
+              exit 0
+            fi
           fi
+
+          tar --use-compress-program="zstd -d" -xf lint.tar.zst target/lint/
+          find target/lint/ -type f -exec touch {} +
 
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -177,6 +181,7 @@ jobs:
         run: |
           tar --use-compress-program="zstd -T0 -1" -cf lint.tar.zst target/lint/
           ls -lh lint.tar.zst
+          mc cp lint.tar.zst spice-minio/benchmarks/caching/${{ github.ref_name }}/lint.tar.zst
 
       - name: force exit
         run: exit 1
