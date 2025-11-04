@@ -20,7 +20,7 @@ use crate::{flight::query_to_batches, queries::Query};
 use spiceai::Client as SpiceClient;
 
 const CAYENNE_PATH_FILTER_PATTERN: &str =
-    r"(/data/[A-Za-z0-9_\-\[\]]+)(?:/[A-Za-z0-9_\-\.\[\]]+)+\.vortex";
+    r"(/data/[A-Za-z0-9_\-\[\]=]+)(?:/[A-Za-z0-9_\-\.\[\]=]+)+\.vortex";
 const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
 const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
 const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
@@ -136,25 +136,34 @@ mod tests {
 
     #[test]
     fn test_cayenne_file_filters() -> Result<(), String> {
-        let input = "/data/customer/5/019a22d7-f162-7be0-975f-417b334a95c6/tD0GMdUfbVhRvA6E_0.vortex:0..368070";
+        let test_cases = [
+            (
+                "/data/customer/5/019a22d7-f162-7be0-975f-417b334a95c6/tD0GMdUfbVhRvA6E_0.vortex:0..368070",
+                "/data/customer/<CAYENNE_PATH>.vortex:<RANGE>",
+            ),
+            (
+                "/data/customer/expression=22/5/019a4a83-a9a5-76b2-8cb4-3efdd70ce29b/7h45OnUbTA5PyuSE_0.vortex:",
+                "/data/customer/<CAYENNE_PATH>.vortex:",
+            ),
+        ];
 
-        let path_regex =
-            regex::Regex::new(super::CAYENNE_PATH_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
-        let range_regex =
-            regex::Regex::new(super::VORTEX_RANGE_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        for (input, expected) in test_cases {
+            let path_regex = regex::Regex::new(super::CAYENNE_PATH_FILTER_PATTERN)
+                .map_err(|e| format!("{e}"))?;
+            let range_regex = regex::Regex::new(super::VORTEX_RANGE_FILTER_PATTERN)
+                .map_err(|e| format!("{e}"))?;
 
-        let path_redacted = path_regex.replace_all(input, super::CAYENNE_PATH_FILTER_REPLACEMENT);
-        let fully_redacted = range_regex
-            .replace_all(
-                path_redacted.as_ref(),
-                super::VORTEX_RANGE_FILTER_REPLACEMENT,
-            )
-            .into_owned();
+            let path_redacted =
+                path_regex.replace_all(input, super::CAYENNE_PATH_FILTER_REPLACEMENT);
+            let fully_redacted = range_regex
+                .replace_all(
+                    path_redacted.as_ref(),
+                    super::VORTEX_RANGE_FILTER_REPLACEMENT,
+                )
+                .into_owned();
 
-        assert_eq!(
-            fully_redacted,
-            "/data/customer/<CAYENNE_PATH>.vortex:<RANGE>"
-        );
+            assert_eq!(fully_redacted, expected, "Failed for input: {input}");
+        }
 
         Ok(())
     }
