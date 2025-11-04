@@ -147,7 +147,6 @@ mod tests {
             ),
         ];
 
-        // Compile regexes once outside the loop to avoid repeated compilation overhead
         let path_regex =
             regex::Regex::new(super::CAYENNE_PATH_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
         let range_regex =
