@@ -1,30 +1,10 @@
 name: Makefile Targets
 
 on:
-  pull_request:
+  push:
     branches:
       - trunk
-      - release-*
       - release/*
-      - feature-*
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
 
   workflow_dispatch:
 
@@ -52,7 +32,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -65,21 +45,13 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: make install
-        run: |
-          make install
-
       - name: make install-dev
         run: |
           make install-dev
 
-      - name: make install-with-models
+      - name: make install
         run: |
-          make install-with-models
-
-      - name: make install-with-odbc
-        run: |
-          make install-with-odbc
+          make install
 
       - name: make install-cli
         run: |
@@ -88,3 +60,11 @@ jobs:
       - name: make install-runtime
         run: |
           make install-runtime
+
+      - name: make install-with-models
+        run: |
+          make install-with-models
+
+      - name: make install-with-odbc
+        run: |
+          make install-with-odbc

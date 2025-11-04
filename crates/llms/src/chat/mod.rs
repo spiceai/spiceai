@@ -40,8 +40,6 @@ use async_openai::{
     },
 };
 
-#[cfg(feature = "llama_cpp")]
-pub mod llama_cpp;
 pub mod mistral;
 pub mod nsql;
 use crate::streaming_utils::generate_stream_id;
@@ -723,33 +721,4 @@ pub async fn create_local_model(
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
-}
-
-/// Create a llama.cpp model from `HuggingFace`
-/// This requires the `llama_cpp` feature to be enabled.
-#[cfg(feature = "llama_cpp")]
-pub async fn create_hf_model_llama_cpp(
-    model_id: &str,
-    from_gguf: Option<PathBuf>,
-    hf_token_literal: Option<&SecretString>,
-) -> Result<Arc<dyn Chat>> {
-    llama_cpp::LlamaCpp::from_hf(model_id, hf_token_literal, from_gguf)
-        .await
-        .map(|x| Arc::new(x) as Arc<dyn Chat>)
-}
-
-/// Create a llama.cpp model from local files
-/// This requires the `llama_cpp` feature to be enabled.
-#[cfg(feature = "llama_cpp")]
-pub async fn create_local_model_llama_cpp(model_weights: &[String]) -> Result<Arc<dyn Chat>> {
-    let paths: Vec<PathBuf> = model_weights
-        .iter()
-        .map(|p| PathBuf::from_str(p))
-        .collect::<Result<Vec<_>, _>>()
-        .boxed()
-        .map_err(|e| Error::FailedToLoadModel { source: e })?;
-
-    llama_cpp::LlamaCpp::from(&paths)
-        .await
-        .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
