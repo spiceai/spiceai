@@ -22,7 +22,7 @@ use test_framework::{
     utils::scan_directory_for_yamls,
 };
 
-use crate::args::dispatch::{DispatchArgs, DispatchTestFile, DispatchTests, WorkflowArgs};
+use crate::args::dispatch::{DispatchArgs, DispatchTestFile, WorkflowArgs};
 
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
@@ -50,116 +50,91 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let total_tests = tests.len();
-    for (index, (path, test)) in tests.into_iter().enumerate() {
-        let mut payload = match (test_type, &test.tests) {
-            (
-                TestType::Benchmark,
-                DispatchTests {
-                    bench: Some(bench), ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: bench
-                        .clone()
-                        .with_update_snapshots(args.update_snapshots.into())
-                        .with_validate(args.validate),
-                    spiced_commit: args.spiced_commit.clone(),
-                })
+    // Collect all test instances for the selected test type
+    let mut tests_to_dispatch = Vec::new();
+
+    for (path, test_file) in tests {
+        match test_type {
+            TestType::Benchmark => {
+                for bench in &test_file.tests.bench {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: bench
+                                .clone()
+                                .with_update_snapshots(args.update_snapshots.into())
+                                .with_validate(args.validate),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
             }
-            (
-                TestType::Throughput,
-                DispatchTests {
-                    throughput: Some(throughput),
-                    ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: throughput.clone(),
-                    spiced_commit: args.spiced_commit.clone(),
-                })
+            TestType::Load => {
+                for load in &test_file.tests.load {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: load.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
             }
-            (
-                TestType::Load,
-                DispatchTests {
-                    load: Some(load), ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: load.clone(),
-                    spiced_commit: args.spiced_commit.clone(),
-                })
+            TestType::Throughput => {
+                for throughput in &test_file.tests.throughput {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: throughput.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
             }
-            (
-                TestType::HttpConsistency,
-                DispatchTests {
-                    http_consistency: Some(consistency),
-                    ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: consistency,
-                    spiced_commit: args.spiced_commit.clone(),
-                })
+            TestType::HttpConsistency => {
+                for consistency in &test_file.tests.http_consistency {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: consistency.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
             }
-            (
-                TestType::HttpOverhead,
-                DispatchTests {
-                    http_overhead: Some(overhead),
-                    ..
-                },
-            ) => {
-                serde_json::json!(WorkflowArgs {
-                    specific_args: overhead,
-                    spiced_commit: args.spiced_commit.clone(),
-                })
-            }
-            (TestType::Benchmark, _) => {
-                println!(
-                    "Test file {} does not contain a benchmark test",
-                    path.display()
-                );
-                continue;
-            }
-            (TestType::Throughput, _) => {
-                println!(
-                    "Test file {} does not contain a throughput test",
-                    path.display()
-                );
-                continue;
-            }
-            (TestType::Load, _) => {
-                println!("Test file {} does not contain a load test", path.display());
-                continue;
-            }
-            (TestType::HttpConsistency, _) => {
-                println!(
-                    "Test file {} does not contain an HTTP consistency test",
-                    path.display()
-                );
-                continue;
-            }
-            (TestType::HttpOverhead, _) => {
-                println!(
-                    "Test file {} does not contain an HTTP overhead test",
-                    path.display()
-                );
-                continue;
+            TestType::HttpOverhead => {
+                for overhead in &test_file.tests.http_overhead {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: overhead.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
             }
             _ => {
-                return Err(anyhow::anyhow!(
-                    "Test type {test_type} not supported for dispatching"
-                ));
+                println!("Test type {test_type} not supported for dispatching");
             }
-        };
+        }
+    }
 
+    if tests_to_dispatch.is_empty() {
+        println!("No tests found for test type {test_type}");
+        return Ok(());
+    }
+
+    let total_tests = tests_to_dispatch.len();
+    for (index, (path, mut payload)) in tests_to_dispatch.into_iter().enumerate() {
         payload = map_numbers_to_strings(payload);
 
         println!(
-            "{index}/{total_tests} - Dispatching {test_type} test from {}",
+            "{}/{} - Dispatching {test_type} test from {}",
+            index + 1,
+            total_tests,
             path.display(),
-            index = index + 1,
         );
+
         GitHubWorkflow::new(
             "spicehq",
             "spiceai",

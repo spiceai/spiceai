@@ -218,7 +218,7 @@ impl Query {
     }
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default, PartialEq)]
 pub enum QuerySet {
     #[default]
     #[serde(rename = "tpch")]
