@@ -309,6 +309,10 @@ pub struct CayenneTableProvider {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
+    /// Cached deletion vectors (deleted row IDs) to avoid repeated metastore queries on every scan.
+    /// This is loaded once during table provider initialization and invalidated when delete files change.
+    /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
+    cached_deleted_row_ids: Arc<RwLock<std::collections::HashSet<i64>>>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -440,11 +444,17 @@ impl CayenneTableProvider {
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
         )?;
 
+        // Load deletion vectors once at initialization to avoid repeated SQLite queries on every scan
+        let table_id = table_metadata.table_id;
+        let catalog_for_load = Arc::clone(&catalog);
+        let deleted_row_ids = Self::load_deletion_vectors(table_id, catalog_for_load).await?;
+
         Ok(Self {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
+            cached_deleted_row_ids: Arc::new(RwLock::new(deleted_row_ids)),
         })
     }
 
@@ -729,13 +739,55 @@ impl CayenneTableProvider {
             Arc::clone(&self.listing_table),
             Arc::clone(&self.table_metadata.schema),
             &filters,
+            Arc::clone(&self.cached_deleted_row_ids),
         );
 
-        sink.delete_from()
-            .await
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to execute retention filters: {err}"),
-            })
+        let deleted_count =
+            sink.delete_from()
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message: format!("Failed to execute retention filters: {err}"),
+                })?;
+
+        // Refresh deletion cache after applying retention filters
+        if deleted_count > 0 {
+            self.refresh_deletion_cache().await?;
+        }
+
+        Ok(deleted_count)
+    }
+
+    /// Refresh the cached deletion vectors by reloading from the catalog.
+    ///
+    /// This should be called after operations that modify deletion vectors:
+    /// - After applying retention filters
+    /// - After manual delete operations
+    /// - After compaction that removes deleted rows
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion vectors cannot be loaded from the catalog.
+    async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
+        let deleted_row_ids =
+            Self::load_deletion_vectors(self.table_metadata.table_id, Arc::clone(&self.catalog))
+                .await?;
+
+        let mut guard =
+            self.cached_deleted_row_ids
+                .write()
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: format!("Failed to acquire write lock on deletion cache: {e}"),
+                })?;
+
+        *guard = deleted_row_ids;
+
+        tracing::debug!(
+            "Refreshed deletion cache for table {} ({} deleted rows)",
+            self.table_metadata.table_name,
+            guard.len()
+        );
+
+        Ok(())
     }
 
     /// Delete rows matching the given primary key values.
@@ -811,6 +863,59 @@ impl CayenneTableProvider {
         );
 
         Ok(())
+    }
+
+    /// Load deletion vectors from the catalog and return a set of deleted row IDs.
+    ///
+    /// This method queries the catalog for delete files and loads all deletion vectors
+    /// into memory. It should be called once during table provider initialization and
+    /// whenever delete files are added/updated.
+    ///
+    /// # Performance Notes
+    ///
+    /// - Queries metastore once via catalog
+    /// - Reads deletion vector files in a blocking task
+    /// - Result is cached in the table provider to avoid repeated queries on every scan
+    async fn load_deletion_vectors(
+        table_id: i64,
+        catalog: Arc<dyn MetadataCatalog>,
+    ) -> CatalogResult<std::collections::HashSet<i64>> {
+        // Query catalog for delete files (this spawns a blocking task internally)
+        let delete_files = catalog
+            .get_table_delete_files(table_id)
+            .await
+            .map_err(|e| super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to load deletion vectors from catalog: {e}"),
+            })?;
+
+        if delete_files.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        // Read deletion vector files in a blocking task
+        let delete_files_for_read = delete_files.clone();
+        let deleted_row_ids =
+            task::spawn_blocking(move || Self::read_deletion_vectors(delete_files_for_read))
+                .await
+                .map_err(|err| super::catalog::CatalogError::InvalidOperation {
+                    message: format!(
+                        "Deletion vector reader task panicked or was cancelled: {err}"
+                    ),
+                })
+                .and_then(|result| {
+                    result.map_err(|err| super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to read deletion vectors: {err}"),
+                    })
+                })?;
+
+        tracing::debug!(
+            "Cached {} deletion vectors ({} deleted rows) for table_id {}",
+            delete_files.len(),
+            deleted_row_ids.len(),
+            table_id
+        );
+
+        Ok(deleted_row_ids)
     }
 
     /// Read deletion vectors from files and return a set of deleted row IDs.
@@ -934,49 +1039,26 @@ impl TableProvider for CayenneTableProvider {
             .scan(state, projection, filters, limit)
             .await?;
 
-        // Load deletion vectors from catalog
-        let delete_files = self
-            .catalog
-            .get_table_delete_files(self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
+        // Use cached deletion vectors instead of querying the catalog on every scan.
+        // This dramatically improves concurrent query performance by avoiding repeated
+        // SQLite queries and spawn_blocking tasks.
+        let deleted_row_ids = {
+            let guard = self.cached_deleted_row_ids.read().map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to load deletion vectors: {e}"
+                    "Failed to acquire read lock on deletion cache: {e}"
                 ))
             })?;
+            guard.clone()
+        };
 
-        // If there are any deletion vectors, load and apply filtering
-        if !delete_files.is_empty() {
-            let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
+        // If there are any deleted rows, apply filtering
+        if !deleted_row_ids.is_empty() {
             tracing::debug!(
-                "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
-                delete_files.len(),
-                total_deleted,
+                "Applying cached deletion filter ({} deleted rows) to scan of table {}",
+                deleted_row_ids.len(),
                 self.table_metadata.table_name
             );
-
-            // Read all deletion vectors and build a set of deleted row IDs
-            let delete_files_for_read = delete_files.clone();
-            let deleted_row_ids =
-                task::spawn_blocking(move || Self::read_deletion_vectors(delete_files_for_read))
-                    .await
-                    .map_err(|err| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Deletion vector reader task panicked or was cancelled: {err}"
-                        ))
-                    })
-                    .and_then(|result| {
-                        result.map_err(|err| {
-                            datafusion_common::DataFusionError::Execution(format!(
-                                "Failed to read deletion vectors: {err}"
-                            ))
-                        })
-                    })?;
-
-            if !deleted_row_ids.is_empty() {
-                // Wrap the plan with our deletion filter
-                return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
-            }
+            return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
         }
 
         Ok(plan)
@@ -1139,6 +1221,7 @@ impl DeletionTableProvider for CayenneTableProvider {
                 Arc::clone(&self.listing_table),
                 Arc::clone(&self.table_metadata.schema),
                 filters,
+                Arc::clone(&self.cached_deleted_row_ids),
             )),
             &self.table_metadata.schema,
         )))
@@ -1152,6 +1235,8 @@ struct CayenneDeletionSink {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     schema: SchemaRef,
     filters: Vec<Expr>,
+    /// Reference to the cached deletion vectors to invalidate after writing new deletions
+    cached_deleted_row_ids: Arc<RwLock<std::collections::HashSet<i64>>>,
 }
 
 impl CayenneDeletionSink {
@@ -1161,6 +1246,7 @@ impl CayenneDeletionSink {
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
         schema: SchemaRef,
         filters: &[Expr],
+        cached_deleted_row_ids: Arc<RwLock<std::collections::HashSet<i64>>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -1168,6 +1254,7 @@ impl CayenneDeletionSink {
             listing_table,
             schema,
             filters: filters.to_vec(),
+            cached_deleted_row_ids,
         }
     }
 
@@ -1292,10 +1379,22 @@ impl CayenneDeletionSink {
             .await
             .map_err(catalog_error_to_box)?;
 
+        // Update the cached deletion vectors with the newly deleted row IDs
+        // This avoids needing to reload from SQLite on the next scan
+        {
+            let mut guard = self
+                .cached_deleted_row_ids
+                .write()
+                .map_err(|e| format!("Failed to acquire write lock on deletion cache: {e}"))?;
+            for row_id in &result.row_ids {
+                guard.insert(*row_id);
+            }
+        }
+
         let deleted_count = convert_to_u64_box(result.row_ids.len(), "deleted row count")?;
 
         tracing::debug!(
-            "Deletion vector written: {} row(s) at {:?}",
+            "Deletion vector written and cache updated: {} row(s) at {:?}",
             deleted_count,
             result.path
         );
