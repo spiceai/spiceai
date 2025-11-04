@@ -22,9 +22,15 @@ use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
 use datafusion::functions::math::random::RandomFunc;
+use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::ai;
-use runtime_datafusion_udfs::embed;
+use runtime_datafusion_udfs::ai::AI_UDF_NAME;
+use runtime_datafusion_udfs::bucket::BUCKET_SCALAR_UDF_NAME;
+use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
+use runtime_datafusion_udfs::digest_many::DIGEST_UDF_NAME;
+use runtime_datafusion_udfs::embed::{self, EMBED_UDF_NAME};
+use runtime_datafusion_udfs::truncate::TRUNCATE_SCALAR_UDF_NAME;
 use runtime_datafusion_udfs::{alias, bucket, cosine_distance, digest_many, truncate};
 
 pub async fn register_udfs(runtime: &crate::Runtime) {
@@ -70,4 +76,26 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     }
 
     ctx.register_udf(digest_many::INSTANCE.clone());
+}
+
+/// Create a [`FunctionSupport`] with all spice specific functions as unsupported for federation.
+pub fn deny_spice_specific_functions() -> FunctionSupport {
+    FunctionSupport::new(
+        Some(FunctionRestriction::Deny(
+            [
+                "rand",
+                BUCKET_SCALAR_UDF_NAME,
+                COSINE_DISTANCE_UDF_NAME,
+                TRUNCATE_SCALAR_UDF_NAME,
+                EMBED_UDF_NAME,
+                AI_UDF_NAME,
+                DIGEST_UDF_NAME,
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        )),
+        None,
+        None,
+    )
 }
