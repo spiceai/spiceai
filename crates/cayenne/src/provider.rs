@@ -66,10 +66,32 @@ use vortex_datafusion::VortexFormat;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
 
+/// Error message for poisoned `RwLock` on the listing table.
+///
+/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
+/// inconsistent state. This is a critical error that typically requires restarting the runtime.
+const LISTING_TABLE_LOCK_POISONED: &str =
+    "Lock poisoned on listing table: a thread panicked while holding this lock. \
+    This indicates an internal error that requires restarting the runtime.";
+
+/// Error message for poisoned `RwLock` on the deletion cache.
+///
+/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
+/// inconsistent state. This is a critical error that typically requires restarting the runtime.
+const DELETION_CACHE_LOCK_POISONED: &str =
+    "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
+    This indicates an internal error that requires restarting the runtime.";
+
 /// Execution plan that filters out deleted rows based on deletion vectors.
 ///
 /// This wraps another execution plan and removes rows whose positions
 /// match the deleted row IDs loaded from deletion vector files.
+///
+/// # Zero-Copy Design
+///
+/// The deleted row IDs are wrapped in `Arc` to enable zero-copy sharing across
+/// concurrent scans. This avoids cloning potentially large `HashSet`s on every scan,
+/// aligning with the project's zero-copy principles for Arrow data.
 struct DeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
     deleted_row_ids: RoaringBitmap,
@@ -131,7 +153,7 @@ impl ExecutionPlan for DeletionFilterExec {
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            self.deleted_row_ids.clone(),
+            Arc::clone(&self.deleted_row_ids),
         )))
     }
 
@@ -141,7 +163,8 @@ impl ExecutionPlan for DeletionFilterExec {
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let deleted_row_ids = self.deleted_row_ids.clone();
+        // Zero-copy Arc clone - just increments reference count
+        let deleted_row_ids = Arc::clone(&self.deleted_row_ids);
         let schema = input_stream.schema();
 
         Ok(Box::pin(DeletionFilterStream {
@@ -317,6 +340,12 @@ pub struct CayenneTableProvider {
     retention_filters: Vec<Expr>,
     /// Vortex encoding configuration for hardware-accelerated compression
     vortex_config: super::metadata::VortexConfig,
+    /// Cached deletion vectors (deleted row IDs) to avoid repeated metastore queries on every scan.
+    /// This is loaded once during table provider initialization and invalidated when delete files change.
+    /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
+    /// The inner `Arc<HashSet<i64>>` enables zero-copy sharing: scans clone the Arc (cheap ref count
+    /// increment) rather than cloning the entire `HashSet`, aligning with zero-copy principles.
+    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -473,6 +502,96 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Cleanup old snapshot directories after a full refresh.
+    ///
+    /// For full refresh mode, after the new snapshot is written and the catalog is updated,
+    /// old snapshot directories are no longer needed and can be physically deleted.
+    ///
+    /// This function performs blocking filesystem I/O and should be called from within
+    /// `tokio::task::spawn_blocking` to avoid blocking the async runtime thread pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_path` - Base path for the table
+    /// * `table_id` - Table identifier
+    /// * `current_snapshot_id` - The current (active) snapshot ID that should be kept
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot directories cannot be listed or deleted.
+    ///
+    /// # Blocking I/O Warning
+    ///
+    /// This function uses `std::fs` for filesystem operations and will block the calling thread.
+    /// It must be called from within `tokio::task::spawn_blocking`.
+    fn cleanup_old_snapshots_blocking(
+        table_path: &str,
+        table_id: i64,
+        current_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        let table_dir = std::path::PathBuf::from(table_path).join(table_id.to_string());
+
+        // Check if table directory exists
+        if !table_dir.exists() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Cleaning up old snapshots for table {} (keeping {})",
+            table_id,
+            current_snapshot_id
+        );
+
+        // Read all entries in the table directory using blocking I/O
+        let entries =
+            std::fs::read_dir(&table_dir).map_err(|source| CatalogError::IoError { source })?;
+
+        let mut deleted_count = 0;
+        for entry_result in entries {
+            let entry = entry_result.map_err(|source| CatalogError::IoError { source })?;
+            let path = entry.path();
+
+            // Only process directories (snapshots)
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Get the snapshot ID (directory name)
+            let Some(snapshot_id) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Skip the current snapshot
+            if snapshot_id == current_snapshot_id {
+                tracing::debug!("Keeping current snapshot: {}", snapshot_id);
+                continue;
+            }
+
+            // Delete the old snapshot directory using blocking I/O
+            tracing::info!(
+                "Deleting old snapshot directory for table {}: {}",
+                table_id,
+                snapshot_id
+            );
+
+            std::fs::remove_dir_all(&path).map_err(|source| CatalogError::IoError { source })?;
+
+            deleted_count += 1;
+        }
+
+        if deleted_count > 0 {
+            tracing::info!(
+                "Cleaned up {} old snapshot(s) for table {}",
+                deleted_count,
+                table_id
+            );
+        } else {
+            tracing::debug!("No old snapshots to cleanup for table {}", table_id);
+        }
+
+        Ok(())
+    }
+
     /// Create a new Cayenne table provider.
     ///
     /// # Errors
@@ -514,12 +633,19 @@ impl CayenneTableProvider {
             &super::metadata::VortexConfig::default(),
         )?;
 
+        // Load deletion vectors once at initialization to avoid repeated SQLite queries on every scan
+        let table_id = table_metadata.table_id;
+        let catalog_for_load = Arc::clone(&catalog);
+        let deleted_row_ids = Self::load_deletion_vectors(table_id, catalog_for_load).await?;
+
         Ok(Self {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
             vortex_config: super::metadata::VortexConfig::default(),
+            // Wrap in Arc for zero-copy sharing across concurrent scans
+            cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
         })
     }
 
@@ -706,9 +832,9 @@ impl CayenneTableProvider {
         // Delegate to ListingTable's insert_into to write Vortex files
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                super::catalog::CatalogError::InvalidOperation {
-                    message: format!("Failed to acquire read lock on listing table: {e}"),
+            let guard = self.listing_table.read().map_err(|_| {
+                super::catalog::CatalogError::LockPoisoned {
+                    operation: "insert (read listing table)".to_string(),
                 }
             })?;
             Arc::clone(&guard)
@@ -804,13 +930,56 @@ impl CayenneTableProvider {
             Arc::clone(&self.listing_table),
             Arc::clone(&self.table_metadata.schema),
             &filters,
+            Arc::clone(&self.cached_deleted_row_ids),
         );
 
-        sink.delete_from()
-            .await
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to execute retention filters: {err}"),
-            })
+        let deleted_count =
+            sink.delete_from()
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message: format!("Failed to execute retention filters: {err}"),
+                })?;
+
+        // Refresh deletion cache after applying retention filters
+        if deleted_count > 0 {
+            self.refresh_deletion_cache().await?;
+        }
+
+        Ok(deleted_count)
+    }
+
+    /// Refresh the cached deletion vectors by reloading from the catalog.
+    ///
+    /// This should be called after operations that modify deletion vectors:
+    /// - After applying retention filters
+    /// - After manual delete operations
+    /// - After compaction that removes deleted rows
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion vectors cannot be loaded from the catalog.
+    async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
+        let deleted_row_ids =
+            Self::load_deletion_vectors(self.table_metadata.table_id, Arc::clone(&self.catalog))
+                .await?;
+
+        let mut guard =
+            self.cached_deleted_row_ids
+                .write()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "refresh deletion cache (write)".to_string(),
+                })?;
+
+        // Replace with new Arc-wrapped HashSet for zero-copy sharing
+        *guard = Arc::new(deleted_row_ids);
+
+        tracing::debug!(
+            "Refreshed deletion cache for table {} ({} deleted rows)",
+            self.table_metadata.table_name,
+            guard.len()
+        );
+
+        Ok(())
     }
 
     /// Delete rows matching the given primary key values.
@@ -874,11 +1043,12 @@ impl CayenneTableProvider {
         )?;
 
         // Update the listing table with write lock
-        let mut guard = self.listing_table.write().map_err(|e| {
-            super::catalog::CatalogError::InvalidOperation {
-                message: format!("Failed to acquire write lock for listing table refresh: {e}"),
-            }
-        })?;
+        let mut guard =
+            self.listing_table
+                .write()
+                .map_err(|_| super::catalog::CatalogError::LockPoisoned {
+                    operation: "refresh listing table (write)".to_string(),
+                })?;
         *guard = new_listing_table;
 
         tracing::debug!(
@@ -887,6 +1057,58 @@ impl CayenneTableProvider {
         );
 
         Ok(())
+    }
+
+    /// Load deletion vectors from the catalog and return a set of deleted row IDs.
+    ///
+    /// This method queries the catalog for delete files and loads all deletion vectors
+    /// into memory. It should be called once during table provider initialization and
+    /// whenever delete files are added/updated.
+    ///
+    /// # Performance Notes
+    ///
+    /// - Queries metastore once via catalog
+    /// - Reads deletion vector files in a blocking task
+    /// - Result is cached in the table provider to avoid repeated queries on every scan
+    async fn load_deletion_vectors(
+        table_id: i64,
+        catalog: Arc<dyn MetadataCatalog>,
+    ) -> CatalogResult<std::collections::HashSet<i64>> {
+        // Query catalog for delete files (this spawns a blocking task internally)
+        let delete_files = catalog
+            .get_table_delete_files(table_id)
+            .await
+            .map_err(|e| super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to load deletion vectors from catalog: {e}"),
+            })?;
+
+        if delete_files.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        // Read deletion vector files in a blocking task
+        let deleted_row_ids =
+            task::spawn_blocking(move || Self::read_deletion_vectors(delete_files))
+                .await
+                .map_err(|err| super::catalog::CatalogError::InvalidOperation {
+                    message: format!(
+                        "Deletion vector reader task panicked or was cancelled: {err}"
+                    ),
+                })
+                .and_then(|result| {
+                    result.map_err(|err| super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to read deletion vectors: {err}"),
+                    })
+                })?;
+
+        tracing::debug!(
+            "Cached {} deletion vectors ({} deleted rows) for table_id {}",
+            deleted_row_ids.len(),
+            deleted_row_ids.len(),
+            table_id
+        );
+
+        Ok(deleted_row_ids)
     }
 
     /// Read deletion vectors from files and return a set of deleted row IDs.
@@ -1022,10 +1244,10 @@ impl TableProvider for CayenneTableProvider {
         // Delegate to the underlying listing table first
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1033,49 +1255,27 @@ impl TableProvider for CayenneTableProvider {
             .scan(state, projection, filters, limit)
             .await?;
 
-        // Load deletion vectors from catalog
-        let delete_files = self
-            .catalog
-            .get_table_delete_files(self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to load deletion vectors: {e}"
-                ))
+        // Use cached deletion vectors instead of querying the catalog on every scan.
+        // This dramatically improves concurrent query performance by avoiding repeated
+        // SQLite queries and spawn_blocking tasks.
+        // Zero-copy Arc clone: just increments reference count, no HashSet allocation.
+        let deleted_row_ids = {
+            let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    DELETION_CACHE_LOCK_POISONED.to_string(),
+                )
             })?;
+            Arc::clone(&guard)
+        };
 
-        // If there are any deletion vectors, load and apply filtering
-        if !delete_files.is_empty() {
-            let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
+        // If there are any deleted rows, apply filtering
+        if !deleted_row_ids.is_empty() {
             tracing::debug!(
-                "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
-                delete_files.len(),
-                total_deleted,
+                "Applying cached deletion filter ({} deleted rows) to scan of table {}",
+                deleted_row_ids.len(),
                 self.table_metadata.table_name
             );
-
-            // Read all deletion vectors and build a set of deleted row IDs
-            let delete_files_for_read = delete_files.clone();
-            let deleted_row_ids =
-                task::spawn_blocking(move || Self::read_deletion_vectors(delete_files_for_read))
-                    .await
-                    .map_err(|err| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Deletion vector reader task panicked or was cancelled: {err}"
-                        ))
-                    })
-                    .and_then(|result| {
-                        result.map_err(|err| {
-                            datafusion_common::DataFusionError::Execution(format!(
-                                "Failed to read deletion vectors: {err}"
-                            ))
-                        })
-                    })?;
-
-            if !deleted_row_ids.is_empty() {
-                // Wrap the plan with our deletion filter
-                return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
-            }
+            return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
         }
 
         Ok(plan)
@@ -1087,10 +1287,10 @@ impl TableProvider for CayenneTableProvider {
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
         // Synchronous method - clone Arc quickly and release lock immediately
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1181,12 +1381,28 @@ impl TableProvider for CayenneTableProvider {
 
             // Update the provider's listing table to point to the new snapshot
             // This ensures subsequent queries in the same context will read from the new data
-            let mut listing_table_guard = self.listing_table.write().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire write lock on listing table: {e}"
-                ))
+            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             *listing_table_guard = new_listing_table;
+
+            // Trigger cleanup of old snapshot directories after successful full refresh
+            // This is fire-and-forget using spawn_blocking to avoid blocking the async runtime
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = new_snapshot_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+                {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
 
             return Ok(result);
         }
@@ -1203,10 +1419,10 @@ impl TableProvider for CayenneTableProvider {
 
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1241,6 +1457,7 @@ impl DeletionTableProvider for CayenneTableProvider {
                 Arc::clone(&self.listing_table),
                 Arc::clone(&self.table_metadata.schema),
                 filters,
+                Arc::clone(&self.cached_deleted_row_ids),
             )),
             &self.table_metadata.schema,
         )))
@@ -1254,6 +1471,9 @@ struct CayenneDeletionSink {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     schema: SchemaRef,
     filters: Vec<Expr>,
+    /// Reference to the cached deletion vectors to invalidate after writing new deletions.
+    /// Uses Arc-wrapped `HashSet` for zero-copy sharing across concurrent operations.
+    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
 }
 
 impl CayenneDeletionSink {
@@ -1263,6 +1483,7 @@ impl CayenneDeletionSink {
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
         schema: SchemaRef,
         filters: &[Expr],
+        cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -1270,6 +1491,7 @@ impl CayenneDeletionSink {
             listing_table,
             schema,
             filters: filters.to_vec(),
+            cached_deleted_row_ids,
         }
     }
 
@@ -1394,10 +1616,42 @@ impl CayenneDeletionSink {
             .await
             .map_err(catalog_error_to_box)?;
 
+        // Update the cached deletion vectors with the newly deleted row IDs
+        // This avoids needing to reload from SQLite on the next scan.
+        //
+        // We create a new Arc with the updated HashSet to maintain zero-copy semantics
+        // for concurrent readers who still hold references to the old Arc. This requires
+        // cloning the entire HashSet, which is acceptable because:
+        //
+        // 1. **Write infrequency**: Deletions happen much less frequently than reads
+        // 2. **Concurrent reader safety**: Cloning prevents disrupting ongoing scans that
+        //    hold Arc references to the old deletion set
+        // 3. **Cache coherence**: The alternative (in-place mutation) would require either:
+        //    - Taking write locks during scans (blocks all concurrent queries)
+        //    - Complex lock-free data structures (higher complexity, potential performance issues)
+        //
+        // For tables with very large deletion sets (millions of deleted rows), consider
+        // running compaction to physically remove deleted rows and reset the deletion vectors.
+        {
+            let mut guard = self
+                .cached_deleted_row_ids
+                .write()
+                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+
+            // Clone the entire HashSet and add new deletions.
+            // Cost: O(n) where n = existing deleted rows, but this is write path (infrequent).
+            // Benefit: Zero-copy Arc clones for concurrent readers (frequent).
+            let mut updated_set = (**guard).clone();
+            updated_set.extend(result.row_ids.iter().copied());
+
+            // Replace with new Arc - concurrent readers still have old Arc
+            *guard = Arc::new(updated_set);
+        }
+
         let deleted_count = convert_to_u64_box(result.row_ids.len(), "deleted row count")?;
 
         tracing::debug!(
-            "Deletion vector written: {} row(s) at {:?}",
+            "Deletion vector written and cache updated: {} row(s) at {:?}",
             deleted_count,
             result.path
         );
@@ -1464,7 +1718,7 @@ impl DeletionSink for CayenneDeletionSink {
             let guard = self
                 .listing_table
                 .read()
-                .map_err(|e| format!("Failed to acquire read lock on listing table: {e}"))?;
+                .map_err(|_| LISTING_TABLE_LOCK_POISONED.to_string())?;
             Arc::clone(&guard)
         };
 
