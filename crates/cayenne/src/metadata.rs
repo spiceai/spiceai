@@ -126,12 +126,13 @@ pub struct PartitionStats {
 
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct VortexConfig {
     /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns
     pub enable_alp: bool,
     /// Enable FSST (Fast String Suffix Trie) encoding for string columns
     pub enable_fsst: bool,
-    /// Enable BitPacking encoding for integer columns
+    /// Enable `BitPacking` encoding for integer columns
     pub enable_bitpacking: bool,
     /// Enable Delta encoding for sequential data
     pub enable_delta: bool,
@@ -141,7 +142,7 @@ pub struct VortexConfig {
     pub enable_dict: bool,
     /// Enable Frame-of-Reference (FOR) encoding
     pub enable_for: bool,
-    /// Enable ZigZag encoding for signed integers
+    /// Enable `ZigZag` encoding for signed integers
     pub enable_zigzag: bool,
     /// Footer cache size in MB
     pub footer_cache_mb: usize,

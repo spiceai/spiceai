@@ -396,10 +396,10 @@ impl CayenneTableProvider {
             enabled.push("ZigZag");
         }
 
-        if !enabled.is_empty() {
-            tracing::info!("Cayenne Vortex encodings enabled: {}", enabled.join(", "));
-        } else {
+        if enabled.is_empty() {
             tracing::warn!("All Cayenne Vortex encodings disabled - using canonical encoding only");
+        } else {
+            tracing::info!("Cayenne Vortex encodings enabled: {}", enabled.join(", "));
         }
 
         session
@@ -433,9 +433,10 @@ impl CayenneTableProvider {
         let vortex_session = Self::create_vortex_session(vortex_config);
 
         // Configure VortexFormat with hardware-optimized settings
-        let mut vortex_opts = vortex_datafusion::VortexOptions::default();
-        vortex_opts.footer_cache_size_mb = vortex_config.footer_cache_mb;
-        vortex_opts.segment_cache_size_mb = vortex_config.segment_cache_mb;
+        let vortex_opts = vortex_datafusion::VortexOptions {
+            footer_cache_size_mb: vortex_config.footer_cache_mb,
+            segment_cache_size_mb: vortex_config.segment_cache_mb,
+        };
 
         let format = Arc::new(VortexFormat::new_with_options(
             Arc::new(vortex_session),
@@ -902,7 +903,7 @@ impl CayenneTableProvider {
     ///
     /// Uses `RoaringBitmap` for:
     /// - SIMD-optimized contains operations (used in hot read path)
-    /// - 50-90% memory savings vs HashSet for sparse deletions
+    /// - 50-90% memory savings vs `HashSet` for sparse deletions
     /// - Efficient bulk insertion using Arrow's contiguous arrays
     fn read_deletion_vectors(
         delete_files: Vec<super::metadata::DeleteFile>,
