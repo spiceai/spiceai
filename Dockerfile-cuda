@@ -7,7 +7,7 @@ FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04 AS build
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev curl libclang-dev \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev curl \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y \
