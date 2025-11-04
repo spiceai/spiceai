@@ -214,9 +214,6 @@ impl S3Vectors for S3VectorClient {
         &self,
         input: ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
-        let _guard = TimeMeasurement::new(&super::metrics::list_indexes::LATENCY, &[]);
-        super::metrics::list_indexes::REQUESTS.add(1, &[]);
-
         // Check cache if next_token is None (full list)
         let is_full_list = input.next_token.is_none();
         if is_full_list && let Some(ttl) = self.ttl {
@@ -229,11 +226,15 @@ impl S3Vectors for S3VectorClient {
             }
         }
 
-        let result = self
-            .client
-            .list_indexes(input.clone())
-            .await
-            .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]));
+        let result = {
+            let _guard = TimeMeasurement::new(&super::metrics::list_indexes::LATENCY, &[]);
+            super::metrics::list_indexes::REQUESTS.add(1, &[]);
+
+            self.client
+                .list_indexes(input.clone())
+                .await
+                .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]))
+        };
 
         // Cache successful full list results
         if is_full_list
