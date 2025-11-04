@@ -12,38 +12,19 @@ on:
       - release-*
       - release/*
       - feature-*
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
-      - 'bin/spice/**'
 
   workflow_dispatch:
     inputs:
       update_snapshots:
-        description: 'Update the snapshots?'
+        description: "Update the snapshots?"
         required: false
-        default: 'no'
+        default: "no"
         type: choice
         options:
-          - 'always'
-          - 'no'
+          - "always"
+          - "no"
       run_all_tests:
-        description: 'Run all tests'
+        description: "Run all tests"
         type: boolean
         required: false
         default: false
@@ -57,16 +38,52 @@ env:
   CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
 
 jobs:
+  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
+  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
+  # a sucess when skipped).
+  check_changes:
+    runs-on: spiceai-dev-runners
+    outputs:
+      relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect all code changes
+        id: changed-code-files
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code_changes:
+              - 'crates/**'
+              - 'bin/**'
+              - 'test/**'
+              - 'tools/**'
+              - 'install/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'go.mod'
+              - 'go.sum'
+
+      - name: Check for relevant changes
+        id: check_changes
+        run: |
+          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+
   build:
     name: Build Test Binary
+    needs: check_changes
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@v5
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Cache Cargo dependencies
       - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -78,17 +95,21 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Set up make
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-make
 
       - name: Set up cc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
       - name: Check if sccache can be set up
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
@@ -99,18 +120,20 @@ jobs:
           fi
 
       - name: Set up sccache
-        if: ${{ env.SCCACHE_SETUP == 'true' }}
+        if: ${{ env.SCCACHE_SETUP == 'true' && needs.check_changes.outputs.relevant_changes == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
+          os: "linux"
 
       - name: Install Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       # Build the test binaries without running tests
       - name: Build integration test archives
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -135,6 +158,7 @@ jobs:
 
       # Upload the test archive as an artifact
       - name: Upload test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: integration-test-archive
@@ -142,6 +166,7 @@ jobs:
           retention-days: 1
 
       - name: Upload AWS SDK test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: integration-aws-sdk-test-archive
@@ -149,6 +174,7 @@ jobs:
           retention-days: 1
 
       - name: Upload AWS SDK credential bridge test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
@@ -156,6 +182,7 @@ jobs:
           retention-days: 1
 
       - name: Upload partition table test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: integration-partition-table-test-archive
@@ -163,6 +190,7 @@ jobs:
           retention-days: 1
 
       - name: Upload data components test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: integration-data-components-test-archive
@@ -171,7 +199,7 @@ jobs:
 
   test:
     name: Integration Tests (part ${{ matrix.label }})
-    needs: build
+    needs: [build, check_changes]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -180,23 +208,26 @@ jobs:
       matrix:
         include:
           - label: 1
-            partition: 'count:1/3'
+            partition: "count:1/3"
           - label: 2
-            partition: 'count:2/3'
+            partition: "count:2/3"
           - label: 3
-            partition: 'count:3/3'
+            partition: "count:3/3"
     steps:
       - uses: actions/checkout@v5
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Install Oracle ODPI-C
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
           mkdir linux
@@ -207,16 +238,19 @@ jobs:
 
       # Download the test archive artifact
       - name: Download test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/download-artifact@v6
         with:
           name: integration-test-archive
           path: ./integration_test
 
       - name: Install Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Login to ACR
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: docker/login-action@v3
         with:
           registry: spiceaitestimages.azurecr.io
@@ -224,16 +258,19 @@ jobs:
           password: ${{ secrets.AZCR_PASSWORD }}
 
       - name: Pull the Postgres/MySQL images
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           echo ${{ env.CONTAINER_REGISTRY }}
           docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
           docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
 
       - name: Set up Spice.ai API Key
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
 
       - name: Set up Github Token
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/create-github-app-token@v2
         id: github-app-token
         with:
@@ -244,6 +281,7 @@ jobs:
             spiceai
 
       - name: Run integration test
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
@@ -285,7 +323,7 @@ jobs:
           fi
       - name: Upload integration snapshots artifact
         id: create_snapshot_archive
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           git diff --name-only -- '*.snap' > snapshot-files
           git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
@@ -300,7 +338,7 @@ jobs:
           rm -f snapshot-files snapshot-files-0
         shell: bash
       - name: Store integration snapshots artifact
-        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true'
+        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: integration-snapshots-part-${{ matrix.label }}
@@ -364,7 +402,8 @@ jobs:
 
   test-aws-sdk:
     name: AWS SDK Integration Tests
-    needs: build
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
@@ -376,7 +415,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Download AWS SDK test archive
         uses: actions/download-artifact@v6
@@ -406,7 +445,8 @@ jobs:
 
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
-    needs: build
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
@@ -418,7 +458,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Download AWS SDK credential bridge test archive
         uses: actions/download-artifact@v6
@@ -452,7 +492,8 @@ jobs:
 
   test-data-components:
     name: Data Components Integration Tests
-    needs: build
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -464,7 +505,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Download data components test archive
         uses: actions/download-artifact@v6
@@ -486,7 +527,8 @@ jobs:
 
   test-runtime-partition:
     name: Partition Table Integration Tests
-    needs: build
+    needs: [build, check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
@@ -497,7 +539,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Download partition table test archive
         uses: actions/download-artifact@v6
