@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/acceleration/partition_by_cayenne.rs
+assertion_line: 129
+expression: plan_str
+---
+BytesProcessedExec
+  SchemaCastScanExec
+    UnionExec
+      DataSourceExec: file_groups={1 group: [[Users/lukim/dev/spice2/crates/runtime/.spice/data/bucket_test/expr0=2/2/019a4cb7-fcaf-74f0-bebd-0fd962f281e5/S07KhQMYAd7f1kyo_0.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+      DataSourceExec: file_groups={1 group: [[Users/lukim/dev/spice2/crates/runtime/.spice/data/bucket_test/expr0=0/3/019a4cb7-fcaf-74f0-bebd-0fe77686f624/36KcO2obPCAsXtzv_0.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+      DataSourceExec: file_groups={1 group: [[Users/lukim/dev/spice2/crates/runtime/.spice/data/bucket_test/expr0=1/4/019a4cb7-fcaf-74f0-bebd-0fcb38c8deed/WE1sSB4T2WSxvi9q_0.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
