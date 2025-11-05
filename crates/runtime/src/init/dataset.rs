@@ -815,19 +815,16 @@ impl Runtime {
 
         let mut initialized_datasets = vec![];
         for ds in datasets {
-            let acceleration_settings = match &ds.acceleration {
-                // Non-accelerated datasets are always successfully initialized
-                None => {
-                    initialized_datasets.push(Arc::clone(ds));
-                    continue;
-                }
-                // Skip accelerator initialization if acceleration is disabled
-                Some(settings) if !settings.enabled => {
-                    initialized_datasets.push(Arc::clone(ds));
-                    continue;
-                }
-                Some(settings) => settings,
-            };
+            // Non-accelerated datasets or disabled acceleration are always successfully initialized
+            if ds.acceleration.as_ref().map_or(true, |acc| !acc.enabled) {
+                initialized_datasets.push(Arc::clone(ds));
+                continue;
+            }
+
+            let acceleration_settings = ds
+                .acceleration
+                .as_ref()
+                .expect("acceleration is Some and enabled");
 
             let accelerator = match self
                 .accelerator_engine_registry
@@ -847,23 +844,22 @@ impl Runtime {
                 }
             };
 
-            if let Err(err) =
-                accelerator
-                    .init(ds.as_ref())
-                    .await
-                    .context(AcceleratorInitializationFailedSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    })
-            {
-                let ds_name = &ds.name;
-                self.status
-                    .update_dataset(ds_name, status::ComponentStatus::Error);
-                metrics::datasets::LOAD_ERROR.add(1, &[]);
-                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                continue;
+            match accelerator.init(ds.as_ref()).await.context(
+                AcceleratorInitializationFailedSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                },
+            ) {
+                Ok(()) => {
+                    initialized_datasets.push(Arc::clone(ds));
+                }
+                Err(err) => {
+                    let ds_name = &ds.name;
+                    self.status
+                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                }
             }
-
-            initialized_datasets.push(Arc::clone(ds));
         }
 
         let snapshot_sources: Vec<Arc<dyn AccelerationSource>> = initialized_datasets

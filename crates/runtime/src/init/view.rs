@@ -103,35 +103,43 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         for view in views {
-            if let Some(acceleration_settings) = &view.acceleration {
-                // Skip accelerator initialization if acceleration is disabled
-                if !acceleration_settings.enabled {
+            // Non-accelerated views or disabled acceleration don't need initialization
+            if view.acceleration.as_ref().map_or(true, |acc| !acc.enabled) {
+                continue;
+            }
+
+            let acceleration_settings = view
+                .acceleration
+                .as_ref()
+                .expect("acceleration is Some and enabled");
+
+            let accelerator = match self
+                .accelerator_engine_registry
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineNotAvailableSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                }) {
+                Ok(accelerator) => accelerator,
+                Err(err) => {
+                    let view_name = &view.name;
+                    self.status
+                        .update_view(view_name, status::ComponentStatus::Error);
+                    metrics::views::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
                     continue;
                 }
+            };
 
-                let accelerator = match self
-                    .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration_settings.engine)
-                    .await
-                    .context(AcceleratorEngineNotAvailableSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    }) {
-                    Ok(accelerator) => accelerator,
-                    Err(err) => {
-                        let view_name = &view.name;
-                        self.status
-                            .update_view(view_name, status::ComponentStatus::Error);
-                        metrics::views::LOAD_ERROR.add(1, &[]);
-                        warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
-                        continue;
-                    }
-                };
-
-                if let Err(err) = accelerator.init(view.as_ref()).await.context(
-                    AcceleratorInitializationFailedSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    },
-                ) {
+            match accelerator.init(view.as_ref()).await.context(
+                AcceleratorInitializationFailedSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                },
+            ) {
+                Ok(()) => {
+                    // Initialization successful, continue to next view
+                }
+                Err(err) => {
                     let view_name = &view.name;
                     self.status
                         .update_view(view_name, status::ComponentStatus::Error);
