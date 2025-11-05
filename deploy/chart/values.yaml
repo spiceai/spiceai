@@ -2,8 +2,8 @@
 additionalLabels: {}
 
 image:
-  repository: ghcr.io/spiceai/spiceai-nightly
-  tag: latest-models # 1.9.0-unstable
+  repository: spiceai/spiceai
+  tag: 1.9.0-rc.1-models # 1.9.0-unstable
 replicaCount: 1
 
 service:
@@ -64,7 +64,7 @@ serviceAccount:
 stateful:
   enabled: false
   # Storage class for the volume claim template
-  storageClass: 'standard'
+  storageClass: "standard"
   # Size of each PV in the StatefulSet
   size: 1Gi
   # Mount path in container
