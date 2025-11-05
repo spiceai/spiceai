@@ -815,44 +815,55 @@ impl Runtime {
 
         let mut initialized_datasets = vec![];
         for ds in datasets {
-            if let Some(acceleration_settings) = &ds.acceleration {
-                let accelerator = match self
-                    .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration_settings.engine)
-                    .await
-                    .context(AcceleratorEngineNotAvailableSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    }) {
-                    Ok(accelerator) => accelerator,
-                    Err(err) => {
-                        let ds_name = &ds.name;
-                        self.status
-                            .update_dataset(ds_name, status::ComponentStatus::Error);
-                        metrics::datasets::LOAD_ERROR.add(1, &[]);
-                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                        continue;
-                    }
-                };
-
-                match accelerator.init(ds.as_ref()).await.context(
-                    AcceleratorInitializationFailedSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    },
-                ) {
-                    Ok(()) => {
-                        initialized_datasets.push(Arc::clone(ds));
-                    }
-                    Err(err) => {
-                        let ds_name = &ds.name;
-                        self.status
-                            .update_dataset(ds_name, status::ComponentStatus::Error);
-                        metrics::datasets::LOAD_ERROR.add(1, &[]);
-                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                    }
+            let acceleration_settings = match &ds.acceleration {
+                // Non-accelerated datasets are always successfully initialized
+                None => {
+                    initialized_datasets.push(Arc::clone(ds));
+                    continue;
                 }
-            } else {
-                initialized_datasets.push(Arc::clone(ds)); // non-accelerated datasets are always successfully initialized
+                // Skip accelerator initialization if acceleration is disabled
+                Some(settings) if !settings.enabled => {
+                    initialized_datasets.push(Arc::clone(ds));
+                    continue;
+                }
+                Some(settings) => settings,
+            };
+
+            let accelerator = match self
+                .accelerator_engine_registry
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineNotAvailableSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                }) {
+                Ok(accelerator) => accelerator,
+                Err(err) => {
+                    let ds_name = &ds.name;
+                    self.status
+                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    continue;
+                }
+            };
+
+            if let Err(err) =
+                accelerator
+                    .init(ds.as_ref())
+                    .await
+                    .context(AcceleratorInitializationFailedSnafu {
+                        name: acceleration_settings.engine.to_string(),
+                    })
+            {
+                let ds_name = &ds.name;
+                self.status
+                    .update_dataset(ds_name, status::ComponentStatus::Error);
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
+                warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                continue;
             }
+
+            initialized_datasets.push(Arc::clone(ds));
         }
 
         let snapshot_sources: Vec<Arc<dyn AccelerationSource>> = initialized_datasets

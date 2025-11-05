@@ -104,6 +104,11 @@ impl Runtime {
 
         for view in views {
             if let Some(acceleration_settings) = &view.acceleration {
+                // Skip accelerator initialization if acceleration is disabled
+                if !acceleration_settings.enabled {
+                    continue;
+                }
+
                 let accelerator = match self
                     .accelerator_engine_registry
                     .get_accelerator_engine(acceleration_settings.engine)
