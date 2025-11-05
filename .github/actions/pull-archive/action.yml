@@ -7,6 +7,9 @@ inputs:
   local-path:
     description: "Local path to extract the archive"
     required: true
+  force-extract-at-path:
+    description: "Whether to supply the local path to tar for extraction"
+    required: false
 runs:
   using: "composite"
   steps:
@@ -31,5 +34,10 @@ runs:
           fi
         fi
 
-        tar --use-compress-program="zstd -d" -xf ${{ inputs.archive-path }} ${{ inputs.local-path }}
+        # if force-extract-at-path is not specified, extract without specifying a path
+        if [ -z "${{ inputs.force-extract-at-path }}" ]; then
+          tar --use-compress-program="zstd -d" -xf ${{ inputs.archive-path }}
+        else
+          tar --use-compress-program="zstd -d" -xf ${{ inputs.archive-path }} ${{ inputs.local-path }}
+        fi
         find ${{ inputs.local-path }} -type f -exec touch {} +

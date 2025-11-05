@@ -158,13 +158,14 @@ jobs:
         with:
           archive-path: lint.tar.zst
           local-path: target/lint/
+          force-extract-at-path: true
 
       - name: pull cargo cache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/pull-archive
         with:
           archive-path: cargo.tar.zst
-          local-path: ~/.cargo/
+          local-path: ~/.cargo/registry
 
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -179,12 +180,12 @@ jobs:
           archive-path: lint.tar.zst
           local-path: target/lint/
 
-      - name: push cargo cache
+      - name: push cargo registry cache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/push-archive
         with:
           archive-path: cargo.tar.zst
-          local-path: ~/.cargo/
+          local-path: ~/.cargo/registry
 
       - name: force exit
         run: exit 1
