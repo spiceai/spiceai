@@ -179,13 +179,16 @@ async fn dispatch_workflow_with_concurrency(
     input: Option<serde_json::Value>,
     max_parallel: usize,
 ) -> Result<()> {
-    wait_for_slot(
+    if let Err(err) = wait_for_slot(
         &workflow,
         octo,
         max_parallel,
         Duration::from_secs(1800), // 30 mins
     )
-    .await?;
+    .await
+    {
+        eprintln!("Error waiting for slot: {err}");
+    }
 
     workflow.send(octo.actions(), input).await
 }
