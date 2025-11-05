@@ -10,18 +10,18 @@ use std::sync::Arc;
 /// Creates a fixed `NumberInfoRecord` for consistent snapshotting
 fn create_fixed_number_info_record() -> NumberInfoRecord {
     NumberInfoRecord {
-        account_sid: "AC02da2b759e8342d4b73ff6e64a77ce58".to_string(),
-        number_pool_sid: "NPcb39bd63c0a54ab8b106d8f9e0aa6507".to_string(),
-        number_sid: "PN00000000000000000000000000000001".to_string(), // Not used in parameters
-        max_rate: 49,
-        number_did: String::new(), // Not used in parameters
-        number_type: "tf".to_string(),
-        supported_dest_region: String::new(), // Not used in parameters
-        number_region: "CA".to_string(),
-        current_rate: 0,             // Not used in parameters
-        is_available: 0,             // Not used in parameters
-        provider_sid: String::new(), // Not used in parameters
-        area_code_region: "212".to_string(),
+        account_sid: "AC8ee2a82cf11c7c8860b192678c9e3066".to_string(),
+        number_pool_sid: "NPe85ca269e9eb6b9268ffeab9d6ffaba9".to_string(),
+        number_sid: "PNbd07a0546edbbd27fbf578fdf1581454".to_string(), // Not used in parameters
+        max_rate: 20,
+        number_did: "+16176906114".to_string(), // Not used in parameters
+        number_type: "lc".to_string(),
+        supported_dest_region: "US".to_string(), // Not used in parameters
+        number_region: "US".to_string(),
+        current_rate: 100, // Not used in parameters
+        is_available: 1,   // Not used in parameters
+        provider_sid: "OT22140ff77c26978211f29cf6663d75b5".to_string(), // Not used in parameters
+        area_code_region: "617".to_string(),
         available_for_number_selection: 0, // Maps to selectA2pNumber flag = 0
         capability: "sms".to_string(),
     }
