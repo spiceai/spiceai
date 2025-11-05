@@ -182,12 +182,11 @@ pub async fn list_index_names(
     bucket_name: &str,
     prefix: &str,
 ) -> Result<Vec<String>, DataFusionError> {
-    let prefix = prefix.replace('_', "-");
     let list_indexes_output = client
         .list_indexes(
             ListIndexesInput::builder()
                 .set_vector_bucket_name(Some(bucket_name.to_string()))
-                .set_prefix(Some(prefix))
+                .set_prefix(Some(prefix.to_string()))
                 .build()
                 .boxed()
                 .map_err(DataFusionError::External)?,
