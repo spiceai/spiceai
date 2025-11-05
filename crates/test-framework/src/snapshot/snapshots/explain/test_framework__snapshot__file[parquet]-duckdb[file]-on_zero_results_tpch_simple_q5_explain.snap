@@ -27,9 +27,9 @@ description: "Query: tpch_simple_q5"
 |               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_totalprice@1, l_linestatus@3] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 32), input_partitions=32                                                 |
-|               |                       BytesProcessedExec                                                                                                        |
-|               |                         SchemaCastScanExec                                                                                                      |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                 |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
+|               |                         BytesProcessedExec                                                                                                      |
+|               |                           SchemaCastScanExec                                                                                                    |
 |               |                             FallbackOnZeroResultsScanExec                                                                                       |
 |               |                               CoalescePartitionsExec                                                                                            |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                           |
@@ -37,9 +37,9 @@ description: "Query: tpch_simple_q5"
 |               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_totalprice" FROM orders                                            |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 32), input_partitions=32                                                 |
-|               |                       BytesProcessedExec                                                                                                        |
-|               |                         SchemaCastScanExec                                                                                                      |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                 |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
+|               |                         BytesProcessedExec                                                                                                      |
+|               |                           SchemaCastScanExec                                                                                                    |
 |               |                             FallbackOnZeroResultsScanExec                                                                                       |
 |               |                               CoalescePartitionsExec                                                                                            |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                           |
