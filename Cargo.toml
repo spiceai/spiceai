@@ -286,7 +286,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "376f925a3a735e3b5077257a9c0ffdad3bbfe89f" } # Jeadie:jeadie/25-11-03/scalar-udfs
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "0be4971c1589b8774c9fd6632d5ebcefb14dc5f5" } # Jeadie:jeadie/25-11-03/scalar-udfs
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a99494a6f3bad72faa7daecd4477ef42f4e9c046" } # jeadie/25-10-31/temp
 
