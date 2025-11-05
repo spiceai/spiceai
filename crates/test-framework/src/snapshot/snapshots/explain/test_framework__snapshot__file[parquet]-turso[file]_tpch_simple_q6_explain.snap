@@ -13,8 +13,8 @@ description: "Query: tpch_simple_q6"
 | physical_plan | ProjectionExec: expr=[o_orderkey@0 + 1 as key]                          |
 |               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
 |               |     BytesProcessedExec                                                  |
-|               |       SchemaCastScanExec                                                |
-|               |         GlobalLimitExec: skip=0, fetch=10                               |
+|               |       GlobalLimitExec: skip=0, fetch=10                                 |
+|               |         SchemaCastScanExec                                              |
 |               |           CooperativeExec                                               |
 |               |             TursoExec sql=SELECT "o_orderkey" FROM orders LIMIT 10      |
 |               |                                                                         |
