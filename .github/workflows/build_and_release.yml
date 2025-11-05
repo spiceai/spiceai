@@ -7,46 +7,46 @@ on:
     tags:
       - v*
     paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
+      - "**/*.md"
+      - "docs/**"
+      - "README.md"
+      - "Makefile"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "LICENSE"
+      - ".github/**"
+      - "version.txt"
+      - ".schema/**"
+      - ".vscode/**"
+      - "deploy/**"
+      - "install/**"
+      - "media/**"
+      - "monitoring/**"
+      - "acknowledgements.md"
+      - "Dockerfile*"
 
   workflow_dispatch:
     inputs:
       platform_option:
-        description: 'Which option do you want to run on? (Default is ALL)'
+        description: "Which option do you want to run on? (Default is ALL)"
         required: false
         type: choice
         options:
-          - 'all'
-          - 'Linux x64'
-          - 'Linux aarch64'
-          - 'macOS aarch64 (Apple Silicon)'
-          - 'Windows x64'
-          - 'macOS x64 (Intel)'
-        default: 'all'
+          - "all"
+          - "Linux x64"
+          - "Linux aarch64"
+          - "macOS aarch64 (Apple Silicon)"
+          - "Windows x64"
+          - "macOS x64 (Intel)"
+        default: "all"
       profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
+        description: "Which Rust build profile to use? (Default is release)"
         required: false
         type: choice
         options:
-          - 'release'
-          - 'release-lto'
-        default: 'release'
+          - "release"
+          - "release-lto"
+        default: "release"
 
 jobs:
   setup-matrix:
@@ -63,21 +63,21 @@ jobs:
           script: |
             // Check if this is a tagged release
             const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-            
+
             // Check if this is trunk or a release branch
             const isTrunkOrRelease = context.ref === 'refs/heads/trunk' || 
                                       context.ref.startsWith('refs/heads/release-') ||
                                       context.ref.startsWith('refs/heads/release/');
-            
+
             // Check if this is a manual workflow dispatch
             const isManualDispatch = context.eventName === 'workflow_dispatch';
-            
+
             // Include Windows only for trunk, release branches, tagged releases, or manual dispatch
             const includeWindows = isTaggedRelease || isTrunkOrRelease || isManualDispatch;
-            
+
             // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
             const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
-            
+
             const matrix = [
               {
                 name: "Linux x64",
@@ -102,7 +102,7 @@ jobs:
                 tags: ["default", "models", "metal"],
               }
             ];
-            
+
             // Add Windows only for trunk, release branches, tagged releases, or manual dispatch
             if (includeWindows) {
               matrix.push({
@@ -368,9 +368,9 @@ jobs:
         if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Upload artifacts to Minio
         if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
@@ -390,47 +390,6 @@ jobs:
           if [ -f "spice_linux_x86_64.tar.gz" ]; then
             mc cp spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
           fi;
-
-  upload_to_minio:
-    name: Upload artifacts to MinIO
-    needs: build
-    runs-on: spiceai-dev-runners
-    if: inputs.platform_option == 'Linux x64' || inputs.platform_option == 'all' || github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v5
-      - name: Setup MinIO
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: download artifacts - spice_linux_x86_64
-        uses: actions/download-artifact@v6
-        with:
-          name: spice_linux_x86_64
-
-      - name: download artifacts - spiced_linux_x86_64
-        uses: actions/download-artifact@v6
-        with:
-          name: spiced_linux_x86_64
-
-      - name: download artifacts - spiced_models_linux_x86_64
-        uses: actions/download-artifact@v6
-        with:
-          name: spiced_models_linux_x86_64
-
-      - name: download artifacts - spiced_odbc_models_linux_x86_64
-        uses: actions/download-artifact@v6
-        with:
-          name: spiced_odbc_models_linux_x86_64
-
-      - name: Upload artifacts to Minio
-        run: |
-          mc cp spiced_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_linux_x86_64.tar.gz
-          mc cp spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_models_linux_x86_64.tar.gz
-          mc cp spiced_odbc_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_odbc_models_linux_x86_64.tar.gz
-          mc cp spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/spice_linux_x86_64.tar.gz
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
