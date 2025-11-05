@@ -65,18 +65,43 @@ use vortex_datafusion::VortexFormat;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
 
+/// Error message for poisoned `RwLock` on the listing table.
+///
+/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
+/// inconsistent state. This is a critical error that typically requires restarting the runtime.
+const LISTING_TABLE_LOCK_POISONED: &str =
+    "Lock poisoned on listing table: a thread panicked while holding this lock. \
+    This indicates an internal error that requires restarting the runtime.";
+
+/// Error message for poisoned `RwLock` on the deletion cache.
+///
+/// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
+/// inconsistent state. This is a critical error that typically requires restarting the runtime.
+const DELETION_CACHE_LOCK_POISONED: &str =
+    "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
+    This indicates an internal error that requires restarting the runtime.";
+
 /// Execution plan that filters out deleted rows based on deletion vectors.
 ///
 /// This wraps another execution plan and removes rows whose positions
 /// match the deleted row IDs loaded from deletion vector files.
+///
+/// # Zero-Copy Design
+///
+/// The deleted row IDs are wrapped in `Arc` to enable zero-copy sharing across
+/// concurrent scans. This avoids cloning potentially large `HashSet`s on every scan,
+/// aligning with the project's zero-copy principles for Arrow data.
 struct DeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    deleted_row_ids: std::collections::HashSet<i64>,
+    deleted_row_ids: Arc<std::collections::HashSet<i64>>,
     properties: datafusion_physical_plan::PlanProperties,
 }
 
 impl DeletionFilterExec {
-    fn new(input: Arc<dyn ExecutionPlan>, deleted_row_ids: std::collections::HashSet<i64>) -> Self {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        deleted_row_ids: Arc<std::collections::HashSet<i64>>,
+    ) -> Self {
         let properties = input.properties().clone();
         Self {
             input,
@@ -130,7 +155,7 @@ impl ExecutionPlan for DeletionFilterExec {
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            self.deleted_row_ids.clone(),
+            Arc::clone(&self.deleted_row_ids),
         )))
     }
 
@@ -140,7 +165,8 @@ impl ExecutionPlan for DeletionFilterExec {
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let deleted_row_ids = self.deleted_row_ids.clone();
+        // Zero-copy Arc clone - just increments reference count
+        let deleted_row_ids = Arc::clone(&self.deleted_row_ids);
         let schema = input_stream.schema();
 
         Ok(Box::pin(DeletionFilterStream {
@@ -155,7 +181,7 @@ impl ExecutionPlan for DeletionFilterExec {
 /// Stream that filters out deleted rows from an input stream.
 struct DeletionFilterStream {
     input: SendableRecordBatchStream,
-    deleted_row_ids: std::collections::HashSet<i64>,
+    deleted_row_ids: Arc<std::collections::HashSet<i64>>,
     schema: arrow_schema::SchemaRef,
     global_row_offset: i64,
 }
@@ -309,6 +335,12 @@ pub struct CayenneTableProvider {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
+    /// Cached deletion vectors (deleted row IDs) to avoid repeated metastore queries on every scan.
+    /// This is loaded once during table provider initialization and invalidated when delete files change.
+    /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
+    /// The inner `Arc<HashSet<i64>>` enables zero-copy sharing: scans clone the Arc (cheap ref count
+    /// increment) rather than cloning the entire `HashSet`, aligning with zero-copy principles.
+    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -400,6 +432,96 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Cleanup old snapshot directories after a full refresh.
+    ///
+    /// For full refresh mode, after the new snapshot is written and the catalog is updated,
+    /// old snapshot directories are no longer needed and can be physically deleted.
+    ///
+    /// This function performs blocking filesystem I/O and should be called from within
+    /// `tokio::task::spawn_blocking` to avoid blocking the async runtime thread pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_path` - Base path for the table
+    /// * `table_id` - Table identifier
+    /// * `current_snapshot_id` - The current (active) snapshot ID that should be kept
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot directories cannot be listed or deleted.
+    ///
+    /// # Blocking I/O Warning
+    ///
+    /// This function uses `std::fs` for filesystem operations and will block the calling thread.
+    /// It must be called from within `tokio::task::spawn_blocking`.
+    fn cleanup_old_snapshots_blocking(
+        table_path: &str,
+        table_id: i64,
+        current_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        let table_dir = std::path::PathBuf::from(table_path).join(table_id.to_string());
+
+        // Check if table directory exists
+        if !table_dir.exists() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Cleaning up old snapshots for table {} (keeping {})",
+            table_id,
+            current_snapshot_id
+        );
+
+        // Read all entries in the table directory using blocking I/O
+        let entries =
+            std::fs::read_dir(&table_dir).map_err(|source| CatalogError::IoError { source })?;
+
+        let mut deleted_count = 0;
+        for entry_result in entries {
+            let entry = entry_result.map_err(|source| CatalogError::IoError { source })?;
+            let path = entry.path();
+
+            // Only process directories (snapshots)
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Get the snapshot ID (directory name)
+            let Some(snapshot_id) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Skip the current snapshot
+            if snapshot_id == current_snapshot_id {
+                tracing::debug!("Keeping current snapshot: {}", snapshot_id);
+                continue;
+            }
+
+            // Delete the old snapshot directory using blocking I/O
+            tracing::info!(
+                "Deleting old snapshot directory for table {}: {}",
+                table_id,
+                snapshot_id
+            );
+
+            std::fs::remove_dir_all(&path).map_err(|source| CatalogError::IoError { source })?;
+
+            deleted_count += 1;
+        }
+
+        if deleted_count > 0 {
+            tracing::info!(
+                "Cleaned up {} old snapshot(s) for table {}",
+                deleted_count,
+                table_id
+            );
+        } else {
+            tracing::debug!("No old snapshots to cleanup for table {}", table_id);
+        }
+
+        Ok(())
+    }
+
     /// Create a new Cayenne table provider.
     ///
     /// # Errors
@@ -440,11 +562,18 @@ impl CayenneTableProvider {
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
         )?;
 
+        // Load deletion vectors once at initialization to avoid repeated SQLite queries on every scan
+        let table_id = table_metadata.table_id;
+        let catalog_for_load = Arc::clone(&catalog);
+        let deleted_row_ids = Self::load_deletion_vectors(table_id, catalog_for_load).await?;
+
         Ok(Self {
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
+            // Wrap in Arc for zero-copy sharing across concurrent scans
+            cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
         })
     }
 
@@ -631,9 +760,9 @@ impl CayenneTableProvider {
         // Delegate to ListingTable's insert_into to write Vortex files
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                super::catalog::CatalogError::InvalidOperation {
-                    message: format!("Failed to acquire read lock on listing table: {e}"),
+            let guard = self.listing_table.read().map_err(|_| {
+                super::catalog::CatalogError::LockPoisoned {
+                    operation: "insert (read listing table)".to_string(),
                 }
             })?;
             Arc::clone(&guard)
@@ -729,13 +858,56 @@ impl CayenneTableProvider {
             Arc::clone(&self.listing_table),
             Arc::clone(&self.table_metadata.schema),
             &filters,
+            Arc::clone(&self.cached_deleted_row_ids),
         );
 
-        sink.delete_from()
-            .await
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to execute retention filters: {err}"),
-            })
+        let deleted_count =
+            sink.delete_from()
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message: format!("Failed to execute retention filters: {err}"),
+                })?;
+
+        // Refresh deletion cache after applying retention filters
+        if deleted_count > 0 {
+            self.refresh_deletion_cache().await?;
+        }
+
+        Ok(deleted_count)
+    }
+
+    /// Refresh the cached deletion vectors by reloading from the catalog.
+    ///
+    /// This should be called after operations that modify deletion vectors:
+    /// - After applying retention filters
+    /// - After manual delete operations
+    /// - After compaction that removes deleted rows
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion vectors cannot be loaded from the catalog.
+    async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
+        let deleted_row_ids =
+            Self::load_deletion_vectors(self.table_metadata.table_id, Arc::clone(&self.catalog))
+                .await?;
+
+        let mut guard =
+            self.cached_deleted_row_ids
+                .write()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "refresh deletion cache (write)".to_string(),
+                })?;
+
+        // Replace with new Arc-wrapped HashSet for zero-copy sharing
+        *guard = Arc::new(deleted_row_ids);
+
+        tracing::debug!(
+            "Refreshed deletion cache for table {} ({} deleted rows)",
+            self.table_metadata.table_name,
+            guard.len()
+        );
+
+        Ok(())
     }
 
     /// Delete rows matching the given primary key values.
@@ -798,11 +970,12 @@ impl CayenneTableProvider {
         )?;
 
         // Update the listing table with write lock
-        let mut guard = self.listing_table.write().map_err(|e| {
-            super::catalog::CatalogError::InvalidOperation {
-                message: format!("Failed to acquire write lock for listing table refresh: {e}"),
-            }
-        })?;
+        let mut guard =
+            self.listing_table
+                .write()
+                .map_err(|_| super::catalog::CatalogError::LockPoisoned {
+                    operation: "refresh listing table (write)".to_string(),
+                })?;
         *guard = new_listing_table;
 
         tracing::debug!(
@@ -811,6 +984,58 @@ impl CayenneTableProvider {
         );
 
         Ok(())
+    }
+
+    /// Load deletion vectors from the catalog and return a set of deleted row IDs.
+    ///
+    /// This method queries the catalog for delete files and loads all deletion vectors
+    /// into memory. It should be called once during table provider initialization and
+    /// whenever delete files are added/updated.
+    ///
+    /// # Performance Notes
+    ///
+    /// - Queries metastore once via catalog
+    /// - Reads deletion vector files in a blocking task
+    /// - Result is cached in the table provider to avoid repeated queries on every scan
+    async fn load_deletion_vectors(
+        table_id: i64,
+        catalog: Arc<dyn MetadataCatalog>,
+    ) -> CatalogResult<std::collections::HashSet<i64>> {
+        // Query catalog for delete files (this spawns a blocking task internally)
+        let delete_files = catalog
+            .get_table_delete_files(table_id)
+            .await
+            .map_err(|e| super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to load deletion vectors from catalog: {e}"),
+            })?;
+
+        if delete_files.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        // Read deletion vector files in a blocking task
+        let deleted_row_ids =
+            task::spawn_blocking(move || Self::read_deletion_vectors(delete_files))
+                .await
+                .map_err(|err| super::catalog::CatalogError::InvalidOperation {
+                    message: format!(
+                        "Deletion vector reader task panicked or was cancelled: {err}"
+                    ),
+                })
+                .and_then(|result| {
+                    result.map_err(|err| super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to read deletion vectors: {err}"),
+                    })
+                })?;
+
+        tracing::debug!(
+            "Cached {} deletion vectors ({} deleted rows) for table_id {}",
+            deleted_row_ids.len(),
+            deleted_row_ids.len(),
+            table_id
+        );
+
+        Ok(deleted_row_ids)
     }
 
     /// Read deletion vectors from files and return a set of deleted row IDs.
@@ -923,10 +1148,10 @@ impl TableProvider for CayenneTableProvider {
         // Delegate to the underlying listing table first
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -934,49 +1159,27 @@ impl TableProvider for CayenneTableProvider {
             .scan(state, projection, filters, limit)
             .await?;
 
-        // Load deletion vectors from catalog
-        let delete_files = self
-            .catalog
-            .get_table_delete_files(self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to load deletion vectors: {e}"
-                ))
+        // Use cached deletion vectors instead of querying the catalog on every scan.
+        // This dramatically improves concurrent query performance by avoiding repeated
+        // SQLite queries and spawn_blocking tasks.
+        // Zero-copy Arc clone: just increments reference count, no HashSet allocation.
+        let deleted_row_ids = {
+            let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    DELETION_CACHE_LOCK_POISONED.to_string(),
+                )
             })?;
+            Arc::clone(&guard)
+        };
 
-        // If there are any deletion vectors, load and apply filtering
-        if !delete_files.is_empty() {
-            let total_deleted = delete_files.iter().map(|df| df.delete_count).sum::<i64>();
+        // If there are any deleted rows, apply filtering
+        if !deleted_row_ids.is_empty() {
             tracing::debug!(
-                "Applying {} deletion vectors ({} deleted rows) to scan of table {}",
-                delete_files.len(),
-                total_deleted,
+                "Applying cached deletion filter ({} deleted rows) to scan of table {}",
+                deleted_row_ids.len(),
                 self.table_metadata.table_name
             );
-
-            // Read all deletion vectors and build a set of deleted row IDs
-            let delete_files_for_read = delete_files.clone();
-            let deleted_row_ids =
-                task::spawn_blocking(move || Self::read_deletion_vectors(delete_files_for_read))
-                    .await
-                    .map_err(|err| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Deletion vector reader task panicked or was cancelled: {err}"
-                        ))
-                    })
-                    .and_then(|result| {
-                        result.map_err(|err| {
-                            datafusion_common::DataFusionError::Execution(format!(
-                                "Failed to read deletion vectors: {err}"
-                            ))
-                        })
-                    })?;
-
-            if !deleted_row_ids.is_empty() {
-                // Wrap the plan with our deletion filter
-                return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
-            }
+            return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
         }
 
         Ok(plan)
@@ -988,10 +1191,10 @@ impl TableProvider for CayenneTableProvider {
     ) -> datafusion_common::Result<Vec<TableProviderFilterPushDown>> {
         // Synchronous method - clone Arc quickly and release lock immediately
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1079,12 +1282,28 @@ impl TableProvider for CayenneTableProvider {
 
             // Update the provider's listing table to point to the new snapshot
             // This ensures subsequent queries in the same context will read from the new data
-            let mut listing_table_guard = self.listing_table.write().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire write lock on listing table: {e}"
-                ))
+            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             *listing_table_guard = new_listing_table;
+
+            // Trigger cleanup of old snapshot directories after successful full refresh
+            // This is fire-and-forget using spawn_blocking to avoid blocking the async runtime
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = new_snapshot_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+                {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
 
             return Ok(result);
         }
@@ -1101,10 +1320,10 @@ impl TableProvider for CayenneTableProvider {
 
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to acquire read lock on listing table: {e}"
-                ))
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
             })?;
             Arc::clone(&guard)
         };
@@ -1139,6 +1358,7 @@ impl DeletionTableProvider for CayenneTableProvider {
                 Arc::clone(&self.listing_table),
                 Arc::clone(&self.table_metadata.schema),
                 filters,
+                Arc::clone(&self.cached_deleted_row_ids),
             )),
             &self.table_metadata.schema,
         )))
@@ -1152,6 +1372,9 @@ struct CayenneDeletionSink {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     schema: SchemaRef,
     filters: Vec<Expr>,
+    /// Reference to the cached deletion vectors to invalidate after writing new deletions.
+    /// Uses Arc-wrapped `HashSet` for zero-copy sharing across concurrent operations.
+    cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
 }
 
 impl CayenneDeletionSink {
@@ -1161,6 +1384,7 @@ impl CayenneDeletionSink {
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
         schema: SchemaRef,
         filters: &[Expr],
+        cached_deleted_row_ids: Arc<RwLock<Arc<std::collections::HashSet<i64>>>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -1168,6 +1392,7 @@ impl CayenneDeletionSink {
             listing_table,
             schema,
             filters: filters.to_vec(),
+            cached_deleted_row_ids,
         }
     }
 
@@ -1292,10 +1517,42 @@ impl CayenneDeletionSink {
             .await
             .map_err(catalog_error_to_box)?;
 
+        // Update the cached deletion vectors with the newly deleted row IDs
+        // This avoids needing to reload from SQLite on the next scan.
+        //
+        // We create a new Arc with the updated HashSet to maintain zero-copy semantics
+        // for concurrent readers who still hold references to the old Arc. This requires
+        // cloning the entire HashSet, which is acceptable because:
+        //
+        // 1. **Write infrequency**: Deletions happen much less frequently than reads
+        // 2. **Concurrent reader safety**: Cloning prevents disrupting ongoing scans that
+        //    hold Arc references to the old deletion set
+        // 3. **Cache coherence**: The alternative (in-place mutation) would require either:
+        //    - Taking write locks during scans (blocks all concurrent queries)
+        //    - Complex lock-free data structures (higher complexity, potential performance issues)
+        //
+        // For tables with very large deletion sets (millions of deleted rows), consider
+        // running compaction to physically remove deleted rows and reset the deletion vectors.
+        {
+            let mut guard = self
+                .cached_deleted_row_ids
+                .write()
+                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+
+            // Clone the entire HashSet and add new deletions.
+            // Cost: O(n) where n = existing deleted rows, but this is write path (infrequent).
+            // Benefit: Zero-copy Arc clones for concurrent readers (frequent).
+            let mut updated_set = (**guard).clone();
+            updated_set.extend(result.row_ids.iter().copied());
+
+            // Replace with new Arc - concurrent readers still have old Arc
+            *guard = Arc::new(updated_set);
+        }
+
         let deleted_count = convert_to_u64_box(result.row_ids.len(), "deleted row count")?;
 
         tracing::debug!(
-            "Deletion vector written: {} row(s) at {:?}",
+            "Deletion vector written and cache updated: {} row(s) at {:?}",
             deleted_count,
             result.path
         );
@@ -1353,7 +1610,7 @@ impl DeletionSink for CayenneDeletionSink {
             let guard = self
                 .listing_table
                 .read()
-                .map_err(|e| format!("Failed to acquire read lock on listing table: {e}"))?;
+                .map_err(|_| LISTING_TABLE_LOCK_POISONED.to_string())?;
             Arc::clone(&guard)
         };
 
@@ -1514,9 +1771,450 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::cayenne_catalog::CayenneCatalog;
+    use crate::metadata::CreateTableOptions;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::context::SessionContext;
+    use datafusion_catalog::TableProvider;
+    use futures::future::join_all;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Helper to create a test catalog with a table containing sample data
+    async fn setup_test_table(
+        connection_string: &str,
+    ) -> (Arc<CayenneCatalog>, TableMetadata, TempDir) {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory for test");
+        let catalog = Arc::new(
+            CayenneCatalog::new(connection_string)
+                .expect("Failed to create CayenneCatalog instance"),
+        );
+        catalog
+            .init()
+            .await
+            .expect("Failed to initialize catalog schema and tables");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let table_name = "test_table";
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+            })
+            .await
+            .expect("Failed to create test table in catalog");
+
+        let table_metadata = catalog
+            .get_table(table_name)
+            .await
+            .expect("Failed to get table metadata from catalog");
+
+        tracing::info!("Created table '{}' with ID {}", table_name, table_id);
+
+        // Create provider and insert test data
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = CayenneTableProvider::new(table_name, catalog_trait)
+            .await
+            .expect("Failed to create CayenneTableProvider instance");
+
+        // Insert 1000 rows of test data
+        let mut id_values = Vec::new();
+        let mut name_values = Vec::new();
+        for i in 0..1000 {
+            id_values.push(i);
+            name_values.push(format!("name_{i}"));
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(id_values)),
+                Arc::new(StringArray::from(name_values)),
+            ],
+        )
+        .expect("Failed to create RecordBatch with test data");
+
+        // Create a memory exec plan from the batch
+        let mem_config = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("Failed to create MemorySourceConfig from test data");
+        let mem_exec = DataSourceExec::new(Arc::new(mem_config));
+
+        let insert_result = provider
+            .insert_into(&ctx.state(), Arc::new(mem_exec), InsertOp::Append)
+            .await
+            .expect("Failed to create insert execution plan");
+
+        // Execute the insert plan to actually write the data
+        let batches = collect(insert_result, ctx.task_ctx())
+            .await
+            .expect("Failed to execute insert plan and write test data");
+
+        tracing::info!("Insert completed, wrote {} batches", batches.len());
+
+        (catalog, table_metadata, temp_dir)
+    }
+
     #[tokio::test]
-    async fn test_table_provider_creation() {
-        // Tests will be added once SQLite catalog implementation is complete
+    async fn test_concurrent_reads_sqlite() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for concurrent reads test");
+        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_turso() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for concurrent reads test (Turso)");
+        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_impl(&connection_string).await;
+    }
+
+    /// Core concurrent read test implementation
+    async fn test_concurrent_reads_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        // Create multiple concurrent readers
+        let num_readers = 20;
+        let num_queries_per_reader = 10;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("Failed to create provider in concurrent reader task");
+
+                let mut total_rows = 0;
+                for query_num in 0..num_queries_per_reader {
+                    // Execute a full table scan
+                    let plan = provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .expect("Failed to create scan plan in concurrent reader");
+
+                    let batches = collect(plan, ctx.task_ctx())
+                        .await
+                        .expect("Failed to collect scan results in concurrent reader");
+
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    total_rows += row_count;
+
+                    if query_num == 0 {
+                        tracing::info!(
+                            "Reader {} first query returned {} rows",
+                            reader_id,
+                            row_count
+                        );
+                    }
+                }
+
+                total_rows
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all readers to complete
+        let results = join_all(handles).await;
+
+        // Verify all readers completed successfully
+        for (idx, result) in results.iter().enumerate() {
+            match result {
+                Ok(total_rows) => {
+                    assert_eq!(
+                        *total_rows,
+                        1000 * num_queries_per_reader,
+                        "Reader {idx} read incorrect number of rows"
+                    );
+                }
+                Err(e) => panic!("Reader {idx} failed: {e}"),
+            }
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers successfully completed {} queries each",
+            num_readers,
+            num_queries_per_reader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_with_filters_sqlite() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for filter test");
+        let db_path = temp_dir.path().join("cayenne_filter_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_filters_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_with_filters_turso() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for filter test (Turso)");
+        let db_path = temp_dir.path().join("cayenne_filter_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_filters_impl(&connection_string).await;
+    }
+
+    /// Test concurrent reads with various filter conditions
+    async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        let num_readers = 10;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("Failed to create provider for filter test reader");
+
+                // Register the table with DataFusion so we can run SQL queries
+                ctx.register_table("test_table", Arc::new(provider))
+                    .expect("Failed to register table with DataFusion context");
+
+                // Execute various queries with filters
+                let queries = vec![
+                    ("SELECT COUNT(*) FROM test_table WHERE id < 500", 500),
+                    ("SELECT COUNT(*) FROM test_table WHERE id >= 500", 500),
+                    ("SELECT COUNT(*) FROM test_table WHERE id % 2 = 0", 500),
+                    ("SELECT COUNT(*) FROM test_table", 1000),
+                ];
+
+                for (query, expected_count) in &queries {
+                    let df = ctx.sql(query).await.expect("Failed to execute SQL query");
+                    let batches = df.collect().await.expect("Failed to collect query results");
+
+                    // Extract count from result
+                    let count = batches[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("Failed to downcast count column to Int64Array")
+                        .value(0);
+
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let count_usize = count as usize;
+                    assert_eq!(
+                        count_usize, *expected_count,
+                        "Reader {reader_id} query '{query}' returned incorrect count"
+                    );
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all readers to complete
+        let results = join_all(handles).await;
+
+        // Verify all readers completed successfully
+        for result in results {
+            result.expect("Filter test concurrent reader task should complete successfully");
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers with filters completed successfully",
+            num_readers
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_with_projections_sqlite() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for projection test");
+        let db_path = temp_dir.path().join("cayenne_projection_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_projections_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_with_projections_turso() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for projection test (Turso)");
+        let db_path = temp_dir.path().join("cayenne_projection_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_projections_impl(&connection_string).await;
+    }
+
+    /// Test concurrent reads with different column projections
+    async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        let num_readers = 15;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("Failed to create provider for projection test reader");
+
+                ctx.register_table("test_table", Arc::new(provider))
+                    .expect("Failed to register table for projection test");
+
+                // Test different projection patterns
+                let queries = vec![
+                    "SELECT id FROM test_table",
+                    "SELECT name FROM test_table",
+                    "SELECT id, name FROM test_table",
+                    "SELECT name, id FROM test_table",
+                ];
+
+                for query in &queries {
+                    let df = ctx
+                        .sql(query)
+                        .await
+                        .expect("Failed to execute projection query");
+                    let batches = df
+                        .collect()
+                        .await
+                        .expect("Failed to collect projection query results");
+
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(
+                        row_count, 1000,
+                        "Reader {reader_id} query '{query}' returned incorrect row count"
+                    );
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+
+        for result in results {
+            result.expect("Projection test concurrent reader task should complete successfully");
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers with projections completed successfully",
+            num_readers
+        );
+    }
+
+    #[tokio::test]
+    async fn test_high_concurrency_stress_sqlite() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for high concurrency stress test");
+        let db_path = temp_dir.path().join("cayenne_stress_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_high_concurrency_stress_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_high_concurrency_stress_turso() {
+        let temp_dir = TempDir::new().expect(
+            "Failed to create temporary directory for high concurrency stress test (Turso)",
+        );
+        let db_path = temp_dir.path().join("cayenne_stress_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_high_concurrency_stress_impl(&connection_string).await;
+    }
+
+    /// Stress test with high concurrency (50 readers, 50 queries each)
+    async fn test_high_concurrency_stress_impl(connection_string: &str) {
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string).await;
+
+        let num_readers = 50;
+        let queries_per_reader = 50;
+
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider = CayenneTableProvider::new(&table_name, catalog_trait)
+                    .await
+                    .expect("Failed to create provider for stress test reader");
+
+                for _ in 0..queries_per_reader {
+                    let plan = provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .expect("Failed to create scan plan in stress test");
+
+                    let batches = collect(plan, ctx.task_ctx())
+                        .await
+                        .expect("Failed to collect scan results in stress test");
+
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(row_count, 1000, "Reader {reader_id} got wrong row count");
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+        let duration = start.elapsed();
+
+        for result in results {
+            result.expect("Stress test concurrent reader task should complete successfully");
+        }
+
+        let total_queries = num_readers * queries_per_reader;
+        let qps = f64::from(total_queries) / duration.as_secs_f64();
+
+        tracing::info!(
+            "✓ Stress test: {} concurrent readers × {} queries = {} total queries in {:.2}s ({:.0} qps)",
+            num_readers,
+            queries_per_reader,
+            total_queries,
+            duration.as_secs_f64(),
+            qps
+        );
     }
 }
 

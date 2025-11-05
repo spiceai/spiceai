@@ -72,6 +72,10 @@ impl TursoMetastore {
         }
 
         let db = Builder::new_local(db_path)
+            // Note: Turso doesn't support indexes with MVCC, and PRIMARY KEY automatically creates
+            // indexes. All PRIMARY KEY constraints have been replaced with NOT NULL to enable
+            // MVCC for better concurrent read performance. Once Turso supports indexes with MVCC, we can re-add indexes.
+            .with_mvcc(true)
             .build()
             .await
             .map_err(|e| CatalogError::Database {
@@ -91,17 +95,19 @@ impl TursoMetastore {
     }
 
     /// Schema for the `cayenne_metadata` table that tracks next IDs.
+    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const METADATA_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_metadata (
-            key TEXT PRIMARY KEY,
+            key TEXT NOT NULL,
             value BIGINT NOT NULL
         )
     ";
 
     /// Schema for the `cayenne_table` table.
+    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id BIGINT PRIMARY KEY,
+            table_id BIGINT NOT NULL,
             table_uuid TEXT NOT NULL,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
@@ -114,9 +120,11 @@ impl TursoMetastore {
     ";
 
     /// Schema for the `cayenne_data_file` table.
+    /// Note: PRIMARY KEY and FOREIGN KEY constraints removed to enable MVCC mode in libSQL.
+    /// MVCC is incompatible with any indexes, including those created by constraints.
     const DATA_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_data_file (
-            data_file_id BIGINT PRIMARY KEY,
+            data_file_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
             partition_id BIGINT,
             file_order BIGINT NOT NULL,
@@ -125,15 +133,15 @@ impl TursoMetastore {
             file_format TEXT NOT NULL,
             record_count BIGINT NOT NULL,
             file_size_bytes BIGINT NOT NULL,
-            row_id_start BIGINT NOT NULL,
-            FOREIGN KEY(partition_id) REFERENCES cayenne_partition(partition_id) ON DELETE SET NULL
+            row_id_start BIGINT NOT NULL
         )
     ";
 
     /// Schema for the `cayenne_delete_file` table.
+    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id BIGINT PRIMARY KEY,
+            delete_file_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
             data_file_id BIGINT NOT NULL,
             path TEXT NOT NULL,
@@ -145,17 +153,15 @@ impl TursoMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
+    /// Note: UNIQUE constraint removed for Turso as indexes are not yet supported with MVCC
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id BIGINT PRIMARY KEY,
+            partition_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
-            partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            record_count BIGINT NOT NULL DEFAULT 0,
-            file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            UNIQUE(table_id, partition_value)
+            min_value TEXT,
+            max_value TEXT,
+            row_count BIGINT NOT NULL
         )
     ";
 }
@@ -248,6 +254,26 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
+
+        // Note: Foreign keys are NOT enabled because FOREIGN KEY constraints create indexes
+        // that are incompatible with MVCC mode. All foreign key constraints have been removed
+        // from the schema to enable MVCC for better concurrent read performance.
+
+        // NORMAL synchronous mode: safe with WAL, more performant than FULL
+        // With WAL mode, NORMAL only syncs at checkpoints, not on every commit
+        conn.execute("PRAGMA synchronous = NORMAL", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set synchronous mode: {e}"),
+            })?;
+
+        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
+        // Larger cache reduces disk I/O for frequently accessed metadata
+        conn.execute("PRAGMA cache_size = -32768", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set cache size: {e}"),
+            })?;
 
         // Create tables
         let schema_sql = format!(

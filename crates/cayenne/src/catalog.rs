@@ -86,6 +86,13 @@ pub enum CatalogError {
         /// The underlying IO error  
         source: std::io::Error,
     },
+
+    /// Lock poisoning error
+    #[snafu(display("Lock poisoned during {operation}: a thread panicked while holding this lock. This indicates an internal error that requires restarting the runtime."))]
+    LockPoisoned {
+        /// The operation that failed due to lock poisoning
+        operation: String,
+    },
 }
 
 /// Result type for catalog operations.

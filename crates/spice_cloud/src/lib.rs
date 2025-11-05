@@ -145,7 +145,11 @@ impl SpiceExtension {
         path: &str,
         body: Req,
     ) -> Result<Resp, Error> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
+            .build()
+            .context(UnableToConnectToSpiceCloudSnafu)?;
         let response = client
             .post(format!("{}{path}", self.spice_http_url()))
             .json(&body)

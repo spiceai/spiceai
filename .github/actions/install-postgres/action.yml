@@ -27,7 +27,7 @@ runs:
       if: inputs.os == 'darwin'
       shell: bash
       run: |
-        # macos-14 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
+        # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
         brew update
         brew install postgresql
         brew services start postgresql

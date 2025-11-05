@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/acceleration/partition_by_cayenne.rs
+expression: sanitized_plan
+---
+BytesProcessedExec
+  FilterExec: score@4 > 85
+    SchemaCastScanExec
+      UnionExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
