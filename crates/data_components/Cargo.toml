@@ -99,6 +99,8 @@ uuid.workspace = true
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
+default = []
+bench = [] # Feature for benchmarking that exposes internal functions
 clickhouse = ["dep:clickhouse-rs"]
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka"]
@@ -143,7 +145,19 @@ test_hadoop_catalog_docker = []
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
+chrono = { workspace = true }
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.5.0"
 iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
 insta = { version = "1.43" }
+object_store = { workspace = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[[bench]]
+name = "arrow_write"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "object_filter"
+harness = false
