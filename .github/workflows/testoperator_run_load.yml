@@ -68,11 +68,6 @@ on:
         required: true
         default: '8'
         type: string
-      scale_factor:
-        description: 'Scale factor for the benchmark'
-        required: false
-        type: string
-        default: '1'
       random_param_set_count:
         description: 'Number of random parameter sets to generate for parameterized queries (optional)'
         required: false
@@ -99,7 +94,7 @@ jobs:
         run: |
           query_set="${{ github.event.inputs.query_set }}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
