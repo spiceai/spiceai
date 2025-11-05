@@ -1,5 +1,5 @@
 #[cfg(feature = "postgres")]
-mod common;
+pub(crate) mod common;
 #[cfg(all(not(windows), feature = "postgres"))]
 mod refresh_cayenne;
 #[cfg(all(feature = "duckdb", feature = "postgres"))]
