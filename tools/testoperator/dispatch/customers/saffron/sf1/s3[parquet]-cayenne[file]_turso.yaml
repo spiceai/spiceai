@@ -10,13 +10,13 @@ tests:
       ready_wait: 300
       runner_type: spicehq-dev-runners
       concurrency: 128
-      duration: 1800
+      duration: 900
       random_param_set_count: 1000
     - spicepod_path: s3[parquet]-cayenne[file]_turso.yaml
       query_set: saffron[parameterized]
       ready_wait: 300
       runner_type: spicehq-dev-runners
       concurrency: 128
-      duration: 1800
+      duration: 900
       random_param_set_count: 1000
       http_clients: true
