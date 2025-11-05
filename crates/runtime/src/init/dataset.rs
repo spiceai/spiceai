@@ -816,15 +816,14 @@ impl Runtime {
         let mut initialized_datasets = vec![];
         for ds in datasets {
             // Non-accelerated datasets or disabled acceleration are always successfully initialized
-            if ds.acceleration.as_ref().map_or(true, |acc| !acc.enabled) {
+            if ds.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
                 initialized_datasets.push(Arc::clone(ds));
                 continue;
             }
 
-            let acceleration_settings = ds
-                .acceleration
-                .as_ref()
-                .expect("acceleration is Some and enabled");
+            let Some(acceleration_settings) = &ds.acceleration else {
+                unreachable!("acceleration is Some and enabled");
+            };
 
             let accelerator = match self
                 .accelerator_engine_registry

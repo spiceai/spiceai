@@ -104,14 +104,13 @@ impl Runtime {
 
         for view in views {
             // Non-accelerated views or disabled acceleration don't need initialization
-            if view.acceleration.as_ref().map_or(true, |acc| !acc.enabled) {
+            if view.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
                 continue;
             }
 
-            let acceleration_settings = view
-                .acceleration
-                .as_ref()
-                .expect("acceleration is Some and enabled");
+            let Some(acceleration_settings) = &view.acceleration else {
+                unreachable!("acceleration is Some and enabled");
+            };
 
             let accelerator = match self
                 .accelerator_engine_registry
