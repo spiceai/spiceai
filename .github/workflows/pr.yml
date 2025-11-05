@@ -160,12 +160,17 @@ jobs:
           local-path: target/lint/
           force-extract-at-path: true
 
+      - name: precreate cargo directory
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          mkdir -p ~/.cargo
+
       - name: pull cargo cache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/pull-archive
         with:
           archive-path: cargo.tar.zst
-          local-path: ~/.cargo/registry
+          local-path: ~/.cargo
 
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
