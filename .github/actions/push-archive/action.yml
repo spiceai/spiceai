@@ -1,0 +1,31 @@
+name: "Push an archive to MinIO"
+description: "Pushes an archive to MinIO"
+inputs:
+  archive-path:
+    description: "Path to the archive in MinIO"
+    required: true
+  local-path:
+    description: "Local path to the data"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: install zstd if needed
+      shell: bash
+      run: |
+        if ! command -v zstd &> /dev/null
+        then
+          sudo apt update
+          sudo apt install zstd -y
+        fi
+
+    - name: create archive
+      shell: bash
+      run: |
+        tar --use-compress-program="zstd -T0 -1" -cf ${{ inputs.archive-path }} ${{ inputs.local-path }}
+          ls -lh ${{ inputs.archive-path }}
+
+    - name: push archive
+      shell: bash
+      run: |
+        mc cp ${{ inputs.archive-path }} spice-minio/spiceai-cache/${{ github.ref_name }}/${{ inputs.archive-path }}

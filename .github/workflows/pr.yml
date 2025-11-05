@@ -82,17 +82,17 @@ jobs:
       - uses: actions/checkout@v5
 
       # Cache Cargo dependencies
-      - name: Cache Cargo registry
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      # - name: Cache Cargo registry
+      #   if: needs.check_changes.outputs.relevant_changes == 'true'
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       ~/.cargo/registry/index/
+      #       ~/.cargo/registry/cache/
+      #       ~/.cargo/git/db/
+      #     key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      #     restore-keys: |
+      #       ${{ runner.os }}-cargo-
 
       # Cache Go modules
       - name: Cache Go modules
@@ -154,20 +154,17 @@ jobs:
 
       - name: pull lint archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          sudo apt update
-          sudo apt install zstd -y
-          mc cp spice-minio/benchmarks/caching/${{ github.ref_name }}/lint.tar.zst ./ || true
-          if [ ! -f ./lint.tar.zst ]; then
-            mc cp spice-minio/benchmarks/caching//trunk/lint.tar.zst ./ || true
-            if [ ! -f ./lint.tar.zst ]; then
-              echo "No lint cache found"
-              exit 0
-            fi
-          fi
+        uses: ./.github/actions/pull-archive
+        with:
+          archive-path: lint.tar.zst
+          local-path: target/lint/
 
-          tar --use-compress-program="zstd -d" -xf lint.tar.zst target/lint/
-          find target/lint/ -type f -exec touch {} +
+      - name: pull cargo cache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/pull-archive
+        with:
+          archive-path: cargo.tar.zst
+          local-path: ~/.cargo/
 
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -177,10 +174,17 @@ jobs:
 
       - name: push lint archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          tar --use-compress-program="zstd -T0 -1" -cf lint.tar.zst target/lint/
-          ls -lh lint.tar.zst
-          mc cp lint.tar.zst spice-minio/benchmarks/caching/${{ github.ref_name }}/lint.tar.zst
+        uses: ./.github/actions/push-archive
+        with:
+          archive-path: lint.tar.zst
+          local-path: target/lint/
+
+      - name: push cargo cache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/push-archive
+        with:
+          archive-path: cargo.tar.zst
+          local-path: ~/.cargo/
 
       - name: force exit
         run: exit 1

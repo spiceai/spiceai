@@ -1,0 +1,35 @@
+name: "Pull and extract an archive from MinIO"
+description: "Pulls an archive from MinIO and extracts it"
+inputs:
+  archive-path:
+    description: "Path to the archive in MinIO"
+    required: true
+  local-path:
+    description: "Local path to extract the archive"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: install zstd if needed
+      shell: bash
+      run: |
+        if ! command -v zstd &> /dev/null
+        then
+          sudo apt update
+          sudo apt install zstd -y
+        fi
+
+    - name: pull archive
+      shell: bash
+      run: |
+        mc cp spice-minio/spiceai-cache/${{ github.ref_name }}/${{ inputs.archive-path }} ./ || true
+        if [ ! -f ./${{ inputs.archive-path }} ]; then
+          mc cp spice-minio/spiceai-cache/trunk/${{ inputs.archive-path }} ./ || true
+          if [ ! -f ./${{ inputs.archive-path }} ]; then
+            echo "No cache found"
+            exit 0
+          fi
+        fi
+
+        tar --use-compress-program="zstd -d" -xf ${{ inputs.archive-path }} ${{ inputs.local-path }}
+        find ${{ inputs.local-path }} -type f -exec touch {} +
