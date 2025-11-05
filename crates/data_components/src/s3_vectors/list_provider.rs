@@ -83,7 +83,7 @@ impl S3VectorsListTable {
 /// Create an execution plan to scan across spill indexes. If no spill indexes
 /// are found return None.
 #[allow(clippy::too_many_arguments)]
-async fn create_spill_plan(
+fn create_spill_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
     index_name: &str,
@@ -91,9 +91,9 @@ async fn create_spill_plan(
     projection: Option<&Vec<usize>>,
     limit: Option<usize>,
     all_index_names: &[String],
-) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+) -> Option<Arc<dyn ExecutionPlan>> {
     let virtual_index_names =
-        SpillIndex::get_all_indexes_for_virtual_index(index_name, &all_index_names);
+        SpillIndex::get_all_indexes_for_virtual_index(index_name, all_index_names);
 
     if virtual_index_names.len() > 1 {
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -124,12 +124,12 @@ async fn create_spill_plan(
         let union_plan = Arc::new(UnionExec::new(index_plans));
         if let Some(limit) = limit {
             let limit_plan = Arc::new(GlobalLimitExec::new(union_plan, 0, Some(limit)));
-            Ok(Some(limit_plan))
+            Some(limit_plan)
         } else {
-            Ok(Some(union_plan))
+            Some(union_plan)
         }
     } else {
-        Ok(None)
+        None
     }
 }
 
@@ -248,7 +248,7 @@ impl TableProvider for S3VectorsListTable {
         )
         .await?;
 
-        if let (Some(bucket_name), Some(index_name), Some(ref all_index_names)) =
+        if let (Some(bucket_name), Some(index_name), Some(all_index_names)) =
             (bucket_name, index_name, all_index_names.as_ref())
             && let Some(plan) = create_spill_plan(
                 &self.table.client,
@@ -259,7 +259,6 @@ impl TableProvider for S3VectorsListTable {
                 limit,
                 all_index_names,
             )
-            .await?
         {
             return Ok(plan);
         }

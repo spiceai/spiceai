@@ -83,7 +83,7 @@ pub struct S3VectorsQueryTable {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_spill_plan_query(
+fn create_spill_plan_query(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
     index_name: &str,
@@ -91,11 +91,11 @@ async fn create_spill_plan_query(
     projection: Option<&Vec<usize>>,
     filters: &[Expr],
     limit: Option<usize>,
-    query_vector: Vec<f32>,
+    query_vector: &[f32],
     all_index_names: &[String],
-) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+) -> Option<Arc<dyn ExecutionPlan>> {
     let virtual_index_names =
-        SpillIndex::get_all_indexes_for_virtual_index(index_name, &all_index_names);
+        SpillIndex::get_all_indexes_for_virtual_index(index_name, all_index_names);
 
     if virtual_index_names.len() > 1 {
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -139,7 +139,7 @@ async fn create_spill_plan_query(
                 &query_table,
                 projection,
                 limit,
-                query_vector.clone(),
+                query_vector.to_owned(),
                 filters.to_vec(),
             ));
             index_plans.push(index_plan);
@@ -148,9 +148,9 @@ async fn create_spill_plan_query(
         let union_plan = Arc::new(UnionExec::new(index_plans));
         let limit_plan = Arc::new(GlobalLimitExec::new(union_plan, 0, limit));
 
-        Ok(Some(limit_plan))
+        Some(limit_plan)
     } else {
-        Ok(None)
+        None
     }
 }
 
@@ -346,7 +346,7 @@ impl TableProvider for S3VectorsQueryTable {
         )
         .await?;
 
-        if let (Some(bucket_name), Some(index_name), Some(ref all_index_names)) =
+        if let (Some(bucket_name), Some(index_name), Some(all_index_names)) =
             (bucket_name, index_name, all_index_names.as_ref())
             && let Some(plan) = create_spill_plan_query(
                 &self.table.client,
@@ -356,10 +356,9 @@ impl TableProvider for S3VectorsQueryTable {
                 projection,
                 filters,
                 limit,
-                query_vector.clone(),
+                &query_vector,
                 all_index_names,
             )
-            .await?
         {
             return Ok(plan);
         }
