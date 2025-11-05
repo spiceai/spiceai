@@ -63,21 +63,20 @@ jobs:
           script: |
             // Check if this is a tagged release
             const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-            
-            // Check if this is trunk or a release branch
-            const isTrunkOrRelease = context.ref === 'refs/heads/trunk' || 
-                                      context.ref.startsWith('refs/heads/release-') ||
-                                      context.ref.startsWith('refs/heads/release/');
-            
+
+            // Check if this is a release branch
+            const isReleaseBranch = context.ref.startsWith('refs/heads/release-') ||
+                                     context.ref.startsWith('refs/heads/release/');
+
             // Check if this is a manual workflow dispatch
             const isManualDispatch = context.eventName === 'workflow_dispatch';
-            
-            // Include Windows only for trunk, release branches, tagged releases, or manual dispatch
-            const includeWindows = isTaggedRelease || isTrunkOrRelease || isManualDispatch;
-            
+
+            // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
+            const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
+
             // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
             const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
-            
+
             const matrix = [
               {
                 name: "Linux x64",
@@ -87,13 +86,6 @@ jobs:
                 target_arch_go: "amd64",
                 tags: ["default", "models", "odbc"],
               }, {
-                name: "Linux aarch64",
-                runner: "hosted-linux-arm-runner",
-                target_os: "linux",
-                target_arch: "aarch64",
-                target_arch_go: "arm64",
-                tags: ["default", "models"],
-              }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: macosRunner,
                 target_os: "darwin",
@@ -102,9 +94,17 @@ jobs:
                 tags: ["default", "models", "metal"],
               }
             ];
-            
-            // Add Windows only for trunk, release branches, tagged releases, or manual dispatch
-            if (includeWindows) {
+
+            // Add Linux ARM and Windows only for tagged releases, release branches, or manual dispatch
+            if (includeWindowsAndLinuxArm) {
+              matrix.push({
+                name: "Linux aarch64",
+                runner: "hosted-linux-arm-runner",
+                target_os: "linux",
+                target_arch: "aarch64",
+                target_arch_go: "arm64",
+                tags: ["default", "models"],
+              });
               matrix.push({
                 name: "Windows x64",
                 runner: "windows-latest",
