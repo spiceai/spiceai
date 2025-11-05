@@ -90,16 +90,8 @@ async fn create_spill_plan(
     table: &S3VectorsListTable,
     projection: Option<&Vec<usize>>,
     limit: Option<usize>,
+    all_index_names: &[String],
 ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
-    // Use the base name (without spill suffix) as prefix to get all related indexes
-    let base_name = if let Ok(Some(spill)) = SpillIndex::parse(index_name) {
-        spill.base_name
-    } else {
-        index_name.to_string()
-    };
-
-    let all_index_names = super::list_index_names(client, bucket_name, &base_name).await?;
-
     let virtual_index_names =
         SpillIndex::get_all_indexes_for_virtual_index(index_name, &all_index_names);
 
@@ -152,15 +144,10 @@ async fn create_partition_plan(
     filters: &[Expr],
     limit: Option<usize>,
     state: &dyn Session,
+    all_index_names: &[String],
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    let prefix =
-        PartitionedIndexName::common_prefix(index_name, &table.column_name, &table.partition_by)
-            .map_err(|e| DataFusionError::Plan(e.to_string()))?;
-
-    let all_index_names = super::list_index_names(client, bucket_name, &prefix).await?;
-
     let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-    for idx_name in &all_index_names {
+    for idx_name in all_index_names {
         let Ok(partitioned_index_name) = PartitionedIndexName::from_index_name(idx_name) else {
             continue;
         };
@@ -254,7 +241,15 @@ impl TableProvider for S3VectorsListTable {
         let current_index = self.table.current_index();
         let (_, bucket_name, index_name) = current_index.index_identifier_variables();
 
-        if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name)
+        let all_index_names = super::fetch_all_index_names(
+            &self.table.client,
+            bucket_name.as_deref(),
+            index_name.as_deref(),
+        )
+        .await?;
+
+        if let (Some(bucket_name), Some(index_name), Some(ref all_index_names)) =
+            (bucket_name, index_name, all_index_names.as_ref())
             && let Some(plan) = create_spill_plan(
                 &self.table.client,
                 &bucket_name,
@@ -262,6 +257,7 @@ impl TableProvider for S3VectorsListTable {
                 self,
                 projection,
                 limit,
+                all_index_names,
             )
             .await?
         {
@@ -280,6 +276,8 @@ impl TableProvider for S3VectorsListTable {
             return exec_err!("No bucket name or index name for bucket query");
         };
 
+        let all_index_names = all_index_names.unwrap_or_default();
+
         create_partition_plan(
             &self.table.client,
             &bucket_name,
@@ -289,6 +287,7 @@ impl TableProvider for S3VectorsListTable {
             filters,
             limit,
             state,
+            &all_index_names,
         )
         .await
     }
@@ -596,9 +595,9 @@ mod tests {
     #[tokio::test]
     async fn scan_plan_with_partitions() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
-        let bucket_name = "test_bucket";
-        let index_name_prefix = "test_index";
-        let column_name = "my_col";
+        let bucket_name = "test-bucket";
+        let index_name_prefix = "test-index";
+        let column_name = "my-col";
 
         let partition_by = &[col(column_name)];
 
@@ -632,7 +631,7 @@ mod tests {
                 .vector_bucket_name(bucket_name)
                 .set_index_arn(Some("arn".to_string()))
                 .creation_time(DateTime::from_secs(1))
-                .index_name("another_index")
+                .index_name("another-index")
                 .build()?,
         );
 
@@ -697,8 +696,8 @@ mod tests {
     #[tokio::test]
     async fn scan_plan_with_index_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
-        let bucket_name = "test_bucket";
-        let virtual_index_name = "virtual_index";
+        let bucket_name = "test-bucket";
+        let virtual_index_name = "virtual-index";
 
         let mut indexes = vec![];
 
@@ -755,7 +754,7 @@ mod tests {
             distance_metric: DistanceMetric::Cosine,
         };
 
-        let list_table = S3VectorsListTable::new(s3_table, "test_column".to_string(), vec![]);
+        let list_table = S3VectorsListTable::new(s3_table, "test-column".to_string(), vec![]);
 
         let session_state = SessionContext::new().state();
         let plan = list_table

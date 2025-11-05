@@ -182,11 +182,12 @@ pub async fn list_index_names(
     bucket_name: &str,
     prefix: &str,
 ) -> Result<Vec<String>, DataFusionError> {
+    let prefix = prefix.replace('_', "-");
     let list_indexes_output = client
         .list_indexes(
             ListIndexesInput::builder()
                 .set_vector_bucket_name(Some(bucket_name.to_string()))
-                .set_prefix(Some(prefix.to_string()))
+                .set_prefix(Some(prefix))
                 .build()
                 .boxed()
                 .map_err(DataFusionError::External)?,
@@ -206,4 +207,24 @@ pub async fn list_index_names(
         .iter()
         .map(|idx| idx.index_name().to_string())
         .collect())
+}
+
+async fn fetch_all_index_names(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: Option<&str>,
+    index_name: Option<&str>,
+) -> Result<Option<Vec<String>>, DataFusionError> {
+    if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
+        // Use the base name (without spill suffix) as prefix to get all related indexes
+        let base_name = if let Ok(Some(spill)) = SpillIndex::parse(index_name) {
+            spill.base_name
+        } else {
+            index_name.to_string()
+        };
+        Ok(Some(
+            list_index_names(client, bucket_name, &base_name).await?,
+        ))
+    } else {
+        Ok(None)
+    }
 }
