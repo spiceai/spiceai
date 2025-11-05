@@ -41,14 +41,14 @@ use tokio::sync::RwLock;
 
 use self::arrow::ArrowAccelerator;
 
+#[cfg(not(windows))]
+use self::cayenne::CayenneAccelerator;
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "duckdb")]
 use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(not(windows))]
-use self::pepper::PepperAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
@@ -57,12 +57,12 @@ use self::sqlite::SqliteAccelerator;
 use self::turso::TursoAccelerator;
 
 pub mod arrow;
+#[cfg(not(windows))]
+pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(not(windows))]
-pub mod pepper;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
@@ -168,7 +168,7 @@ impl AcceleratorEngineRegistry {
         self.register_accelerator_engine(Engine::Turso, Arc::new(TursoAccelerator::new()))
             .await;
         #[cfg(not(windows))]
-        self.register_accelerator_engine(Engine::Pepper, Arc::new(PepperAccelerator::new()))
+        self.register_accelerator_engine(Engine::Cayenne, Arc::new(CayenneAccelerator::new()))
             .await;
     }
 
@@ -779,7 +779,15 @@ mod accelerator_compat_tests {
         }
     }
 
-    /// Mock acceleration source for testing
+    /// Helper function to construct mode label with optional timestamp format
+    fn make_mode_label(mode: &str, timestamp_format: Option<&str>) -> String {
+        if let Some(ts_fmt) = timestamp_format {
+            format!("{}, timestamp_format={}", mode, ts_fmt)
+        } else {
+            mode.to_string()
+        }
+    }
+
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
@@ -787,38 +795,38 @@ mod accelerator_compat_tests {
         Fut: std::future::Future<Output = ()>,
     {
         // Test both memory and file modes for databases
-        // For Turso, also test both timestamp formats
+        // For Turso accelerator, test both timestamp formats
+        // For Cayenne, test both SQLite and Turso metastore backends
+        // Format: (engine, mode, timestamp_format, metastore_type)
         let test_configs = vec![
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "memory", None),
+            (Engine::Sqlite, "memory", None, None),
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "file", None),
+            (Engine::Sqlite, "file", None, None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("rfc3339")),
+            (Engine::Turso, "memory", Some("rfc3339"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("rfc3339")),
+            (Engine::Turso, "file", Some("rfc3339"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("integer_millis")),
+            (Engine::Turso, "memory", Some("integer_millis"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("integer_millis")),
+            (Engine::Turso, "file", Some("integer_millis"), None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "memory", None),
+            (Engine::DuckDB, "memory", None, None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "file", None),
-            (Engine::Arrow, "memory", None),
+            (Engine::DuckDB, "file", None, None),
+            (Engine::Arrow, "memory", None, None),
             #[cfg(not(windows))]
-            (Engine::Pepper, "file", None), // Pepper only supports file mode
+            (Engine::Cayenne, "file", None, Some("sqlite")), // Cayenne with SQLite metastore
+            #[cfg(all(not(windows), feature = "turso"))]
+            (Engine::Cayenne, "file", None, Some("turso")), // Cayenne with Turso metastore
         ];
 
-        for (engine, mode, timestamp_format) in test_configs {
+        for (engine, mode, timestamp_format, metastore_type) in test_configs {
             // Create a unique test environment for this test run
             let test_env = TestEnvironment::new();
 
-            let mode_label = if let Some(ts_fmt) = timestamp_format {
-                format!("{}, timestamp_format={}", mode, ts_fmt)
-            } else {
-                mode.to_string()
-            };
+            let mode_label = make_mode_label(mode, timestamp_format);
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
@@ -828,10 +836,16 @@ mod accelerator_compat_tests {
             // Create appropriate location based on mode with a unique identifier per test run
             // This ensures tests don't interfere with each other by reusing the same file/directory
             let location = if mode == "file" {
+                let variant = match (timestamp_format, metastore_type) {
+                    (Some(ts_fmt), Some(metastore)) => format!("{ts_fmt}_{metastore}"),
+                    (Some(ts_fmt), None) => ts_fmt.to_string(),
+                    (None, Some(metastore)) => metastore.to_string(),
+                    (None, None) => "default".to_string(),
+                };
                 format!(
                     "/tmp/spice_benchmark_{:?}_{}_{}_{}.db",
                     engine,
-                    timestamp_format.unwrap_or("default"),
+                    variant,
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -928,20 +942,21 @@ mod accelerator_compat_tests {
                     }
                 }
                 #[cfg(not(windows))]
-                Engine::Pepper => {
+                Engine::Cayenne => {
                     use crate::component::dataset::builder::DatasetBuilder;
-                    use crate::dataaccelerator::pepper::PepperAccelerator;
+                    use crate::dataaccelerator::cayenne::CayenneAccelerator;
 
-                    // Clean up any existing .pepper files and Pepper metadata
-                    // Pepper only supports appends, so we need a clean state for each test
+                    // Clean up any existing .cayenne files and Cayenne metadata
+                    // Cayenne only supports appends, so we need a clean state for each test
                     if mode == "file" && !location.is_empty() {
                         let test_dir = std::path::Path::new(&location);
                         if test_dir.exists() {
                             if let Ok(entries) = std::fs::read_dir(test_dir) {
                                 for entry in entries.flatten() {
                                     let path = entry.path();
-                                    // Safety: only delete .pepper files
-                                    if path.extension().and_then(|s| s.to_str()) == Some("pepper") {
+                                    // Safety: only delete .cayenne files
+                                    if path.extension().and_then(|s| s.to_str()) == Some("cayenne")
+                                    {
                                         let _ = std::fs::remove_file(&path);
                                     }
                                 }
@@ -951,11 +966,11 @@ mod accelerator_compat_tests {
                             let _ = std::fs::create_dir_all(test_dir);
                         }
 
-                        // Also clean up Pepper metadata to ensure fresh schema
+                        // Also clean up Cayenne metadata to ensure fresh schema
                         // Use test environment's metadata directory
-                        let pepper_db_path = format!("{}/pepper.db", test_env.metadata_dir());
-                        if std::path::Path::new(&pepper_db_path).exists() {
-                            let _ = std::fs::remove_file(&pepper_db_path);
+                        let cayenne_db_path = format!("{}/cayenne.db", test_env.metadata_dir());
+                        if std::path::Path::new(&cayenne_db_path).exists() {
+                            let _ = std::fs::remove_file(&cayenne_db_path);
                         }
                     }
 
@@ -988,13 +1003,17 @@ mod accelerator_compat_tests {
                     let mut params = HashMap::new();
                     if mode == "file" {
                         // Set file_path to use our unique temporary location with timestamp
-                        params.insert("pepper_file_path".to_string(), location.clone());
+                        params.insert("cayenne_file_path".to_string(), location.clone());
                     }
-                    // Use test environment's metadata directory for Pepper
-                    params.insert("pepper_metadata_dir".to_string(), test_env.metadata_dir());
+                    // Use test environment's metadata directory for Cayenne
+                    params.insert("cayenne_metadata_dir".to_string(), test_env.metadata_dir());
                     // Use 'error' mode for tests to fail on unsupported types
                     // This matches the new default production behavior
                     params.insert("unsupported_type_action".to_string(), "error".to_string());
+                    // Set metastore type if specified (for Cayenne variants)
+                    if let Some(metastore) = metastore_type {
+                        params.insert("cayenne_metastore".to_string(), metastore.to_string());
+                    }
 
                     dataset.acceleration = Some(Acceleration {
                         enabled: true,
@@ -1003,7 +1022,7 @@ mod accelerator_compat_tests {
                         } else {
                             Mode::Memory
                         },
-                        engine: Engine::Pepper,
+                        engine: Engine::Cayenne,
                         params,
                         ..Acceleration::default()
                     });
@@ -1013,7 +1032,7 @@ mod accelerator_compat_tests {
                     use futures::FutureExt;
                     use std::panic::AssertUnwindSafe;
 
-                    let accelerator = PepperAccelerator::new();
+                    let accelerator = CayenneAccelerator::new();
                     let create_future = AssertUnwindSafe(accelerator.create_external_table(
                         external_table,
                         Some(&dataset),
@@ -1088,7 +1107,7 @@ mod accelerator_compat_tests {
         ];
 
         // Skip Time32 and Time64 for Vortex as they're not yet supported
-        if !matches!(engine, Some(Engine::Pepper)) {
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "time32_ms_col",
                 DataType::Time32(TimeUnit::Millisecond),
@@ -1108,7 +1127,7 @@ mod accelerator_compat_tests {
         ));
 
         // Skip Duration for Vortex as it's not yet supported
-        if !matches!(engine, Some(Engine::Pepper)) {
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "duration_ms_col",
                 DataType::Duration(TimeUnit::Millisecond),
@@ -1117,7 +1136,7 @@ mod accelerator_compat_tests {
         }
 
         // Skip Interval for Vortex as it's not yet supported
-        if !matches!(engine, Some(Engine::Pepper)) {
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "interval_ym_col",
                 DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
@@ -1132,7 +1151,7 @@ mod accelerator_compat_tests {
         ));
 
         // Skip Map type for Vortex as it's not yet supported
-        if !matches!(engine, Some(Engine::Pepper)) {
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "map_col",
                 DataType::Map(
@@ -1757,7 +1776,7 @@ mod accelerator_compat_tests {
                 let table_type = table_field.data_type();
 
                 // For Vortex, check if unsupported types are converted to Utf8
-                if matches!(engine, Engine::Pepper) {
+                if matches!(engine, Engine::Cayenne) {
                     if vortex_unsupported_types.contains(original_type) {
                         assert_eq!(
                             table_type,
@@ -1853,7 +1872,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("filtered scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Pepper {
+            if engine != Engine::Arrow && engine != Engine::Cayenne {
                 assert!(
                     total_rows <= 50,
                     "{:?}: filtered should have <= 50 rows, got {}",
@@ -1887,7 +1906,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("limit scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Pepper {
+            if engine != Engine::Arrow && engine != Engine::Cayenne {
                 assert!(
                     total_rows <= 10,
                     "{:?}: limit should have <= 10 rows, got {}",
@@ -1909,7 +1928,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("combined scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Pepper {
+            if engine != Engine::Arrow && engine != Engine::Cayenne {
                 assert!(
                     total_rows <= 5,
                     "{:?}: combined should have <= 5 rows, got {}",
@@ -1927,8 +1946,8 @@ mod accelerator_compat_tests {
                 .await
                 .expect("scan successful");
 
-            // Pepper may not preserve nulls properly yet, so skip this check for Pepper
-            if engine != Engine::Pepper {
+            // Cayenne may not preserve nulls properly yet, so skip this check for Cayenne
+            if engine != Engine::Cayenne {
                 for batch in &results {
                     let value_col = batch
                         .column(2)
@@ -1949,7 +1968,7 @@ mod accelerator_compat_tests {
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
-            if engine == Engine::Arrow || engine == Engine::Pepper {
+            if engine == Engine::Arrow || engine == Engine::Cayenne {
                 return;
             }
 
@@ -2149,9 +2168,9 @@ mod accelerator_compat_tests {
                             .expect("Arrow table should be created")
                     }
                     #[cfg(not(windows))]
-                    Engine::Pepper => {
+                    Engine::Cayenne => {
                         use crate::component::dataset::builder::DatasetBuilder;
-                        use crate::dataaccelerator::pepper::PepperAccelerator; // Clean up any existing files and metadata
+                        use crate::dataaccelerator::cayenne::CayenneAccelerator; // Clean up any existing files and metadata
                         if _mode == "file" && !location.is_empty() {
                             let test_dir = std::path::Path::new(&location);
                             if test_dir.exists() {
@@ -2159,7 +2178,7 @@ mod accelerator_compat_tests {
                                     for entry in entries.flatten() {
                                         let path = entry.path();
                                         if path.extension().and_then(|s| s.to_str())
-                                            == Some("pepper")
+                                            == Some("cayenne")
                                         {
                                             let _ = std::fs::remove_file(&path);
                                         }
@@ -2169,11 +2188,11 @@ mod accelerator_compat_tests {
                                 let _ = std::fs::create_dir_all(test_dir);
                             }
 
-                            // Clean up Pepper metadata
+                            // Clean up Cayenne metadata
                             // Use test environment's metadata directory
-                            let pepper_db_path = format!("{}/pepper.db", metadata_dir);
-                            if std::path::Path::new(&pepper_db_path).exists() {
-                                let _ = std::fs::remove_file(&pepper_db_path);
+                            let cayenne_db_path = format!("{}/cayenne.db", metadata_dir);
+                            if std::path::Path::new(&cayenne_db_path).exists() {
+                                let _ = std::fs::remove_file(&cayenne_db_path);
                             }
                         }
 
@@ -2202,10 +2221,10 @@ mod accelerator_compat_tests {
 
                         let mut params = HashMap::new();
                         if _mode == "file" {
-                            params.insert("pepper_file_path".to_string(), location.clone());
+                            params.insert("cayenne_file_path".to_string(), location.clone());
                         }
-                        // Use test environment's metadata directory for Pepper
-                        params.insert("pepper_metadata_dir".to_string(), metadata_dir.clone());
+                        // Use test environment's metadata directory for Cayenne
+                        params.insert("cayenne_metadata_dir".to_string(), metadata_dir.clone());
                         params.insert("unsupported_type_action".to_string(), "error".to_string());
 
                         dataset.acceleration = Some(Acceleration {
@@ -2215,12 +2234,12 @@ mod accelerator_compat_tests {
                             } else {
                                 Mode::Memory
                             },
-                            engine: Engine::Pepper,
+                            engine: Engine::Cayenne,
                             params,
                             ..Acceleration::default()
                         });
 
-                        PepperAccelerator::new()
+                        CayenneAccelerator::new()
                             .create_external_table(external_table, Some(&dataset), Vec::new())
                             .await
                             .expect("Vortex table should be created")
@@ -2347,7 +2366,7 @@ mod accelerator_compat_tests {
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 4
@@ -2372,7 +2391,7 @@ mod accelerator_compat_tests {
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 3
@@ -2396,7 +2415,7 @@ mod accelerator_compat_tests {
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 1
@@ -2422,7 +2441,7 @@ mod accelerator_compat_tests {
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
             // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Pepper {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 3
@@ -2579,7 +2598,7 @@ mod accelerator_compat_tests {
                     "{:?}: should have 10 rows (no pushdown)",
                     engine
                 );
-            } else if engine == Engine::Pepper {
+            } else if engine == Engine::Cayenne {
                 // Limit pushdown only - id > 3 gives 6 rows, limit 2 gives 2 rows
                 assert_eq!(
                     total_rows, 2,
@@ -2630,7 +2649,7 @@ mod accelerator_compat_tests {
             let table_has_map = table_schema.column_with_name("map_col").is_some();
 
             // Vortex supports List natively, but Map is excluded from schema
-            if engine == Engine::Pepper {
+            if engine == Engine::Cayenne {
                 assert!(
                     has_list,
                     "{:?}: should have list_col (natively supported)",
@@ -2694,7 +2713,7 @@ mod accelerator_compat_tests {
                 }
 
                 // Verify Map column exists and has correct type (only for non-Vortex engines)
-                if engine != Engine::Pepper
+                if engine != Engine::Cayenne
                     && let Ok(map_col_idx) = batch.schema().index_of("map_col")
                 {
                     let map_col = batch.column(map_col_idx);
@@ -2721,7 +2740,7 @@ mod accelerator_compat_tests {
                 }
             }
 
-            if engine == Engine::Pepper {
+            if engine == Engine::Cayenne {
                 println!(
                     "✓ {:?}: List type works correctly (Map not yet supported)",
                     engine
@@ -2893,9 +2912,20 @@ mod accelerator_compat_tests {
             );
 
             // Print header with engine names
+            // For Cayenne, include metastore type in the label
             print!("║ {:20}", "Metric");
             for result in &mode_results {
-                print!(" │ {:>15}", format!("{:?}", result.engine));
+                let engine_label = if matches!(result.engine, Engine::Cayenne) {
+                    // Extract metastore type from mode string (e.g., "file, metastore=turso")
+                    if let Some(metastore) = result.mode.split("metastore=").nth(1) {
+                        format!("Cayenne({})", metastore)
+                    } else {
+                        format!("{:?}", result.engine)
+                    }
+                } else {
+                    format!("{:?}", result.engine)
+                };
+                print!(" │ {:>15}", engine_label);
             }
             println!(" ║");
             println!(
@@ -3122,7 +3152,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,pepper -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,cayenne -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::sync::Mutex;
         use std::time::Instant;

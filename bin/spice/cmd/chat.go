@@ -716,7 +716,7 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling request body: %w", err)
 	}
-	return rtcontext.Do("POST", "/v1/chat/completions", bytes.NewReader(jsonBody), "Content-Type", "application/json")
+	return rtcontext.DoLongRunning("POST", "/v1/chat/completions", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
 func sendResponsesRequest(rtcontext *context.RuntimeContext, body *ResponsesRequestBody) (*http.Response, error) {
@@ -724,7 +724,7 @@ func sendResponsesRequest(rtcontext *context.RuntimeContext, body *ResponsesRequ
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling request body: %w", err)
 	}
-	return rtcontext.Do("POST", "/v1/responses", bytes.NewReader(jsonBody), "Content-Type", "application/json")
+	return rtcontext.DoLongRunning("POST", "/v1/responses", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
 // messagesToInput converts a message history into a single input string for the Responses API

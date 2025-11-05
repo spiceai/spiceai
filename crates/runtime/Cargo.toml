@@ -59,8 +59,7 @@ document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",
-    "vtab",
-    "vtab-arrow",
+    "extensions-full",
 ], optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
@@ -259,9 +258,7 @@ models = [
     "mcp",
     "dep:strsim",
     "runtime-datafusion-udfs/models",
-    "llama_cpp",
 ]
-llama_cpp = ["llms/llama_cpp"]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
@@ -301,7 +298,7 @@ vortex = ["dep:vortex-datafusion", "dep:vortex"]
 xxhash = ["dep:twox-hash", "cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]
-pepper = { path = "../pepper", features = ["turso"] }
+cayenne = { path = "../cayenne", features = ["turso"] }
 vortex = { workspace = true, optional = true }
 vortex-datafusion = { workspace = true, optional = true }
 

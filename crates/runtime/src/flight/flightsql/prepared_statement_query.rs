@@ -123,23 +123,28 @@ pub(crate) struct PreparedStatement {
     pub(super) parameter_schema: Option<Vec<u8>>,
 }
 
-mod record_batch_serde {
+mod param_values_serde {
     use arrow::array::RecordBatch;
     use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+    use arrow_tools::record_batch::record_to_param_values;
+    use datafusion::common::ParamValues;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::io::Cursor;
 
     #[allow(clippy::ref_option)]
-    pub fn serialize<S>(batch: &Option<RecordBatch>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(params: &Option<ParamValues>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        match batch {
+        match params {
             None => Vec::<u8>::new().serialize(serializer),
-            Some(batch) => {
+            Some(params) => {
+                // Convert ParamValues back to RecordBatch for serialization
+                // This is only done once during do_put, not on every query execution
+                let batch = param_values_to_record(params).map_err(serde::ser::Error::custom)?;
                 let mut writer = StreamWriter::try_new(Vec::new(), &batch.schema())
                     .map_err(serde::ser::Error::custom)?;
-                writer.write(batch).map_err(serde::ser::Error::custom)?;
+                writer.write(&batch).map_err(serde::ser::Error::custom)?;
                 writer.finish().map_err(serde::ser::Error::custom)?;
                 let bytes = writer.into_inner().map_err(serde::ser::Error::custom)?;
                 bytes.serialize(serializer)
@@ -147,7 +152,7 @@ mod record_batch_serde {
         }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<RecordBatch>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ParamValues>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -158,8 +163,60 @@ mod record_batch_serde {
 
         let cursor = Cursor::new(bytes);
         let mut reader = StreamReader::try_new(cursor, None).map_err(serde::de::Error::custom)?;
+        let batch = reader
+            .next()
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
 
-        reader.next().transpose().map_err(serde::de::Error::custom)
+        match batch {
+            None => Ok(None),
+            Some(batch) => {
+                // Convert RecordBatch to ParamValues once during deserialization
+                // This is more efficient than doing it on every query execution
+                let params = record_to_param_values(&batch).map_err(serde::de::Error::custom)?;
+                Ok(Some(params))
+            }
+        }
+    }
+
+    // Helper function to convert ParamValues back to RecordBatch
+    fn param_values_to_record(
+        params: &ParamValues,
+    ) -> Result<RecordBatch, arrow::error::ArrowError> {
+        use arrow::array::{ArrayRef, RecordBatch};
+        use arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        match params {
+            ParamValues::List(values) => {
+                let fields: Vec<Field> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| Field::new(format!("${}", i + 1), v.data_type(), v.is_null()))
+                    .collect();
+
+                let arrays: Result<Vec<ArrayRef>, _> = values
+                    .iter()
+                    .map(datafusion::scalar::ScalarValue::to_array)
+                    .collect();
+
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
+            }
+            ParamValues::Map(map) => {
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by_key(|(k, _)| *k);
+
+                let fields: Vec<Field> = entries
+                    .iter()
+                    .map(|(name, v)| Field::new(name.as_str(), v.data_type(), v.is_null()))
+                    .collect();
+
+                let arrays: Result<Vec<ArrayRef>, _> =
+                    entries.iter().map(|(_, v)| v.to_array()).collect();
+
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
+            }
+        }
     }
 }
 
@@ -359,7 +416,7 @@ pub(crate) async fn do_put_query(
     let mut decoder = FlightDataDecoder::new(streaming_flight);
 
     // Read the schema first - Arrow Flight always sends schema before batches
-    let schema = decode_schema(&mut decoder).await?;
+    let _schema = decode_schema(&mut decoder).await?;
 
     tracing::info!("do_put_query: Parameter schema: {:?}", schema);
 
