@@ -7,46 +7,46 @@ on:
     tags:
       - v*
     paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "README.md"
-      - "Makefile"
-      - "CONTRIBUTING.md"
-      - "SECURITY.md"
-      - "LICENSE"
-      - ".github/**"
-      - "version.txt"
-      - ".schema/**"
-      - ".vscode/**"
-      - "deploy/**"
-      - "install/**"
-      - "media/**"
-      - "monitoring/**"
-      - "acknowledgements.md"
-      - "Dockerfile*"
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   workflow_dispatch:
     inputs:
       platform_option:
-        description: "Which option do you want to run on? (Default is ALL)"
+        description: 'Which option do you want to run on? (Default is ALL)'
         required: false
         type: choice
         options:
-          - "all"
-          - "Linux x64"
-          - "Linux aarch64"
-          - "macOS aarch64 (Apple Silicon)"
-          - "Windows x64"
-          - "macOS x64 (Intel)"
-        default: "all"
+          - 'all'
+          - 'Linux x64'
+          - 'Linux aarch64'
+          - 'macOS aarch64 (Apple Silicon)'
+          - 'Windows x64'
+          - 'macOS x64 (Intel)'
+        default: 'all'
       profile_option:
-        description: "Which Rust build profile to use? (Default is release)"
+        description: 'Which Rust build profile to use? (Default is release)'
         required: false
         type: choice
         options:
-          - "release"
-          - "release-lto"
-        default: "release"
+          - 'release'
+          - 'release-lto'
+        default: 'release'
 
 jobs:
   setup-matrix:
