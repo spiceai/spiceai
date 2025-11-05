@@ -47,6 +47,10 @@ pub struct DispatchArgs {
 
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
     pub(crate) validate: bool,
+
+    /// Maximum number of concurrent workflow runs allowed (default: 2)
+    #[arg(long)]
+    pub(crate) max_concurrent: Option<usize>,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]

@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::time::Duration;
+
 use test_framework::{
     TestType,
     anyhow::{self, Result},
     gh_utils::{GitHubWorkflow, map_numbers_to_strings},
-    octocrab,
+    octocrab::{self, Octocrab},
     utils::scan_directory_for_yamls,
 };
 
@@ -135,19 +137,93 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             path.display(),
         );
 
-        GitHubWorkflow::new(
+        let workflow = GitHubWorkflow::new(
             "spicehq",
             "spiceai",
             test_type.workflow(),
             &args.workflow_commit,
-        )
-        .send(octo_client.actions(), Some(payload))
-        .await?;
+        );
+
+        match args.max_concurrent {
+            Some(max_parallel) => {
+                // Dispatch workflow while waiting for an available slot, limiting to max_parallel concurrent runs
+                dispatch_workflow_with_concurrency(
+                    workflow,
+                    &octo_client,
+                    Some(payload),
+                    max_parallel,
+                )
+                .await?;
+            }
+            None => {
+                // Dispatch workflow without concurrency limit
+                workflow.send(octo_client.actions(), Some(payload)).await?;
+            }
+        }
 
         // sleep to space out runs
         println!("Waiting for next run...");
         tokio::time::sleep(std::time::Duration::from_secs(80)).await;
     }
 
+    Ok(())
+}
+
+/// Dispatches the workflow, waiting until the number of active runs is below the limit
+/// or until the 30 minutes max wait time expires.
+///
+/// - `max_parallel`: maximum number of active runs allowed
+async fn dispatch_workflow_with_concurrency(
+    workflow: GitHubWorkflow,
+    octo: &Octocrab,
+    input: Option<serde_json::Value>,
+    max_parallel: usize,
+) -> Result<()> {
+    wait_for_slot(
+        &workflow,
+        octo,
+        max_parallel,
+        Duration::from_secs(1800), // 30 mins
+    )
+    .await?;
+
+    workflow.send(octo.actions(), input).await
+}
+
+/// Waits until the number of already queued runs is below the given limit,
+/// or until the timeout expires.
+///
+/// This is used to limit the number of concurrent workflow runs on GitHub Actions.
+/// - `max_parallel`: maximum number of active runs allowed
+async fn wait_for_slot(
+    workflow: &GitHubWorkflow,
+    octo: &Octocrab,
+    max_parallel: usize,
+    timeout: Duration,
+) -> Result<()> {
+    let start_time = std::time::Instant::now();
+
+    loop {
+        let num_active = workflow.active_runs_count(octo).await?;
+        if num_active < max_parallel {
+            break;
+        }
+
+        // Check if we've exceeded the maximum wait time
+        if start_time.elapsed() >= timeout {
+            return Err(anyhow::anyhow!(
+                "Timeout: waited {} seconds for available slot but {num_active} runs still active",
+                timeout.as_secs()
+            ));
+        }
+
+        let remaining_time = timeout.saturating_sub(start_time.elapsed());
+        println!(
+            "🕒 {num_active} run(s) already active — waiting for slot (<{max_parallel}) ... ({} seconds remaining)",
+            remaining_time.as_secs()
+        );
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
     Ok(())
 }
