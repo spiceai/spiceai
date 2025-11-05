@@ -472,7 +472,9 @@ fn create_factory() -> DuckDBTableProviderFactory {
     DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
         .with_dialect(new_duckdb_dialect())
         .with_settings_registry(
-            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
+            DuckDBSettingsRegistry::new()
+                .with_setting(Box::new(OrderByNonIntegerLiteral))
+                .with_setting(Box::new(super::duckdb::settings::TimeZone)),
         )
 }
 

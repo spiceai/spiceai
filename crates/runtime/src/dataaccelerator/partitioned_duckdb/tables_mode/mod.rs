@@ -22,7 +22,7 @@ pub use insert::DuckDBPartitionedInsertStrategy;
 
 use std::{any::Any, ffi::OsStr, sync::Arc};
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
@@ -197,12 +197,15 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         }
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());
+        // DuckDB internally uses microsecond precision for timestamps, so normalize
+        // the schema to avoid type mismatches during partition comparisons
+        let normalized_schema = normalize_timestamp_precision(Arc::clone(&schema));
         let creator = Arc::new(
             DuckDBPartitionCreator::new(
                 self.get_shared_pool(source).await?,
                 cmd.clone(),
                 partition_by_first,
-                Arc::clone(&schema),
+                Arc::clone(&normalized_schema),
                 &self.duckdb_factory,
             )
             .await?,
@@ -217,7 +220,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         ));
 
         let table_provider = Arc::new(
-            PartitionTableProvider::new(creator, partition_by, schema)
+            PartitionTableProvider::new(creator, partition_by, normalized_schema)
                 .await?
                 .with_insert_strategy(insert_strategy),
         );
@@ -401,11 +404,37 @@ impl PartitionCreator for DuckDBPartitionCreator {
     }
 }
 
+/// Normalizes nanosecond timestamp types to microsecond precision.
+/// DuckDB stores nanosecond timestamps as microseconds internally, so we normalize
+/// the schema to avoid type mismatches when comparing partition values.
+/// Other timestamp precisions are left unchanged.
+fn normalize_timestamp_precision(schema: SchemaRef) -> SchemaRef {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            match field.data_type() {
+                // Only convert nanosecond timestamps to microseconds (DuckDB's native precision)
+                DataType::Timestamp(TimeUnit::Nanosecond, tz) => Arc::new(Field::new(
+                    field.name(),
+                    DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                    field.is_nullable(),
+                )),
+                _ => Arc::clone(field),
+            }
+        })
+        .collect();
+
+    Arc::new(Schema::new(fields))
+}
+
 fn create_factory() -> DuckDBTableProviderFactory {
     DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
         .with_dialect(new_duckdb_dialect())
         .with_settings_registry(
-            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
+            DuckDBSettingsRegistry::new()
+                .with_setting(Box::new(OrderByNonIntegerLiteral))
+                .with_setting(Box::new(crate::dataaccelerator::duckdb::settings::TimeZone)),
         )
 }
 
@@ -418,7 +447,8 @@ async fn get_pool(
         .with_max_size(Some(connection_pool_size.unwrap_or(10)))
         .with_min_idle(Some(
             crate::dataaccelerator::duckdb::DEFAULT_MIN_IDLE_CONNECTIONS,
-        ));
+        ))
+        .with_connection_setup_query("SET TimeZone='UTC'");
     Ok(Arc::new(
         duckdb_factory
             .get_or_init_instance_with_builder(pool_builder)
@@ -607,5 +637,179 @@ mod tests {
         insta::assert_snapshot!(format!("{test_name}_result"), result_pretty);
 
         Ok(())
+    }
+
+    /// Test for timestamp precision mismatch issue when querying partitioned DuckDB tables.
+    /// This reproduces the "RowConverter column schema mismatch" error where DuckDB returns
+    /// timestamps in microsecond precision but the partition comparison expects nanoseconds.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_timestamp_precision_mismatch_in_partitioned_query() {
+        use arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+
+        let test_db_path = "./test_timestamp_partition.db";
+        if std::path::Path::new(test_db_path).exists() {
+            std::fs::remove_file(test_db_path).expect("Failed to remove existing test database");
+        }
+
+        let app = app::AppBuilder::new("test_timestamp_partitioned").build();
+        let rt = Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new("test_source".to_string(), "test_events")
+            .expect("Failed to create dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::TableModePartitionedDuckDB,
+            mode: Mode::File,
+            enabled: true,
+            params: {
+                let mut params = HashMap::new();
+                params.insert("duckdb_file".to_string(), test_db_path.to_string());
+                params
+            },
+            ..Default::default()
+        });
+
+        // Create schema with timestamp in NANOSECOND precision with UTC timezone
+        // This is what typically comes from sources like PostgreSQL TIMESTAMPTZ
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("test_events"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        // Partition by the timestamp column
+        let partitioned_by = vec![PartitionedBy {
+            name: "event_time".to_string(),
+            expression: col("event_time"),
+        }];
+
+        let accelerator = TablesModePartitionedDuckDBAccelerator::new();
+
+        let table = accelerator
+            .create_external_table(external_table, Some(&dataset), partitioned_by)
+            .await
+            .expect("accelerated table created");
+
+        // Create test data with nanosecond timestamps including sub-microsecond precision
+        // to verify proper truncation (not rounding) to microseconds
+        let timestamp_nanos = vec![
+            1_704_067_200_000_000_123_i64, // 2024-01-01 00:00:00.000000123 (123 nanos)
+            1_704_067_200_000_000_456_i64, // 2024-01-01 00:00:00.000000456 (456 nanos)
+            1_704_153_600_000_000_789_i64, // 2024-01-02 00:00:00.000000789 (789 nanos)
+        ];
+
+        let test_data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    TimestampNanosecondArray::from(timestamp_nanos.clone())
+                        .with_timezone("UTC".to_string()),
+                ),
+            ],
+        )
+        .expect("test data should be created");
+
+        let ctx = SessionContext::new();
+        let exec = Arc::new(MockExec::new(vec![Ok(test_data)], Arc::clone(&schema)));
+
+        let insertion = table
+            .insert_into(&ctx.state(), exec, InsertOp::Overwrite)
+            .await
+            .expect("insertion plan created");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insertion successful");
+
+        assert!(!result.is_empty());
+
+        ctx.register_table("test_events", Arc::clone(&table))
+            .expect("table registration successful");
+
+        // This query should trigger the RowConverter error if schemas don't match
+        // because DuckDB internally converts nanosecond timestamps to microsecond precision
+        let query_result = ctx
+            .sql("SELECT * FROM test_events ORDER BY id")
+            .await
+            .expect("query should succeed");
+
+        let batches = query_result
+            .collect()
+            .await
+            .expect("collecting results should succeed without RowConverter error");
+
+        // Verify we got the expected number of rows
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Should have 3 rows");
+
+        // Verify the timestamp column exists and has the correct type
+        // After DuckDB round-trip, timestamps should be in microsecond precision
+        let first_batch = &batches[0];
+        let timestamp_col = first_batch.column(1);
+
+        // DuckDB stores timestamps as microseconds, so after round-trip we expect microseconds
+        // The timezone should be UTC since we configured it via settings
+        match timestamp_col.data_type() {
+            DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) if tz.as_ref() == "UTC" => {
+                // Success - this is what we expect after the fix
+            }
+            other => {
+                panic!(
+                    "DuckDB should return timestamps in microsecond precision with UTC timezone, got: {:?}",
+                    other
+                );
+            }
+        }
+
+        // Verify that nanosecond precision is truncated (not rounded) to microseconds
+        let ts_array = timestamp_col
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("should be TimestampMicrosecondArray");
+
+        // Expected values after truncation (nanoseconds removed, not rounded)
+        let expected_micros = vec![
+            1_704_067_200_000_000_i64, // 123 nanos truncated to 0
+            1_704_067_200_000_000_i64, // 456 nanos truncated to 0
+            1_704_153_600_000_000_i64, // 789 nanos truncated to 0
+        ];
+
+        for (i, expected) in expected_micros.iter().enumerate() {
+            assert_eq!(
+                ts_array.value(i),
+                *expected,
+                "Row {i}: nanosecond precision should be truncated to microseconds"
+            );
+        }
+
+        // cleanup
+        std::fs::remove_file(test_db_path).expect("file should be removed");
     }
 }
