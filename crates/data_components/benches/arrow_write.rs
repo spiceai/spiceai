@@ -45,7 +45,7 @@ fn bench_check_unique_constraint(c: &mut Criterion) {
 
     for size in [1_000, 10_000, 50_000, 100_000] {
         let ids_owned: Vec<String> = (0..size).map(|i| format!("id_{i:05}")).collect();
-        let ids: Vec<&str> = ids_owned.iter().map(std::string::String::as_str).collect();
+        let ids: Vec<&str> = ids_owned.iter().map(|s| s.as_str()).collect();
 
         group.bench_with_input(BenchmarkId::new("unique_ids", size), &ids, |b, ids| {
             b.iter(|| {
@@ -58,7 +58,7 @@ fn bench_check_unique_constraint(c: &mut Criterion) {
     // Benchmark with existing set to check against
     for size in [1_000, 10_000, 50_000] {
         let ids_owned: Vec<String> = (0..size).map(|i| format!("new_id_{i:05}")).collect();
-        let ids: Vec<&str> = ids_owned.iter().map(std::string::String::as_str).collect();
+        let ids: Vec<&str> = ids_owned.iter().map(|s| s.as_str()).collect();
         let existing: HashSet<String> = (0..size).map(|i| format!("old_id_{i:05}")).collect();
 
         group.bench_with_input(
@@ -67,7 +67,7 @@ fn bench_check_unique_constraint(c: &mut Criterion) {
             |b, (ids, existing)| {
                 b.iter(|| {
                     let result = check_and_filter_unique_constraint(
-                        black_box(ids),
+                        black_box(&*ids),
                         Some(black_box(existing)),
                     );
                     black_box(result).expect("Should succeed");

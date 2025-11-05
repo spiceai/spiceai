@@ -42,8 +42,8 @@ description: "Query: tpcds_q3"
 |               |                                 BytesProcessedExec                                                                                                                   |
 |               |                                   CoalesceBatchesExec: target_batch_size=8192                                                                                        |
 |               |                                     FilterExec: d_moy@2 = 12                                                                                                         |
-|               |                                       SchemaCastScanExec                                                                                                             |
-|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                        |
+|               |                                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                          |
+|               |                                         SchemaCastScanExec                                                                                                           |
 |               |                                           FallbackOnZeroResultsScanExec                                                                                              |
 |               |                                             CoalescePartitionsExec                                                                                                   |
 |               |                                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                  |
@@ -51,9 +51,9 @@ description: "Query: tpcds_q3"
 |               |                                                   DuckSqlExec sql= SELECT "d_date_sk", "d_year", "d_moy" FROM date_dim WHERE ("d_moy" = 12)                          |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                |
 |               |                             RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 32), input_partitions=32                                                         |
-|               |                               BytesProcessedExec                                                                                                                     |
-|               |                                 SchemaCastScanExec                                                                                                                   |
-|               |                                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                              |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                  |
+|               |                                 BytesProcessedExec                                                                                                                   |
+|               |                                   SchemaCastScanExec                                                                                                                 |
 |               |                                     FallbackOnZeroResultsScanExec                                                                                                    |
 |               |                                       CoalescePartitionsExec                                                                                                         |
 |               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                        |
@@ -65,8 +65,8 @@ description: "Query: tpcds_q3"
 |               |                         BytesProcessedExec                                                                                                                           |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                |
 |               |                             FilterExec: i_manufact_id@3 = 445                                                                                                        |
-|               |                               SchemaCastScanExec                                                                                                                     |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                  |
+|               |                                 SchemaCastScanExec                                                                                                                   |
 |               |                                   FallbackOnZeroResultsScanExec                                                                                                      |
 |               |                                     CoalescePartitionsExec                                                                                                           |
 |               |                                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                          |

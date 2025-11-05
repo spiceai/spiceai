@@ -17,7 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
-use arrow::array::BooleanBuilder;
+use arrow::array::{Array, BooleanBuilder};
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
@@ -406,28 +406,50 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
         let mut sorted_ids: Vec<&str> = ids.to_vec();
         sorted_ids.sort_unstable();
 
-        // Check for duplicates in sorted array (O(n) scan)
-        for window in sorted_ids.windows(2) {
-            if window[0] == window[1] {
-                return Err(DataFusionError::Execution(
-                    "Primary key values must be unique".to_string(),
-                ));
-            }
-        }
+        // Build HashSet incrementally while validating uniqueness
+        // This avoids a separate O(n) allocation pass after validation
+        let mut unique_set = HashSet::with_capacity_and_hasher(ids.len(), S::default());
 
-        // Check against existing ids if provided
         if let Some(existing) = existing_ids {
+            // Path with existing IDs check
+            let mut prev: Option<&str> = None;
             for &id in &sorted_ids {
+                // Check for consecutive duplicates in sorted array
+                if prev.is_some_and(|p| p == id) {
+                    return Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ));
+                }
+
+                // Check against existing ids
                 if existing.contains(id) {
                     return Err(DataFusionError::Execution(format!(
                         "Primary key ({id}) already exists and is not unique"
                     )));
                 }
+
+                // Insert into set while validating (only allocate once per string)
+                unique_set.insert(id.to_string());
+                prev = Some(id);
+            }
+        } else {
+            // Fast path without existing IDs check
+            let mut prev: Option<&str> = None;
+            for &id in &sorted_ids {
+                // Check for consecutive duplicates in sorted array
+                if prev.is_some_and(|p| p == id) {
+                    return Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ));
+                }
+
+                // Insert into set while validating (only allocate once per string)
+                unique_set.insert(id.to_string());
+                prev = Some(id);
             }
         }
 
-        // Build HashSet from sorted unique ids
-        Ok(sorted_ids.iter().map(|&s| s.to_string()).collect())
+        Ok(unique_set)
     } else {
         // For smaller datasets, use HashSet (better for small sizes)
         let mut unique_set = HashSet::with_capacity_and_hasher(ids.len(), S::default());
@@ -460,10 +482,13 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
 ) -> Result<Vec<Option<String>>> {
+    use arrow::datatypes::DataType;
+
     let num_rows = batch.num_rows();
 
     // Optimization: Fast path for single-column primary keys
@@ -472,14 +497,172 @@ pub(crate) fn extract_primary_keys_str(
         let col = batch.column(pk_indices_ordered[0]);
         let mut keys = Vec::with_capacity(num_rows);
 
-        // Use Arrow's optimized iteration over the array
-        for row_idx in 0..num_rows {
-            if col.is_null(row_idx) {
-                keys.push(None);
-            } else {
-                let val = ScalarValue::try_from_array(col, row_idx)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                keys.push(Some(val.to_string()));
+        // Further optimization: Use direct downcasting for common primitive types
+        // This avoids the expensive ScalarValue::try_from_array() conversion
+        match col.data_type() {
+            DataType::Int8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int8Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int8Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int16 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int16Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int16Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int32 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int32Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int64 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int64Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt8Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt8Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt16 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt16Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt16Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt32 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt32Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt64 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt64Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Utf8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to StringArray".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::LargeUtf8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "Failed to downcast to LargeStringArray".to_string(),
+                        )
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            // Fallback to ScalarValue conversion for less common types
+            _ => {
+                for row_idx in 0..num_rows {
+                    if col.is_null(row_idx) {
+                        keys.push(None);
+                    } else {
+                        let val = ScalarValue::try_from_array(col, row_idx)
+                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                        keys.push(Some(val.to_string()));
+                    }
+                }
             }
         }
         return Ok(keys);
@@ -614,13 +797,10 @@ pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
 // Public wrappers for benchmarking with standard hasher
 #[cfg(feature = "bench")]
 pub mod bench_wrappers {
-    use std::collections::HashSet;
+    use super::*;
     use std::collections::hash_map::RandomState;
 
-    use super::{RecordBatch, Result};
-
     /// Public wrapper for benchmarking `check_and_filter_non_null_unique_primary_keys`
-    #[allow(dead_code, clippy::implicit_hasher)]
     pub fn check_and_filter_non_null_unique_primary_keys(
         pks: &[Option<String>],
         existing_pks: Option<&HashSet<String>>,
@@ -629,7 +809,6 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `check_and_filter_unique_constraint`
-    #[allow(dead_code, clippy::implicit_hasher)]
     pub fn check_and_filter_unique_constraint(
         ids: &[&str],
         existing_ids: Option<&HashSet<String>>,
@@ -638,7 +817,6 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `extract_primary_keys_str`
-    #[allow(dead_code)]
     pub fn extract_primary_keys_str(
         batch: &RecordBatch,
         pk_indices_ordered: &[usize],
@@ -647,7 +825,6 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `filter_existing`
-    #[allow(dead_code, clippy::implicit_hasher)]
     pub fn filter_existing(
         existing_batches: &mut Vec<RecordBatch>,
         overwriting_primary_keys: &HashSet<String>,
@@ -1500,7 +1677,7 @@ mod tests {
             .await
             .expect("collect should succeed");
 
-        let total_rows: usize = result.iter().map(arrow_array::RecordBatch::num_rows).sum();
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 4, "should have all 4 rows from both partitions");
     }
 
@@ -1684,10 +1861,7 @@ mod tests {
     async fn test_large_dataset_optimization_path() {
         // Test the optimization path for large datasets (> 10,000 rows)
         let large_ids_owned: Vec<String> = (0..15_000).map(|i| format!("id_{i:05}")).collect();
-        let large_ids: Vec<&str> = large_ids_owned
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
+        let large_ids: Vec<&str> = large_ids_owned.iter().map(String::as_str).collect();
 
         // Test successful case with unique values
         let result = super::check_and_filter_unique_constraint::<
@@ -1935,7 +2109,7 @@ mod tests {
         // Verify distribution across partitions
         for (i, partition) in table.batches.iter().enumerate() {
             let p = partition.read().await;
-            let row_count: usize = p.iter().map(arrow_array::RecordBatch::num_rows).sum();
+            let row_count: usize = p.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(
                 row_count, 3,
                 "partition {i} should have 3 rows due to round-robin distribution"
