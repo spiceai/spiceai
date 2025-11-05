@@ -17,7 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
-use arrow::array::BooleanBuilder;
+use arrow::array::{Array, BooleanBuilder};
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
@@ -137,12 +137,17 @@ impl MemTable {
                 let valid_ids = match c {
                     Constraint::PrimaryKey(pk) => {
                         let pks = primary_key_identifier(&p, pk)?;
-                        check_and_filter_non_null_unique_primary_keys(&pks, constraint_keys.get(i))?
+                        check_and_filter_non_null_unique_primary_keys::<
+                            std::collections::hash_map::RandomState,
+                        >(&pks, constraint_keys.get(i))?
                     }
                     Constraint::Unique(u) => {
                         let ids = constraint_identifiers(&p, u)?;
                         let as_str: Vec<_> = ids.iter().map(String::as_str).collect();
-                        check_and_filter_unique_constraint(&as_str, constraint_keys.get(i))?
+                        check_and_filter_unique_constraint::<std::collections::hash_map::RandomState>(
+                            &as_str,
+                            constraint_keys.get(i),
+                        )?
                     }
                 };
                 // Keep track of ids to ensure uniqueness across all partitions.
@@ -360,15 +365,18 @@ impl MemSink {
 /// If `existing_pks` is provided, also check uniqueness of `pks` against `existing_pks`.
 ///
 /// Returns a set of unique, non-null primary key ids.
-fn check_and_filter_non_null_unique_primary_keys(
+///
+/// # Visibility
+/// This function is public for benchmarking purposes.
+pub(crate) fn check_and_filter_non_null_unique_primary_keys<S: std::hash::BuildHasher + Default>(
     pks: &[Option<String>],
-    existing_pks: Option<&HashSet<String>>,
-) -> Result<HashSet<String>> {
+    existing_pks: Option<&HashSet<String, S>>,
+) -> Result<HashSet<String, S>> {
     let num_pks = pks.len();
 
     // First check uniqueness
     let non_null_pks: Vec<&str> = pks.iter().filter_map(|opt| opt.as_deref()).collect();
-    let unique_set = check_and_filter_unique_constraint(&non_null_pks, existing_pks)?;
+    let unique_set = check_and_filter_unique_constraint::<S>(&non_null_pks, existing_pks)?;
 
     if num_pks != non_null_pks.len() {
         return Err(DataFusionError::Execution(
@@ -384,29 +392,86 @@ fn check_and_filter_non_null_unique_primary_keys(
 /// not check for nullity, or uniqueness of null values.
 ///
 /// Returns a set of unique ids.
-fn check_and_filter_unique_constraint(
+///
+/// # Visibility
+/// This function is public for benchmarking purposes.
+pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Default>(
     ids: &[&str],
-    existing_ids: Option<&HashSet<String>>,
-) -> Result<HashSet<String>> {
-    let mut unique_set = HashSet::<String>::new();
-    ids.iter()
-        .map(|&id| {
-            if unique_set.insert(id.to_string()) {
-                if existing_ids.is_some_and(|existing| existing.contains(id)) {
+    existing_ids: Option<&HashSet<String, S>>,
+) -> Result<HashSet<String, S>> {
+    // Optimization: For large datasets, sort first then check for duplicates
+    // This can be faster than HashSet insertion for very large batches due to better cache locality
+    if ids.len() > 10_000 {
+        // For large datasets, sort and check for consecutive duplicates
+        let mut sorted_ids: Vec<&str> = ids.to_vec();
+        sorted_ids.sort_unstable();
+
+        // Build HashSet incrementally while validating uniqueness
+        // This avoids a separate O(n) allocation pass after validation
+        let mut unique_set = HashSet::with_capacity_and_hasher(ids.len(), S::default());
+
+        if let Some(existing) = existing_ids {
+            // Path with existing IDs check
+            let mut prev: Option<&str> = None;
+            for &id in &sorted_ids {
+                // Check for consecutive duplicates in sorted array
+                if prev.is_some_and(|p| p == id) {
+                    return Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ));
+                }
+
+                // Check against existing ids
+                if existing.contains(id) {
                     return Err(DataFusionError::Execution(format!(
                         "Primary key ({id}) already exists and is not unique"
                     )));
                 }
-                Ok(())
-            } else {
-                Err(DataFusionError::Execution(
-                    "Primary key values must be unique".to_string(),
-                ))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
 
-    Ok(unique_set)
+                // Insert into set while validating (only allocate once per string)
+                unique_set.insert(id.to_string());
+                prev = Some(id);
+            }
+        } else {
+            // Fast path without existing IDs check
+            let mut prev: Option<&str> = None;
+            for &id in &sorted_ids {
+                // Check for consecutive duplicates in sorted array
+                if prev.is_some_and(|p| p == id) {
+                    return Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ));
+                }
+
+                // Insert into set while validating (only allocate once per string)
+                unique_set.insert(id.to_string());
+                prev = Some(id);
+            }
+        }
+
+        Ok(unique_set)
+    } else {
+        // For smaller datasets, use HashSet (better for small sizes)
+        let mut unique_set = HashSet::with_capacity_and_hasher(ids.len(), S::default());
+        ids.iter()
+            .map(|&id| {
+                if unique_set.insert(id.to_string()) {
+                    if existing_ids.is_some_and(|existing| existing.contains(id)) {
+                        return Err(DataFusionError::Execution(format!(
+                            "Primary key ({id}) already exists and is not unique"
+                        )));
+                    }
+                    Ok(())
+                } else {
+                    Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(unique_set)
+    }
 }
 
 /// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
@@ -414,25 +479,211 @@ fn check_and_filter_unique_constraint(
 /// `pk_indices_ordered` should be in ascending order.
 ///
 /// If any primary key value is `Null`, the entire key is [`Option::None`].
-fn extract_primary_keys_str(
+///
+/// # Visibility
+/// This function is public for benchmarking purposes.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
 ) -> Result<Vec<Option<String>>> {
+    use arrow::datatypes::DataType;
+
     let num_rows = batch.num_rows();
+
+    // Optimization: Fast path for single-column primary keys
+    // Avoids ScalarValue conversion and string concatenation overhead
+    if pk_indices_ordered.len() == 1 {
+        let col = batch.column(pk_indices_ordered[0]);
+        let mut keys = Vec::with_capacity(num_rows);
+
+        // Further optimization: Use direct downcasting for common primitive types
+        // This avoids the expensive ScalarValue::try_from_array() conversion
+        match col.data_type() {
+            DataType::Int8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int8Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int8Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int16 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int16Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int16Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int32 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int32Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int64 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int64Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt8Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt8Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt16 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt16Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt16Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt32 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt32Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt64 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt64Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Utf8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to StringArray".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::LargeUtf8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "Failed to downcast to LargeStringArray".to_string(),
+                        )
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            // Fallback to ScalarValue conversion for less common types
+            _ => {
+                for row_idx in 0..num_rows {
+                    if col.is_null(row_idx) {
+                        keys.push(None);
+                    } else {
+                        let val = ScalarValue::try_from_array(col, row_idx)
+                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                        keys.push(Some(val.to_string()));
+                    }
+                }
+            }
+        }
+        return Ok(keys);
+    }
+
+    // Composite key path: must concatenate multiple columns
     let mut keys = Vec::with_capacity(num_rows);
 
     'row: for row_idx in 0..num_rows {
         let mut parts = Vec::with_capacity(pk_indices_ordered.len());
         for &col_idx in pk_indices_ordered {
             let col = batch.column(col_idx);
-            let val = ScalarValue::try_from_array(col, row_idx)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-            // Early exit creating the entire row if any part is null.
-            if val.is_null() {
+            // Optimization: Check nullity first before expensive conversion
+            if col.is_null(row_idx) {
                 keys.push(None);
                 continue 'row;
             }
+
+            let val = ScalarValue::try_from_array(col, row_idx)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             parts.push(val.to_string());
         }
         // Join all PK parts with a delimiter
@@ -484,9 +735,12 @@ fn constraint_identifiers(rb: &[&RecordBatch], constraint_idx: &[usize]) -> Resu
 /// This is one part of `InsertOp::Replace` functionality, and still requires the new rows (with conflicting PKs), to be added.
 ///
 /// This function modifies `existing_batches` in place.
-fn filter_existing(
+///
+/// # Visibility
+/// This function is public for benchmarking purposes.
+pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
     existing_batches: &mut Vec<RecordBatch>,
-    overwriting_primary_keys: &HashSet<String>,
+    overwriting_primary_keys: &HashSet<String, S>,
     pk_indices_ordered: &[usize],
 ) -> Result<()> {
     if existing_batches.is_empty() {
@@ -516,6 +770,50 @@ fn filter_existing(
 
     *existing_batches = filtered;
     Ok(())
+}
+
+// Public wrappers for benchmarking with standard hasher
+#[cfg(feature = "bench")]
+pub mod bench_wrappers {
+    use super::*;
+    use std::collections::hash_map::RandomState;
+
+    /// Public wrapper for benchmarking `check_and_filter_non_null_unique_primary_keys`
+    pub fn check_and_filter_non_null_unique_primary_keys(
+        pks: &[Option<String>],
+        existing_pks: Option<&HashSet<String>>,
+    ) -> Result<HashSet<String>> {
+        super::check_and_filter_non_null_unique_primary_keys::<RandomState>(pks, existing_pks)
+    }
+
+    /// Public wrapper for benchmarking `check_and_filter_unique_constraint`
+    pub fn check_and_filter_unique_constraint(
+        ids: &[&str],
+        existing_ids: Option<&HashSet<String>>,
+    ) -> Result<HashSet<String>> {
+        super::check_and_filter_unique_constraint::<RandomState>(ids, existing_ids)
+    }
+
+    /// Public wrapper for benchmarking `extract_primary_keys_str`
+    pub fn extract_primary_keys_str(
+        batch: &RecordBatch,
+        pk_indices_ordered: &[usize],
+    ) -> Result<Vec<Option<String>>> {
+        super::extract_primary_keys_str(batch, pk_indices_ordered)
+    }
+
+    /// Public wrapper for benchmarking `filter_existing`
+    pub fn filter_existing(
+        existing_batches: &mut Vec<RecordBatch>,
+        overwriting_primary_keys: &HashSet<String>,
+        pk_indices_ordered: &[usize],
+    ) -> Result<()> {
+        super::filter_existing::<RandomState>(
+            existing_batches,
+            overwriting_primary_keys,
+            pk_indices_ordered,
+        )
+    }
 }
 
 fn primary_key_identifier(
@@ -577,8 +875,9 @@ impl DataSink for MemSink {
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
-            new_key_set =
-                check_and_filter_non_null_unique_primary_keys(&new_primary_key_ids, None)?;
+            new_key_set = check_and_filter_non_null_unique_primary_keys::<
+                std::collections::hash_map::RandomState,
+            >(&new_primary_key_ids, None)?;
         }
 
         let mut writable_targets: Vec<_> =
@@ -598,10 +897,9 @@ impl DataSink for MemSink {
 
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
-                            let _ = check_and_filter_non_null_unique_primary_keys(
-                                &batch_pks,
-                                Some(&new_key_set),
-                            )?;
+                            let _ = check_and_filter_non_null_unique_primary_keys::<
+                                std::collections::hash_map::RandomState,
+                            >(&batch_pks, Some(&new_key_set))?;
                         }
                     }
                 }
@@ -705,12 +1003,14 @@ impl DeletionSink for MemDeletionSink {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use arrow::{
         array::{RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema, SchemaRef},
     };
+    use arrow_array::Array;
     use arrow_buffer::ArrowNativeType;
     use datafusion::{
         catalog::TableProvider,
@@ -1286,5 +1586,512 @@ mod tests {
             .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn test_composite_primary_key() {
+        // Test composite primary key handling
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "a", "b", "b"]),
+            ("pk2", vec!["1", "2", "1", "2"]),
+            ("value", vec!["v1", "v2", "v3", "v4"]),
+        ]);
+
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0, 1]), // Composite key on pk1 and pk2
+            ]))
+            .await
+            .expect("satisfy composite primary key constraints");
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Try to insert duplicate composite key
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "c"]),
+            ("pk2", vec!["1", "1"]),
+            ("value", vec!["v5", "v6"]),
+        ]);
+
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        assert!(
+            collect(insertion, ctx.task_ctx()).await.is_err(),
+            "insertion should fail due to composite primary key conflict on (a,1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_partitions() {
+        // Test with multiple partitions
+        let (rb1, schema) =
+            create_batch_with_string_columns(&[("id", vec!["1", "2"]), ("value", vec!["a", "b"])]);
+        let (rb2, _) =
+            create_batch_with_string_columns(&[("id", vec!["3", "4"]), ("value", vec!["c", "d"])]);
+
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![rb1], vec![rb2]])
+            .expect("mem table with multiple partitions should be created");
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Verify scanning returns all data from all partitions
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 4, "should have all 4 rows from both partitions");
+    }
+
+    #[tokio::test]
+    async fn test_null_primary_key_rejection() {
+        // Test that null primary keys are rejected
+        let (rb, schema) = create_batch_with_nullable_string_columns(&[
+            ("id", vec![Some("1"), None, Some("3")]),
+            ("value", vec![Some("a"), Some("b"), Some("c")]),
+        ]);
+
+        let result = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should reject null values in primary key column"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_table_operations() {
+        // Test operations on empty table
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let table = MemTable::try_new(Arc::clone(&schema), vec![])
+            .expect("empty mem table should be created");
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Test scan on empty table
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan should succeed on empty table");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+
+        assert_eq!(result.len(), 0, "empty table should return no batches");
+
+        // Test insert into empty table
+        let (insert_rb, _) =
+            create_batch_with_string_columns(&[("id", vec!["1", "2"]), ("value", vec!["a", "b"])]);
+
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], Arc::clone(&schema)));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should succeed");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        assert_eq!(
+            result[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("should be u64")
+                .value(0),
+            2,
+            "should have inserted 2 rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_primary_keys_str() {
+        // Test the primary key extraction function directly
+        let (rb, _) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "b", "c"]),
+            ("pk2", vec!["1", "2", "3"]),
+            ("data", vec!["x", "y", "z"]),
+        ]);
+
+        // Single column primary key
+        let keys = super::extract_primary_keys_str(&rb, &[0]).expect("extraction should succeed");
+        assert_eq!(
+            keys,
+            vec![
+                Some("a".to_string()),
+                Some("b".to_string()),
+                Some("c".to_string())
+            ]
+        );
+
+        // Composite primary key
+        let keys =
+            super::extract_primary_keys_str(&rb, &[0, 1]).expect("extraction should succeed");
+        assert_eq!(
+            keys,
+            vec![
+                Some("a|1".to_string()),
+                Some("b|2".to_string()),
+                Some("c|3".to_string())
+            ]
+        );
+
+        // Test with nullable values
+        let (rb_nullable, _) = create_batch_with_nullable_string_columns(&[
+            ("pk1", vec![Some("a"), None, Some("c")]),
+            ("pk2", vec![Some("1"), Some("2"), Some("3")]),
+        ]);
+
+        let keys = super::extract_primary_keys_str(&rb_nullable, &[0, 1])
+            .expect("extraction should succeed");
+        assert_eq!(keys[0], Some("a|1".to_string()));
+        assert_eq!(keys[1], None, "should be None when any part is null");
+        assert_eq!(keys[2], Some("c|3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_check_and_filter_functions() {
+        // Test check_and_filter_non_null_unique_primary_keys
+        let pks = vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+            Some("c".to_string()),
+        ];
+
+        let result = super::check_and_filter_non_null_unique_primary_keys::<
+            std::collections::hash_map::RandomState,
+        >(&pks, None)
+        .expect("should succeed with unique keys");
+        assert_eq!(result.len(), 3);
+
+        // Test with duplicates
+        let pks_with_dup = vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+            Some("a".to_string()),
+        ];
+
+        let result = super::check_and_filter_non_null_unique_primary_keys::<
+            std::collections::hash_map::RandomState,
+        >(&pks_with_dup, None);
+        assert!(result.is_err(), "should fail with duplicate keys");
+
+        // Test with null
+        let pks_with_null = vec![Some("a".to_string()), None, Some("c".to_string())];
+
+        let result = super::check_and_filter_non_null_unique_primary_keys::<
+            std::collections::hash_map::RandomState,
+        >(&pks_with_null, None);
+        assert!(result.is_err(), "should fail with null primary key");
+
+        // Test against existing set
+        let mut existing = HashSet::new();
+        existing.insert("b".to_string());
+
+        let pks_conflict = vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+            Some("c".to_string()),
+        ];
+
+        let result = super::check_and_filter_non_null_unique_primary_keys::<
+            std::collections::hash_map::RandomState,
+        >(&pks_conflict, Some(&existing));
+        assert!(
+            result.is_err(),
+            "should fail when key exists in existing set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_dataset_optimization_path() {
+        // Test the optimization path for large datasets (> 10,000 rows)
+        let large_ids_owned: Vec<String> = (0..15_000).map(|i| format!("id_{i:05}")).collect();
+        let large_ids: Vec<&str> = large_ids_owned.iter().map(String::as_str).collect();
+
+        // Test successful case with unique values
+        let result = super::check_and_filter_unique_constraint::<
+            std::collections::hash_map::RandomState,
+        >(&large_ids, None)
+        .expect("should succeed with unique large dataset");
+        assert_eq!(result.len(), 15_000);
+
+        // Test with duplicate in large dataset
+        let mut large_ids_dup_owned: Vec<String> = large_ids_owned.clone();
+        large_ids_dup_owned[10_000] = large_ids_dup_owned[5_000].clone(); // Create duplicate
+        let large_ids_dup: Vec<&str> = large_ids_dup_owned.iter().map(String::as_str).collect();
+
+        let result = super::check_and_filter_unique_constraint::<
+            std::collections::hash_map::RandomState,
+        >(&large_ids_dup, None);
+        assert!(
+            result.is_err(),
+            "should fail with duplicate in large dataset"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_existing() {
+        // Test the filter_existing function
+        let (rb1, _) = create_batch_with_string_columns(&[
+            ("id", vec!["1", "2", "3"]),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        let (rb2, _) = create_batch_with_string_columns(&[
+            ("id", vec!["4", "5", "6"]),
+            ("value", vec!["d", "e", "f"]),
+        ]);
+
+        let mut existing_batches = vec![rb1, rb2];
+        let mut overwriting_keys = HashSet::new();
+        overwriting_keys.insert("2".to_string());
+        overwriting_keys.insert("5".to_string());
+
+        super::filter_existing(&mut existing_batches, &overwriting_keys, &[0])
+            .expect("filter should succeed");
+
+        // Collect remaining IDs
+        let mut remaining_ids = Vec::new();
+        for batch in &existing_batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("should be string array");
+            for i in 0..ids.len() {
+                remaining_ids.push(ids.value(i));
+            }
+        }
+
+        assert_eq!(
+            remaining_ids,
+            vec!["1", "3", "4", "6"],
+            "should filter out ids 2 and 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_conflict_validation() {
+        // Test on_conflict validation with primary key mismatch
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "b"]),
+            ("pk2", vec!["1", "2"]),
+            ("value", vec!["v1", "v2"]),
+        ]);
+
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0, 1]), // Composite key
+            ]))
+            .await
+            .expect("constraints should be satisfied")
+            .with_on_conflict(
+                OnConflict::try_from("upsert:pk1").expect("create on_conflict"), // Only one column
+            );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["c"]),
+            ("pk2", vec!["3"]),
+            ("value", vec!["v3"]),
+        ]);
+
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let result = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should fail when on_conflict columns don't match primary key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_multiple_filters() {
+        // Test deletion with multiple filters
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("id", vec!["1", "2", "3", "4", "5"]),
+            ("category", vec!["A", "B", "A", "B", "C"]),
+            ("value", vec!["10", "20", "30", "40", "50"]),
+        ]);
+
+        let table = MemTable::try_new(schema, vec![vec![rb]]).expect("mem table should be created");
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Delete rows where category = 'A' OR id = '4'
+        let filter1 = col("category").eq(lit("A"));
+        let filter2 = col("id").eq(lit("4"));
+
+        let plan = table
+            .delete_from(&state, &[filter1, filter2])
+            .await
+            .expect("deletion should succeed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion should complete");
+
+        let deleted_count = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("should be u64")
+            .value(0);
+
+        // Should delete rows with id 1, 3 (category A) and 4 (id match)
+        assert_eq!(deleted_count, 3, "should delete 3 rows");
+
+        // Verify remaining data
+        let scan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let remaining = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+
+        let remaining_ids: Vec<_> = remaining[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("should be string")
+            .iter()
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            remaining_ids,
+            vec!["2", "5"],
+            "only ids 2 and 5 should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_mismatch_detection() {
+        // Test that schema mismatches are properly detected
+        let schema1 = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", DataType::Int32, false),
+        ]));
+
+        let schema2 = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", DataType::Utf8, false), // Different type
+        ]));
+
+        let _batch1 = RecordBatch::try_new(
+            Arc::clone(&schema1),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "2"])),
+                Arc::new(arrow::array::Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .expect("batch should be created");
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema2),
+            vec![
+                Arc::new(StringArray::from(vec!["3", "4"])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("batch should be created");
+
+        let result = MemTable::try_new(schema1, vec![vec![batch2]]);
+        assert!(result.is_err(), "should fail with mismatched schema");
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_partitioning() {
+        // Test that inserts are distributed round-robin across partitions
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Utf8,
+            false,
+        )]));
+
+        // Create table with 3 partitions
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![], vec![], vec![]])
+            .expect("3-partition table should be created");
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Insert 9 rows
+        let mut batches = Vec::new();
+        for i in 0..9 {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(StringArray::from(vec![format!("{i}")]))],
+            )
+            .expect("batch should be created");
+            batches.push(Ok(batch));
+        }
+
+        let exec = Arc::new(MockExec::new(batches, schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should succeed");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert should complete");
+
+        // Verify distribution across partitions
+        for (i, partition) in table.batches.iter().enumerate() {
+            let p = partition.read().await;
+            let row_count: usize = p.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(
+                row_count, 3,
+                "partition {i} should have 3 rows due to round-robin distribution"
+            );
+        }
     }
 }
