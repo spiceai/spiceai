@@ -706,7 +706,7 @@ impl Runtime {
         // Warn if Turso engine is being used
         if accelerator_engine == crate::component::dataset::acceleration::Engine::Turso {
             tracing::warn!(
-                "The Turso data accelerator (engine: turso) is in preview and should not be used in production."
+                "Turso data accelerator (Alpha) is in preview and should not be used in production."
             );
         }
 
