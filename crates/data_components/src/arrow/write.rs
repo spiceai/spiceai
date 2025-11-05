@@ -17,7 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
-use arrow::array::BooleanBuilder;
+use arrow::array::{Array, BooleanBuilder};
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
@@ -482,10 +482,13 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
 ) -> Result<Vec<Option<String>>> {
+    use arrow::datatypes::DataType;
+
     let num_rows = batch.num_rows();
 
     // Optimization: Fast path for single-column primary keys
@@ -494,14 +497,172 @@ pub(crate) fn extract_primary_keys_str(
         let col = batch.column(pk_indices_ordered[0]);
         let mut keys = Vec::with_capacity(num_rows);
 
-        // Use Arrow's optimized iteration over the array
-        for row_idx in 0..num_rows {
-            if col.is_null(row_idx) {
-                keys.push(None);
-            } else {
-                let val = ScalarValue::try_from_array(col, row_idx)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                keys.push(Some(val.to_string()));
+        // Further optimization: Use direct downcasting for common primitive types
+        // This avoids the expensive ScalarValue::try_from_array() conversion
+        match col.data_type() {
+            DataType::Int8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int8Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int8Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int16 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int16Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int16Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int32 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int32Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Int64 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to Int64Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt8Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt8Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt16 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt16Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt16Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt32 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt32Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::UInt64 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to UInt64Array".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::Utf8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Failed to downcast to StringArray".to_string())
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            DataType::LargeUtf8 => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "Failed to downcast to LargeStringArray".to_string(),
+                        )
+                    })?;
+                for row_idx in 0..num_rows {
+                    keys.push(if array.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(array.value(row_idx).to_string())
+                    });
+                }
+            }
+            // Fallback to ScalarValue conversion for less common types
+            _ => {
+                for row_idx in 0..num_rows {
+                    if col.is_null(row_idx) {
+                        keys.push(None);
+                    } else {
+                        let val = ScalarValue::try_from_array(col, row_idx)
+                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                        keys.push(Some(val.to_string()));
+                    }
+                }
             }
         }
         return Ok(keys);

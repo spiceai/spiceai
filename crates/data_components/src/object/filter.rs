@@ -956,4 +956,84 @@ mod tests {
         assert_eq!(rb.column(3).data_type(), &DataType::Utf8); // e_tag
         assert_eq!(rb.column(4).data_type(), &DataType::Utf8); // version
     }
+
+    #[tokio::test]
+    async fn test_path_round_trip_symmetry() {
+        // This test verifies that Path::parse() correctly round-trips paths that were
+        // encoded via Path::from() and then retrieved via as_ref().
+        // This is critical for the filter_object_meta implementation which uses:
+        //   1. Path::from() to create paths (which URL-encodes)
+        //   2. as_ref() to get URL-encoded strings (in to_record_batch)
+        //   3. Path::parse() to reconstruct paths (in from_filtered_record_batch)
+
+        let test_paths = vec![
+            "simple.txt",
+            "with spaces.txt",
+            "文件.txt",    // Chinese characters
+            "αρχείο.txt",  // Greek characters
+            "emoji😀.txt", // Emoji
+            "mixed/path/文件 with spaces.txt",
+            "special!@#$%^&*().txt",
+            "path/to/file.txt",
+            "",                      // Empty path
+            "already%20encoded.txt", // Pre-encoded characters
+        ];
+
+        for original_path_str in test_paths {
+            // Step 1: Create Path using from() (like create_test_meta does)
+            let original_path = Path::from(original_path_str);
+
+            // Step 2: Get URL-encoded representation (like to_record_batch does)
+            let encoded_str = original_path.as_ref();
+
+            // Step 3: Parse it back (like from_filtered_record_batch does)
+            let parsed_path = Path::parse(encoded_str).unwrap_or_else(|e| {
+                panic!("Failed to parse '{encoded_str}' (from '{original_path_str}'): {e}")
+            });
+
+            // Verify round-trip: The parsed path should be identical to the original
+            assert_eq!(
+                original_path.as_ref(),
+                parsed_path.as_ref(),
+                "Round-trip failed for path '{}': original='{}' parsed='{}'",
+                original_path_str,
+                original_path.as_ref(),
+                parsed_path.as_ref()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_filter_preserves_path_encoding() {
+        // Integration test: Verify that filtering preserves exact path encoding
+        // including special characters and Unicode
+        let now = Utc::now();
+        let test_cases = [
+            ("simple.txt", 100),
+            ("with spaces.txt", 200),
+            ("文件.txt", 300),
+            ("emoji😀.txt", 400),
+        ];
+
+        let metas: Vec<ObjectMeta> = test_cases
+            .iter()
+            .map(|(path, size)| create_test_meta(path, now, *size, None, None))
+            .collect();
+
+        // Filter for all files (no actual filtering, just round-trip)
+        let filters = vec![col("size").gt(lit(0u64))];
+        let filtered = filter_object_meta(&filters, &metas).expect("could not filter ObjectMeta");
+
+        assert_eq!(filtered.len(), metas.len());
+
+        // Verify each path round-tripped correctly
+        for (original, filtered_meta) in metas.iter().zip(filtered.iter()) {
+            assert_eq!(
+                original.location.as_ref(),
+                filtered_meta.location.as_ref(),
+                "Path encoding changed during filter for '{}'",
+                original.location.as_ref()
+            );
+        }
+    }
 }
