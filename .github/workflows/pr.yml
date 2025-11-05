@@ -163,19 +163,21 @@ jobs:
       - name: precreate cargo directory
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          mkdir -p ~/.cargo
+          mkdir -p .cargo-cache
 
       - name: pull cargo cache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/pull-archive
         with:
-          archive-path: cargo.tar.zst
-          local-path: ~/.cargo
+          archive-path: cargo-cache.tar.zst
+          local-path: .cargo-cache/
+          force-extract-at-path: true
 
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
+          CARGO_HOME: .cargo-cache
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: push lint archive
@@ -185,12 +187,13 @@ jobs:
           archive-path: lint.tar.zst
           local-path: target/lint/
 
-      - name: push cargo registry cache
+      - name: push cargo cache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/push-archive
         with:
-          archive-path: cargo.tar.zst
-          local-path: ~/.cargo/registry
+          archive-path: cargo-cache.tar.zst
+          local-path: .cargo-cache/
+          force-extract-at-path: true
 
       - name: force exit
         run: exit 1
