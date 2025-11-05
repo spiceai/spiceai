@@ -131,13 +131,12 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Setup MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+      - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
