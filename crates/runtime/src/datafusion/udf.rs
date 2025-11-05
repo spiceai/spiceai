@@ -89,6 +89,7 @@ pub fn deny_spice_specific_functions() -> FunctionSupport {
                 COSINE_DISTANCE_UDF_NAME,
                 TRUNCATE_SCALAR_UDF_NAME,
                 EMBED_UDF_NAME,
+                #[cfg(feature = "models")]
                 AI_UDF_NAME,
                 DIGEST_UDF_NAME,
             ]

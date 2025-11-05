@@ -105,7 +105,7 @@ use arrow::{
 };
 use async_trait::async_trait;
 use datafusion_table_providers::util::supported_functions::{
-    FunctionSupport, unsupported_scalar_functions,
+    FunctionSupport, contains_unsupported_functions,
 };
 use std::ops::ControlFlow;
 
@@ -1298,11 +1298,11 @@ impl SQLExecutor for TursoTableProvider {
     }
 
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        // Default to not federate if [`Self::scalar_udf_support`] provided, otherwise true.
+        // Default to not federate if [`Self::function_support`] provided, otherwise true.
         self.function_support
             .as_ref()
-            .map(|supported_scalar_udfs| {
-                !unsupported_scalar_functions(plan, supported_scalar_udfs).unwrap_or(false)
+            .map(|func_supp| {
+                !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
             })
             .unwrap_or(true)
     }
