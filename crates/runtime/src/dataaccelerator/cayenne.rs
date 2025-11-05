@@ -467,7 +467,8 @@ impl DataAccelerator for CayenneAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(
-            "Cayenne data accelerator (Alpha) is in preview and should not be used in production.");
+            "Cayenne data accelerator (Alpha) is in preview and should not be used in production."
+        );
 
         if !source.is_file_accelerated() {
             return Err(Box::new(Error::InvalidConfiguration {
