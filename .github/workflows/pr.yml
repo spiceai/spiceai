@@ -173,9 +173,30 @@ jobs:
           local-path: .cargo-cache/
           force-extract-at-path: true
 
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+
+      - name: Set up sccache
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          os: "linux"
+
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
           CARGO_HOME: .cargo-cache
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
