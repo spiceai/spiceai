@@ -155,3 +155,4 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
 
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Notify that the Enterprise and Cloud releases are complete and ready for communications in the release coordination channel.
