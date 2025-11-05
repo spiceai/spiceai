@@ -22,6 +22,7 @@ on:
           - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
+          - 'saffron[parameterized]'
       query_overrides:
         description: 'Query overrides'
         required: false
@@ -45,6 +46,7 @@ on:
           - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
+          - 'saffron-views'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -58,11 +60,11 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spicehq-dev-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-runners'
+          - 'spicehq-dev-large-runners'
       scale_factor:
         description: 'Scale factor for the benchmark'
         required: false

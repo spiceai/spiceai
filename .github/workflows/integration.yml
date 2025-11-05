@@ -16,15 +16,15 @@ on:
   workflow_dispatch:
     inputs:
       update_snapshots:
-        description: "Update the snapshots?"
+        description: 'Update the snapshots?'
         required: false
-        default: "no"
+        default: 'no'
         type: choice
         options:
-          - "always"
-          - "no"
+          - 'always'
+          - 'no'
       run_all_tests:
-        description: "Run all tests"
+        description: 'Run all tests'
         type: boolean
         required: false
         default: false
@@ -42,7 +42,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a sucess when skipped).
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
@@ -74,7 +74,7 @@ jobs:
   build:
     name: Build Test Binary
     needs: check_changes
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@v5
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -98,7 +98,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -124,7 +124,7 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: "linux"
+          os: 'linux'
 
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -208,11 +208,11 @@ jobs:
       matrix:
         include:
           - label: 1
-            partition: "count:1/3"
+            partition: 'count:1/3'
           - label: 2
-            partition: "count:2/3"
+            partition: 'count:2/3'
           - label: 3
-            partition: "count:3/3"
+            partition: 'count:3/3'
     steps:
       - uses: actions/checkout@v5
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -224,7 +224,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Install Oracle ODPI-C
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -274,9 +274,9 @@ jobs:
         uses: actions/create-github-app-token@v2
         id: github-app-token
         with:
-          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: spiceai
+          app-id: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_ID }}
+          private-key: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
           repositories: |
             spiceai
 
@@ -415,7 +415,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download AWS SDK test archive
         uses: actions/download-artifact@v6
@@ -458,7 +458,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download AWS SDK credential bridge test archive
         uses: actions/download-artifact@v6
@@ -495,7 +495,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@v5
         with:
@@ -505,7 +505,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download data components test archive
         uses: actions/download-artifact@v6
@@ -539,7 +539,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download partition table test archive
         uses: actions/download-artifact@v6

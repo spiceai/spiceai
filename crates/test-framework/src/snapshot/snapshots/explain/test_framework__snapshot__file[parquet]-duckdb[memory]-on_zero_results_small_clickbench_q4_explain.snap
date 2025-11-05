@@ -11,9 +11,9 @@ description: "Query: clickbench_q4"
 | physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                            |
 |               |   CoalescePartitionsExec                                                              |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]                      |
-|               |       BytesProcessedExec                                                              |
-|               |         SchemaCastScanExec                                                            |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1       |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1           |
+|               |         BytesProcessedExec                                                            |
+|               |           SchemaCastScanExec                                                          |
 |               |             FallbackOnZeroResultsScanExec                                             |
 |               |               CoalescePartitionsExec                                                  |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |

@@ -11,8 +11,8 @@ description: "Query: clickbench_q20"
 | physical_plan | BytesProcessedExec                                                                                  |
 |               |   CoalesceBatchesExec: target_batch_size=8192                                                       |
 |               |     FilterExec: UserID@0 = 435090932899640449                                                       |
-|               |       SchemaCastScanExec                                                                            |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                         |
+|               |         SchemaCastScanExec                                                                          |
 |               |           FallbackOnZeroResultsScanExec                                                             |
 |               |             CoalescePartitionsExec                                                                  |
 |               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                 |

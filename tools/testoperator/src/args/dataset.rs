@@ -47,6 +47,11 @@ pub struct DatasetTestArgs {
     /// Whether to add HTTP clients for the test
     #[arg(long)]
     pub(crate) http_clients: bool,
+
+    /// Number of parameters to randomize for each query execution.
+    /// If not specified or 0, fixed parameters are used (no randomization).
+    #[arg(long)]
+    pub(crate) random_param_set_count: Option<usize>,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -56,6 +61,8 @@ pub enum QuerySetArg {
     Clickbench,
     #[value(name = "tpch[parameterized]")]
     ParameterizedTpch,
+    #[value(name = "saffron[parameterized]")]
+    ParameterizedSaffron,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
@@ -94,6 +101,8 @@ pub enum QueryOverridesArg {
     DatabricksCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
+    #[serde(rename = "saffron-views")]
+    SaffronViews,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -103,6 +112,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
+            QuerySetArg::ParameterizedSaffron => QuerySet::ParameterizedSaffron,
         }
     }
 }
@@ -128,6 +138,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
+            QueryOverridesArg::SaffronViews => QueryOverrides::SaffronViews,
         }
     }
 }

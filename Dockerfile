@@ -39,8 +39,8 @@ FROM debian:bookworm-slim as sandbox-setup
 ARG CARGO_FEATURES
 
 ARG INSTALL_ORACLE_ODPIC=false
-ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=05b4c01c77521eee32c89550d3a2e2f4d9f9601a79af96da441dfdd2d2a32ec4
-ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=1d27641f16df1b1384f5d61cdcbd95a5ca57ba5d25ed881edde56543f8c6d135
+ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=208bc7a9372efae098ab743d6e76aeb66e6f42579dcdbb7a6a8438412481b02e
+ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=390999bc623c39c065f1236b8b1331b342431564a7a5e36e4c645fe8d159fc5e
 
 # Install required packages
 RUN apt update \
@@ -78,7 +78,7 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
-    set -euo pipefail; \
+    set -eu; \
     apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \

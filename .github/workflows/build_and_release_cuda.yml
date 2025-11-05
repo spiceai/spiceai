@@ -7,8 +7,6 @@ on:
     paths:
       - 'crates/llms/Cargo.toml'
   push:
-    tags:
-      - v*
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -75,31 +73,31 @@ jobs:
             const matrix = [
               {
                 compute_cap: "80",
-                runner: "spiceai-large-runners",
+                runner: "spicehq-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "spiceai-large-runners",
+                runner: "spicehq-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "spiceai-large-runners",
+                runner: "spicehq-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "spiceai-large-runners",
+                runner: "spicehq-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "spiceai-large-runners",
+                runner: "spicehq-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               }
@@ -124,12 +122,8 @@ jobs:
               return filtered;
             }
 
-            // For `on.pull_request`, only build 90 compute capability on Linux.
-            if (context.eventName === 'pull_request') {
-              return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
-            }
-
-            return matrix;
+            // Non-manual (push/PR): Linux 90 cap only
+            return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
 
   build:
     name: Build CUDA ${{ matrix.target.compute_cap }} binaries
@@ -181,7 +175,7 @@ jobs:
 
   publish-minio:
     name: Publish linux-x86_64 CUDA binaries to Minio
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     needs: build
     env:
       ARTIFACT_DIR: ./release

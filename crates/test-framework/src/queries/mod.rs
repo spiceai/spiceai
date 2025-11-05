@@ -20,9 +20,13 @@ use arrow::array::RecordBatch;
 use parameterized::{ParameterValue, add_tpch_parameters};
 use serde::{Deserialize, Serialize};
 
-use crate::flight::{PreparedStatementParamColumn, create_param_batch};
+use crate::{
+    flight::{PreparedStatementParamColumn, create_param_batch},
+    spiced::SpicedInstance,
+};
 
 pub mod parameterized;
+pub mod saffron;
 pub mod validation;
 
 #[macro_export]
@@ -119,6 +123,7 @@ macro_rules! add_tpcds_query_overrides {
         }
     }
 }
+
 macro_rules! generate_clickbench_queries {
   ( $( $i:literal ),* ) => {
       vec![
@@ -145,6 +150,34 @@ macro_rules! generate_clickbench_query_overrides {
           ),*
       ]
   }
+}
+
+macro_rules! generate_saffron_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("saffron_q", stringify!($i)).into(),
+                    include_str!(concat!("./saffron/q", stringify!($i), ".sql")).into(),
+                    false
+                )
+            ),*
+        ]
+    }
+}
+
+macro_rules! generate_saffron_views_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("saffron_q", stringify!($i)).into(),
+                    include_str!(concat!("./saffron/views/q", stringify!($i), ".sql")).into(),
+                    true
+                )
+            ),*
+        ]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,9 +216,37 @@ impl Query {
             create_param_batch(columns)
         })
     }
+
+    /// Converts parameterized SQL to raw SQL with parameters substituted as literals
+    /// for use with endpoints that don't support parameterized queries.
+    #[must_use]
+    pub fn to_sql_with_inlined_params(&self) -> Arc<str> {
+        match &self.parameters {
+            Some(params) if !params.is_empty() => {
+                let mut sql = self.sql.as_ref().to_string();
+
+                // Handle different parameter formats
+                if sql.contains('?') {
+                    // Positional format: replace ? with actual values
+                    for param in params {
+                        sql = sql.replacen('?', &param.to_sql_literal(), 1);
+                    }
+                } else {
+                    // Named format: replace $1, $2, etc. with actual values
+                    for (i, param) in params.iter().enumerate() {
+                        let placeholder = format!("${}", i + 1);
+                        sql = sql.replace(&placeholder, &param.to_sql_literal());
+                    }
+                }
+
+                sql.into()
+            }
+            _ => Arc::clone(&self.sql),
+        }
+    }
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default, PartialEq)]
 pub enum QuerySet {
     #[default]
     #[serde(rename = "tpch")]
@@ -196,6 +257,8 @@ pub enum QuerySet {
     Clickbench,
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
+    #[serde(rename = "saffron[parameterized]")]
+    ParameterizedSaffron,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -226,12 +289,19 @@ impl From<&(&'static str, u32)> for TableWithRowCount {
 }
 
 impl QuerySet {
-    #[must_use]
-    pub fn get_queries(&self, overrides: Option<QueryOverrides>) -> Vec<Query> {
+    pub async fn get_queries(
+        &self,
+        overrides: Option<QueryOverrides>,
+        instance: Option<&SpicedInstance>,
+        random_param_set_count: Option<usize>,
+    ) -> anyhow::Result<Vec<Query>> {
         match self {
-            QuerySet::Tpch => get_tpch_test_queries(overrides),
-            QuerySet::Tpcds => get_tpcds_test_queries(overrides),
-            QuerySet::Clickbench => get_clickbench_test_queries(overrides),
+            QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
+            QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
+            QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
+            QuerySet::ParameterizedSaffron => {
+                get_saffron_test_queries(overrides, instance, random_param_set_count).await
+            }
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
                     "parameterized",
@@ -256,7 +326,7 @@ impl QuerySet {
                     q21 // q22 -- Invalid argument error: column types must match schema types, expected Float64 but found Decimal128(38, 10) at column index 7
                 );
 
-                add_tpch_parameters(queries)
+                Ok(add_tpch_parameters(queries))
             }
         }
     }
@@ -311,6 +381,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
+            QuerySet::ParameterizedSaffron => [].iter().map(TableWithRowCount::from).collect(),
         }
     }
 
@@ -363,6 +434,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
+            QuerySet::ParameterizedSaffron => [].iter().map(TableWithTimeColumn::from).collect(),
         }
     }
 }
@@ -374,6 +446,7 @@ impl Display for QuerySet {
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
+            QuerySet::ParameterizedSaffron => write!(f, "saffron[parameterized]"),
         }
     }
 }
@@ -396,6 +469,7 @@ pub enum QueryOverrides {
     SpicecloudCatalog,
     GlueCatalog,
     Spicecloud,
+    SaffronViews,
 }
 
 impl QueryOverrides {
@@ -712,4 +786,108 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     }
 
     queries
+}
+
+pub async fn get_saffron_test_queries(
+    overrides: Option<QueryOverrides>,
+    instance: Option<&SpicedInstance>,
+    random_param_set_count: Option<usize>,
+) -> anyhow::Result<Vec<Query>> {
+    let queries = match overrides {
+        Some(QueryOverrides::SaffronViews) => {
+            generate_saffron_views_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11)
+        }
+        _ => generate_saffron_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11),
+    };
+
+    match (random_param_set_count, instance) {
+        (Some(count), Some(instance)) if count > 0 => {
+            // Generate randomized parameter sets for load testing
+            saffron::generate_randomized_saffron_queries(queries, instance, count, overrides).await
+        }
+        _ => {
+            // Use fixed parameters for deterministic testing
+            Ok(saffron::add_saffron_fixed_parameters(queries))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_sql_with_inlined_params_named_format() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE id = $1 AND name = $2 AND price > $3".into(),
+            false,
+        );
+        query.parameters = Some(vec![
+            ParameterValue::Number(123),
+            ParameterValue::String("test_name".into()),
+            ParameterValue::Float(99.99),
+        ]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE id = 123 AND name = 'test_name' AND price > 99.99"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_positional_format() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE id = ? AND name = ? AND active = ?".into(),
+            false,
+        );
+        query.parameters = Some(vec![
+            ParameterValue::Number(456),
+            ParameterValue::String("positional_test".into()),
+            ParameterValue::Number(1),
+        ]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE id = 456 AND name = 'positional_test' AND active = 1"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_string_escaping() {
+        let mut query = Query::new(
+            "test_query".into(),
+            "SELECT * FROM table WHERE comment = ?".into(),
+            false,
+        );
+        query.parameters = Some(vec![ParameterValue::String(
+            "It's a test with 'quotes'".into(),
+        )]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(
+            result.as_ref(),
+            "SELECT * FROM table WHERE comment = 'It''s a test with ''quotes'''"
+        );
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_no_parameters() {
+        let query = Query::new("test_query".into(), "SELECT * FROM table".into(), false);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(result.as_ref(), "SELECT * FROM table");
+    }
+
+    #[test]
+    fn test_to_sql_with_inlined_params_empty_parameters() {
+        let mut query = Query::new("test_query".into(), "SELECT * FROM table".into(), false);
+        query.parameters = Some(vec![]);
+
+        let result = query.to_sql_with_inlined_params();
+        assert_eq!(result.as_ref(), "SELECT * FROM table");
+    }
 }

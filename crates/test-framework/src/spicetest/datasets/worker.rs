@@ -550,24 +550,24 @@ impl SpiceTestQueryWorker {
     ) -> Result<()> {
         if let Some(http_client) = self.http_client.as_ref() {
             let query_start = Instant::now();
+            let sql_text = query.to_sql_with_inlined_params();
             let http_response = http_client
                 .post("http://localhost:8090/v1/sql")
-                .body(query.sql.to_string())
+                .body(sql_text.to_string())
                 .send()
                 .await?;
 
-            if !http_response.status().is_success() {
+            let status = http_response.status();
+            let body = http_response.text().await.unwrap_or_default();
+
+            if !status.is_success() {
                 eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {}",
+                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {status} - {body}",
                     chrono::Utc::now(),
                     self.id,
                     query.name,
-                    http_response.status()
                 );
-                return Err(anyhow::anyhow!(
-                    "Query HTTP request failed: {}",
-                    http_response.status()
-                ));
+                return Err(anyhow::anyhow!("Query HTTP request failed: {status}",));
             }
 
             let duration = query_start.elapsed();

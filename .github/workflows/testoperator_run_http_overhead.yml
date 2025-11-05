@@ -54,7 +54,7 @@ on:
 jobs:
   run-http-consistency:
     name: Run http consistency tests
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     timeout-minutes: 600
     steps:
       - name: Run details

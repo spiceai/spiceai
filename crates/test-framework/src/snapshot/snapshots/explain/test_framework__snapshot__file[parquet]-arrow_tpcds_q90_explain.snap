@@ -92,8 +92,8 @@ description: "Query: tpcds_q90"
 |               |                                   BytesProcessedExec                                                                                                                                        |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |                                       FilterExec: t_hour@1 >= 9 AND t_hour@1 <= 10                                                                                                          |
-|               |                                         SchemaCastScanExec                                                                                                                                  |
-|               |                                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                             |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                               |
+|               |                                           SchemaCastScanExec                                                                                                                                |
 |               |                                             DataSourceExec: partitions=1, partition_sizes=[11]                                                                                              |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
 |               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 32), input_partitions=32                                                                                       |
@@ -139,8 +139,8 @@ description: "Query: tpcds_q90"
 |               |                                   BytesProcessedExec                                                                                                                                        |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |                                       FilterExec: t_hour@1 >= 15 AND t_hour@1 <= 16                                                                                                         |
-|               |                                         SchemaCastScanExec                                                                                                                                  |
-|               |                                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                             |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                               |
+|               |                                           SchemaCastScanExec                                                                                                                                |
 |               |                                             DataSourceExec: partitions=1, partition_sizes=[11]                                                                                              |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
 |               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 32), input_partitions=32                                                                                       |
