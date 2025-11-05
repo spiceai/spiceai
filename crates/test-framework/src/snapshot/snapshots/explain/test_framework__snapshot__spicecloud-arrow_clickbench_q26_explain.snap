@@ -10,8 +10,8 @@ description: "Query: clickbench_q26"
 |               |     Filter: hits.SearchPhrase != LargeUtf8("")                                                                                                              |
 |               |       TableScan: hits projection=[SearchPhrase]                                                                                                             |
 | physical_plan | SortPreservingMergeExec: [SearchPhrase@0 ASC NULLS LAST], fetch=10                                                                                          |
-|               |   SortExec: TopK(fetch=10), expr=[SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[true]                                                              |
-|               |     BytesProcessedExec                                                                                                                                      |
+|               |   BytesProcessedExec                                                                                                                                        |
+|               |     SortExec: TopK(fetch=10), expr=[SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[true]                                                            |
 |               |       CoalesceBatchesExec: target_batch_size=8192                                                                                                           |
 |               |         FilterExec: SearchPhrase@0 !=                                                                                                                       |
 |               |           SchemaCastScanExec                                                                                                                                |
