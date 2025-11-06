@@ -5,13 +5,12 @@ expression: pretty
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                           |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                             |
-|               |   Federated                                                                                                                                                    |
+| logical_plan  | Federated                                                                                                                                                      |
 |               |  Projection: regexp_replace(csv_test.region, Utf8("AMERICA"), Utf8("AUSTRALIA"))                                                                               |
 |               |   TableScan: csv_test projection=[region]                                                                                                                      |
-| physical_plan | BytesProcessedExec                                                                                                                                             |
-|               |   SchemaCastScanExec                                                                                                                                           |
-|               |     CooperativeExec                                                                                                                                            |
+| physical_plan | SchemaCastScanExec                                                                                                                                             |
+|               |   CooperativeExec                                                                                                                                              |
+|               |     BytesProcessedExec                                                                                                                                         |
 |               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT regexp_replace("csv_test"."region", 'AMERICA', 'AUSTRALIA') FROM "csv_test" |
 |               |                                                                                                                                                                |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
