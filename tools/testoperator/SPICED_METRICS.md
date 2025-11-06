@@ -6,8 +6,8 @@ TestOperator now supports scraping Prometheus metrics from the spiced runtime du
 
 When enabled, TestOperator will:
 
-1. Start spiced with the `--metrics` flag (exposing Prometheus metrics on port 3000)
-2. Periodically scrape metrics from `http://localhost:3000/metrics` during test execution
+1. Start spiced with the `--metrics` flag (exposing Prometheus metrics on port 9090)
+2. Periodically scrape metrics from `http://localhost:9090/metrics` during test execution
 3. Process and aggregate the metrics
 4. Display key metrics after test completion
 5. Emit metrics via OpenTelemetry alongside test metrics (when `--metrics` is also enabled)
