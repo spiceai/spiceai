@@ -37,7 +37,7 @@ jobs:
       fail-fast: false
       matrix:
         branch:
-          - 'sgrebnov/1105-test'
+          - 'trunk'
     concurrency:
       # the new run waits for in-progress runs to complete
       group: testoperator-customers-${{ matrix.branch }}

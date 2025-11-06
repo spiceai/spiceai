@@ -77,7 +77,7 @@ impl GitHubWorkflow {
         let active_runs = page
             .items
             .into_iter()
-            .filter(|run| matches!(run.status.as_str(), "queued" | "in_progress"))
+            .filter(|run| matches!(run.status.as_str(), "queued" | "in_progress" | "waiting"))
             .count();
 
         Ok(active_runs)

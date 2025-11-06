@@ -212,6 +212,7 @@ async fn wait_for_slot(
     loop {
         let num_active = workflow.active_runs_count(octo).await?;
         if num_active < max_concurrent {
+            println!("✅ Dispatch slot available! Currently {num_active} active runs.");
             break;
         }
 
@@ -225,7 +226,7 @@ async fn wait_for_slot(
 
         let remaining_time = timeout.saturating_sub(start_time.elapsed());
         println!(
-            "🕒 {num_active} run(s) already active — waiting for slot (<{max_concurrent}) ... ({} seconds remaining)",
+            "🕒 {num_active} run(s) already active — waiting for slot... ({} seconds remaining)",
             remaining_time.as_secs()
         );
 
