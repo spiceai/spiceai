@@ -107,6 +107,8 @@ pub struct BenchArgs {
         serialize_with = "serialize_scale_factor"
     )]
     pub scale_factor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scrape_spiced_metrics: Option<bool>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
