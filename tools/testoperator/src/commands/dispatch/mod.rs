@@ -179,6 +179,9 @@ async fn dispatch_workflow_with_concurrency(
     input: Option<serde_json::Value>,
     max_parallel: usize,
 ) -> Result<()> {
+    println!(
+        "Checking for available slot to run workflow (limit: {max_parallel} concurrent runs)..."
+    );
     if let Err(err) = wait_for_slot(
         &workflow,
         octo,
