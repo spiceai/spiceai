@@ -142,7 +142,17 @@ async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>
                 );
                 Ok(None)
             }
-            Err(source) => Err(LoadError::CredentialResolve { source }),
+            Err(err) => match err {
+                CredentialsError::ProviderError(_) => {
+                    Err(LoadError::CredentialResolve { source: err })
+                }
+                _ => {
+                    tracing::warn!(
+                        "Non-retryable AWS credentials error, proceeding without authentication: {err}"
+                    );
+                    Ok(None)
+                }
+            },
         }
     } else {
         tracing::debug!(
