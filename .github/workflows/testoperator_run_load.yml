@@ -46,6 +46,8 @@ on:
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
       ready_wait:
