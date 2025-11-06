@@ -98,10 +98,6 @@ pub enum CatalogError {
 /// Result type for catalog operations.
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
-/// Transaction guard for catalog operations that automatically rolls back on drop unless explicitly committed.
-///
-/// This follows the RAII pattern used by rusqlite and other database libraries.
-#[async_trait]
 // Transaction support is currently not exposed at the catalog level.
 // Each catalog implementation can use backend-specific transactions internally
 // to ensure atomicity of operations.
