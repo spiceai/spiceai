@@ -182,39 +182,37 @@ impl SpiceTest<NotStarted> {
             None
         };
 
-        let spice_client = self
-            .get_spiced()?
-            .spice_client(self.api_key.clone(), self.state.disable_caching)
-            .await?;
-
         let http_client = self.get_spiced()?.http_client()?;
 
-        let query_workers = (0..self.state.parallel_count)
-            .map(|id| {
-                let mut worker = SpiceTestQueryWorker::new(
-                    id,
-                    self.state.query_set.clone(),
-                    self.state.end_condition,
-                    spice_client.clone(),
-                    self.name.clone(),
-                )
-                .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate)
-                .with_validate(self.state.validate)
-                .with_scale_factor(self.state.scale_factor);
+        let mut query_workers = Vec::new();
+        for id in 0..self.state.parallel_count {
+            let spice_client = self
+                .get_spiced()?
+                .spice_client(self.api_key.clone(), self.state.disable_caching)
+                .await?;
 
-                if let Some(multi) = &multi {
-                    worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
-                }
+            let mut worker = SpiceTestQueryWorker::new(
+                id,
+                self.state.query_set.clone(),
+                self.state.end_condition,
+                spice_client,
+                self.name.clone(),
+            )
+            .with_explain_plan_snapshot(self.explain_plan_snapshot)
+            .with_results_snapshot(self.results_snapshot_predicate)
+            .with_validate(self.state.validate)
+            .with_scale_factor(self.state.scale_factor);
 
-                if self.state.http_client {
-                    worker = worker.with_http_client(http_client.clone());
-                }
+            if let Some(multi) = &multi {
+                worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
+            }
 
-                worker
-            })
-            .map(SpiceTestQueryWorker::start)
-            .collect();
+            if self.state.http_client {
+                worker = worker.with_http_client(http_client.clone());
+            }
+
+            query_workers.push(worker.start());
+        }
 
         Ok(SpiceTest {
             name: self.name,
