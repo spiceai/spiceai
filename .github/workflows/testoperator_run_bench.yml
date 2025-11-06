@@ -48,6 +48,7 @@ on:
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'saffron-views'
+          - 'saffron-duckdb-cte'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
