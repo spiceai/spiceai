@@ -133,11 +133,17 @@ async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>
     let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
     if let Some(creds_provider) = sdk_config.credentials_provider() {
-        creds_provider
-            .provide_credentials()
-            .await
-            .map(|_| Some(Arc::new(sdk_config)))
-            .map_err(|source| LoadError::CredentialResolve { source })
+        match creds_provider.provide_credentials().await {
+            Ok(_) => Ok(Some(Arc::new(sdk_config))),
+            Err(err @ CredentialsError::CredentialsNotLoaded(_)) => {
+                tracing::debug!(
+                    "AWS credential provider initialized without credentials: {err}. \
+                     Proceeding without authentication."
+                );
+                Ok(None)
+            }
+            Err(source) => Err(LoadError::CredentialResolve { source }),
+        }
     } else {
         tracing::debug!(
             "No AWS credential provider detected in the default configuration. \
