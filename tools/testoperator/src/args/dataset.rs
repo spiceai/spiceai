@@ -103,6 +103,8 @@ pub enum QueryOverridesArg {
     Spicecloud,
     #[serde(rename = "saffron-views")]
     SaffronViews,
+    #[serde(rename = "saffron-duckdb-cte")]
+    SaffronDuckdbCTE,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -139,6 +141,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
             QueryOverridesArg::SaffronViews => QueryOverrides::SaffronViews,
+            QueryOverridesArg::SaffronDuckdbCTE => QueryOverrides::SaffronDuckdbCTE,
         }
     }
 }

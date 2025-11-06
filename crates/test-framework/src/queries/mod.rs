@@ -180,6 +180,20 @@ macro_rules! generate_saffron_views_queries {
     }
 }
 
+macro_rules! generate_saffron_duckdb_cte_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("saffron_q", stringify!($i)).into(),
+                    include_str!(concat!("./saffron/duckdb_cte/q", stringify!($i), ".sql")).into(),
+                    true
+                )
+            ),*
+        ]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Query {
     pub name: Arc<str>,
@@ -470,6 +484,7 @@ pub enum QueryOverrides {
     GlueCatalog,
     Spicecloud,
     SaffronViews,
+    SaffronDuckdbCTE,
 }
 
 impl QueryOverrides {
@@ -796,6 +811,9 @@ pub async fn get_saffron_test_queries(
     let queries = match overrides {
         Some(QueryOverrides::SaffronViews) => {
             generate_saffron_views_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11)
+        }
+        Some(QueryOverrides::SaffronDuckdbCTE) => {
+            generate_saffron_duckdb_cte_queries!(4, 6)
         }
         _ => generate_saffron_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11),
     };
