@@ -68,6 +68,7 @@ impl SpicedMetrics {
             .iter()
             .filter(|s| s.metric_type == MetricType::Gauge)
             .map(|s| s.value)
+            .filter(|v| !v.is_nan()) // Filter out NaN values to avoid incorrect comparisons
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     }
 
@@ -138,9 +139,11 @@ impl MetricsScraper {
                                 }
                             }
                             Err(e) => {
-                                // Silently ignore scraping errors during collection
-                                // They will be logged when stopping if persistent
-                                let _ = e;
+                                // Log transient scraping errors to aid troubleshooting
+                                // Using eprintln for debug output to stderr
+                                #[cfg(debug_assertions)]
+                                eprintln!("Debug: Failed to scrape metrics: {e}");
+                                let _ = e; // Suppress unused variable warning in release builds
                             }
                         }
                     }
@@ -273,7 +276,13 @@ impl MetricsScraper {
             let value_str = remainder[close_brace + 1..].trim();
 
             let labels = Self::parse_labels(labels_str);
-            let value = value_str.parse::<f64>().unwrap_or(0.0);
+            let value = match value_str.parse::<f64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Warning: Failed to parse metric value '{value_str}': {e}");
+                    0.0
+                }
+            };
 
             (labels, value)
         } else if let Ok(value) = remainder.parse::<f64>() {
@@ -281,6 +290,7 @@ impl MetricsScraper {
             (HashMap::new(), value)
         } else {
             // Failed to parse
+            eprintln!("Warning: Failed to parse metric line: '{remainder}'");
             (HashMap::new(), 0.0)
         }
     }

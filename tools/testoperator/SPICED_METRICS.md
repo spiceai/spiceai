@@ -164,10 +164,10 @@ Helper methods:
 
 ### Metrics Endpoint
 
-By default, spiced is started with `--metrics 0.0.0.0:3000`. This endpoint is scraped at:
+By default, spiced is started with `--metrics 0.0.0.0:9090`. This endpoint is scraped at:
 
 ```
-http://localhost:3000/metrics
+http://localhost:9090/metrics
 ```
 
 ### Scrape Interval
@@ -198,7 +198,7 @@ This usually means:
 
 If metrics are scraped but not displayed:
 
-- Check that spiced is exposing metrics (visit `http://localhost:3000/metrics` manually)
+- Check that spiced is exposing metrics (visit `http://localhost:9090/metrics` manually)
 - Verify the metric names match what spiced exports
 - Check for parsing errors in the logs
 
