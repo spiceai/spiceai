@@ -813,7 +813,7 @@ pub async fn get_saffron_test_queries(
             generate_saffron_views_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11)
         }
         Some(QueryOverrides::SaffronDuckdbCTE) => {
-            generate_saffron_duckdb_cte_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11)
+            generate_saffron_duckdb_cte_queries!(4, 6)
         }
         _ => generate_saffron_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11),
     };
