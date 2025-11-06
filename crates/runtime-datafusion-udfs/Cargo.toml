@@ -16,7 +16,7 @@ async-openai.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
-llms = { path = "../llms" }
+llms = { path = "../llms", optional = true }
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -31,4 +31,4 @@ tracing-test = "0.2"
 tracing-subscriber.workspace = true
 
 [features]
-models = []
+models = ["dep:llms"]
