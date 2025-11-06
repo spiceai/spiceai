@@ -64,7 +64,7 @@ exclude = [".github/"]
 homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.89"
+rust-version = "1.90"
 version = "1.9.0-unstable"
 
 [workspace.dependencies]
@@ -139,6 +139,7 @@ datafusion-physical-expr-common = "50.3.0"
 datafusion-physical-plan = "50.3.0"
 datafusion-proto = { version = "50.3.0", features = ["json"] }
 datafusion-pruning = "50.3.0"
+datafusion-spark = "50.3.0"
 datafusion-table-providers = "0.1"
 delta_kernel = { version = "0.14", features = [
     "default-engine-rustls",
