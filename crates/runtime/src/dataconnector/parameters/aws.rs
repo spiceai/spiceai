@@ -198,7 +198,7 @@ impl Validator for AuthValidator {
 /// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
-pub fn initiate_config_with_credentials(
+pub async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region_name: &'static str,
     key_name: &'static str,
@@ -243,7 +243,11 @@ pub fn initiate_config_with_credentials(
                 .credentials_provider(credentials)
         }
         _ => {
-            // This will automatically load AWS credentials from the environment, via IAM roles if configured.
+            // Initialize AWS SDK credentials for IAM role authentication.
+            // This will automatically load credentials from the environment or IAM roles.
+            if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+                tracing::warn!("Unable to initialize AWS credentials for {provider_name}: {err}");
+            }
             default_aws_config().region(Region::new(region))
         }
     })

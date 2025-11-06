@@ -296,6 +296,7 @@ impl CatalogConnector for IcebergCatalog {
                 "s3_session_token",
                 &self.params,
             )
+            .await
             .map_err(|e| super::Error::InvalidConfiguration {
                 connector: "iceberg".into(),
                 message: e.to_string(),

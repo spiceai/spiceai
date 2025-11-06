@@ -16,8 +16,9 @@ limitations under the License.
 
 use anyhow::Context;
 use async_openai::error::OpenAIError;
-use aws_config::{BehaviorVersion, Region, defaults};
+use aws_config::Region;
 use aws_credential_types::Credentials;
+use aws_sdk_credential_bridge::default_aws_config;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
@@ -38,7 +39,7 @@ use std::{
 };
 
 pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    let mut config_builder = defaults(BehaviorVersion::latest());
+    let mut config_builder = default_aws_config();
 
     if let Ok(region) = std::env::var("SPICE_BEDROCK_REGION") {
         config_builder = config_builder.region(Region::new(region.clone()));
@@ -70,7 +71,7 @@ pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyh
         }
     }
 
-    let config = config_builder.load().await;
+    let config: aws_config::SdkConfig = config_builder.load().await;
     Ok(Arc::new(BedrockConverse::new(
         Arc::new((&config).into()),
         model_id.to_string(),
