@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use aws_config::{BehaviorVersion, ConfigLoader, Region};
+use aws_config::{ConfigLoader, Region};
 use aws_credential_types::Credentials;
 use snafu::prelude::*;
 use tonic::async_trait;
@@ -22,6 +22,10 @@ use tonic::async_trait;
 use crate::parameters::{ParamLookup, Parameters};
 
 use super::{ConnectorParams, Validator};
+
+// Re-export the default AWS config function from aws-sdk-credential-bridge
+// to provide a single source of truth for AWS SDK configuration.
+pub use aws_sdk_credential_bridge::default_aws_config;
 
 // https://docs.aws.amazon.com/general/latest/gr/rande.html
 pub const AWS_REGIONS: [&str; 32] = [
@@ -194,7 +198,7 @@ impl Validator for AuthValidator {
 /// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
-pub fn initiate_config_with_credentials(
+pub async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region_name: &'static str,
     key_name: &'static str,
@@ -224,8 +228,8 @@ pub fn initiate_config_with_credentials(
         .ok()
         .map(ToString::to_string);
 
-    Ok(match (access_key_id, secret_access_key) {
-        (Some(access_key_id), Some(secret_access_key)) => {
+    Ok(
+        if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
             let credentials = Credentials::new(
                 access_key_id,
                 secret_access_key,
@@ -234,13 +238,16 @@ pub fn initiate_config_with_credentials(
                 provider_name,
             );
 
-            aws_config::defaults(BehaviorVersion::v2025_08_07())
+            default_aws_config()
                 .region(Region::new(region))
                 .credentials_provider(credentials)
-        }
-        _ => {
-            // This will automatically load AWS credentials from the environment, via IAM roles if configured.
-            aws_config::defaults(BehaviorVersion::v2025_08_07()).region(Region::new(region))
-        }
-    })
+        } else {
+            // Initialize AWS SDK credentials for IAM role authentication.
+            // This will automatically load credentials from the environment or IAM roles.
+            if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+                tracing::warn!("Unable to initialize AWS credentials for {provider_name}: {err}");
+            }
+            default_aws_config().region(Region::new(region))
+        },
+    )
 }

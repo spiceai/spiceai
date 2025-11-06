@@ -110,14 +110,26 @@ mod tests {
 
 - **Use `tracing::` for logging**: Use `tracing::info!`, `tracing::error!`, `tracing::debug!`, etc.
 - **DO NOT use `log::`**: The project uses `tracing` crate, not `log` crate
+- **DO NOT add newlines in log messages or error strings**: Keep all log/error messages on a single line
 
 ```rust
 // GOOD
 tracing::info!("Starting runtime");
 tracing::error!("Failed to connect: {}", error);
+tracing::warn!(attempt = 1, "Failed to initialize credentials; retrying");
+
+// GOOD - long messages on single line
+tracing::debug!("AWS credential provider initialized without credentials. Proceeding without authentication.");
 
 // BAD - don't use log crate
 log::info!("Starting runtime");
+
+// BAD - don't add newlines in messages
+tracing::error!(
+    "Failed to connect: {}. \
+     Please check your configuration.",
+    error
+);
 ```
 
 ### Async/Blocking Patterns (CRITICAL)

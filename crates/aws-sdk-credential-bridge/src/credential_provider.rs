@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aws_config::{BehaviorVersion, SdkConfig};
+use aws_config::SdkConfig;
 
 use aws_credential_types::Credentials;
 use aws_runtime::auth::sigv4::SigV4AuthScheme;
@@ -59,7 +59,7 @@ impl S3CredentialProvider {
     ///
     /// Returns an error if the credentials cannot be loaded from the environment.
     pub async fn from_env() -> Result<(Self, SdkConfig)> {
-        let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        let config = super::default_aws_config().load().await;
 
         Ok((Self::from_config(&config)?, config))
     }
@@ -128,11 +128,18 @@ impl AwsCredentialLoad for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
+            .inspect_err(|err| {
+                tracing::error!(
+                    error = %err,
+                    "Failed to resolve AWS credentials from identity cache for Iceberg"
+                );
+            })
             .context(FailedToResolveIcebergCredentialsSnafu)?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
+            tracing::error!("Resolved identity does not contain AWS credentials for Iceberg");
             Error::FailedToResolveIcebergCredentials {
-                source: "No valid credentials found".into(),
+                source: "No valid credentials found in resolved identity".into(),
             }
         })?;
 
@@ -160,15 +167,29 @@ impl CredentialProvider for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
-            .map_err(|_| object_store::Error::Generic {
-                store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+            .map_err(|err| {
+                tracing::error!(
+                    error = %err,
+                    "Failed to resolve AWS credentials from identity cache"
+                );
+                object_store::Error::Generic {
+                    store: "S3",
+                    source: format!(
+                        "Failed to find valid credentials from the AWS credential provider chain for the S3 connection: {err}. \
+                         Ensure that valid AWS credentials are provided in the environment. \
+                         Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+                    ).into(),
+                }
             })?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
+            tracing::error!("Resolved identity does not contain AWS credentials");
             object_store::Error::Generic {
                 store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. \
+                         The resolved identity does not contain credential data. \
+                         Ensure that valid AWS credentials are provided in the environment. \
+                         Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             }
         })?;
 

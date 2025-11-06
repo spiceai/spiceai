@@ -38,7 +38,7 @@ pub(super) async fn create_bedrock_client(
     credential_provider_name: &'static str,
 ) -> Result<BedrockClient, Box<dyn std::error::Error + Send + Sync>> {
     // Build AWS config
-    let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    let mut config_builder = aws_sdk_credential_bridge::default_aws_config();
 
     // Set region if provided
     if let Some(region) = extract_secret!(params, "aws_region") {

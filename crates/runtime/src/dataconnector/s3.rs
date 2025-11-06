@@ -170,11 +170,13 @@ impl DataConnectorFactory for S3Factory {
                 validator.validate(&mut params).await?;
             }
 
-            // `get_or_init_sdk_config` emits a warning if the credentials provider cannot be initialized
-            // so we skip it if the auth method is public.
+            // Initialize AWS SDK credentials for IAM role authentication (default).
+            // Skip initialization only for 'public' and 'key' auth methods which use explicit credentials.
             match params.parameters.get("auth").expose().ok() {
-                None | Some("public") => (),
-                _ => {
+                Some("public" | "key") => {
+                    // Skip AWS SDK initialization - use explicit auth method directly
+                }
+                None | Some("iam_role" | _) => {
                     if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
                         tracing::warn!(
                             "Unable to initialize AWS credentials for S3 connector: {err}"

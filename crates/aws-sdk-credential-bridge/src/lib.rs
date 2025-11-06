@@ -70,6 +70,15 @@ pub enum LoadError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Returns a default AWS SDK configuration with the latest behavior version.
+///
+/// This is a convenience function to ensure all AWS SDK configuration uses
+/// the same behavior version consistently across the codebase.
+#[must_use]
+pub fn default_aws_config() -> aws_config::ConfigLoader {
+    aws_config::defaults(BehaviorVersion::v2025_08_07())
+}
+
 static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
 
 /// Returns the global SDK configuration, initializing it if necessary.
@@ -81,14 +90,32 @@ static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
 ///
 /// Returns a [`LoadError`] if credential initialization continues to fail due to unrecoverable
 /// issues when communicating with the AWS credential provider.
+///
+/// # Note on Concurrent Calls
+///
+/// Multiple concurrent calls to this function are safe but if initialization fails,
+/// subsequent calls will retry from scratch. This is intentional to allow recovery
+/// from transient failures.
 pub async fn get_or_init_sdk_config() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
     if let Some(cached) = SDK_CONFIG.get() {
         return Ok(cached.clone());
     }
 
+    tracing::debug!("Initializing AWS SDK configuration from environment");
+
     let value = SDK_CONFIG
-        .get_or_try_init(initialize_sdk_config_with_retry)
-        .await?;
+        .get_or_try_init(|| async move { retry_with_backoff(load_sdk_config_from_env).await })
+        .await
+        .inspect(|config| {
+            if config.is_some() {
+                tracing::info!("Successfully initialized AWS SDK configuration");
+            } else {
+                tracing::info!("AWS SDK initialized without credentials (unauthenticated mode)");
+            }
+        })
+        .inspect_err(|err| {
+            tracing::error!(error = %err, "Failed to initialize AWS SDK configuration after all retry attempts");
+        })?;
 
     Ok(value.clone())
 }
@@ -100,29 +127,83 @@ pub fn get_sdk_config() -> Option<Arc<SdkConfig>> {
         .and_then(|value| value.as_ref().map(Arc::clone))
 }
 
-async fn initialize_sdk_config_with_retry() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError>
-{
-    retry_with_backoff(load_sdk_config_from_env).await
-}
+/// Maximum number of retry attempts for AWS credential initialization.
+/// 300 attempts with Fibonacci backoff (capped at 10 minutes) provides approximately 48 hours of AWS downtime
+/// retry time, accommodating extended AWS service outages while eventually failing for permanent issues.
+const MAX_CREDENTIAL_RETRIES: usize = 300;
 
+/// Maximum duration for a single retry interval in seconds.
+/// 600 seconds (10 minutes) caps the backoff interval between retry attempts.
+const MAX_RETRY_DURATION_SECS: u64 = 600;
+
+/// Retry a credential loading operation with Fibonacci backoff.
+///
+/// This function implements a resilient retry strategy for AWS credential initialization:
+/// - Uses Fibonacci backoff sequence: 1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s, 34s, 55s, 89s, 144s...
+/// - Caps individual retry intervals at 10 minutes to prevent excessive delays
+/// - Allows up to 300 retry attempts, providing ~48 hours of total retry time
+/// - Returns immediately on success or when no credentials are needed (Ok(None))
+/// - Logs warnings for each failed attempt with retry timing information
+///
+/// This generous retry policy accommodates:
+/// - Extended AWS service outages (up to ~2 days)
+/// - Slow metadata service responses (IMDS)
+/// - Transient network issues
+/// - IAM credential propagation delays
+///
+/// # Returns
+/// - `Ok(Some(T))` - Successfully loaded credentials
+/// - `Ok(None)` - No credentials configured (unauthenticated mode)
+/// - `Err(LoadError)` - All retry attempts exhausted with persistent failure
 async fn retry_with_backoff<F, Fut, T>(mut attempt: F) -> std::result::Result<Option<T>, LoadError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<Option<T>, LoadError>>,
 {
-    let mut backoff = FibonacciBackoffBuilder::new().build();
+    let mut backoff = FibonacciBackoffBuilder::new()
+        .max_retries(Some(MAX_CREDENTIAL_RETRIES))
+        .max_duration(Some(Duration::from_secs(MAX_RETRY_DURATION_SECS)))
+        .build();
+
+    let mut last_err = None;
+    let mut attempt_num = 0;
 
     loop {
+        attempt_num += 1;
+
         match attempt().await {
-            Ok(result @ Some(_)) => return Ok(result),
+            Ok(result @ Some(_)) => {
+                if attempt_num > 1 {
+                    tracing::info!(
+                        attempts = attempt_num,
+                        "Successfully initialized AWS SDK credentials after retries"
+                    );
+                }
+                return Ok(result);
+            }
             Ok(None) => return Ok(None),
             Err(err) => {
-                let delay = backoff
-                    .next_duration()
-                    .unwrap_or_else(|| Duration::from_secs(1));
-                tracing::warn!(
-                    "Failed to initialize AWS SDK credentials (retrying in {delay:?}): {err}"
-                );
+                let Some(delay) = backoff.next_duration() else {
+                    // Exhausted retries - return the last error with context
+                    let final_error = last_err.unwrap_or_else(|| LoadError::Other {
+                        message: format!(
+                            "Failed to initialize AWS SDK credentials after {} attempts. This may indicate a persistent AWS service outage or misconfigured credentials.",
+                            attempt_num - 1
+                        ),
+                    });
+
+                    tracing::error!(
+                        attempts = attempt_num - 1,
+                        max_retries = MAX_CREDENTIAL_RETRIES,
+                        "Exhausted all retry attempts for AWS SDK credential initialization"
+                    );
+
+                    return Err(final_error);
+                };
+
+                tracing::warn!(attempt = attempt_num, max_retries = MAX_CREDENTIAL_RETRIES, next_retry_in = ?delay, error = %err, "Failed to initialize AWS SDK credentials; retrying");
+
+                last_err = Some(err);
                 sleep(delay).await;
             }
         }
@@ -130,15 +211,14 @@ where
 }
 
 async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    let sdk_config = default_aws_config().load().await;
 
     if let Some(creds_provider) = sdk_config.credentials_provider() {
         match creds_provider.provide_credentials().await {
             Ok(_) => Ok(Some(Arc::new(sdk_config))),
             Err(err @ CredentialsError::CredentialsNotLoaded(_)) => {
                 tracing::debug!(
-                    "AWS credential provider initialized without credentials: {err}. \
-                     Proceeding without authentication."
+                    "AWS credential provider initialized without credentials: {err}. Proceeding without authentication."
                 );
                 Ok(None)
             }
@@ -146,8 +226,7 @@ async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>
         }
     } else {
         tracing::debug!(
-            "No AWS credential provider detected in the default configuration. \
-             Assuming unauthenticated access."
+            "No AWS credential provider detected in the default configuration. Assuming unauthenticated access."
         );
         Ok(None)
     }
@@ -295,6 +374,27 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_exhausts_retries() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let attempts_clone = Arc::clone(&attempts);
+        let result: std::result::Result<Option<()>, LoadError> = retry_with_backoff(|| {
+            let attempts = Arc::clone(&attempts_clone);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(LoadError::Other {
+                    message: "persistent failure".to_string(),
+                })
+            }
+        })
+        .await;
+
+        assert!(result.is_err(), "Expected error after exhausting retries");
+        // Should attempt initial + MAX_CREDENTIAL_RETRIES
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_CREDENTIAL_RETRIES + 1);
     }
 
     #[test]
