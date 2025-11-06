@@ -18,15 +18,15 @@ on:
   workflow_dispatch:
     inputs:
       update_snapshots:
-        description: "Update the snapshots?"
+        description: 'Update the snapshots?'
         required: false
-        default: "no"
+        default: 'no'
         type: choice
         options:
-          - "always"
-          - "no"
+          - 'always'
+          - 'no'
       run_all_tests:
-        description: "Run all tests"
+        description: 'Run all tests'
         type: boolean
         required: false
         default: false
@@ -100,7 +100,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -126,7 +126,7 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: "linux"
+          os: 'linux'
 
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -210,11 +210,11 @@ jobs:
       matrix:
         include:
           - label: 1
-            partition: "count:1/3"
+            partition: 'count:1/3'
           - label: 2
-            partition: "count:2/3"
+            partition: 'count:2/3'
           - label: 3
-            partition: "count:3/3"
+            partition: 'count:3/3'
     steps:
       - uses: actions/checkout@v5
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -226,7 +226,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Install Oracle ODPI-C
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -400,6 +400,7 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref || github.ref_name }}
 
       - name: No snapshot changes detected
         if: steps.download_snapshots.outcome != 'success'
@@ -420,7 +421,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download AWS SDK test archive
         uses: actions/download-artifact@v6
@@ -463,7 +464,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download AWS SDK credential bridge test archive
         uses: actions/download-artifact@v6
@@ -510,7 +511,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download data components test archive
         uses: actions/download-artifact@v6
@@ -544,7 +545,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download partition table test archive
         uses: actions/download-artifact@v6
