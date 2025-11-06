@@ -11,6 +11,7 @@ tests:
     query_overrides: mysql
     runner_type: spiceai-dev-runners
   load:
+    scrape_spiced_metrics: true
     spicepod_path: federated/mysql.yaml
     query_set: tpch
     query_overrides: mysql

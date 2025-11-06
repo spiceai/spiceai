@@ -8,6 +8,7 @@ tests:
     query_set: clickbench
     runner_type: spiceai-dev-runners
   load:
+    scrape_spiced_metrics: true
     spicepod_path: federated/spicecloud.yaml
     query_set: clickbench
     runner_type: spiceai-dev-runners

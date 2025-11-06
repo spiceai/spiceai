@@ -8,6 +8,7 @@ tests:
     query_set: tpcds
     runner_type: spiceai-dev-large-runners
   load:
+    scrape_spiced_metrics: true
     spicepod_path: federated/s3[parquet].yaml
     query_set: tpcds
     runner_type: spiceai-dev-large-runners

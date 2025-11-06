@@ -12,6 +12,7 @@ tests:
     ready_wait: 60
     runner_type: spiceai-dev-runners
   load:
+    scrape_spiced_metrics: true
     spicepod_path: accelerated/file[parquet]-duckdb[memory].yaml
     query_set: tpcds
     query_overrides: duckdb

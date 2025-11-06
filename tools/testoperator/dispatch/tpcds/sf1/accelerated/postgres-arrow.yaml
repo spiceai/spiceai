@@ -10,6 +10,7 @@ tests:
     ready_wait: 600
     runner_type: spiceai-dev-large-runners
   load:
+    scrape_spiced_metrics: true
     spicepod_path: accelerated/postgres-arrow.yaml
     query_set: tpcds
     ready_wait: 600

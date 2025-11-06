@@ -11,6 +11,7 @@ tests:
     query_overrides: spark
     runner_type: spiceai-dev-large-runners
   load:
+    scrape_spiced_metrics: true
     spicepod_path: federated/databricks[sql_warehouse].yaml
     query_set: tpch
     query_overrides: spark
