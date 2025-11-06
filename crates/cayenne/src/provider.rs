@@ -1165,6 +1165,10 @@ impl CayenneTableProvider {
             file_count
         );
 
+        // Track overflow occurrences to log once at the end instead of per-row
+        let mut overflow_count: u64 = 0;
+        let mut first_overflow_id: Option<i64> = None;
+
         for delete_file in delete_files {
             let path = std::path::Path::new(&delete_file.path);
             tracing::debug!("read_deletion_vectors: reading file {:?}", path);
@@ -1215,10 +1219,11 @@ impl CayenneTableProvider {
                         if let Ok(row_id_u32) = u32::try_from(row_id) {
                             deleted_row_ids.insert(row_id_u32);
                         } else {
-                            tracing::warn!(
-                                "Skipping row ID {} that exceeds u32::MAX - table should be compacted",
-                                row_id
-                            );
+                            // Track overflow for single warning at end
+                            if first_overflow_id.is_none() {
+                                first_overflow_id = Some(row_id);
+                            }
+                            overflow_count += 1;
                         }
                     }
                 } else {
@@ -1229,15 +1234,25 @@ impl CayenneTableProvider {
                             if let Ok(row_id_u32) = u32::try_from(row_id) {
                                 deleted_row_ids.insert(row_id_u32);
                             } else {
-                                tracing::warn!(
-                                    "Skipping row ID {} that exceeds u32::MAX - table should be compacted",
-                                    row_id
-                                );
+                                // Track overflow for single warning at end
+                                if first_overflow_id.is_none() {
+                                    first_overflow_id = Some(row_id);
+                                }
+                                overflow_count += 1;
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Log once if any overflows occurred, avoiding hot path log spam
+        if overflow_count > 0 {
+            tracing::warn!(
+                "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted to remove deleted rows",
+                overflow_count,
+                first_overflow_id.unwrap_or(0)
+            );
         }
 
         tracing::debug!(
