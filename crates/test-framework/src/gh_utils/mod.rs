@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use octocrab::actions::ActionsHandler;
+use octocrab::{Octocrab, actions::ActionsHandler};
 use serde_json::Value;
 
 /// Represents a GitHub workflow to be dispatched
@@ -58,6 +58,29 @@ impl GitHubWorkflow {
         .await?;
 
         Ok(())
+    }
+
+    /// Returns the number of active workflow runs for this workflow.
+    ///
+    /// Active runs include workflows that are either queued or currently in progress.
+    ///
+    /// Notes:
+    /// - This method retrieves **only the first page** of results, with a maximum of **100 runs** (`per_page(100)` limit).
+    pub async fn active_runs_count(&self, octo: &Octocrab) -> anyhow::Result<usize> {
+        let page = octo
+            .workflows(&self.org, &self.repo)
+            .list_runs(&self.workflow_file)
+            .per_page(100)
+            .send()
+            .await?;
+
+        let active_runs = page
+            .items
+            .into_iter()
+            .filter(|run| matches!(run.status.as_str(), "queued" | "in_progress" | "waiting"))
+            .count();
+
+        Ok(active_runs)
     }
 }
 

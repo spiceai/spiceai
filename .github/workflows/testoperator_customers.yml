@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: false
+      max_concurrent:
+        description: 'Allowed concurrency for workflow runs'
+        required: false
+        type: number
+        default: 2
   schedule:
     # Run every 4 hours at minute 0
     - cron: '0 */4 * * *'
@@ -70,7 +75,7 @@ jobs:
       - name: Scheduled Bench Run - Saffron - SF1
         if: ${{ github.event_name == 'schedule' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 --workflow bench
+          testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 --workflow bench --max-concurrent 2
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -79,7 +84,7 @@ jobs:
       - name: Scheduled Load Run - Saffron - SF1
         if: ${{ github.event_name == 'schedule' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 --workflow load
+          testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 --workflow load --max-concurrent 2
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -91,7 +96,8 @@ jobs:
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/customers/saffron/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
+            --max-concurrent ${{ github.event.inputs.max_concurrent || 2 }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
