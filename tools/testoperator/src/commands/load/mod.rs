@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::get_app_and_start_request;
 use crate::{args::LoadTestArgs, health::HealthMonitor, wait_test_and_memory};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
@@ -71,11 +71,21 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     // baseline run
     println!("Running baseline throughput test");
+
+    // Parameterized queries may contain variations of the same query with different parameters.
+    // For the baseline run, we include only unique queries to avoid excessively long baseline durations.
+    let mut seen = std::collections::HashSet::new();
+    let baseline_queries: Vec<_> = queries
+        .iter()
+        .filter(|q| seen.insert(Arc::clone(&q.name)))
+        .cloned()
+        .collect();
+
     let baseline_test = SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_query_set(queries.clone())
+            .with_query_set(baseline_queries)
             .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
