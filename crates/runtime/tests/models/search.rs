@@ -17,6 +17,7 @@ limitations under the License.
 use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
 use crate::models::s3_vectors::basic_vector_search_tests;
+use crate::models::s3_vectors::search::{init_vector_store_w_index_name, prepare_for_aws_tests};
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
 };
@@ -30,9 +31,12 @@ use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
+use itertools::{Either, Itertools};
 use reqwest::header::HeaderMap;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
+use runtime::component::dataset::acceleration::Engine;
+use runtime::component::view::View;
 use runtime::config::Config;
 use serde_json::{Value, json};
 use spicepod::acceleration::Acceleration;
@@ -41,10 +45,12 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
+use spicepod::vector::VectorStore;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use super::{get_tpcds_dataset, sort_json_keys};
@@ -116,6 +122,209 @@ impl SearchTestCase {
             name: self.name.clone(),
             skip: self.skip,
         }
+    }
+}
+
+/// [`TableComponentType`] defines how a SQL table to be searched upon should be constructed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SearchTableComponentType {
+    /// A single [`spicepod::component::dataset::Dataset`]
+    Dataset,
+
+    /// A [`spicepod::component::view::View`] constructed from a `JOIN ON`.
+    ///   e.g. `SELECT a.*, b.* FROM a JOIN b ON a.id=b.id`
+    ViewJoin,
+
+    /// A [`spicepod::component::view::View`] constructed from a `UNION ALL`.
+    ///   e.g. `SELECT * FROM a UNION ALL SELECT * FROM b`
+    ViewUnionAll,
+
+    /// A [`spicepod::component::view::View`] constructed from a `UNION ALL` where one of the inputs is a ` JOIN ON`.
+    ///   e.g. `SELECT * FROM a UNION ALL SELECT * FROM (SELECT b.*, c.* FROM b JOIN c ON c.id=b.id)`
+    ViewUnionAllJoin,
+}
+
+impl std::fmt::Display for SearchTableComponentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Dataset => "dataset",
+            Self::ViewJoin => "view_join",
+            Self::ViewUnionAll => "view_union_all",
+            Self::ViewUnionAllJoin => "view_union_all_join",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl FromStr for SearchTableComponentType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "dataset" => Ok(Self::Dataset),
+            "view_join" => Ok(Self::ViewJoin),
+            "view_union_all" => Ok(Self::ViewUnionAll),
+            "view_union_all_join" => Ok(Self::ViewUnionAllJoin),
+            _ => Err(format!("Unknown SearchTableComponentType: '{}'", s)),
+        }
+    }
+}
+
+// The spicepod fields important in testing search
+pub struct SearchSpicepodConfiguration {
+    acceleration: Option<Acceleration>,
+    vector: Option<VectorStore>,
+    table_component: SearchTableComponentType,
+    columns: Vec<Column>,
+}
+
+static MEGA_SCIENCE_COLUMN_CONFIGS: LazyLock<HashMap<&str, Vec<Column>>> = LazyLock::new(|| {
+    HashMap::from([(
+        "basic",
+        vec![
+            Column::new("answer")
+                .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id")),
+        ],
+    )])
+});
+
+impl SearchSpicepodConfiguration {
+    // search.duckdb.no_vector_engine.join_view.hybrid_single_column
+    pub fn from_str(
+        id: &str,
+        column_configs: &HashMap<&str, Vec<Column>>,
+    ) -> Result<Self, anyhow::Error> {
+        let Some(
+            [
+                "search",
+                engine,
+                vector,
+                table_component,
+                column_configuration,
+            ],
+        ) = id.split('.').collect_array()
+        else {
+            return Err(anyhow::anyhow!("Invalid search spicepod slug: '{id}'."));
+        };
+        let acceleration = Acceleration {
+            engine: Some(Engine::try_from(engine)?.to_string()),
+            enabled: true,
+            ..Default::default()
+        };
+
+        let vector = match vector {
+            "s3_vectors" => Some(VectorStore {
+                enabled: true,
+                engine: Some("s3_vectors".to_string()),
+                params: Some(Params::from_string_map(
+                    vec![
+                        ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
+                        (
+                            "s3_vectors_bucket".to_string(),
+                            "spice-ci-tests-s3-vectors".to_string(),
+                        ),
+                        (
+                            "s3_vectors_index".to_string(),
+                            format!(
+                                "{engine}-{}-{}-{}",
+                                table_component.replace("_", "-"),
+                                column_configuration.replace("_", "-"),
+                                rand::random::<u8>() % 11
+                            ),
+                        ),
+                        (
+                            "s3_vectors_aws_access_key_id".to_string(),
+                            "${env:AWS_S3_VECTORS_KEY}".to_string(),
+                        ),
+                        (
+                            "s3_vectors_aws_secret_access_key".to_string(),
+                            "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )),
+                partition_by: vec![],
+            }),
+            "no_vector_engine" => None,
+            x => {
+                return Err(anyhow::anyhow!(
+                    "Invalid vector field '{x}' in search spicepod slug."
+                ));
+            }
+        };
+
+        let Some(columns) = column_configs.get(column_configuration).cloned() else {
+            return Err(anyhow::anyhow!(
+                "Invalid column configuration field '{column_configuration}' in search spicepod slug."
+            ));
+        };
+
+        Ok(SearchSpicepodConfiguration {
+            acceleration: Some(acceleration),
+            vector,
+            table_component: table_component
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?,
+            columns,
+        })
+    }
+}
+
+// if let Some(ref store) = cfg.vector {
+//     prepare_for_aws_tests(store).await?:
+// }
+pub fn build_mega_science(mut app: AppBuilder, cfg: &SearchSpicepodConfiguration) -> AppBuilder {
+    let answer = cfg.columns.iter().find(|col| col.name == "answer");
+    let question = cfg.columns.iter().find(|col| col.name == "question");
+
+    let (ds, views) = match cfg.table_component {
+        SearchTableComponentType::Dataset => {
+            let mut ds = get_mega_science_dataset(Some("qs"), question.cloned(), answer.cloned());
+            ds.vectors = cfg.vector.clone();
+            ds.acceleration = cfg.acceleration.clone();
+            (ds, vec![])
+        }
+        SearchTableComponentType::ViewUnionAllJoin => {
+            let (ds, mut views) =
+                get_mega_science_view(Some("qs"), question.cloned(), answer.cloned());
+            if let Some(v) = views.last_mut() {
+                v.vectors = cfg.vector.clone();
+                v.acceleration = cfg.acceleration.clone();
+            }
+            (ds, views)
+        }
+        x => {
+            unimplemented!("Search test with {x} configuration")
+        }
+    };
+    app = app.with_dataset(ds);
+    for v in views {
+        app = app.with_view(v);
+    }
+    app
+}
+
+#[tokio::test]
+pub async fn run_tests() {
+    let slugs = vec![
+        "search.arrow.s3_vectors.view_union_all_join.basic",
+        "search.arrow.no_vector_engine.dataset.basic",
+    ];
+    for s in slugs {
+        let app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
+            "hf_minilm",
+        ));
+        let cfg = SearchSpicepodConfiguration::from_str(s, &MEGA_SCIENCE_COLUMN_CONFIGS)
+            .expect("could not initialise configuration");
+        run_search_w_explain(
+            build_mega_science(app, &cfg).build(),
+            basic_vector_search_tests(s),
+            true,
+        )
+        .await
+        .expect("failed to run searh tests");
     }
 }
 
