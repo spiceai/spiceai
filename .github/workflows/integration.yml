@@ -382,7 +382,7 @@ jobs:
           git config --global user.email 'spiceaibot@spice.ai'
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'success'
+        if: steps.download_snapshots.outcome == 'success'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
