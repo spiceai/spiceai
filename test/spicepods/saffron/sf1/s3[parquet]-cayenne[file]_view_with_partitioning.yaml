@@ -32,16 +32,6 @@ datasets:
       params:
         duckdb_preserve_insertion_order: false
 
-  - from: s3://benchmarks/saffron/number_caps_sf1
-    name: number_caps
-    params: *params_s3
-    acceleration:
-      enabled: true
-      engine: duckdb
-      mode: file
-      params:
-        duckdb_preserve_insertion_order: false
-
   - from: s3://benchmarks/saffron/sender_info_sf1
     name: sender_info
     params: *params_s3
