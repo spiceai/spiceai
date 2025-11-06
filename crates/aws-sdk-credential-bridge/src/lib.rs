@@ -142,14 +142,18 @@ async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>
                 );
                 Ok(None)
             }
-            Err(err) => if let CredentialsError::ProviderError(_) = err {
-                Err(LoadError::CredentialResolve { source: err })
-            } else {
-                tracing::warn!(
-                    "Non-retryable AWS credentials error, proceeding without authentication: {err}"
-                );
-                Ok(None)
-            },
+            Err(err) => {
+                if let CredentialsError::ProviderError(_) = err {
+                    // What source error are we actually getting in CI?
+                    tracing::warn!("{err:?}");
+                    Err(LoadError::CredentialResolve { source: err })
+                } else {
+                    tracing::warn!(
+                        "Non-retryable AWS credentials error, proceeding without authentication: {err}"
+                    );
+                    Ok(None)
+                }
+            }
         }
     } else {
         tracing::debug!(
