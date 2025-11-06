@@ -128,7 +128,8 @@ pub(crate) async fn process_spiced_metrics(
             println!("{}", vec!["="; 30].join(""));
 
             // Display and optionally emit key metrics
-            if let Some(query_count) = metrics.get_counter_value("queries_count") {
+            // Note: Prometheus exporter appends _total to counter metrics
+            if let Some(query_count) = metrics.get_counter_value("query_executions_total") {
                 println!("Total Queries Executed: {query_count}");
 
                 if emit_to_telemetry {
@@ -136,8 +137,9 @@ pub(crate) async fn process_spiced_metrics(
                 }
             }
 
-            if let Some(cache_hits) = metrics.get_counter_value("cache_hits")
-                && let Some(cache_requests) = metrics.get_counter_value("cache_requests")
+            if let Some(cache_hits) = metrics.get_counter_value("results_cache_hits_total")
+                && let Some(cache_requests) =
+                    metrics.get_counter_value("results_cache_requests_total")
                 && cache_requests > 0.0
             {
                 let hit_rate = cache_hits / cache_requests;
@@ -148,7 +150,7 @@ pub(crate) async fn process_spiced_metrics(
                 }
             }
 
-            if let Some(active_conns) = metrics.get_gauge_max("active_connections") {
+            if let Some(active_conns) = metrics.get_gauge_max("query_active_count") {
                 println!("Peak Active Connections: {active_conns}");
 
                 if emit_to_telemetry {

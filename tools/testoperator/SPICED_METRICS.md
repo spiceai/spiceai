@@ -70,9 +70,9 @@ Peak Active Connections: 12
 
 When both `--metrics` and `--scrape-spiced-metrics` are enabled, the following metrics are emitted:
 
-- `spiced_query_count`: Total number of queries executed by spiced
-- `spiced_cache_hit_rate`: Cache hit rate from spiced metrics
-- `spiced_active_connections`: Peak active connections during test
+- `spiced_query_count`: Total number of queries executed by spiced (from `query_executions_total`)
+- `spiced_cache_hit_rate`: Cache hit rate from spiced metrics (calculated from `results_cache_hits_total` / `results_cache_requests_total`)
+- `spiced_active_connections`: Peak active query count during test (from `query_active_count`)
 
 These metrics are tagged with appropriate dimensions (e.g., test name, query set) for filtering in your observability platform.
 
@@ -204,10 +204,21 @@ If metrics are scraped but not displayed:
 
 ### Metric Names
 
-Spiced metric names may vary by version. Common patterns:
+Spiced metric names as exposed via Prometheus:
 
-- Counters: `queries_total`, `cache_hits_total`, `errors_total`
-- Gauges: `active_connections`, `memory_usage_bytes`
-- Histograms: `query_duration_seconds`, `request_duration_seconds`
+- **Counters** (have `_total` suffix in Prometheus format):
+  - `query_executions_total` - Total queries executed
+  - `results_cache_hits_total` - Cache hits
+  - `results_cache_requests_total` - Cache requests
+  - `query_processed_bytes_total` - Bytes processed
+  - `query_returned_bytes_total` - Bytes returned
 
-Update the metric names in the test commands if needed to match your spiced version.
+- **Gauges**:
+  - `query_active_count` - Active query count (up-down counter)
+  - `dataset_active_count` - Active datasets
+  - `model_active_count` - Active models
+
+- **Histograms**:
+  - `query_duration_ms` - Query duration in milliseconds
+  - `query_execution_duration_ms` - Query execution duration
+  - `query_returned_rows` - Rows returned per query
