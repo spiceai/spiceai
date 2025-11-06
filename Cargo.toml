@@ -118,6 +118,7 @@ candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "a
 candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
 charset = "0.1.5"
+util = { path = "crates/util" }
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
@@ -226,7 +227,7 @@ tiberius = { version = "0.12.3", default-features = false, features = [
     "rustls",
     "chrono",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util"] }
 tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",
     "with-uuid-1",

@@ -15,15 +15,17 @@ limitations under the License.
 */
 
 mod credential_provider;
-use std::sync::{Arc, LazyLock, OnceLock};
-use tokio::runtime::Handle;
+use std::{sync::Arc, time::Duration};
 
 use aws_config::{BehaviorVersion, SdkConfig};
+use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_s3::config::ProvideCredentials;
 use aws_smithy_runtime_api::client::runtime_components::BuildError;
 pub use credential_provider::S3CredentialProvider;
 use object_store::{ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConnector};
+use tokio::{runtime::Handle, sync::OnceCell, time::sleep};
 use url::Url;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
@@ -54,88 +56,94 @@ pub enum Error {
     ObjectStore { source: object_store::Error },
 }
 
+#[derive(Debug, snafu::Snafu)]
+pub enum LoadError {
+    #[snafu(display(
+        "Failed to resolve AWS credentials from the default provider chain: {source}. \
+         Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+    ))]
+    CredentialResolve { source: CredentialsError },
+
+    #[snafu(display("{message}"))]
+    Other { message: String },
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A cache that stores a value after it has been successfully produced once.
-///
-/// Unlike a standard `OnceLock`, this cache will retry initialization if the loader returns
-/// `None`, which makes it suitable for scenarios where a transient failure (such as a DNS outage)
-/// should not permanently poison the cache.
-pub(crate) struct RetryOnceCell<T> {
-    cell: OnceLock<T>,
-}
+static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
 
-impl<T> RetryOnceCell<T> {
-    pub(crate) const fn new() -> Self {
-        Self {
-            cell: OnceLock::new(),
-        }
+/// Returns the global SDK configuration, initializing it if necessary.
+///
+/// This function retries with Fibonacci backoff until credentials can be resolved successfully.
+/// If no credentials provider is configured, the function returns `Ok(None)` without retrying.
+///
+/// # Errors
+///
+/// Returns a [`LoadError`] if credential initialization continues to fail due to unrecoverable
+/// issues when communicating with the AWS credential provider.
+pub async fn get_or_init_sdk_config() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+    if let Some(cached) = SDK_CONFIG.get() {
+        return Ok(cached.clone());
     }
 
-    pub(crate) async fn get_or_try_init_cloned<F, Fut>(&self, loader: F) -> Option<T>
-    where
-        T: Send + Sync + Clone,
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Option<T>>,
-    {
-        if let Some(value) = self.cell.get() {
-            return Some(value.clone());
-        }
+    let value = SDK_CONFIG
+        .get_or_try_init(initialize_sdk_config_with_retry)
+        .await?;
 
-        if let Some(value) = loader().await {
-            match self.cell.set(value) {
-                Ok(()) => (),
-                Err(value) => drop(value),
+    Ok(value.clone())
+}
+
+/// Retrieves the cached SDK configuration if it has already been initialized.
+pub fn get_sdk_config() -> Option<Arc<SdkConfig>> {
+    SDK_CONFIG
+        .get()
+        .and_then(|value| value.as_ref().map(Arc::clone))
+}
+
+async fn initialize_sdk_config_with_retry() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError>
+{
+    retry_with_backoff(load_sdk_config_from_env).await
+}
+
+async fn retry_with_backoff<F, Fut, T>(mut attempt: F) -> std::result::Result<Option<T>, LoadError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Option<T>, LoadError>>,
+{
+    let mut backoff = FibonacciBackoffBuilder::new().build();
+
+    loop {
+        match attempt().await {
+            Ok(result @ Some(_)) => return Ok(result),
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                let delay = backoff
+                    .next_duration()
+                    .unwrap_or_else(|| Duration::from_secs(1));
+                tracing::warn!(
+                    "Failed to initialize AWS SDK credentials (retrying in {delay:?}): {err}"
+                );
+                sleep(delay).await;
             }
         }
-
-        self.cell.get().cloned()
-    }
-
-    pub(crate) fn get_cloned(&self) -> Option<T>
-    where
-        T: Send + Sync + Clone,
-    {
-        self.cell.get().cloned()
     }
 }
 
-static SDK_CONFIG_CACHE: LazyLock<RetryOnceCell<Arc<SdkConfig>>> =
-    LazyLock::new(RetryOnceCell::new);
-
-/// Initializes the global SDK configuration if it can provide credentials.
-pub async fn initialize_sdk_config() -> Option<Arc<SdkConfig>> {
-    SDK_CONFIG_CACHE
-        .get_or_try_init_cloned(load_sdk_config_from_env)
-        .await
-}
-
-/// Gets the initialized SDK configuration if available.
-pub fn get_sdk_config() -> Option<Arc<SdkConfig>> {
-    SDK_CONFIG_CACHE.get_cloned()
-}
-
-async fn load_sdk_config_from_env() -> Option<Arc<SdkConfig>> {
+async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
     let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
     if let Some(creds_provider) = sdk_config.credentials_provider() {
-        match creds_provider.provide_credentials().await {
-            Ok(_) => Some(Arc::new(sdk_config)),
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to resolve AWS credentials from the default provider chain: {err}. \
-                     Spice will retry credential initialization. \
-                     Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
-                );
-                None
-            }
-        }
+        creds_provider
+            .provide_credentials()
+            .await
+            .map(|_| Some(Arc::new(sdk_config)))
+            .map_err(|source| LoadError::CredentialResolve { source })
     } else {
         tracing::debug!(
             "No AWS credential provider detected in the default configuration. \
              Assuming unauthenticated access."
         );
-        None
+        Ok(None)
     }
 }
 
@@ -218,83 +226,69 @@ pub fn get_bucket_name(url: &Url) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Duration,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
-    use tokio::time::sleep;
+    use tokio::time::Duration;
     use url::Url;
 
-    #[tokio::test]
-    async fn retry_once_cell_retries_after_failure() {
-        let cache: RetryOnceCell<u32> = RetryOnceCell::new();
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_retries_until_success() {
         let attempts = Arc::new(AtomicUsize::new(0));
 
-        let first = cache
-            .get_or_try_init_cloned({
-                let attempts = Arc::clone(&attempts);
-                move || {
-                    let attempts = Arc::clone(&attempts);
-                    async move {
-                        attempts.fetch_add(1, Ordering::SeqCst);
-                        None
+        let attempts_clone = Arc::clone(&attempts);
+        let handle = tokio::spawn(async move {
+            retry_with_backoff(|| {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    let current = attempts.fetch_add(1, Ordering::SeqCst);
+                    if current < 2 {
+                        Err(LoadError::Other {
+                            message: "simulated failure".to_string(),
+                        })
+                    } else {
+                        Ok(Some(()))
                     }
                 }
             })
-            .await;
-        assert!(first.is_none());
+            .await
+        });
+
+        // Allow the first attempt to run.
+        tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
-        let second = cache
-            .get_or_try_init_cloned({
-                let attempts = Arc::clone(&attempts);
-                move || {
-                    let attempts = Arc::clone(&attempts);
-                    async move {
-                        attempts.fetch_add(1, Ordering::SeqCst);
-                        Some(42)
-                    }
-                }
-            })
-            .await;
-        assert_eq!(second, Some(42));
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        // Advance time to trigger the second retry.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
 
-        let third = cache
-            .get_or_try_init_cloned(|| async { unreachable!() })
-            .await;
-        assert_eq!(third, Some(42));
+        // Advance time again so the third attempt can succeed.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let outcome = handle
+            .await
+            .expect("task panicked")
+            .expect("retry loop failed");
+        assert_eq!(outcome, Some(()));
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
     }
 
-    #[tokio::test]
-    async fn retry_once_cell_allows_concurrent_initialization() {
-        let cache: Arc<RetryOnceCell<u32>> = Arc::new(RetryOnceCell::new());
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_returns_none_without_retry() {
         let attempts = Arc::new(AtomicUsize::new(0));
 
-        let loader = || {
+        let result = retry_with_backoff(|| {
             let attempts = Arc::clone(&attempts);
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                sleep(Duration::from_millis(10)).await;
-                Some(7)
+                Ok::<Option<()>, LoadError>(None)
             }
-        };
+        })
+        .await
+        .expect("retry loop failed");
 
-        let cache_clone = Arc::clone(&cache);
-        let loader_clone = loader;
-
-        let (a, b) = tokio::join!(
-            cache.get_or_try_init_cloned(loader),
-            cache_clone.get_or_try_init_cloned(loader_clone)
-        );
-
-        let attempt_count = attempts.load(Ordering::SeqCst);
-        assert!((1..=2).contains(&attempt_count));
-        assert_eq!(a, Some(7));
-        assert_eq!(b, Some(7));
+        assert!(result.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
