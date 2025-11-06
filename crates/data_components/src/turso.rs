@@ -1301,9 +1301,7 @@ impl SQLExecutor for TursoTableProvider {
         // Default to not federate if [`Self::function_support`] provided, otherwise true.
         self.function_support
             .as_ref()
-            .map(|func_supp| {
-                !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
-            })
+            .map(|func_supp| !contains_unsupported_functions(plan, func_supp).unwrap_or(false))
             .unwrap_or(true)
     }
 
