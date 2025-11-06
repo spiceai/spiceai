@@ -4499,7 +4499,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
- "datafusion-macros",
+ "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=41d08054e37e9cdca9b760c16fc2b97a21893af2)",
  "hex",
  "itertools 0.14.0",
  "log",
@@ -4523,7 +4523,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions-aggregate-common",
- "datafusion-macros",
+ "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=41d08054e37e9cdca9b760c16fc2b97a21893af2)",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "half",
@@ -4569,7 +4569,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-functions-aggregate",
  "datafusion-functions-aggregate-common",
- "datafusion-macros",
+ "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=41d08054e37e9cdca9b760c16fc2b97a21893af2)",
  "datafusion-physical-expr-common",
  "itertools 0.14.0",
  "log",
@@ -4601,7 +4601,7 @@ dependencies = [
  "datafusion-doc",
  "datafusion-expr",
  "datafusion-functions-window-common",
- "datafusion-macros",
+ "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=41d08054e37e9cdca9b760c16fc2b97a21893af2)",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "log",
@@ -4615,6 +4615,17 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=41d08054e37e9cdca9b7
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
+]
+
+[[package]]
+name = "datafusion-macros"
+version = "50.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec6f637bce95efac05cdfb9b6c19579ed4aa5f6b94d951cfa5bb054b7bb4f730"
+dependencies = [
+ "datafusion-expr",
+ "quote",
+ "syn 2.0.108",
 ]
 
 [[package]]
@@ -4826,6 +4837,27 @@ dependencies = [
  "object_store",
  "parking_lot 0.12.5",
  "tokio",
+]
+
+[[package]]
+name = "datafusion-spark"
+version = "50.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613efb6666a7d42fcb922b90cd0daa2b25ea486d141350e5d3e86e46df28309a"
+dependencies = [
+ "arrow",
+ "chrono",
+ "crc32fast",
+ "datafusion-catalog",
+ "datafusion-common",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-macros 50.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "log",
+ "sha1",
+ "url",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -12995,6 +13027,7 @@ dependencies = [
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
  "datafusion-proto",
+ "datafusion-spark",
  "datafusion-table-providers",
  "db_connection_pool",
  "dirs",
@@ -19046,6 +19079,12 @@ name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "xz2"
