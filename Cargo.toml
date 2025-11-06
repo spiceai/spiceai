@@ -139,6 +139,7 @@ datafusion-physical-expr-common = "50.3.0"
 datafusion-physical-plan = "50.3.0"
 datafusion-proto = { version = "50.3.0", features = ["json"] }
 datafusion-pruning = "50.3.0"
+datafusion-spark = "50.3.0"
 datafusion-table-providers = "0.1"
 delta_kernel = { version = "0.14", features = [
     "default-engine-rustls",
@@ -359,4 +360,3 @@ aws-smithy-async = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887
 # Note: Turso's bindings/rust/src/lib.rs defines #[global_allocator] which conflicts with spiced's allocator
 # We need to fork and remove the global allocator or patch it out
 turso = { git = "https://github.com/spiceai/turso", rev = "5c4d14d298869fe5ea296163b3241d6963a2e87d" }
-
