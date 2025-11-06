@@ -19,7 +19,7 @@ use std::{sync::Arc, time::Duration};
 
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
-use aws_sdk_s3::config::ProvideCredentials;
+use aws_sdk_s3::{config::ProvideCredentials, error::ConnectorError};
 use aws_smithy_runtime_api::client::runtime_components::BuildError;
 pub use credential_provider::S3CredentialProvider;
 use object_store::{ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConnector};
@@ -215,7 +215,30 @@ async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>
                 );
                 Ok(None)
             }
-            Err(source) => Err(LoadError::CredentialResolve { source }),
+            Err(err) => {
+                if let CredentialsError::ProviderError(_) = &err {
+                    use core::error::Error as StdError;
+                    if let Some(mut current) = err.source() {
+                        loop {
+                            if current.is::<ConnectorError>() {
+                                // Retry for `ConnectorError`s
+                                return Err(LoadError::CredentialResolve { source: err });
+                            }
+                            current = match current.source() {
+                                Some(src) => src,
+                                None => break,
+                            };
+                        }
+                    }
+
+                    Ok(None)
+                } else {
+                    tracing::warn!(
+                        "Non-retryable AWS credentials error, proceeding without authentication: {err}"
+                    );
+                    Ok(None)
+                }
+            }
         }
     } else {
         tracing::debug!(
