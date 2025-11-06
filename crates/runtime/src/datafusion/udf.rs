@@ -70,7 +70,4 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     }
 
     ctx.register_udf(digest_many::INSTANCE.clone());
-
-    let mut state = &*ctx.state_ref().write();
-    datafusion_spark::register_all(state);
 }
