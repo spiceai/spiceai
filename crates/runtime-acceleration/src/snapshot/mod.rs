@@ -1409,7 +1409,7 @@ async fn build_s3_object_store(
         {
             tracing::trace!("Using S3 credentials provider from SDK config");
             s3_builder = s3_builder.with_credentials(Arc::new(
-                S3CredentialProvider::from_config(sdk_config).context(EnvLoadSnafu)?,
+                S3CredentialProvider::from_config(sdk_config.as_ref()).context(EnvLoadSnafu)?,
             ));
         }
     }

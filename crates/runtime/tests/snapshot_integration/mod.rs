@@ -385,14 +385,13 @@ async fn build_snapshot_store() -> Result<Arc<dyn ObjectStore>> {
             builder = builder.with_token(token);
         }
     } else {
-        let sdk_config = initialize_sdk_config().await;
-        let Some(config) = sdk_config.as_ref() else {
+        let Some(config) = initialize_sdk_config().await else {
             return Err(anyhow!(
                 "AWS credentials are required to run snapshot integration tests. Provide AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET or configure AWS_PROFILE."
             ));
         };
         builder = builder.with_credentials(Arc::new(
-            S3CredentialProvider::from_config(config)
+            S3CredentialProvider::from_config(config.as_ref())
                 .context("Loading AWS credentials from environment")?,
         ));
     }

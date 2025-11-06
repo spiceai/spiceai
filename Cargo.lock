@@ -1295,6 +1295,7 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "tracing",
  "url",
 ]
 

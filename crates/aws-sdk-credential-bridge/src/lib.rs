@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 mod credential_provider;
-use std::sync::Arc;
-use tokio::{runtime::Handle, sync::OnceCell};
+use std::sync::{Arc, LazyLock, OnceLock};
+use tokio::runtime::Handle;
 
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_s3::config::ProvideCredentials;
@@ -56,30 +56,87 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-static SDK_CONFIG: OnceCell<Option<SdkConfig>> = OnceCell::const_new();
+/// A cache that stores a value after it has been successfully produced once.
+///
+/// Unlike a standard `OnceLock`, this cache will retry initialization if the loader returns
+/// `None`, which makes it suitable for scenarios where a transient failure (such as a DNS outage)
+/// should not permanently poison the cache.
+pub(crate) struct RetryOnceCell<T> {
+    cell: OnceLock<T>,
+}
+
+impl<T> RetryOnceCell<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+
+    pub(crate) async fn get_or_try_init_cloned<F, Fut>(&self, loader: F) -> Option<T>
+    where
+        T: Send + Sync + Clone,
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        if let Some(value) = self.cell.get() {
+            return Some(value.clone());
+        }
+
+        if let Some(value) = loader().await {
+            match self.cell.set(value) {
+                Ok(()) => (),
+                Err(value) => drop(value),
+            }
+        }
+
+        self.cell.get().cloned()
+    }
+
+    pub(crate) fn get_cloned(&self) -> Option<T>
+    where
+        T: Send + Sync + Clone,
+    {
+        self.cell.get().cloned()
+    }
+}
+
+static SDK_CONFIG_CACHE: LazyLock<RetryOnceCell<Arc<SdkConfig>>> =
+    LazyLock::new(RetryOnceCell::new);
 
 /// Initializes the global SDK configuration if it can provide credentials.
-pub async fn initialize_sdk_config() -> &'static Option<SdkConfig> {
-    SDK_CONFIG
-        .get_or_init(|| async {
-            let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-
-            if let Some(creds_provider) = sdk_config.credentials_provider() {
-                if creds_provider.provide_credentials().await.is_ok() {
-                    Some(sdk_config)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
+pub async fn initialize_sdk_config() -> Option<Arc<SdkConfig>> {
+    SDK_CONFIG_CACHE
+        .get_or_try_init_cloned(load_sdk_config_from_env)
         .await
 }
 
 /// Gets the initialized SDK configuration if available.
-pub fn get_sdk_config() -> Option<&'static SdkConfig> {
-    SDK_CONFIG.get().and_then(|opt| opt.as_ref())
+pub fn get_sdk_config() -> Option<Arc<SdkConfig>> {
+    SDK_CONFIG_CACHE.get_cloned()
+}
+
+async fn load_sdk_config_from_env() -> Option<Arc<SdkConfig>> {
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+
+    if let Some(creds_provider) = sdk_config.credentials_provider() {
+        match creds_provider.provide_credentials().await {
+            Ok(_) => Some(Arc::new(sdk_config)),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to resolve AWS credentials from the default provider chain: {err}. \
+                     Spice will retry credential initialization. \
+                     Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::debug!(
+            "No AWS credential provider detected in the default configuration. \
+             Assuming unauthenticated access."
+        );
+        None
+    }
 }
 
 /// Creates an `ObjectStore` from an S3 URL
@@ -161,7 +218,84 @@ pub fn get_bucket_name(url: &Url) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::time::sleep;
     use url::Url;
+
+    #[tokio::test]
+    async fn retry_once_cell_retries_after_failure() {
+        let cache: RetryOnceCell<u32> = RetryOnceCell::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let first = cache
+            .get_or_try_init_cloned({
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        None
+                    }
+                }
+            })
+            .await;
+        assert!(first.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let second = cache
+            .get_or_try_init_cloned({
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Some(42)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(second, Some(42));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let third = cache
+            .get_or_try_init_cloned(|| async { unreachable!() })
+            .await;
+        assert_eq!(third, Some(42));
+    }
+
+    #[tokio::test]
+    async fn retry_once_cell_allows_concurrent_initialization() {
+        let cache: Arc<RetryOnceCell<u32>> = Arc::new(RetryOnceCell::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let loader = || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(10)).await;
+                Some(7)
+            }
+        };
+
+        let cache_clone = Arc::clone(&cache);
+        let loader_clone = loader;
+
+        let (a, b) = tokio::join!(
+            cache.get_or_try_init_cloned(loader),
+            cache_clone.get_or_try_init_cloned(loader_clone)
+        );
+
+        let attempt_count = attempts.load(Ordering::SeqCst);
+        assert!((1..=2).contains(&attempt_count));
+        assert_eq!(a, Some(7));
+        assert_eq!(b, Some(7));
+    }
 
     #[test]
     fn test_get_bucket_name_valid() {

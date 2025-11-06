@@ -130,7 +130,7 @@ impl SpiceObjectStoreRegistry {
                 if sdk_config.credentials_provider().is_some() {
                     tracing::trace!("Using S3 credentials provider from SDK config");
                     s3_builder = s3_builder.with_credentials(Arc::new(
-                        S3CredentialProvider::from_config(sdk_config).map_err(|e| {
+                        S3CredentialProvider::from_config(sdk_config.as_ref()).map_err(|e| {
                             object_store::Error::Generic {
                                 store: "S3",
                                 source: e.into(),
