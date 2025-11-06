@@ -16,7 +16,7 @@ limitations under the License.
 
 use aws_config::Region;
 use aws_credential_types::Credentials;
-use runtime::dataconnector::parameters::aws::default_aws_config;
+use aws_sdk_credential_bridge::default_aws_config;
 use s3_vectors::Client;
 use serde_json::json;
 use snafu::ResultExt;

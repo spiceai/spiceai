@@ -41,9 +41,7 @@ use iceberg::io::{
 use object_store::{CredentialProvider, aws::AwsCredential as ObjectStoreAwsCredential};
 use snafu::prelude::*;
 
-use crate::{
-    Error, FailedToBuildAWSRuntimeComponentsSnafu, FailedToResolveIcebergCredentialsSnafu, Result,
-};
+use crate::{Error, FailedToBuildAWSRuntimeComponentsSnafu, Result};
 
 #[derive(Debug)]
 pub struct S3CredentialProvider {
@@ -128,19 +126,19 @@ impl AwsCredentialLoad for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
-            .inspect_err(|err| {
+            .map_err(|err| {
                 tracing::error!(
                     error = %err,
-                    "Failed to resolve AWS credentials from identity cache for Iceberg"
+                    "Failed to resolve AWS credentials from identity cache"
                 );
-            })
-            .context(FailedToResolveIcebergCredentialsSnafu)?;
+                anyhow::Error::msg(format!(
+                    "Failed to find valid credentials from the AWS credential provider chain for the S3 connection: {err}. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+                ))
+            })?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
-            tracing::error!("Resolved identity does not contain AWS credentials for Iceberg");
-            Error::FailedToResolveIcebergCredentials {
-                source: "No valid credentials found in resolved identity".into(),
-            }
+            tracing::error!("Resolved identity does not contain AWS credentials");
+            anyhow::Error::msg("Failed to find valid credentials from the AWS credential provider chain for the S3 connection. The resolved identity does not contain credential data. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain")
         })?;
 
         Ok(Some(IcebergAwsCredential {
@@ -174,11 +172,7 @@ impl CredentialProvider for S3CredentialProvider {
                 );
                 object_store::Error::Generic {
                     store: "S3",
-                    source: format!(
-                        "Failed to find valid credentials from the AWS credential provider chain for the S3 connection: {err}. \
-                         Ensure that valid AWS credentials are provided in the environment. \
-                         Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
-                    ).into(),
+                    source: format!("Failed to find valid credentials from the AWS credential provider chain for the S3 connection: {err}. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain").into(),
                 }
             })?;
 
@@ -186,10 +180,7 @@ impl CredentialProvider for S3CredentialProvider {
             tracing::error!("Resolved identity does not contain AWS credentials");
             object_store::Error::Generic {
                 store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. \
-                         The resolved identity does not contain credential data. \
-                         Ensure that valid AWS credentials are provided in the environment. \
-                         Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. The resolved identity does not contain credential data. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             }
         })?;
 

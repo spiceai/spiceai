@@ -39,13 +39,6 @@ pub enum Error {
     ))]
     FailedToGetCredentialsProviderFromConfig,
 
-    #[snafu(display(
-        "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. {source} Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
-    ))]
-    FailedToResolveIcebergCredentials {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Not an S3 URL: {url}"))]
     NotAnS3Url { url: String },
 
