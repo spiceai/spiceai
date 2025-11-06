@@ -138,7 +138,7 @@ impl AwsCredentialLoad for S3CredentialProvider {
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
             tracing::error!("Resolved identity does not contain AWS credentials");
-            anyhow::Error::msg("Failed to find valid credentials from the AWS credential provider chain for the S3 connection. The resolved identity does not contain credential data. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain")
+            anyhow::Error::msg("Failed to find valid credentials from the AWS credential provider chain for the S3 connection. The resolved identity does not contain credential data. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-provider-chain")
         })?;
 
         Ok(Some(IcebergAwsCredential {

@@ -466,19 +466,14 @@ impl DataConnectorFactory for DatabricksFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
+            let param_map = params.parameters.to_secret_map();
             Box::pin(async move {
-                // Initialize AWS SDK credentials only if using IAM role authentication.
-                // Skip if explicit AWS credentials are provided.
-                let has_explicit_key = params.parameters.get("aws_access_key_id").ok().is_some();
-                let has_explicit_secret = params
-                    .parameters
-                    .get("aws_secret_access_key")
-                    .ok()
-                    .is_some();
-
-                if !has_explicit_key
-                    && !has_explicit_secret
-                    && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                // Initialize AWS SDK credentials if not using explicit credentials
+                if !aws_sdk_credential_bridge::has_explicit_credentials(
+                    &param_map,
+                    "aws_access_key_id",
+                    "aws_secret_access_key",
+                ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
                 {
                     tracing::warn!(
                         "Unable to initialize AWS credentials for Databricks connector: {err}"
