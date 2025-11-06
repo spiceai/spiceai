@@ -145,13 +145,13 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         );
 
         match args.max_concurrent {
-            Some(max_parallel) => {
-                // Dispatch workflow while waiting for an available slot, limiting to max_parallel concurrent runs
+            Some(max_concurrent) => {
+                // Dispatch workflow while waiting for an available slot, limiting to max_concurrent parallel runs
                 dispatch_workflow_with_concurrency(
                     workflow,
                     &octo_client,
                     Some(payload),
-                    max_parallel,
+                    max_concurrent,
                 )
                 .await?;
             }
@@ -172,20 +172,20 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
 /// Dispatches the workflow, waiting until the number of active runs is below the limit
 /// or until the 30 minutes max wait time expires.
 ///
-/// - `max_parallel`: maximum number of active runs allowed
+/// - `max_concurrent`: maximum number of active runs allowed
 async fn dispatch_workflow_with_concurrency(
     workflow: GitHubWorkflow,
     octo: &Octocrab,
     input: Option<serde_json::Value>,
-    max_parallel: usize,
+    max_concurrent: usize,
 ) -> Result<()> {
     println!(
-        "Checking for available slot to run workflow (limit: {max_parallel} concurrent runs)..."
+        "Checking for available slot to run workflow (limit: {max_concurrent} concurrent runs)..."
     );
     if let Err(err) = wait_for_slot(
         &workflow,
         octo,
-        max_parallel,
+        max_concurrent,
         Duration::from_secs(1800), // 30 mins
     )
     .await
@@ -200,18 +200,18 @@ async fn dispatch_workflow_with_concurrency(
 /// or until the timeout expires.
 ///
 /// This is used to limit the number of concurrent workflow runs on GitHub Actions.
-/// - `max_parallel`: maximum number of active runs allowed
+/// - `max_concurrent`: maximum number of active runs allowed
 async fn wait_for_slot(
     workflow: &GitHubWorkflow,
     octo: &Octocrab,
-    max_parallel: usize,
+    max_concurrent: usize,
     timeout: Duration,
 ) -> Result<()> {
     let start_time = std::time::Instant::now();
 
     loop {
         let num_active = workflow.active_runs_count(octo).await?;
-        if num_active < max_parallel {
+        if num_active < max_concurrent {
             break;
         }
 
@@ -225,7 +225,7 @@ async fn wait_for_slot(
 
         let remaining_time = timeout.saturating_sub(start_time.elapsed());
         println!(
-            "🕒 {num_active} run(s) already active — waiting for slot (<{max_parallel}) ... ({} seconds remaining)",
+            "🕒 {num_active} run(s) already active — waiting for slot (<{max_concurrent}) ... ({} seconds remaining)",
             remaining_time.as_secs()
         );
 
