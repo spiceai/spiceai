@@ -22,6 +22,7 @@ use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
 use datafusion::functions::math::random::RandomFunc;
+use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::ai;
@@ -81,23 +82,32 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
 
 /// Create a [`FunctionSupport`] with all spice specific functions as unsupported for federation.
 pub fn deny_spice_specific_functions() -> FunctionSupport {
+    let builtin = [
+        "rand",
+        BUCKET_SCALAR_UDF_NAME,
+        COSINE_DISTANCE_UDF_NAME,
+        TRUNCATE_SCALAR_UDF_NAME,
+        EMBED_UDF_NAME,
+        #[cfg(feature = "models")]
+        AI_UDF_NAME,
+        DIGEST_UDF_NAME,
+    ];
+
     FunctionSupport::new(
         Some(FunctionRestriction::Deny(
-            [
-                "rand",
-                BUCKET_SCALAR_UDF_NAME,
-                COSINE_DISTANCE_UDF_NAME,
-                TRUNCATE_SCALAR_UDF_NAME,
-                EMBED_UDF_NAME,
-                #[cfg(feature = "models")]
-                AI_UDF_NAME,
-                DIGEST_UDF_NAME,
-            ]
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
+            builtin
+                .iter()
+                .map(ToString::to_string)
+                .chain(json_functions())
+                .collect::<Vec<_>>(),
         )),
         None,
         None,
     )
+}
+
+fn json_functions() -> Vec<String> {
+    let mut ctx = SessionContext::new();
+    let _ = datafusion_functions_json::register_all(&mut ctx);
+    ctx.state().scalar_functions().keys().cloned().collect()
 }
