@@ -11,6 +11,10 @@ version.workspace = true
 [dependencies]
 datafusion.workspace = true
 datafusion-expr.workspace = true
+datafusion-table-providers.workspace = true
+r2d2.workspace = true
+duckdb.workspace = true
+tokio.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

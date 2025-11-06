@@ -47,6 +47,7 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,

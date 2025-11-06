@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use datafusion::execution::SessionStateBuilder;
 use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
@@ -73,7 +74,7 @@ use crate::datafusion::{
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
-
+use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
 use super::managed_runtime;
 use managed_runtime::ManagedRuntimeError;
 
@@ -245,7 +246,9 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.get_session_state()?;
+            let mut session = SessionStateBuilder::new_from_existing(self.get_session_state()?)
+                .with_physical_optimizer_rule(DuckDBIntermediateIndexMaterializationOptimizer::new(Arc::clone(&self.df.ctx)))
+                .build();
 
             let ctx = self;
             let tracker = ctx.tracker;

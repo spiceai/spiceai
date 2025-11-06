@@ -276,13 +276,13 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::datafusion::cluster::common::plan_node_key::PlanNodeKey;
-    use crate::datafusion::cluster::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
+    use datafusion_optimizer_rules::common::plan_node_key::PlanNodeKey;
+    use datafusion_optimizer_rules::common::search_visitor::SearchVisitor;
     use object_store::ObjectMeta;
     use object_store::path::Path;
     use std::sync::LazyLock;
