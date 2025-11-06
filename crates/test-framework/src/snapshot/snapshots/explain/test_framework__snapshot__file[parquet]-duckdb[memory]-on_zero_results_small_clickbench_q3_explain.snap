@@ -13,9 +13,9 @@ description: "Query: clickbench_q3"
 |               |   AggregateExec: mode=Final, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                                    |
 |               |     CoalescePartitionsExec                                                                                                                                       |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                              |
-|               |         BytesProcessedExec                                                                                                                                       |
-|               |           SchemaCastScanExec                                                                                                                                     |
-|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                    |
+|               |           BytesProcessedExec                                                                                                                                     |
+|               |             SchemaCastScanExec                                                                                                                                   |
 |               |               FallbackOnZeroResultsScanExec                                                                                                                      |
 |               |                 CoalescePartitionsExec                                                                                                                           |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                          |
