@@ -2,4 +2,5 @@
 {
   "rust-analyzer.cargo.features": [],
   "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"],
+  "yaml.format.singleQuote": true
 }
