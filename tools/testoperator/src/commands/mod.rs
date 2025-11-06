@@ -68,7 +68,7 @@ pub(crate) async fn get_app_and_start_request(
     // If scrape_spiced_metrics is enabled, add --metrics flag to spiced
     if args.scrape_spiced_metrics {
         start_request = start_request
-            .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:3000".to_string()]);
+            .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:9090".to_string()]);
     }
 
     Ok((app, start_request))

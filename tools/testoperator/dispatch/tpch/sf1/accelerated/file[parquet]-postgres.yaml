@@ -13,7 +13,6 @@ tests:
     runner_type: spiceai-dev-runners
     ready_wait: 600
   load:
-    scrape_spiced_metrics: true
     spicepod_path: accelerated/file[parquet]-postgres.yaml
     query_set: tpch
     query_overrides: postgresql

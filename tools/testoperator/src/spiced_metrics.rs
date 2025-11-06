@@ -69,7 +69,13 @@ impl SpicedMetrics {
             .filter(|s| s.metric_type == MetricType::Gauge)
             .map(|s| s.value)
             .filter(|v| !v.is_nan()) // Filter out NaN values to avoid incorrect comparisons
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                // partial_cmp returns Some for all non-NaN f64 values, and NaN values are filtered out above
+                match a.partial_cmp(b) {
+                    Some(ordering) => ordering,
+                    None => unreachable!("partial_cmp should succeed for non-NaN f64 values"),
+                }
+            })
     }
 
     /// Get the average value for a gauge metric
@@ -81,6 +87,7 @@ impl SpicedMetrics {
             .iter()
             .filter(|s| s.metric_type == MetricType::Gauge)
             .map(|s| s.value)
+            .filter(|v| !v.is_nan()) // Filter out NaN values to avoid corrupting the average
             .collect();
 
         if samples.is_empty() {
@@ -138,12 +145,15 @@ impl MetricsScraper {
                                         .push(sample);
                                 }
                             }
+                            #[cfg(debug_assertions)]
                             Err(e) => {
                                 // Log transient scraping errors to aid troubleshooting
                                 // Using eprintln for debug output to stderr
-                                #[cfg(debug_assertions)]
                                 eprintln!("Debug: Failed to scrape metrics: {e}");
-                                let _ = e; // Suppress unused variable warning in release builds
+                            }
+                            #[cfg(not(debug_assertions))]
+                            Err(_) => {
+                                // Silently ignore in release builds
                             }
                         }
                     }

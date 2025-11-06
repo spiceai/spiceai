@@ -10,7 +10,6 @@ tests:
     runner_type: spiceai-dev-large-runners
     ready_wait: 300
   load:
-    scrape_spiced_metrics: true
     spicepod_path: accelerated/databricks[delta_lake]-arrow.yaml
     query_set: tpcds
     runner_type: spiceai-dev-large-runners

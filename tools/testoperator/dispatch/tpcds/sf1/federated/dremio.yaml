@@ -10,7 +10,6 @@ tests:
     query_overrides: dremio
     runner_type: spiceai-dev-runners
   load:
-    scrape_spiced_metrics: true
     spicepod_path: federated/dremio.yaml
     query_set: tpcds
     query_overrides: dremio

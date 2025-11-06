@@ -8,7 +8,6 @@ tests:
     query_set: tpcds
     runner_type: spiceai-dev-large-runners
   load:
-    scrape_spiced_metrics: true
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds
     runner_type: spiceai-dev-large-runners
