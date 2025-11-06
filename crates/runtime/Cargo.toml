@@ -53,6 +53,7 @@ datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true, optional = true }
+datafusion-spark.workspace = true
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
