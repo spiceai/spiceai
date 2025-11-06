@@ -127,12 +127,13 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 .ok()
                 .is_some();
 
-            if !has_explicit_key && !has_explicit_secret {
-                if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
-                    tracing::warn!(
-                        "Unable to initialize AWS credentials for Delta Lake connector: {err}"
-                    );
-                }
+            if !has_explicit_key
+                && !has_explicit_secret
+                && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+            {
+                tracing::warn!(
+                    "Unable to initialize AWS credentials for Delta Lake connector: {err}"
+                );
             }
 
             let delta = DeltaLake::new(params.parameters, params.io_runtime);

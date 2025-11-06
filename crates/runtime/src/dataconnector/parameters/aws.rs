@@ -228,8 +228,8 @@ pub async fn initiate_config_with_credentials(
         .ok()
         .map(ToString::to_string);
 
-    Ok(match (access_key_id, secret_access_key) {
-        (Some(access_key_id), Some(secret_access_key)) => {
+    Ok(
+        if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
             let credentials = Credentials::new(
                 access_key_id,
                 secret_access_key,
@@ -241,14 +241,13 @@ pub async fn initiate_config_with_credentials(
             default_aws_config()
                 .region(Region::new(region))
                 .credentials_provider(credentials)
-        }
-        _ => {
+        } else {
             // Initialize AWS SDK credentials for IAM role authentication.
             // This will automatically load credentials from the environment or IAM roles.
             if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
                 tracing::warn!("Unable to initialize AWS credentials for {provider_name}: {err}");
             }
             default_aws_config().region(Region::new(region))
-        }
-    })
+        },
+    )
 }

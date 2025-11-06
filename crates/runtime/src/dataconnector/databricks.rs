@@ -476,12 +476,13 @@ impl DataConnectorFactory for DatabricksFactory {
                     .ok()
                     .is_some();
 
-                if !has_explicit_key && !has_explicit_secret {
-                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
-                        tracing::warn!(
-                            "Unable to initialize AWS credentials for Databricks connector: {err}"
-                        );
-                    }
+                if !has_explicit_key
+                    && !has_explicit_secret
+                    && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                {
+                    tracing::warn!(
+                        "Unable to initialize AWS credentials for Databricks connector: {err}"
+                    );
                 }
 
                 let databricks = Databricks::new(
