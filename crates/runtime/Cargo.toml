@@ -9,7 +9,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ahash.workspace = true
 app = { path = "../app" }
 arrow.workspace = true
 arrow-csv.workspace = true
@@ -17,7 +16,6 @@ arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc.workspace = true
 arrow-json.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
-arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
 async-stream.workspace = true
@@ -30,7 +28,6 @@ aws-sdk-glue.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
-ballista = { workspace = true, optional = true }
 ballista-core = { workspace = true, optional = true }
 ballista-executor = { workspace = true, optional = true }
 ballista-scheduler = { workspace = true, optional = true }
@@ -38,12 +35,11 @@ base64.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
-chrono = { version = "0.4.42" }
+chrono.workspace = true
 chunking = { path = "../chunking" }
 clap.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 csv = "1.3.0"
-dashmap = "6.1.0"
 data_components = { path = "../data_components" }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
@@ -107,7 +103,6 @@ percent-encoding.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true
-prometheus-parse = "0.2.5"
 prost = { version = "0.13.1", default-features = false, features = [
     "prost-derive",
 ] }
@@ -151,7 +146,6 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 strsim = { version = "0.11.1", optional = true }
-tantivy.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
@@ -169,10 +163,9 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
-tract-core = "0.22.0"
+tract-core.workspace = true
 turso = { workspace = true, optional = true }
-twox-hash = { workspace = true, optional = true }
-url = "2.5.4"
+url.workspace = true
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = ">=8.1.1", features = [
@@ -184,7 +177,7 @@ workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [dev-dependencies]
-anyhow = "1.0.99"
+anyhow.workspace = true
 async-graphql = "7.0.16"
 async-graphql-axum = "7.0.16"
 azure_core = "0.28.0"
@@ -220,11 +213,9 @@ bedrock = ["dep:aws-config"]
 clickhouse = [
     "dep:clickhouse-rs",
     "db_connection_pool/clickhouse",
-    "arrow_sql_gen/clickhouse",
     "data_components/clickhouse",
 ]
 cluster = [
-    "dep:ballista",
     "dep:ballista-core",
     "dep:ballista-scheduler",
     "dep:ballista-executor",
@@ -296,7 +287,7 @@ turso = [
     "dep:rusqlite",
 ]
 vortex = ["dep:vortex-datafusion", "dep:vortex"]
-xxhash = ["dep:twox-hash", "cache/xxhash"]
+xxhash = ["cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }

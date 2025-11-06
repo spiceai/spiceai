@@ -25,10 +25,7 @@ prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-async = { path = "../../crates/runtime-async" }
-runtime-auth = { path = "../../crates/runtime-auth" }
 rustls.workspace = true
-rustls-pemfile.workspace = true
-serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
 snmalloc-rs = { version = "0.3.6" }
@@ -82,7 +79,7 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso"
+    "turso",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -107,10 +104,10 @@ postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []
 sharepoint = ["runtime/sharepoint"]
-snowflake = ["runtime/snowflake"]
 snapshots = ["runtime/snapshots"]
+snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
-turso = ["runtime/turso"]
 tpc-extension = ["dep:tpc-extension"]
+turso = ["runtime/turso"]
 xxhash = ["runtime/xxhash"]
