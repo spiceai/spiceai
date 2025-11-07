@@ -1,7 +1,7 @@
 ---
-name: HotFix
+name: Hotfix
 about: Ship a hotfix release for Spice.ai Open Source!
-title: 'v1.x.x HotFix'
+title: 'v1.x.x Hotfix'
 labels: 'kind/hotfix'
 assignees: ''
 ---
