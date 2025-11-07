@@ -2,53 +2,35 @@
 
 ## Project Overview
 
-Spice is a SQL query, search, and LLM-inference engine written in Rust for data apps and agents. It provides federated SQL querying, data acceleration/materialization, search (vector, keyword, full-text), and AI inference through industry-standard APIs.
+Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and agents. Provides federated SQL querying, data acceleration/materialization, search (vector, keyword, full-text), and AI inference via industry-standard APIs.
 
-**Architecture**: Hybrid Go (CLI: `bin/spice`) + Rust (runtime daemon: `bin/spiced`). The runtime is built on Apache DataFusion, Arrow, and DuckDB.
+**Architecture**: Go CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
 
 **Core Principle**: Developer Experience First — Bring data and AI/ML to your application, not the other way around.
 
 ### Runtime Architecture - Separate Tokio Runtimes
 
-The Spice runtime uses **separate Tokio runtime instances** for different concerns:
+**Separate runtime instances for:**
 
-- **HTTP Server Runtime**: Dedicated runtime for the HTTP API server (health checks, query endpoints, etc.)
-- **Query Processing Runtime**: Main DataFusion runtime for query planning and execution
+- **HTTP Server**: Health checks, query endpoints (must stay responsive)
+- **Query Processing**: DataFusion planning and execution (CPU/IO intensive)
 
-**Why this matters**: DataFusion by default plans and executes all operations (CPU and IO) on the same thread pool. This can cause tail latency issues where large queries block the HTTP server, causing health check failures and Kubernetes pod restarts. By isolating the HTTP server on its own runtime, health checks remain responsive even under heavy query load.
+**Why**: DataFusion uses one thread pool for all operations. Large queries can block HTTP server, causing K8s health check failures. Separate runtimes isolate concerns.
 
-**Implementation Notes**:
+**Rules**: Never share runtime handles; HTTP endpoints (especially `/health`) must respond quickly regardless of query load.
 
-- Do not share runtime handles between HTTP server and query processing
-- HTTP endpoints (especially `/health`) must respond quickly regardless of query load
-- Long-running queries should not block HTTP request handling
+**References**: [DataFusion Thread Pools](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/thread_pools.rs#L18), [Thread Scheduling](https://docs.rs/datafusion/latest/datafusion/index.html#thread-scheduling-cpu--io-thread-pools-and-tokio-runtimes)
 
-**References**:
-
-- [DataFusion Thread Pools Example](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/thread_pools.rs#L18)
-- [DataFusion Thread Scheduling Docs](https://docs.rs/datafusion/latest/datafusion/index.html#thread-scheduling-cpu--io-thread-pools-and-tokio-runtimes)
-- [Using Tokio for CPU-Bound Tasks](https://thenewstack.io/using-rustlangs-async-tokio-runtime-for-cpu-bound-tasks/)
-
-## Essential Build & Test Commands
+## Build & Test Commands
 
 ```bash
-# Build everything (release mode)
-make install
+make install            # Release build
+make install-dev        # Dev build (faster)
+SPICED_CUSTOM_FEATURES="postgres sqlite" make build-runtime  # Custom features
 
-# Build in dev mode (faster compilation)
-make install-dev
-
-# Build with custom features (important for lightweight builds)
-SPICED_CUSTOM_FEATURES="postgres sqlite" make build-runtime
-
-# Run linting (auto-fix Rust issues)
-make lint-rust-fix
-make lint  # Check without fixing
-
-# Run tests
-make test                    # Unit tests (cargo test --all --lib)
-make test-integration        # Integration tests (requires .env or spice login)
-make test-integration-models # Model integration tests
+make lint-rust-fix      # Auto-fix Rust issues
+make test               # Unit tests
+make test-integration   # Integration tests (needs .env or spice login)
 
 # Benchmarks with testoperator
 cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate
@@ -58,13 +40,12 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 
 ### Error Handling (CRITICAL)
 
-- **Use SNAFU for all errors**: Derive `Snafu` and `Debug` on error enums
-- **NO `.unwrap()` or `.expect()` in non-test code**: Use proper error handling with `?` operator or `match`
-- **NO `.unwrap()` in test code**: All Result unwraps that are not handled with `?` in tests should use `.expect()` with a sensible message instead
-- **Use `unreachable!()` for truly impossible cases**: Only when you can prove a case is logically impossible
-- **Use `ensure!` macro**: Preferred over manual `if` + `return Err`
-- **Define errors in originating module**: Keep `Error` enum with the code that uses it
-- **Always define `Result` type alias**: `pub type Result<T, E = Error> = std::result::Result<T, E>;`
+- **Use SNAFU**: Derive `Snafu` and `Debug` on error enums
+- **NO `.unwrap()`/`.expect()` in non-test code**: Use `?` operator or `match`
+- **In tests**: Use `.expect("descriptive message")` instead of `.unwrap()`
+- **Use `unreachable!()`**: Only for provably impossible cases
+- **Use `ensure!` macro**: Preferred over `if` + `return Err`
+- **Define `Result` type alias**: `pub type Result<T, E = Error> = std::result::Result<T, E>;`
 
 ```rust
 // GOOD
@@ -73,368 +54,318 @@ pub enum Error {
     #[snafu(display("Failed to connect to {connector}: {source}"))]
     ConnectionFailed { connector: String, source: std::io::Error },
 }
-
 ensure!(!data.is_empty(), DataEmptySnafu);
-
-// GOOD - proper error handling
 let value = option.context(ValueMissingSnafu)?;
 
-// GOOD - for logically impossible cases with proof
-let value = match state {
-    State::Initialized(v) => v,
-    _ => unreachable!("state is always Initialized after init() completes"),
-};
-
-// BAD - avoid unwrap and expect
-let value = option.unwrap();
-let value = option.expect("value must be present");
-
-// GOOD - use expect in tests
+// Tests only
 #[cfg(test)]
-mod tests {
-  #[test]
-  fn test_thing() {
-    let value = option.expect("value must be present");
-  }
+fn test() { let value = option.expect("descriptive message"); }
+```
+
+### Logging & Streams (CRITICAL)
+
+- **Use `tracing::`** not `log::` (tracing::info!, tracing::error!, etc.)
+- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug
+
+### Async/Blocking (CRITICAL)
+
+**Rule**: Async code must reach `.await` within 10-100 microseconds.
+
+**Never block async runtime**:
+
+- ❌ `std::thread::sleep`/`std::fs`/blocking DB → ✅ `tokio::time::sleep`/`tokio::fs`/async pools
+
+**Handling blocking operations**:
+
+1. **Blocking I/O**: `tokio::task::spawn_blocking(move || { /* sync code */ }).await?`
+2. **CPU-bound**: Use `rayon::spawn()` with `oneshot::channel()` for result
+3. **Background tasks**: `std::thread::spawn()`
+
+### Clippy (Enforced in CI)
+
+**Errors**: `clippy::pedantic`, `clippy::unwrap_used`, `clippy::expect_used`, `clippy::clone_on_ref_ptr`  
+**Allowed**: `clippy::module_name_repetitions`, `clippy::large_futures`
+
+## Performance & Memory (CRITICAL)
+
+### Zero-Copy Operations
+
+- **Prefer zero-copy** with Arrow arrays: avoid `.to_data()`, `.clone()`, conversions
+- **Use `Arc<dyn Array>`** for type-erased arrays (cheap clone, shares buffers)
+- **Use `RecordBatch::slice()`** instead of filtering/copying
+- **Prefer `ArrayRef`** in function signatures over owned arrays
+
+```rust
+// GOOD
+let subset = batch.slice(offset, length);  // Shares buffers
+let int_array = array.as_any().downcast_ref::<Int32Array>()?;
+let shared: ArrayRef = Arc::clone(&array);  // Just refcount++
+
+// BAD
+let values: Vec<i32> = array.values().iter().copied().collect();  // Avoid
+```
+
+### SIMD & Hardware Acceleration
+
+- **Let Arrow/DataFusion handle SIMD**: Auto-vectorizes for arm64/amd64
+- **Use `arrow::compute::*` kernels**: SIMD-optimized (add, filter, cast, etc.)
+- **Structure loops for auto-vectorization**: Cache-aligned chunks (64 bytes), no branches in tight loops, use `slice::chunks_exact()`
+- **Vortex arrays**: For compressed data when memory >> compute cost
+- **Apple Metal**: Consider DataFusion::gpu extensions for macOS/iOS
+
+```rust
+// GOOD - Arrow kernels
+use arrow::compute::add;
+let result = add(&left_array, &right_array)?;
+
+// GOOD - auto-vectorizable
+let sum: i64 = int_array.values().iter().map(|&v| i64::from(v)).sum();
+
+// BAD - manual loop when kernel exists
+for i in 0..array.len() { result.push(array.value(i) + other.value(i)); }
+```
+
+### Architecture-Specific
+
+- **arm64** (Apple Silicon, Graviton): NEON SIMD auto-enabled
+- **amd64** (Intel/AMD): AVX2/AVX-512 when available
+- **Production builds**: `RUSTFLAGS="-C target-cpu=native" cargo build --release`
+- **Distributed binaries**: Default build (runtime CPU detection)
+
+### DataFusion Query Performance
+
+- **Partition data**: Align with CPU core count
+- **Use `ParquetExec` directly**: Pushes down filters/projections
+- **Keep streaming**: Don't collect streams early (`RecordBatchStream`)
+- **Enable predicate pushdown**: Implement `TableProvider::supports_filters_pushdown`
+- **Batch sizing**: Default 8192 rows is cache-friendly
+
+```rust
+// GOOD - streaming
+let stream = table_provider.scan(...).await?;
+while let Some(batch) = stream.next().await { process_batch(batch?)?; }
+
+// BAD - materializes entire dataset (OOM risk)
+let all_batches: Vec<RecordBatch> = stream.try_collect().await?;
+```
+
+### Allocation Minimization
+
+- **Reuse buffers**: `String::clear()`, `Vec::clear()` to keep capacity
+- **Prefer `&str`/`&[T]`** in signatures over `String`/`Vec<T>`
+- **Use `Cow<str>`**: When ownership might be needed but often isn't
+- **Avoid intermediate collections**: Use iterators, collect only at end
+- **Use `SmallVec`**: For small, stack-allocated vectors
+- **Pre-allocate**: `Vec::with_capacity()`, array builders with hints
+
+```rust
+// GOOD - reuse buffer
+let mut buffer = String::with_capacity(1024);
+for item in items {
+    buffer.clear();  // Keeps capacity
+    write!(&mut buffer, "{}", item)?;
+}
+
+// GOOD - zero allocations
+let sum: i64 = values.iter().filter(|&&x| x > 0).map(|&x| i64::from(x)).sum();
+
+// BAD
+for item in items { let buffer = format!("{}", item); }  // Allocs every iteration
+```
+
+### Fine-Grained Locking
+
+- **Lock `Arc` contents**: Use `Arc<RwLock<T>>`, not `Arc<RwLock<EntireStruct>>`
+- **Prefer `RwLock`**: When reads >> writes (common in query engines)
+- **Minimize lock scopes**: Drop locks ASAP with explicit scopes
+- **Use `parking_lot`**: Faster than std locks (already in deps)
+- **Never hold locks across `.await`**: Causes deadlocks/stalls
+- **Use lock-free**: `Arc<AtomicU64>`, `dashmap::DashMap` when possible
+- **Partition data**: Shard by key to reduce contention
+- **Document lock ordering**: Prevent deadlocks
+
+```rust
+use parking_lot::RwLock;
+use std::sync::Arc;
+
+// GOOD - fine-grained
+struct Cache {
+    entries: Arc<RwLock<HashMap<String, Data>>>,
+    stats: Arc<AtomicU64>,  // Separate lock-free counter
+}
+
+async fn get(&self, key: &str) -> Option<Data> {
+    let data = { self.entries.read().get(key).cloned() };  // Lock dropped
+    self.stats.fetch_add(1, Ordering::Relaxed);
+    data
+}
+
+// GOOD - DashMap (no single lock)
+let cache: Arc<DashMap<String, Data>> = Arc::new(DashMap::new());
+
+// BAD - lock across await
+async fn bad(&self) {
+    let data = self.data.lock();
+    some_async_op().await;  // Still holding lock!
 }
 ```
 
-**Note**: In test code, `.expect()` with descriptive messages is preferred over `.unwrap()` since test failures should panic with clear context.
+### Connection Pooling & Arc Cloning
 
-### Stream Handling (CRITICAL)
-
-- **AVOID `stream!` macro**: Breaks rust-analyzer IDE hints and makes debugging harder
-- **Use manual Stream implementations or `async_stream::stream` sparingly**: When unavoidable, document why
-
-### Logging (CRITICAL)
-
-- **Use `tracing::` for logging**: Use `tracing::info!`, `tracing::error!`, `tracing::debug!`, etc.
-- **DO NOT use `log::`**: The project uses `tracing` crate, not `log` crate
+- **Always use pools**: Pool creation never fails, errors only on `.get()`
+- **Use `deadpool`/`r2d2`**: For async/sync respectively
+- **Avoid unnecessary Arc clones**: Prefer `&Arc<T>` if no ownership needed
 
 ```rust
-// GOOD
-tracing::info!("Starting runtime");
-tracing::error!("Failed to connect: {}", error);
-
-// BAD - don't use log crate
-log::info!("Starting runtime");
-```
-
-### Async/Blocking Patterns (CRITICAL)
-
-**Rule**: Async code should never spend a long time without reaching an `.await`.
-
-- **Target**: No more than 10-100 microseconds between `.await` points
-- **NEVER use blocking operations in async functions**:
-  - ❌ `std::thread::sleep` → ✅ `tokio::time::sleep`
-  - ❌ `std::fs` → ✅ `tokio::fs`
-  - ❌ Blocking database calls → ✅ Use connection pools with async APIs
-
-**Handling blocking operations:**
-
-1. **For blocking I/O** (file system, synchronous DB clients):
-
-   ```rust
-   // Use spawn_blocking for synchronous operations
-   let result = tokio::task::spawn_blocking(move || {
-       // Blocking operations here (file I/O, synchronous DB calls)
-       std::fs::read_to_string("file.txt")
-   }).await?;
-   ```
-
-2. **For CPU-bound computations**:
-
-   ```rust
-   // Use rayon for parallel CPU work
-   let (tx, rx) = tokio::sync::oneshot::channel();
-   rayon::spawn(move || {
-       let result = expensive_computation();
-       let _ = tx.send(result);
-   });
-   let result = rx.await?;
-   ```
-
-3. **For long-running background tasks**: Spawn dedicated threads with `std::thread::spawn`
-
-**Why this matters**: Blocking an async runtime thread prevents other tasks from running, causing cascading delays and poor throughput under load.
-
-### Clippy Rules (Enforced in CI)
-
-The following clippy rules are **errors** in CI (`-Dwarnings`):
-
-- `clippy::pedantic` - All pedantic lints enabled
-- `clippy::unwrap_used` - No `.unwrap()` calls
-- `clippy::expect_used` - No `.expect()` calls (use proper error handling)
-- `clippy::clone_on_ref_ptr` - Don't clone `Arc`/`Rc` unnecessarily
-
-Allowed exceptions:
-
-- `clippy::module_name_repetitions` - OK to have `module_name::ModuleName`
-- `clippy::large_futures` - Allowed due to async complexity
-
-### Performance and Memory Management
-
-#### Zero-Copy Operations
-
-- **Prefer zero-copy** when working with Arrow arrays
-- Use `Arc<dyn Array>` for type-erased arrays (cheap to clone)
-- Avoid unnecessary data copies between Arrow, DataFusion, and connectors
-
-```rust
-// GOOD - zero-copy sharing
-let array: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 3]));
-let shared = Arc::clone(&array); // Cheap reference count increment
-
-// BAD - unnecessary copy
-let copied = array.to_data().clone(); // Avoid unless necessary
-```
-
-#### Connection Pooling
-
-- **Always use connection pools** for database connectors
-- Pool creation should never fail - errors only on `.get()`
-- Use `deadpool` or `r2d2` for async/sync pooling respectively
-
-```rust
-// GOOD - pool creation doesn't fail, errors on get
-let pool = Pool::builder(manager).build()?;
-// Later...
-let conn = pool.get().await?; // Error only here
-
-// BAD - don't create connections on-demand
-let conn = create_connection().await?; // Creates new connection every time
-```
-
-#### Arc/Rc Cloning
-
-- **Avoid unnecessary `Arc`/`Rc` clones** (caught by `clippy::clone_on_ref_ptr`)
-- `Arc::clone()` is cheap but not free - don't clone in hot loops unnecessarily
-- When passing `Arc<T>` to functions, prefer `&Arc<T>` if you don't need ownership
-
-```rust
-// GOOD
+// GOOD - function signature
 fn process_data(data: &Arc<RecordBatch>) { ... }
-
-// LESS GOOD - unnecessary clone if we don't need ownership
-fn process_data(data: Arc<RecordBatch>) { ... }
-```
-
-#### Pre-allocation
-
-- Pre-allocate vectors/buffers when sizes are known
-- Use `Vec::with_capacity()` or array builders with capacity hints
-
-```rust
-// GOOD
-let mut results = Vec::with_capacity(expected_size);
-
-// LESS GOOD - will reallocate multiple times
-let mut results = Vec::new();
 ```
 
 ### User-Facing Error Messages
 
-1. **Use simple but specific language**: "Failed to read from dataset mytable (duckdb)" not "Unable to get read provider"
-2. **Specify affected resource**: Always include dataset/model/catalog name
-3. **Provide actionable steps**: Link to docs, suggest config fixes
-4. **Exclude internal concepts**: Don't mention "read provider", "table source", etc.
-5. **Format**: `Failed to {action} {resource_type} {name} ({connector}): {specific_error}`
+**Format**: `Failed to {action} {resource_type} {name} ({connector}): {specific_error}`
 
-Example:
+1. Simple but specific language
+2. Always include dataset/model/catalog name
+3. Provide actionable steps (docs links, config fixes)
+4. Exclude internal concepts ("read provider", "table source")
 
 ```rust
 #[snafu(display(
     "Failed to register dataset {dataset_name} ({connector}): Invalid file format. \
     Expected '.csv' but found '.parquet'. \
-    Update the 'file_format' parameter in your spicepod. \
-    See: https://spiceai.org/docs/components/data-connectors"
+    Update 'file_format' parameter. See: https://spiceai.org/docs/components/data-connectors"
 ))]
 ```
 
-## Project Structure & Key Components
+## Project Structure
 
 ### Binary Targets
 
-- `bin/spiced/` - Runtime daemon (Rust) - The main engine
-- `bin/spice/` - CLI tool (Go) - User-facing commands
+- `bin/spiced/` - Runtime daemon (Rust)
+- `bin/spice/` - CLI (Go)
 
-### Core Crates (High-Level)
+### Core Crates
 
-- `crates/runtime/` - Main runtime logic, orchestration, component initialization
-- `crates/data_components/` - DataFusion `TableProvider` implementations for all connectors
-- `crates/app/` - Application model, spicepod parsing
-- `crates/datafusion/` - DataFusion extensions and optimizations
-- `crates/llms/` - LLM inference (chat completions, embeddings)
-- `crates/model_components/` - ML/LLM model loading and serving
-- `crates/search/` - Search functionality (vector, text, keyword)
-- `crates/test-framework/` - Testing utilities, Spicetest framework
+- `runtime/` - Orchestration, component init
+- `data_components/` - TableProvider implementations
+- `app/` - Spicepod parsing
+- `datafusion/` - DataFusion extensions
+- `llms/` - LLM inference
+- `model_components/` - ML/LLM loading
+- `search/` - Search functionality
+- `test-framework/` - Testing utilities
 
-### Runtime Sub-Crates (Modular Runtime Features)
+### Runtime Sub-Crates
 
-- `runtime-acceleration/` - Data acceleration engines (Arrow, DuckDB, SQLite, PostgreSQL)
-- `runtime-auth/` - Authentication and authorization
-- `runtime-datafusion-udfs/` - User-defined functions
-- `runtime-secrets/` - Secret store integrations
-- `runtime-parameters/` - Parameter resolution and templates
+- `runtime-acceleration/` - Arrow, DuckDB, SQLite, PostgreSQL
+- `runtime-auth/`, `runtime-datafusion-udfs/`, `runtime-secrets/`, `runtime-parameters/`
 
-### Extension Points (See `docs/EXTENSIBILITY.md`)
+### Extension Points (see `docs/EXTENSIBILITY.md`)
 
-1. **Data Connector** (`crates/runtime/src/dataconnector/mod.rs`): Source data from external systems
-2. **Data Accelerator** (`crates/runtime/src/databackend.rs`): Local storage engines (Arrow, DuckDB, SQLite, PostgreSQL)
-3. **Catalog Connector**: External catalog integration (Iceberg, Unity, Glue)
-4. **Secret Stores** (`crates/runtime/src/secrets.rs`): Secure credential storage
-5. **Models** (`crates/model_components/`): ML/LLM model sources and inference
-6. **Embeddings** (`crates/llms/src/embeddings/`): Vector embedding generation
+1. Data Connector, 2. Data Accelerator, 3. Catalog Connector, 4. Secret Stores, 5. Models, 6. Embeddings
 
-## Testing Conventions
+## Testing
 
-### Spicepod Naming (Critical for Integration Tests)
+### Spicepod Naming
 
-Format: `{connector[variant]}-{accelerator[variant]}-{test_variant}`
+Format: `{connector[variant]}-{accelerator[variant]}-{test_variant}`  
+Non-accelerated MUST use `-federated` suffix.
 
-Examples:
+Examples: `s3[parquet]-federated`, `mysql-duckdb[file]-on_zero_results`
 
-- `s3[parquet]-federated` - S3 with no acceleration
-- `mysql-duckdb[file]-on_zero_results` - MySQL with DuckDB file acceleration
-- `file[csv]-arrow-refresh_append` - File connector with Arrow acceleration
-
-**Rule**: Non-accelerated connectors MUST use `-federated` suffix.
-
-### testoperator Usage
+### testoperator
 
 ```bash
-# Run benchmark with validation (TPC-H scale factor 1)
-testoperator run bench -p test/spicepods/tpch/sf1/federated/duckdb.yaml \
-  -s spiced -d ./.data --query-set tpch --validate
-
-# Throughput test with 25 concurrent workers
-testoperator run throughput -p benchmarks/file_tpch.yaml \
-  -s spiced -d ./.data --query-set tpch --concurrency 25
-
-# Load test for specific duration
-testoperator run load -p test.yaml -s spiced --duration 60
+testoperator run bench -p test.yaml -s spiced --query-set tpch --validate
+testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrency 25
 ```
 
-Snapshots auto-generate for TPC-H/TPC-DS queries. Use `INSTA_UPDATE=1` to regenerate.
+Use `INSTA_UPDATE=1` to regenerate snapshots.
 
-## Feature Flags & Build System
+## Feature Flags
 
-### Cargo Features (Important!)
-
-`spiced` uses **optional heavy dependencies**. Default features in `bin/spiced/Cargo.toml`:
-
-```toml
-default = ["duckdb", "postgres", "sqlite", "mysql", ...]
-```
-
-When adding a new connector:
+`spiced` uses optional heavy dependencies. When adding connectors:
 
 1. Make dependency optional: `dep:newdb-client`
-2. Add feature to workspace crates: `newdb = ["runtime/newdb", "data_components/newdb"]`
-3. Gate code with `#[cfg(feature = "newdb")]`
-4. Update `Makefile` lint targets to include new feature
-
-**Goal**: Minimize unused code warnings when building with `SPICED_CUSTOM_FEATURES`.
+2. Add feature: `newdb = ["runtime/newdb", "data_components/newdb"]`
+3. Gate code: `#[cfg(feature = "newdb")]`
+4. Update Makefile lint targets
 
 ## Development Workflow
 
-### Initial Setup (macOS/Linux)
-
-See `CONTRIBUTING.md` for full setup. Quick start:
+### Setup (macOS/Linux)
 
 ```bash
-brew install rust go cmake protobuf  # macOS
+brew install rust go cmake protobuf
 make install-dev
 export PATH="$PATH:$HOME/.spice/bin"
-spice init test-app && cd test-app && spice run
 ```
 
-### VSCode Configuration
-
-Add to User Settings JSON for auto-format and clippy-on-save:
+### VSCode Settings
 
 ```json
-"[rust]": {
-  "editor.defaultFormatter": "rust-lang.rust-analyzer",
-  "editor.formatOnSave": true
-},
+"[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer", "editor.formatOnSave": true },
 "rust-analyzer.check.command": "clippy",
-"rust-analyzer.check.extraArgs": [
-  "--", "-Dwarnings", "-Dclippy::expect_used", "-Dclippy::pedantic",
-  "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr",
-  "-Aclippy::module_name_repetitions"
-],
-"rust-analyzer.cargo.target": "aarch64-apple-darwin"  // or your arch
+"rust-analyzer.check.extraArgs": ["--", "-Dwarnings", "-Dclippy::expect_used", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"]
 ```
 
-### PR & Release Process
+### PR Process
 
-- **Branch from `trunk`**: All changes start here
-- **Link issue**: PRs require associated issue (bug/proposal)
-- **Tests required**: Code changes need tests
-- **Follow style guides**: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`
-- **Release branches**: `release/X.Y` for minor releases, patch updates cherry-picked from trunk
+- Branch from `trunk`, link issue, add tests
+- Follow style guides: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`
 
-## Common Patterns & Idioms
+## Common Patterns
 
-### Adding a Data Connector
+### Adding Data Connector
 
-1. Create `crates/data_components/src/{connector}.rs` implementing `TableProvider`
-2. Create `crates/runtime/src/dataconnector/{connector}.rs` with factory function
-3. Add to `crates/runtime/src/dataconnector/mod.rs` connector registry
-4. Gate with `#[cfg(feature = "connector_name")]`
-5. Update `bin/spiced/Cargo.toml` default features
+1. Create `data_components/src/{connector}.rs` (TableProvider)
+2. Create `runtime/src/dataconnector/{connector}.rs` (factory)
+3. Register in `runtime/src/dataconnector/mod.rs`
+4. Gate with `#[cfg(feature = "...")]`
+5. Update `bin/spiced/Cargo.toml` features
 6. Add integration test in `test/spicepods/{connector}/`
-7. Document in README.md connector table
+7. Document in README.md
 
 ### DataFusion Integration
 
-- Spice extends DataFusion with custom `TableProvider` implementations
-- Use `ensure!` for plan validation, not `expect`
-- Push-down filters/projections when possible for federation
-- Acceleration wraps federated tables: `AcceleratedTable` → `FederatedTable` → connector `TableProvider`
+- Use `ensure!` for validation, not `expect`
+- Push-down filters/projections for federation
+- Acceleration wraps: `AcceleratedTable` → `FederatedTable` → connector `TableProvider`
 
 ### Async Patterns
 
-- Use `tokio` runtime (configured in `bin/spiced/src/main.rs`)
-- Prefer `async_trait` for trait async methods
-- Use `CancellationToken` for graceful shutdown (see `runtime/src/cancellable_task.rs`)
+- Use `tokio` runtime (see `bin/spiced/src/main.rs`)
+- Use `async_trait` for trait async methods
+- Use `CancellationToken` for shutdown (see `runtime/src/cancellable_task.rs`)
 
-## Key Files to Reference
+## Key Files
 
-- `docs/PRINCIPLES.md` - First principles guiding decisions
-- `docs/EXTENSIBILITY.md` - Extension point interfaces
-- `docs/dev/style_guide.md` - Rust style conventions
-- `docs/dev/error_handling.md` - Error message guidelines
-- `CONTRIBUTING.md` - Setup, build options, PR workflow
-- `Makefile` - All build/test/lint targets
-- `Cargo.toml` - Workspace dependencies and versions
-- `crates/runtime/src/lib.rs` - Runtime entry point and orchestration
+- `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`
+- `CONTRIBUTING.md`, `Makefile`, `Cargo.toml`, `crates/runtime/src/lib.rs`
 
-## Gotchas & Important Notes
+## Gotchas
 
-1. **Don't use `stream!` macro** - Breaks IDE tooling
-2. **Always use feature gates** - `#[cfg(feature = "...")]` for optional connectors
-3. **Spicepod is the config format** - YAML files in `spicepod.yml` define datasets, models, acceleration
-4. **Integration tests need credentials** - Run `spice login` or create `.env` file
-5. **testoperator is the test harness** - Don't write manual benchmark scripts
-6. **Cargo workspace uses edition 2024** - Use latest Rust features
-7. **Allocator can be customized** - Default is snmalloc, can use jemalloc/mimalloc via features
+1. Don't use `stream!` macro
+2. Always use feature gates for optional connectors
+3. Spicepod is YAML config format
+4. Integration tests need credentials (`spice login` or `.env`)
+5. testoperator is the test harness
+6. Workspace uses Rust edition 2024
+7. Allocator customizable (default: snmalloc, can use jemalloc/mimalloc)
 
-## When Adding New Features
+## Adding Features Checklist
 
-1. Check if it requires a new **extension point** (connector, accelerator, etc.)
-2. Make dependencies **optional via features** if heavy
-3. Add **integration tests** via testoperator or `test-framework`
-4. Update **user-facing documentation** (README.md, docs/)
-5. Follow **error message guidelines** for user experience
-6. Ensure **clippy passes** with strict rules before PR
-7. Add to **Makefile lint targets** if new features added
-8. For async connectors, ensure **no blocking operations in async context** (use `spawn_blocking` or `rayon`)
+1. Check if needs new extension point
+2. Make heavy dependencies optional via features
+3. Add integration tests (testoperator or test-framework)
+4. Update user docs (README.md, docs/)
+5. Follow error message guidelines
+6. Ensure clippy passes
+7. Add to Makefile lint targets
+8. Ensure no blocking ops in async context (`spawn_blocking` or `rayon`)
 
-## Questions? References
+## References
 
-- [Spice Docs](https://spiceai.org/docs)
-- [Cookbook Recipes](https://github.com/spiceai/cookbook)
-- [Architecture Decisions](docs/decisions/)
-- [Threat Models](docs/threat_models/)
+- [Spice Docs](https://spiceai.org/docs), [Cookbook](https://github.com/spiceai/cookbook)
+- [Architecture Decisions](docs/decisions/), [Threat Models](docs/threat_models/)

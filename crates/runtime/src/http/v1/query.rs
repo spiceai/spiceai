@@ -213,8 +213,9 @@ pub(crate) async fn post(
             }
         }
     } else {
-        let sql = match String::from_utf8(body.to_vec()) {
-            Ok(query) => query,
+        // Use &body directly to avoid unnecessary copy of Bytes
+        let sql = match std::str::from_utf8(&body) {
+            Ok(query) => query.to_string(),
             Err(e) => {
                 tracing::debug!("Error reading query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();

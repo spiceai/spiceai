@@ -27,7 +27,11 @@ use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
 use tempfile::TempDir;
 
-use crate::{process::Process, utils::wait_until_true};
+use crate::{
+    constants::{FLIGHT_URL, HEALTH_ENDPOINT, HTTP_BASE_URL, READY_ENDPOINT},
+    process::Process,
+    utils::wait_until_true,
+};
 
 #[derive(Debug, Clone)]
 pub struct SpicedVersion(String);
@@ -55,6 +59,7 @@ pub struct StartRequest {
     spicepod: SpicepodDefinition,
     tempdir: TempDir,
     data_dir: Option<PathBuf>,
+    additional_args: Vec<String>,
     prepared: bool,
 }
 
@@ -66,12 +71,19 @@ impl StartRequest {
             tempdir: TempDir::new()?,
             prepared: false,
             data_dir: None,
+            additional_args: Vec::new(),
         })
     }
 
     #[must_use]
     pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
         self.data_dir = Some(data_dir);
+        self
+    }
+
+    #[must_use]
+    pub fn with_additional_args(mut self, args: Vec<String>) -> Self {
+        self.additional_args = args;
         self
     }
 
@@ -119,7 +131,8 @@ impl SpicedInstance {
     pub async fn start(mut start_request: StartRequest) -> Result<Self> {
         // Check if spiced is already running
         let client = reqwest::Client::new();
-        let response = client.get("http://localhost:8090/health").send().await;
+        let health_url = format!("{HTTP_BASE_URL}{HEALTH_ENDPOINT}");
+        let response = client.get(&health_url).send().await;
         if response.is_ok() {
             anyhow::bail!("Spiced instance is already running");
         }
@@ -154,6 +167,12 @@ impl SpicedInstance {
         let mut cmd = Command::new(start_request.spiced_path);
         cmd.current_dir(tempdir.path());
         cmd.arg("--telemetry-enabled=false");
+
+        // Add any additional arguments
+        for arg in start_request.additional_args {
+            cmd.arg(arg);
+        }
+
         let child = cmd.spawn()?;
 
         Ok(Self {
@@ -194,7 +213,7 @@ impl SpicedInstance {
         }
 
         let spice_client = spice_client
-            .flight_url("http://localhost:50051")
+            .flight_url(FLIGHT_URL)
             .user_agent("spice-test-framework/1.0")
             .build()
             .await
@@ -222,8 +241,9 @@ impl SpicedInstance {
     pub async fn wait_for_ready(&mut self, timeout: Duration) -> Result<()> {
         // Wait for the spiced instance to be ready by polling the `/v1/ready` endpoint
         let client = self.http_client()?;
+        let ready_url = format!("{HTTP_BASE_URL}{READY_ENDPOINT}");
         if !wait_until_true(timeout, || async {
-            let response = client.get("http://localhost:8090/v1/ready").send().await;
+            let response = client.get(&ready_url).send().await;
             match response {
                 Ok(response) => response.status().is_success(),
                 Err(_) => false,
@@ -240,7 +260,8 @@ impl SpicedInstance {
         let Ok(client) = self.http_client() else {
             return false;
         };
-        let response = client.get("http://localhost:8090/v1/ready").send().await;
+        let ready_url = format!("{HTTP_BASE_URL}{READY_ENDPOINT}");
+        let response = client.get(&ready_url).send().await;
         match response {
             Ok(response) => response.status().is_success(),
             Err(_) => false,
