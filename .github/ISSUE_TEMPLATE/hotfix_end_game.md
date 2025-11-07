@@ -20,6 +20,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 
 - [ ] Create `release/X.Y.Z-prep` from `release/X.Y`
 - [ ] Cherry-pick hotfix commits onto release branch
+- [ ] Update version (patch)
 - [ ] Prepare and finalize release notes
 
 ## Pre-Release Testing & Validation
