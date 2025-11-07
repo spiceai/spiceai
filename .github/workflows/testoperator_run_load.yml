@@ -53,11 +53,6 @@ on:
           - 'iceberg-hadoop'
           - 'saffron-views'
           - 'saffron-duckdb-cte'
-      ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
-        required: true
-        default: '30'
-        type: string
       runner_type:
         description: 'Runner type'
         required: true
@@ -159,7 +154,7 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
@@ -210,7 +205,7 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
