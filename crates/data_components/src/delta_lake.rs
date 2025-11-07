@@ -120,8 +120,7 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
-    #[allow(clippy::unused_async)]
-    pub async fn from(
+    pub fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
         io_runtime: Handle,
