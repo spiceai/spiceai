@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
@@ -108,6 +109,12 @@ pub fn deny_spice_specific_functions() -> FunctionSupport {
 
 fn json_functions() -> Vec<String> {
     let mut ctx = SessionContext::new();
+    let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
     let _ = datafusion_functions_json::register_all(&mut ctx);
-    ctx.state().scalar_functions().keys().cloned().collect()
+    ctx.state()
+        .scalar_functions()
+        .keys()
+        .filter(|&k| !existing.contains(k))
+        .cloned()
+        .collect()
 }
