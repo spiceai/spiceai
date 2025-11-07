@@ -116,7 +116,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             return None;
         }
 
-        // Match filters to the index idents. An index may be satisifed by more than one filter.
+        // Match filters to the index idents. An index may be satisfied by more than one filter.
         let cte_filters = filters
             .into_iter()
             .filter(|f| f.references.iter().all(|cr| bindable_index.contains(cr)))
