@@ -490,7 +490,7 @@ impl ReciprocalRankFusion {
                             cs.iter().find_map(|c| match c {
                                 Constraint::PrimaryKey(pk) => provider
                                     .schema()
-                                    .project(&pk)
+                                    .project(pk)
                                     .map(|x| {
                                         x.fields()
                                             .iter()
