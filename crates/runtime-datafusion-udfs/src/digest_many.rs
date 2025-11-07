@@ -126,25 +126,69 @@ impl ScalarUDFImpl for DigestMany {
         let mut args = scalar_args.args;
         let hash_fn = Self::concrete_hash_function(args.pop())?;
 
-        // Collect variadic args into one string for hashing
-        let mut hash_me = String::with_capacity(32 * args.len());
-        for arg in args {
-            match arg {
-                ColumnarValue::Array(array) => {
-                    for buf in array.to_data().buffers() {
-                        for b in buf.as_slice() {
-                            write!(&mut hash_me, "{b:02X}")?;
-                        }
+        // Check if we have any arrays (columnar values)
+
+        if !args
+            .iter()
+            .any(|arg| matches!(arg, ColumnarValue::Array(_)))
+        {
+            // All scalars - process as before
+            let mut hash_me = String::with_capacity(32 * args.len());
+            for arg in args {
+                if let ColumnarValue::Scalar(scalar) = arg {
+                    write!(&mut hash_me, "{scalar}")?;
+                }
+            }
+
+            return hash_fn.invoke_with_args(Self::make_scalar_function_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me))),
+            ]));
+        }
+
+        // We have arrays - need to process row by row
+        let num_rows = args
+            .iter()
+            .filter_map(|arg| match arg {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(1);
+
+        let mut result_hashes = Vec::with_capacity(num_rows);
+
+        for row_idx in 0..num_rows {
+            let mut hash_me = String::with_capacity(32 * args.len());
+
+            for arg in &args {
+                match arg {
+                    ColumnarValue::Array(array) => {
+                        // Get the scalar value at this row index
+                        let scalar = ScalarValue::try_from_array(array, row_idx)?;
+                        write!(&mut hash_me, "{scalar}")?;
+                    }
+                    ColumnarValue::Scalar(scalar) => {
+                        write!(&mut hash_me, "{scalar}")?;
                     }
                 }
+            }
 
-                ColumnarValue::Scalar(scalar) => write!(&mut hash_me, "{scalar}")?,
+            // Hash this row's concatenated string
+            let row_hash = hash_fn.invoke_with_args(Self::make_scalar_function_args(vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me))),
+            ]))?;
+
+            // Extract the hash value
+            if let ColumnarValue::Scalar(hash_scalar) = row_hash {
+                result_hashes.push(hash_scalar);
+            } else {
+                return exec_err!("{DIGEST_UDF_NAME}: expected scalar hash result");
             }
         }
 
-        hash_fn.invoke_with_args(Self::make_scalar_function_args(vec![
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me))),
-        ]))
+        // Convert the vector of scalars into an array
+        let result_array = ScalarValue::iter_to_array(result_hashes)?;
+        Ok(ColumnarValue::Array(result_array))
     }
 
     fn documentation(&self) -> Option<&Documentation> {
@@ -204,12 +248,12 @@ mod tests {
         +---+-----+-------+----------------------------------+----------------------------------+
         | a | b   | c     | digest_many(a, b, c)             | digest_many(c)                   |
         +---+-----+-------+----------------------------------+----------------------------------+
-        | 1 | 4.0 | alpha | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
-        | 2 |     | beta  | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
-        | 3 | 5.0 | gamma | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
-        | 4 | 6.0 | alpha | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
-        | 5 | 7.0 | beta  | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
-        | 6 | 8.0 | gamma | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
+        | 1 | 4.0 | alpha | 3409f2c75ffd509c8984bbb074f0e04d | 2c1743a391305fbf367df8e4f069f9f9 |
+        | 2 |     | beta  | 546bdc9d2972f2665650d628b4da0bb6 | 987bcab01b929eb2c07877b224215c92 |
+        | 3 | 5.0 | gamma | 82ff28e3c0dd00b848f98ea90fc99a39 | 05b048d7242cb7b8b57cfa3b1d65ecea |
+        | 4 | 6.0 | alpha | d96dc6ee83c54921044e6f823fb54359 | 2c1743a391305fbf367df8e4f069f9f9 |
+        | 5 | 7.0 | beta  | 896b722fd78bf5fe3e33d5baa96cbd88 | 987bcab01b929eb2c07877b224215c92 |
+        | 6 | 8.0 | gamma | 5e53bce9cc7a3eaaca70d58d04947043 | 05b048d7242cb7b8b57cfa3b1d65ecea |
         +---+-----+-------+----------------------------------+----------------------------------+
         "
         );
