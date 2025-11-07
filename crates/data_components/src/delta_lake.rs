@@ -104,9 +104,7 @@ impl Read for DeltaTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
         let delta: DeltaTable =
-            DeltaTable::from(delta_path, self.params.clone(), self.io_runtime.clone())
-                .await
-                .boxed()?;
+            DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime).boxed()?;
         Ok(Arc::new(delta))
     }
 }
@@ -123,7 +121,7 @@ impl DeltaTable {
     pub fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
-        io_runtime: Handle,
+        io_runtime: &Handle,
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;

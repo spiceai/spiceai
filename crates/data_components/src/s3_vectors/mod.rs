@@ -207,3 +207,23 @@ pub async fn list_index_names(
         .map(|idx| idx.index_name().to_string())
         .collect())
 }
+
+async fn fetch_all_index_names(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: Option<&str>,
+    index_name: Option<&str>,
+) -> Result<Option<Vec<String>>, DataFusionError> {
+    if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
+        // Use the base name (without spill suffix) as prefix to get all related indexes
+        let base_name = if let Ok(Some(spill)) = SpillIndex::parse(index_name) {
+            spill.base_name
+        } else {
+            index_name.to_string()
+        };
+        Ok(Some(
+            list_index_names(client, bucket_name, &base_name).await?,
+        ))
+    } else {
+        Ok(None)
+    }
+}

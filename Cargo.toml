@@ -207,6 +207,7 @@ rdkafka = { version = "0.38.0" }
 regex = "1.12.2"
 reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
 rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "ec71bd9b735c87cc903c33ed643a04bfd661273e" }
+roaring = "0.11"
 rusqlite = { version = "0.31.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
@@ -262,8 +263,21 @@ util = { path = "crates/util" }
 uuid = "1"
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
 vortex = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-alp = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-array = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-bytebool = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
 vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-datetime-parts = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-decimal-byte-parts = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-dict = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-fastlanes = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-fsst = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-runend = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-sequence = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-session = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-sparse = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
 vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-zigzag = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
