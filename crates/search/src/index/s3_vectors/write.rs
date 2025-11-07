@@ -39,8 +39,11 @@ pub enum Error {
     #[snafu(display("Embedding model '{model_name}' was not found"))]
     EmbeddingModelNotFound { model_name: String },
 
+    #[cfg(feature = "llms")]
     #[snafu(display("{source}"))]
-    FailedToEmbed { source: llms::embeddings::Error },
+    FailedToEmbed {
+        source: llms::embeddings::Error,
+    },
 
     #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
     ColumnNotFound { index: String, column: String },
@@ -102,6 +105,7 @@ pub enum Error {
 }
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
+#[cfg(feature = "llms")]
 #[allow(clippy::too_many_lines)]
 pub async fn write(
     index: &S3Vector,
@@ -134,6 +138,7 @@ pub async fn write(
     Ok(concatenated)
 }
 
+#[cfg(feature = "llms")]
 async fn process_single_batch(
     index: &S3Vector,
     table: &S3VectorsTable,
