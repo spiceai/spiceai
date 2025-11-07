@@ -122,6 +122,7 @@ impl DataConnector for DynamoDB {
             "aws_session_token",
             &self.params,
         )
+        .await
         .map_err(|message| DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "dynamodb".to_string(),
             connector_component: ConnectorComponent::from(dataset),

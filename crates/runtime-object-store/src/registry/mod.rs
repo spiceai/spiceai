@@ -92,39 +92,35 @@ impl SpiceObjectStoreRegistry {
             client_options = client_options.with_allow_http(as_bool);
         }
 
-        let mut load_credentials_from_environment = true;
+        // Determine credential configuration using common utility
+        let credential_config = aws_sdk_credential_bridge::determine_s3_credential_config(
+            params.get("key").map(String::as_str),
+            params.get("secret").map(String::as_str),
+            params.get("auth").map(String::as_str),
+        )
+        .map_err(DataFusionError::Configuration)?;
 
-        if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
+        // Apply explicit credentials if provided
+        if !credential_config.load_from_environment
+            && !credential_config.skip_signature
+            && let (Some(key), Some(secret)) = (params.get("key"), params.get("secret"))
+        {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
             if let Some(token) = params.get("session_token") {
                 s3_builder = s3_builder.with_token(token);
             }
-            load_credentials_from_environment = false;
-        } else {
-            match params.get("auth") {
-                Some(auth) if auth == "iam_role" => {
-                    s3_builder = s3_builder.with_skip_signature(false);
-                }
-                Some(auth) if auth == "public" => {
-                    s3_builder = s3_builder.with_skip_signature(true);
-                    load_credentials_from_environment = false;
-                }
-                None => {
-                    // Default to public if no auth is provided
-                    s3_builder = s3_builder.with_skip_signature(true);
-                    load_credentials_from_environment = false;
-                }
-                Some(auth) => {
-                    return Err(DataFusionError::Configuration(format!(
-                        "Unexpected S3 auth method: {auth}",
-                    )));
-                }
-            }
         }
+
+        // Configure skip signature for public access
+        if credential_config.skip_signature {
+            s3_builder = s3_builder.with_skip_signature(true);
+        }
+
         s3_builder = s3_builder.with_client_options(client_options);
 
-        if load_credentials_from_environment {
+        // Load credentials from AWS SDK environment if needed
+        if credential_config.load_from_environment {
             tracing::trace!("Loading S3 credentials from environment");
             if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
                 if sdk_config.credentials_provider().is_some() {
@@ -144,7 +140,9 @@ impl SpiceObjectStoreRegistry {
                     s3_builder = s3_builder.with_skip_signature(true);
                 }
             } else {
-                tracing::trace!("No AWS SDK loaded, assuming public access");
+                tracing::trace!(
+                    "No AWS SDK credentials provider available, assuming public access"
+                );
                 s3_builder = s3_builder.with_skip_signature(true);
             }
         }

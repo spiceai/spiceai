@@ -8590,6 +8590,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-bedrockruntime",
+ "aws-sdk-credential-bridge",
  "aws-smithy-types",
  "bytes",
  "cache",
@@ -13247,6 +13248,7 @@ version = "1.9.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-sdk-credential-bridge",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
  "base64 0.22.1",
