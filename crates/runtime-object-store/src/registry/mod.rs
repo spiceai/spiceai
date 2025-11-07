@@ -122,18 +122,23 @@ impl SpiceObjectStoreRegistry {
         // Load credentials from AWS SDK environment if needed
         if credential_config.load_from_environment {
             tracing::trace!("Loading S3 credentials from environment");
-            if let Some(sdk_config) =
-                aws_sdk_credential_bridge::should_use_sdk_credentials(&params, "key", "secret")
-            {
-                tracing::trace!("Using S3 credentials provider from SDK config");
-                s3_builder = s3_builder.with_credentials(Arc::new(
-                    S3CredentialProvider::from_config(sdk_config.as_ref()).map_err(|e| {
-                        object_store::Error::Generic {
-                            store: "S3",
-                            source: e.into(),
-                        }
-                    })?,
-                ));
+            if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
+                if sdk_config.credentials_provider().is_some() {
+                    tracing::trace!("Using S3 credentials provider from SDK config");
+                    s3_builder = s3_builder.with_credentials(Arc::new(
+                        S3CredentialProvider::from_config(sdk_config.as_ref()).map_err(|e| {
+                            object_store::Error::Generic {
+                                store: "S3",
+                                source: e.into(),
+                            }
+                        })?,
+                    ));
+                } else {
+                    tracing::trace!(
+                        "No S3 credentials provider found from AWS SDK, assuming public access"
+                    );
+                    s3_builder = s3_builder.with_skip_signature(true);
+                }
             } else {
                 tracing::trace!(
                     "No AWS SDK credentials provider available, assuming public access"

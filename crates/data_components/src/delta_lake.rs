@@ -157,7 +157,7 @@ impl DeltaTable {
                 match aws_sdk_credential_bridge::from_s3_url_and_config(
                     &table_url,
                     region,
-                    &sdk_config,
+                    sdk_config.as_ref(),
                     io_runtime.clone(),
                 ) {
                     Ok(object_store) => Some(object_store),
