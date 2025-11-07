@@ -28,6 +28,7 @@ static DIALECT: DuckDbDialect = DuckDbDialect {};
 
 pub struct DuckDBIntermediateIndexMaterializationOptimizer {}
 
+#[derive(Debug)]
 struct SelectionWithIdents {
     expr: Expr,
     references: HashSet<String>
@@ -102,12 +103,16 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         let cte_filters = filters
             .into_iter()
             .filter(|f| {
-                f.references.iter().all(|cr| all_filter_idents.contains(cr))
+                f.references.iter().all(|cr| bindable_index.contains(cr))
             })
             .collect::<Vec<_>>();
 
+        // It may be possible for an expr to reference many columns, so a binding can be satisfied
+        // by one or more exprs
+        let cte_ref_count = cte_filters.iter().map(|swi| swi.references.len()).sum::<usize>();
+
         // TODO: it may be possible to rewrite variants where this is true
-        if cte_filters.len() != bindable_index.len() {
+        if cte_ref_count != bindable_index.len() {
             return None;
         }
 
