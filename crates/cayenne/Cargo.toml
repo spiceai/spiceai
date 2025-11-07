@@ -36,21 +36,20 @@ tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"] }
 vortex = { workspace = true }
+vortex-alp = { workspace = true }
+vortex-array = { workspace = true }
+vortex-bytebool = { workspace = true }
 vortex-datafusion = { workspace = true }
-vortex-session = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
-# Vortex encoding dependencies for hardware-accelerated compression
-vortex-alp = "0.54.0"
-vortex-array = "0.54.0"
-vortex-bytebool = "0.54.0"
-vortex-datetime-parts = "0.54.0"
-vortex-decimal-byte-parts = "0.54.0"
-vortex-dict = "0.54.0"
-vortex-fastlanes = "0.54.0"
-vortex-fsst = "0.54.0"
-vortex-runend = "0.54.0"
-vortex-sequence = "0.54.0"
-vortex-sparse = "0.54.0"
-vortex-zigzag = "0.54.0"
+vortex-datetime-parts = { workspace = true }
+vortex-decimal-byte-parts = { workspace = true }
+vortex-dict = { workspace = true }
+vortex-fastlanes = { workspace = true }
+vortex-fsst = { workspace = true }
+vortex-runend = { workspace = true }
+vortex-sequence = { workspace = true }
+vortex-session = { workspace = true }
+vortex-sparse = { workspace = true }
+vortex-zigzag = { workspace = true }
 
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
