@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
 use datafusion::execution::SessionStateBuilder;
 use std::{fmt::Display, sync::Arc};
 
