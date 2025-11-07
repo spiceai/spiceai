@@ -300,7 +300,7 @@ mod search {
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
-                        "datasets": ["qs", "qs_view"],
+                        "datasets": ["qs_view"],
                         "additional_columns": ["answer"],
                     })),
                 ),
