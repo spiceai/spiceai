@@ -62,8 +62,6 @@ use std::borrow::Cow;
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use tokio::task;
-use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
@@ -398,8 +396,9 @@ impl CayenneTableProvider {
     /// allowing fine-grained control over compression vs performance tradeoffs.
     fn create_vortex_session(
         config: &super::metadata::VortexConfig,
-    ) -> vortex::session::VortexSession {
-        use vortex::session::VortexSession;
+    ) -> vortex_session::VortexSession {
+        use vortex::VortexSessionDefault;
+        use vortex_session::VortexSession;
 
         // Use default session which registers all encodings
         // Note: If all encodings are enabled, this is optimal. Otherwise, the overhead
@@ -476,10 +475,7 @@ impl CayenneTableProvider {
             segment_cache_size_mb: vortex_config.segment_cache_mb,
         };
 
-        let format = Arc::new(VortexFormat::new_with_options(
-            Arc::new(vortex_session),
-            vortex_opts,
-        ));
+        let format = Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts));
         let listing_options = ListingOptions::new(format);
 
         let config = ListingTableConfig::new(table_url)

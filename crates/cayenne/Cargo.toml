@@ -37,8 +37,8 @@ turso = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"] }
 vortex = { workspace = true }
 vortex-datafusion = { workspace = true }
+vortex-session = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
 # Vortex encoding dependencies for hardware-accelerated compression
-vortex = "0.54.0"
 vortex-alp = "0.54.0"
 vortex-array = "0.54.0"
 vortex-bytebool = "0.54.0"
