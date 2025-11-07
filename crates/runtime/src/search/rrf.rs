@@ -455,7 +455,7 @@ impl ReciprocalRankFusion {
     ///
     /// Only single-column PKs are supported for now.
     fn infer_join_key(table_pks: &[Option<Vec<String>>]) -> Option<Expr> {
-        let inferred_key = table_pks.iter().find(Option::is_some)?.clone()?;
+        let inferred_key = table_pks.iter().find(|&s| s.is_some())?.clone()?;
         if table_pks
             .iter()
             .all(|pk_opt| pk_opt.as_ref() == Some(&inferred_key))
