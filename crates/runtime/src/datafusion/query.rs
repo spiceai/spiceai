@@ -68,15 +68,15 @@ use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
+use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
+use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
-use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
-use super::managed_runtime;
-use managed_runtime::ManagedRuntimeError;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

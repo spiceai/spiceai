@@ -1,15 +1,19 @@
 use crate::common::plan_node_key::PlanNodeKey;
 use crate::common::search_visitor::SearchVisitor;
 use crate::concrete;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::sqlparser::ast::{CteAsMaterialized, ObjectName, Query};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
-use datafusion::sql::sqlparser::ast::{visit_expressions, visit_expressions_mut, BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, With};
+use datafusion::sql::sqlparser::ast::{
+    BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SetExpr, Statement, TableAlias,
+    TableFactor, TableWithJoins, Value, ValueWithSpan, With, visit_expressions,
+    visit_expressions_mut, visit_relations,
+};
 use datafusion::sql::sqlparser::dialect::DuckDbDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Span;
@@ -25,13 +29,14 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 static DIALECT: DuckDbDialect = DuckDbDialect {};
+const CTE_NAME: &str = "_intermediate_materialize";
 
 pub struct DuckDBIntermediateIndexMaterializationOptimizer {}
 
 #[derive(Debug)]
 struct SelectionWithIdents {
     expr: Expr,
-    references: HashSet<String>
+    references: HashSet<String>,
 }
 
 impl SelectionWithIdents {
@@ -46,7 +51,10 @@ impl SelectionWithIdents {
             ControlFlow::<()>::Continue(())
         });
 
-        Self { expr: expr.clone(), references }
+        Self {
+            expr: expr.clone(),
+            references,
+        }
     }
 }
 
@@ -79,7 +87,10 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
     /// Given the SELECT component of a statement and bound DuckDB indexes, attempt to build a
     /// materialized CTE with filters _only_ on index columns
-    fn build_cte(select: &Box<Select>, indexes: &Vec<(ColumnReference, IndexType)>) -> Option<(Cte, Vec<SelectionWithIdents>)> {
+    fn build_cte(
+        select: &Box<Select>,
+        indexes: &Vec<(ColumnReference, IndexType)>,
+    ) -> Option<(Cte, Vec<SelectionWithIdents>)> {
         // There must be a `WHERE` otherwise we cannot apply the optimization
         let selection = select.selection.as_ref()?;
 
@@ -91,28 +102,38 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .collect::<HashSet<_>>();
 
         // Find the first index we can bind (we can only bind one)
-        let bindable_index = indexes.iter().filter_map(|(cr, _)| {
-            if cr.columns.iter().all(|c| all_filter_idents.contains(c)) {
-                Some(cr.columns.iter().cloned().collect::<HashSet<_>>())
-            } else {
-                None
-            }
-        }).next()?;
+        let bindable_index = indexes
+            .iter()
+            .filter_map(|(cr, _)| {
+                if cr.columns.iter().all(|c| all_filter_idents.contains(c)) {
+                    Some(cr.columns.iter().cloned().collect::<HashSet<_>>())
+                } else {
+                    None
+                }
+            })
+            .next()?;
+
+        // This query is already optimal
+        if bindable_index == all_filter_idents {
+            return None;
+        }
 
         // Match filters to the index idents. An index may be satisifed by more than one filter.
         let cte_filters = filters
             .into_iter()
-            .filter(|f| {
-                f.references.iter().all(|cr| bindable_index.contains(cr))
-            })
+            .filter(|f| f.references.iter().all(|cr| bindable_index.contains(cr)))
             .collect::<Vec<_>>();
 
         // It may be possible for an expr to reference many columns, so a binding can be satisfied
         // by one or more exprs
-        let cte_ref_count = cte_filters.iter().map(|swi| swi.references.len()).sum::<usize>();
+        let cte_columns = cte_filters
+            .iter()
+            .flat_map(|swi| swi.references.iter())
+            .cloned()
+            .collect::<HashSet<_>>();
 
         // TODO: it may be possible to rewrite variants where this is true
-        if cte_ref_count != bindable_index.len() {
+        if cte_columns != bindable_index {
             return None;
         }
 
@@ -120,12 +141,10 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         let cte_selection = cte_filters
             .iter()
             .map(|swi| swi.expr.clone())
-            .reduce(|a, b| {
-                Expr::BinaryOp {
-                    left: Box::new(a),
-                    right: Box::new(b),
-                    op: BinaryOperator::And,
-                }
+            .reduce(|a, b| Expr::BinaryOp {
+                left: Box::new(a),
+                right: Box::new(b),
+                op: BinaryOperator::And,
             })
             .or_else(|| cte_filters.last().map(|f| f.expr.clone()));
 
@@ -134,8 +153,8 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         cte_select.selection = cte_selection;
 
         let table_alias = TableAlias {
-            name: Ident::new("_intermediate_materialize"),
-            columns: vec![]
+            name: Ident::new(CTE_NAME),
+            columns: vec![],
         };
 
         let cte_query = Query {
@@ -156,10 +175,92 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             query: Box::new(cte_query),
             from: None,
             materialized: Some(CteAsMaterialized::Materialized),
-            closing_paren_token: AttachedToken::empty()
+            closing_paren_token: AttachedToken::empty(),
         };
 
         Some((cte, cte_filters))
+    }
+
+    pub(crate) fn rewrite_statement(
+        statement: &Statement,
+        indexes: &Vec<(ColumnReference, IndexType)>,
+    ) -> Option<Statement> {
+        let mut relation_count: usize = 0;
+        let _ = visit_relations(statement, |_| {
+            relation_count += 1;
+            ControlFlow::<()>::Continue(())
+        });
+
+        if relation_count > 1 {
+            return None;
+        }
+
+        // Unfurl the AST to the SetExpr node
+        let Statement::Query(query) = statement else {
+            return None;
+        };
+
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+
+        // Bind index filters, build CTE
+        let (index_cte, bound_filters) = Self::build_cte(&select, indexes)?;
+
+        let Some(mut outer_selections) = select.selection.clone() else {
+            return None;
+        };
+
+        // Rewrite any predicates used in the filter with no-op truthy value
+        let exprs_to_noop = bound_filters
+            .into_iter()
+            .map(|f| f.expr)
+            .collect::<HashSet<_>>();
+
+        let _ = visit_expressions_mut(&mut outer_selections, |e| {
+            if exprs_to_noop.contains(e) {
+                *e = Expr::Value(ValueWithSpan {
+                    value: Value::Boolean(true),
+                    span: Span::empty(),
+                });
+            }
+
+            ControlFlow::<()>::Continue(())
+        });
+
+        // Build the new select
+        let mut new_select = select.as_ref().clone();
+
+        // From should point to our intermediate materialized CTE
+        new_select.from = vec![TableWithJoins {
+            relation: TableFactor::Table {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(CTE_NAME))]),
+                alias: None,
+                args: None,
+                with_hints: vec![],
+                version: None,
+                with_ordinality: false,
+                partitions: vec![],
+                json_path: None,
+                sample: None,
+                index_hints: vec![],
+            },
+            joins: vec![],
+        }];
+
+        // The selection now has all predicates except for those bound to the intermediate CTE
+        new_select.selection = Some(outer_selections);
+
+        // Build the new query, with all the new pieces
+        let mut new_query = query.as_ref().clone();
+        new_query.body = Box::new(SetExpr::Select(Box::new(new_select)));
+        new_query.with = Some(With {
+            with_token: AttachedToken::empty(),
+            recursive: false,
+            cte_tables: vec![index_cte],
+        });
+
+        Some(Statement::Query(Box::new(new_query)))
     }
 }
 
@@ -195,76 +296,10 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             return Ok(plan);
         };
 
-        // Unfurl the AST to the SetExpr node
-        let Statement::Query(query) = statement else {
+        let Some(new_statement) = Self::rewrite_statement(&statement, duck_exec.indexes()) else {
             return Ok(plan);
         };
 
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            return Ok(plan);
-        };
-
-        // Bind index filters, build CTE
-        let Some((index_cte, bound_filters)) = Self::build_cte(&select, duck_exec.indexes()) else {
-            return Ok(plan);
-        };
-
-        let Some(mut outer_selections) = select.selection.clone() else {
-            return Ok(plan);
-        };
-
-        // Rewrite any predicates used in the filter with no-op truthy value
-        let exprs_to_noop = bound_filters
-            .into_iter()
-            .map(|f| f.expr)
-            .collect::<HashSet<_>>();
-
-        let _ = visit_expressions_mut(&mut outer_selections, |e| {
-            if exprs_to_noop.contains(e) {
-                *e = Expr::Value(ValueWithSpan {
-                    value: Value::Boolean(true),
-                    span: Span::empty()
-                });
-            }
-
-            ControlFlow::<()>::Continue(())
-        });
-
-        // Build the new select
-        let mut new_select = select.as_ref().clone();
-
-        // From should point to our intermediate materialized CTE
-        new_select.from = vec![TableWithJoins {
-            relation: TableFactor::Table {
-                name: ObjectName(vec![ObjectNamePart::Identifier(
-                    Ident::new("_intermediate_materialize")
-                )]),
-                alias: None,
-                args: None,
-                with_hints: vec![],
-                version: None,
-                with_ordinality: false,
-                partitions: vec![],
-                json_path: None,
-                sample: None,
-                index_hints: vec![],
-            },
-            joins: vec![],
-        }];
-
-        // The selection now has all predicates except for those bound to the intermediate CTE
-        new_select.selection = Some(outer_selections);
-
-        // Build the new query, with all the new pieces
-        let mut new_query = query.as_ref().clone();
-        new_query.body = Box::new(SetExpr::Select(Box::new(new_select)));
-        new_query.with = Some(With {
-            with_token: AttachedToken::empty(),
-            recursive: false,
-            cte_tables: vec![index_cte],
-        });
-
-        let new_statement = Statement::Query(Box::new(new_query));
         let old_exec_key = PlanNodeKey::from(exec.as_ref());
 
         // Finally, replace the old DuckSqlExec with the optimized one
@@ -272,7 +307,8 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             let node_key = PlanNodeKey::from(node.as_ref());
 
             if node_key == old_exec_key {
-                let new_exec = duck_exec.clone()
+                let new_exec = duck_exec
+                    .clone()
                     .with_optimized_sql(format!("{}", new_statement));
 
                 Ok(Transformed::yes(Arc::new(new_exec)))
@@ -295,12 +331,110 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
 
 #[cfg(test)]
 mod tests {
-    use crate::physical_plan::duckdb_intermediate_index::DIALECT;
-    use datafusion::logical_expr::sqlparser::parser::Parser;
+    use super::*;
+    use datafusion_table_providers::util::column_reference::ColumnReference;
+    use datafusion_table_providers::util::indexes::IndexType;
+
+    fn parse_statement(sql: &str) -> Statement {
+        Parser::parse_sql(&DIALECT, sql)
+            .expect("Failed to parse SQL")
+            .into_iter()
+            .next()
+            .expect("No statement found")
+    }
+
+    fn make_index(columns: &[&str]) -> (ColumnReference, IndexType) {
+        (
+            ColumnReference {
+                columns: columns.iter().map(|s| s.to_string()).collect(),
+            },
+            IndexType::Enabled,
+        )
+    }
 
     #[test]
-    fn unparse_stuff() {
-        let parsed = Parser::parse_sql(&DIALECT, "select * from foo where a = 1 and b = 2 and c = 3 and d = 4 and e = 5").unwrap();
-        println!("{:#?}", parsed);
+    fn test_rewrite_statement() {
+        let test_cases: Vec<(&str, Vec<(ColumnReference, IndexType)>, Option<&str>)> = vec![
+            // core query we want to optimize
+            (
+                "SELECT * FROM foo WHERE a = 1 AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE a = 1 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // all filters covered by index - no rewrite
+            (
+                "SELECT * FROM foo WHERE a = 1 AND b = 2",
+                vec![make_index(&["a", "b"])],
+                None,
+            ),
+            // all filters covered, but subquery - no rewrite
+            (
+                "SELECT * FROM (SELECT * FROM foo) AS t WHERE a = 1 AND b = 2",
+                vec![make_index(&["a", "b"])],
+                None,
+            ),
+            // no filters
+            ("SELECT * FROM foo", vec![make_index(&["a", "b"])], None),
+            // c is not an indexed column
+            (
+                "SELECT * FROM foo WHERE a = 1 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                None,
+            ),
+            // Multiple filters on same column - should work
+            (
+                "SELECT * FROM foo WHERE a = 1 AND a > 0 AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE a = 1 AND a > 0 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND true AND c = 3",
+                ),
+            ),
+            // single column index
+            (
+                "SELECT * FROM foo WHERE a = 1 AND b = 2",
+                vec![make_index(&["a"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE a = 1) SELECT * FROM _intermediate_materialize WHERE true AND b = 2",
+                ),
+            ),
+            // multiple indexes but only one is bindable
+            (
+                "SELECT * FROM foo WHERE a = 1 AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"]), make_index(&["c", "d"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE a = 1 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // not bindable
+            (
+                "SELECT * FROM foo WHERE z = 1",
+                vec![make_index(&["a", "b"])],
+                None,
+            ),
+            // more than one relation (no joins)
+            (
+                "SELECT * FROM foo JOIN bar ON foo.id = bar.id WHERE a = 1 AND b = 2",
+                vec![make_index(&["a", "b"])],
+                None,
+            ),
+        ];
+
+        test_cases.into_iter().enumerate().for_each(
+            |(i, (input_sql, indexes, expected_pattern))| {
+                let input_stmt = parse_statement(input_sql);
+                let result = DuckDBIntermediateIndexMaterializationOptimizer::rewrite_statement(
+                    &input_stmt,
+                    &indexes,
+                );
+
+                assert_eq!(
+                    expected_pattern.map(String::from),
+                    result.map(|s| format!("{}", s)),
+                    "Query {i} must be rewritten correctly"
+                );
+            },
+        );
     }
 }
