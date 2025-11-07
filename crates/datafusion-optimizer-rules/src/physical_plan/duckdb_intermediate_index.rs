@@ -10,8 +10,8 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins, Value, ValueWithSpan, With, visit_expressions,
+    BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, With, visit_expressions,
     visit_expressions_mut, visit_relations,
 };
 use datafusion::sql::sqlparser::dialect::DuckDbDialect;
@@ -33,7 +33,7 @@ const CTE_NAME: &str = "_intermediate_materialize";
 
 pub struct DuckDBIntermediateIndexMaterializationOptimizer {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 struct SelectionWithIdents {
     expr: Expr,
     references: HashSet<String>,
@@ -149,6 +149,45 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         // Copy the input select overriding `WHERE`, build the CTE
         let mut cte_select = select.clone();
         cte_select.selection = cte_selection;
+
+        // Outer query filters may reference columns not in the projection, so we need to pass
+        // them along
+        let remaining_filter_columns: HashSet<_> = all_filter_idents
+            .difference(&cte_columns)
+            .cloned()
+            .collect();
+
+        // But not for SELECT *
+        let has_wildcard = cte_select.projection.iter().any(|item| {
+            matches!(
+                item,
+                datafusion::sql::sqlparser::ast::SelectItem::Wildcard(_)
+            )
+        });
+
+        if !has_wildcard && !remaining_filter_columns.is_empty() {
+            let mut projected_columns = HashSet::new();
+            for item in &cte_select.projection {
+                let _ = visit_expressions(item, |e| {
+                    if let Expr::Identifier(id) = e {
+                        projected_columns.insert(id.value.clone());
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+            }
+
+            let mut missing_columns: Vec<_> = remaining_filter_columns
+                .difference(&projected_columns)
+                .cloned()
+                .collect();
+            missing_columns.sort();
+
+            for col in missing_columns {
+                cte_select
+                    .projection
+                    .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(&col))));
+            }
+        }
 
         let table_alias = TableAlias {
             name: Ident::new(CTE_NAME),
@@ -415,6 +454,22 @@ mod tests {
                 "SELECT * FROM foo JOIN bar ON foo.id = bar.id WHERE a = 1 AND b = 2",
                 vec![make_index(&["a", "b"])],
                 None,
+            ),
+            // projection filters on (a,b,c), cte filters on (a,b) but needs c for outer
+            (
+                "SELECT d FROM foo WHERE a = 1 AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT d, c FROM foo WHERE a = 1 AND b = 2) SELECT d FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // ensure order by is preserved
+            (
+                "SELECT * FROM foo WHERE a = 1 AND b = 2 AND c = 3 ORDER BY d",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE a = 1 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3 ORDER BY d",
+                ),
             ),
         ];
 
