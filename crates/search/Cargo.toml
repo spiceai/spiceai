@@ -25,7 +25,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 chunking = { path = "../chunking" }
 serde_json.workspace = true
 itertools.workspace = true
-llms = {path = "../llms"}
+llms = {path = "../llms", optional = true}
 snafu.workspace = true
 tantivy = { workspace = true, optional = true }
 tokio.workspace = true
@@ -35,6 +35,7 @@ util = { path = "../util" }
 [features]
 default = ["text_search"]
 text_search = ["dep:tantivy"]
+llms = ["dep:llms"]
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }

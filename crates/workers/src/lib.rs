@@ -18,5 +18,7 @@ limitations under the License.
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::doc_markdown)]
 
+#[cfg(feature = "llms")]
 pub mod router;
+#[cfg(feature = "llms")]
 pub use router::RouterModel;

@@ -22,4 +22,5 @@ pub mod sample;
 pub mod search;
 pub mod sql;
 pub mod table_schema;
+#[cfg(feature = "models")]
 pub mod web_search;

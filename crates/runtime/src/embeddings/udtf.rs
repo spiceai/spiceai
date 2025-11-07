@@ -50,7 +50,10 @@ use datafusion_expr::{
 };
 use futures::FutureExt;
 use itertools::Itertools;
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use search::generation::CandidateGeneration;
 use search::generation::util::get_primary_keys;
 use std::{

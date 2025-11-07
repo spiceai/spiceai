@@ -34,12 +34,14 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
 use futures::future::try_join_all;
+#[cfg(feature = "llms")]
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use runtime_table_partition::insert::partition_batch;
 use snafu::ResultExt;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
+#[cfg(feature = "llms")]
 use crate::index::s3_vectors::compute_query::EmbedQuery;
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
@@ -66,6 +68,7 @@ pub struct S3Vector {
     /// Additional columns to add as metadata to the S3 vector index from the original dataset columns.
     pub metadata_columns: MetadataColumns,
 
+    #[cfg(feature = "llms")]
     pub compute_query: Arc<dyn Embed>,
 
     pub partition_by: Vec<Expr>,
@@ -80,6 +83,7 @@ impl S3Vector {
         clippy::too_many_arguments
     )]
     #[must_use]
+    #[cfg(feature = "llms")]
     pub fn new(
         table: S3VectorsTable,
         embedded_column: String,

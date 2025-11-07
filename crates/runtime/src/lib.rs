@@ -35,11 +35,14 @@ use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+#[cfg(feature = "models")]
 use crate::model::LLMResponsesModelStore;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
-    internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+    internal_table::Error as InternalTableError,
 };
+#[cfg(feature = "models")]
+use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
@@ -62,12 +65,15 @@ use futures::Stream;
 use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
+#[cfg(feature = "models")]
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
+#[cfg(feature = "models")]
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
+#[cfg(feature = "models")]
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
@@ -92,6 +98,7 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
+#[cfg(feature = "models")]
 pub mod embeddings;
 pub mod extension;
 pub mod federated_table;
@@ -102,6 +109,7 @@ pub mod internal_table;
 mod management;
 mod metrics;
 mod metrics_server;
+#[cfg(feature = "models")]
 pub mod model;
 mod opentelemetry;
 
@@ -449,15 +457,21 @@ pub struct LogErrors(pub bool);
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
+    #[cfg(feature = "models")]
     models: Arc<RwLock<HashMap<String, Model>>>,
+    #[cfg(feature = "models")]
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     // LLMs that support the OpenAI Responses API
+    #[cfg(feature = "models")]
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
+    #[cfg(feature = "models")]
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
+    #[cfg(feature = "models")]
     evals: Arc<RwLock<Vec<Eval>>>,
+    #[cfg(feature = "models")]
     eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
@@ -520,11 +534,13 @@ impl Runtime {
         Arc::clone(&self.status)
     }
 
+    #[cfg(feature = "models")]
     #[must_use]
     pub fn embeds(&self) -> Arc<RwLock<EmbeddingModelStore>> {
         Arc::clone(&self.embeds)
     }
 
+    #[cfg(feature = "models")]
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         Arc::clone(&self.completion_llms)

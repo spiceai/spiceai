@@ -83,7 +83,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-llms = { path = "../llms" }
+llms = { path = "../llms", optional = true }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -143,7 +143,7 @@ rustls-pemfile.workspace = true
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
-search = { path = "../search" }
+search = { path = "../search", default-features = false, features = ["text_search"], optional = false }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -180,7 +180,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
-workers = { path = "../workers" }
+workers = { path = "../workers", optional = true }
 x509-certificate.workspace = true
 
 [dev-dependencies]
@@ -230,7 +230,7 @@ cluster = [
     "dep:ballista-executor",
     "dep:datafusion-proto",
 ]
-cuda = ["llms/cuda"]
+cuda = ["dep:llms", "llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
@@ -253,12 +253,15 @@ imap = ["data_components/imap", "dep:imap"]
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
-metal = ["llms/metal"]
+metal = ["dep:llms", "llms/metal"]
 models = [
     "model_components/full",
     "mcp",
     "dep:strsim",
+    "dep:llms",
+    "dep:workers",
     "runtime-datafusion-udfs/models",
+    "search/llms",
 ]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]

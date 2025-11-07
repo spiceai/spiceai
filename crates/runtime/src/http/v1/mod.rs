@@ -15,14 +15,19 @@ limitations under the License.
 */
 
 pub mod catalogs;
+#[cfg(feature = "models")]
 pub mod chat;
 pub mod datasets;
+#[cfg(feature = "models")]
 pub mod embeddings;
+#[cfg(feature = "models")]
 pub mod eval;
 pub mod iceberg;
 pub mod inference;
+#[cfg(feature = "models")]
 pub mod responses;
 
+#[cfg(feature = "models")]
 pub mod models;
 pub mod nsql;
 pub mod packages;
