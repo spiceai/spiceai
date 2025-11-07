@@ -147,8 +147,12 @@ impl DeltaTable {
         ) {
             (true, Some(sdk_config)) => {
                 let region = storage_options.get("aws_region").map(ToString::to_string);
-                aws_sdk_credential_bridge::from_s3_url_and_config(&table_url, region, sdk_config)
-                    .ok()
+                aws_sdk_credential_bridge::from_s3_url_and_config(
+                    &table_url,
+                    region,
+                    sdk_config.as_ref(),
+                )
+                .ok()
             }
             _ => None,
         };
