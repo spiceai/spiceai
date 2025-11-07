@@ -69,6 +69,7 @@ version = "1.9.0-unstable"
 
 [workspace.dependencies]
 ahash = "0.8.12"
+anyhow = "1.0.99"
 arrow = { version = "56.0.0", features = ["prettyprint"] }
 arrow-array = "56.0.0"
 arrow-buffer = "56.0.0"
@@ -79,7 +80,7 @@ arrow-ipc = "56.0.0"
 arrow-json = "56.0.0"
 arrow-odbc = "18"
 arrow-schema = "56.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "ec48de2d31ecc021a1962c629199ca11cf645fab", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "afaaba87a10e48853e59c809bf296aefbb08c9bd", features = [
     "byot",
 ] }
 async-stream = "0.3.5"
@@ -169,7 +170,7 @@ iceberg-catalog-rest = "0.7.0"
 iceberg-datafusion = "0.7.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
-insta = { version = "1.42.0", features = ["filters"] }
+insta = { version = "1.43.0", features = ["filters"] }
 itertools = "0.14"
 logos = "0.15.1"
 mailparse = "0.15.0"
@@ -215,6 +216,7 @@ secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
+sha2 = "0.10.8"
 snafu = "0.8.6"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "85f6ceb72f13ea7701fd9a0ee03afe7f03cd6a97" } # spiceai
 sqlparser = "0.58.0"
@@ -227,6 +229,7 @@ tiberius = { version = "0.12.3", default-features = false, features = [
     "rustls",
     "chrono",
 ] }
+tokenizers = "0.21.2"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util"] }
 tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",
@@ -247,6 +250,7 @@ tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tract-core = "0.22.0"
 turso = "0.3.0"
 twox-hash = "2.1.2"
 url = "2.5"
