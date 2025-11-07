@@ -12901,6 +12901,7 @@ dependencies = [
  "clickhouse-rs",
  "criterion",
  "csv",
+ "dashmap",
  "data_components",
  "dataformat-json",
  "datafusion",

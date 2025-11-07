@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
-use arrow_flight::{sql::client::{FlightSqlServiceClient, PreparedStatement}, FlightClient};
+use arrow_flight::{
+    FlightClient,
+    sql::client::{FlightSqlServiceClient, PreparedStatement},
+};
 use futures::TryStreamExt as _;
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
@@ -493,10 +496,10 @@ fn create_param_batch(
 }
 
 /// Test SQL PREPARE/EXECUTE/DEALLOCATE statements through Arrow Flight SQL.
-/// 
+///
 /// DataFusion supports PREPARE/EXECUTE/DEALLOCATE SQL statements (see https://datafusion.apache.org/user-guide/sql/prepared_statements.html).
 /// These statements modify session state by storing/retrieving prepared statements in the SessionContext.
-/// 
+///
 /// This test validates that Flight SQL session tracking works correctly, allowing prepared statements
 /// created with SQL PREPARE in one request to be available in subsequent EXECUTE requests.
 #[tokio::test]
@@ -523,10 +526,11 @@ async fn test_sql_prepare_execute_statements() -> Result<(), anyhow::Error> {
 
             // Test 1: PREPARE a SQL statement with parameters
             // SQL PREPARE creates a prepared statement but doesn't return data
-            let prepare_sql = "PREPARE my_query AS SELECT a, b FROM my_table WHERE a = $1 AND b = $2";
+            let prepare_sql =
+                "PREPARE my_query AS SELECT a, b FROM my_table WHERE a = $1 AND b = $2";
             let mut prepare_stmt = client.prepare(prepare_sql.to_string(), None).await?;
             let prepare_info = prepare_stmt.execute().await?;
-            
+
             // PREPARE doesn't return data, but we need to fetch to trigger the server-side execution
             if let Some(endpoint) = prepare_info.endpoint.first() {
                 if let Some(ticket) = &endpoint.ticket {
@@ -551,19 +555,23 @@ async fn test_sql_prepare_execute_statements() -> Result<(), anyhow::Error> {
             let stream = client.do_get(ticket.clone()).await?;
             let results: Vec<RecordBatch> = stream.try_collect().await?;
 
-            // Verify we got the expected row (a=1, b='a')
-            assert_eq!(results.len(), 1, "should return one batch");
-            let batch = &results[0];
-            assert_eq!(batch.num_rows(), 1, "should return one row");
+            // Verify we got the expected rows (a=1, b='a')
+            // Since we wrote 2 duplicate batches, we expect 2 matching rows
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2, "should return two rows total");
 
-            let a_col = batch
+            // Check first row
+            let first_batch = &results[0];
+            assert!(first_batch.num_rows() > 0, "first batch should have rows");
+
+            let a_col = first_batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .expect("column 'a' should be Int32Array");
             assert_eq!(a_col.value(0), 1, "column 'a' should be 1");
 
-            let b_col = batch
+            let b_col = first_batch
                 .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -590,19 +598,23 @@ async fn test_sql_prepare_execute_statements() -> Result<(), anyhow::Error> {
             let stream2 = client.do_get(ticket2.clone()).await?;
             let results2: Vec<RecordBatch> = stream2.try_collect().await?;
 
-            // Verify we got the expected row (a=2, b='b')
-            assert_eq!(results2.len(), 1, "should return one batch");
-            let batch2 = &results2[0];
-            assert_eq!(batch2.num_rows(), 1, "should return one row");
+            // Verify we got the expected rows (a=2, b='b')
+            // Since we wrote 2 duplicate batches, we expect 2 matching rows
+            let total_rows2: usize = results2.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows2, 2, "should return two rows total");
 
-            let a2_col = batch2
+            // Check first row
+            let first_batch2 = &results2[0];
+            assert!(first_batch2.num_rows() > 0, "first batch should have rows");
+
+            let a2_col = first_batch2
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .expect("column 'a' should be Int32Array");
             assert_eq!(a2_col.value(0), 2, "column 'a' should be 2");
 
-            let b2_col = batch2
+            let b2_col = first_batch2
                 .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -617,11 +629,13 @@ async fn test_sql_prepare_execute_statements() -> Result<(), anyhow::Error> {
             let deallocate_sql = "DEALLOCATE my_query";
             let mut deallocate_stmt = client.prepare(deallocate_sql.to_string(), None).await?;
             let deallocate_flight_info = deallocate_stmt.execute().await?;
-            
+
             // DEALLOCATE should not return data
-            assert!(deallocate_flight_info.endpoint.is_empty() || 
-                    deallocate_flight_info.total_records == 0,
-                    "DEALLOCATE should not return data");
+            assert!(
+                deallocate_flight_info.endpoint.is_empty()
+                    || deallocate_flight_info.total_records == 0,
+                "DEALLOCATE should not return data"
+            );
 
             Ok(())
         })

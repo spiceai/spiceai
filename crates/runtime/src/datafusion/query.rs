@@ -149,10 +149,12 @@ impl Query {
     #[allow(clippy::unnecessary_wraps)]
     fn get_session_state(&self, request_context: &Arc<RequestContext>) -> Result<SessionState> {
         // Check if there's a Flight SQL session-specific context
-        if let Some(flight_session) = request_context.extension::<super::flight_session_extension::FlightSessionExtension>() {
+        if let Some(flight_session) =
+            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
+        {
             return Ok(flight_session.session_context().state());
         }
-        
+
         // Otherwise use the shared context
         Ok(self.df.ctx.state())
     }
@@ -160,12 +162,14 @@ impl Query {
     #[cfg(feature = "cluster")]
     fn get_session_state(&self, request_context: &Arc<RequestContext>) -> Result<SessionState> {
         // Check if there's a Flight SQL session-specific context
-        if let Some(flight_session) = request_context.extension::<super::flight_session_extension::FlightSessionExtension>() {
+        if let Some(flight_session) =
+            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
+        {
             // For cluster mode with session context, we don't apply cluster modifications
             // since the session state should remain local to preserve prepared statements
             return Ok(flight_session.session_context().state());
         }
-        
+
         if !matches!(self.df.cluster_config.mode, Some(ClusterMode::Scheduler)) {
             return Ok(self.df.ctx.state());
         }
@@ -361,21 +365,8 @@ impl Query {
             let (res_stream, physical_plan) = if matches!(&*plan, LogicalPlan::Statement(_)) {
                 // For Statement plans, use SessionContext::execute_logical_plan()
                 // which handles PREPARE/EXECUTE/DEALLOCATE by modifying session state
-                let stream = match ctx.df.ctx.execute_logical_plan(plan.as_ref().clone()).await {
-                    Ok(dataframe) => match dataframe.execute_stream().await {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            let error_code = ErrorCode::from(&e);
-                            handle_error!(
-                                tracker,
-                                &request_context,
-                                error_code,
-                                e,
-                                UnableToExecuteQuery
-                            )
-                        }
-                    },
+                let dataframe = match ctx.df.ctx.execute_logical_plan(plan.as_ref().clone()).await {
+                    Ok(df) => df,
                     Err(e) => {
                         let e = find_datafusion_root(e);
                         let error_code = ErrorCode::from(&e);
@@ -388,7 +379,40 @@ impl Query {
                         )
                     }
                 };
-                (stream, None)
+
+                // Create a physical plan from the dataframe and execute it with our own TaskContext
+                // that includes the request context. This ensures BytesProcessedExec has access to it.
+                let df_plan = match dataframe.create_physical_plan().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let e = find_datafusion_root(e);
+                        let error_code = ErrorCode::from(&e);
+                        handle_error!(
+                            tracker,
+                            &request_context,
+                            error_code,
+                            e,
+                            UnableToExecuteQuery
+                        )
+                    }
+                };
+
+                let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+                let stream = match execute_stream(Arc::clone(&df_plan), task_ctx) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let e = find_datafusion_root(e);
+                        let error_code = ErrorCode::from(&e);
+                        handle_error!(
+                            tracker,
+                            &request_context,
+                            error_code,
+                            e,
+                            UnableToExecuteQuery
+                        )
+                    }
+                };
+                (stream, Some(df_plan))
             } else {
                 // For regular plans, use the standard physical plan execution
                 let physical_plan = match session_for_execution.create_physical_plan(&plan).await {
@@ -425,17 +449,21 @@ impl Query {
                 (stream, Some(physical_plan))
             };
 
-            let plan_schema = Arc::clone(plan.schema().inner());
-            let res_schema = res_stream.schema();
+            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE)
+            // as their logical plan schema may differ from the actual execution result
+            if !matches!(&*plan, LogicalPlan::Statement(_)) {
+                let plan_schema = Arc::clone(plan.schema().inner());
+                let res_schema = res_stream.schema();
 
-            if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
-                handle_error!(
-                    tracker,
-                    &request_context,
-                    ErrorCode::InternalError,
-                    e,
-                    SchemaMismatch
-                )
+                if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        ErrorCode::InternalError,
+                        e,
+                        SchemaMismatch
+                    )
+                }
             }
 
             let final_stream = if cache_manager.should_cache_results() {

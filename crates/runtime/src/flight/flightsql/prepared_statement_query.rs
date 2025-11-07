@@ -387,12 +387,17 @@ pub(crate) async fn do_get(
     };
 
     // Use the standard flow with the (possibly rewritten) SQL
-    let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
-        datafusion,
-        &sql_to_execute,
-        param_values,
-    ))
-    .await?;
+    // Ensure the query execution happens within the request context scope
+    let (output, from_cache) = context
+        .scope(async {
+            Box::pin(Service::sql_to_flight_stream(
+                datafusion,
+                &sql_to_execute,
+                param_values,
+            ))
+            .await
+        })
+        .await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
@@ -416,7 +421,7 @@ pub(crate) async fn do_put_query(
     let mut decoder = FlightDataDecoder::new(streaming_flight);
 
     // Read the schema first - Arrow Flight always sends schema before batches
-    let _schema = decode_schema(&mut decoder).await?;
+    let schema = decode_schema(&mut decoder).await?;
 
     tracing::info!("do_put_query: Parameter schema: {:?}", schema);
 
@@ -442,7 +447,7 @@ pub(crate) async fn do_put_query(
         }
     }
     encoder.finish().map_err(error_to_status)?;
-    
+
     if total_rows > 1 {
         return Err(Status::invalid_argument(
             "parameters should contain a single row",
@@ -1170,7 +1175,9 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Diana", "Eve"])),
+                Arc::new(StringArray::from(vec![
+                    "Alice", "Bob", "Charlie", "Diana", "Eve",
+                ])),
                 Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
             ],
         )
@@ -1181,17 +1188,24 @@ mod tests {
             .expect("should register table");
 
         // Test 1: PREPARE a statement with parameters
-        let prepare_sql = "PREPARE my_query AS SELECT id, name, value FROM users WHERE id = $1 AND value > $2";
+        let prepare_sql =
+            "PREPARE my_query AS SELECT id, name, value FROM users WHERE id = $1 AND value > $2";
         let prepare_df = ctx.sql(prepare_sql).await.expect("PREPARE should succeed");
 
         // Execute PREPARE (this creates the prepared statement but returns no data)
-        let prepare_result = prepare_df.collect().await.expect("PREPARE execution should succeed");
+        let prepare_result = prepare_df
+            .collect()
+            .await
+            .expect("PREPARE execution should succeed");
         assert_eq!(prepare_result.len(), 0, "PREPARE should return no rows");
 
         // Test 2: EXECUTE the prepared statement with parameters
         let execute_sql = "EXECUTE my_query(2, 150)";
         let execute_df = ctx.sql(execute_sql).await.expect("EXECUTE should succeed");
-        let execute_result = execute_df.collect().await.expect("EXECUTE should return results");
+        let execute_result = execute_df
+            .collect()
+            .await
+            .expect("EXECUTE should return results");
 
         // Verify results: should return row with id=2 (Bob, value=200) since 200 > 150
         assert_eq!(execute_result.len(), 1, "should return one batch");
@@ -1222,7 +1236,10 @@ mod tests {
         // Test 3: EXECUTE the same prepared statement with different parameters
         let execute2_sql = "EXECUTE my_query(4, 350)";
         let execute2_df = ctx.sql(execute2_sql).await.expect("EXECUTE should succeed");
-        let execute2_result = execute2_df.collect().await.expect("EXECUTE should return results");
+        let execute2_result = execute2_df
+            .collect()
+            .await
+            .expect("EXECUTE should return results");
 
         // Verify results: should return row with id=4 (Diana, value=400) since 400 > 350
         assert_eq!(execute2_result.len(), 1, "should return one batch");
@@ -1253,17 +1270,33 @@ mod tests {
         // Test 4: EXECUTE with parameters that return no rows
         let execute3_sql = "EXECUTE my_query(3, 500)";
         let execute3_df = ctx.sql(execute3_sql).await.expect("EXECUTE should succeed");
-        let execute3_result = execute3_df.collect().await.expect("EXECUTE should return results");
+        let execute3_result = execute3_df
+            .collect()
+            .await
+            .expect("EXECUTE should return results");
 
         // Verify results: should return no rows (id=3 has value=300, which is not > 500)
         let total_rows: usize = execute3_result.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 0, "should return no rows when filter doesn't match");
+        assert_eq!(
+            total_rows, 0,
+            "should return no rows when filter doesn't match"
+        );
 
         // Test 5: DEALLOCATE the prepared statement
         let deallocate_sql = "DEALLOCATE my_query";
-        let deallocate_df = ctx.sql(deallocate_sql).await.expect("DEALLOCATE should succeed");
-        let deallocate_result = deallocate_df.collect().await.expect("DEALLOCATE should succeed");
-        assert_eq!(deallocate_result.len(), 0, "DEALLOCATE should return no rows");
+        let deallocate_df = ctx
+            .sql(deallocate_sql)
+            .await
+            .expect("DEALLOCATE should succeed");
+        let deallocate_result = deallocate_df
+            .collect()
+            .await
+            .expect("DEALLOCATE should succeed");
+        assert_eq!(
+            deallocate_result.len(),
+            0,
+            "DEALLOCATE should return no rows"
+        );
 
         // This test verifies:
         // 1. PREPARE statement creates a prepared statement with parameters
