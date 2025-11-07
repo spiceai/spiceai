@@ -36,13 +36,13 @@ use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 #[cfg(feature = "models")]
+use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
+#[cfg(feature = "models")]
 use crate::model::LLMResponsesModelStore;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError,
 };
-#[cfg(feature = "models")]
-use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};

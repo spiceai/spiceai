@@ -260,6 +260,7 @@ models = [
     "dep:strsim",
     "dep:llms",
     "dep:workers",
+    "workers/llms",
     "runtime-datafusion-udfs/models",
     "search/llms",
 ]

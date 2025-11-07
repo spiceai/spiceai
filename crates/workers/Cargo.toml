@@ -25,4 +25,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [features]
-default = ["dep:llms"]
+default = []
+llms = ["dep:llms"]

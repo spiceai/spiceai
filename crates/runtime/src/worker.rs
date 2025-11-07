@@ -131,12 +131,10 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
             )))
         }
         #[cfg(not(feature = "models"))]
-        WorkerType::LoadBalance => {
-            Err(super::Error::FailedToInitializeWorker {
-                worker_name: worker.name.clone(),
-                source: "LoadBalance workers require the 'models' feature to be enabled".into(),
-            })
-        }
+        WorkerType::LoadBalance => Err(super::Error::FailedToInitializeWorker {
+            worker_name: worker.name.clone(),
+            source: "LoadBalance workers require the 'models' feature to be enabled".into(),
+        }),
         WorkerType::Sql => {
             let Some(sql) = &worker.sql else {
                 unreachable!("SQL worker must have sql defined");
