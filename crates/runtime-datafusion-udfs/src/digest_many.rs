@@ -161,10 +161,61 @@ pub fn digest_many(args: Vec<Expr>, digest: &str) -> Expr {
 #[cfg(test)]
 mod tests {
     use crate::digest_many::{DigestMany, digest_many};
+
+    use arrow::array::record_batch;
+    use arrow::util::pretty::pretty_format_batches;
     use datafusion::common::Result as DataFusionResult;
     use datafusion::logical_expr::{col, lit};
     use datafusion::prelude::{SessionContext, make_array, named_struct};
     use std::process::ExitCode;
+
+    #[tokio::test]
+    async fn test_digest_many_record_batch() -> DataFusionResult<ExitCode> {
+        let ctx = SessionContext::new();
+        ctx.register_udf(DigestMany::default().into());
+        let _ = ctx.register_batch(
+            "tbl",
+            record_batch!(
+                ("a", Int32, [1, 2, 3, 4, 5, 6]),
+                (
+                    "b",
+                    Float64,
+                    [Some(4.0), None, Some(5.0), Some(6.0), Some(7.0), Some(8.0)]
+                ),
+                (
+                    "c",
+                    Utf8,
+                    ["alpha", "beta", "gamma", "alpha", "beta", "gamma"]
+                )
+            )
+            .expect("couldn't make record batch"),
+        );
+
+        let data = ctx
+            .sql("select a, b, c, digest_many(a, b, c, 'md5') as 'digest_many(a, b, c)', digest_many(c, 'md5') as 'digest_many(c)' from tbl")
+            .await
+            .expect("failed to prepare SQL")
+            .collect()
+            .await
+            .expect("failed to prepare SQL");
+        insta::assert_snapshot!(
+            pretty_format_batches(data.as_slice()).expect("couldn't format batches"),
+            @r"
+        +---+-----+-------+----------------------------------+----------------------------------+
+        | a | b   | c     | digest_many(a, b, c)             | digest_many(c)                   |
+        +---+-----+-------+----------------------------------+----------------------------------+
+        | 1 | 4.0 | alpha | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
+        | 2 |     | beta  | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
+        | 3 | 5.0 | gamma | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
+        | 4 | 6.0 | alpha | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
+        | 5 | 7.0 | beta  | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
+        | 6 | 8.0 | gamma | 38ed956ed6786325258e8595c62c3c90 | cd30c92d275235edee4554f718f1436c |
+        +---+-----+-------+----------------------------------+----------------------------------+
+        "
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
 
     #[tokio::test]
     async fn test_digest_many() -> DataFusionResult<ExitCode> {
