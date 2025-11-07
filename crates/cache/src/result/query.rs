@@ -38,6 +38,39 @@ pub struct CachedQueryResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
     pub input_tables: Arc<HashSet<TableReference>>,
+    /// Timestamp (seconds) captured relative to the owning cache provider's start.
+    /// Stored as `u32` because caches expose uptime in second precision.
+    cached_at_offset_secs: u32,
+}
+
+impl CachedQueryResult {
+    /// Create a new cached query result with the provided cached-at offset (seconds).
+    #[must_use]
+    pub fn new(
+        records: Arc<Vec<RecordBatch>>,
+        schema: Arc<Schema>,
+        input_tables: Arc<HashSet<TableReference>>,
+        cached_at_offset_secs: u32,
+    ) -> Self {
+        Self {
+            records,
+            schema,
+            input_tables,
+            cached_at_offset_secs,
+        }
+    }
+
+    /// Check if the cached data is stale (older than the given TTL in seconds)
+    #[must_use]
+    pub fn is_stale(&self, ttl_seconds: u64, now_offset_secs: u32) -> bool {
+        let age = u64::from(now_offset_secs.saturating_sub(self.cached_at_offset_secs));
+        age > ttl_seconds
+    }
+
+    #[must_use]
+    pub fn cached_at_offset_secs(&self) -> u32 {
+        self.cached_at_offset_secs
+    }
 }
 
 impl Sizeable for CachedQueryResult {

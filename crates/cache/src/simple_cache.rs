@@ -23,10 +23,11 @@ use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
+use std::convert::TryFrom;
 use std::fmt::Display;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // 'static is required by a bound from moka::Cache
 pub struct SimpleCache<
@@ -37,6 +38,7 @@ pub struct SimpleCache<
     hasher: T,
     max_size: u64,
     ttl: Duration,
+    initial_instant: Instant,
 }
 
 impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> Display
@@ -78,6 +80,7 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
             hasher,
             ttl,
             max_size: cache_max_size,
+            initial_instant: Instant::now(),
         }
     }
 }
@@ -129,6 +132,12 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     async fn checkpoint(&self) {
         self.cache.run_pending_tasks().await;
     }
+
+    fn uptime_secs(&self) -> u32 {
+        let secs = self.initial_instant.elapsed().as_secs();
+        let capped_secs = secs.min(u64::from(u32::MAX));
+        u32::try_from(capped_secs).unwrap_or(u32::MAX)
+    }
 }
 
 #[async_trait]
@@ -179,11 +188,12 @@ mod tests {
             table: Arc::from("test_table"),
         });
 
-        CachedQueryResult {
-            records: Arc::new(vec![record_batch.clone()]),
-            schema: Arc::new(record_batch.schema().as_ref().to_owned()),
-            input_tables: Arc::new(input_tables),
-        }
+        CachedQueryResult::new(
+            Arc::new(vec![record_batch.clone()]),
+            Arc::new(record_batch.schema().as_ref().to_owned()),
+            Arc::new(input_tables),
+            0,
+        )
     }
 
     #[rstest]

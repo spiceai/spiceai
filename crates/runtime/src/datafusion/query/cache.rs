@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use super::{
-    BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
+    BindingParametersSnafu, Query, QueryResult, QueryTracker, UnsupportedStaleWhileRevalidateSnafu,
+    attach_query_tracker_to_stream,
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
@@ -31,7 +32,7 @@ use datafusion::{
     sql::TableReference,
 };
 use runtime_request_context::{CacheControl, CacheKeyType, RequestContext};
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
 use tracing::Span;
 
@@ -176,7 +177,10 @@ impl Query {
         };
 
         let request_raw_cache_key = match request_context.cache_control() {
-            CacheControl::Cache(CacheKeyType::Default) => plan_raw_cache_key,
+            CacheControl::Cache(CacheKeyType::Default)
+            | CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, _) => {
+                plan_raw_cache_key
+            }
             _ => sql_or_client_raw_key,
         }
         .unwrap_or(sql_raw_cache_key);
@@ -199,6 +203,7 @@ impl Query {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
         df: &DataFusion,
         request_context: Arc<RequestContext>,
@@ -214,11 +219,49 @@ impl Query {
 
         let cache_control = request_context.cache_control();
 
+        // Validate that stale-while-revalidate is only used with SQL cache keys
+        if let CacheControl::CacheWithStaleWhileRevalidate(cache_key_type, _) = cache_control {
+            match (&key, cache_key_type) {
+                (CacheKey::Query(_, _), CacheKeyType::Raw) => {
+                    // This is the only supported combination
+                }
+                (CacheKey::LogicalPlan(_), _) => {
+                    ensure!(
+                        false,
+                        UnsupportedStaleWhileRevalidateSnafu {
+                            cache_key_type: "default (plan)"
+                        }
+                    );
+                }
+                (CacheKey::ClientSupplied(_), _) => {
+                    ensure!(
+                        false,
+                        UnsupportedStaleWhileRevalidateSnafu {
+                            cache_key_type: "client-supplied"
+                        }
+                    );
+                }
+                _ => {
+                    ensure!(
+                        false,
+                        UnsupportedStaleWhileRevalidateSnafu {
+                            cache_key_type: format!("{cache_key_type:?}")
+                        }
+                    );
+                }
+            }
+        }
+
         // Validate that the provided cache key is the correct type for this request
         match (cache_control, &key) {
             (CacheControl::Cache(CacheKeyType::Default), CacheKey::LogicalPlan(_))
-            | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _))
-            | (CacheControl::Cache(CacheKeyType::ClientSupplied), CacheKey::ClientSupplied(_)) => { /* no-op */
+            | (
+                CacheControl::Cache(CacheKeyType::Raw)
+                | CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Raw, _),
+                CacheKey::Query(_, _),
+            )
+            | (CacheControl::Cache(CacheKeyType::ClientSupplied), CacheKey::ClientSupplied(_)) => {
+                /* no-op */
             }
             (CacheControl::NoCache, _) => {
                 return Ok(CacheResponse::from(
@@ -251,9 +294,21 @@ impl Query {
         };
 
         tracker = tracker.map(|t| {
-            t.datasets(cached_result.input_tables)
+            t.datasets(Arc::clone(&cached_result.input_tables))
                 .results_cache_hit(true)
         });
+
+        // If stale-while-revalidate is enabled, check if data is stale and trigger background revalidation
+        if let CacheControl::CacheWithStaleWhileRevalidate(_, _) = cache_control {
+            let ttl_seconds = cache_provider.ttl().as_secs();
+            let now_offset_secs = cache_provider.uptime_secs();
+            if cached_result.is_stale(ttl_seconds, now_offset_secs) {
+                tracing::debug!(
+                    "Cache entry is stale, triggering background revalidation for stale-while-revalidate"
+                );
+                Self::trigger_background_query_revalidation(df, key, &request_context);
+            }
+        }
 
         let record_batch_stream = CachedStream::new(cached_result.records, cached_result.schema);
 
@@ -281,6 +336,67 @@ impl Query {
             Some(provider) if provider.cache_is_enabled_for_plan(plan) => cache_status,
             _ => CacheStatus::CacheDisabled,
         }
+    }
+
+    /// Trigger background query re-execution for stale-while-revalidate.
+    ///
+    /// This spawns a background task that re-executes the original query, which will:
+    /// 1. Go through acceleration if available, or the data source
+    /// 2. Naturally populate the cache with fresh data via the normal caching mechanism
+    ///
+    /// The key insight is we don't need to trigger acceleration refresh - we just
+    /// re-execute the query and let it flow through the normal query path.
+    ///
+    /// Note: This should only be called with `CacheKey::Query` since validation rejects
+    /// stale-while-revalidate with other cache key types.
+    fn trigger_background_query_revalidation(
+        df: &DataFusion,
+        cache_key: &CacheKey<'_>,
+        _request_context: &Arc<RequestContext>,
+    ) {
+        let ctx = Arc::clone(&df.ctx);
+
+        // Extract the SQL from the cache key - we know this is a Query variant
+        // because validation rejects stale-while-revalidate with other key types
+        let sql = if let CacheKey::Query(sql, _) = cache_key {
+            (*sql).to_string()
+        } else {
+            // This should never happen due to validation, but handle gracefully
+            tracing::error!(
+                "trigger_background_query_revalidation called with non-SQL cache key. \
+                This indicates a bug - validation should have rejected this earlier."
+            );
+            return;
+        };
+
+        tokio::spawn(async move {
+            tracing::debug!("Background revalidation: re-executing query");
+
+            // Execute the query in the background - this will go through acceleration/datasource
+            // and automatically populate the cache with fresh results
+            match ctx.sql(&sql).await {
+                Ok(df_result) => {
+                    // Collect the results to ensure the query executes and cache is populated
+                    match df_result.collect().await {
+                        Ok(batches) => {
+                            tracing::debug!(
+                                "Background revalidation completed successfully, {} batches cached",
+                                batches.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Background revalidation failed during collection: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Background revalidation failed to execute query: {}", e);
+                }
+            }
+        });
     }
 
     pub(super) fn wrap_stream_with_cache(

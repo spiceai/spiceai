@@ -98,6 +98,13 @@ pub enum Error {
 
     #[snafu(display("Failed to set parameters in logical plan: {source}"))]
     BindingParameters { source: DataFusionError },
+
+    #[snafu(display(
+        "Cache-Control header specifies 'stale-while-revalidate' which is only supported with cache_key_type: sql (raw). \
+        The current configuration uses cache_key_type: {cache_key_type}. \
+        Either remove 'stale-while-revalidate' from the Cache-Control header or change cache_key_type to 'sql'."
+    ))]
+    UnsupportedStaleWhileRevalidate { cache_key_type: String },
 }
 
 impl Error {
