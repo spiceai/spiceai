@@ -31,7 +31,7 @@ use datafusion_table_providers::util::retriable_error::{
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
-use runtime_datafusion::extension::bytes_processed::BytesProcessedExtensionPlanner;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
@@ -845,13 +845,8 @@ impl RefreshTask {
             .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
 
-        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
-            Arc::new(BytesProcessedExtensionPlanner::new(
-                Box::new(track_bytes_processed),
-                cfg!(feature = "cluster"),
-            )),
-            Arc::new(IndexTableScanExtensionPlanner::new()),
-        ];
+        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
+            vec![Arc::new(IndexTableScanExtensionPlanner::new())];
 
         let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
 
@@ -868,6 +863,9 @@ impl RefreshTask {
                 ExtensionPlanQueryPlanner::from_extension_planners(extension_planners),
             ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
 

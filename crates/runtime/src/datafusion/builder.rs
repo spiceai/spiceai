@@ -55,10 +55,7 @@ use datafusion_optimizer_rules::{
     physical_plan::EmptyHashJoinExecPhysicalOptimization,
 };
 use runtime_datafusion::{
-    extension::{
-        ExtensionPlanQueryPlanner,
-        bytes_processed::{BytesProcessedExtensionPlanner, BytesProcessedOptimizerRule},
-    },
+    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
@@ -246,6 +243,9 @@ impl DataFusionBuilder {
             ))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
             .with_physical_optimizer_rule(DuckDBIntermediateIndexMaterializationOptimizer::new())
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
 
@@ -258,7 +258,6 @@ impl DataFusionBuilder {
         }
 
         let ctx = SessionContext::new_with_state(state);
-        ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
 
         // Add cache invalidation optimizer rule if caching is enabled
         if let Some(caching) = &self.caching {
@@ -456,10 +455,6 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
     vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
-        Arc::new(BytesProcessedExtensionPlanner::new(
-            Box::new(track_bytes_processed),
-            cfg!(feature = "cluster"),
-        )),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
     ]
 }
