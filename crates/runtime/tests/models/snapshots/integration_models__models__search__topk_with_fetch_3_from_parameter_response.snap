@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(result.clone())
+---
+[
+  {
+    "plan": "Sort: vector_search(spice.public.basic_embedding_search, Utf8(\"basic\"), Int64(3)).score DESC NULLS FIRST\n  TableScan: vector_search(spice.public.basic_embedding_search, Utf8(\"basic\"), Int64(3)) projection=[cp_catalog_page_sk, score]",
+    "plan_type": "logical_plan"
+  },
+  {
+    "plan": "SortExec: expr=[score@1 DESC], preserve_partitioning=[false]\n  SortExec: TopK(fetch=3), expr=[score@1 DESC NULLS LAST], preserve_partitioning=[false]\n    ProjectionExec: expr=[cp_catalog_page_sk@0 as cp_catalog_page_sk, 1 - cosine_distance([0.13316624, 0.18349423, -0.17905867, -0.20656988, 0.16027938, -0.0061542727, 0.012938258, -0.2597924, 0.06275041, -0.16063577, -0.19151735, 0.060857393, -0.050651014, 0.03269419, -0.10856374, -0.21360004, -0.015287735, -0.031445533, 0.049624007, 0.16654463, 0.061165046, -0.13273938, -0.037651494, -0.17008226, -0.1486924, 0.2550524, 0.22068529, -0.03908632, -0.07962663, -0.07198052, -0.025799057, 0.09298251, -0.02110908, 0.08045579, -0.02138204, 0.13996263, 0.04155522, -0.09697707, 0.028812692, -0.004573778, -0.00114884, -0.028096175, -0.0064520277, 0.20784838, -0.06391946, -0.091238916, 0.071811266, -0.12634371, 0.01965399, 0.14142583, 0.099721, 0.11531701, 0.03847638, -0.08645258, 0.28999585, 0.2131827, 0.09401482, -0.005640828, 0.04911459, 0.098381855, 0.20607963, -0.062285192, 0.19730423, -0.05545756], CAST(cp_description_embedding@1 AS List(Field { name: \"item\", data_type: Float32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }))) as score]\n      SchemaCastScanExec\n        BytesProcessedExec\n          DataSourceExec: partitions=1, partition_sizes=[1]\n",
+    "plan_type": "physical_plan"
+  }
+]

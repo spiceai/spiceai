@@ -43,6 +43,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream as DFStream;
+use datafusion::prelude::SessionConfig;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::Constraints;
 use datafusion_execution::SendableRecordBatchStream;
@@ -401,7 +402,8 @@ impl CayenneTableProvider {
         })?;
 
         let format = Arc::new(VortexFormat::default());
-        let listing_options = ListingOptions::new(format);
+        let listing_options =
+            ListingOptions::new(format).with_session_config_options(&SessionConfig::default());
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
