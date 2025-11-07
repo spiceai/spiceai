@@ -465,7 +465,11 @@ impl DataConnectorFactory for DatabricksFactory {
         if let Some(runtime) = params.runtime {
             Box::pin(async move {
                 // Initialize the AWS SDK and make it available.
-                let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
+                if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+                    tracing::warn!(
+                        "Unable to initialize AWS credentials for Databricks connector: {err}"
+                    );
+                }
                 let databricks =
                     Databricks::new(params.parameters, runtime.token_provider_registry()).await?;
                 Ok(Arc::new(databricks) as Arc<dyn DataConnector>)

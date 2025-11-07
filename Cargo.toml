@@ -58,7 +58,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.88"
-version = "1.7.2"
+version = "1.7.3"
 
 [workspace.dependencies]
 ahash = "0.8.12"
@@ -100,6 +100,7 @@ bigdecimal = "0.4.7"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
 charset = "0.1.5"
+util = { path = "crates/util" }
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
@@ -193,7 +194,7 @@ tiberius = { version = "0.12.3", default-features = false, features = [
     "rustls",
     "chrono",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util"] }
 tokio-postgres = { version = "0.7.13", features = [
     "with-chrono-0_4",
     "with-uuid-1",

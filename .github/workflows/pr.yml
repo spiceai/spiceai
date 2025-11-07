@@ -54,7 +54,6 @@ jobs:
               - 'test/**'
               - 'tools/**'
               - 'install/**'
-              - '.github/workflows/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'go.mod'
