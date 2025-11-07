@@ -34,11 +34,15 @@ tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 uuid = { version = "1.11", features = ["v7"] }
+vortex = { workspace = true }
 vortex-datafusion = { workspace = true }
 
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
-aegis = { version = "0.9.3", default-features = false, features = ["std", "pure-rust"] }
+aegis = { version = "0.9.3", default-features = false, features = [
+    "std",
+    "pure-rust",
+] }
 
 [features]
 default = []
@@ -52,5 +56,5 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 
 [[bench]]
-name = "metastore_operations"
 harness = false
+name = "metastore_operations"

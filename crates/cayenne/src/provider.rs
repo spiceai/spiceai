@@ -61,6 +61,8 @@ use std::borrow::Cow;
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use tokio::task;
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
@@ -400,7 +402,8 @@ impl CayenneTableProvider {
             }
         })?;
 
-        let format = Arc::new(VortexFormat::default());
+        let session = VortexSession::default();
+        let format = Arc::new(VortexFormat::new(session));
         let listing_options = ListingOptions::new(format);
 
         let config = ListingTableConfig::new(table_url)
