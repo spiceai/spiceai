@@ -198,6 +198,8 @@ pub struct LoadArgs {
     pub concurrency: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub random_param_set_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_clients: Option<bool>,
 }
 
 /// Represents the type of runner to use in the action
