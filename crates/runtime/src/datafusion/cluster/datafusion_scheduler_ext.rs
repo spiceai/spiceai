@@ -1,3 +1,4 @@
+use crate::datafusion::DataFusion;
 use async_trait::async_trait;
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use ballista_scheduler::state::SchedulerState;
@@ -5,7 +6,6 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use runtime::datafusion::DataFusion;
 use std::sync::Arc;
 use std::time::Duration;
 

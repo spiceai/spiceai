@@ -1,4 +1,3 @@
-use crate::concrete;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -11,6 +10,7 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_optimizer_rules::common::plan_node_key::PlanNodeKey;
 use datafusion_optimizer_rules::common::search_visitor::SearchVisitor;
+use datafusion_optimizer_rules::concrete;
 use std::collections::HashMap;
 use std::sync::Arc;
 

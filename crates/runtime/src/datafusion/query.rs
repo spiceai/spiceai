@@ -56,7 +56,6 @@ use {
     crate::datafusion::cluster::config::SpiceClusterConfig,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
-    datafusion::execution::SessionStateBuilder,
     datafusion::physical_planner::DefaultPhysicalPlanner,
     datafusion_proto::protobuf::LogicalPlanNode,
 };
@@ -72,7 +71,6 @@ use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
-use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};

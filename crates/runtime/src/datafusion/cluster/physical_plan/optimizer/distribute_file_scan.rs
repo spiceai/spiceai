@@ -1,4 +1,3 @@
-use crate::concrete;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
@@ -14,6 +13,7 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
+use datafusion_optimizer_rules::concrete;
 use itertools::Itertools;
 use std::cmp::max;
 use std::sync::Arc;

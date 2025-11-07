@@ -46,7 +46,7 @@ impl SelectionWithIdents {
         let _ = visit_expressions(expr, |e| {
             if let Expr::Identifier(id) = e {
                 references.insert(id.value.clone());
-            };
+            }
 
             ControlFlow::<()>::Continue(())
         });
@@ -59,6 +59,7 @@ impl SelectionWithIdents {
 }
 
 impl DuckDBIntermediateIndexMaterializationOptimizer {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(DuckDBIntermediateIndexMaterializationOptimizer {})
     }
@@ -85,11 +86,11 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         selections
     }
 
-    /// Given the SELECT component of a statement and bound DuckDB indexes, attempt to build a
+    /// Given the SELECT component of a statement and bound `DuckDB` indexes, attempt to build a
     /// materialized CTE with filters _only_ on index columns
     fn build_cte(
-        select: &Box<Select>,
-        indexes: &Vec<(ColumnReference, IndexType)>,
+        select: &Select,
+        indexes: &[(ColumnReference, IndexType)],
     ) -> Option<(Cte, Vec<SelectionWithIdents>)> {
         // There must be a `WHERE` otherwise we cannot apply the optimization
         let selection = select.selection.as_ref()?;
@@ -102,16 +103,13 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .collect::<HashSet<_>>();
 
         // Find the first index we can bind (we can only bind one)
-        let bindable_index = indexes
-            .iter()
-            .filter_map(|(cr, _)| {
-                if cr.columns.iter().all(|c| all_filter_idents.contains(c)) {
-                    Some(cr.columns.iter().cloned().collect::<HashSet<_>>())
-                } else {
-                    None
-                }
-            })
-            .next()?;
+        let bindable_index = indexes.iter().find_map(|(cr, _)| {
+            if cr.columns.iter().all(|c| all_filter_idents.contains(c)) {
+                Some(cr.columns.iter().cloned().collect::<HashSet<_>>())
+            } else {
+                None
+            }
+        })?;
 
         // This query is already optimal
         if bindable_index == all_filter_idents {
@@ -159,7 +157,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
         let cte_query = Query {
             with: None,
-            body: Box::new(SetExpr::Select(cte_select)),
+            body: Box::new(SetExpr::Select(Box::new(cte_select))),
             order_by: None,
             limit_clause: None,
             fetch: None,
@@ -183,7 +181,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
     pub(crate) fn rewrite_statement(
         statement: &Statement,
-        indexes: &Vec<(ColumnReference, IndexType)>,
+        indexes: &[(ColumnReference, IndexType)],
     ) -> Option<Statement> {
         let mut relation_count: usize = 0;
         let _ = visit_relations(statement, |_| {
@@ -205,11 +203,9 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         };
 
         // Bind index filters, build CTE
-        let (index_cte, bound_filters) = Self::build_cte(&select, indexes)?;
+        let (index_cte, bound_filters) = Self::build_cte(select.as_ref(), indexes)?;
 
-        let Some(mut outer_selections) = select.selection.clone() else {
-            return None;
-        };
+        let mut outer_selections = select.selection.clone()?;
 
         // Rewrite any predicates used in the filter with no-op truthy value
         let exprs_to_noop = bound_filters
@@ -309,7 +305,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             if node_key == old_exec_key {
                 let new_exec = duck_exec
                     .clone()
-                    .with_optimized_sql(format!("{}", new_statement));
+                    .with_optimized_sql(format!("{new_statement}"));
 
                 Ok(Transformed::yes(Arc::new(new_exec)))
             } else {
@@ -320,7 +316,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
         transformed.map(|t| t.data)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DuckDBIntermediateIndexMaterialization"
     }
 
@@ -346,13 +342,14 @@ mod tests {
     fn make_index(columns: &[&str]) -> (ColumnReference, IndexType) {
         (
             ColumnReference {
-                columns: columns.iter().map(|s| s.to_string()).collect(),
+                columns: columns.iter().map(|s| (*s).to_string()).collect(),
             },
             IndexType::Enabled,
         )
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn test_rewrite_statement() {
         let test_cases: Vec<(&str, Vec<(ColumnReference, IndexType)>, Option<&str>)> = vec![
             // core query we want to optimize
@@ -383,7 +380,7 @@ mod tests {
                 vec![make_index(&["a", "b"])],
                 None,
             ),
-            // Multiple filters on same column - should work
+            // multiple filters on same column
             (
                 "SELECT * FROM foo WHERE a = 1 AND a > 0 AND b = 2 AND c = 3",
                 vec![make_index(&["a", "b"])],
@@ -431,7 +428,7 @@ mod tests {
 
                 assert_eq!(
                     expected_pattern.map(String::from),
-                    result.map(|s| format!("{}", s)),
+                    result.map(|s| format!("{s}")),
                     "Query {i} must be rewritten correctly"
                 );
             },
