@@ -33,6 +33,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"] }
+vortex = { workspace = true }
 vortex-datafusion = { workspace = true }
 
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues

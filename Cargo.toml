@@ -119,7 +119,6 @@ candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "a
 candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
 charset = "0.1.5"
-util = { path = "crates/util" }
 chrono = "0.4.42"
 clap = { version = "4.5.47", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
@@ -230,7 +229,12 @@ tiberius = { version = "0.12.3", default-features = false, features = [
     "chrono",
 ] }
 tokenizers = "0.21.2"
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "signal",
+    "macros",
+    "test-util",
+] }
 tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",
     "with-uuid-1",
@@ -254,10 +258,12 @@ tract-core = "0.22.0"
 turso = "0.3.0"
 twox-hash = "2.1.2"
 url = "2.5"
+util = { path = "crates/util" }
 uuid = "1"
-vortex = "0.54.0"
-vortex-datafusion = "0.54.0"
-vortex-utils = "0.54.0"
+# We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
+vortex = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
+vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "dbc2c3eb993e663b0be658c7b4788eb2ca830c3c" }
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
