@@ -35,6 +35,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"] }
+vortex = { workspace = true }
 vortex-datafusion = { workspace = true }
 # Vortex encoding dependencies for hardware-accelerated compression
 vortex = "0.54.0"
