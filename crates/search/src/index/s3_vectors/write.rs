@@ -41,9 +41,7 @@ pub enum Error {
 
     #[cfg(feature = "llms")]
     #[snafu(display("{source}"))]
-    FailedToEmbed {
-        source: llms::embeddings::Error,
-    },
+    FailedToEmbed { source: llms::embeddings::Error },
 
     #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
     ColumnNotFound { index: String, column: String },

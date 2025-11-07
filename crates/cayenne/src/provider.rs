@@ -43,7 +43,6 @@ use datafusion::datasource::listing::{
 };
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream as DFStream;
-use datafusion::prelude::SessionConfig;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::Constraints;
 use datafusion_execution::SendableRecordBatchStream;
