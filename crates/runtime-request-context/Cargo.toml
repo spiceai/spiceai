@@ -9,23 +9,18 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-async-stream.workspace = true
-async-trait.workspace = true
 app = { path = "../app" }
-spicepod = { path = "../spicepod" }
-percent-encoding.workspace = true
+async-trait.workspace = true
 axum.workspace = true
-tonic.workspace = true
-tower.workspace = true
+futures.workspace = true
+http.workspace = true
+opentelemetry.workspace = true
+percent-encoding.workspace = true
+regex.workspace = true
+runtime-auth = { path = "../runtime-auth" }
+spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
-futures.workspace = true
-base64.workspace = true
-pin-project.workspace = true
-http.workspace = true
-runtime-auth = { path = "../runtime-auth" }
-regex.workspace = true
-opentelemetry.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

@@ -747,15 +747,37 @@ pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
         return Ok(());
     }
 
+    // Optimization: For large key sets, convert to sorted vector for binary search
+    // Binary search is O(log n) vs HashSet's O(1), but has better cache locality
+    // and can be faster for moderately sized sets due to fewer cache misses
+    let use_sorted_search = overwriting_primary_keys.len() > 1000;
+    let sorted_keys = if use_sorted_search {
+        let mut keys: Vec<&str> = overwriting_primary_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        Some(keys)
+    } else {
+        None
+    };
+
     // Instead of concatenating, we can filter each batch individually
     let mut filtered = Vec::with_capacity(existing_batches.len());
     for batch in existing_batches.drain(..) {
         let keys = extract_primary_keys_str(&batch, pk_indices_ordered)?;
 
+        // Pre-allocate with exact capacity for better performance
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
+
         for k in keys {
             if let Some(k) = k {
-                keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+                let should_remove = if let Some(ref sorted) = sorted_keys {
+                    sorted.binary_search(&k.as_str()).is_ok()
+                } else {
+                    overwriting_primary_keys.contains(&k)
+                };
+                keep_row_builder.append_value(!should_remove);
             } else {
                 unreachable!(
                     "Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion."

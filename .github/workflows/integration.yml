@@ -8,7 +8,7 @@ on:
     branches:
       - trunk
       - release/*
-  pull_request_target:
+  pull_request:
     branches:
       - trunk
       - release-*
@@ -80,8 +80,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Cache Cargo dependencies
       - name: Cache Cargo registry
@@ -219,7 +217,6 @@ jobs:
       - uses: actions/checkout@v5
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
@@ -285,6 +282,7 @@ jobs:
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
+          AWS_EC2_METADATA_DISABLED: true
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
@@ -354,11 +352,11 @@ jobs:
       - test
     permissions:
       contents: write
+      pull-requests: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Download integration snapshots artifacts
@@ -385,18 +383,11 @@ jobs:
           git config --global user.name 'Spice Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
 
-      - name: Upload benchmark snapshots to branch
+      - name: Push snapshots to branch
         if: steps.download_snapshots.outcome == 'success'
-        run: |
-          git add '*.snap'
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "fix: Update the integration test snapshots"
-            git push origin HEAD
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: No snapshot changes detected
         if: steps.download_snapshots.outcome != 'success'
@@ -411,7 +402,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Set up Rust
@@ -439,6 +429,7 @@ jobs:
 
       - name: Run AWS SDK integration test
         env:
+          AWS_EC2_METADATA_DISABLED: true
           TEST_DATABRICKS_TOKEN: ${{ secrets.NEW_DATABRICKS_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
@@ -454,7 +445,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Set up Rust
@@ -482,6 +472,7 @@ jobs:
 
       - name: Run AWS SDK credential bridge integration test
         env:
+          AWS_EC2_METADATA_DISABLED: true
           AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
           AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
           AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
@@ -501,7 +492,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Set up Rust
@@ -536,7 +526,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

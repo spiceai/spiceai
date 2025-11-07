@@ -12,12 +12,12 @@ version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.99"
+anyhow.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 dirs = "6.0.0"
 ndarray = "0.15.6"
-regex = "1.12.2"
+regex.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -25,7 +25,7 @@ serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
-tract-core = "0.22.0"
+tract-core.workspace = true
 tract-onnx = "0.22.0"
 
 [features]

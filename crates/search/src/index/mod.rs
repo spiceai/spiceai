@@ -23,6 +23,7 @@ use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
+#[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).

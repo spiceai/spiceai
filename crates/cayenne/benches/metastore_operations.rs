@@ -6,7 +6,8 @@ use cayenne::metastore::turso::TursoMetastore;
 use cayenne::metastore::{
     ExecuteParams, MetastoreBackend, MetastoreValue, QueryParams, QueryRowParams,
 };
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
