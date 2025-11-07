@@ -138,7 +138,9 @@ rustls-pemfile.workspace = true
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
-search = { path = "../search" }
+search = { path = "../search", default-features = false, features = [
+    "text_search",
+], optional = false }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -250,6 +252,7 @@ models = [
     "mcp",
     "dep:strsim",
     "runtime-datafusion-udfs/models",
+    "search/llms",
 ]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
@@ -263,7 +266,11 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-write = []
-s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
+s3_vectors = [
+    "data_components/s3_vectors",
+    "dep:s3_vectors",
+    "search/s3_vectors",
+]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
