@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use aws_config::{BehaviorVersion, Region};
+use aws_config::Region;
 use aws_credential_types::Credentials;
+use aws_sdk_credential_bridge::default_aws_config;
 use s3_vectors::{Client, DeleteIndexInput, S3Vectors};
 use serde_json::json;
 use snafu::ResultExt;
@@ -1008,7 +1009,7 @@ async fn delete_index(
     bucket_name: &str,
     index_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = aws_config::defaults(BehaviorVersion::v2025_08_07())
+    let config = default_aws_config()
         .region(Region::from_static("us-east-2"))
         .credentials_provider(Credentials::new(
             std::env::var("AWS_S3_VECTORS_KEY").ok().unwrap_or_default(),
