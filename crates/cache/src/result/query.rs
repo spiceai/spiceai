@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Formatter;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -38,6 +39,7 @@ pub struct CachedQueryResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
     pub input_tables: Arc<HashSet<TableReference>>,
+    pub cached_at: SystemTime,
 }
 
 impl Sizeable for CachedQueryResult {
