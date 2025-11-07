@@ -47,6 +47,7 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+#[cfg(feature = "duckdb")]
 use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -242,12 +243,19 @@ impl DataFusionBuilder {
                 self.io_runtime.clone(),
             ))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(DuckDBIntermediateIndexMaterializationOptimizer::new())
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
-            .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
-            .build();
+            .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        #[cfg(feature = "duckdb")]
+        {
+            state = state.with_physical_optimizer_rule(
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            );
+        }
+
+        let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
