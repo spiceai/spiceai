@@ -148,7 +148,7 @@ impl ScalarUDFImpl for DigestMany {
             .iter()
             .find_map(|arg| match arg {
                 ColumnarValue::Array(arr) => Some(arr.len()),
-                _ => None,
+                ColumnarValue::Scalar(_) => None,
             })
             .unwrap_or_default();
 
