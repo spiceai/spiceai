@@ -126,13 +126,11 @@ impl ScalarUDFImpl for DigestMany {
         let mut args = scalar_args.args;
         let hash_fn = Self::concrete_hash_function(args.pop())?;
 
-        // Check if we have any arrays (columnar values)
-
-        if !args
+        // All scalars - process as before
+        if args
             .iter()
-            .any(|arg| matches!(arg, ColumnarValue::Array(_)))
+            .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
         {
-            // All scalars - process as before
             let mut hash_me = String::with_capacity(32 * args.len());
             for arg in args {
                 if let ColumnarValue::Scalar(scalar) = arg {
@@ -148,12 +146,11 @@ impl ScalarUDFImpl for DigestMany {
         // We have arrays - need to process row by row
         let num_rows = args
             .iter()
-            .filter_map(|arg| match arg {
+            .find_map(|arg| match arg {
                 ColumnarValue::Array(arr) => Some(arr.len()),
                 _ => None,
             })
-            .next()
-            .unwrap_or(1);
+            .unwrap_or_default();
 
         let mut result_hashes = Vec::with_capacity(num_rows);
 
@@ -185,10 +182,9 @@ impl ScalarUDFImpl for DigestMany {
                 return exec_err!("{DIGEST_UDF_NAME}: expected scalar hash result");
             }
         }
-
-        // Convert the vector of scalars into an array
-        let result_array = ScalarValue::iter_to_array(result_hashes)?;
-        Ok(ColumnarValue::Array(result_array))
+        Ok(ColumnarValue::Array(ScalarValue::iter_to_array(
+            result_hashes,
+        )?))
     }
 
     fn documentation(&self) -> Option<&Documentation> {
@@ -236,7 +232,7 @@ mod tests {
         );
 
         let data = ctx
-            .sql("select a, b, c, digest_many(a, b, c, 'md5') as 'digest_many(a, b, c)', digest_many(c, 'md5') as 'digest_many(c)' from tbl")
+            .sql("select a, b, c, digest_many(a, b, c, 'md5') as 'digest_many(a, b, c)', digest_many(c, 'md5') as 'digest_many(c)', digest_many(c, 'foo', 'md5') as 'digest_many(c, ''foo'')' from tbl")
             .await
             .expect("failed to prepare SQL")
             .collect()
@@ -245,16 +241,16 @@ mod tests {
         insta::assert_snapshot!(
             pretty_format_batches(data.as_slice()).expect("couldn't format batches"),
             @r"
-        +---+-----+-------+----------------------------------+----------------------------------+
-        | a | b   | c     | digest_many(a, b, c)             | digest_many(c)                   |
-        +---+-----+-------+----------------------------------+----------------------------------+
-        | 1 | 4.0 | alpha | 3409f2c75ffd509c8984bbb074f0e04d | 2c1743a391305fbf367df8e4f069f9f9 |
-        | 2 |     | beta  | 546bdc9d2972f2665650d628b4da0bb6 | 987bcab01b929eb2c07877b224215c92 |
-        | 3 | 5.0 | gamma | 82ff28e3c0dd00b848f98ea90fc99a39 | 05b048d7242cb7b8b57cfa3b1d65ecea |
-        | 4 | 6.0 | alpha | d96dc6ee83c54921044e6f823fb54359 | 2c1743a391305fbf367df8e4f069f9f9 |
-        | 5 | 7.0 | beta  | 896b722fd78bf5fe3e33d5baa96cbd88 | 987bcab01b929eb2c07877b224215c92 |
-        | 6 | 8.0 | gamma | 5e53bce9cc7a3eaaca70d58d04947043 | 05b048d7242cb7b8b57cfa3b1d65ecea |
-        +---+-----+-------+----------------------------------+----------------------------------+
+        +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
+        | a | b   | c     | digest_many(a, b, c)             | digest_many(c)                   | digest_many(c, 'foo')            |
+        +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
+        | 1 | 4.0 | alpha | 3409f2c75ffd509c8984bbb074f0e04d | 2c1743a391305fbf367df8e4f069f9f9 | 8784bced698bc929e46475089cb0f674 |
+        | 2 |     | beta  | 546bdc9d2972f2665650d628b4da0bb6 | 987bcab01b929eb2c07877b224215c92 | 16d4e759f170a3cd0928427fe29e41a1 |
+        | 3 | 5.0 | gamma | 82ff28e3c0dd00b848f98ea90fc99a39 | 05b048d7242cb7b8b57cfa3b1d65ecea | 09a0d53b795ebe42be507eb8e36bffc3 |
+        | 4 | 6.0 | alpha | d96dc6ee83c54921044e6f823fb54359 | 2c1743a391305fbf367df8e4f069f9f9 | 8784bced698bc929e46475089cb0f674 |
+        | 5 | 7.0 | beta  | 896b722fd78bf5fe3e33d5baa96cbd88 | 987bcab01b929eb2c07877b224215c92 | 16d4e759f170a3cd0928427fe29e41a1 |
+        | 6 | 8.0 | gamma | 5e53bce9cc7a3eaaca70d58d04947043 | 05b048d7242cb7b8b57cfa3b1d65ecea | 09a0d53b795ebe42be507eb8e36bffc3 |
+        +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
         "
         );
 
