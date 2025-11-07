@@ -85,7 +85,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         app.name.clone(),
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_query_set(baseline_queries)
+            .with_query_set(baseline_queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
@@ -229,7 +229,9 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
-    for query in queries {
+    // Use baseline_queries that represent unique query names, otherwise the same failure
+    // could be reported multiple times for each parameterized query params set variation
+    for query in baseline_queries {
         let Some(baseline_percentile) = baseline_percentiles.get(&query.name) else {
             // Query Failed, no percentile statistics recorded
             continue;
