@@ -245,6 +245,7 @@ impl DataFusionBuilder {
                 self.io_runtime.clone(),
             ))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            .with_physical_optimizer_rule(DuckDBIntermediateIndexMaterializationOptimizer::new())
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
             .build();
 

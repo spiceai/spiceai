@@ -246,9 +246,7 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = SessionStateBuilder::new_from_existing(self.get_session_state()?)
-                .with_physical_optimizer_rule(DuckDBIntermediateIndexMaterializationOptimizer::new(Arc::clone(&self.df.ctx)))
-                .build();
+            let mut session = self.get_session_state()?;
 
             let ctx = self;
             let tracker = ctx.tracker;

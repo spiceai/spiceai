@@ -14,9 +14,16 @@ datafusion-expr.workspace = true
 datafusion-table-providers.workspace = true
 r2d2.workspace = true
 duckdb.workspace = true
-tokio.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 futures.workspace = true
 cache = { path = "../cache" }
+
+[features]
+duckdb = [
+    "datafusion-table-providers/duckdb",
+    "datafusion-table-providers/duckdb-federation",
+    "duckdb/bundled",
+    "duckdb/r2d2"
+]
