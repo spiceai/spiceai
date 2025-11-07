@@ -214,6 +214,9 @@ impl<'de> Deserialize<'de> for LoadArgs {
             #[serde(flatten)]
             bench_args: BenchArgs,
             duration: Option<u64>,
+            concurrency: Option<u64>,
+            random_param_set_count: Option<usize>,
+            http_clients: Option<bool>,
         }
 
         let mut helper = LoadArgsHelper::deserialize(deserializer)?;
@@ -226,6 +229,9 @@ impl<'de> Deserialize<'de> for LoadArgs {
         Ok(LoadArgs {
             bench_args: helper.bench_args,
             duration: helper.duration,
+            concurrency: helper.concurrency,
+            random_param_set_count: helper.random_param_set_count,
+            http_clients: helper.http_clients,
         })
     }
 }
