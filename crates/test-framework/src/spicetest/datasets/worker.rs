@@ -28,6 +28,8 @@ use indicatif::ProgressBar;
 use spiceai::{Client as SpiceClient, SpiceClientError};
 use tokio::task::JoinHandle;
 
+use crate::constants::{HTTP_BASE_URL, SQL_ENDPOINT};
+
 use crate::{
     metrics::QueryStatus,
     queries::{
@@ -565,8 +567,9 @@ impl SpiceTestQueryWorker {
         if let Some(http_client) = self.http_client.as_ref() {
             let query_start = Instant::now();
             let sql_text = query.to_sql_with_inlined_params();
+            let sql_url = format!("{HTTP_BASE_URL}{SQL_ENDPOINT}");
             let http_response = http_client
-                .post("http://localhost:8090/v1/sql")
+                .post(&sql_url)
                 .body(sql_text.to_string())
                 .send()
                 .await?;

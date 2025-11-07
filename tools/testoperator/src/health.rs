@@ -21,11 +21,11 @@ use std::{
 
 use test_framework::{
     anyhow::{self, Context},
+    constants::{HEALTH_ENDPOINT, HTTP_BASE_URL, READY_ENDPOINT},
     tokio_util::sync::CancellationToken,
 };
 
-const BASE_URL: &str = "http://localhost:8090";
-const ENDPOINTS: [&str; 2] = ["/health", "/v1/ready"];
+const ENDPOINTS: [&str; 2] = [HEALTH_ENDPOINT, READY_ENDPOINT];
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const LATENCY_THRESHOLD: Duration = Duration::from_millis(50);
 
@@ -112,9 +112,9 @@ impl HealthMonitor {
                         return HealthCheckReport { endpoints: stats };
                     }
 
-                    let url = format!("{BASE_URL}{endpoint}");
+                    let url = format!("{HTTP_BASE_URL}{endpoint}");
                     let start = Instant::now();
-                    let response = client.get(url).send().await;
+                    let response = client.get(&url).send().await;
                     let latency = start.elapsed();
 
                     let failure_reason = match response {

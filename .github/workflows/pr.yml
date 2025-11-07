@@ -21,6 +21,14 @@ on:
           - 'release'
           - 'release-lto'
         default: 'lint'
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -181,6 +189,7 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           NEXTEST_FLAG: --features=xxhash
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
 
       - if: needs.check_changes.outputs.relevant_changes == 'true'
         run: cargo build -p testoperator --all-features
@@ -198,3 +207,9 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
+      
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

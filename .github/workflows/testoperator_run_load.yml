@@ -47,6 +47,8 @@ on:
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'saffron-views'
@@ -81,6 +83,11 @@ on:
         options:
           - 'true'
           - 'false'
+      scrape_spiced_metrics:
+        description: 'Scrape Prometheus metrics from spiced during the test'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-load:
@@ -159,6 +166,7 @@ jobs:
             ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
             ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
             --metrics
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -210,6 +218,7 @@ jobs:
             ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
             ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
             --metrics
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}

@@ -10,7 +10,6 @@ version.workspace = true
 
 [dependencies]
 futures.workspace = true
-futures-util = "0.3.31"
 snafu.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
