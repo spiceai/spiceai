@@ -26,8 +26,8 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::RecordBatchStream;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
-use futures::Stream;
 use futures::task::{Context, Poll};
+use futures::Stream;
 
 use crate::AsTableRefs;
 use crate::Sizeable;
