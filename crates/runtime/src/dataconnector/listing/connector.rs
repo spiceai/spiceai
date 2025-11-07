@@ -577,7 +577,10 @@ pub trait ListingTableConnector: DataConnector {
             sanitized_url = schema_infer_url.sanitized_url(),
         );
 
-        let mut options = ListingOptions::new(file_format).with_file_extension(extension);
+        let session_state = ctx.state();
+        let mut options = ListingOptions::new(file_format)
+            .with_file_extension(extension)
+            .with_session_config_options(session_state.config());
 
         let resolved_schema = options
             .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())

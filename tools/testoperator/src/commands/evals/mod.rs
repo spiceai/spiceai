@@ -27,6 +27,7 @@ use test_framework::{
         array::{Float64Array, RecordBatch, StringArray},
         util::pretty::pretty_format_batches,
     },
+    constants::{EVALS_ENDPOINT_PREFIX, HTTP_BASE_URL},
     futures::TryStreamExt,
     git,
     opentelemetry::KeyValue,
@@ -117,7 +118,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 
     let http_client = spiced_instance.http_client()?;
 
-    let url = format!("http://localhost:8090/v1/evals/{eval}");
+    let url = format!("{HTTP_BASE_URL}{EVALS_ENDPOINT_PREFIX}/{eval}");
     let body = json!({"model": model}).to_string();
 
     let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;

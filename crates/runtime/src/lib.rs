@@ -35,10 +35,11 @@ use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
-    internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+    internal_table::Error as InternalTableError,
 };
 
 use ::datafusion::error::DataFusionError;

@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use s3_vectors::{
-    Client, CreateIndexError, CreateIndexInput, CreateIndexOutput, CreateVectorBucketError,
+    CreateIndexError, CreateIndexInput, CreateIndexOutput, CreateVectorBucketError,
     CreateVectorBucketInput, CreateVectorBucketOutput, DeleteIndexError, DeleteIndexInput,
     DeleteIndexOutput, DeleteVectorBucketError, DeleteVectorBucketInput, DeleteVectorBucketOutput,
     DeleteVectorBucketPolicyError, DeleteVectorBucketPolicyInput, DeleteVectorBucketPolicyOutput,
@@ -33,12 +33,36 @@ use s3_vectors::{
 
 use crate::timing::TimeMeasurement;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time::Instant;
+
+const TTL_DURATION_MINIMUM: Duration = Duration::from_secs(5);
+
 pub struct S3VectorClient {
-    client: Client,
+    client: Arc<dyn S3Vectors + Send + Sync>,
+    list_indexes_cache: RwLock<HashMap<String, (ListIndexesOutput, Instant)>>,
+    ttl: Option<Duration>,
 }
+
 impl S3VectorClient {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(client: Arc<dyn S3Vectors + Send + Sync>, ttl: Option<Duration>) -> Self {
+        let ttl = ttl.map(|d| {
+            if d < TTL_DURATION_MINIMUM {
+                tracing::warn!("S3 vector index poll interval minimum is 5s.");
+                TTL_DURATION_MINIMUM
+            } else {
+                d
+            }
+        });
+
+        Self {
+            client,
+            list_indexes_cache: RwLock::new(HashMap::new()),
+            ttl,
+        }
     }
 }
 #[async_trait]
@@ -50,17 +74,22 @@ impl S3Vectors for S3VectorClient {
         let _guard = TimeMeasurement::new(&super::metrics::create_index::LATENCY, &[]);
         super::metrics::create_index::REQUESTS.add(1, &[]);
 
-        self.client
-            .create_index()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_data_type(input.data_type)
-            .set_dimension(input.dimension)
-            .set_distance_metric(input.distance_metric)
-            .set_metadata_configuration(input.metadata_configuration)
-            .send()
+        let result = self
+            .client
+            .create_index(input.clone())
             .await
-            .inspect_err(|_| super::metrics::create_index::ERRORS.add(1, &[]))
+            .inspect_err(|_| super::metrics::create_index::ERRORS.add(1, &[]));
+
+        // Invalidate cache on successful creation
+        if result.is_ok()
+            && self.ttl.is_some()
+            && let Some(bucket) = &input.vector_bucket_name
+        {
+            let mut cache = self.list_indexes_cache.write().await;
+            cache.remove(bucket);
+        }
+
+        result
     }
 
     async fn create_vector_bucket(
@@ -71,10 +100,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::create_vector_bucket::REQUESTS.add(1, &[]);
 
         self.client
-            .create_vector_bucket()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_encryption_configuration(input.encryption_configuration)
-            .send()
+            .create_vector_bucket(input)
             .await
             .inspect_err(|_| super::metrics::create_vector_bucket::ERRORS.add(1, &[]))
     }
@@ -87,11 +113,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::delete_index::REQUESTS.add(1, &[]);
 
         self.client
-            .delete_index()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_index_arn(input.index_arn)
-            .send()
+            .delete_index(input)
             .await
             .inspect_err(|_| super::metrics::delete_index::ERRORS.add(1, &[]))
     }
@@ -104,10 +126,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::delete_vector_bucket::REQUESTS.add(1, &[]);
 
         self.client
-            .delete_vector_bucket()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_vector_bucket_arn(input.vector_bucket_arn)
-            .send()
+            .delete_vector_bucket(input)
             .await
             .inspect_err(|_| super::metrics::delete_vector_bucket::ERRORS.add(1, &[]))
     }
@@ -121,10 +140,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::delete_vector_bucket_policy::REQUESTS.add(1, &[]);
 
         self.client
-            .delete_vector_bucket_policy()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_vector_bucket_arn(input.vector_bucket_arn)
-            .send()
+            .delete_vector_bucket_policy(input)
             .await
             .inspect_err(|_| super::metrics::delete_vector_bucket_policy::ERRORS.add(1, &[]))
     }
@@ -137,12 +153,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::delete_vectors::REQUESTS.add(1, &[]);
 
         self.client
-            .delete_vectors()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_index_arn(input.index_arn)
-            .set_keys(input.keys)
-            .send()
+            .delete_vectors(input)
             .await
             .inspect_err(|_| super::metrics::delete_vectors::ERRORS.add(1, &[]))
     }
@@ -155,10 +166,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::get_vector_bucket_policy::REQUESTS.add(1, &[]);
 
         self.client
-            .get_vector_bucket_policy()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_vector_bucket_arn(input.vector_bucket_arn)
-            .send()
+            .get_vector_bucket_policy(input)
             .await
             .inspect_err(|_| super::metrics::get_vector_bucket_policy::ERRORS.add(1, &[]))
     }
@@ -171,11 +179,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::get_index::REQUESTS.add(1, &[]);
 
         self.client
-            .get_index()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_index_arn(input.index_arn)
-            .send()
+            .get_index(input)
             .await
             .inspect_err(|_| super::metrics::get_index::ERRORS.add(1, &[]))
     }
@@ -188,10 +192,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::get_vector_bucket::REQUESTS.add(1, &[]);
 
         self.client
-            .get_vector_bucket()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_vector_bucket_arn(input.vector_bucket_arn)
-            .send()
+            .get_vector_bucket(input)
             .await
             .inspect_err(|_| super::metrics::get_vector_bucket::ERRORS.add(1, &[]))
     }
@@ -204,14 +205,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::get_vectors::REQUESTS.add(1, &[]);
 
         self.client
-            .get_vectors()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_index_arn(input.index_arn)
-            .set_keys(input.keys)
-            .set_return_data(input.return_data)
-            .set_return_metadata(input.return_metadata)
-            .send()
+            .get_vectors(input)
             .await
             .inspect_err(|_| super::metrics::get_vectors::ERRORS.add(1, &[]))
     }
@@ -220,19 +214,39 @@ impl S3Vectors for S3VectorClient {
         &self,
         input: ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
-        let _guard = TimeMeasurement::new(&super::metrics::list_indexes::LATENCY, &[]);
-        super::metrics::list_indexes::REQUESTS.add(1, &[]);
+        // Check cache if next_token is None (full list)
+        let is_full_list = input.next_token.is_none();
+        if is_full_list && let Some(ttl) = self.ttl {
+            let cache = self.list_indexes_cache.read().await;
+            if let Some(bucket) = &input.vector_bucket_name
+                && let Some((cached_output, timestamp)) = cache.get(bucket)
+                && timestamp.elapsed() < ttl
+            {
+                return Ok(cached_output.clone());
+            }
+        }
 
-        self.client
-            .list_indexes()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_vector_bucket_arn(input.vector_bucket_arn)
-            .set_max_results(input.max_results)
-            .set_next_token(input.next_token)
-            .set_prefix(input.prefix)
-            .send()
-            .await
-            .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]))
+        let result = {
+            let _guard = TimeMeasurement::new(&super::metrics::list_indexes::LATENCY, &[]);
+            super::metrics::list_indexes::REQUESTS.add(1, &[]);
+
+            self.client
+                .list_indexes(input.clone())
+                .await
+                .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]))
+        };
+
+        // Cache successful full list results
+        if is_full_list
+            && self.ttl.is_some()
+            && let Ok(output) = &result
+            && let Some(bucket) = input.vector_bucket_name
+        {
+            let mut cache = self.list_indexes_cache.write().await;
+            cache.insert(bucket, (output.clone(), Instant::now()));
+        }
+
+        result
     }
 
     async fn list_vector_buckets(
@@ -243,11 +257,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::list_vector_buckets::REQUESTS.add(1, &[]);
 
         self.client
-            .list_vector_buckets()
-            .set_max_results(input.max_results)
-            .set_next_token(input.next_token)
-            .set_prefix(input.prefix)
-            .send()
+            .list_vector_buckets(input)
             .await
             .inspect_err(|_| super::metrics::list_vector_buckets::ERRORS.add(1, &[]))
     }
@@ -260,17 +270,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::list_vectors::REQUESTS.add(1, &[]);
 
         self.client
-            .list_vectors()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_index_arn(input.index_arn)
-            .set_max_results(input.max_results)
-            .set_next_token(input.next_token)
-            .set_segment_count(input.segment_count)
-            .set_segment_index(input.segment_index)
-            .set_return_data(input.return_data)
-            .set_return_metadata(input.return_metadata)
-            .send()
+            .list_vectors(input)
             .await
             .inspect_err(|_| super::metrics::list_vectors::ERRORS.add(1, &[]))
     }
@@ -283,11 +283,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::put_vector_bucket_policy::REQUESTS.add(1, &[]);
 
         self.client
-            .put_vector_bucket_policy()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_vector_bucket_arn(input.vector_bucket_arn)
-            .set_policy(input.policy)
-            .send()
+            .put_vector_bucket_policy(input)
             .await
             .inspect_err(|_| super::metrics::put_vector_bucket_policy::ERRORS.add(1, &[]))
     }
@@ -300,12 +296,7 @@ impl S3Vectors for S3VectorClient {
         super::metrics::put_vectors::REQUESTS.add(1, &[]);
 
         self.client
-            .put_vectors()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_index_arn(input.index_arn)
-            .set_vectors(input.vectors)
-            .send()
+            .put_vectors(input)
             .await
             .inspect_err(|_| super::metrics::put_vectors::ERRORS.add(1, &[]))
     }
@@ -318,17 +309,219 @@ impl S3Vectors for S3VectorClient {
         super::metrics::query_vectors::REQUESTS.add(1, &[]);
 
         self.client
-            .query_vectors()
-            .set_vector_bucket_name(input.vector_bucket_name)
-            .set_index_name(input.index_name)
-            .set_index_arn(input.index_arn)
-            .set_query_vector(input.query_vector)
-            .set_top_k(input.top_k)
-            .set_filter(input.filter)
-            .set_return_metadata(input.return_metadata)
-            .set_return_distance(input.return_distance)
-            .send()
+            .query_vectors(input)
             .await
             .inspect_err(|_| super::metrics::query_vectors::ERRORS.add(1, &[]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use s3_vectors::{
+        CreateIndexInput, DataType, DistanceMetric, ListIndexesInput, mock::MockClient,
+    };
+    use tokio::time::{pause, resume};
+
+    use super::*;
+
+    async fn create_test_index(client: &S3VectorClient, bucket_name: &str, index_name: &str) {
+        let create_input = CreateIndexInput::builder()
+            .vector_bucket_name(bucket_name)
+            .index_name(index_name)
+            .data_type(DataType::Float32)
+            .dimension(128)
+            .distance_metric(DistanceMetric::Cosine)
+            .build()
+            .expect("test assertion");
+        let _create_result = client
+            .create_index(create_input)
+            .await
+            .expect("test assertion");
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_within_ttl() {
+        pause();
+        let mock_client = Arc::new(MockClient::new());
+        mock_client.reset_call_counts();
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let client = S3VectorClient::new(client, Some(Duration::from_secs(10)));
+
+        create_test_index(&client, "test-bucket", "test-index").await;
+
+        // populate cache
+        let input = ListIndexesInput::builder()
+            .vector_bucket_name("test-bucket")
+            .build()
+            .expect("test assertion");
+        let _ = client
+            .list_indexes(input.clone())
+            .await
+            .expect("test assertion");
+
+        // within TTL should use cache
+        let output = client.list_indexes(input).await.expect("test assertion");
+
+        assert!(!output.indexes().is_empty());
+        assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 1);
+        resume();
+    }
+
+    #[tokio::test]
+    async fn test_cache_miss_after_ttl_expires() {
+        pause();
+        let mock_client = Arc::new(MockClient::new());
+        mock_client.reset_call_counts();
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let client = S3VectorClient::new(client, Some(Duration::from_secs(5)));
+
+        create_test_index(&client, "test-bucket", "test-index").await;
+
+        // populate cache
+        let input = ListIndexesInput::builder()
+            .vector_bucket_name("test-bucket")
+            .build()
+            .expect("test assertion");
+        let _ = client
+            .list_indexes(input.clone())
+            .await
+            .expect("test assertion");
+
+        // advance time past TTL
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        // miss cache and call client again
+        let output = client.list_indexes(input).await.expect("test assertion");
+
+        assert!(!output.indexes().is_empty());
+        assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
+        resume();
+    }
+
+    #[tokio::test]
+    async fn test_no_caching_when_ttl_none() {
+        let mock_client = Arc::new(MockClient::new());
+        mock_client.reset_call_counts();
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let client = S3VectorClient::new(client, None);
+
+        create_test_index(&client, "test-bucket", "test-index").await;
+
+        let input = ListIndexesInput::builder()
+            .vector_bucket_name("test-bucket")
+            .build()
+            .expect("test assertion");
+        let _ = client
+            .list_indexes(input.clone())
+            .await
+            .expect("test assertion");
+
+        let output = client.list_indexes(input).await.expect("test assertion");
+
+        assert!(!output.indexes().is_empty());
+        assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_bypasses_cache() {
+        pause();
+        let mock_client = Arc::new(MockClient::new());
+        mock_client.reset_call_counts();
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let client = S3VectorClient::new(client, Some(Duration::from_secs(10)));
+
+        create_test_index(&client, "test-bucket", "test-index").await;
+
+        let input = ListIndexesInput::builder()
+            .vector_bucket_name("test-bucket")
+            .build()
+            .expect("test assertion");
+        let _ = client.list_indexes(input).await.expect("test assertion");
+
+        // call with next_token should bypass cache
+        let input = ListIndexesInput::builder()
+            .vector_bucket_name("test-bucket")
+            .next_token("some-token")
+            .build()
+            .expect("test assertion");
+        let output = client.list_indexes(input).await.expect("test assertion");
+
+        assert!(!output.indexes().is_empty());
+        assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
+        resume();
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidation_on_create_index() {
+        pause();
+        let mock_client = Arc::new(MockClient::new());
+        mock_client.reset_call_counts();
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let client = S3VectorClient::new(client, Some(Duration::from_secs(10)));
+
+        let list_input = ListIndexesInput::builder()
+            .vector_bucket_name("test-bucket")
+            .build()
+            .expect("test assertion");
+        let _ = client
+            .list_indexes(list_input.clone())
+            .await
+            .expect("test assertion");
+
+        // create index should invalidate cache
+        create_test_index(&client, "test-bucket", "new-index").await;
+
+        let output = client
+            .list_indexes(list_input)
+            .await
+            .expect("test assertion");
+
+        assert!(!output.indexes().is_empty());
+        assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
+        resume();
+    }
+
+    #[tokio::test]
+    async fn test_different_buckets_cached_separately() {
+        pause();
+        let mock_client = Arc::new(MockClient::new());
+        mock_client.reset_call_counts();
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let client = S3VectorClient::new(client, Some(Duration::from_secs(10)));
+
+        // Create indexes in both buckets
+        create_test_index(&client, "bucket1", "test-index1").await;
+        create_test_index(&client, "bucket2", "test-index2").await;
+
+        let input1 = ListIndexesInput::builder()
+            .vector_bucket_name("bucket1")
+            .build()
+            .expect("test assertion");
+        let _ = client
+            .list_indexes(input1.clone())
+            .await
+            .expect("test assertion");
+
+        let input2 = ListIndexesInput::builder()
+            .vector_bucket_name("bucket2")
+            .build()
+            .expect("test assertion");
+        let _ = client
+            .list_indexes(input2.clone())
+            .await
+            .expect("test assertion");
+
+        let result = client.list_indexes(input1).await.expect("test assertion");
+        assert!(!result.indexes().is_empty());
+
+        let result = client.list_indexes(input2).await.expect("test assertion");
+        assert!(!result.indexes().is_empty());
+
+        assert_eq!(mock_client.get_list_indexes_call_count("bucket1"), 1);
+        assert_eq!(mock_client.get_list_indexes_call_count("bucket2"), 1);
+
+        resume();
     }
 }

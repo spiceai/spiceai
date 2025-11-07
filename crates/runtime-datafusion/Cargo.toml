@@ -1,9 +1,9 @@
 [package]
-name = "runtime-datafusion"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
+name = "runtime-datafusion"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -23,4 +23,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 datafusion-datasource.workspace = true
-tokio.workspace=true
+tokio.workspace = true
+
+[features]
+cluster = []
+default = []

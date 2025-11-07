@@ -216,7 +216,8 @@ impl GlueDataConnector {
             "secret",
             "session_token",
             &self.params,
-        )?
+        )
+        .await?
         .load()
         .await;
 
