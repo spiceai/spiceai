@@ -32,7 +32,7 @@ use datafusion::{
     sql::TableReference,
 };
 use runtime_request_context::{CacheControl, CacheKeyType, RequestContext};
-use snafu::{ResultExt, ensure};
+use snafu::ResultExt;
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
 use tracing::Span;
 
@@ -226,28 +226,22 @@ impl Query {
                     // This is the only supported combination
                 }
                 (CacheKey::LogicalPlan(_), _) => {
-                    ensure!(
-                        false,
-                        UnsupportedStaleWhileRevalidateSnafu {
-                            cache_key_type: "default (plan)"
-                        }
-                    );
+                    return UnsupportedStaleWhileRevalidateSnafu {
+                        cache_key_type: "default (plan)",
+                    }
+                    .fail();
                 }
                 (CacheKey::ClientSupplied(_), _) => {
-                    ensure!(
-                        false,
-                        UnsupportedStaleWhileRevalidateSnafu {
-                            cache_key_type: "client-supplied"
-                        }
-                    );
+                    return UnsupportedStaleWhileRevalidateSnafu {
+                        cache_key_type: "client-supplied",
+                    }
+                    .fail();
                 }
                 _ => {
-                    ensure!(
-                        false,
-                        UnsupportedStaleWhileRevalidateSnafu {
-                            cache_key_type: format!("{cache_key_type:?}")
-                        }
-                    );
+                    return UnsupportedStaleWhileRevalidateSnafu {
+                        cache_key_type: format!("{cache_key_type:?}"),
+                    }
+                    .fail();
                 }
             }
         }
