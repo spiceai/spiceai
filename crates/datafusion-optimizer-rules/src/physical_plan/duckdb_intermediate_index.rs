@@ -161,7 +161,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         let has_wildcard = cte_select.projection.iter().any(|item| {
             matches!(
                 item,
-                datafusion::sql::sqlparser::ast::SelectItem::Wildcard(_)
+                SelectItem::Wildcard(_)
             )
         });
 
