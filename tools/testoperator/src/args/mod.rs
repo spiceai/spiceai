@@ -96,4 +96,8 @@ pub struct CommonArgs {
     /// Whether to enable metrics collection
     #[arg(long)]
     pub(crate) metrics: bool,
+
+    /// Whether to enable scraping spiced metrics (automatically enables --metrics for spiced)
+    #[arg(long)]
+    pub(crate) scrape_spiced_metrics: bool,
 }

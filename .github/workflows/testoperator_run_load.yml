@@ -46,6 +46,8 @@ on:
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
       ready_wait:
@@ -71,6 +73,11 @@ on:
         required: false
         type: string
         default: '1'
+      scrape_spiced_metrics:
+        description: 'Scrape Prometheus metrics from spiced during the test'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-load:
@@ -140,7 +147,8 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }}
+            --concurrency ${{ github.event.inputs.concurrency_count }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -187,7 +195,8 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }}
+            --concurrency ${{ github.event.inputs.concurrency_count }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}

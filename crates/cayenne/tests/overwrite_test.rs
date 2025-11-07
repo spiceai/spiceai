@@ -17,7 +17,7 @@ limitations under the License.
 //! Test INSERT OVERWRITE functionality for Cayenne
 
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::metadata::CreateTableOptions;
+use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use datafusion::prelude::*;
 use std::sync::Arc;
@@ -52,6 +52,7 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        vortex_config: VortexConfig::default(),
     };
 
     let table = CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?;
@@ -205,6 +206,7 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        vortex_config: VortexConfig::default(),
     };
 
     let table = CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?;

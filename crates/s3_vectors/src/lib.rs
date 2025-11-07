@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use aws_config::SdkConfig;
 
 pub use aws_sdk_s3vectors::{
-    Client,
     config::http::HttpResponse,
     error::SdkError,
     operation::{
@@ -56,12 +56,253 @@ pub use aws_sdk_s3vectors::{
         PutInputVector, QueryOutputVector, VectorData,
     },
 };
-pub use aws_smithy_types::{Document, Number, error::operation::BuildError};
+pub use aws_smithy_types::{DateTime, Document, Number, error::operation::BuildError};
 
 pub static LIST_VECTORS_MAX_RESULTS: usize = 500;
 pub static PUT_VECTORS_MAX_ITEMS: usize = 500;
 
+/// Wrapper for `aws_sdk_s3vectors::Client` that implements the `S3Vectors` trait
+#[derive(Debug)]
+pub struct Client {
+    client: aws_sdk_s3vectors::Client,
+}
+
+impl Client {
+    #[must_use]
+    pub fn new(config: &SdkConfig) -> Self {
+        Self {
+            client: aws_sdk_s3vectors::Client::new(config),
+        }
+    }
+}
+
 pub mod mock;
+
+#[async_trait]
+impl S3Vectors for Client {
+    async fn create_index(
+        &self,
+        input: CreateIndexInput,
+    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
+        self.client
+            .create_index()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_data_type(input.data_type)
+            .set_dimension(input.dimension)
+            .set_distance_metric(input.distance_metric)
+            .set_metadata_configuration(input.metadata_configuration)
+            .send()
+            .await
+    }
+
+    async fn create_vector_bucket(
+        &self,
+        input: CreateVectorBucketInput,
+    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>> {
+        self.client
+            .create_vector_bucket()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .send()
+            .await
+    }
+
+    async fn delete_index(
+        &self,
+        input: DeleteIndexInput,
+    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>> {
+        self.client
+            .delete_index()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_index_arn(input.index_arn)
+            .send()
+            .await
+    }
+
+    async fn delete_vector_bucket(
+        &self,
+        input: DeleteVectorBucketInput,
+    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>> {
+        self.client
+            .delete_vector_bucket()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_vector_bucket_arn(input.vector_bucket_arn)
+            .send()
+            .await
+    }
+
+    async fn delete_vector_bucket_policy(
+        &self,
+        input: DeleteVectorBucketPolicyInput,
+    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
+        self.client
+            .delete_vector_bucket_policy()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_vector_bucket_arn(input.vector_bucket_arn)
+            .send()
+            .await
+    }
+
+    async fn delete_vectors(
+        &self,
+        input: DeleteVectorsInput,
+    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
+        self.client
+            .delete_vectors()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_index_arn(input.index_arn)
+            .set_keys(input.keys)
+            .send()
+            .await
+    }
+
+    async fn get_index(
+        &self,
+        input: GetIndexInput,
+    ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
+        self.client
+            .get_index()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_index_arn(input.index_arn)
+            .send()
+            .await
+    }
+
+    async fn get_vector_bucket(
+        &self,
+        input: GetVectorBucketInput,
+    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
+        self.client
+            .get_vector_bucket()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_vector_bucket_arn(input.vector_bucket_arn)
+            .send()
+            .await
+    }
+
+    async fn get_vector_bucket_policy(
+        &self,
+        input: GetVectorBucketPolicyInput,
+    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
+        self.client
+            .get_vector_bucket_policy()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_vector_bucket_arn(input.vector_bucket_arn)
+            .send()
+            .await
+    }
+
+    async fn get_vectors(
+        &self,
+        input: GetVectorsInput,
+    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>> {
+        self.client
+            .get_vectors()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_index_arn(input.index_arn)
+            .set_keys(input.keys)
+            .set_return_data(input.return_data)
+            .set_return_metadata(input.return_metadata)
+            .send()
+            .await
+    }
+
+    async fn list_indexes(
+        &self,
+        input: ListIndexesInput,
+    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
+        self.client
+            .list_indexes()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_vector_bucket_arn(input.vector_bucket_arn)
+            .set_max_results(input.max_results)
+            .set_next_token(input.next_token)
+            .set_prefix(input.prefix)
+            .send()
+            .await
+    }
+
+    async fn list_vector_buckets(
+        &self,
+        input: ListVectorBucketsInput,
+    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>> {
+        self.client
+            .list_vector_buckets()
+            .set_max_results(input.max_results)
+            .set_next_token(input.next_token)
+            .set_prefix(input.prefix)
+            .send()
+            .await
+    }
+
+    async fn list_vectors(
+        &self,
+        input: ListVectorsInput,
+    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>> {
+        self.client
+            .list_vectors()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_index_arn(input.index_arn)
+            .set_max_results(input.max_results)
+            .set_next_token(input.next_token)
+            .set_segment_count(input.segment_count)
+            .set_segment_index(input.segment_index)
+            .set_return_data(input.return_data)
+            .set_return_metadata(input.return_metadata)
+            .send()
+            .await
+    }
+
+    async fn put_vector_bucket_policy(
+        &self,
+        input: PutVectorBucketPolicyInput,
+    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
+        self.client
+            .put_vector_bucket_policy()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_vector_bucket_arn(input.vector_bucket_arn)
+            .set_policy(input.policy)
+            .send()
+            .await
+    }
+
+    async fn put_vectors(
+        &self,
+        input: PutVectorsInput,
+    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>> {
+        self.client
+            .put_vectors()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_index_arn(input.index_arn)
+            .set_vectors(input.vectors)
+            .send()
+            .await
+    }
+
+    async fn query_vectors(
+        &self,
+        input: QueryVectorsInput,
+    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
+        self.client
+            .query_vectors()
+            .set_vector_bucket_name(input.vector_bucket_name)
+            .set_index_name(input.index_name)
+            .set_index_arn(input.index_arn)
+            .set_query_vector(input.query_vector)
+            .set_top_k(input.top_k)
+            .set_return_distance(input.return_distance)
+            .set_return_metadata(input.return_metadata)
+            .set_filter(input.filter)
+            .send()
+            .await
+    }
+}
 
 /// Trait representing the capabilities of the Amazon S3 Vectors API. Amazon S3 Vectors clients implement this trait.
 #[async_trait]
