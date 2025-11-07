@@ -46,18 +46,12 @@ pub fn to_cached_record_batch_stream(
         let cache_max_size = usize::try_from(cache_provider.max_size().min(u64::from(u32::MAX))).unwrap_or_default();
 
         while let Some(batch_result) = stream.next().await {
-            // Optimize: Only clone if we're actually caching. RecordBatch clone is cheap (Arc refcount)
-            // but we can still avoid the metadata allocation if not needed
-            match batch_result {
-                Ok(batch) if records_size < cache_max_size => {
-                    let batch_size = batch.get_array_memory_size();
-                    // Clone batch for cache, yield original
-                    records.push(batch.clone());
-                    records_size += batch_size;
-                    yield Ok(batch);
-                }
-                other => yield other,
+            if records_size < cache_max_size && let Ok(batch) = &batch_result {
+                records.push(batch.clone());
+                records_size += batch.get_array_memory_size();
             }
+
+            yield batch_result;
         }
 
         if records_size < cache_max_size {

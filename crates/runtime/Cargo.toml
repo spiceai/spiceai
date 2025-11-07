@@ -79,7 +79,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-llms = { path = "../llms", optional = true }
+llms = { path = "../llms" }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -138,7 +138,9 @@ rustls-pemfile.workspace = true
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
-search = { path = "../search", default-features = false, features = ["text_search"], optional = false }
+search = { path = "../search", default-features = false, features = [
+    "text_search",
+], optional = false }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -173,7 +175,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
-workers = { path = "../workers", optional = true }
+workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [dev-dependencies]
@@ -221,7 +223,7 @@ cluster = [
     "dep:ballista-executor",
     "dep:datafusion-proto",
 ]
-cuda = ["dep:llms", "llms/cuda"]
+cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
@@ -244,14 +246,11 @@ imap = ["data_components/imap", "dep:imap"]
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
-metal = ["dep:llms", "llms/metal"]
+metal = ["llms/metal"]
 models = [
     "model_components/full",
     "mcp",
     "dep:strsim",
-    "dep:llms",
-    "dep:workers",
-    "workers/llms",
     "runtime-datafusion-udfs/models",
     "search/llms",
 ]
@@ -267,7 +266,11 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-write = []
-s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
+s3_vectors = [
+    "data_components/s3_vectors",
+    "dep:s3_vectors",
+    "search/s3_vectors",
+]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [

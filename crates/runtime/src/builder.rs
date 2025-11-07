@@ -250,7 +250,6 @@ impl RuntimeBuilder {
 
         let secrets = Self::load_secrets(self.app.as_ref()).await;
 
-        #[cfg(feature = "models")]
         let evals = self
             .app
             .as_ref()
@@ -260,18 +259,12 @@ impl RuntimeBuilder {
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
             df,
-            #[cfg(feature = "models")]
             models: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "models")]
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "models")]
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "models")]
             embeds: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "models")]
             evals: Arc::new(RwLock::new(evals)),
-            #[cfg(feature = "models")]
             eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),

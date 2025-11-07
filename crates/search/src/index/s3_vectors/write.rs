@@ -25,7 +25,6 @@ use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field, Schema};
 use data_components::s3_vectors::S3VectorsTable;
 use itertools::Itertools;
-#[cfg(feature = "llms")]
 use llms::embeddings::{Embed, EmbeddingInput};
 use runtime_datafusion_index::Index;
 use serde_json::Value;
@@ -39,7 +38,6 @@ pub enum Error {
     #[snafu(display("Embedding model '{model_name}' was not found"))]
     EmbeddingModelNotFound { model_name: String },
 
-    #[cfg(feature = "llms")]
     #[snafu(display("{source}"))]
     FailedToEmbed { source: llms::embeddings::Error },
 
@@ -103,7 +101,6 @@ pub enum Error {
 }
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
-#[cfg(feature = "llms")]
 #[allow(clippy::too_many_lines)]
 pub async fn write(
     index: &S3Vector,
@@ -136,7 +133,6 @@ pub async fn write(
     Ok(concatenated)
 }
 
-#[cfg(feature = "llms")]
 async fn process_single_batch(
     index: &S3Vector,
     table: &S3VectorsTable,
@@ -388,7 +384,6 @@ where
 /// Embed the given `column_idx` from the [`RecordBatch`]s, assuming it is a String-like value.
 ///
 /// Return results a nullable array of vectors. Null is original string is null or empty.
-#[cfg(feature = "llms")]
 async fn embed_column(
     rb: &RecordBatch,
     column_idx: usize,

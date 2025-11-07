@@ -16,16 +16,13 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::s3_vectors::query_provider::ComputeQueryVector;
-#[cfg(feature = "llms")]
 use llms::embeddings::Embed;
 use snafu::ResultExt;
 use std::sync::Arc;
 
-#[cfg(feature = "llms")]
 #[derive(Debug)]
 pub struct EmbedQuery(pub Arc<dyn Embed>);
 
-#[cfg(feature = "llms")]
 #[async_trait]
 impl ComputeQueryVector for EmbedQuery {
     async fn compute_vector(

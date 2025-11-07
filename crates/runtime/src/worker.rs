@@ -17,12 +17,10 @@ limitations under the License.
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-#[cfg(feature = "models")]
 use llms::chat::Chat;
 use serde_json::Value;
 use spicepod::component::worker::Worker as WorkerComponent;
 use tokio::sync::RwLock;
-#[cfg(feature = "models")]
 use workers::RouterModel;
 
 use crate::{Result, Runtime};
@@ -76,7 +74,6 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
     let worker_type = infer_worker_type(worker)?;
 
     match worker_type {
-        #[cfg(feature = "models")]
         WorkerType::LoadBalance => {
             let Some(load_balance) = &worker.load_balance else {
                 unreachable!("LoadBalance worker must have load_balance defined");
@@ -130,11 +127,6 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
                 schedule_parameters,
             )))
         }
-        #[cfg(not(feature = "models"))]
-        WorkerType::LoadBalance => Err(super::Error::FailedToInitializeWorker {
-            worker_name: worker.name.clone(),
-            source: "LoadBalance workers require the 'models' feature to be enabled".into(),
-        }),
         WorkerType::Sql => {
             let Some(sql) = &worker.sql else {
                 unreachable!("SQL worker must have sql defined");
@@ -168,7 +160,6 @@ pub trait Worker: Send + Sync {
 
     fn description(&self) -> Option<Cow<'_, str>>;
 
-    #[cfg(feature = "models")]
     fn as_model(self: Arc<Self>) -> Option<Arc<dyn Chat>> {
         None
     }
@@ -178,14 +169,12 @@ pub trait Worker: Send + Sync {
     }
 }
 
-#[cfg(feature = "models")]
 pub struct LoadBalanceWorker {
     description: Option<String>,
     model: Arc<RouterModel>,
     schedule_parameters: Option<WorkerScheduleParameters>,
 }
 
-#[cfg(feature = "models")]
 impl LoadBalanceWorker {
     pub fn new(
         model: Arc<RouterModel>,
@@ -200,7 +189,6 @@ impl LoadBalanceWorker {
     }
 }
 
-#[cfg(feature = "models")]
 impl Worker for LoadBalanceWorker {
     fn name(&self) -> Cow<'_, str> {
         self.model.router_name.clone().into()
@@ -210,7 +198,6 @@ impl Worker for LoadBalanceWorker {
         self.description.as_ref().map(Into::into)
     }
 
-    #[cfg(feature = "models")]
     fn as_model(self: Arc<Self>) -> Option<Arc<dyn Chat>> {
         let model = Arc::clone(&self.model) as Arc<dyn Chat>;
         Some(model)

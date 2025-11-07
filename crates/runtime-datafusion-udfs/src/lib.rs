@@ -20,6 +20,5 @@ pub mod alias;
 pub mod bucket;
 pub mod cosine_distance;
 pub mod digest_many;
-#[cfg(feature = "models")]
 pub mod embed;
 pub mod truncate;

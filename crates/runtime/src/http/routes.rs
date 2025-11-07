@@ -18,7 +18,6 @@ limitations under the License.
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
-#[cfg(feature = "models")]
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
 use crate::{search::search_engine, status::RuntimeStatus};
