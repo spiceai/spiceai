@@ -19,11 +19,11 @@ use aws_config::BehaviorVersion;
 use aws_sdk_cognitoidentity as cognito_identity;
 use aws_sdk_cognitoidentityprovider as cognito_idp;
 use aws_sdk_cognitoidentityprovider::types::AuthFlowType;
-use aws_sdk_credential_bridge::S3CredentialProvider;
+use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use iceberg::io::AwsCredentialLoad;
 use object_store::CredentialProvider;
 use std::io::Write;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 #[allow(clippy::expect_used)]
 async fn setup(file: &mut NamedTempFile) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -151,4 +151,57 @@ async fn s3_credential_provider_caches_calls_for_object_store() {
     assert_eq!(first_credentials.key_id, second_credentials.key_id);
     assert_eq!(first_credentials.secret_key, second_credentials.secret_key);
     assert_eq!(first_credentials.token, second_credentials.token);
+}
+
+#[tokio::test]
+async fn aws_sdk_config_allows_unauthenticated_access() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let credentials_file = temp_dir.path().join("fake_credentials");
+    std::fs::write(&credentials_file, "").expect("write fake credentials file");
+    let config_file = temp_dir.path().join("fake_config");
+    std::fs::write(&config_file, "").expect("write fake config file");
+
+    // Preserve existing environment variables so we can restore them after the test.
+    let vars_to_clear = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_EC2_METADATA_DISABLED",
+    ];
+
+    let mut saved_vars = Vec::new();
+    unsafe {
+        for key in vars_to_clear {
+            saved_vars.push((key, std::env::var(key).ok()));
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", &credentials_file);
+        std::env::set_var("AWS_CONFIG_FILE", &config_file);
+        std::env::set_var("AWS_PROFILE", "spiceai-nonexistent-profile");
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+    }
+
+    let config = get_or_init_sdk_config()
+        .await
+        .expect("AWS SDK initialization should not error for unauthenticated access");
+    assert!(
+        config.is_none(),
+        "Expected AWS SDK config to be absent when no credentials are configured"
+    );
+
+    // Restore environment variables to avoid affecting other tests.
+    unsafe {
+        for (key, value) in saved_vars {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
 }
