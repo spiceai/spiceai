@@ -7,7 +7,6 @@ use datafusion::prelude::SessionContext;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{Extension, LogicalPlan, ScalarUDF};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
-use runtime_datafusion::extension::bytes_processed::BytesProcessedNode;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -61,18 +60,10 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         let name = serde_json::from_slice::<String>(buf)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let node = match name.as_str() {
-            "BytesProcessedNode" => Extension {
-                node: Arc::new(BytesProcessedNode::new(inputs[0].clone())),
-            },
-            other => {
-                return exec_err!(
-                    "SpiceLogicalCodec does not support {other}. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
-                );
-            }
-        };
-
-        Ok(node)
+        exec_err!(
+            "SpiceLogicalCodec does not support {}. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
+            name.as_str()
+        )
     }
 
     fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> Result<()> {

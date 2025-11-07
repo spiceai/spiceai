@@ -8,7 +8,7 @@ on:
     branches:
       - trunk
       - release/*
-  pull_request_target:
+  pull_request:
     branches:
       - trunk
       - release-*
@@ -18,15 +18,15 @@ on:
   workflow_dispatch:
     inputs:
       update_snapshots:
-        description: "Update the snapshots?"
+        description: 'Update the snapshots?'
         required: false
-        default: "no"
+        default: 'no'
         type: choice
         options:
-          - "always"
-          - "no"
+          - 'always'
+          - 'no'
       run_all_tests:
-        description: "Run all tests"
+        description: 'Run all tests'
         type: boolean
         required: false
         default: false
@@ -80,8 +80,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Cache Cargo dependencies
       - name: Cache Cargo registry
@@ -100,7 +98,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -126,7 +124,7 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: "linux"
+          os: 'linux'
 
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -210,23 +208,22 @@ jobs:
       matrix:
         include:
           - label: 1
-            partition: "count:1/3"
+            partition: 'count:1/3'
           - label: 2
-            partition: "count:2/3"
+            partition: 'count:2/3'
           - label: 3
-            partition: "count:3/3"
+            partition: 'count:3/3'
     steps:
       - uses: actions/checkout@v5
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Install Oracle ODPI-C
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -355,11 +352,11 @@ jobs:
       - test
     permissions:
       contents: write
+      pull-requests: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Download integration snapshots artifacts
@@ -386,18 +383,11 @@ jobs:
           git config --global user.name 'Spice Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
 
-      - name: Upload benchmark snapshots to branch
+      - name: Push snapshots to branch
         if: steps.download_snapshots.outcome == 'success'
-        run: |
-          git add '*.snap'
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "fix: Update the integration test snapshots"
-            git push origin HEAD
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: No snapshot changes detected
         if: steps.download_snapshots.outcome != 'success'
@@ -412,13 +402,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download AWS SDK test archive
         uses: actions/download-artifact@v6
@@ -456,13 +445,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download AWS SDK credential bridge test archive
         uses: actions/download-artifact@v6
@@ -504,13 +492,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download data components test archive
         uses: actions/download-artifact@v6
@@ -539,12 +526,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Download partition table test archive
         uses: actions/download-artifact@v6
