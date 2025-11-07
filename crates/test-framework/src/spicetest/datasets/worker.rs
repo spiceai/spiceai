@@ -642,10 +642,7 @@ fn build_unique_query_sets(queries: &[Query]) -> Result<Vec<Vec<Query>>> {
             None => expected_size = Some(group_size),
             Some(expected) if expected != group_size => {
                 return Err(anyhow::anyhow!(
-                    "Uneven parameter groups detected: query '{}' has {} parameters, expected {}",
-                    name,
-                    group_size,
-                    expected
+                    "Uneven parameter groups detected: query '{name}' has {group_size} parameters, expected {expected}"
                 ));
             }
             _ => {}
@@ -660,7 +657,7 @@ fn build_unique_query_sets(queries: &[Query]) -> Result<Vec<Vec<Query>>> {
     for param_index in 0..num_variations {
         let mut query_set = Vec::with_capacity(groups.len());
 
-        for (_name, query_group) in &groups {
+        for query_group in groups.values() {
             if let Some(query) = query_group.get(param_index) {
                 query_set.push((*query).clone());
             }
