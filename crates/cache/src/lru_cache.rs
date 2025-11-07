@@ -29,7 +29,6 @@ use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
 use spicepod::component::caching::CacheConfig;
-use std::convert::TryFrom;
 use std::fmt::Display;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
@@ -256,8 +255,9 @@ impl<
 
     fn uptime_secs(&self) -> u32 {
         let secs = self.initial_instant.elapsed().as_secs();
-        let capped_secs = secs.min(u64::from(u32::MAX));
-        u32::try_from(capped_secs).unwrap_or(u32::MAX)
+        #[allow(clippy::cast_possible_truncation)]
+        let uptime = secs.min(u64::from(u32::MAX)) as u32;
+        uptime
     }
 }
 

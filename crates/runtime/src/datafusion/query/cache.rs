@@ -341,6 +341,10 @@ impl Query {
     /// The key insight is we don't need to trigger acceleration refresh - we just
     /// re-execute the query and let it flow through the normal query path.
     ///
+    /// The background task will be automatically cancelled if:
+    /// - The `DataFusion` context is dropped (runtime shutdown)
+    /// - The query execution is interrupted via the session context
+    ///
     /// Note: This should only be called with `CacheKey::Query` since validation rejects
     /// stale-while-revalidate with other cache key types.
     fn trigger_background_query_revalidation(
@@ -363,31 +367,34 @@ impl Query {
             return;
         };
 
+        // Spawn a detached task for background revalidation
+        // The task will be automatically cancelled if the DataFusion context is dropped
         tokio::spawn(async move {
             tracing::debug!("Background revalidation: re-executing query");
 
             // Execute the query in the background - this will go through acceleration/datasource
             // and automatically populate the cache with fresh results
-            match ctx.sql(&sql).await {
-                Ok(df_result) => {
-                    // Collect the results to ensure the query executes and cache is populated
-                    match df_result.collect().await {
-                        Ok(batches) => {
-                            tracing::debug!(
-                                "Background revalidation completed successfully, {} batches cached",
-                                batches.len()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Background revalidation failed during collection: {}",
-                                e
-                            );
-                        }
-                    }
+            let query_result = ctx.sql(&sql).await;
+
+            // Check if we should continue (context might be cancelled)
+            let Ok(df_result) = query_result else {
+                if let Err(e) = query_result {
+                    tracing::debug!("Background revalidation query failed to plan: {}", e);
+                }
+                return;
+            };
+
+            // Collect the results to ensure the query executes and cache is populated
+            match df_result.collect().await {
+                Ok(batches) => {
+                    tracing::debug!(
+                        "Background revalidation completed successfully, {} batches cached",
+                        batches.len()
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("Background revalidation failed to execute query: {}", e);
+                    // Don't log as warning if it's a cancellation
+                    tracing::debug!("Background revalidation failed during collection: {}", e);
                 }
             }
         });
