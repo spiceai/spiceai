@@ -158,12 +158,10 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .collect();
 
         // But not for SELECT *
-        let has_wildcard = cte_select.projection.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Wildcard(_)
-            )
-        });
+        let has_wildcard = cte_select
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard(_)));
 
         if !has_wildcard && !remaining_filter_columns.is_empty() {
             let mut projected_columns = HashSet::new();
