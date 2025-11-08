@@ -15,17 +15,17 @@ arrow-json.workspace = true
 arrow-schema.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+chunking = { path = "../chunking" }
+data_components = { path = "../data_components", optional = true }
 datafusion.workspace = true
 datafusion-expr.workspace = true
-futures.workspace = true
 datafusion-functions-json = { workspace = true }
-data_components  = { path = "../data_components", features = ["s3_vectors"] }
+futures.workspace = true
+itertools.workspace = true
+llms = { path = "../llms", optional = true }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-table-partition = { path = "../runtime-table-partition" }
-chunking = { path = "../chunking" }
 serde_json.workspace = true
-itertools.workspace = true
-llms = {path = "../llms"}
 snafu.workspace = true
 tantivy = { workspace = true, optional = true }
 tokio.workspace = true
@@ -33,7 +33,9 @@ tracing.workspace = true
 util = { path = "../util" }
 
 [features]
-default = ["text_search"]
+default = ["text_search", "s3_vectors"]
+llms = ["dep:llms"]
+s3_vectors = ["data_components/s3_vectors", "llms"]
 text_search = ["dep:tantivy"]
 
 [dev-dependencies]

@@ -91,6 +91,7 @@ async fn test_cayenne_partition_pruning_impl(
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("region".to_string()),
+        vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let table = CayenneTableProvider::create_table(
@@ -391,6 +392,7 @@ async fn test_cayenne_bucket_partitioning_impl(
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("id".to_string()), // In practice, runtime would use bucket(3, id)
+        vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let table = CayenneTableProvider::create_table(

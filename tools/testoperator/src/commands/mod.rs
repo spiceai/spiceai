@@ -59,12 +59,17 @@ pub(crate) async fn get_app_and_start_request(
     spicepod.dependencies = vec![];
     let app = app_builder.build();
 
-    let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
-    let start_request = if let Some(ref data_dir) = args.data_dir {
-        start_request.with_data_dir(data_dir.clone())
-    } else {
-        start_request
-    };
+    let mut start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+
+    if let Some(ref data_dir) = args.data_dir {
+        start_request = start_request.with_data_dir(data_dir.clone());
+    }
+
+    // If scrape_spiced_metrics is enabled, add --metrics flag to spiced
+    if args.scrape_spiced_metrics {
+        start_request = start_request
+            .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:9090".to_string()]);
+    }
 
     Ok((app, start_request))
 }
@@ -98,4 +103,67 @@ macro_rules! wait_test_and_memory {
             }
         }
     };
+}
+
+/// Process and display metrics from the spiced metrics scraper
+///
+/// # Arguments
+/// * `scraper` - Optional metrics scraper to stop and process
+/// * `emit_to_telemetry` - Whether to emit metrics to OpenTelemetry
+/// * `attributes` - Optional attributes to attach to emitted metrics (e.g., test name)
+///
+/// # Returns
+/// The collected `SpicedMetrics` if scraper was present, None otherwise
+pub(crate) async fn process_spiced_metrics(
+    scraper: Option<crate::spiced_metrics::MetricsScraper>,
+    emit_to_telemetry: bool,
+    attributes: &[test_framework::opentelemetry::KeyValue],
+) -> Option<crate::spiced_metrics::SpicedMetrics> {
+    let scraper = scraper?;
+
+    match scraper.stop().await {
+        Ok(metrics) => {
+            println!("\n{}", vec!["="; 30].join(""));
+            println!("Spiced Runtime Metrics:");
+            println!("{}", vec!["="; 30].join(""));
+
+            // Display and optionally emit key metrics
+            // Note: Prometheus exporter appends _total to counter metrics
+            if let Some(query_count) = metrics.get_counter_value("query_executions_total") {
+                println!("Total Queries Executed: {query_count}");
+
+                if emit_to_telemetry {
+                    crate::metrics::SPICED_QUERY_COUNT.record(query_count, attributes);
+                }
+            }
+
+            if let Some(cache_hits) = metrics.get_counter_value("results_cache_hits_total")
+                && let Some(cache_requests) =
+                    metrics.get_counter_value("results_cache_requests_total")
+                && cache_requests > 0.0
+            {
+                let hit_rate = cache_hits / cache_requests;
+                println!("Cache Hit Rate: {:.2}%", hit_rate * 100.0);
+
+                if emit_to_telemetry {
+                    crate::metrics::SPICED_CACHE_HIT_RATE.record(hit_rate, attributes);
+                }
+            }
+
+            if let Some(active_conns) = metrics.get_gauge_max("query_active_count") {
+                println!("Peak Active Connections: {active_conns}");
+
+                if emit_to_telemetry {
+                    crate::metrics::SPICED_ACTIVE_CONNECTIONS.record(active_conns, attributes);
+                }
+            }
+
+            println!("{}", vec!["="; 30].join(""));
+            Some(metrics)
+        }
+        Err(e) => {
+            println!("Warning: Failed to collect spiced metrics: {e}");
+            None
+        }
+    }
 }

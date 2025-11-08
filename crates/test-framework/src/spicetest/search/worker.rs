@@ -24,6 +24,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
+use crate::constants::{HTTP_BASE_URL, SEARCH_ENDPOINT};
+
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct SearchRequest {
     #[serde(skip)]
@@ -180,9 +182,10 @@ impl VectorSearchWorker {
 
             for (index, request) in self.config.requests.into_iter().enumerate() {
                 let start = Instant::now();
+                let search_url = format!("{HTTP_BASE_URL}{SEARCH_ENDPOINT}");
                 let res = self
                     .http_client
-                    .post("http://localhost:8090/v1/search")
+                    .post(&search_url)
                     .json(&request)
                     .send()
                     .await?;
