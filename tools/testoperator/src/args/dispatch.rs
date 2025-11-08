@@ -226,6 +226,15 @@ impl<'de> Deserialize<'de> for LoadArgs {
             helper.bench_args.scrape_spiced_metrics = Some(true);
         }
 
+        // Remove ready_wait parameter as it's not supported by testoperator_run_load workflow
+        if helper.bench_args.ready_wait.is_some() {
+            eprintln!(
+                "Warning: ready_wait parameter (spicepod_path = {}) is not supported by testoperator_run_load workflow and will be ignored",
+                helper.bench_args.spicepod_path.display()
+            );
+            helper.bench_args.ready_wait = None;
+        }
+
         Ok(LoadArgs {
             bench_args: helper.bench_args,
             duration: helper.duration,

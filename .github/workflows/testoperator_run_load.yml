@@ -53,11 +53,6 @@ on:
           - 'iceberg-hadoop'
           - 'saffron-views'
           - 'saffron-duckdb-cte'
-      ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
-        required: true
-        default: '30'
-        type: string
       runner_type:
         description: 'Runner type'
         required: true
@@ -76,13 +71,10 @@ on:
         required: false
         type: string
       http_clients:
-        description: 'Whether to use HTTP clients for the test (default: false)'
+        description: 'Use HTTP clients for the test?'
         required: false
-        type: choice
-        default: 'false'
-        options:
-          - 'true'
-          - 'false'
+        type: boolean
+        default: false
       scrape_spiced_metrics:
         description: 'Scrape Prometheus metrics from spiced during the test'
         required: false
@@ -159,14 +151,14 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
             ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
             --metrics
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -210,15 +202,15 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
             ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
             --metrics
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
