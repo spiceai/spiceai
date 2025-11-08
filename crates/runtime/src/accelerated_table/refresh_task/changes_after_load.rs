@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{inner_err_from_retry_ref, RefreshTask};
+use super::{RefreshTask, inner_err_from_retry_ref};
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::{
-    ChangesAfterLoadBootstrappingSnafu, ChangesAfterLoadCheckDatasetSnafu, Result,
+    ChangesAfterLoadBootstrappingSnafu, ChangesAfterLoadCheckDatasetSnafu, Error,
+    Result as AcceleratedTableResult,
 };
 use crate::dataconnector::changes_after_load::{ChangesAfterLoadCoordinator, DatasetStatus};
 use crate::dataconnector::get_data;
@@ -29,6 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 use tokio::sync::{Notify, RwLock};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 impl RefreshTask {
     pub async fn coordinate_changes_after_load(
@@ -38,7 +41,7 @@ impl RefreshTask {
         caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
-    ) -> Result<()> {
+    ) -> AcceleratedTableResult<()> {
         let federated_provider = self.federated.table_provider().await;
 
         let ctx = &Self::create_refresh_df_context(
@@ -50,50 +53,80 @@ impl RefreshTask {
         )
         .await;
 
+        let refresh_cloned = Arc::clone(&refresh);
+        let _refresh = refresh_cloned.read().await;
+        let max_retries = if _refresh.retry_enabled {
+            _refresh.retry_max_attempts
+        } else {
+            Some(0)
+        };
+
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(max_retries)
+            .build();
+
         match coordinator
             .check_dataset_status(ctx)
             .await
             .context(ChangesAfterLoadCheckDatasetSnafu)?
         {
             DatasetStatus::Bootstrap => {
-                self.cold_start(
-                    coordinator,
-                    federated_provider,
-                    refresh,
-                    caching,
-                    ready_sender,
-                    initial_load_completed,
-                )
-                .await
+                retry(retry_strategy, {
+                    let coordinator = Arc::clone(&coordinator);
+                    let refresh = Arc::clone(&refresh);
+                    let caching = caching.clone();
+                    let ready_sender = ready_sender.clone();
+                    let initial_load_completed = Arc::clone(&initial_load_completed);
+
+                    move || {
+                        let coordinator = Arc::clone(&coordinator);
+                        let refresh = Arc::clone(&refresh);
+                        let caching = caching.clone();
+                        let ready_sender = ready_sender.clone();
+                        let initial_load_completed = Arc::clone(&initial_load_completed);
+
+                        async move {
+                            self.cold_start(
+                                coordinator,
+                                refresh,
+                                caching,
+                                ready_sender,
+                                initial_load_completed,
+                            )
+                            .await
+                        }
+                    }
+                });
             }
             DatasetStatus::ChangesStream => {
-                self.changes_after_load_stream(
-                    coordinator,
-                    refresh,
-                    caching,
-                    ready_sender,
-                    initial_load_completed,
-                )
-                .await
+                let _ = self
+                    .changes_after_load_stream(
+                        coordinator,
+                        refresh,
+                        caching,
+                        ready_sender,
+                        initial_load_completed,
+                    )
+                    .await;
             }
         }
+
+        Ok(())
     }
 
     async fn cold_start(
         &self,
         coordinator: Arc<dyn ChangesAfterLoadCoordinator>,
-        federated_provider: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
-    ) -> Result<()> {
+    ) -> Result<(), RetryError<Error>> {
         // Step 1. Initialize changes stream
         let deferred_stream = coordinator.initialize_deferred_changes_stream().await;
 
         // Step 2. Ingest initial data
         self.cold_start_ingestion(
-            federated_provider,
             Arc::clone(&refresh),
             ready_sender,
             Arc::clone(&initial_load_completed),
@@ -115,41 +148,22 @@ impl RefreshTask {
             initial_load_completed,
         )
         .await
+        .map_err(|e| RetryError::permanent(e))
     }
 
     async fn cold_start_ingestion(
         &self,
-        federated_provider: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
-    ) -> Result<()> {
+    ) -> Result<(), RetryError<Error>> {
         let start_time = SystemTime::now();
-
-        let dataset_name = self.dataset_name.clone();
-
-        let mut ctx = Self::create_refresh_df_context(
-            Arc::clone(&federated_provider),
-            &self.dataset_name,
-            &self.accelerator,
-            self.disable_federation,
-            self.io_runtime.clone(),
-        )
-        .await;
 
         let refresh = refresh.read().await;
 
-        let batch_stream = get_data(
-            &mut ctx,
-            dataset_name,
-            federated_provider,
-            refresh.sql.clone(),
-            vec![],
-        )
-        .await
-        .context(ChangesAfterLoadBootstrappingSnafu)?;
-
-        let streaming_data_update = StreamingDataUpdate::new(batch_stream, UpdateType::Append);
+        let streaming_data_update = self
+            .get_full_or_incremental_append_update(&refresh, None)
+            .await?;
 
         self.write_streaming_data_update(
             Some(start_time),
@@ -157,8 +171,17 @@ impl RefreshTask {
             refresh.sql.as_deref(),
         )
         .await
-        .map_err(|e| inner_err_from_retry_ref(&e))
-        .context(ChangesAfterLoadBootstrappingSnafu)?;
+        .inspect_err(|e| {
+            // tracing::warn!(
+            //         "Failed to load data for {} {}: {}",
+            //         self.component_type(),
+            //         include_source_to_table_name(
+            //             &self.dataset_name,
+            //             self.federated_source.as_deref()
+            //         ),
+            //         inner_err_from_retry_ref(e)
+            //     );
+        })?;
 
         if let Some(ready_sender) = ready_sender.as_ref() {
             ready_sender.notify_waiters();
@@ -175,7 +198,7 @@ impl RefreshTask {
         caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
-    ) -> Result<()> {
+    ) {
         let changes_stream = coordinator.changes_stream();
 
         tracing::debug!(
@@ -184,13 +207,17 @@ impl RefreshTask {
             self.dataset_name,
         );
 
-        self.start_changes_stream(
-            refresh,
-            changes_stream,
-            caching,
-            ready_sender,
-            initial_load_completed,
-        )
-        .await
+        if let Err(err) = self
+            .start_changes_stream(
+                refresh,
+                changes_stream,
+                caching,
+                ready_sender,
+                initial_load_completed,
+            )
+            .await
+        {
+            tracing::error!("Changes stream failed with error: {err}");
+        };
     }
 }

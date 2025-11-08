@@ -28,7 +28,7 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum RefreshMode {
     Full,
     Append,
