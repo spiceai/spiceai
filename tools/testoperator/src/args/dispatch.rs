@@ -106,6 +106,7 @@ pub struct BenchArgs {
     pub spicepod_path: PathBuf,
     pub query_set: QuerySet,
     pub query_overrides: Option<QueryOverridesArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
     #[serde(skip_serializing_if = "Option::is_none")]
